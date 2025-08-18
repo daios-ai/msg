@@ -1,0 +1,63 @@
+package mindscript
+
+import (
+	"strings"
+	"testing"
+)
+
+func mustContain(t *testing.T, s, sub string) {
+	t.Helper()
+	if !strings.Contains(s, sub) {
+		t.Fatalf("expected output to contain %q\n--- output ---\n%s", sub, s)
+	}
+}
+
+func Test_ErrorWrap_Parse_ShowsCaretAndContext(t *testing.T) {
+	// Two lines; parse error on line 2: missing ')'
+	src := `let x = 1
+f(1`
+
+	// Pretty calls ParseSExpr under the hood and now wraps with WrapErrorWithSource
+	_, err := Pretty(src)
+	if err == nil {
+		t.Fatalf("expected parse error, got nil")
+	}
+	msg := err.Error()
+
+	// Header
+	mustContain(t, msg, "PARSE ERROR at")
+	// Context lines (line numbers + source)
+	mustContain(t, msg, "   1 | let x = 1")
+	mustContain(t, msg, "   2 | f(1")
+	// Caret line
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_ErrorWrap_Lex_ShowsCaretAndContext(t *testing.T) {
+	// Two lines; lex error on line 2: invalid \\u escape (non-hex)
+	src := "let ok = 1\n\"bad \\u12GZ\""
+
+	// Pretty triggers lexing as well
+	_, err := Pretty(src)
+	if err == nil {
+		t.Fatalf("expected lex error, got nil")
+	}
+	msg := err.Error()
+
+	// Header
+	mustContain(t, msg, "LEXICAL ERROR at")
+	// Context lines
+	mustContain(t, msg, "   1 | let ok = 1")
+	mustContain(t, msg, "   2 | \"bad \\u12GZ\"")
+	// Caret line
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+
+	// A bit of the lexer message to be sure it's the unicode escape path
+	// (exact wording can vary; loosen as needed)
+	// e.g. "unicode escape was not terminated" or "invalid unicode escape"
+	if !(strings.Contains(strings.ToLower(msg), "unicode") || strings.Contains(strings.ToLower(msg), "escape")) {
+		t.Fatalf("expected unicode escape related message, got:\n%s", msg)
+	}
+}

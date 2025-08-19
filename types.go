@@ -187,13 +187,13 @@ func deepEqual(a, b Value) bool {
 		}
 		return true
 	case VTMap:
-		am := a.Data.(map[string]Value)
-		bm := b.Data.(map[string]Value)
-		if len(am) != len(bm) {
+		am := a.Data.(*MapObject)
+		bm := b.Data.(*MapObject)
+		if len(am.Entries) != len(bm.Entries) {
 			return false
 		}
-		for k, av := range am {
-			bv, ok := bm[k]
+		for k, av := range am.Entries {
+			bv, ok := bm.Entries[k]
 			if !ok || !deepEqual(av, bv) {
 				return false
 			}
@@ -286,10 +286,10 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 		return S{"array", elem}
 
 	case VTMap:
-		m := v.Data.(map[string]Value)
+		mo := v.Data.(*MapObject)
 		out := S{"map"}
 		// For a single observed map, infer optional fields (no required).
-		for k, vv := range m {
+		for k, vv := range mo.Entries {
 			out = append(out, S{"pair", S{"str", k}, ip.valueToTypeS(vv, env)})
 		}
 		return out
@@ -437,9 +437,9 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			return false
 		}
 		fs := mapTypeFields(t)
-		m := v.Data.(map[string]Value)
+		mo := v.Data.(*MapObject)
 		for name, f := range fs {
-			val, ok := m[name]
+			val, ok := mo.Entries[name]
 			if !ok {
 				if f.required {
 					return false

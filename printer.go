@@ -511,14 +511,31 @@ func (p *pp) printMap(n S) {
 			p.write(", ")
 		}
 		pair := pr.(S)
-		k := getStr(child(pair, 0))
-		if isIdent(k) {
-			p.write(k)
+		keyNode := child(pair, 0)
+		key, keyAnn := unwrapKey(keyNode)
+
+		if keyAnn != "" {
+			// put the annotation as a line comment just before the field
+			p.nl()
+			p.out.withIndent(func() {
+				p.pad()
+				p.out.annot(keyAnn)
+			})
+			p.pad()
+		}
+
+		if isIdent(key) {
+			p.write(key)
 		} else {
-			p.write(quoteString(k))
+			p.write(quoteString(key))
 		}
 		p.write(": ")
 		p.printExpr(child(pair, 1), 0)
+
+		// if we emitted a leading annotation, keep items nicely lined up
+		if keyAnn != "" && i < len(items)-1 {
+			p.write(", ")
+		}
 	}
 	p.write("}")
 }
@@ -547,6 +564,14 @@ func prec(n S) int {
 	default:
 		return 100
 	}
+}
+
+func unwrapKey(n S) (name string, annot string) {
+	for tag(n) == "annot" {
+		annot += getStr(child(n, 0))
+		n = child(n, 1)
+	}
+	return getStr(n), annot
 }
 
 func binopPrec(op string) int {
@@ -713,20 +738,22 @@ func writeType(o *out, t S) {
 			name     string
 			required bool
 			typ      S
-			annot    string
+			keyAnnot string
+			valAnnot string
 		}
 		fs := make([]field, 0, len(t)-1)
 		for i := 1; i < len(t); i++ {
-			p := t[i].(S) // ("pair"|"pair!", ("str", name), T or ("annot", ("str",doc), T))
+			p := t[i].(S) // ("pair"|"pair!", keyNode, T or ("annot", ("str",doc), T))
 			req := p[0].(string) == "pair!"
-			key := p[1].(S)[1].(string)
+			keyNode := p[1].(S)
+			key, keyAnn := unwrapKey(keyNode)
 			ft := p[2].(S)
-			doc := ""
+			valAnn := ""
 			if len(ft) > 0 && ft[0].(string) == "annot" {
-				doc = ft[1].(S)[1].(string)
+				valAnn = ft[1].(S)[1].(string)
 				ft = ft[2].(S)
 			}
-			fs = append(fs, field{name: key, required: req, typ: ft, annot: doc})
+			fs = append(fs, field{name: key, required: req, typ: ft, keyAnnot: keyAnn, valAnnot: valAnn})
 		}
 		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
 
@@ -734,8 +761,11 @@ func writeType(o *out, t S) {
 		o.nl()
 		o.withIndent(func() {
 			for i, f := range fs {
-				if f.annot != "" {
-					o.annot(f.annot)
+				if f.keyAnnot != "" {
+					o.annot(f.keyAnnot)
+				}
+				if f.valAnnot != "" {
+					o.annot(f.valAnnot)
 				}
 				o.pad()
 				if isIdent(f.name) {
@@ -855,6 +885,32 @@ func FormatValue(v Value) string {
 	return b.String()
 }
 
+func mapOneLineMO(keys []string, mo *MapObject) string {
+	if len(keys) == 0 {
+		return "{}"
+	}
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+			// any annotated key forces multiline
+			return ""
+		}
+		v := mo.Entries[k]
+		if isValueMultiline(v) {
+			return ""
+		}
+		key := k
+		if !isIdent(key) {
+			key = quoteString(key)
+		}
+		var b strings.Builder
+		o := out{b: &b}
+		writeValue(&o, v)
+		parts = append(parts, key+": "+b.String())
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
+}
+
 func writeValue(o *out, v Value) {
 	// Header annotation (once)
 	if v.Annot != "" {
@@ -897,9 +953,10 @@ func writeValue(o *out, v Value) {
 		o.nl()
 		o.withIndent(func() {
 			for i, it := range xs {
-				o.pad()
-				o.write("  ")
-				writeValue(o, it)
+				if it.Annot == "" {
+					o.pad() // pad here only when no header annot
+				}
+				writeValue(o, it) // annotated values handle their own padding
 				if i < len(xs)-1 {
 					o.blue(",")
 				}
@@ -910,30 +967,33 @@ func writeValue(o *out, v Value) {
 		o.blue("]")
 
 	case VTMap:
-		m := v.Data.(map[string]Value)
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
+		mo := v.Data.(*MapObject)
+		// Build a sorted view of keys for stable output
+		keys := append([]string(nil), mo.Keys...)
 		sort.Strings(keys)
 
-		if oneline := mapOneLine(keys, m); oneline != "" && len(oneline) <= MaxInlineWidth {
+		// One-line candidate (only if no key is annotated)
+		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
 			o.blue(oneline)
 			return
 		}
+
+		// Multiline
 		o.blue("{")
 		o.nl()
 		o.withIndent(func() {
 			for i, k := range keys {
-				o.pad()
-				o.write("  ")
+				if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+					o.annot(ann) // o.annot already pads correctly
+				}
+				o.pad() // align with annotation line
 				if isIdent(k) {
 					o.blue(k)
 				} else {
 					o.blue(quoteString(k))
 				}
 				o.blue(": ")
-				writeValue(o, m[k])
+				writeValue(o, mo.Entries[k])
 				if i < len(keys)-1 {
 					o.blue(",")
 				}
@@ -942,6 +1002,7 @@ func writeValue(o *out, v Value) {
 		})
 		o.pad()
 		o.blue("}")
+		return
 
 	case VTFun:
 		// Pretty-print as <fun: n1:T1 -> n2:T2 -> R> ; zero-arg as _:Null -> R
@@ -1076,14 +1137,15 @@ func isValueMultiline(v Value) bool {
 		line := arrayOneLine(xs)
 		return line == "" || len(line) > MaxInlineWidth
 	case VTMap:
-		m := v.Data.(map[string]Value)
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
+		mo := v.Data.(*MapObject)
+		if len(mo.Keys) == 0 {
+			return false
 		}
+		keys := append([]string(nil), mo.Keys...)
 		sort.Strings(keys)
-		line := mapOneLine(keys, m)
+		line := mapOneLineMO(keys, mo)
 		return line == "" || len(line) > MaxInlineWidth
+
 	case VTType:
 		t := v.Data.(S)
 		return len(t) > 0 && t[0].(string) == "map" && len(t) > 1

@@ -7,6 +7,15 @@ import (
 
 // --- helpers ---------------------------------------------------------------
 
+func mustEvalPersistent(t *testing.T, ip *Interpreter, src string) Value {
+	t.Helper()
+	v, err := ip.EvalPersistentSource(src)
+	if err != nil {
+		t.Fatalf("eval error for %q: %v", src, err)
+	}
+	return v
+}
+
 func evalSrc(t *testing.T, src string) Value {
 	t.Helper()
 	ip := NewInterpreter()
@@ -1139,4 +1148,156 @@ arr
 	pair := v.Data.([]Value)
 	wantStrAnn(t, pair[0], "k", "B")
 	wantInt(t, pair[1], 9)
+}
+
+func Test_Interpreter_Annot_On_Assign_Persists_In_Env(t *testing.T) {
+	ip := NewInterpreter()
+
+	// #(doc) let c = 1
+	mustEvalPersistent(t, ip, "# speed of light\nlet c = 299792458")
+
+	// c must carry the annotation
+	v := mustEvalPersistent(t, ip, "c")
+	if v.Tag != VTInt || v.Data.(int64) != 299792458 {
+		t.Fatalf("expected c == 299792458, got %#v", v)
+	}
+	if got, want := v.Annot, "speed of light"; got != want {
+		t.Fatalf("annotation lost on stored value: got %q want %q", got, want)
+	}
+}
+
+func Test_Interpreter_Annot_On_Bare_Decl_Persists_As_AnnotatedNull(t *testing.T) {
+	ip := NewInterpreter()
+
+	// #(doc) let x
+	mustEvalPersistent(t, ip, "# doc for x\nlet x")
+
+	v := mustEvalPersistent(t, ip, "x")
+	if v.Tag != VTNull {
+		t.Fatalf("expected x to be null, got %#v", v)
+	}
+	if got, want := v.Annot, "doc for x"; got != want {
+		t.Fatalf("annotation lost on bare decl: got %q want %q", got, want)
+	}
+}
+
+func Test_Interpreter_Annot_On_Reassign_Persists_On_Binding(t *testing.T) {
+	ip := NewInterpreter()
+
+	mustEvalPersistent(t, ip, "let x = 1")
+	// #(doc2) x = 2
+	mustEvalPersistent(t, ip, "# newer doc\nx = 2")
+
+	v := mustEvalPersistent(t, ip, "x")
+	if v.Tag != VTInt || v.Data.(int64) != 2 {
+		t.Fatalf("expected x == 2, got %#v", v)
+	}
+	if got, want := v.Annot, "newer doc"; got != want {
+		t.Fatalf("annotation lost on reassignment: got %q want %q", got, want)
+	}
+}
+
+func Test_Interpreter_Annot_On_Expression_Does_NotMutate_Binding(t *testing.T) {
+	ip := NewInterpreter()
+
+	mustEvalPersistent(t, ip, "let z = 5")
+
+	// #(temp) z  — returns annotated copy, should NOT change z in env
+	r := mustEvalPersistent(t, ip, "# temp note\nz")
+	if r.Tag != VTInt || r.Data.(int64) != 5 {
+		t.Fatalf("expected annotated expression to evaluate to 5, got %#v", r)
+	}
+	if got, want := r.Annot, "temp note"; got != want {
+		t.Fatalf("annotation not present on expression result: got %q want %q", got, want)
+	}
+
+	// z in env remains unannotated
+	v := mustEvalPersistent(t, ip, "z")
+	if v.Annot != "" {
+		t.Fatalf("binding was mutated by annotated expression (should not): got %q", v.Annot)
+	}
+}
+
+func Test_Interpreter_Identity_Preserves_Annotation(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Annotated binding
+	mustEvalPersistent(t, ip, "# doc\nlet a = 42")
+
+	// identity function that returns its argument verbatim
+	mustEvalPersistent(t, ip, "let id = fun(x: Any) -> Any do x end")
+
+	// id(a) should preserve a's annotation
+	v := mustEvalPersistent(t, ip, "id(a)")
+	if v.Tag != VTInt || v.Data.(int64) != 42 {
+		t.Fatalf("expected 42, got %#v", v)
+	}
+	if got, want := v.Annot, "doc"; got != want {
+		t.Fatalf("identity lost annotation: got %q want %q", got, want)
+	}
+}
+
+func Test_Interpreter_Arithmetic_Does_Not_Propagate_Annotation(t *testing.T) {
+	ip := NewInterpreter()
+
+	mustEvalPersistent(t, ip, "# golden ratio\nlet phi = (1 + 5) / 2")
+
+	// 2 * phi should not carry annotation
+	v := mustEvalPersistent(t, ip, "2 * phi")
+	if v.Annot != "" {
+		t.Fatalf("unexpected propagation through construction: got %q", v.Annot)
+	}
+}
+
+func Test_Interpreter_Pretty_Does_Not_Show_Desugaring(t *testing.T) {
+	// Ensure codegen-only rewrite doesn’t affect Pretty/printing.
+
+	src1 := "# hello\nlet y = 1"
+	got1, err := Pretty(src1)
+	if err != nil {
+		t.Fatalf("Pretty error: %v", err)
+	}
+	if got1 != src1 {
+		t.Fatalf("Pretty changed surface form.\nwant:\n%s\n\ngot:\n%s", src1, got1)
+	}
+
+	src2 := "# note\nlet u"
+	got2, err := Pretty(src2)
+	if err != nil {
+		t.Fatalf("Pretty error: %v", err)
+	}
+	if got2 != src2 {
+		t.Fatalf("Pretty changed surface form for bare decl.\nwant:\n%s\n\ngot:\n%s", src2, got2)
+	}
+}
+
+func Test_Interpreter_Type_And_Field_Notes_Appear_In_FormatValue(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Type-level + field-level annotations:
+	src := `
+# The input number.
+let Input = type {
+  # The key carrying the input.
+  input!: Int,
+  age: Int
+}
+`
+	mustEvalPersistent(t, ip, src)
+
+	v := mustEvalPersistent(t, ip, "Input") // VTType value
+
+	out := FormatValue(v)
+	// Top-level type note should appear as a header.
+	if !strings.Contains(out, "The input number.") {
+		t.Fatalf("missing top-level type annotation in output:\n%s", out)
+	}
+	// Field-level note should appear before the "input!" field
+	if !strings.Contains(out, "The key carrying the input.") {
+		t.Fatalf("missing field-level annotation in output:\n%s", out)
+	}
+	// Ensure the field is present as well
+	if !strings.Contains(out, "input!") || !strings.Contains(out, "Int") {
+		t.Fatalf("missing field in output:\n%s", out)
+	}
 }

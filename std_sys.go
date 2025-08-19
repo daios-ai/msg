@@ -1,0 +1,1071 @@
+package mindscript
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
+
+// --- Concurrency primitives -------------------------------------------------
+
+type procState struct {
+	done   chan struct{}
+	result Value
+	cancel chan struct{} // cooperative
+}
+
+// Channel box (shared by all channel builtins)
+type chanBox struct {
+	ch chan Value
+}
+
+// --- Deep copy & snapshot for isolated worlds --------------------------------
+
+func snapshotEnv(e *Env) *Env {
+	// Flatten chain into one level (shadowing by nearer scopes wins).
+	flat := map[string]Value{}
+	for cur := e; cur != nil; cur = cur.parent {
+		for k, v := range cur.table {
+			if _, exists := flat[k]; !exists {
+				flat[k] = cloneValue(v)
+			}
+		}
+	}
+	cp := NewEnv(nil)
+	for k, v := range flat {
+		cp.Define(k, v)
+	}
+	return cp
+}
+
+func registerConcurrencyBuiltins(ip *Interpreter) {
+	// spawn(f: Any->Any) -> Any (proc handle)
+	ip.RegisterNative(
+		"procSpawn",
+		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			fv := ctx.MustArg("f")
+			if fv.Tag != VTFun {
+				fail("spawn expects a function")
+			}
+
+			// TODO(engine): provide engine API to rebind a callable's closure env
+			// e.g., CloneCallableWithEnv(fn, snapshotEnv). For now, copy *Fun.
+			fn := fv.Data.(*Fun)
+
+			// Snapshot closure env for isolation
+			snap := snapshotEnv(fn.Env)
+			// Clone function onto the snapshot
+			work := &Fun{
+				Params:     append([]string{}, fn.Params...),
+				ParamTypes: append([]S{}, fn.ParamTypes...),
+				ReturnType: fn.ReturnType,
+				Body:       fn.Body,
+				Env:        snap,
+				HiddenNull: fn.HiddenNull,
+			}
+
+			pr := &procState{done: make(chan struct{}), cancel: make(chan struct{})}
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						switch sig := r.(type) {
+						case returnSig:
+							pr.result = sig.v
+						case rtErr:
+							pr.result = errNull(sig.msg)
+						default:
+							pr.result = errNull(fmt.Sprintf("runtime panic: %v", r))
+						}
+					}
+					close(pr.done)
+				}()
+				pr.result = ip.execFunBodyScoped(work, nil)
+			}()
+			return HandleVal("proc", pr)
+		},
+	)
+	setBuiltinDoc(ip, "procSpawn", `Run a function in a new lightweight process.
+
+The function runs concurrently with the caller in an isolated snapshot of its
+closure environment (variables are deep-copied where applicable). Pass a
+fully-applied function (no missing parameters).
+
+Params:
+  f: Any — work to execute
+
+Returns:
+  proc handle (opaque)
+
+Notes:
+  • Use procJoin(proc) to retrieve the result.
+  • If the process fails, join returns an annotated null with the error message.
+  • Use procCancel(proc) to request cooperative cancellation (best effort).`)
+
+	ip.RegisterNative(
+		"procJoin",
+		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			pv := ctx.MustArg("p")
+			pr := asHandle(pv, "proc").Data.(*procState)
+			<-pr.done
+			return pr.result
+		},
+	)
+	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.
+
+Params:
+  p: proc — a handle returned by procSpawn
+
+Returns:
+  Any — the function's result, or an annotated null if the process failed.`)
+
+	ip.RegisterNative(
+		"procCancel",
+		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		S{"id", "Null"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			pv := ctx.MustArg("p")
+			pr := asHandle(pv, "proc").Data.(*procState)
+			select {
+			case <-pr.cancel:
+			default:
+				close(pr.cancel)
+			}
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process.
+
+Cancellation is best-effort: user code/libraries may choose to observe the
+request and stop early.
+
+Params:
+  p: proc — a handle returned by procSpawn
+
+Returns:
+  Null`)
+
+	// Channels (untyped)
+	ip.RegisterNative("chan", nil, S{"id", "Any"}, func(ip *Interpreter, ctx CallCtx) Value {
+		return HandleVal("chan", &chanBox{ch: make(chan Value)})
+	})
+	setBuiltinDoc(ip, "chan", `Create a new unbuffered channel.
+
+Channels transport arbitrary values between concurrent processes.
+
+Returns:
+  chan handle (opaque)
+
+See also:
+  chanSend, chanRecv, chanClose`)
+
+	ip.RegisterNative(
+		"chanSend",
+		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Null"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			x := ctx.MustArg("x")
+			cb.ch <- x
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "chanSend", `Send a value on a channel.
+
+Blocks until a receiver is ready (unbuffered semantics).
+
+Params:
+  c: chan — channel handle
+  x: Any  — value to send
+
+Returns:
+  Null`)
+
+	ip.RegisterNative(
+		"chanRecv",
+		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			v, ok := <-cb.ch
+			if !ok {
+				return annotNull("channel closed")
+			}
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel.
+
+Blocks until a sender is ready. After chanClose(c), further receives return an
+annotated null with the message "channel closed".
+
+Params:
+  c: chan — channel handle
+
+Returns:
+  Any — the received value, or annotated null after close`)
+
+	ip.RegisterNative(
+		"chanClose",
+		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
+		S{"id", "Null"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			close(cb.ch)
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "chanClose", `Close a channel.
+
+After closing:
+  • chanRecv returns an annotated null ("channel closed")
+  • Sending on a closed channel is an error
+
+Params:
+  c: chan — channel handle
+
+Returns:
+  Null`)
+}
+
+// --- Utilities: time, rand, json --------------------------------------------
+
+func cloneValue(v Value) Value {
+	switch v.Tag {
+	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
+		return v
+	case VTArray:
+		xs := v.Data.([]Value)
+		cp := make([]Value, len(xs))
+		for i := range xs {
+			cp[i] = cloneValue(xs[i])
+		}
+		return Arr(cp)
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		// Deep-copy entries
+		entries := make(map[string]Value, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			entries[k] = cloneValue(vv)
+		}
+		// Preserve insertion order and per-key annotations
+		keys := make([]string, len(mo.Keys))
+		copy(keys, mo.Keys)
+		keyAnn := make(map[string]string, len(mo.KeyAnn))
+		for k, ann := range mo.KeyAnn {
+			keyAnn[k] = ann
+		}
+		return Value{
+			Tag: VTMap,
+			Data: &MapObject{
+				Entries: entries,
+				KeyAnn:  keyAnn,
+				Keys:    keys,
+			},
+		}
+	default:
+		// Userdata/modules are NOT copied; processes should not capture them.
+		return v
+	}
+}
+
+func registerUtilityBuiltins(ip *Interpreter) {
+	ip.RegisterNative("nowMillis", nil, S{"id", "Int"}, func(ip *Interpreter, ctx CallCtx) Value {
+		return Int(time.Now().UnixMilli())
+	})
+	setBuiltinDoc(ip, "nowMillis", `Current wall-clock time in milliseconds since the Unix epoch.
+
+Returns:
+  Int`)
+
+	ip.RegisterNative(
+		"clone",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return cloneValue(ctx.MustArg("x"))
+		},
+	)
+	setBuiltinDoc(ip, "clone", `Deep-copy arrays and maps.
+
+For maps, preserves key order and per-key annotations. Primitive values are
+returned as-is. Functions, modules, and handles are not duplicated (identity
+is preserved).
+
+Params:
+  x: Any
+
+Returns:
+  Any — a structurally independent copy for arrays/maps`)
+
+	ip.RegisterNative(
+		"sleep",
+		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
+		S{"id", "Null"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			ms := ctx.MustArg("ms")
+			time.Sleep(time.Duration(ms.Data.(int64)) * time.Millisecond)
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "sleep", `Pause execution for a number of milliseconds.
+
+Params:
+  ms: Int — milliseconds to sleep
+
+Returns:
+  Null`)
+
+	var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	ip.RegisterNative(
+		"seedRand",
+		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
+		S{"id", "Null"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			n := ctx.MustArg("n")
+			rng.Seed(n.Data.(int64))
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "seedRand", `Seed the pseudo-random number generator.
+
+Use a fixed seed for reproducible sequences.
+
+Params:
+  n: Int — seed value
+
+Returns:
+  Null`)
+
+	ip.RegisterNative("randInt",
+		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
+		S{"id", "Int"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			n := ctx.MustArg("n")
+			return Int(int64(rng.Intn(int(n.Data.(int64)))))
+		},
+	)
+	setBuiltinDoc(ip, "randInt", `Uniform random integer in [0, n).
+
+Params:
+  n: Int — upper bound (must be > 0)
+
+Returns:
+  Int`)
+
+	ip.RegisterNative("randFloat", nil, S{"id", "Num"}, func(ip *Interpreter, ctx CallCtx) Value {
+		return Num(rng.Float64())
+	})
+	setBuiltinDoc(ip, "randFloat", `Uniform random number in [0.0, 1.0).
+
+Returns:
+  Num`)
+
+	// JSON
+	ip.RegisterNative(
+		"jsonParse",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			sv := ctx.MustArg("s")
+			var x any
+			if err := json.Unmarshal([]byte(sv.Data.(string)), &x); err != nil {
+				fail(err.Error())
+			}
+			return goJSONToValue(x)
+		},
+	)
+	setBuiltinDoc(ip, "jsonParse", `Parse a JSON string into MindScript values.
+
+Mapping rules:
+  • null/bool/number/string map to Null/Bool/Int|Num/Str
+  • arrays map to [Any]
+  • objects map to {Str: Any}
+  • integral JSON numbers become Int; other numbers become Num
+
+Params:
+  s: Str — JSON text
+
+Returns:
+  Any`)
+
+	ip.RegisterNative(
+		"jsonStringify",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Str"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			xv := ctx.MustArg("x")
+			b, err := json.Marshal(valueToGoJSON(xv))
+			if err != nil {
+				fail(err.Error())
+			}
+			return Str(string(b))
+		},
+	)
+	setBuiltinDoc(ip, "jsonStringify", `Serialize a value to a compact JSON string.
+
+Arrays and maps are emitted as JSON arrays/objects. Object key order is not
+guaranteed.
+
+Params:
+  x: Any
+
+Returns:
+  Str`)
+}
+
+func goJSONToValue(x any) Value {
+	switch v := x.(type) {
+	case nil:
+		return Null
+	case bool:
+		return Bool(v)
+	case float64:
+		// JSON numbers are float64; cast to Int if integral
+		if math.Trunc(v) == v {
+			return Int(int64(v))
+		}
+		return Num(v)
+	case string:
+		return Str(v)
+	case []any:
+		out := make([]Value, len(v))
+		for i := range v {
+			out[i] = goJSONToValue(v[i])
+		}
+		return Arr(out)
+	case map[string]any:
+		m := make(map[string]Value, len(v))
+		for k, vv := range v {
+			m[k] = goJSONToValue(vv)
+		}
+		return Map(m)
+	default:
+		return annotNull("unsupported JSON value")
+	}
+}
+
+func valueToGoJSON(v Value) any {
+	switch v.Tag {
+	case VTNull:
+		return nil
+	case VTBool:
+		return v.Data.(bool)
+	case VTInt:
+		return v.Data.(int64)
+	case VTNum:
+		return v.Data.(float64)
+	case VTStr:
+		return v.Data.(string)
+	case VTArray:
+		xs := v.Data.([]Value)
+		out := make([]any, len(xs))
+		for i := range xs {
+			out[i] = valueToGoJSON(xs[i])
+		}
+		return out
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		out := make(map[string]any, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			out[k] = valueToGoJSON(vv)
+		}
+		return out
+	default:
+		return fmt.Sprintf("<%v>", v.Tag)
+	}
+}
+
+// --- String Utilities --------------------------------------------
+
+func registerStringBuiltins(ip *Interpreter) {
+	// substr(s, i, j)
+	ip.RegisterNative(
+		"substr",
+		[]ParamSpec{{"s", S{"id", "Str"}}, {"i", S{"id", "Int"}}, {"j", S{"id", "Int"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.MustArg("s").Data.(string)
+			i := int(ctx.MustArg("i").Data.(int64))
+			j := int(ctx.MustArg("j").Data.(int64))
+			r := []rune(s)
+			if i < 0 {
+				i = 0
+			}
+			if j < i {
+				j = i
+			}
+			if i > len(r) {
+				i = len(r)
+			}
+			if j > len(r) {
+				j = len(r)
+			}
+			return Str(string(r[i:j]))
+		},
+	)
+	setBuiltinDoc(ip, "substr", `Unicode-safe substring by rune index.
+
+Takes the half-open slice [i, j). Indices are clamped to bounds and negative
+values are treated as 0.
+
+Params:
+  s: Str — source string
+  i: Int — start index (inclusive)
+  j: Int — end index (exclusive)
+
+Returns:
+  Str`)
+
+	ip.RegisterNative(
+		"toLower",
+		[]ParamSpec{{"s", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.MustArg("s").Data.(string))) },
+	)
+	setBuiltinDoc(ip, "toLower", `Lowercase conversion (Unicode aware).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterNative(
+		"toUpper",
+		[]ParamSpec{{"s", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.MustArg("s").Data.(string))) },
+	)
+	setBuiltinDoc(ip, "toUpper", `Uppercase conversion (Unicode aware).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	trimFunc := func(left, right bool) func(string) string {
+		return func(s string) string {
+			if left && right {
+				return strings.TrimSpace(s)
+			}
+			if left {
+				return strings.TrimLeftFunc(s, unicode.IsSpace)
+			}
+			return strings.TrimRightFunc(s, unicode.IsSpace)
+		}
+	}
+
+	ip.RegisterNative("strip",
+		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Str(trimFunc(true, true)(ctx.MustArg("s").Data.(string)))
+		},
+	)
+	setBuiltinDoc(ip, "strip", `Remove leading and trailing whitespace (Unicode).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterNative("lstrip",
+		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Str(trimFunc(true, false)(ctx.MustArg("s").Data.(string)))
+		},
+	)
+	setBuiltinDoc(ip, "lstrip", `Remove leading whitespace (Unicode).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterNative("rstrip",
+		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Str(trimFunc(false, true)(ctx.MustArg("s").Data.(string)))
+		},
+	)
+	setBuiltinDoc(ip, "rstrip", `Remove trailing whitespace (Unicode).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterNative(
+		"split",
+		[]ParamSpec{{"s", S{"id", "Str"}}, {"sep", S{"id", "Str"}}},
+		S{"array", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.MustArg("s").Data.(string)
+			sep := ctx.MustArg("sep").Data.(string)
+			parts := strings.Split(s, sep)
+			out := make([]Value, len(parts))
+			for i := range parts {
+				out[i] = Str(parts[i])
+			}
+			return Arr(out)
+		},
+	)
+	setBuiltinDoc(ip, "split", `Split a string on a separator (no regex).
+
+If sep is empty (""), splits between UTF-8 code points.
+
+Params:
+  s: Str   — source string
+  sep: Str — separator
+
+Returns:
+  [Str]`)
+
+	ip.RegisterNative(
+		"join",
+		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			xs := ctx.MustArg("xs").Data.([]Value)
+			sep := ctx.MustArg("sep").Data.(string)
+			strs := make([]string, len(xs))
+			for i := range xs {
+				strs[i] = xs[i].Data.(string)
+			}
+			return Str(strings.Join(strs, sep))
+		},
+	)
+	setBuiltinDoc(ip, "join", `Join strings with a separator.
+
+Params:
+  xs: [Str] — pieces to join
+  sep: Str  — separator
+
+Returns:
+  Str`)
+
+}
+
+// ---- Regex: match, replace --------------------------------------------------
+
+func registerRegexBuiltins(ip *Interpreter) {
+	// match(pattern: Str, s: Str) -> [Str]
+	ip.RegisterNative(
+		"match",
+		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
+		S{"array", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			pat := ctx.MustArg("pattern").Data.(string)
+			s := ctx.MustArg("string").Data.(string)
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				fail(err.Error())
+			}
+			ms := re.FindAllString(s, -1)
+			out := make([]Value, len(ms))
+			for i := range ms {
+				out[i] = Str(ms[i])
+			}
+			return Arr(out)
+		},
+	)
+	setBuiltinDoc(ip, "match", `Find all non-overlapping matches of a regex.
+
+Params:
+  pattern: Str — RE2-compatible regular expression
+  string:  Str — input
+
+Returns:
+  [Str] — matched substrings (no capture groups)`)
+
+	// replace(pattern: Str, repl: Str, s: Str) -> Str
+	ip.RegisterNative(
+		"replace",
+		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"replace", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			pat := ctx.MustArg("pattern").Data.(string)
+			rep := ctx.MustArg("replace").Data.(string)
+			s := ctx.MustArg("string").Data.(string)
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				fail(err.Error())
+			}
+			return Str(re.ReplaceAllString(s, rep))
+		},
+	)
+	setBuiltinDoc(ip, "replace", `Replace all non-overlapping regex matches.
+
+Params:
+  pattern: Str — RE2-compatible regular expression
+  replace: Str — replacement (no backrefs)
+  string:  Str — input
+
+Returns:
+  Str`)
+}
+
+// --- Casting Utilities --------------------------------------------
+
+func registerCastBuiltins(ip *Interpreter) {
+
+	// str(x) -> Str (JSON-ish for arrays/maps; quotes preserved for strings)
+	ip.RegisterNative(
+		"str",
+		[]ParamSpec{{"x", S{"id", "Any"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			switch v.Tag {
+			case VTStr:
+				return v
+			case VTNull:
+				return Str("null")
+			case VTBool:
+				if v.Data.(bool) {
+					return Str("true")
+				}
+				return Str("false")
+			case VTInt:
+				return Str(strconv.FormatInt(v.Data.(int64), 10))
+			case VTNum:
+				return Str(strconv.FormatFloat(v.Data.(float64), 'g', -1, 64))
+			case VTArray, VTMap:
+				b, _ := json.Marshal(valueToGoJSON(v))
+				return Str(string(b))
+			default:
+				// functions/modules/handles/types: fall back to Value.String()
+				return Str(v.String())
+			}
+		},
+	)
+	setBuiltinDoc(ip, "str", `Stringify a value.
+
+Rules:
+  • Str stays as-is
+  • Null → "null"
+  • Bool → "true"/"false"
+  • Int/Num → decimal representation
+  • Arrays/Maps → JSON text
+  • Functions/Modules/Handles/Types → readable debug form
+
+Params:
+  x: Any
+
+Returns:
+  Str`)
+
+	ip.RegisterNative(
+		"int",
+		[]ParamSpec{{"x", S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Int"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			switch v.Tag {
+			case VTInt:
+				return v
+			case VTNum:
+				return Int(int64(v.Data.(float64)))
+			case VTBool:
+				if v.Data.(bool) {
+					return Int(1)
+				}
+				return Int(0)
+			case VTStr:
+				if n, err := strconv.ParseInt(v.Data.(string), 10, 64); err == nil {
+					return Int(n)
+				}
+				return Null
+			default:
+				return Null
+			}
+		},
+	)
+	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise return null.
+
+Rules:
+  • Int → Int
+  • Num → truncated toward zero
+  • Bool → 1/0
+  • Str → parsed base-10 integer, or null on failure
+  • Others → null
+
+Params:
+  x: Any
+
+Returns:
+  Int?`)
+
+	ip.RegisterNative(
+		"num",
+		[]ParamSpec{{"x", S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Num"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			switch v.Tag {
+			case VTNum:
+				return v
+			case VTInt:
+				return Num(float64(v.Data.(int64)))
+			case VTBool:
+				if v.Data.(bool) {
+					return Num(1)
+				}
+				return Num(0)
+			case VTStr:
+				if f, err := strconv.ParseFloat(v.Data.(string), 64); err == nil {
+					return Num(f)
+				}
+				return Null
+			default:
+				return Null
+			}
+		},
+	)
+	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise return null.
+
+Rules:
+  • Num → Num
+  • Int → floating-point value
+  • Bool → 1.0/0.0
+  • Str → parsed as float64, or null on failure
+  • Others → null
+
+Params:
+  x: Any
+
+Returns:
+  Num?`)
+
+	ip.RegisterNative(
+		"bool",
+		[]ParamSpec{{"x", S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Bool"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			switch v.Tag {
+			case VTBool:
+				return v
+			case VTNull:
+				return Bool(false)
+			case VTInt:
+				return Bool(v.Data.(int64) != 0)
+			case VTNum:
+				return Bool(v.Data.(float64) != 0)
+			case VTStr:
+				return Bool(v.Data.(string) != "")
+			case VTArray:
+				return Bool(len(v.Data.([]Value)) > 0)
+			case VTMap:
+				return Bool(len(v.Data.(*MapObject).Entries) > 0)
+			default:
+				return Bool(true) // functions, modules, handles, types → truthy
+			}
+		},
+	)
+	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules.
+
+Falsey:
+  • null
+  • 0, 0.0
+  • "" (empty string)
+  • [] (empty array)
+  • {} (empty map)
+
+Truthy:
+  • everything else (including functions, modules, handles, types)
+
+Params:
+  x: Any
+
+Returns:
+  Bool`)
+
+	ip.RegisterNative(
+		"size",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Int"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			switch x.Tag {
+			case VTArray:
+				return Int(int64(len(x.Data.([]Value))))
+			case VTMap:
+				mo := x.Data.(*MapObject)
+				// Use ordered keys length to reflect object “size”
+				return Int(int64(len(mo.Keys)))
+			case VTStr:
+				// Unicode-aware length to match substr’s rune semantics
+				return Int(int64(utf8.RuneCountInString(x.Data.(string))))
+			default:
+				return Null
+			}
+		},
+	)
+}
+
+// --- Math Utilities --------------------------------------------
+
+func registerMathBuiltins(ip *Interpreter) {
+	// Constants
+	ip.Core.Define("PI", Num(math.Pi))
+	ip.Core.Define("E", Num(math.E))
+	setBuiltinDoc(ip, "PI", `Mathematical constant π.
+
+Returns:
+  Num`)
+	setBuiltinDoc(ip, "E", `Euler's number e.
+
+Returns:
+  Num`)
+
+	// Unary math helpers
+	un1 := func(name string, f func(float64) float64, doc string) {
+		ip.RegisterNative(
+			name,
+			[]ParamSpec{{"x", S{"id", "Num"}}},
+			S{"id", "Num"},
+			func(_ *Interpreter, ctx CallCtx) Value { return Num(f(ctx.MustArg("x").Data.(float64))) },
+		)
+		setBuiltinDoc(ip, name, doc)
+	}
+	un1("sin", math.Sin, `Sine of an angle in radians.
+
+Params:
+  x: Num — radians
+
+Returns:
+  Num`)
+	un1("cos", math.Cos, `Cosine of an angle in radians.
+
+Params:
+  x: Num — radians
+
+Returns:
+  Num`)
+	un1("tan", math.Tan, `Tangent of an angle in radians.
+
+Params:
+  x: Num — radians
+
+Returns:
+  Num`)
+	un1("sqrt", math.Sqrt, `Square root.
+
+Params:
+  x: Num — non-negative
+
+Returns:
+  Num`)
+	un1("log", math.Log, `Natural logarithm (base e).
+
+Params:
+  x: Num — positive
+
+Returns:
+  Num`)
+	un1("exp", math.Exp, `Exponential function e^x.
+
+Params:
+  x: Num
+
+Returns:
+  Num`)
+
+	ip.RegisterNative(
+		"pow",
+		[]ParamSpec{{"base", S{"id", "Num"}}, {"exp", S{"id", "Num"}}},
+		S{"id", "Num"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Num(math.Pow(ctx.MustArg("base").Data.(float64), ctx.MustArg("exp").Data.(float64)))
+		},
+	)
+	setBuiltinDoc(ip, "pow", `Power: base^exp.
+
+Params:
+  base: Num
+  exp:  Num
+
+Returns:
+  Num`)
+}
+
+// Date
+func registerTimeExtras(ip *Interpreter) {
+	// dateNow() -> {year, month, day, hour, min, sec, ms}
+	ip.RegisterNative(
+		"dateNow",
+		nil,
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			now := time.Now()
+			mo := &MapObject{
+				Entries: map[string]Value{
+					"year":        Int(int64(now.Year())),
+					"month":       Int(int64(int(now.Month()))),
+					"day":         Int(int64(now.Day())),
+					"hour":        Int(int64(now.Hour())),
+					"minute":      Int(int64(now.Minute())),
+					"second":      Int(int64(now.Second())),
+					"millisecond": Int(int64(now.Nanosecond() / 1e6)),
+				},
+				KeyAnn: map[string]string{},
+				Keys:   []string{"year", "month", "day", "hour", "minute", "second", "millisecond"},
+			}
+			return Value{Tag: VTMap, Data: mo}
+		},
+	)
+	setBuiltinDoc(ip, "dateNow", `Current local date/time components.
+
+Fields:
+  year, month(1–12), day(1–31),
+  hour(0–23), minute(0–59), second(0–59),
+  millisecond(0–999)
+
+Returns:
+  {Str: Any} — a map with the fields above`)
+}
+
+// --- Process Utilities --------------------------------------------
+
+func registerProcessBuiltins(ip *Interpreter) {
+	// exit(code:Int?) -> Null (terminates the host process)
+	ip.RegisterNative(
+		"exit",
+		[]ParamSpec{{"code", S{"unop", "?", S{"id", "Int"}}}},
+		S{"id", "Null"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			codeV := ctx.MustArg("code")
+			code := 0
+			if codeV.Tag == VTInt {
+				code = int(codeV.Data.(int64))
+			}
+			os.Exit(code)
+			return Null // unreachable
+		},
+	)
+	setBuiltinDoc(ip, "exit", `Terminate the current process with an optional status code.
+
+By convention, 0 indicates success; non-zero indicates an error.
+
+Params:
+  code: Int? — exit status (default 0)
+
+Returns:
+  Null (never returns; process exits)`)
+}

@@ -48,7 +48,7 @@ func chdir(t *testing.T, dir string) func() {
 
 // importCode(name, src) builds an isolated module (no cache registration).
 func Test_ImportCode_Simple(t *testing.T) {
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 
 	v := evalWithIP(t, ip, `
 let m = importCode("mem.calc", "
@@ -71,7 +71,7 @@ func Test_FileImport_Simple_And_DefaultExt(t *testing.T) {
 let inc = fun(n: Int) -> Int do return(n + 1) end
 `)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 
 	// import("m1") should find m1.ms via default extension
 	v := evalWithIP(t, ip, `
@@ -92,7 +92,7 @@ let b = import("b")
 let y = b.x + 2
 `)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 	v := evalWithIP(t, ip, `
 let a = import("a")
 a.y`)
@@ -111,7 +111,7 @@ func Test_FileImport_Search_MINDSCRIPT_PATH(t *testing.T) {
 	_ = os.Setenv("MINDSCRIPT_PATH", lib)
 	defer os.Setenv("MINDSCRIPT_PATH", old)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 	v := evalWithIP(t, ip, `
 let u = import("util")
 u.name`)
@@ -127,7 +127,7 @@ func Test_FileImport_Cycle_TwoModules(t *testing.T) {
 	_ = write(t, dir, "A.ms", `let b = import("B")`)
 	_ = write(t, dir, "B.ms", `let a = import("A")`)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 	v := evalWithIP(t, ip, `import("A")`)
 	wantAnnotatedNullContains(t, v, "import cycle")
 	wantAnnotatedNullContains(t, v, "A -> B -> A")
@@ -142,7 +142,7 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 	_ = write(t, dir, "bad.ms", `let x = (1 +`)
 	_ = write(t, dir, "boom.ms", `1 / 0`)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 
 	p := evalWithIP(t, ip, `import("bad")`)
 	wantAnnotatedNullContains(t, p, "parse error")
@@ -162,7 +162,7 @@ func Test_FileImport_ReadOnly_Exports(t *testing.T) {
 
 	_ = write(t, dir, "m.ms", `let name = "Bob"`)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 	v := evalWithIP(t, ip, `
 let m = import("m")
 m.name`)
@@ -184,7 +184,7 @@ func Test_FileImport_Builtins_Accessible(t *testing.T) {
 let js = jsonStringify({a: 1})
 `)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 	v := evalWithIP(t, ip, `
 let u = import("util")
 u.js`)
@@ -199,7 +199,7 @@ func Test_Isolation_No_Leak_To_User_Global(t *testing.T) {
 
 	_ = write(t, dir, "mod.ms", `let hidden = 123`)
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 	// Import should not define "hidden" in the caller's env.
 	v := evalWithIP(t, ip, `
 let _ = import("mod")
@@ -219,7 +219,7 @@ func Test_HTTP_Import_Simple(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ip := NewInterpreterWithBuiltins()
+	ip := NewRuntime()
 
 	// Explicit .ms
 	v1 := evalWithIP(t, ip, `

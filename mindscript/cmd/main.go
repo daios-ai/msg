@@ -63,7 +63,7 @@ func runFile(path string) int {
 		return 1
 	}
 
-	ip := mindscript.NewInterpreterWithBuiltins()
+	ip := mindscript.NewRuntime()
 	v, err := ip.EvalSource(string(src))
 	if err != nil {
 		// Parse/Lex errors are already pretty-printed by the library.
@@ -76,7 +76,7 @@ func runFile(path string) int {
 
 func runEvalString(code string) int {
 	// -e mode: keep colors OFF (library default).
-	ip := mindscript.NewInterpreterWithBuiltins()
+	ip := mindscript.NewRuntime()
 	v, err := ip.EvalSource(code)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
@@ -107,7 +107,7 @@ func runREPL() int {
 		_ = f.Close()
 	}
 
-	ip := mindscript.NewInterpreterWithBuiltins()
+	ip := mindscript.NewRuntime()
 
 	for {
 		// Accumulate possibly-multiline input until parser says it's complete.
@@ -170,7 +170,7 @@ func handleReplCommand(ip *mindscript.Interpreter, ln *liner.State, line string)
 
 	case ":reset":
 		// fresh runtime (built-ins only)
-		*ip = *mindscript.NewInterpreterWithBuiltins()
+		*ip = *mindscript.NewRuntime()
 		fmt.Println("interpreter reset.")
 
 	case ":load":

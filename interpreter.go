@@ -1035,10 +1035,14 @@ func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 	case VTArray:
 		return append([]Value(nil), iter.Data.([]Value)...)
 	case VTMap:
-		m := iter.Data.(map[string]Value)
-		out := make([]Value, 0, len(m))
-		for k, v := range m {
-			out = append(out, Arr([]Value{Str(k), v}))
+		mo := iter.Data.(*MapObject)
+		out := make([]Value, 0, len(mo.Keys))
+		for _, k := range mo.Keys {
+			keyV := Str(k)
+			if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+				keyV = withAnnot(keyV, ann)
+			}
+			out = append(out, Arr([]Value{keyV, mo.Entries[k]}))
 		}
 		return out
 	case VTFun:
@@ -1505,7 +1509,48 @@ func (e *emitter) emitExpr(n S) {
 	case "type":
 		e.emit(opConst, e.k(TypeVal(n[1].(S))))
 	case "annot":
-		e.callBuiltin("__annotate", S{"str", n[1].(S)[1].(string)}, n[2].(S))
+		text := n[1].(S)[1].(string)
+		subj := n[2].(S)
+
+		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
+		if len(subj) > 0 && subj[0].(string) == "assign" {
+			lhs := subj[1].(S)
+			rhs := subj[2].(S)
+
+			opName := "__assign_set"
+			switch lhs[0].(string) {
+			case "decl", "darr", "dobj", "annot":
+				opName = "__assign_def"
+			}
+
+			// push assign function
+			e.emit(opLoadGlobal, e.ks(opName))
+			// arg1: Type(lhs)
+			e.emit(opConst, e.k(TypeVal(lhs)))
+			// arg2: __annotate(text, rhs)
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.emitExpr(rhs)
+			e.emit(opCall, 2) // -> annotated RHS
+			// call assign(Type(lhs), annotatedRHS)
+			e.emit(opCall, 2)
+			return
+		}
+
+		// #(doc) (let x)  ==>  let x = #(doc) null
+		if len(subj) > 0 && subj[0].(string) == "decl" {
+			e.emit(opLoadGlobal, e.ks("__assign_def"))
+			e.emit(opConst, e.k(TypeVal(subj))) // Type(decl)
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.emit(opConst, e.k(Null))
+			e.emit(opCall, 2) // __annotate(text, null)
+			e.emit(opCall, 2) // __assign_def(Type(decl), annotatedNull)
+			return
+		}
+
+		// default: #(doc) expr  ==>  __annotate(doc, expr)
+		e.callBuiltin("__annotate", S{"str", text}, subj)
 
 	default:
 		e.emit(opConst, e.k(errNull("unknown AST tag")))

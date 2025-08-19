@@ -341,3 +341,40 @@ person.name = "Sarah"`
 		t.Fatalf("did not find `person.name = \"Sarah\"` sequence in tokens")
 	}
 }
+func Test_Lexer_Object_Annotations_TokenFlow(t *testing.T) {
+	src := `{
+# the name
+name: "Raffaella",
+#(the age) age: 29,
+available: #(status) "yes"
+}`
+
+	ts := toks(t, src)
+	gotTypes := typesWithoutEOF(ts)
+
+	// Expected token *types* sequence (not positions of annotations)
+	want := []TokenType{
+		LCURLY,
+		ANNOTATION, ID, COLON, STRING, COMMA,
+		ANNOTATION, ID, COLON, INTEGER, COMMA,
+		ID, COLON, ANNOTATION, STRING,
+		RCURLY,
+	}
+	if !reflect.DeepEqual(gotTypes, want) {
+		t.Fatalf("unexpected token sequence:\nwant %v\ngot  %v", want, gotTypes)
+	}
+
+	// Collect annotation payloads in the order they appear.
+	var anns []string
+	for _, tok := range ts {
+		if tok.Type == ANNOTATION {
+			anns = append(anns, strings.TrimSpace(tok.Literal.(string)))
+		}
+	}
+	if len(anns) != 3 {
+		t.Fatalf("expected 3 annotations, got %d: %v", len(anns), anns)
+	}
+	if anns[0] != "the name" || anns[1] != "the age" || anns[2] != "status" {
+		t.Fatalf("unexpected annotation texts: %v", anns)
+	}
+}

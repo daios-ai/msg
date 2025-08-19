@@ -42,6 +42,16 @@ func wantStr(t *testing.T, v Value, s string) {
 	}
 }
 
+func wantStrAnn(t *testing.T, v Value, s, ann string) {
+	t.Helper()
+	if v.Tag != VTStr || v.Data.(string) != s {
+		t.Fatalf("want str %q, got %#v", s, v)
+	}
+	if v.Annot != ann {
+		t.Fatalf("want annot %q, got %q", ann, v.Annot)
+	}
+}
+
 func wantBool(t *testing.T, v Value, b bool) {
 	t.Helper()
 	if v.Tag != VTBool || v.Data.(bool) != b {
@@ -69,6 +79,16 @@ func wantAnnotatedNullContains(t *testing.T, v Value, substr string) {
 // annotated null = null with a non-empty annotation
 func isAnnotatedNull(v Value) bool {
 	return v.Tag == VTNull && v.Annot != ""
+}
+
+func wantStrWithAnnot(t *testing.T, v Value, s, ann string) {
+	t.Helper()
+	if v.Tag != VTStr || v.Data.(string) != s {
+		t.Fatalf("want str %q, got %#v", s, v)
+	}
+	if v.Annot != ann {
+		t.Fatalf("want annot %q, got %q (value=%#v)", ann, v.Annot, v)
+	}
 }
 
 // --- tests -----------------------------------------------------------------
@@ -921,4 +941,202 @@ let mk = fun()->Any do {a:[10,20,30]} end
 mk().a.2
 `)
 	wantInt(t, v, 30)
+}
+
+// Map with any "word-like" keys (keywords, type names, booleans, null, ids).
+func Test_Interpreter_Map_AnyWordLike_Keys(t *testing.T) {
+	src := `
+let o = {if: 1, else: 2, for: 3, type: 4, Enum: 5, enum: 6, Int: 7, Str: 8, true: 9, null: 10}
+[o["if"], o["else"], o["for"], o["type"], o["Enum"], o["enum"], o["Int"], o["Str"], o["true"], o["null"]]
+`
+	v := evalSrc(t, src)
+	if v.Tag != VTArray {
+		t.Fatalf("want array, got %#v", v)
+	}
+	xs := v.Data.([]Value)
+	want := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if len(xs) != len(want) {
+		t.Fatalf("want %d items, got %d", len(want), len(xs))
+	}
+	for i, w := range want {
+		if xs[i].Tag != VTInt || xs[i].Data.(int64) != w {
+			t.Fatalf("idx %d: want %d, got %#v", i, w, xs[i])
+		}
+	}
+}
+
+// Map with annotated keys (single-line and inline) + annotated value.
+// Key annotations should NOT affect runtime map (keys become plain strings).
+// Value annotation MUST be preserved on the stored value.
+func Test_Interpreter_Map_AnnotatedKeys_And_ValueAnnotation(t *testing.T) {
+	src := `
+let o = {
+# the name
+name: "Mo",
+#(the age) age: 47,
+available: #(status) "yes"
+}
+[o["name"], o["age"], o["available"]]
+`
+	v := evalSrc(t, src)
+	if v.Tag != VTArray {
+		t.Fatalf("want array, got %#v", v)
+	}
+	xs := v.Data.([]Value)
+	// name: "Mo" (no annotation on the value)
+	wantStr(t, xs[0], "Mo")
+	// age: 47
+	wantInt(t, xs[1], 47)
+	// available: "yes" with annotation "status"
+	wantStrWithAnnot(t, xs[2], "yes", "status")
+}
+
+// Destructuring with annotated keys should bind correctly.
+func Test_Interpreter_ObjectDestructuring_With_AnnotatedKey(t *testing.T) {
+	src := `
+let { #(first) name: x, age: y } = { name: "Ana", age: 33 }
+[x, y]
+`
+	v := evalSrc(t, src)
+	if v.Tag != VTArray {
+		t.Fatalf("want array, got %#v", v)
+	}
+	xs := v.Data.([]Value)
+	wantStr(t, xs[0], "Ana")
+	wantInt(t, xs[1], 33)
+}
+
+// Destructuring with annotated keys — missing key should yield annotated null.
+func Test_Interpreter_ObjectDestructuring_AnnotatedKey_MissingValue(t *testing.T) {
+	src := `
+let { #(first) name: x, #(years) age: y } = { name: "Bob" }
+[y]  ## probe only 'y'
+`
+	v := evalSrc(t, src)
+	if v.Tag != VTArray || len(v.Data.([]Value)) != 1 {
+		t.Fatalf("want single-element array, got %#v", v)
+	}
+	vy := v.Data.([]Value)[0]
+	if !isAnnotatedNull(vy) {
+		t.Fatalf("want annotated null for missing 'age', got %#v", vy)
+	}
+	// The message should mention it's missing (we don't assert exact string, just meaning).
+	wantAnnotatedNullContains(t, vy, "missing key")
+}
+
+// Map construction with several annotated keys mixed with values.
+// Confirms key-unwrapping works for multiple pairs.
+func Test_Interpreter_Map_AnnotatedKeys_MultiplePairs(t *testing.T) {
+	src := `
+let m = {
+# k1
+k1: 1,
+#(k2-inline) k2: 2,
+k3: #(val) "v"
+}
+[m["k1"], m["k2"], m["k3"]]
+`
+	v := evalSrc(t, src)
+	if v.Tag != VTArray {
+		t.Fatalf("want array, got %#v", v)
+	}
+	xs := v.Data.([]Value)
+	wantInt(t, xs[0], 1)
+	wantInt(t, xs[1], 2)
+	wantStrWithAnnot(t, xs[2], "v", "val")
+}
+
+// Using type-like names and keywords as keys in destructuring (no access syntax needed).
+func Test_Interpreter_Destructure_AnyWordLike_Keys(t *testing.T) {
+	src := `
+let { if: a, Enum: b, Int: c, true: d, null: e } = { if: 1, Enum: 2, Int: 3, true: 4, null: 5 }
+[a, b, c, d, e]
+`
+	v := evalSrc(t, src)
+	if v.Tag != VTArray {
+		t.Fatalf("want array, got %#v", v)
+	}
+	xs := v.Data.([]Value)
+	want := []int64{1, 2, 3, 4, 5}
+	for i, w := range want {
+		if xs[i].Tag != VTInt || xs[i].Data.(int64) != w {
+			t.Fatalf("idx %d: want %d, got %#v", i, w, xs[i])
+		}
+	}
+}
+
+// Iteration yields Str keys carrying their annotations.
+func Test_Interpreter_Map_KeyAnnotations_On_Iter(t *testing.T) {
+	src := `
+let o = {
+# the name
+name: "Mo",
+#(the age) age: 47,
+plain: "ok"
+}
+let it = __to_iter(o)
+let a = it(null)
+let b = it(null)
+let c = it(null)
+[a[0], a[1], b[0], b[1], c[0], c[1]]
+`
+	v := evalSrc(t, src)
+	xs := v.Data.([]Value)
+	wantStrAnn(t, xs[0], "name", "the name")
+	wantStr(t, xs[1], "Mo")
+	wantStrAnn(t, xs[2], "age", "the age")
+	wantInt(t, xs[3], 47)
+	wantStrAnn(t, xs[4], "plain", "")
+	wantStr(t, xs[5], "ok")
+}
+
+// Lookup ignores key annotation (storage by raw string).
+func Test_Interpreter_Map_Lookup_Ignores_Key_Annot(t *testing.T) {
+	src := `
+let o = { #(the name) name: "Mo" }
+o["name"]
+`
+	wantStr(t, evalSrc(t, src), "Mo")
+}
+
+// Deep equality ignores key annotations.
+func Test_Interpreter_Map_DeepEqual_Ignores_KeyAnnots(t *testing.T) {
+	ip := NewInterpreter()
+	ip.RegisterNative("__eq_maps",
+		[]ParamSpec{{"x", S{"id", "Any"}}, {"y", S{"id", "Any"}}},
+		S{"id", "Bool"},
+		func(ip2 *Interpreter, ctx CallCtx) Value {
+			return Bool(ip2.deepEqual(ctx.MustArg("x"), ctx.MustArg("y")))
+		})
+
+	srcA := `let a = { #(the name) name: "Mo", x: 1 }`
+	srcB := `let b = { #(label)     name: "Mo", x: 1 }`
+	v1, err := ip.EvalSource(srcA + "\n" + srcB + "\n__eq_maps(a, b)")
+	if err != nil {
+		t.Fatalf("eval error: %v", err)
+	}
+	wantBool(t, v1, true)
+}
+
+// Merge carries key annotations from RHS.
+func Test_Interpreter_Map_Plus_Merge_Carries_RHS_KeyAnnot(t *testing.T) {
+	src := `
+let a = { #(A) k: 1, x: 2 }
+let b = { #(B) k: 9, y: 3 }
+let m = a + b
+let it = __to_iter(m)
+let p = it(null)
+let q = it(null)
+let r = it(null)
+let arr =
+  if p[0] == "k" then p
+  elif q[0] == "k" then q
+  else r
+  end
+arr
+`
+	v := evalSrc(t, src)
+	pair := v.Data.([]Value)
+	wantStrAnn(t, pair[0], "k", "B")
+	wantInt(t, pair[1], 9)
 }

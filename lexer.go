@@ -1,4 +1,4 @@
-// mindscript_lexer.go
+// mindscript_lexer.go (refactored)
 package mindscript
 
 import (
@@ -138,7 +138,7 @@ type Lexer struct {
 	tokens           []Token
 	whitespaceBefore bool
 
-	// record precise start position for the token (more accurate with UTF-8)
+	// precise token start position
 	tokStartLine int
 	tokStartCol  int
 }
@@ -185,9 +185,8 @@ func (l *Lexer) advance() (byte, bool) {
 }
 
 func (l *Lexer) rewindToStart() {
-	// recompute line/col by rescanning from previous newline — in practice
-	// we never need this; we only rewind immediately after start in this lexer,
-	// so we can just set cur = start and leave line/col as-is for error arrows.
+	// We rewind only within the bounds of the current token start; line/col are kept
+	// for error arrows (OK since we set tokStartLine/Col before scanning).
 	l.cur = l.start
 }
 
@@ -217,23 +216,25 @@ func (l *Lexer) skipWhitespace() {
 	l.whitespaceBefore = false
 	for !l.isAtEnd() {
 		ch, _ := l.peek()
-		if ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t' {
+		switch ch {
+		case ' ', '\r', '\n', '\t':
 			l.whitespaceBefore = true
 			l.advance()
 			l.start = l.cur
-			continue
+		default:
+			return
 		}
-		break
 	}
 }
 
-// add near the top of lexer.go (helpers)
+// helpers
+
 func canBeLeftOperand(t TokenType) bool {
 	switch t {
 	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
 		TYPE, ENUM,
 		RROUND, RSQUARE, RCURLY,
-		QUESTION: // postfix optional already applied
+		QUESTION:
 		return true
 	default:
 		return false
@@ -252,15 +253,12 @@ func isAlphaNum(b byte) bool {
 		b == '_'
 }
 
-// small helper to detect property context after '.'
 func (l *Lexer) afterDotIsProperty() bool {
-	if p := l.previousToken(); p != nil && p.Type == PERIOD {
-		return true
-	}
-	return false
+	p := l.previousToken()
+	return p != nil && p.Type == PERIOD
 }
 
-// error helpers
+// ----- errors -----
 
 type LexError struct {
 	Line int
@@ -275,6 +273,8 @@ func (e *LexError) Error() string {
 func (l *Lexer) err(msg string) error {
 	return &LexError{Line: l.line, Col: l.col, Msg: msg}
 }
+
+// ----- scanners -----
 
 // scanString parses a JSON-style string literal (single or double quotes).
 func (l *Lexer) scanString() (string, error) {
@@ -336,7 +336,6 @@ func (l *Lexer) scanString() (string, error) {
 				if 0xD800 <= r && r <= 0xDBFF {
 					saveCur := l.cur
 					saveLine, saveCol := l.line, l.col
-					// Must be \uXXXX next
 					if b1, ok := l.peek(); ok && b1 == '\\' {
 						l.advance()
 						if b2, ok := l.peek(); ok && b2 == 'u' {
@@ -418,12 +417,9 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	// decimal point with optional digits
 	sawDot := false
 	if b, ok := l.peek(); ok && b == '.' {
-		// If we already saw digits (e.g. "5."), accept '.' even if no digit follows.
-		// If we haven't, require at least one digit after '.' (for ".5").
 		if sawDigits {
 			l.advance() // consume '.'
 			sawDot = true
-			// optional fractional digits
 			for {
 				b, ok := l.peek()
 				if !ok || !isDigit(b) {
@@ -431,7 +427,6 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 				}
 				l.advance()
 			}
-			// sawDigits already true
 		} else if b2, ok2 := l.peekN(1); ok2 && isDigit(b2) {
 			l.advance() // consume '.'
 			sawDot = true
@@ -449,7 +444,6 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	// exponent
 	sawExp := false
 	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
-		// ensure at least one digit after optional sign
 		save := l.cur
 		l.advance()
 		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
@@ -465,7 +459,6 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 				l.advance()
 			}
 		} else {
-			// rollback; not an exponent actually
 			l.cur = save
 		}
 	}
@@ -476,14 +469,12 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 
 	lex := l.src[l.start:l.cur]
 	if !sawDot && !sawExp {
-		// integer
 		v, convErr := strconv.ParseInt(lex, 10, 64)
 		if convErr != nil {
 			return ILLEGAL, nil, l.err("invalid integer literal")
 		}
 		return INTEGER, v, nil
 	}
-	// float
 	vf, convErr := strconv.ParseFloat(lex, 64)
 	if convErr != nil {
 		return ILLEGAL, nil, l.err("invalid float literal")
@@ -507,6 +498,7 @@ func (l *Lexer) ignoreUntilNewline() {
 func (l *Lexer) scanAnnotation() (string, error) {
 	var bldr strings.Builder
 
+	// Consume (indent* '#') with one optional post-# space/tab. Returns true if a line was consumed.
 	consumeHashOnLine := func() (bool, error) {
 		// skip leading spaces/tabs (not newline)
 		for {
@@ -521,46 +513,61 @@ func (l *Lexer) scanAnnotation() (string, error) {
 			break
 		}
 		b, ok := l.peek()
-		if !ok {
-			return false, nil
-		}
-		if b != '#' {
+		if !ok || b != '#' {
 			return false, nil
 		}
 		l.advance() // consume '#'
+		// Optional single space/tab immediately after '#'
+		if b2, ok2 := l.peek(); ok2 && (b2 == ' ' || b2 == '\t') {
+			l.advance()
+		}
 		return true, nil
 	}
 
-	// Current position is right after we consumed a single '#'
-	// Capture the rest of the line
+	// We were called with current char being '#' already consumed by caller in scanToken.
+	// Trim one optional space/tab after this first '#'.
+	if b, ok := l.peek(); ok && (b == ' ' || b == '\t') {
+		l.advance()
+	}
+
+	// Capture the rest of the first line
 	for {
-		// read until '\n' or EOF
+		b, ok := l.peek()
+		if !ok || b == '\n' {
+			if ok {
+				l.advance() // consume newline
+			}
+			bldr.WriteByte('\n')
+			break
+		}
+		bldr.WriteByte(b)
+		l.advance()
+	}
+
+	// Capture subsequent lines that also start with '#'
+	for {
+		save := l.cur
+		cont, err := consumeHashOnLine()
+		if err != nil {
+			return "", err
+		}
+		if !cont {
+			l.cur = save
+			break
+		}
+		// read until newline
 		for {
 			b, ok := l.peek()
 			if !ok || b == '\n' {
-				bldr.WriteByte('\n')
 				if ok {
-					l.advance() // consume newline
+					l.advance()
 				}
+				bldr.WriteByte('\n')
 				break
 			}
 			bldr.WriteByte(b)
 			l.advance()
 		}
-
-		// Save position; see if next line continues annotation
-		save := l.cur
-		// Peek any whitespace then '#'
-		continued, err := consumeHashOnLine()
-		if err != nil {
-			return "", err
-		}
-		if !continued {
-			// Rewind to start of this non-annotation line.
-			l.cur = save
-			break
-		}
-		// else continue loop to capture that line content
 	}
 
 	s := bldr.String()
@@ -600,6 +607,65 @@ func (l *Lexer) scanInlineParens() (string, error) {
 	return bldr.String(), nil
 }
 
+// --- hash/comment helpers ---
+
+// handleDoubleHash processes '##' comments.
+// Returns (handled, err). When handled, the content is ignored and start is advanced.
+func (l *Lexer) handleDoubleHash() (bool, error) {
+	b1, ok := l.peek()
+	if !ok || b1 != '#' {
+		return false, nil
+	}
+	l.advance() // second '#'
+
+	// Inline comment: ##( ... ) → ignore entirely
+	if b2, ok2 := l.peek(); ok2 && b2 == '(' {
+		if _, err := l.scanInlineParens(); err != nil {
+			return true, err
+		}
+		l.start = l.cur
+		return true, nil
+	}
+
+	// Line comment: ## ... \n → ignore until newline
+	l.ignoreUntilNewline()
+	l.start = l.cur
+	return true, nil
+}
+
+// handleSingleHash processes '#' annotations (inline or multiline).
+// Returns (producedAnnotation, text, err).
+func (l *Lexer) handleSingleHash() (bool, string, error) {
+	if b1, ok := l.peek(); ok && b1 == '(' {
+		text, err := l.scanInlineParens()
+		if err != nil {
+			return false, "", err
+		}
+		return true, text, nil
+	}
+	annot, err := l.scanAnnotation()
+	if err != nil {
+		return false, "", l.err("incomplete annotation")
+	}
+	return true, annot, nil
+}
+
+// --- misc helpers ---
+
+func (l *Lexer) dotStartsNumber() bool {
+	b, ok := l.peek()
+	if !ok || !isDigit(b) {
+		return false
+	}
+	prev := l.previousToken()
+	if l.whitespaceBefore || prev == nil || !canBeLeftOperand(prev.Type) {
+		return true
+	}
+	return false
+}
+
+// ----- main scanner -----
+
 func (l *Lexer) scanToken() (Token, error) {
 	for {
 		l.skipWhitespace()
@@ -614,10 +680,6 @@ func (l *Lexer) scanToken() (Token, error) {
 		ch, _ := l.advance()
 
 		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
-		// We distinguish between "(" with no whitespace and " (" with whitespace
-		// because this will help our parser distinguish between "f(1)", a function
-		// call, and "f (1)", a function and a grouped expression. Similarly for
-		// "identifier[...]" versus "identifier [...]".
 		switch ch {
 		case '(':
 			if l.whitespaceBefore {
@@ -655,21 +717,13 @@ func (l *Lexer) scanToken() (Token, error) {
 
 		// '.' : either decimal-starting float or PERIOD
 		if ch == '.' {
-			if b, ok := l.peek(); ok && isDigit(b) {
-				prev := l.previousToken()
-				// Parse as a NUMBER if:
-				//  - there was whitespace before '.', OR
-				//  - there is no valid left operand to the left.
-				// Only treat it as a property/index dot when there is NO whitespace
-				// and a valid left operand (e.g., obj.name.field(5).90).
-				if l.whitespaceBefore || prev == nil || !canBeLeftOperand(prev.Type) {
-					l.rewindToStart()
-					tt, lit, err := l.scanNumber()
-					if err != nil {
-						return Token{}, err
-					}
-					return l.addToken(tt, lit), nil
+			if l.dotStartsNumber() {
+				l.rewindToStart()
+				tt, lit, err := l.scanNumber()
+				if err != nil {
+					return Token{}, err
 				}
+				return l.addToken(tt, lit), nil
 			}
 			return l.addToken(PERIOD, "."), nil
 		}
@@ -709,45 +763,22 @@ func (l *Lexer) scanToken() (Token, error) {
 		}
 
 		// Comments / Annotations
-		// Comments start with double-hashes (##) and are pure comments that can
-		// be ignored. Annotations start with a single hash (#) and they will
-		// annotate the expression that follows.
 		if ch == '#' {
-			// Look ahead to decide among: ##(...), ##<eol> comment, #( ... ) inline annotation, or multiline annotation
-			if b1, ok := l.peek(); ok && b1 == '#' {
-				l.advance() // consume second '#'
-
-				// Inline comment: ##( ... )  → ignored (no token)
-				if b2, ok2 := l.peek(); ok2 && b2 == '(' {
-					_, err := l.scanInlineParens()
-					if err != nil {
-						return Token{}, err
-					}
-					l.start = l.cur
-					continue
-				}
-
-				// Line comment: ## ...\n → ignored
-				l.ignoreUntilNewline()
-				l.start = l.cur
-				continue
-			}
-
-			// Inline annotation: #( ... ) → ANNOTATION token carrying the payload
-			if b1, ok := l.peek(); ok && b1 == '(' {
-				text, err := l.scanInlineParens()
+			// Try '##' comment forms first
+			if handled, err := l.handleDoubleHash(); handled || err != nil {
 				if err != nil {
 					return Token{}, err
 				}
+				continue
+			}
+			// Single '#': inline '#(...)' or multiline block
+			ok, text, err := l.handleSingleHash()
+			if err != nil {
+				return Token{}, err
+			}
+			if ok {
 				return l.addToken(ANNOTATION, text), nil
 			}
-
-			// Multiline annotation block starting with single '#'
-			annot, err := l.scanAnnotation()
-			if err != nil {
-				return Token{}, l.err("incomplete annotation")
-			}
-			return l.addToken(ANNOTATION, annot), nil
 		}
 
 		// Strings
@@ -757,7 +788,7 @@ func (l *Lexer) scanToken() (Token, error) {
 			if err != nil {
 				return Token{}, err
 			}
-			// If previous token was PERIOD, treat this as an ID (property name)
+			// After '.' a quoted key becomes ID (property name)
 			if l.afterDotIsProperty() {
 				return l.addToken(ID, text), nil
 			}
@@ -778,7 +809,7 @@ func (l *Lexer) scanToken() (Token, error) {
 		if isAlpha(ch) {
 			l.rewindToStart()
 			lex := l.scanIdentifier()
-			// If previous token was PERIOD, always ID (property)
+			// After '.', treat as property name (ID)
 			if l.afterDotIsProperty() {
 				return l.addToken(ID, lex), nil
 			}

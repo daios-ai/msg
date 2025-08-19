@@ -643,3 +643,93 @@ func Test_Parser_While_With_Grouping(t *testing.T) {
 		t.Fatalf("want '<' in condition, got %v", cond[1])
 	}
 }
+
+func Test_Parser_Map_KeyAndValue_Annotations(t *testing.T) {
+	src := `{
+# the name
+name: "Mo",
+#(the age) age: 47,
+available: #(status) "yes"
+}`
+	root := mustParse(t, src)
+	m := kid(root, 0)
+	wantTag(t, m, "map")
+	if len(m) != 4 { // "map" + 3 fields
+		t.Fatalf("unexpected map arity: %s", dump(m))
+	}
+
+	// 1) "the name" annotates KEY "name"
+	p1 := kid(m, 0)
+	if head(p1) != "pair" {
+		t.Fatalf("field1 should be pair: %s", dump(p1))
+	}
+	k1 := p1[1].(S)
+	wantTag(t, k1, "annot")
+	if s := k1[1].(S); head(s) != "str" || s[1].(string) != "the name" {
+		t.Fatalf("bad key annotation payload: %s", dump(k1))
+	}
+	if inner := k1[2].(S); head(inner) != "str" || inner[1].(string) != "name" {
+		t.Fatalf("annot did not wrap key 'name': %s", dump(k1))
+	}
+	v1 := p1[2].(S)
+	wantTag(t, v1, "str")
+	if v1[1].(string) != "Mo" {
+		t.Fatalf("want value 'Mo', got %s", dump(v1))
+	}
+
+	// 2) "(the age)" annotates KEY "age"
+	p2 := kid(m, 1)
+	if head(p2) != "pair" {
+		t.Fatalf("field2 should be pair: %s", dump(p2))
+	}
+	k2 := p2[1].(S)
+	wantTag(t, k2, "annot")
+	if s := k2[1].(S); head(s) != "str" || s[1].(string) != "the age" {
+		t.Fatalf("bad key annotation payload: %s", dump(k2))
+	}
+	if inner := k2[2].(S); head(inner) != "str" || inner[1].(string) != "age" {
+		t.Fatalf("annot did not wrap key 'age': %s", dump(k2))
+	}
+	v2 := p2[2].(S)
+	wantTag(t, v2, "int")
+	if v2[1].(int64) != 47 {
+		t.Fatalf("want 47, got %v", v2[1])
+	}
+
+	// 3) "(status)" annotates VALUE "yes"
+	p3 := kid(m, 2)
+	if head(p3) != "pair" {
+		t.Fatalf("field3 should be pair: %s", dump(p3))
+	}
+	k3 := p3[1].(S)
+	wantTag(t, k3, "str")
+	if k3[1].(string) != "available" {
+		t.Fatalf("want key 'available', got %s", dump(k3))
+	}
+	v3 := p3[2].(S)
+	wantTag(t, v3, "annot")
+	if s := v3[1].(S); head(s) != "str" || s[1].(string) != "status" {
+		t.Fatalf("bad value annotation payload: %s", dump(v3))
+	}
+	if inner := v3[2].(S); head(inner) != "str" || inner[1].(string) != "yes" {
+		t.Fatalf("annot did not wrap value 'yes': %s", dump(v3))
+	}
+}
+
+func Test_Parser_AnyWord_As_Map_Key(t *testing.T) {
+	root := mustParse(t, `{if:1, else:2, for:3, type:4, Enum:5, Int:6, Str:7, true:8, null:9}`)
+	m := kid(root, 0)
+	wantTag(t, m, "map")
+	keys := []string{"if", "else", "for", "type", "Enum", "Int", "Str", "true", "null"}
+	for i, want := range keys {
+		p := kid(m, i)
+		if head(p) != "pair" {
+			t.Fatalf("pair %d missing", i)
+		}
+		k := p[1].(S)
+		wantTag(t, k, "str")
+		if k[1].(string) != want {
+			t.Fatalf("key %d: want %q, got %q", i, want, k[1].(string))
+		}
+	}
+}

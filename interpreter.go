@@ -75,9 +75,28 @@ func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
 func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
 func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
 func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: xs} }
-func Map(m map[string]Value) Value {
-	return Value{Tag: VTMap, Data: m}
+
+// MapObject holds entries + per-key annotations, and preserves insertion order.
+type MapObject struct {
+	Entries map[string]Value
+	KeyAnn  map[string]string
+	Keys    []string // insertion order of keys (unique)
 }
+
+func Map(m map[string]Value) Value {
+	// When constructing from a plain map (rare), we don't know order,
+	// so keep whatever iteration order Go gives. Literals go via __map_from.
+	mo := &MapObject{
+		Entries: m,
+		KeyAnn:  map[string]string{},
+	}
+	mo.Keys = make([]string, 0, len(m))
+	for k := range m {
+		mo.Keys = append(mo.Keys, k)
+	}
+	return Value{Tag: VTMap, Data: mo}
+}
+
 func TypeVal(expr S) Value { return Value{Tag: VTType, Data: expr} }
 
 // Closures keep AST for introspection + a compiled chunk for speed.
@@ -532,6 +551,7 @@ func (ip *Interpreter) initCore() {
 		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
 			a, b := ctx.MustArg("a"), ctx.MustArg("b")
+			// NOTE: annotations are meta; equality ignores .Annot on values and on map keys.
 			if isNumber(a) && isNumber(b) {
 				if a.Tag == VTInt && b.Tag == VTInt {
 					return Int(a.Data.(int64) + b.Data.(int64))
@@ -546,16 +566,43 @@ func (ip *Interpreter) initCore() {
 				return Arr(x)
 			}
 			if a.Tag == VTMap && b.Tag == VTMap {
-				am, bm := a.Data.(map[string]Value), b.Data.(map[string]Value)
-				m := make(map[string]Value, len(am)+len(bm))
-				for k, v := range am {
-					m[k] = v
+				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
+				out := &MapObject{
+					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
+					KeyAnn:  make(map[string]string, len(am.KeyAnn)+len(bm.KeyAnn)),
+					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
 				}
-				for k, v := range bm {
-					m[k] = v
+				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
+
+				// start with LHS order/content
+				for _, k := range am.Keys {
+					out.Keys = append(out.Keys, k)
+					seen[k] = struct{}{}
 				}
-				return Map(m)
+				for k, v := range am.Entries {
+					out.Entries[k] = v
+				}
+				for k, ann := range am.KeyAnn {
+					out.KeyAnn[k] = ann
+				}
+
+				// overlay RHS values/annotations; append new keys in RHS order
+				for _, k := range bm.Keys {
+					if _, ok := seen[k]; !ok {
+						out.Keys = append(out.Keys, k)
+						seen[k] = struct{}{}
+					}
+				}
+				for k, v := range bm.Entries {
+					out.Entries[k] = v
+				}
+				for k, ann := range bm.KeyAnn {
+					out.KeyAnn[k] = ann
+				}
+
+				return Value{Tag: VTMap, Data: out}
 			}
+
 			return errNull("unsupported operands for '+'")
 		})
 
@@ -591,7 +638,7 @@ func (ip *Interpreter) initCore() {
 			return
 		})
 
-	// map from key/value arrays
+	// map from key/value arrays (keys are Str; preserve annotations and insertion order)
 	ip.reg("__map_from",
 		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
@@ -600,11 +647,23 @@ func (ip *Interpreter) initCore() {
 			if len(ka) != len(va) {
 				return errNull("map_from: mismatched arity")
 			}
-			m := make(map[string]Value, len(ka))
-			for i := range ka {
-				m[ka[i].Data.(string)] = va[i]
+			mo := &MapObject{
+				Entries: make(map[string]Value, len(ka)),
+				KeyAnn:  make(map[string]string, len(ka)),
+				Keys:    make([]string, 0, len(ka)),
 			}
-			return Map(m)
+			for i := range ka {
+				if ka[i].Tag != VTStr {
+					return errNull("map key must be string")
+				}
+				k := ka[i].Data.(string)
+				mo.Entries[k] = va[i]
+				mo.Keys = append(mo.Keys, k)
+				if ann := ka[i].Annot; ann != "" {
+					mo.KeyAnn[k] = ann
+				}
+			}
+			return Value{Tag: VTMap, Data: mo}
 		})
 
 	// len(array|map)
@@ -616,7 +675,7 @@ func (ip *Interpreter) initCore() {
 			case VTArray:
 				return Int(int64(len(x.Data.([]Value))))
 			case VTMap:
-				return Int(int64(len(x.Data.(map[string]Value))))
+				return Int(int64(len(x.Data.(*MapObject).Entries)))
 			default:
 				return errNull("len expects array or map")
 			}
@@ -729,17 +788,23 @@ func (ip *Interpreter) initCore() {
 				})
 			}
 
-			// Map → iterator (yields [key, value])
+			// Map → iterator (yields [key, value]) preserving insertion order;
+			// keys are Str values that carry their annotation (if any).
 			if x.Tag == VTMap {
-				m := x.Data.(map[string]Value)
-				keys := make([]Value, 0, len(m))
-				for k := range m {
-					keys = append(keys, Str(k))
-				}
+				mo := x.Data.(*MapObject)
 
 				env := NewEnv(ctx.Env())
 				env.Define("$map", x)
-				env.Define("$keys", Arr(keys))
+				// Precompute ordered keys as Values (with annotations)
+				keyVals := make([]Value, 0, len(mo.Keys))
+				for _, k := range mo.Keys {
+					s := Str(k)
+					if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+						s = withAnnot(s, ann)
+					}
+					keyVals = append(keyVals, s)
+				}
+				env.Define("$keys", Arr(keyVals))
 				env.Define("$i", Int(0))
 
 				body := S{"if",
@@ -749,12 +814,15 @@ func (ip *Interpreter) initCore() {
 							S{"call", S{"id", "__len"}, S{"id", "$keys"}},
 						},
 						S{"block",
+							// k := keys[i]
 							S{"assign", S{"decl", "$k"},
 								S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
 							},
+							// i := i + 1
 							S{"assign", S{"id", "$i"},
 								S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
 							},
+							// [k, map[k]]
 							S{"array",
 								S{"id", "$k"},
 								S{"idx", S{"id", "$map"}, S{"id", "$k"}},
@@ -798,7 +866,7 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 	case VTNum:
 		return a.Data.(float64) == b.Data.(float64)
 	case VTStr:
-		return a.Data.(string) == b.Data.(string)
+		return a.Data.(string) == b.Data.(string) // ignore a.Annot / b.Annot
 	case VTArray:
 		ax, bx := a.Data.([]Value), b.Data.([]Value)
 		if len(ax) != len(bx) {
@@ -811,12 +879,12 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 		}
 		return true
 	case VTMap:
-		am, bm := a.Data.(map[string]Value), b.Data.(map[string]Value)
-		if len(am) != len(bm) {
+		am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
+		if len(am.Entries) != len(bm.Entries) {
 			return false
 		}
-		for k, av := range am {
-			bv, ok := bm[k]
+		for k, av := range am.Entries {
+			bv, ok := bm.Entries[k]
 			if !ok || !ip.deepEqual(av, bv) {
 				return false
 			}
@@ -860,7 +928,11 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			keyStr = k.Data.(string)
 		}
 		if obj.Tag == VTMap {
-			obj.Data.(map[string]Value)[keyStr] = value
+			mo := obj.Data.(*MapObject)
+			if _, exists := mo.Entries[keyStr]; !exists {
+				mo.Keys = append(mo.Keys, keyStr)
+			}
+			mo.Entries[keyStr] = value
 			return
 		}
 		if obj.Tag == VTModule {
@@ -908,10 +980,11 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 			return
 		}
-		m := value.Data.(map[string]Value)
+		mo := value.Data.(*MapObject)
+		m := mo.Entries
 		for i := 1; i < len(target); i++ {
 			p := target[i].(S)
-			k := p[1].(S)[1].(string)
+			k := unwrapKeyStr(p[1].(S))
 			if v, ok := m[k]; ok {
 				ip.assignTo(p[2].(S), v, env, true)
 			} else {
@@ -1037,6 +1110,20 @@ func (e *emitter) callBuiltin(name string, args ...S) {
 		e.emitExpr(a)
 	}
 	e.emit(opCall, uint32(len(args)))
+}
+
+// unwrapKeyStr returns the string name for a map key S-node.
+// Accepts ("str", name) or ("annot", ("str", text), <key>), recursively.
+func unwrapKeyStr(k S) string {
+	for len(k) > 0 && k[0].(string) == "annot" {
+		k = k[2].(S) // skip to the wrapped key
+	}
+	// Parser emits keys as ("str", name).
+	if len(k) >= 2 && k[0].(string) == "str" {
+		return k[1].(string)
+	}
+	fail("map key is not a string")
+	return ""
 }
 
 // Entry
@@ -1192,14 +1279,18 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opMakeArr, uint32(len(n)-1))
 
 	case "map":
-		keys, vals := S{"array"}, S{"array"}
+		// Build keys/vals arrays; for keys, emit the key node as-is
+		// (can be "str" or "annot(..., str)"), so annotations become part of the Str Value.
+		keys := S{"array"}
+		vals := S{"array"}
 		for i := 1; i < len(n); i++ {
-			p := n[i].(S)
-			k := p[1].(S)[1].(string)
-			keys = append(keys, S{"str", k})
-			vals = append(vals, p[2].(S))
+			p := n[i].(S)       // ("pair"|"pair!", keyNode, valueExpr)
+			keyNode := p[1].(S) // "str" or "annot"
+			valExpr := p[2].(S) // value expr
+			keys = append(keys, keyNode)
+			vals = append(vals, valExpr)
 		}
-		// callee, keys, vals
+		// call __map_from(keys, vals)
 		e.emit(opLoadGlobal, e.ks("__map_from"))
 		for i := 1; i < len(keys); i++ {
 			e.emitExpr(keys[i].(S))

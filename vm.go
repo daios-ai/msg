@@ -60,6 +60,14 @@ func pack(op opcode, imm uint32) uint32 { return uint32(op)<<24 | (imm & 0xFFFFF
 func uop(i uint32) opcode               { return opcode(i >> 24) }
 func uimm(i uint32) uint32              { return i & 0xFFFFFF }
 
+// unwrap a VTMap to *MapObject (nil if not a map)
+func asMap(v Value) *MapObject {
+	if v.Tag != VTMap {
+		return nil
+	}
+	return v.Data.(*MapObject)
+}
+
 // -----------------------------
 // Bytecode container (internal)
 // -----------------------------
@@ -280,13 +288,20 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 			obj := m.pop()
 			key := k.Data.(string)
 
+			// Map lookup: use MapObject entries (annotation on keys is meta)
 			if obj.Tag == VTMap {
-				if v, ok := obj.Data.(map[string]Value)[key]; ok {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("property get requires map or module with string key")
+				}
+				if v, ok := mo.Entries[key]; ok {
 					m.push(v)
 					break
 				}
 				return m.fail(fmt.Sprintf("unknown property %q", key))
 			}
+
+			// Module export lookup stays the same
 			if obj.Tag == VTModule {
 				mod := obj.Data.(*Module)
 				if v, ok := mod.get(key); ok {
@@ -295,12 +310,14 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 				}
 				return m.fail(fmt.Sprintf("unknown property %q on module", key))
 			}
+
 			return m.fail("property get requires map or module with string key")
 
 		case opGetIdx:
 			idx := m.pop()
 			obj := m.pop()
 
+			// array[int]
 			if obj.Tag == VTArray && idx.Tag == VTInt {
 				xs := obj.Data.([]Value)
 				if len(xs) == 0 {
@@ -316,15 +333,21 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 				m.push(xs[i])
 				break
 			}
+
+			// map[string]
 			if obj.Tag == VTMap && idx.Tag == VTStr {
-				mm := obj.Data.(map[string]Value)
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("index requires array[int] or map[string]")
+				}
 				k := idx.Data.(string)
-				if v, ok := mm[k]; ok {
+				if v, ok := mo.Entries[k]; ok {
 					m.push(v)
 					break
 				}
 				return m.fail(fmt.Sprintf("unknown key %q", k))
 			}
+
 			return m.fail("index requires array[int] or map[string]")
 
 		// ---- arithmetic / compare / unary ----
@@ -421,7 +444,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 			m.stack = m.stack[:m.sp]
 
 			// Use current frame env as the call-site (for natives & closures)
-			res := m.ip.applyArgsInEnv(callee, args, m.env)
+			res := m.ip.applyArgsScoped(callee, args, m.env)
 
 			// Push result
 			m.push(res)

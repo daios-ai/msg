@@ -106,11 +106,10 @@ func (p *parser) expr(minBP int) (S, error) {
 	p.i++
 	var left S
 	switch t.Type {
-	case ID:
+	case ID, TYPE:
+		// Identifiers and capitalized built-in types behave the same in expressions.
 		left = L("id", t.Literal)
-	case TYPE:
-		// Capitalized built-in types like Str/Int/Num/Type are treated as identifiers in expressions.
-		left = L("id", t.Literal)
+
 	case ENUM:
 		// Enum[ ... ] sugar → ("enum", ...)
 		if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
@@ -127,6 +126,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		} else {
 			left = L("id", t.Literal)
 		}
+
 	case INTEGER:
 		left = L("int", t.Literal)
 	case NUMBER:
@@ -180,11 +180,11 @@ func (p *parser) expr(minBP int) (S, error) {
 				if err != nil {
 					return nil, err
 				}
+				tag := "pair"
 				if req {
-					pairs = append(pairs, L("pair!", k, v))
-				} else {
-					pairs = append(pairs, L("pair", k, v))
+					tag = "pair!"
 				}
+				pairs = append(pairs, L(tag, k, v))
 				if !p.match(COMMA) {
 					break
 				}
@@ -229,11 +229,10 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 		var src any = L("array")
 		if p.match(FROM) {
-			if !(p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE) {
+			if !(p.match(LSQUARE, CLSQUARE)) {
 				g := p.peek()
 				return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '[' after 'from'"}
 			}
-			p.i++
 			a, err := p.arrayLiteralAfterOpen()
 			if err != nil {
 				return nil, err
@@ -372,11 +371,7 @@ func (p *parser) expr(minBP int) (S, error) {
 				left = L("idx", left, L("int", p.prev().Literal))
 				continue
 			}
-			if p.match(ID) {
-				left = L("get", left, L("str", p.prev().Literal))
-				continue
-			}
-			if p.match(STRING) {
+			if p.match(ID) || p.match(STRING) {
 				left = L("get", left, L("str", p.prev().Literal))
 				continue
 			}
@@ -396,8 +391,8 @@ func (p *parser) expr(minBP int) (S, error) {
 		p.i++
 
 		nextBP := bp + 1
-		if op.Type == ASSIGN || op.Type == ARROW {
-			nextBP = bp // right-assoc
+		if op.Type == ASSIGN || op.Type == ARROW { // right-assoc
+			nextBP = bp
 		}
 
 		if op.Type == ASSIGN && !assignable(left) {
@@ -408,7 +403,6 @@ func (p *parser) expr(minBP int) (S, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		if op.Type == ASSIGN {
 			left = L("assign", left, right)
 		} else {
@@ -478,7 +472,6 @@ func (p *parser) params() (S, error) {
 
 // ifExpr builds: ("if", ("pair", cond1, thenBlk1), ("pair", cond2, thenBlk2), ..., [elseBlk?])
 // NOTE: The final element, if present, is a bare ("block", ...) for 'else', not wrapped in a tag.
-// Tests rely on this exact shape.
 func (p *parser) ifExpr() (S, error) {
 	cond, err := p.expr(0)
 	if err != nil {
@@ -678,23 +671,40 @@ func (p *parser) arrayDeclPattern() (S, error) {
 
 // read a key token and turn it into ("str", key)
 func (p *parser) readKeyString() (S, error) {
-	if p.match(ID) {
-		return L("str", p.prev().Literal), nil
+	// Allow annotation(s) directly in front of the key.
+	if p.match(ANNOTATION) {
+		txt := ""
+		if s, ok := p.prev().Literal.(string); ok {
+			txt = s
+		}
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		return L("annot", L("str", txt), k), nil
 	}
+
+	// Quoted key.
 	if p.match(STRING) {
 		return L("str", p.prev().Literal), nil
 	}
-	// Allow keywords as bare keys (keep TYPE out; that's capitalized Str/Int/Num).
-	kw := []TokenType{
+
+	// Any word-like token (identifier, built-in type, or keyword), plus true/false/null.
+	t := p.peek()
+	switch t.Type {
+	case ID, TYPE,
 		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
 		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
 		TYPECONS, ENUM,
-	}
-	for _, tt := range kw {
-		if p.match(tt) {
-			return L("str", p.prev().Lexeme), nil
+		BOOLEAN, NULL:
+		p.i++
+		name := t.Lexeme
+		if s, ok := t.Literal.(string); ok { // ID/TYPE carry string Literal
+			name = s
 		}
+		return L("str", name), nil
 	}
+
 	g := p.peek()
 	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key (id, string, or keyword)"}
 }

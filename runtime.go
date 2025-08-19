@@ -1080,18 +1080,3 @@ func registerNetBuiltins(ip *Interpreter) {
 func (ip *Interpreter) execFunBody(f *Fun) Value {
 	return ip.execFunBodyScoped(f, nil)
 }
-
-// Old name used by runtime.go/vm.go (calls with a call-site env)
-func (ip *Interpreter) execFunBodyInEnv(f *Fun, callSite *Env) Value {
-	return ip.execFunBodyScoped(f, callSite)
-}
-
-// Old name used by vm.go to pass a call-site env
-func (ip *Interpreter) applyArgsInEnv(fn Value, args []Value, callSite *Env) Value {
-	return ip.applyArgsScoped(fn, args, callSite)
-}
-
-// Old helper sometimes referenced internally
-func (ip *Interpreter) applyOne(fn Value, arg Value) Value {
-	return ip.applyOneScoped(fn, arg, nil)
-}

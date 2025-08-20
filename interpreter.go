@@ -110,6 +110,9 @@ type Fun struct {
 
 	Chunk      *Chunk // JIT result
 	NativeName string // non-empty for natives
+
+	IsOracle bool    // marks this function as an "oracle"
+	Examples []Value // optional: array of [input, output] pairs (Values)
 }
 
 func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
@@ -191,6 +194,9 @@ type Interpreter struct {
 	modules   map[string]*moduleRec
 	native    map[string]NativeImpl
 	loadStack []string
+
+	// --- Oracle debug/observability (stub) ---
+	oracleLastPrompt string
 }
 
 func NewInterpreter() *Interpreter {
@@ -352,7 +358,7 @@ func (ip *Interpreter) jitTop(ast S, topBlockToSameEnv bool) *Chunk {
 }
 
 func (ip *Interpreter) ensureChunk(f *Fun, topBlockToSameEnv bool) {
-	if f.Chunk != nil || f.NativeName != "" {
+	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
 		return
 	}
 	em := newEmitter(ip)
@@ -375,7 +381,7 @@ func (ip *Interpreter) applyArgsScoped(fnVal Value, args []Value, callSite *Env)
 	if len(args) == 0 {
 		switch len(f.Params) {
 		case 0:
-			return ip.execFunBodyScoped(f, callSite)
+			return ip.execFunBodyScoped(fnVal, callSite)
 		case 1:
 			if ip.isType(Null, f.ParamTypes[0], f.Env) {
 				return ip.applyOneScoped(fnVal, Null, callSite)
@@ -401,7 +407,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 
 	// Already saturated → execute then keep applying (currying chains).
 	if len(f.Params) == 0 {
-		res := ip.execFunBodyScoped(f, callSite)
+		res := ip.execFunBodyScoped(fnVal, callSite)
 		if res.Tag != VTFun {
 			fail("too many arguments")
 		}
@@ -441,17 +447,27 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		})
 	}
 
-	// Last arg supplied → execute on VM.
-	return ip.execFunBodyScoped(&Fun{
+	// Last arg supplied → execute (preserve the original function's annotation).
+	execFun := &Fun{
 		ReturnType: f.ReturnType,
 		Body:       f.Body,
 		Env:        callEnv,
 		Chunk:      f.Chunk,
 		NativeName: f.NativeName,
-	}, callSite)
+		IsOracle:   f.IsOracle,
+		Examples:   f.Examples,
+		HiddenNull: f.HiddenNull,
+	}
+	execVal := FunVal(execFun)
+	execVal.Annot = fnVal.Annot // keep the informal doc across application
+	return ip.execFunBodyScoped(execVal, callSite)
 }
 
-func (ip *Interpreter) execFunBodyScoped(f *Fun, callSite *Env) Value {
+func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
+	if funVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := funVal.Data.(*Fun)
 	// Native fast path
 	if f.NativeName != "" {
 		impl, ok := ip.native[f.NativeName]
@@ -464,6 +480,10 @@ func (ip *Interpreter) execFunBodyScoped(f *Fun, callSite *Env) Value {
 			fail("return type mismatch")
 		}
 		return res
+	}
+
+	if f.IsOracle {
+		return ip.execOracle(funVal, callSite)
 	}
 
 	// User-defined function
@@ -682,12 +702,15 @@ func (ip *Interpreter) initCore() {
 		})
 
 	// make_fun(params:[str], types:[Type], ret:Type, body:Type) -> Fun
+	// interpreter.go (initCore)
 	ip.reg("__make_fun",
 		[]ParamSpec{
 			{"params", S{"array", S{"id", "Str"}}},
 			{"types", S{"array", S{"id", "Type"}}},
 			{"ret", S{"id", "Type"}},
 			{"body", S{"id", "Type"}},
+			{"isOracle", S{"id", "Bool"}}, // NEW
+			{"examples", S{"id", "Any"}},  // NEW
 		},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
@@ -695,6 +718,8 @@ func (ip *Interpreter) initCore() {
 			typesV := ctx.MustArg("types").Data.([]Value)
 			retT := ctx.MustArg("ret").Data.(S)
 			body := ctx.MustArg("body").Data.(S)
+			isOr := ctx.MustArg("isOracle").Data.(bool)
+			exAny := ctx.MustArg("examples")
 
 			names := make([]string, len(namesV))
 			types := make([]S, len(typesV))
@@ -704,12 +729,19 @@ func (ip *Interpreter) initCore() {
 			for i := range typesV {
 				types[i] = typesV[i].Data.(S)
 			}
+
 			hidden := false
 			if len(names) == 0 {
 				names = []string{"_"}
 				types = []S{S{"id", "Null"}}
 				hidden = true
 			}
+
+			var exVals []Value
+			if exAny.Tag == VTArray {
+				exVals = append([]Value(nil), exAny.Data.([]Value)...)
+			}
+
 			return FunVal(&Fun{
 				Params:     names,
 				ParamTypes: types,
@@ -717,6 +749,9 @@ func (ip *Interpreter) initCore() {
 				Body:       body,
 				Env:        ctx.Env(),
 				HiddenNull: hidden,
+
+				IsOracle: isOr,
+				Examples: exVals,
 			})
 		})
 
@@ -1352,7 +1387,43 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opMakeArr, uint32(len(typesArr)))
 		e.emit(opConst, e.k(TypeVal(retT)))
 		e.emit(opConst, e.k(TypeVal(n[3].(S))))
-		e.emit(opCall, 4)
+		e.emit(opConst, e.k(Bool(false)))
+		e.emit(opConst, e.k(Null))
+		e.emit(opCall, 6)
+
+	case "oracle":
+		// n = ("oracle", params, retType, examplesExpr)
+		params := n[1].(S)
+		namesArr := make([]Value, 0, len(params)-1)
+		typesArr := make([]Value, 0, len(params)-1)
+		for i := 1; i < len(params); i++ {
+			p := params[i].(S)
+			namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+			t := p[2].(S)
+			if len(t) == 0 {
+				t = S{"id", "Any"}
+			}
+			typesArr = append(typesArr, TypeVal(t))
+		}
+		retT := n[2].(S)
+		if len(retT) == 0 {
+			retT = S{"id", "Any"}
+		}
+
+		e.emit(opLoadGlobal, e.ks("__make_fun"))
+		for _, v := range namesArr {
+			e.emit(opConst, e.k(v))
+		}
+		e.emit(opMakeArr, uint32(len(namesArr)))
+		for _, v := range typesArr {
+			e.emit(opConst, e.k(v))
+		}
+		e.emit(opMakeArr, uint32(len(typesArr)))
+		e.emit(opConst, e.k(TypeVal(retT)))
+		e.emit(opConst, e.k(TypeVal(S{"oracle"})))
+		e.emit(opConst, e.k(Bool(true)))
+		e.emitExpr(n[3].(S))
+		e.emit(opCall, 6)
 
 	// control
 	case "return":

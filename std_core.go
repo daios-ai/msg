@@ -40,7 +40,6 @@ Returns:
 			if fv.Tag != VTFun {
 				fail("try expects a function")
 			}
-			fn := fv.Data.(*Fun)
 
 			out := Map(map[string]Value{
 				"ok":    Bool(false),
@@ -61,12 +60,11 @@ Returns:
 						}
 					}
 				}()
-				// Run in the function's closure environment (no isolation needed)
-				res = ip.execFunBodyScoped(fn, nil)
+				// Use public API; does not rely on internals.
+				res = ip.Call0(fv)
 			}()
 
 			if hardErr != nil {
-				// hard error path
 				out.Data.(*MapObject).Entries["ok"] = Bool(false)
 				out.Data.(*MapObject).Entries["error"] = Str(hardErr.Error())
 				out.Data.(*MapObject).Entries["value"] = Null
@@ -97,6 +95,26 @@ Notes:
   • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
   • If the function returns an annotated null, ok=false and error is that annotation.
   • On success, ok=true and value is the function's result.`)
+
+	// typeOf(x: Any) -> Type
+	ip.RegisterNative(
+		"typeOf",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Type"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			return TypeVal(ip.ValueToType(x, ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
+
+This inspects a runtime value and produces its structural Type.
+Useful together with isType/isSubtype for ad-hoc validation.
+
+Params:
+  x: Any — a runtime value
+
+Returns: Type`)
 
 	// typeOf(x: Any) -> Type
 	ip.RegisterNative(

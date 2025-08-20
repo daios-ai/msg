@@ -227,17 +227,14 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			out = o
 		}
+		// NEW: accept any expression after `from`
 		var src any = L("array")
 		if p.match(FROM) {
-			if !(p.match(LSQUARE, CLSQUARE)) {
-				g := p.peek()
-				return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '[' after 'from'"}
-			}
-			a, err := p.arrayLiteralAfterOpen()
+			ex, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
-			src = a
+			src = ex
 		}
 		left = L("oracle", params, out, src)
 

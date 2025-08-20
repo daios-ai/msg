@@ -48,6 +48,7 @@ func snapshotEnv(e *Env) *Env {
 
 func registerConcurrencyBuiltins(ip *Interpreter) {
 	// spawn(f: Any->Any) -> Any (proc handle)
+	// spawn(f: Any->Any) -> Any (proc handle)
 	ip.RegisterNative(
 		"procSpawn",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
@@ -55,24 +56,29 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.MustArg("f")
 			if fv.Tag != VTFun {
-				fail("spawn expects a function")
+				fail("procSpawn expects a function")
 			}
+			orig := fv.Data.(*Fun)
 
-			// TODO(engine): provide engine API to rebind a callable's closure env
-			// e.g., CloneCallableWithEnv(fn, snapshotEnv). For now, copy *Fun.
-			fn := fv.Data.(*Fun)
+			// Snapshot the closure env to isolate the spawned task.
+			snap := snapshotEnv(orig.Env)
 
-			// Snapshot closure env for isolation
-			snap := snapshotEnv(fn.Env)
-			// Clone function onto the snapshot
+			// Clone the function to run in the snapshot.
 			work := &Fun{
-				Params:     append([]string{}, fn.Params...),
-				ParamTypes: append([]S{}, fn.ParamTypes...),
-				ReturnType: fn.ReturnType,
-				Body:       fn.Body,
+				Params:     append([]string{}, orig.Params...),
+				ParamTypes: append([]S{}, orig.ParamTypes...),
+				ReturnType: orig.ReturnType,
+				Body:       orig.Body,
 				Env:        snap,
-				HiddenNull: fn.HiddenNull,
+				HiddenNull: orig.HiddenNull,
+				Chunk:      orig.Chunk,      // ok to reuse compiled chunk
+				NativeName: orig.NativeName, // in case someone passes a native
+				IsOracle:   orig.IsOracle,
+				Examples:   append([]Value(nil), orig.Examples...),
 			}
+			// Wrap as a Value and preserve the original annotation (#-doc).
+			execVal := FunVal(work)
+			execVal.Annot = fv.Annot
 
 			pr := &procState{done: make(chan struct{}), cancel: make(chan struct{})}
 			go func() {
@@ -89,27 +95,50 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 					}
 					close(pr.done)
 				}()
-				pr.result = ip.execFunBodyScoped(work, nil)
+
+				// Use the public API (no internal executor calls).
+				pr.result = ip.Call0(execVal)
 			}()
+
 			return HandleVal("proc", pr)
 		},
 	)
 	setBuiltinDoc(ip, "procSpawn", `Run a function in a new lightweight process.
 
-The function runs concurrently with the caller in an isolated snapshot of its
-closure environment (variables are deep-copied where applicable). Pass a
-fully-applied function (no missing parameters).
+The function runs concurrently in an isolated snapshot of its closure
+environment (variables are deep-copied where applicable). Pass a fully-applied
+function (no missing parameters). If the function returns an annotated null,
+joining the process yields that error annotation.
 
 Params:
-  f: Any — work to execute
+  f: Any — a function to execute (must be zero-arity after partial application)
 
 Returns:
-  proc handle (opaque)
+  Opaque process handle (use with procJoin/procCancel)
+
+Examples:
+  # Simple worker
+  let worker = fun() do
+    40 + 2
+  end
+  let p = procSpawn(worker)
+  procJoin(p)           ## => 42
+
+  ## Partial application first, then spawn
+  let add = fun(a: Int, b: Int) -> Int do a + b end
+  let add1 = add(1)     # now zero-arity
+  let p2 = procSpawn(add1)
+  procJoin(p2)          ## => 1 + b (b must be bound inside add1's closure)
+
+  ## Propagate failure as annotated null via join
+  let boom = fun() do error("boom") end
+  let p3 = procSpawn(boom)
+  procJoin(p3)          ## => null annotated with "boom"
 
 Notes:
-  • Use procJoin(proc) to retrieve the result.
-  • If the process fails, join returns an annotated null with the error message.
-  • Use procCancel(proc) to request cooperative cancellation (best effort).`)
+  • Use procJoin(proc) to retrieve the result (or annotated error).
+  • Use procCancel(proc) to request cooperative cancellation (best effort).
+  • The spawned function sees a snapshot of its original closure env.`)
 
 	ip.RegisterNative(
 		"procJoin",
@@ -485,6 +514,143 @@ func valueToGoJSON(v Value) any {
 	default:
 		return fmt.Sprintf("<%v>", v.Tag)
 	}
+}
+
+// --- Schema ↔ Type bridge ----------------------------------------------------
+
+func registerSchemaBuiltins(ip *Interpreter) {
+	// typeToJSONSchema(t: Type) -> Any
+	ip.RegisterNative(
+		"typeToJSONSchema",
+		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			tv := ctx.MustArg("t") // VTType value
+			js := ip.TypeValueToJSONSchema(tv, ctx.Env())
+			return goJSONToValue(js)
+		},
+	)
+	setBuiltinDoc(ip, "typeToJSONSchema", `Convert a MindScript Type to a JSON Schema object.
+
+Params:
+  t: Type
+
+Returns:
+  Any — JSON Schema as a map/array structure (use jsonStringify to serialize)`)
+
+	// jsonSchemaToType(schema: Any) -> Type
+	ip.RegisterNative(
+		"jsonSchemaToType",
+		[]ParamSpec{{Name: "schema", Type: S{"id", "Any"}}},
+		S{"id", "Type"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			raw := valueToGoJSON(ctx.MustArg("schema"))
+			doc, ok := raw.(map[string]any)
+			if !ok {
+				return TypeVal(S{"id", "Any"})
+			}
+
+			// Convert the root to a **Type value** (keeps top-level description in Annot).
+			tv := ip.JSONSchemaToTypeValue(doc)
+
+			// Import $defs/definitions into the current environment as aliases.
+			importDefs := func(defs map[string]any) {
+				for name, defRaw := range defs {
+					if defObj, ok := defRaw.(map[string]any); ok {
+						// Convert def using the whole document as root for local $ref resolution.
+						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
+						ctx.Env().Define(name, TypeVal(s))
+					}
+				}
+			}
+			if dm, ok := doc["$defs"].(map[string]any); ok {
+				importDefs(dm)
+			}
+			if dm, ok := doc["definitions"].(map[string]any); ok {
+				importDefs(dm)
+			}
+
+			return tv
+		},
+	)
+	setBuiltinDoc(ip, "jsonSchemaToType", `Convert a JSON Schema object to a MindScript Type.
+
+Notes:
+  • Same-document $ref and common keywords are handled.
+  • Unsupported constructs widen to Any.
+  • "$defs"/"definitions" are imported into the current scope as type aliases.
+
+Params:
+  schema: Any — JSON object (e.g., from jsonParse)
+
+Returns:
+  Type`)
+
+	// typeStringToJSONSchema(src: Str) -> Any
+	ip.RegisterNative(
+		"typeStringToJSONSchema",
+		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			src := ctx.MustArg("src").Data.(string)
+			s, err := TypeStringToS(src)
+			if err != nil {
+				return annotNull(err.Error())
+			}
+			// Convert **value-centrically** to ensure annotations propagate.
+			js := ip.TypeValueToJSONSchema(TypeVal(s), ctx.Env())
+			return goJSONToValue(js)
+		},
+	)
+	setBuiltinDoc(ip, "typeStringToJSONSchema", `Parse a MindScript type string and convert it to JSON Schema.
+
+Params:
+  src: Str — a single type expression (annotations map to "description")
+
+Returns:
+  Any — JSON Schema object`)
+
+	// jsonSchemaStringToType(src: Str) -> Type
+	ip.RegisterNative(
+		"jsonSchemaStringToType",
+		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
+		S{"id", "Type"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			src := ctx.MustArg("src").Data.(string)
+			doc, err := JSONSchemaStringToObject(src)
+			if err != nil {
+				return annotNull(err.Error())
+			}
+
+			// Convert to a **Type value**.
+			tv := ip.JSONSchemaToTypeValue(doc)
+
+			// Import $defs/definitions into env (same logic as above).
+			importDefs := func(defs map[string]any) {
+				for name, defRaw := range defs {
+					if defObj, ok := defRaw.(map[string]any); ok {
+						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
+						ctx.Env().Define(name, TypeVal(s))
+					}
+				}
+			}
+			if dm, ok := doc["$defs"].(map[string]any); ok {
+				importDefs(dm)
+			}
+			if dm, ok := doc["definitions"].(map[string]any); ok {
+				importDefs(dm)
+			}
+
+			return tv
+		},
+	)
+	setBuiltinDoc(ip, "jsonSchemaStringToType", `Parse a JSON Schema string and convert it to a MindScript Type.
+
+Params:
+  src: Str — JSON text
+
+Returns:
+  Type`)
 }
 
 // --- String Utilities --------------------------------------------

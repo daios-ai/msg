@@ -8,6 +8,8 @@ import (
 	"unicode"
 )
 
+/* ---------- Public API ---------- */
+
 /* ---------- globals & tiny helpers ---------- */
 
 var MaxInlineWidth = 80 // width threshold for single-line arrays/maps
@@ -1073,27 +1075,6 @@ func arrayOneLine(xs []Value) string {
 		parts = append(parts, b.String())
 	}
 	return "[ " + strings.Join(parts, ", ") + " ]"
-}
-
-func mapOneLine(keys []string, m map[string]Value) string {
-	if len(keys) == 0 {
-		return "{}"
-	}
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if isValueMultiline(m[k]) {
-			return ""
-		}
-		key := k
-		if !isIdent(key) {
-			key = quoteString(key)
-		}
-		var b strings.Builder
-		o := out{b: &b}
-		writeValue(&o, m[k])
-		parts = append(parts, key+": "+b.String())
-	}
-	return "{ " + strings.Join(parts, ", ") + " }"
 }
 
 func isValueMultiline(v Value) bool {

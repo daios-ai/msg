@@ -58,6 +58,7 @@ func NewRuntime() *Interpreter {
 	registerIOBuiltins(ip)
 	registerIntrospectionBuiltins(ip)
 	registerUtilityBuiltins(ip)
+	registerSchemaBuiltins(ip)
 	registerNetBuiltins(ip)
 	registerMapBuiltins(ip)
 	registerStringBuiltins(ip)
@@ -68,26 +69,4 @@ func NewRuntime() *Interpreter {
 	registerProcessBuiltins(ip)
 
 	return ip
-}
-
-// Public convenience if consumers already created an Interpreter.
-func RegisterBuiltins(ip *Interpreter) {
-	if ip == nil {
-		return
-	}
-	if ip.Core == nil {
-		ip.Core = NewEnv(nil)
-	}
-	if ip.native == nil {
-		ip.native = map[string]NativeImpl{}
-	}
-	if ip.modules == nil {
-		ip.modules = map[string]*moduleRec{}
-	}
-	registerStandardBuiltins(ip)
-	registerConcurrencyBuiltins(ip)
-	registerIOBuiltins(ip)
-	registerIntrospectionBuiltins(ip)
-	registerUtilityBuiltins(ip)
-	registerNetBuiltins(ip)
 }

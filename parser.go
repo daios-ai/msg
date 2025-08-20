@@ -324,7 +324,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("annot", L("str", txt), x)
 
 	default:
-		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token %v", t.Type)}
+		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme)}
 	}
 
 	// ---- postfix chain: call (), index [], get . ----
@@ -706,7 +706,7 @@ func (p *parser) readKeyString() (S, error) {
 	}
 
 	g := p.peek()
-	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key (id, string, or keyword)"}
+	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key"}
 }
 
 func (p *parser) keyRequired() (key S, required bool, err error) {

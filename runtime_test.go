@@ -838,3 +838,59 @@ func Test_RT_Sprintf_Does_Not_Interfere_With_IO(t *testing.T) {
 		t.Fatalf("sprintf+IO failed, got %#v", v)
 	}
 }
+func Test_RT_Import_Retry_After_Parse_Error(t *testing.T) {
+	ip := newRT()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mod.ms")
+	ip.Global.Define("P", Str(path))
+
+	// 1) Write a parse-broken module, import should fail with annotated null
+	if err := os.WriteFile(path, []byte("let x = \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v1 := evalWithIP(t, ip, `
+		import(P)
+	`)
+	wantAnnotatedNullContains(t, v1, "parse")
+
+	// 2) Fix the file and re-import; should succeed (cache must NOT be poisoned)
+	if err := os.WriteFile(path, []byte("let answer = 42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v2 := evalWithIP(t, ip, `
+		import(P).answer
+	`)
+	if v2.Tag != VTInt || v2.Data.(int64) != 42 {
+		t.Fatalf("import retry (parse fix) failed, got %#v", v2)
+	}
+}
+
+func Test_RT_Import_Retry_After_Runtime_Error(t *testing.T) {
+	ip := newRT()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mod.ms")
+	ip.Global.Define("P", Str(path))
+
+	// 1) Module parses but fails at runtime (division by zero)
+	if err := os.WriteFile(path, []byte("let bad = 1 / 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v1 := evalWithIP(t, ip, `
+		import(P)
+	`)
+	// The exact wording may vary; "division by zero" is VM's message.
+	wantAnnotatedNullContains(t, v1, "division by zero")
+
+	// 2) Fix the module and re-import; should succeed
+	if err := os.WriteFile(path, []byte("let answer = 7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v2 := evalWithIP(t, ip, `
+		import(P).answer
+	`)
+	if v2.Tag != VTInt || v2.Data.(int64) != 7 {
+		t.Fatalf("import retry (runtime fix) failed, got %#v", v2)
+	}
+}

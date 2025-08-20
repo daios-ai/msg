@@ -1,1919 +1,1011 @@
-=== BEGIN FILE: std_core.go ===
 package mindscript
 
 import (
 	"fmt"
-	"strings"
-)
-
-// ---- standard built-ins ----------------------------------------------------
-
-func registerStandardBuiltins(ip *Interpreter) {
-	// typeOf(x: Any) -> Type
-	ip.RegisterNative(
-		"typeOf",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			return TypeVal(ip.ValueToType(x, ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
-
-This inspects a runtime value and produces its structural Type.
-Useful together with isType/isSubtype for ad-hoc validation.
-
-Params:
-  x: Any — a runtime value
-
-Returns: Type`)
-
-	ip.RegisterNative(
-		"isType",
-		[]ParamSpec{
-			{Name: "x", Type: S{"id", "Any"}},
-			{Name: "T", Type: S{"id", "Type"}},
-		},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			tv := ctx.MustArg("T")
-			if tv.Tag != VTType {
-				fail("isType expects a Type as second argument")
-			}
-			return Bool(ip.IsType(x, tv.Data.(S), ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "isType", `Check whether a value conforms to a Type.
-
-Params:
-  x: Any   — value to check
-  T: Type  — type to check against (must be a Type value, e.g. type Int)
-
-Returns: Bool`)
-
-	// isSubtype(A: Type, B: Type) -> Bool
-	ip.RegisterNative(
-		"isSubtype",
-		[]ParamSpec{
-			{Name: "A", Type: S{"id", "Type"}},
-			{Name: "B", Type: S{"id", "Type"}},
-		},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			Av := ctx.MustArg("A")
-			Bv := ctx.MustArg("B")
-			if Av.Tag != VTType || Bv.Tag != VTType {
-				fail("isSubtype expects Types as both arguments")
-			}
-			return Bool(ip.IsSubtype(Av.Data.(S), Bv.Data.(S), ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "isSubtype", `Structural subtype test: A <: B.
-
-Function types are compared structurally:
-- Parameters are contravariant
-- Return types are covariant
-- Arrows associate to the right (A -> B -> C == A -> (B -> C))
-
-Params:
-  A: Type — candidate subtype
-  B: Type — candidate supertype
-
-Returns: Bool`)
-
-	// import(path: Str) -> Module
-	ip.RegisterNative(
-		"import",
-		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			if pv.Tag != VTStr {
-				return annotNull("import expects a string path")
-			}
-			importer := ""
-			if n := len(ip.loadStack); n > 0 {
-				importer = ip.loadStack[n-1]
-			}
-			mod, err := ip.importModule(pv.Data.(string), importer)
-			if err != nil {
-				return annotNull(err.Error())
-			}
-			return mod
-		},
-	)
-	setBuiltinDoc(ip, "import", `Load a module by URL or file path.
-
-File search order:
-  1) Directory of the importing module
-  2) Current working directory
-  3) MINDSCRIPT_PATH (if set)
-A default extension may be added if omitted.
-
-Params:
-  path: Str — file path or URL
-
-Returns: Module (as a value with exported bindings)`)
-
-	// importCode(name: Str, src: Str) -> Module
-	ip.RegisterNative(
-		"importCode",
-		[]ParamSpec{
-			{Name: "name", Type: S{"id", "Str"}},
-			{Name: "src", Type: S{"id", "Str"}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			nv := ctx.MustArg("name")
-			sv := ctx.MustArg("src")
-			if nv.Tag != VTStr || sv.Tag != VTStr {
-				return annotNull("importCode expects (name: Str, src: Str)")
-			}
-			name := nv.Data.(string)
-			src := sv.Data.(string)
-
-			// Parse
-			ast, perr := ParseSExpr(src)
-			if perr != nil {
-				return annotNull(fmt.Sprintf("parse error in mem:%s: %v", name, perr))
-			}
-
-			// Evaluate in isolated env parented to Core (uncaught to treat rtErr as failure)
-			modEnv := NewEnv(ip.Core)
-			var rterr error
-			var evalRes Value
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						switch sig := r.(type) {
-						case rtErr:
-							rterr = fmt.Errorf("runtime error in mem:%s: %s", name, sig.msg)
-						default:
-							rterr = fmt.Errorf("runtime panic in mem:%s: %v", name, r)
-						}
-					}
-				}()
-				if len(ast) > 0 {
-					evalRes = ip.EvalASTUncaught(ast, modEnv, true)
-				}
-			}()
-			if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
-				rterr = fmt.Errorf("runtime error in mem:%s: %s", name, evalRes.Annot)
-			}
-			if rterr != nil {
-				fail(rterr.Error())
-			}
-
-			exports := make(map[string]Value, len(modEnv.table))
-			for k, v := range modEnv.table {
-				exports[k] = v
-			}
-			return Value{Tag: VTModule, Data: &Module{Name: "mem:" + name, Exports: exports}}
-		},
-	)
-	setBuiltinDoc(ip, "importCode", `Evaluate a source string as a module.
-
-The code is executed in an isolated environment parented to Core.
-This does **not** populate the module cache; a later import(name) won’t find it.
-
-Params:
-  name: Str — logical module name (for diagnostics)
-  src:  Str — MindScript source code
-
-Returns: Module`)
-}
-
-// --- Introspection & docs ----------------------------------------------------
-
-func registerIntrospectionBuiltins(ip *Interpreter) {
-	// getEnv() -> {}  (returns a map of bindings; nearest scope wins)
-	// Preserves insertion order using MapObject (inner-to-outer).
-	ip.RegisterNative(
-		"getEnv",
-		nil,
-		S{"id", "Any"}, // returns a map; keeping return as Any avoids over-constraining
-		func(_ *Interpreter, ctx CallCtx) Value {
-			seen := make(map[string]struct{})
-			mo := &MapObject{
-				Entries: map[string]Value{},
-				KeyAnn:  map[string]string{},
-				Keys:    []string{},
-			}
-			// Walk from current scope to parents; first seen (nearest) wins
-			for e := ctx.Env(); e != nil; e = e.parent {
-				for k, v := range e.table {
-					if _, ok := seen[k]; ok {
-						continue
-					}
-					seen[k] = struct{}{}
-					mo.Entries[k] = v
-					mo.Keys = append(mo.Keys, k)
-				}
-			}
-			return Value{Tag: VTMap, Data: mo}
-		},
-	)
-	setBuiltinDoc(ip, "getEnv", `Return the current lexical environment as a map.
-
-The result contains bindings visible at the call site. Inner scopes shadow
-outer ones. Key order reflects shadowing order (nearest first).
-
-Returns: {Str: Any}`)
-
-	// funInfo(f: Any) -> {params:[{name, type}], return:Type, doc:Str}
-	ip.RegisterNative(
-		"funInfo",
-		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"map",
-			S{"pair!", S{"str", "params"}, S{"array", S{"map",
-				S{"pair!", S{"str", "name"}, S{"id", "Str"}},
-				S{"pair!", S{"str", "type"}, S{"id", "Type"}},
-			}}},
-			S{"pair!", S{"str", "return"}, S{"id", "Type"}},
-			S{"pair", S{"str", "doc"}, S{"id", "Str"}},
-		},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
-			callable, ok := ip.FunMeta(fv)
-			if !ok {
-				fail("funInfo expects a function")
-			}
-			ps := callable.ParamSpecs()
-			params := make([]Value, 0, len(ps))
-			for _, p := range ps {
-				params = append(params, Map(map[string]Value{
-					"name": Str(p.Name),
-					"type": TypeVal(ip.ResolveType(p.Type, callable.ClosureEnv())),
-				}))
-			}
-			doc := callable.Doc()
-			if doc == "" && fv.Annot != "" {
-				doc = fv.Annot
-			}
-			return Map(map[string]Value{
-				"params": Arr(params),
-				"return": TypeVal(ip.ResolveType(callable.ReturnType(), callable.ClosureEnv())),
-				"doc":    Str(doc),
-			})
-		},
-	)
-	setBuiltinDoc(ip, "funInfo", `Return metadata for a function.
-
-The "params" array lists each parameter (in order), with its name and Type.
-The "return" field is the declared return Type of the function body.
-Use funType to obtain the full A -> B -> C arrow chain.
-
-Params:
-  f: Any — must be a function value
-
-Returns: {params:[{name:Str, type:Type}], return:Type, doc:Str}`)
-
-	// funType(f: Any) -> Type
-	ip.RegisterNative(
-		"funType",
-		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
-			return TypeVal(ip.ValueToType(fv, ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "funType", `Return the Type of a function.
-
-Multi-parameter function types are represented as right-associative arrows,
-e.g. (x:Int, y:Int) -> Int is written as Int -> Int -> Int.
-
-Params:
-  f: Any — must be a function value
-
-Returns: Type`)
-
-	// typeEquals(a: Type, b: Type) -> Bool
-	ip.RegisterNative(
-		"typeEquals",
-		[]ParamSpec{{Name: "a", Type: S{"id", "Type"}}, {Name: "b", Type: S{"id", "Type"}}},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("a")
-			bv := ctx.MustArg("b")
-			return Bool(equalS(av.Data.(S), bv.Data.(S)))
-		},
-	)
-	setBuiltinDoc(ip, "typeEquals", `Structural equality on Types.
-
-Resolves aliases before comparing. Arrow chains are compared structurally
-and right-associatively.
-
-Params:
-  a: Type
-  b: Type
-
-Returns: Bool`)
-
-	// typeFields(t: Type) -> [{name, type, required}]
-	ip.RegisterNative(
-		"typeFields",
-		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
-		S{"array", S{"map",
-			S{"pair!", S{"str", "name"}, S{"id", "Str"}},
-			S{"pair!", S{"str", "type"}, S{"id", "Type"}},
-			S{"pair!", S{"str", "required"}, S{"id", "Bool"}},
-		}},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			t := ip.ResolveType(tv.Data.(S), ctx.Env())
-			if len(t) == 0 || t[0].(string) != "map" {
-				return Arr(nil)
-			}
-			fs := mapTypeFields(t)
-			out := make([]Value, 0, len(fs))
-			for k, fi := range fs {
-				out = append(out, Map(map[string]Value{
-					"name":     Str(k),
-					"type":     TypeVal(fi.typ),
-					"required": Bool(fi.required),
-				}))
-			}
-			return Arr(out)
-		},
-	)
-	setBuiltinDoc(ip, "typeFields", `Return the declared fields of a map Type.
-
-Each item includes:
-  - name:     field name (Str)
-  - type:     field Type (Type)
-  - required: whether the field is required (Bool)
-
-Params:
-  t: Type — expected to be a map Type
-
-Returns: [{name:Str, type:Type, required:Bool}]`)
-
-	// arrayElemType(t: Type) -> Type?
-	ip.RegisterNative(
-		"arrayElemType",
-		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
-		S{"unop", "?", S{"id", "Type"}},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			t := ip.ResolveType(tv.Data.(S), ctx.Env())
-			if len(t) == 2 && t[0].(string) == "array" {
-				return TypeVal(t[1].(S))
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "arrayElemType", `If t is an array type [T], return T; otherwise null.
-
-Params:
-  t: Type
-
-Returns: Type?`)
-
-	// isNullable(t: Type) -> Bool
-	ip.RegisterNative(
-		"isNullable",
-		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			t := ip.ResolveType(tv.Data.(S), ctx.Env())
-			return Bool(len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?")
-		},
-	)
-	setBuiltinDoc(ip, "isNullable", `Return true if t is nullable (i.e., T?).
-
-Params:
-  t: Type
-
-Returns: Bool`)
-
-	// baseType(t: Type) -> Type
-	ip.RegisterNative(
-		"baseType",
-		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			bt, _ := deopt(ip.ResolveType(tv.Data.(S), ctx.Env()))
-			return TypeVal(bt)
-		},
-	)
-	setBuiltinDoc(ip, "baseType", `Strip nullable from T? and return the base Type.
-
-Params:
-  t: Type
-
-Returns: Type`)
-
-	// doc(x: Any) -> Str?
-	ip.RegisterNative(
-		"doc",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Str"}},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			if x.Annot == "" {
-				return Null
-			}
-			ln := strings.SplitN(x.Annot, "\n", 2)[0]
-			return Str(ln)
-		},
-	)
-	setBuiltinDoc(ip, "doc", `Return the first line of a value's docstring, or null if absent.
-
-Params:
-  x: Any — a value (functions often carry docstrings)
-
-Returns: Str?`)
-
-	// help(x: Any) -> Str?
-	ip.RegisterNative(
-		"help",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Str"}},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			if x.Annot == "" {
-				return Null
-			}
-			return Str(x.Annot)
-		},
-	)
-	setBuiltinDoc(ip, "help", `Return the full docstring attached to a value, or null if absent.
-
-Params:
-  x: Any
-
-Returns: Str?`)
-}
-
-// Map helpers (object utilities that must be native due to ordered/annotated maps).
-func registerMapBuiltins(ip *Interpreter) {
-	// mapHas(obj, key) -> Bool
-	ip.RegisterNative(
-		"mapHas",
-		[]ParamSpec{{"obj", S{"id", "Any"}}, {"key", S{"id", "Str"}}},
-		S{"id", "Bool"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("obj")
-			k := ctx.MustArg("key").Data.(string)
-			if v.Tag != VTMap {
-				fail("mapHas expects a map")
-			}
-			mo := v.Data.(*MapObject)
-			_, ok := mo.Entries[k]
-			return Bool(ok)
-		},
-	)
-	setBuiltinDoc(ip, "mapHas", `Return true if a key exists in a map.
-
-Params:
-  obj: {}  — a map value
-  key: Str — property name
-
-Returns: Bool`)
-
-	// mapDelete(obj, key) -> {}
-	ip.RegisterNative(
-		"mapDelete",
-		[]ParamSpec{{"obj", S{"id", "Any"}}, {"key", S{"id", "Str"}}},
-		S{"id", "Any"}, // returns the (mutated) input map
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("obj")
-			k := ctx.MustArg("key").Data.(string)
-			if v.Tag != VTMap {
-				fail("mapDelete expects a map")
-			}
-			mo := v.Data.(*MapObject)
-			if _, ok := mo.Entries[k]; !ok {
-				return v // no-op
-			}
-			// delete from Entries
-			delete(mo.Entries, k)
-			// delete annotation if present
-			delete(mo.KeyAnn, k)
-			// remove from Keys while preserving order
-			keys := mo.Keys[:0]
-			for _, kk := range mo.Keys {
-				if kk != k {
-					keys = append(keys, kk)
-				}
-			}
-			mo.Keys = keys
-			return v
-		},
-	)
-	setBuiltinDoc(ip, "mapDelete", `Delete a property from a map (in place).
-
-Preserves the key order and per-key annotations for the remaining entries.
-
-Params:
-  obj: {}  — a map value (mutated)
-  key: Str — property name to remove
-
-Returns: {} (the same map value)`)
-}
-=== END FILE: std_core.go ===
-
-=== BEGIN FILE: std_io_net.go ===
-package mindscript
-
-import (
-	"bufio"
-	"errors"
-	"fmt"
-	"io"
-	"net"
-	"os"
-	"strings"
-)
-
-// File handle (shared by all file I/O builtins)
-type fileH struct {
-	f    *os.File
-	rb   *bufio.Reader
-	wb   *bufio.Writer
-	hasR bool
-	hasW bool
-}
-
-// Sockets
-type netConnH struct {
-	c  net.Conn
-	rb *bufio.Reader
-	wb *bufio.Writer
-}
-
-type netListenerH struct {
-	ln net.Listener
-}
-
-// --- I/O primitives (file & network) ----------------------------------------
-
-func registerIOBuiltins(ip *Interpreter) {
-	openFile := func(path, mode string) (*fileH, error) {
-		var flag int
-		switch mode {
-		case "r":
-			flag = os.O_RDONLY
-		case "w":
-			flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-		case "a":
-			flag = os.O_WRONLY | os.O_CREATE | os.O_APPEND
-		case "rw":
-			flag = os.O_RDWR | os.O_CREATE
-		default:
-			return nil, fmt.Errorf("invalid mode %q", mode)
-		}
-		f, err := os.OpenFile(path, flag, 0o644)
-		if err != nil {
-			return nil, err
-		}
-		h := &fileH{f: f}
-		if strings.Contains(mode, "r") {
-			h.rb = bufio.NewReader(f)
-			h.hasR = true
-		}
-		if strings.Contains(mode, "w") || mode == "a" || mode == "rw" {
-			h.wb = bufio.NewWriter(f)
-			h.hasW = true
-		}
-		return h, nil
-	}
-
-	// helpers to fetch reader/writer across file or net handles
-	getReader := func(hv Value) (*bufio.Reader, string) {
-		h := asHandle(hv, "")
-		switch h.Kind {
-		case "file":
-			fh := h.Data.(*fileH)
-			if !fh.hasR {
-				fail("not readable")
-			}
-			return fh.rb, "file"
-		case "net":
-			nh := h.Data.(*netConnH)
-			return nh.rb, "net"
-		default:
-			fail("unsupported handle for read")
-			return nil, ""
-		}
-	}
-	getWriter := func(hv Value) (*bufio.Writer, string) {
-		h := asHandle(hv, "")
-		switch h.Kind {
-		case "file":
-			fh := h.Data.(*fileH)
-			if !fh.hasW {
-				fail("not writable")
-			}
-			return fh.wb, "file"
-		case "net":
-			nh := h.Data.(*netConnH)
-			return nh.wb, "net"
-		default:
-			fail("unsupported handle for write")
-			return nil, ""
-		}
-	}
-
-	ip.RegisterNative(
-		"open",
-		[]ParamSpec{
-			{Name: "path", Type: S{"id", "Str"}},
-			{Name: "mode", Type: S{"enum", S{"str", "r"}, S{"str", "w"}, S{"str", "a"}, S{"str", "rw"}}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			mv := ctx.MustArg("mode")
-			if pv.Tag != VTStr {
-				fail("open expects path: Str")
-			}
-			if mv.Tag != VTStr {
-				fail("open expects mode: Str")
-			}
-			h, err := openFile(pv.Data.(string), mv.Data.(string))
-			if err != nil {
-				fail(err.Error())
-			}
-			return HandleVal("file", h)
-		},
-	)
-	setBuiltinDoc(ip, "open", `Open a file and return a handle.
-
-Modes:
-  "r"  — read-only
-  "w"  — write (truncate or create)
-  "a"  — append (create if needed)
-  "rw" — read/write (create if needed)
-
-Params:
-  path: Str
-  mode: Str ("r" | "w" | "a" | "rw")
-
-Returns: file handle usable with read*/write/flush/close.`)
-
-	ip.RegisterNative(
-		"close",
-		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			h := asHandle(ctx.MustArg("h"), "")
-			switch h.Kind {
-			case "file":
-				fh := h.Data.(*fileH)
-				if fh.wb != nil {
-					_ = fh.wb.Flush()
-				}
-				_ = fh.f.Close()
-			case "net":
-				nh := h.Data.(*netConnH)
-				if nh.wb != nil {
-					_ = nh.wb.Flush()
-				}
-				_ = nh.c.Close()
-			default:
-				fail("unsupported handle for close")
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "close", `Close a file or network handle.
-
-Flushes buffered output (if any) before closing. Safe to call exactly once.`)
-
-	ip.RegisterNative(
-		"readAll",
-		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Str"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			rb, _ := getReader(ctx.MustArg("h"))
-			b, err := io.ReadAll(rb)
-			if err != nil {
-				fail(err.Error())
-			}
-			return Str(string(b))
-		},
-	)
-	setBuiltinDoc(ip, "readAll", `Read all remaining bytes from a handle.
-
-Blocks until EOF and returns the data as Str.`)
-
-	ip.RegisterNative(
-		"readN",
-		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}, {Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Str"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			rb, _ := getReader(ctx.MustArg("h"))
-			nv := ctx.MustArg("n")
-			n := int(nv.Data.(int64))
-			buf := make([]byte, n)
-			k, err := io.ReadFull(rb, buf)
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				fail(err.Error())
-			}
-			return Str(string(buf[:k]))
-		},
-	)
-	setBuiltinDoc(ip, "readN", `Read up to n bytes from a handle.
-
-May return fewer than n bytes at EOF. Returns data as Str.`)
-
-	ip.RegisterNative(
-		"readLine",
-		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Str"}},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			rb, _ := getReader(ctx.MustArg("h"))
-			s, err := rb.ReadString('\n')
-			if errors.Is(err, io.EOF) && s == "" {
-				return Null
-			}
-			if err != nil && !errors.Is(err, io.EOF) {
-				fail(err.Error())
-			}
-			return Str(strings.TrimRight(s, "\n"))
-		},
-	)
-	setBuiltinDoc(ip, "readLine", `Read one line from a handle (without the trailing newline).
-
-Returns null at EOF.`)
-
-	ip.RegisterNative(
-		"write",
-		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}, {Name: "s", Type: S{"id", "Str"}}},
-		S{"id", "Int"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			wb, _ := getWriter(ctx.MustArg("h"))
-			sv := ctx.MustArg("s")
-			n, err := wb.WriteString(sv.Data.(string))
-			if err != nil {
-				fail(err.Error())
-			}
-			return Int(int64(n))
-		},
-	)
-	setBuiltinDoc(ip, "write", `Write a string to a file or network handle.
-
-Returns the number of bytes written. Output is buffered; call flush to ensure delivery.`)
-
-	ip.RegisterNative(
-		"flush",
-		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			wb, _ := getWriter(ctx.MustArg("h"))
-			if err := wb.Flush(); err != nil {
-				fail(err.Error())
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "flush", `Flush buffered output for a handle.
-
-Ensures written data is visible to readers/peers.`)
-
-	ip.RegisterNative(
-		"readFile",
-		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			b, err := os.ReadFile(pv.Data.(string))
-			if err != nil {
-				fail(err.Error())
-			}
-			return Str(string(b))
-		},
-	)
-	setBuiltinDoc(ip, "readFile", `Read an entire file into a string.
-
-Params:
-  path: Str
-
-Returns: Str`)
-
-	ip.RegisterNative(
-		"writeFile",
-		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}, {Name: "data", Type: S{"id", "Str"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			dv := ctx.MustArg("data")
-			if err := os.WriteFile(pv.Data.(string), []byte(dv.Data.(string)), 0o644); err != nil {
-				fail(err.Error())
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "writeFile", `Write a string to a file (overwriting if it exists).
-
-Creates the file if necessary with mode 0644.`)
-
-	ip.RegisterNative(
-		"listDir",
-		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"array", S{"id", "Str"}},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			ents, err := os.ReadDir(pv.Data.(string))
-			if err != nil {
-				fail(err.Error())
-			}
-			out := make([]Value, 0, len(ents))
-			for _, e := range ents {
-				out = append(out, Str(e.Name()))
-			}
-			return Arr(out)
-		},
-	)
-	setBuiltinDoc(ip, "listDir", `List directory entries as an array of names.
-
-Params:
-  path: Str
-
-Returns: [Str] (names only, no paths)`)
-
-	// Bind std streams with doc
-	ip.Core.Define("stdin",
-		withAnnot(
-			HandleVal("file", &fileH{f: os.Stdin, rb: bufio.NewReader(os.Stdin), hasR: true}),
-			`Standard input stream handle.
-
-Readable; use readLine/readN/readAll.`))
-
-	ip.Core.Define("stdout",
-		withAnnot(
-			HandleVal("file", &fileH{f: os.Stdout, wb: bufio.NewWriter(os.Stdout), hasW: true}),
-			`Standard output stream handle.
-
-Writable; use write/flush.`))
-
-	ip.Core.Define("stderr",
-		withAnnot(
-			HandleVal("file", &fileH{f: os.Stderr, wb: bufio.NewWriter(os.Stderr), hasW: true}),
-			`Standard error stream handle.
-
-Writable; use write/flush.`))
-}
-
-// --- Networking --------------------------------------------------------------
-
-func registerNetBuiltins(ip *Interpreter) {
-	// netConnect("host:port") -> "net" handle
-	ip.RegisterNative(
-		"netConnect",
-		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("addr")
-			conn, err := net.Dial("tcp", av.Data.(string))
-			if err != nil {
-				fail(err.Error())
-			}
-			return HandleVal("net", &netConnH{
-				c:  conn,
-				rb: bufio.NewReader(conn),
-				wb: bufio.NewWriter(conn),
-			})
-		},
-	)
-	setBuiltinDoc(ip, "netConnect", `Open a TCP connection to "host:port".
-
-Returns a network handle usable with read*/write/flush/close.`)
-
-	// netListen("host:port") -> "listener" handle
-	ip.RegisterNative(
-		"netListen",
-		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("addr")
-			ln, err := net.Listen("tcp", av.Data.(string))
-			if err != nil {
-				fail(err.Error())
-			}
-			return HandleVal("listener", &netListenerH{ln: ln})
-		},
-	)
-	setBuiltinDoc(ip, "netListen", `Listen on a TCP address "host:port".
-
-Returns a listener handle for netAccept. Use close(listener) to stop listening.`)
-
-	// netAccept(listener) -> "net" handle
-	ip.RegisterNative(
-		"netAccept",
-		[]ParamSpec{{Name: "l", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			ln := asHandle(ctx.MustArg("l"), "listener").Data.(*netListenerH).ln
-			conn, err := ln.Accept()
-			if err != nil {
-				fail(err.Error())
-			}
-			return HandleVal("net", &netConnH{
-				c:  conn,
-				rb: bufio.NewReader(conn),
-				wb: bufio.NewWriter(conn),
-			})
-		},
-	)
-	setBuiltinDoc(ip, "netAccept", `Accept one TCP connection from a listener.
-
-Blocks until a client connects. Returns a network handle.`)
-}
-=== END FILE: std_io_net.go ===
-
-=== BEGIN FILE: std_sys.go ===
-package mindscript
-
-import (
-	"encoding/json"
-	"fmt"
-	"math"
-	"math/rand"
-	"os"
+	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 )
 
-// --- Concurrency primitives -------------------------------------------------
+/* ---------- globals & tiny helpers ---------- */
 
-type procState struct {
-	done   chan struct{}
-	result Value
-	cancel chan struct{} // cooperative
-}
+var MaxInlineWidth = 80 // width threshold for single-line arrays/maps
 
-// Channel box (shared by all channel builtins)
-type chanBox struct {
-	ch chan Value
-}
-
-// --- Deep copy & snapshot for isolated worlds --------------------------------
-
-func snapshotEnv(e *Env) *Env {
-	// Flatten chain into one level (shadowing by nearer scopes wins).
-	flat := map[string]Value{}
-	for cur := e; cur != nil; cur = cur.parent {
-		for k, v := range cur.table {
-			if _, exists := flat[k]; !exists {
-				flat[k] = cloneValue(v)
-			}
+func isIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	rs := []rune(s)
+	if !(unicode.IsLetter(rs[0]) || rs[0] == '_') {
+		return false
+	}
+	for _, r := range rs[1:] {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return false
 		}
 	}
-	cp := NewEnv(nil)
-	for k, v := range flat {
-		cp.Define(k, v)
+	return true
+}
+
+func quoteString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			b.WriteRune(r)
+		}
 	}
-	return cp
+	b.WriteByte('"')
+	return b.String()
 }
 
-func registerConcurrencyBuiltins(ip *Interpreter) {
-	// spawn(f: Any->Any) -> Any (proc handle)
-	ip.RegisterNative(
-		"procSpawn",
-		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
-			if fv.Tag != VTFun {
-				fail("spawn expects a function")
-			}
+/* ---------- small writer with indentation & annotations ---------- */
 
-			// TODO(engine): provide engine API to rebind a callable's closure env
-			// e.g., CloneCallableWithEnv(fn, snapshotEnv). For now, copy *Fun.
-			fn := fv.Data.(*Fun)
-
-			// Snapshot closure env for isolation
-			snap := snapshotEnv(fn.Env)
-			// Clone function onto the snapshot
-			work := &Fun{
-				Params:     append([]string{}, fn.Params...),
-				ParamTypes: append([]S{}, fn.ParamTypes...),
-				ReturnType: fn.ReturnType,
-				Body:       fn.Body,
-				Env:        snap,
-				HiddenNull: fn.HiddenNull,
-			}
-
-			pr := &procState{done: make(chan struct{}), cancel: make(chan struct{})}
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						switch sig := r.(type) {
-						case returnSig:
-							pr.result = sig.v
-						case rtErr:
-							pr.result = errNull(sig.msg)
-						default:
-							pr.result = errNull(fmt.Sprintf("runtime panic: %v", r))
-						}
-					}
-					close(pr.done)
-				}()
-				pr.result = ip.execFunBodyScoped(work, nil)
-			}()
-			return HandleVal("proc", pr)
-		},
-	)
-	setBuiltinDoc(ip, "procSpawn", `Run a function in a new lightweight process.
-
-The function runs concurrently with the caller in an isolated snapshot of its
-closure environment (variables are deep-copied where applicable). Pass a
-fully-applied function (no missing parameters).
-
-Params:
-  f: (Any -> Any) — work to execute
-
-Returns:
-  proc handle (opaque)
-
-Notes:
-  • Use procJoin(proc) to retrieve the result.
-  • If the process fails, join returns an annotated null with the error message.
-  • Use procCancel(proc) to request cooperative cancellation (best effort).`)
-
-	ip.RegisterNative(
-		"procJoin",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("p")
-			pr := asHandle(pv, "proc").Data.(*procState)
-			<-pr.done
-			return pr.result
-		},
-	)
-	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.
-
-Params:
-  p: proc — a handle returned by procSpawn
-
-Returns:
-  Any — the function's result, or an annotated null if the process failed.`)
-
-	ip.RegisterNative(
-		"cancel",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("p")
-			pr := asHandle(pv, "proc").Data.(*procState)
-			select {
-			case <-pr.cancel:
-			default:
-				close(pr.cancel)
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process.
-
-Cancellation is best-effort: user code/libraries may choose to observe the
-request and stop early.
-
-Params:
-  p: proc — a handle returned by procSpawn
-
-Returns:
-  Null`)
-
-	// Channels (untyped)
-	ip.RegisterNative("chan", nil, S{"id", "Any"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return HandleVal("chan", &chanBox{ch: make(chan Value)})
-	})
-	setBuiltinDoc(ip, "chan", `Create a new unbuffered channel.
-
-Channels transport arbitrary values between concurrent processes.
-
-Returns:
-  chan handle (opaque)
-
-See also:
-  chanSend, chanRecv, chanClose`)
-
-	ip.RegisterNative(
-		"chanSend",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			x := ctx.MustArg("x")
-			cb.ch <- x
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "chanSend", `Send a value on a channel.
-
-Blocks until a receiver is ready (unbuffered semantics).
-
-Params:
-  c: chan — channel handle
-  x: Any  — value to send
-
-Returns:
-  Null`)
-
-	ip.RegisterNative(
-		"chanRecv",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			v, ok := <-cb.ch
-			if !ok {
-				return annotNull("channel closed")
-			}
-			return v
-		},
-	)
-	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel.
-
-Blocks until a sender is ready. After chanClose(c), further receives return an
-annotated null with the message "channel closed".
-
-Params:
-  c: chan — channel handle
-
-Returns:
-  Any — the received value, or annotated null after close`)
-
-	ip.RegisterNative(
-		"chanClose",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			close(cb.ch)
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "chanClose", `Close a channel.
-
-After closing:
-  • chanRecv returns an annotated null ("channel closed")
-  • Sending on a closed channel is an error
-
-Params:
-  c: chan — channel handle
-
-Returns:
-  Null`)
+type out struct {
+	b     *strings.Builder
+	depth int
 }
 
-// --- Utilities: time, rand, json --------------------------------------------
+func (o *out) write(s string) { o.b.WriteString(s) }
+func (o *out) nl()            { o.b.WriteByte('\n') }
+func (o *out) pad() {
+	for i := 0; i < o.depth; i++ {
+		o.b.WriteString("  ")
+	}
+}
+func (o *out) line(s string)        { o.pad(); o.b.WriteString(s) }
+func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
+func (o *out) annot(text string) {
+	if text == "" {
+		return
+	}
+	for _, ln := range strings.Split(text, "\n") {
+		o.line("# " + strings.TrimSpace(ln))
+		o.nl()
+	}
+}
 
-func cloneValue(v Value) Value {
-	switch v.Tag {
-	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
-		return v
-	case VTArray:
-		xs := v.Data.([]Value)
-		cp := make([]Value, len(xs))
-		for i := range xs {
-			cp[i] = cloneValue(xs[i])
+/* ---------- source -> pretty (AST printer) ---------- */
+
+// Pretty parses MindScript source and returns a formatted version (no colors).
+func Pretty(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return "", WrapErrorWithSource(err, src)
+	}
+	return FormatSExpr(ast), nil
+}
+
+// FormatSExpr pretty-prints a parsed s-expr AST.
+func FormatSExpr(n S) string {
+	var b strings.Builder
+	p := pp{out: out{b: &b}}
+	p.printProgram(n)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+type pp struct {
+	out out
+}
+
+func (p *pp) write(s string) { p.out.write(s) }
+func (p *pp) nl()            { p.out.nl() }
+func (p *pp) sp()            { p.out.write(" ") }
+func (p *pp) pad()           { p.out.pad() }
+
+func (p *pp) printProgram(n S) {
+	if tag(n) != "block" {
+		p.printStmt(n)
+		return
+	}
+	kids := children(n)
+	for i, k := range kids {
+		p.printStmt(k.(S))
+		if i < len(kids)-1 {
+			p.nl()
 		}
-		return Arr(cp)
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		// Deep-copy entries
-		entries := make(map[string]Value, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			entries[k] = cloneValue(vv)
+	}
+}
+
+func (p *pp) printStmt(n S) {
+	switch tag(n) {
+	case "annot":
+		text := getStr(child(n, 0))
+		p.out.annot(text)
+		p.printStmt(child(n, 1))
+
+	case "fun":
+		p.pad()
+		p.write("fun(")
+		p.printParams(child(n, 0))
+		p.write(")")
+		ret := child(n, 1)
+		if !(tag(ret) == "id" && getId(ret) == "Any") {
+			p.sp()
+			p.write("->")
+			p.sp()
+			p.printExpr(ret, 0)
 		}
-		// Preserve insertion order and per-key annotations
-		keys := make([]string, len(mo.Keys))
-		copy(keys, mo.Keys)
-		keyAnn := make(map[string]string, len(mo.KeyAnn))
-		for k, ann := range mo.KeyAnn {
-			keyAnn[k] = ann
+		p.sp()
+		p.write("do")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(child(n, 2)) })
+		if len(child(n, 2)) > 1 {
+			p.nl()
 		}
-		return Value{
-			Tag: VTMap,
-			Data: &MapObject{
-				Entries: entries,
-				KeyAnn:  keyAnn,
-				Keys:    keys,
-			},
+		p.pad()
+		p.write("end")
+
+	case "oracle":
+		p.pad()
+		p.write("oracle(")
+		p.printParams(child(n, 0))
+		p.write(")")
+		out := child(n, 1)
+		if !(tag(out) == "id" && getId(out) == "Any") {
+			p.sp()
+			p.write("->")
+			p.sp()
+			p.printExpr(out, 0)
 		}
+		srcs := child(n, 2)
+		if len(srcs) > 1 {
+			p.sp()
+			p.write("from ")
+			p.printArray(srcs)
+		}
+
+	case "for":
+		p.pad()
+		p.write("for ")
+		p.printExpr(child(n, 0), 0)
+		p.sp()
+		p.write("in ")
+		p.printExpr(child(n, 1), 0)
+		p.sp()
+		p.write("do")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(child(n, 2)) })
+		if len(child(n, 2)) > 1 {
+			p.nl()
+		}
+		p.pad()
+		p.write("end")
+
+	case "if":
+		arms := children(n)
+		first := arms[0].(S)
+		p.pad()
+		p.write("if ")
+		p.printExpr(child(first, 0), 0)
+		p.sp()
+		p.write("then")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(child(first, 1)) })
+		if len(child(first, 1)) > 1 {
+			p.nl()
+		}
+		i := 1
+		for i < len(arms) && tag(arms[i].(S)) == "pair" {
+			arm := arms[i].(S)
+			p.pad()
+			p.write("elif ")
+			p.printExpr(child(arm, 0), 0)
+			p.sp()
+			p.write("then")
+			p.nl()
+			p.out.withIndent(func() { p.printBlock(child(arm, 1)) })
+			if len(child(arm, 1)) > 1 {
+				p.nl()
+			}
+			i++
+		}
+		if i < len(arms) {
+			elseBlk := arms[i].(S)
+			p.pad()
+			p.write("else")
+			p.nl()
+			p.out.withIndent(func() { p.printBlock(elseBlk) })
+			if len(elseBlk) > 1 {
+				p.nl()
+			}
+		}
+		p.pad()
+		p.write("end")
+
+	case "type":
+		p.pad()
+		p.write("type ")
+		p.printExpr(child(n, 0), 0)
+
+	case "return":
+		p.pad()
+		p.write("return(")
+		p.printExpr(child(n, 0), 0)
+		p.write(")")
+
+	case "break":
+		p.pad()
+		p.write("break(")
+		p.printExpr(child(n, 0), 0)
+		p.write(")")
+
+	case "continue":
+		p.pad()
+		p.write("continue(")
+		p.printExpr(child(n, 0), 0)
+		p.write(")")
+
+	case "assign":
+		lhs, rhs := child(n, 0), child(n, 1)
+		p.pad()
+		if isDeclPattern(lhs) {
+			p.write("let ")
+			p.printPattern(lhs)
+			p.sp()
+			p.write("=")
+			p.sp()
+			p.printExpr(rhs, 0)
+		} else {
+			p.printExpr(lhs, 0)
+			p.sp()
+			p.write("=")
+			p.sp()
+			p.printExpr(rhs, 0)
+		}
+
+	case "block":
+		p.pad()
+		p.write("do")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(n) })
+		p.pad()
+		p.write("end")
+
 	default:
-		// Userdata/modules are NOT copied; processes should not capture them.
-		return v
+		p.pad()
+		p.printExpr(n, 0)
 	}
 }
 
-func registerUtilityBuiltins(ip *Interpreter) {
-	ip.RegisterNative("nowMillis", nil, S{"id", "Int"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return Int(time.Now().UnixMilli())
-	})
-	setBuiltinDoc(ip, "nowMillis", `Current wall-clock time in milliseconds since the Unix epoch.
-
-Returns:
-  Int`)
-
-	ip.RegisterNative(
-		"clone",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return cloneValue(ctx.MustArg("x"))
-		},
-	)
-	setBuiltinDoc(ip, "clone", `Deep-copy arrays and maps.
-
-For maps, preserves key order and per-key annotations. Primitive values are
-returned as-is. Functions, modules, and handles are not duplicated (identity
-is preserved).
-
-Params:
-  x: Any
-
-Returns:
-  Any — a structurally independent copy for arrays/maps`)
-
-	ip.RegisterNative(
-		"sleep",
-		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms")
-			time.Sleep(time.Duration(ms.Data.(int64)) * time.Millisecond)
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "sleep", `Pause execution for a number of milliseconds.
-
-Params:
-  ms: Int — milliseconds to sleep
-
-Returns:
-  Null`)
-
-	var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
-	ip.RegisterNative(
-		"seedRand",
-		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n")
-			rng.Seed(n.Data.(int64))
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "seedRand", `Seed the pseudo-random number generator.
-
-Use a fixed seed for reproducible sequences.
-
-Params:
-  n: Int — seed value
-
-Returns:
-  Null`)
-
-	ip.RegisterNative("randInt",
-		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Int"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n")
-			return Int(int64(rng.Intn(int(n.Data.(int64)))))
-		},
-	)
-	setBuiltinDoc(ip, "randInt", `Uniform random integer in [0, n).
-
-Params:
-  n: Int — upper bound (must be > 0)
-
-Returns:
-  Int`)
-
-	ip.RegisterNative("randFloat", nil, S{"id", "Num"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return Num(rng.Float64())
-	})
-	setBuiltinDoc(ip, "randFloat", `Uniform random number in [0.0, 1.0).
-
-Returns:
-  Num`)
-
-	// JSON
-	ip.RegisterNative(
-		"jsonParse",
-		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			sv := ctx.MustArg("s")
-			var x any
-			if err := json.Unmarshal([]byte(sv.Data.(string)), &x); err != nil {
-				fail(err.Error())
-			}
-			return goJSONToValue(x)
-		},
-	)
-	setBuiltinDoc(ip, "jsonParse", `Parse a JSON string into MindScript values.
-
-Mapping rules:
-  • null/bool/number/string map to Null/Bool/Int|Num/Str
-  • arrays map to [Any]
-  • objects map to {Str: Any}
-  • integral JSON numbers become Int; other numbers become Num
-
-Params:
-  s: Str — JSON text
-
-Returns:
-  Any`)
-
-	ip.RegisterNative(
-		"jsonStringify",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Str"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			xv := ctx.MustArg("x")
-			b, err := json.Marshal(valueToGoJSON(xv))
-			if err != nil {
-				fail(err.Error())
-			}
-			return Str(string(b))
-		},
-	)
-	setBuiltinDoc(ip, "jsonStringify", `Serialize a value to a compact JSON string.
-
-Arrays and maps are emitted as JSON arrays/objects. Object key order is not
-guaranteed.
-
-Params:
-  x: Any
-
-Returns:
-  Str`)
+func (p *pp) printBlock(n S) {
+	if tag(n) != "block" {
+		p.printStmt(n)
+		return
+	}
+	kids := children(n)
+	for i, k := range kids {
+		p.printStmt(k.(S))
+		if i < len(kids)-1 {
+			p.nl()
+		}
+	}
 }
 
-func goJSONToValue(x any) Value {
-	switch v := x.(type) {
-	case nil:
-		return Null
-	case bool:
-		return Bool(v)
-	case float64:
-		// JSON numbers are float64; cast to Int if integral
-		if math.Trunc(v) == v {
-			return Int(int64(v))
+func (p *pp) printParams(arr S) {
+	if tag(arr) != "array" || len(arr) == 1 {
+		return
+	}
+	items := children(arr)
+	for i, it := range items {
+		pi := it.(S)
+		name := getId(child(pi, 0))
+		p.write(name)
+		ty := child(pi, 1)
+		if !(tag(ty) == "id" && getId(ty) == "Any") {
+			p.write(": ")
+			p.printExpr(ty, 0)
 		}
-		return Num(v)
-	case string:
-		return Str(v)
-	case []any:
-		out := make([]Value, len(v))
-		for i := range v {
-			out[i] = goJSONToValue(v[i])
+		if i < len(items)-1 {
+			p.write(", ")
 		}
-		return Arr(out)
-	case map[string]any:
-		m := make(map[string]Value, len(v))
-		for k, vv := range v {
-			m[k] = goJSONToValue(vv)
+	}
+}
+
+func (p *pp) printExpr(n S, _ctx int) {
+	switch tag(n) {
+	case "id":
+		p.write(getId(n))
+	case "int":
+		p.write(fmt.Sprint(n[1]))
+	case "num":
+		f := n[1].(float64)
+		s := strconv.FormatFloat(f, 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
 		}
-		return Map(m)
+		p.write(s)
+	case "str":
+		p.write(quoteString(getStr(n)))
+	case "bool":
+		if n[1].(bool) {
+			p.write("true")
+		} else {
+			p.write("false")
+		}
+	case "null":
+		p.write("null")
+	case "unop":
+		op := n[1].(string)
+		if op == "?" {
+			recv := n[2].(S)
+			if prec(recv) < 90 {
+				p.write("(")
+				p.printExpr(recv, 0)
+				p.write(")")
+			} else {
+				p.printExpr(recv, 90)
+			}
+			p.write("?")
+			return
+		}
+		if op == "not" {
+			p.write("not ")
+		} else {
+			p.write(op)
+		}
+		operand := n[2].(S)
+		if prec(operand) < 80 {
+			p.write("(")
+			p.printExpr(operand, 0)
+			p.write(")")
+		} else {
+			p.printExpr(operand, 80)
+		}
+	case "binop":
+		op := n[1].(string)
+		my := binopPrec(op)
+		l, r := n[2].(S), n[3].(S)
+		if prec(l) < my {
+			p.write("(")
+			p.printExpr(l, 0)
+			p.write(")")
+		} else {
+			p.printExpr(l, my)
+		}
+		p.write(" " + op + " ")
+		if prec(r) < my {
+			p.write("(")
+			p.printExpr(r, 0)
+			p.write(")")
+		} else {
+			p.printExpr(r, my)
+		}
+	case "assign":
+		l, r := child(n, 0), child(n, 1)
+		if prec(l) < 10 {
+			p.write("(")
+			p.printExpr(l, 0)
+			p.write(")")
+		} else {
+			p.printExpr(l, 10)
+		}
+		p.write(" = ")
+		if prec(r) < 10 {
+			p.write("(")
+			p.printExpr(r, 0)
+			p.write(")")
+		} else {
+			p.printExpr(r, 10)
+		}
+	case "call":
+		recv := child(n, 0)
+		if prec(recv) < 90 {
+			p.write("(")
+			p.printExpr(recv, 0)
+			p.write(")")
+		} else {
+			p.printExpr(recv, 90)
+		}
+		p.write("(")
+		for i := 2; i < len(n); i++ {
+			if i > 2 {
+				p.write(", ")
+			}
+			p.printExpr(n[i].(S), 0)
+		}
+		p.write(")")
+	case "idx":
+		recv := child(n, 0)
+		if prec(recv) < 90 {
+			p.write("(")
+			p.printExpr(recv, 0)
+			p.write(")")
+		} else {
+			p.printExpr(recv, 90)
+		}
+		p.write("[")
+		p.printExpr(child(n, 1), 0)
+		p.write("]")
+	case "get":
+		recv := child(n, 0)
+		if prec(recv) < 90 {
+			p.write("(")
+			p.printExpr(recv, 0)
+			p.write(")")
+		} else {
+			p.printExpr(recv, 90)
+		}
+		name := getStr(child(n, 1))
+		if isIdent(name) {
+			p.write("." + name)
+		} else {
+			p.write("." + quoteString(name))
+		}
+	case "array":
+		p.printArray(n)
+	case "map":
+		p.printMap(n)
+
+	case "enum":
+		// Type expression: Enum[ <lits...> ]
+		p.write("Enum[")
+		items := children(n)
+		for i, it := range items {
+			if i > 0 {
+				p.write(", ")
+			}
+			p.printExpr(it.(S), 0) // literals can be scalars, arrays, or maps
+		}
+		p.write("]")
+
+	case "decl":
+		p.write("let " + getId(n))
+	case "return", "break", "continue", "fun", "oracle", "for", "if", "type", "block", "annot":
+		p.printStmt(n)
 	default:
-		return annotNull("unsupported JSON value")
+		p.write("<" + tag(n) + ">")
 	}
 }
 
-func valueToGoJSON(v Value) any {
+func (p *pp) printArray(n S) {
+	p.write("[")
+	for i, it := range children(n) {
+		if i > 0 {
+			p.write(", ")
+		}
+		p.printExpr(it.(S), 0)
+	}
+	p.write("]")
+}
+
+func (p *pp) printMap(n S) {
+	p.write("{")
+	items := children(n)
+	for i, pr := range items {
+		if i > 0 {
+			p.write(", ")
+		}
+		pair := pr.(S)
+		keyNode := child(pair, 0)
+		key, keyAnn := unwrapKey(keyNode)
+
+		if keyAnn != "" {
+			// put the annotation as a line comment just before the field
+			p.nl()
+			p.out.withIndent(func() {
+				p.pad()
+				p.out.annot(keyAnn)
+			})
+			p.pad()
+		}
+
+		if isIdent(key) {
+			p.write(key)
+		} else {
+			p.write(quoteString(key))
+		}
+		p.write(": ")
+		p.printExpr(child(pair, 1), 0)
+
+		// if we emitted a leading annotation, keep items nicely lined up
+		if keyAnn != "" && i < len(items)-1 {
+			p.write(", ")
+		}
+	}
+	p.write("}")
+}
+
+/* ---------- tiny AST helpers ---------- */
+
+func tag(n S) string     { return n[0].(string) }
+func children(n S) []any { return n[1:] }
+func child(n S, i int) S { return n[i+1].(S) }
+func getId(n S) string   { return n[1].(string) }
+func getStr(n S) string  { return n[1].(string) }
+
+func prec(n S) int {
+	switch tag(n) {
+	case "assign":
+		return 10
+	case "binop":
+		return binopPrec(n[1].(string))
+	case "unop":
+		if n[1].(string) == "?" {
+			return 90
+		}
+		return 80
+	case "call", "idx", "get":
+		return 90
+	default:
+		return 100
+	}
+}
+
+func unwrapKey(n S) (name string, annot string) {
+	for tag(n) == "annot" {
+		annot += getStr(child(n, 0))
+		n = child(n, 1)
+	}
+	return getStr(n), annot
+}
+
+func binopPrec(op string) int {
+	switch op {
+	case "->":
+		return 15
+	case "*", "/", "%":
+		return 70
+	case "+", "-":
+		return 60
+	case "<", "<=", ">", ">=":
+		return 50
+	case "==", "!=":
+		return 40
+	case "and":
+		return 30
+	case "or":
+		return 20
+	default:
+		return 60
+	}
+}
+
+func isDeclPattern(n S) bool {
+	switch tag(n) {
+	case "decl", "darr", "dobj":
+		return true
+	case "annot":
+		return isDeclPattern(child(n, 1))
+	default:
+		return false
+	}
+}
+
+func (p *pp) printPattern(n S) {
+	switch tag(n) {
+	case "decl":
+		p.write(getId(n))
+	case "darr":
+		p.write("[")
+		for i := 1; i < len(n); i++ {
+			if i > 1 {
+				p.write(", ")
+			}
+			p.printPattern(n[i].(S))
+		}
+		p.write("]")
+	case "dobj":
+		items := children(n)
+		needsMultiline := false
+		for _, it := range items {
+			if tag(it.(S)[2].(S)) == "annot" {
+				needsMultiline = true
+				break
+			}
+		}
+		if !needsMultiline {
+			p.write("{")
+			for i, it := range items {
+				if i > 0 {
+					p.write(", ")
+				}
+				pr := it.(S)
+				key := getStr(child(pr, 0))
+				if isIdent(key) {
+					p.write(key)
+				} else {
+					p.write(quoteString(key))
+				}
+				p.write(": ")
+				p.printPattern(child(pr, 1))
+			}
+			p.write("}")
+			return
+		}
+		p.write("{")
+		p.nl()
+		p.out.withIndent(func() {
+			for i, it := range items {
+				pr := it.(S)
+				p.pad()
+				key := getStr(child(pr, 0))
+				if isIdent(key) {
+					p.write(key)
+				} else {
+					p.write(quoteString(key))
+				}
+				p.write(": ")
+				val := child(pr, 1)
+				if tag(val) == "annot" {
+					p.nl()
+					p.printPattern(val)
+				} else {
+					p.printPattern(val)
+				}
+				if i < len(items)-1 {
+					p.write(",")
+				}
+				p.nl()
+			}
+		})
+		p.pad()
+		p.write("}")
+	case "annot":
+		p.out.annot(getStr(child(n, 0)))
+		p.pad()
+		p.printPattern(child(n, 1))
+	default:
+		p.printExpr(n, 0)
+	}
+}
+
+/* ---------- Type pretty-printer ---------- */
+
+// FormatType renders a type S-expr to a compact, readable string.
+func FormatType(t S) string {
+	var b strings.Builder
+	o := out{b: &b}
+	writeType(&o, t)
+	return b.String()
+}
+
+func writeType(o *out, t S) {
+	tagOf := func(x S) string {
+		if len(x) == 0 {
+			return ""
+		}
+		return x[0].(string)
+	}
+
+	switch tagOf(t) {
+	case "id":
+		o.write(t[1].(string))
+
+	case "unop":
+		if len(t) >= 3 && t[1].(string) == "?" {
+			writeType(o, t[2].(S))
+			o.write("?")
+			return
+		}
+		o.write("<unop>")
+
+	case "array":
+		o.write("[")
+		elem := S{"id", "Any"}
+		if len(t) == 2 {
+			elem = t[1].(S)
+		}
+		writeType(o, elem)
+		o.write("]")
+
+	case "enum":
+		o.write("Enum[")
+		for i := 1; i < len(t); i++ {
+			if i > 1 {
+				o.write(", ")
+			}
+			writeTypeLiteral(o, t[i].(S))
+		}
+		o.write("]")
+
+	case "map":
+		type field struct {
+			name     string
+			required bool
+			typ      S
+			keyAnnot string
+			valAnnot string
+		}
+		fs := make([]field, 0, len(t)-1)
+		for i := 1; i < len(t); i++ {
+			p := t[i].(S) // ("pair"|"pair!", keyNode, T or ("annot", ("str",doc), T))
+			req := p[0].(string) == "pair!"
+			keyNode := p[1].(S)
+			key, keyAnn := unwrapKey(keyNode)
+			ft := p[2].(S)
+			valAnn := ""
+			if len(ft) > 0 && ft[0].(string) == "annot" {
+				valAnn = ft[1].(S)[1].(string)
+				ft = ft[2].(S)
+			}
+			fs = append(fs, field{name: key, required: req, typ: ft, keyAnnot: keyAnn, valAnnot: valAnn})
+		}
+		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
+
+		o.write("{")
+		o.nl()
+		o.withIndent(func() {
+			for i, f := range fs {
+				if f.keyAnnot != "" {
+					o.annot(f.keyAnnot)
+				}
+				if f.valAnnot != "" {
+					o.annot(f.valAnnot)
+				}
+				o.pad()
+				if isIdent(f.name) {
+					o.write(f.name)
+				} else {
+					o.write(quoteString(f.name))
+				}
+				if f.required {
+					o.write("!")
+				}
+				o.write(": ")
+				writeType(o, f.typ)
+				if i < len(fs)-1 {
+					o.write(",")
+				}
+				o.nl()
+			}
+		})
+		o.pad()
+		o.write("}")
+
+	case "binop":
+		if len(t) >= 4 && t[1].(string) == "->" {
+			params, ret := flattenArrow(t)
+			o.write("(")
+			for i := range params {
+				if i > 0 {
+					o.write(", ")
+				}
+				writeType(o, params[i])
+			}
+			o.write(") -> ")
+			writeType(o, ret)
+			return
+		}
+		o.write("<binop>")
+
+	case "annot":
+		o.annot(t[1].(S)[1].(string))
+		writeType(o, t[2].(S))
+
+	default:
+		o.write("<type>")
+	}
+}
+
+func writeTypeLiteral(o *out, lit S) {
+	switch lit[0].(string) {
+	case "null":
+		o.write("null")
+	case "bool":
+		if lit[1].(bool) {
+			o.write("true")
+		} else {
+			o.write("false")
+		}
+	case "int":
+		o.write(fmt.Sprint(lit[1]))
+	case "num":
+		o.write(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
+	case "str":
+		o.write(quoteString(lit[1].(string)))
+
+	// Allow complex enum members (arrays/maps) for schema-like enums
+	case "array":
+		o.write("[")
+		for i := 1; i < len(lit); i++ {
+			if i > 1 {
+				o.write(", ")
+			}
+			writeTypeLiteral(o, lit[i].(S))
+		}
+		o.write("]")
+	case "map":
+		o.write("{")
+		items := children(lit)
+		for i, pr := range items {
+			if i > 0 {
+				o.write(", ")
+			}
+			pair := pr.(S)
+			k := getStr(child(pair, 0))
+			if isIdent(k) {
+				o.write(k)
+			} else {
+				o.write(quoteString(k))
+			}
+			o.write(": ")
+			writeTypeLiteral(o, child(pair, 1))
+		}
+		o.write("}")
+
+	default:
+		o.write("<lit>")
+	}
+}
+
+func flattenArrow(t S) (params []S, ret S) {
+	for {
+		if tag(t) == "binop" && t[1].(string) == "->" {
+			params = append(params, t[2].(S))
+			t = t[3].(S)
+			continue
+		}
+		ret = t
+		return
+	}
+}
+
+/* ---------- Runtime value pretty-printer ---------- */
+
+// FormatValue returns a string for a runtime Value with width awareness.
+func FormatValue(v Value) string {
+	var b strings.Builder
+	o := out{b: &b}
+	writeValue(&o, v)
+	return b.String()
+}
+
+func mapOneLineMO(keys []string, mo *MapObject) string {
+	if len(keys) == 0 {
+		return "{}"
+	}
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+			// any annotated key forces multiline
+			return ""
+		}
+		v := mo.Entries[k]
+		if isValueMultiline(v) {
+			return ""
+		}
+		key := k
+		if !isIdent(key) {
+			key = quoteString(key)
+		}
+		var b strings.Builder
+		o := out{b: &b}
+		writeValue(&o, v)
+		parts = append(parts, key+": "+b.String())
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
+}
+
+func writeValue(o *out, v Value) {
+	// Header annotation (once)
+	if v.Annot != "" {
+		o.annot(v.Annot)
+		o.pad()
+	}
+
 	switch v.Tag {
+
 	case VTNull:
-		return nil
+		o.write("null")
+
 	case VTBool:
-		return v.Data.(bool)
+		if v.Data.(bool) {
+			o.write("true")
+		} else {
+			o.write("false")
+		}
+
 	case VTInt:
-		return v.Data.(int64)
+		o.write(strconv.FormatInt(v.Data.(int64), 10))
+
 	case VTNum:
-		return v.Data.(float64)
+		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		o.write(s)
+
 	case VTStr:
-		return v.Data.(string)
+		o.write(quoteString(v.Data.(string)))
+
 	case VTArray:
 		xs := v.Data.([]Value)
-		out := make([]any, len(xs))
-		for i := range xs {
-			out[i] = valueToGoJSON(xs[i])
+		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
+			o.write(oneline)
+			return
 		}
-		return out
+		o.write("[")
+		o.nl()
+		o.withIndent(func() {
+			for i, it := range xs {
+				if it.Annot == "" {
+					o.pad() // pad here only when no header annot
+				}
+				writeValue(o, it) // annotated values handle their own padding
+				if i < len(xs)-1 {
+					o.write(",")
+				}
+				o.nl()
+			}
+		})
+		o.pad()
+		o.write("]")
+
 	case VTMap:
 		mo := v.Data.(*MapObject)
-		out := make(map[string]any, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			out[k] = valueToGoJSON(vv)
+		// Build a sorted view of keys for stable output
+		keys := append([]string(nil), mo.Keys...)
+		sort.Strings(keys)
+
+		// One-line candidate (only if no key is annotated)
+		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
+			o.write(oneline)
+			return
 		}
-		return out
-	default:
-		return fmt.Sprintf("<%v>", v.Tag)
-	}
-}
 
-// --- String Utilities --------------------------------------------
-
-func registerStringBuiltins(ip *Interpreter) {
-	// substr(s, i, j)
-	ip.RegisterNative(
-		"substr",
-		[]ParamSpec{{"s", S{"id", "Str"}}, {"i", S{"id", "Int"}}, {"j", S{"id", "Int"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
-			i := int(ctx.MustArg("i").Data.(int64))
-			j := int(ctx.MustArg("j").Data.(int64))
-			r := []rune(s)
-			if i < 0 {
-				i = 0
-			}
-			if j < i {
-				j = i
-			}
-			if i > len(r) {
-				i = len(r)
-			}
-			if j > len(r) {
-				j = len(r)
-			}
-			return Str(string(r[i:j]))
-		},
-	)
-	setBuiltinDoc(ip, "substr", `Unicode-safe substring by rune index.
-
-Takes the half-open slice [i, j). Indices are clamped to bounds and negative
-values are treated as 0.
-
-Params:
-  s: Str — source string
-  i: Int — start index (inclusive)
-  j: Int — end index (exclusive)
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"toLower",
-		[]ParamSpec{{"s", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.MustArg("s").Data.(string))) },
-	)
-	setBuiltinDoc(ip, "toLower", `Lowercase conversion (Unicode aware).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"toUpper",
-		[]ParamSpec{{"s", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.MustArg("s").Data.(string))) },
-	)
-	setBuiltinDoc(ip, "toUpper", `Uppercase conversion (Unicode aware).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	trimFunc := func(left, right bool) func(string) string {
-		return func(s string) string {
-			if left && right {
-				return strings.TrimSpace(s)
-			}
-			if left {
-				return strings.TrimLeftFunc(s, unicode.IsSpace)
-			}
-			return strings.TrimRightFunc(s, unicode.IsSpace)
-		}
-	}
-
-	ip.RegisterNative("strip",
-		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(true, true)(ctx.MustArg("s").Data.(string)))
-		},
-	)
-	setBuiltinDoc(ip, "strip", `Remove leading and trailing whitespace (Unicode).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative("lstrip",
-		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(true, false)(ctx.MustArg("s").Data.(string)))
-		},
-	)
-	setBuiltinDoc(ip, "lstrip", `Remove leading whitespace (Unicode).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative("rstrip",
-		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(false, true)(ctx.MustArg("s").Data.(string)))
-		},
-	)
-	setBuiltinDoc(ip, "rstrip", `Remove trailing whitespace (Unicode).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"split",
-		[]ParamSpec{{"s", S{"id", "Str"}}, {"sep", S{"id", "Str"}}},
-		S{"array", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
-			sep := ctx.MustArg("sep").Data.(string)
-			parts := strings.Split(s, sep)
-			out := make([]Value, len(parts))
-			for i := range parts {
-				out[i] = Str(parts[i])
-			}
-			return Arr(out)
-		},
-	)
-	setBuiltinDoc(ip, "split", `Split a string on a separator (no regex).
-
-If sep is empty (""), splits between UTF-8 code points.
-
-Params:
-  s: Str   — source string
-  sep: Str — separator
-
-Returns:
-  [Str]`)
-
-	ip.RegisterNative(
-		"join",
-		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			xs := ctx.MustArg("xs").Data.([]Value)
-			sep := ctx.MustArg("sep").Data.(string)
-			strs := make([]string, len(xs))
-			for i := range xs {
-				strs[i] = xs[i].Data.(string)
-			}
-			return Str(strings.Join(strs, sep))
-		},
-	)
-	setBuiltinDoc(ip, "join", `Join strings with a separator.
-
-Params:
-  xs: [Str] — pieces to join
-  sep: Str  — separator
-
-Returns:
-  Str`)
-}
-
-// --- Casting Utilities --------------------------------------------
-
-func registerCastBuiltins(ip *Interpreter) {
-	// str(x) -> Str (JSON-ish for arrays/maps; quotes preserved for strings)
-	ip.RegisterNative(
-		"str",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTStr:
-				return v
-			case VTNull:
-				return Str("null")
-			case VTBool:
-				if v.Data.(bool) {
-					return Str("true")
+		// Multiline
+		o.write("{")
+		o.nl()
+		o.withIndent(func() {
+			for i, k := range keys {
+				if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+					o.annot(ann) // o.annot already pads correctly
 				}
-				return Str("false")
-			case VTInt:
-				return Str(strconv.FormatInt(v.Data.(int64), 10))
-			case VTNum:
-				return Str(strconv.FormatFloat(v.Data.(float64), 'g', -1, 64))
-			case VTArray, VTMap:
-				b, _ := json.Marshal(valueToGoJSON(v))
-				return Str(string(b))
-			default:
-				// functions/modules/handles/types: fall back to Value.String()
-				return Str(v.String())
-			}
-		},
-	)
-	setBuiltinDoc(ip, "str", `Stringify a value.
-
-Rules:
-  • Str stays as-is
-  • Null → "null"
-  • Bool → "true"/"false"
-  • Int/Num → decimal representation
-  • Arrays/Maps → JSON text
-  • Functions/Modules/Handles/Types → readable debug form
-
-Params:
-  x: Any
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"int",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Int"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTInt:
-				return v
-			case VTNum:
-				return Int(int64(v.Data.(float64)))
-			case VTBool:
-				if v.Data.(bool) {
-					return Int(1)
+				o.pad() // align with annotation line
+				if isIdent(k) {
+					o.write(k)
+				} else {
+					o.write(quoteString(k))
 				}
-				return Int(0)
-			case VTStr:
-				if n, err := strconv.ParseInt(v.Data.(string), 10, 64); err == nil {
-					return Int(n)
+				o.write(": ")
+				writeValue(o, mo.Entries[k])
+				if i < len(keys)-1 {
+					o.write(",")
 				}
-				return Null
-			default:
-				return Null
+				o.nl()
 			}
-		},
-	)
-	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise return null.
+		})
+		o.pad()
+		o.write("}")
+		return
 
-Rules:
-  • Int → Int
-  • Num → truncated toward zero
-  • Bool → 1/0
-  • Str → parsed base-10 integer, or null on failure
-  • Others → null
-
-Params:
-  x: Any
-
-Returns:
-  Int?`)
-
-	ip.RegisterNative(
-		"num",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Num"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTNum:
-				return v
-			case VTInt:
-				return Num(float64(v.Data.(int64)))
-			case VTBool:
-				if v.Data.(bool) {
-					return Num(1)
+	case VTFun:
+		// Pretty-print as <fun: n1:T1 -> n2:T2 -> R> ; zero-arg as _:Null -> R
+		if f, ok := v.Data.(*Fun); ok && f != nil {
+			var sb strings.Builder
+			sb.WriteString("<fun: ")
+			if len(f.ParamTypes) == 0 {
+				sb.WriteString("_:Null")
+			} else {
+				for i := range f.ParamTypes {
+					if i > 0 {
+						sb.WriteString(" -> ")
+					}
+					name := "_"
+					if i < len(f.Params) && f.Params[i] != "" {
+						name = f.Params[i]
+					}
+					sb.WriteString(name)
+					sb.WriteString(":")
+					sb.WriteString(FormatType(f.ParamTypes[i]))
 				}
-				return Num(0)
-			case VTStr:
-				if f, err := strconv.ParseFloat(v.Data.(string), 64); err == nil {
-					return Num(f)
-				}
-				return Null
-			default:
-				return Null
 			}
-		},
-	)
-	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise return null.
-
-Rules:
-  • Num → Num
-  • Int → floating-point value
-  • Bool → 1.0/0.0
-  • Str → parsed as float64, or null on failure
-  • Others → null
-
-Params:
-  x: Any
-
-Returns:
-  Num?`)
-
-	ip.RegisterNative(
-		"bool",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Bool"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTBool:
-				return v
-			case VTNull:
-				return Bool(false)
-			case VTInt:
-				return Bool(v.Data.(int64) != 0)
-			case VTNum:
-				return Bool(v.Data.(float64) != 0)
-			case VTStr:
-				return Bool(v.Data.(string) != "")
-			case VTArray:
-				return Bool(len(v.Data.([]Value)) > 0)
-			case VTMap:
-				return Bool(len(v.Data.(*MapObject).Entries) > 0)
-			default:
-				return Bool(true) // functions, modules, handles, types → truthy
-			}
-		},
-	)
-	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules.
-
-Falsey:
-  • null
-  • 0, 0.0
-  • "" (empty string)
-  • [] (empty array)
-  • {} (empty map)
-
-Truthy:
-  • everything else (including functions, modules, handles, types)
-
-Params:
-  x: Any
-
-Returns:
-  Bool`)
-}
-
-// --- Math Utilities --------------------------------------------
-
-func registerMathBuiltins(ip *Interpreter) {
-	// Constants
-	ip.Core.Define("PI", Num(math.Pi))
-	ip.Core.Define("E", Num(math.E))
-	setBuiltinDoc(ip, "PI", `Mathematical constant π.
-
-Returns:
-  Num`)
-	setBuiltinDoc(ip, "E", `Euler's number e.
-
-Returns:
-  Num`)
-
-	// Unary math helpers
-	un1 := func(name string, f func(float64) float64, doc string) {
-		ip.RegisterNative(
-			name,
-			[]ParamSpec{{"x", S{"id", "Num"}}},
-			S{"id", "Num"},
-			func(_ *Interpreter, ctx CallCtx) Value { return Num(f(ctx.MustArg("x").Data.(float64))) },
-		)
-		setBuiltinDoc(ip, name, doc)
-	}
-	un1("sin", math.Sin, `Sine of an angle in radians.
-
-Params:
-  x: Num — radians
-
-Returns:
-  Num`)
-	un1("cos", math.Cos, `Cosine of an angle in radians.
-
-Params:
-  x: Num — radians
-
-Returns:
-  Num`)
-	un1("tan", math.Tan, `Tangent of an angle in radians.
-
-Params:
-  x: Num — radians
-
-Returns:
-  Num`)
-	un1("sqrt", math.Sqrt, `Square root.
-
-Params:
-  x: Num — non-negative
-
-Returns:
-  Num`)
-	un1("log", math.Log, `Natural logarithm (base e).
-
-Params:
-  x: Num — positive
-
-Returns:
-  Num`)
-	un1("exp", math.Exp, `Exponential function e^x.
-
-Params:
-  x: Num
-
-Returns:
-  Num`)
-
-	ip.RegisterNative(
-		"pow",
-		[]ParamSpec{{"base", S{"id", "Num"}}, {"exp", S{"id", "Num"}}},
-		S{"id", "Num"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Num(math.Pow(ctx.MustArg("base").Data.(float64), ctx.MustArg("exp").Data.(float64)))
-		},
-	)
-	setBuiltinDoc(ip, "pow", `Power: base^exp.
-
-Params:
-  base: Num
-  exp:  Num
-
-Returns:
-  Num`)
-}
-
-// Date
-func registerTimeExtras(ip *Interpreter) {
-	// dateNow() -> {year, month, day, hour, min, sec, ms}
-	ip.RegisterNative(
-		"dateNow",
-		nil,
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			now := time.Now()
-			mo := &MapObject{
-				Entries: map[string]Value{
-					"year":        Int(int64(now.Year())),
-					"month":       Int(int64(int(now.Month()))),
-					"day":         Int(int64(now.Day())),
-					"hour":        Int(int64(now.Hour())),
-					"minute":      Int(int64(now.Minute())),
-					"second":      Int(int64(now.Second())),
-					"millisecond": Int(int64(now.Nanosecond() / 1e6)),
-				},
-				KeyAnn: map[string]string{},
-				Keys:   []string{"year", "month", "day", "hour", "minute", "second", "millisecond"},
-			}
-			return Value{Tag: VTMap, Data: mo}
-		},
-	)
-	setBuiltinDoc(ip, "dateNow", `Current local date/time components.
-
-Fields:
-  year, month(1–12), day(1–31),
-  hour(0–23), minute(0–59), second(0–59),
-  millisecond(0–999)
-
-Returns:
-  {Str: Any} — a map with the fields above`)
-}
-
-// --- Process Utilities --------------------------------------------
-
-func registerProcessBuiltins(ip *Interpreter) {
-	// exit(code:Int?) -> Null (terminates the host process)
-	ip.RegisterNative(
-		"exit",
-		[]ParamSpec{{"code", S{"unop", "?", S{"id", "Int"}}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			codeV := ctx.MustArg("code")
-			code := 0
-			if codeV.Tag == VTInt {
-				code = int(codeV.Data.(int64))
-			}
-			os.Exit(code)
-			return Null // unreachable
-		},
-	)
-	setBuiltinDoc(ip, "exit", `Terminate the current process with an optional status code.
-
-By convention, 0 indicates success; non-zero indicates an error.
-
-Params:
-  code: Int? — exit status (default 0)
-
-Returns:
-  Null (never returns; process exits)`)
-}
-=== END FILE: std_sys.go ===
-
+			sb.WriteString(" -> ")
+			sb.WriteString(FormatType(f.ReturnType))

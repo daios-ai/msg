@@ -17,6 +17,31 @@ import (
 )
 
 const (
+	colorReset = "\x1b[0m"
+	colorRed   = "\x1b[31m"
+	colorGreen = "\x1b[32m"
+	colorBlue  = "\x1b[34m"
+)
+
+func red(s string) string   { return colorRed + s + colorReset }
+func green(s string) string { return colorGreen + s + colorReset }
+func blue(s string) string  { return colorBlue + s + colorReset }
+
+// Colorize a formatted value: annotation lines (trim-left starts with "#") → green,
+// everything else → blue.
+func colorizeValue(val string) string {
+	lines := strings.Split(val, "\n")
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+			lines[i] = green(ln)
+		} else if ln != "" {
+			lines[i] = blue(ln)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+const (
 	appName     = "mindscript"
 	historyFile = ".mindscript_history"
 	promptMain  = "==> "
@@ -27,7 +52,6 @@ REPL commands:
   :help            Show this help
   :quit / :exit    Exit the REPL
   :load <file>     Load & execute a file into the current session
-  :type <expr>     Print the static type of an expression (typeOf(expr))
   :fmt [code]      Pretty-print code (multiline if no code provided)
   :pretty [code]   Alias for :fmt
   :reset           Reset the interpreter (new empty global scope)
@@ -91,9 +115,6 @@ func runEvalString(code string) int {
 func runREPL() int {
 	fmt.Println(banner)
 
-	// REPL: turn colors ON (errors red, values blue, annotations green).
-	mindscript.EnableColor = true
-
 	home, _ := os.UserHomeDir()
 	histPath := filepath.Join(home, historyFile)
 
@@ -133,11 +154,11 @@ func runREPL() int {
 		// Evaluate (persistent session)
 		v, err := ip.EvalPersistentSource(code)
 		if err != nil {
-			// Lexer/parse errors are already colored by the library.
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, red(err.Error()))
 			continue
 		}
-		fmt.Println(mindscript.FormatValue(v))
+		val := mindscript.FormatValue(v)
+		fmt.Println(colorizeValue(val))
 
 		// Save to history
 		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
@@ -181,36 +202,16 @@ func handleReplCommand(ip *mindscript.Interpreter, ln *liner.State, line string)
 		path := fields[1]
 		src, err := os.ReadFile(path)
 		if err != nil {
-			fmt.Printf("cannot read %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "%s\n", red(fmt.Sprintf("cannot read %s: %v", path, err)))
 			return false
 		}
-		// Persist into this session:
 		if v, err := ip.EvalPersistentSource(string(src)); err != nil {
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, red(err.Error()))
 		} else {
 			// Print last value
 			fmt.Println(mindscript.FormatValue(v))
 			ln.AppendHistory(fmt.Sprintf(":load %s", path))
 		}
-
-	case ":type":
-		if len(fields) < 2 {
-			fmt.Println("usage: :type <expr>")
-			return false
-		}
-		expr := strings.TrimSpace(strings.TrimPrefix(line, ":type"))
-		src := fmt.Sprintf("typeOf(%s)", expr)
-		v, err := ip.EvalPersistentSource(src) // <-- persistent
-		if err != nil {
-			fmt.Println(err)
-			return false
-		}
-		if v.Tag != mindscript.VTType {
-			fmt.Printf("typeOf error: got %#v\n", v)
-			return false
-		}
-		// Types are S-exprs; reuse the AST formatter.
-		fmt.Println(mindscript.FormatSExpr(v.Data.(mindscript.S)))
 
 	case ":fmt", ":pretty":
 		// Inline snippet?
@@ -327,7 +328,7 @@ func looksIncomplete(err error) bool {
 func runFormat(src string) {
 	formatted, err := mindscript.Pretty(src)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, red(err.Error()))
 		return
 	}
 	fmt.Println(formatted)

@@ -18,16 +18,12 @@ func max(a, b int) int {
 // It shows up to one previous and one next line if available.
 func prettyErrorString(src, header string, line, col int, msg string) string {
 	lines := strings.Split(src, "\n")
-
-	// Normalize 1-based line/col
 	if line < 1 {
 		line = 1
 	}
 	if col < 1 {
 		col = 1
 	}
-
-	// Clamp line within [1, len(lines)]; tolerate empty source
 	if len(lines) == 0 {
 		lines = []string{""}
 	}
@@ -35,33 +31,28 @@ func prettyErrorString(src, header string, line, col int, msg string) string {
 		line = len(lines)
 	}
 
-	// Current line text
 	lineTxt := lines[line-1]
 
 	var b strings.Builder
+	// Plain header, no ANSI
+	fmt.Fprintf(&b, "%s at %d:%d: %s\n\n", header, line, col, msg)
 
-	// HEADER (in red when EnableColor)
-	fmt.Fprintf(&b, "%s at %d:%d: %s\n\n",
-		colorize(header, colorRed), line, col, msg)
-
-	// Previous line (if any)
+	// Optional previous line
 	if line > 1 {
 		fmt.Fprintf(&b, "%4d | %s\n", line-1, lines[line-2])
 	}
-
 	// Error line
 	fmt.Fprintf(&b, "%4d | %s\n", line, lineTxt)
 
-	// Caret line (in red)
-	caretPad := max(0, col-1) // spaces before '^'
+	// Caret (plain)
+	caretPad := max(0, col-1)
 	caret := strings.Repeat(" ", caretPad) + "^"
-	fmt.Fprintf(&b, "     | %s\n", colorize(caret, colorRed))
+	fmt.Fprintf(&b, "     | %s\n", caret)
 
-	// Next line (if any)
+	// Optional next line
 	if line < len(lines) {
 		fmt.Fprintf(&b, "%4d | %s\n", line+1, lines[line])
 	}
-
 	return b.String()
 }
 

@@ -77,9 +77,7 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 
 	// --- cached? ---
 	if rec, ok := ip.modules[canon]; ok {
-		if rec.err != nil {
-			return Null, rec.err
-		}
+		// We no longer cache failures, so only hit for true successes or in-flight loads.
 		if rec.state == modLoading {
 			path := joinCyclePath(ip.loadStack, canon)
 			return Null, fmt.Errorf("import cycle detected: %s", path)
@@ -95,9 +93,10 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 	// --- parse ---
 	ast, perr := ParseSExpr(src)
 	if perr != nil {
-		err := fmt.Errorf("parse error in %s: %v", display, perr)
-		ip.modules[canon].err = err
-		return Null, err
+		perr = WrapErrorWithSource(perr, src)
+		// DO NOT cache failures; allow retry on next import
+		delete(ip.modules, canon)
+		return Null, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
 	}
 
 	// --- evaluate in isolated env parented to Core ---
@@ -116,16 +115,17 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 			}
 		}()
 		if len(ast) > 0 {
-			// Uncaught: panics bubble into rterr; VM runtime errors may return annotated-null.
 			evalRes = ip.EvalASTUncaught(ast, modEnv, true)
 		}
 	}()
+
 	// Treat VM-returned annotated null as a hard import failure too.
 	if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
 		rterr = fmt.Errorf("runtime error in %s: %s", display, evalRes.Annot)
 	}
 	if rterr != nil {
-		ip.modules[canon].err = rterr
+		// DO NOT cache failures; allow retry on next import
+		delete(ip.modules, canon)
 		return Null, rterr
 	}
 
@@ -135,7 +135,7 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 		exports[k] = v
 	}
 
-	// --- commit cache ---
+	// --- commit cache on success only ---
 	rec := ip.modules[canon]
 	rec.displayName = display
 	rec.src = src
@@ -145,7 +145,6 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 	rec.err = nil
 
 	return Value{Tag: VTModule, Data: &Module{Name: rec.spec, Exports: rec.exports}}, nil
-
 }
 
 // resolveAndFetch returns (src, display, canonicalKey) for the given spec.

@@ -226,7 +226,8 @@ Returns: Module (as a value with exported bindings)`)
 			// Parse
 			ast, perr := ParseSExpr(src)
 			if perr != nil {
-				return annotNull(fmt.Sprintf("parse error in mem:%s: %v", name, perr))
+				perr = WrapErrorWithSource(perr, src)
+				return annotNull(fmt.Sprintf("parse error in mem:%s:\n%s", name, perr.Error()))
 			}
 
 			// Evaluate in isolated env parented to Core (uncaught to treat rtErr as failure)

@@ -10,24 +10,7 @@ import (
 
 /* ---------- globals & tiny helpers ---------- */
 
-var EnableColor = false // REPL-only; tests can leave this false
 var MaxInlineWidth = 80 // width threshold for single-line arrays/maps
-
-const (
-	colorReset = "\033[0m"
-	colorRed   = "\033[31m"
-	colorGreen = "\033[32m"
-	colorBlue  = "\033[34m"
-)
-
-func colorize(s, c string) string {
-	if !EnableColor {
-		return s
-	}
-	return c + s + colorReset
-}
-func blue(s string) string  { return colorize(s, colorBlue) }
-func green(s string) string { return colorize(s, colorGreen) }
 
 func isIdent(s string) bool {
 	if s == "" {
@@ -87,14 +70,13 @@ func (o *out) pad() {
 	}
 }
 func (o *out) line(s string)        { o.pad(); o.b.WriteString(s) }
-func (o *out) blue(s string)        { o.b.WriteString(blue(s)) }
 func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
 func (o *out) annot(text string) {
 	if text == "" {
 		return
 	}
 	for _, ln := range strings.Split(text, "\n") {
-		o.line(green("# " + strings.TrimSpace(ln)))
+		o.line("# " + strings.TrimSpace(ln))
 		o.nl()
 	}
 }
@@ -877,7 +859,7 @@ func flattenArrow(t S) (params []S, ret S) {
 
 /* ---------- Runtime value pretty-printer ---------- */
 
-// FormatValue returns a string for a runtime Value with width awareness and colors (optional).
+// FormatValue returns a string for a runtime Value with width awareness.
 func FormatValue(v Value) string {
 	var b strings.Builder
 	o := out{b: &b}
@@ -921,35 +903,35 @@ func writeValue(o *out, v Value) {
 	switch v.Tag {
 
 	case VTNull:
-		o.blue("null")
+		o.write("null")
 
 	case VTBool:
 		if v.Data.(bool) {
-			o.blue("true")
+			o.write("true")
 		} else {
-			o.blue("false")
+			o.write("false")
 		}
 
 	case VTInt:
-		o.blue(strconv.FormatInt(v.Data.(int64), 10))
+		o.write(strconv.FormatInt(v.Data.(int64), 10))
 
 	case VTNum:
 		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
 		if !strings.ContainsAny(s, ".eE") {
 			s += ".0"
 		}
-		o.blue(s)
+		o.write(s)
 
 	case VTStr:
-		o.blue(quoteString(v.Data.(string)))
+		o.write(quoteString(v.Data.(string)))
 
 	case VTArray:
 		xs := v.Data.([]Value)
 		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
-			o.blue(oneline)
+			o.write(oneline)
 			return
 		}
-		o.blue("[")
+		o.write("[")
 		o.nl()
 		o.withIndent(func() {
 			for i, it := range xs {
@@ -958,13 +940,13 @@ func writeValue(o *out, v Value) {
 				}
 				writeValue(o, it) // annotated values handle their own padding
 				if i < len(xs)-1 {
-					o.blue(",")
+					o.write(",")
 				}
 				o.nl()
 			}
 		})
 		o.pad()
-		o.blue("]")
+		o.write("]")
 
 	case VTMap:
 		mo := v.Data.(*MapObject)
@@ -974,12 +956,12 @@ func writeValue(o *out, v Value) {
 
 		// One-line candidate (only if no key is annotated)
 		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
-			o.blue(oneline)
+			o.write(oneline)
 			return
 		}
 
 		// Multiline
-		o.blue("{")
+		o.write("{")
 		o.nl()
 		o.withIndent(func() {
 			for i, k := range keys {
@@ -988,20 +970,20 @@ func writeValue(o *out, v Value) {
 				}
 				o.pad() // align with annotation line
 				if isIdent(k) {
-					o.blue(k)
+					o.write(k)
 				} else {
-					o.blue(quoteString(k))
+					o.write(quoteString(k))
 				}
-				o.blue(": ")
+				o.write(": ")
 				writeValue(o, mo.Entries[k])
 				if i < len(keys)-1 {
-					o.blue(",")
+					o.write(",")
 				}
 				o.nl()
 			}
 		})
 		o.pad()
-		o.blue("}")
+		o.write("}")
 		return
 
 	case VTFun:
@@ -1028,9 +1010,9 @@ func writeValue(o *out, v Value) {
 			sb.WriteString(" -> ")
 			sb.WriteString(FormatType(f.ReturnType))
 			sb.WriteString(">")
-			o.blue(sb.String())
+			o.write(sb.String())
 		} else {
-			o.blue("<fun>")
+			o.write("<fun>")
 		}
 
 	case VTType:
@@ -1039,21 +1021,16 @@ func writeValue(o *out, v Value) {
 			lines := strings.Split(typ, "\n")
 			for i, ln := range lines {
 				if i == 0 {
-					o.blue(ln)
+					o.write(ln)
 					continue
 				}
 				o.nl()
 				o.pad()
-				// green lines (already colored) must pass through
-				if EnableColor && strings.HasPrefix(ln, colorGreen) {
-					o.write(ln)
-				} else {
-					o.blue(ln)
-				}
+				o.write(ln)
 			}
 			return
 		}
-		o.blue(typ)
+		o.write(typ)
 
 	case VTModule:
 		name := "<module>"
@@ -1064,7 +1041,7 @@ func writeValue(o *out, v Value) {
 			}
 			name = "<module: " + disp + ">"
 		}
-		o.blue(name)
+		o.write(name)
 
 	default:
 		s := "<unknown>"
@@ -1075,7 +1052,7 @@ func writeValue(o *out, v Value) {
 				s = "<handle>"
 			}
 		}
-		o.blue(s)
+		o.write(s)
 	}
 }
 

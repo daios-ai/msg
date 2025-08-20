@@ -733,3 +733,155 @@ func Test_Parser_AnyWord_As_Map_Key(t *testing.T) {
 		}
 	}
 }
+func Test_Parser_Let_Array_Destructuring(t *testing.T) {
+	src := `let [x, y] = arr`
+	root := mustParse(t, src)
+
+	// block with one child: assign(darr(...), id(arr))
+	wantTag(t, root, "block")
+	assign := kid(root, 0)
+	wantTag(t, assign, "assign")
+
+	lhs := kid(assign, 0)
+	wantTag(t, lhs, "darr")
+	if len(lhs) != 3 { // "darr", ("decl","x"), ("decl","y")
+		t.Fatalf("want 2 elements in array pattern, got %d\n%s", len(lhs)-1, dump(lhs))
+	}
+	if head(lhs[1].(S)) != "decl" || lhs[1].(S)[1].(string) != "x" {
+		t.Fatalf("lhs[0] not decl x: %s", dump(lhs[1].(S)))
+	}
+	if head(lhs[2].(S)) != "decl" || lhs[2].(S)[1].(string) != "y" {
+		t.Fatalf("lhs[1] not decl y: %s", dump(lhs[2].(S)))
+	}
+
+	rhs := kid(assign, 1)
+	wantTag(t, rhs, "id")
+	if rhs[1].(string) != "arr" {
+		t.Fatalf("rhs id != arr: %s", dump(rhs))
+	}
+}
+
+func Test_Parser_For_ArrayPattern_NoLet(t *testing.T) {
+	src := `for [k, v] in obj do end`
+	root := mustParse(t, src)
+
+	wantTag(t, root, "block")
+	forNode := kid(root, 0)
+	wantTag(t, forNode, "for")
+
+	// target
+	tgt := kid(forNode, 0)
+	wantTag(t, tgt, "darr")
+	if len(tgt) != 3 {
+		t.Fatalf("want 2 elems in pattern, got %d\n%s", len(tgt)-1, dump(tgt))
+	}
+	if head(tgt[1].(S)) != "decl" || tgt[1].(S)[1].(string) != "k" {
+		t.Fatalf("first pattern not decl k: %s", dump(tgt[1].(S)))
+	}
+	if head(tgt[2].(S)) != "decl" || tgt[2].(S)[1].(string) != "v" {
+		t.Fatalf("second pattern not decl v: %s", dump(tgt[2].(S)))
+	}
+
+	// iter
+	iter := kid(forNode, 1)
+	wantTag(t, iter, "id")
+	if iter[1].(string) != "obj" {
+		t.Fatalf("iter id != obj: %s", dump(iter))
+	}
+
+	// body
+	body := kid(forNode, 2)
+	wantTag(t, body, "block")
+}
+
+func Test_Parser_For_ArrayPattern_WithLet(t *testing.T) {
+	src := `for let [k, v] in obj do end`
+	root := mustParse(t, src)
+
+	wantTag(t, root, "block")
+	forNode := kid(root, 0)
+	wantTag(t, forNode, "for")
+
+	tgt := kid(forNode, 0)
+	wantTag(t, tgt, "darr")
+	if head(tgt[1].(S)) != "decl" || tgt[1].(S)[1].(string) != "k" {
+		t.Fatalf("first pattern not decl k: %s", dump(tgt[1].(S)))
+	}
+	if head(tgt[2].(S)) != "decl" || tgt[2].(S)[1].(string) != "v" {
+		t.Fatalf("second pattern not decl v: %s", dump(tgt[2].(S)))
+	}
+}
+
+func Test_Parser_For_ObjectPattern(t *testing.T) {
+	src := `for {name: n, age: a} in people do end`
+	root := mustParse(t, src)
+
+	wantTag(t, root, "block")
+	forNode := kid(root, 0)
+	wantTag(t, forNode, "for")
+
+	tgt := kid(forNode, 0)
+	wantTag(t, tgt, "dobj")
+	if len(tgt) != 3 { // "dobj", pair(name->decl n), pair(age->decl a)
+		t.Fatalf("want 2 pairs, got %d\n%s", len(tgt)-1, dump(tgt))
+	}
+
+	// check first pair: ("pair", ("str","name"), ("decl","n"))
+	p1 := tgt[1].(S)
+	wantTag(t, p1, "pair")
+	key1 := p1[1].(S)
+	wantTag(t, key1, "str")
+	if key1[1].(string) != "name" {
+		t.Fatalf("first key != name: %s", dump(key1))
+	}
+	val1 := p1[2].(S)
+	wantTag(t, val1, "decl")
+	if val1[1].(string) != "n" {
+		t.Fatalf("first value decl != n: %s", dump(val1))
+	}
+
+	// second pair: ("pair", ("str","age"), ("decl","a"))
+	p2 := tgt[2].(S)
+	wantTag(t, p2, "pair")
+	key2 := p2[1].(S)
+	wantTag(t, key2, "str")
+	if key2[1].(string) != "age" {
+		t.Fatalf("second key != age: %s", dump(key2))
+	}
+	val2 := p2[2].(S)
+	wantTag(t, val2, "decl")
+	if val2[1].(string) != "a" {
+		t.Fatalf("second value decl != a: %s", dump(val2))
+	}
+
+	iter := kid(forNode, 1)
+	wantTag(t, iter, "id")
+	if iter[1].(string) != "people" {
+		t.Fatalf("iter id != people: %s", dump(iter))
+	}
+
+	body := kid(forNode, 2)
+	wantTag(t, body, "block")
+}
+
+func Test_Parser_For_BareId_ImplicitDecl(t *testing.T) {
+	src := `for k in obj do end`
+	root := mustParse(t, src)
+
+	wantTag(t, root, "block")
+	forNode := kid(root, 0)
+	wantTag(t, forNode, "for")
+
+	tgt := kid(forNode, 0)
+	wantTag(t, tgt, "decl")
+	if tgt[1].(string) != "k" {
+		t.Fatalf("target not decl k: %s", dump(tgt))
+	}
+	iter := kid(forNode, 1)
+	wantTag(t, iter, "id")
+	if iter[1].(string) != "obj" {
+		t.Fatalf("iter id != obj: %s", dump(iter))
+	}
+	body := kid(forNode, 2)
+	wantTag(t, body, "block")
+}

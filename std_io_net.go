@@ -32,6 +32,30 @@ type netListenerH struct {
 	ln net.Listener
 }
 
+// --- OS primitives ----------------------------------------
+
+func registerOsBuiltins(ip *Interpreter) {
+
+	ip.RegisterNative(
+		"osEnv",
+		[]ParamSpec{{Name: "name", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			n := ctx.MustArg("name").Data.(string)
+			if v, ok := os.LookupEnv(n); ok {
+				return Str(v)
+			}
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "osEnv", `Read an environment variable.
+
+Params:
+  name: Str
+Returns:
+  Str? (null if unset)`)
+}
+
 // --- I/O primitives (file & network) ----------------------------------------
 
 func registerIOBuiltins(ip *Interpreter) {

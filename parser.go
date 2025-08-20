@@ -578,15 +578,24 @@ func (p *parser) whileExpr() (S, error) {
 }
 
 func (p *parser) forTarget() (S, error) {
-	// allow explicit `let x`
+	// Allow explicit `let <pattern>`
 	if p.match(LET) {
-		idTok, err := p.need(ID, "expected identifier after 'let'")
-		if err != nil {
-			return nil, err
-		}
-		return L("decl", idTok.Literal), nil
+		return p.declPattern()
 	}
-	// Parse prim+postfix only (no binops) so targets stay simple
+
+	// If the next token clearly starts a pattern, parse a *declaration* pattern
+	// (implicit binding) just like Python: `for [k, v] in ...` or `for {k:x} in ...`.
+	switch p.peek().Type {
+	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
+		save := p.i
+		pt, err := p.declPattern()
+		if err == nil {
+			return pt, nil // e.g., ("darr", ...), ("dobj", ...)
+		}
+		p.i = save // fall back below if pattern parse fails
+	}
+
+	// Otherwise, parse a simple prim+postfix expression and require it's assignable
 	save := p.i
 	e, err := p.expr(90)
 	if err != nil {
@@ -595,9 +604,10 @@ func (p *parser) forTarget() (S, error) {
 	if !assignable(e) {
 		p.i = save
 		g := p.peek()
-		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "invalid for-target (must be id/get/idx/decl)"}
+		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "invalid for-target (must be id/get/idx/decl/pattern)"}
 	}
-	// bare id → implicit declaration
+
+	// Bare id → implicit declaration, same as before
 	if e[0].(string) == "id" {
 		return L("decl", e[1].(string)), nil
 	}

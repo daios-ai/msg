@@ -8,6 +8,13 @@
 
 package mindscript
 
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
 // --- Opaque, universal handle (Lua-like userdata) + concrete boxed types ---
 
 type Handle struct {
@@ -52,7 +59,7 @@ func NewRuntime() *Interpreter {
 	// engine helpers
 	ip.initCore()
 
-	// std library
+	// standard native builtins
 	registerStandardBuiltins(ip)
 	registerConcurrencyBuiltins(ip)
 	registerIOBuiltins(ip)
@@ -67,6 +74,28 @@ func NewRuntime() *Interpreter {
 	registerMathBuiltins(ip)
 	registerTimeExtras(ip)
 	registerProcessBuiltins(ip)
+	registerOsBuiltins(ip)
+
+	// standard library
+	loadPreludeIntoMain(ip, "std.ms")
 
 	return ip
+}
+
+func loadPreludeIntoMain(ip *Interpreter, filename string) error {
+	paths := strings.Split(os.Getenv("MINDSCRIPT_PATH"), string(os.PathListSeparator))
+	for _, dir := range paths {
+		if dir == "" {
+			continue
+		}
+		p := filepath.Join(dir, filename)
+		if data, err := os.ReadFile(p); err == nil {
+			// Evaluate directly in main env so top-level lets become globals
+			if _, err := ip.EvalPersistentSource(string(data)); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return fs.ErrNotExist
 }

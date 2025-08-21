@@ -97,7 +97,15 @@ func Map(m map[string]Value) Value {
 	return Value{Tag: VTMap, Data: mo}
 }
 
-func TypeVal(expr S) Value { return Value{Tag: VTType, Data: expr} }
+type TypeValue struct {
+	Ast S
+	Env *Env // lexical scope where this type was defined
+}
+
+func TypeVal(expr S) Value { return Value{Tag: VTType, Data: &TypeValue{Ast: expr}} }
+func TypeValIn(expr S, env *Env) Value {
+	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
+}
 
 // Closures keep AST for introspection + a compiled chunk for speed.
 type Fun struct {
@@ -267,6 +275,20 @@ func toFloat(v Value) float64 {
 		return float64(v.Data.(int64))
 	}
 	return v.Data.(float64)
+}
+
+// Given a Value of type VTType, resolve its AST using its own env if present;
+// otherwise fall back to the provided env.
+func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
+	if v.Tag != VTType {
+		return S{"id", "Any"} // defensive default; you can fail(...) if you prefer
+	}
+	tv := v.Data.(*TypeValue)
+	env := tv.Env
+	if env == nil {
+		env = fallback
+	}
+	return ip.resolveType(tv.Ast, env)
 }
 
 // -----------------------------------------------------------------------------
@@ -551,7 +573,8 @@ func (ip *Interpreter) initCore() {
 		func(ctx CallCtx) Value {
 			t := ctx.MustArg("target")
 			v := ctx.MustArg("value")
-			ip.assignTo(t.Data.(S), v, ctx.Env())
+			tv := t.Data.(*TypeValue)
+			ip.assignTo(tv.Ast, v, ctx.Env())
 			return v
 		})
 
@@ -562,7 +585,8 @@ func (ip *Interpreter) initCore() {
 		func(ctx CallCtx) Value {
 			t := ctx.MustArg("target")
 			v := ctx.MustArg("value")
-			ip.assignTo(t.Data.(S), v, ctx.Env(), true)
+			tv := t.Data.(*TypeValue)
+			ip.assignTo(tv.Ast, v, ctx.Env(), true)
 			return v
 		})
 
@@ -630,8 +654,9 @@ func (ip *Interpreter) initCore() {
 	ip.reg("__resolve_type",
 		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
 		func(ctx CallCtx) Value {
-			t := ctx.MustArg("t").Data.(S)
-			return TypeVal(ip.resolveType(t, ctx.Env()))
+			t := ctx.MustArg("t")
+			resolved := ip.resolveTypeValue(t, ctx.Env())
+			return TypeVal(resolved) // structural; env can be nil
 		})
 
 	// annotate a value
@@ -709,15 +734,18 @@ func (ip *Interpreter) initCore() {
 			{"types", S{"array", S{"id", "Type"}}},
 			{"ret", S{"id", "Type"}},
 			{"body", S{"id", "Type"}},
-			{"isOracle", S{"id", "Bool"}}, // NEW
-			{"examples", S{"id", "Any"}},  // NEW
+			{"isOracle", S{"id", "Bool"}},
+			{"examples", S{"id", "Any"}},
 		},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
 			namesV := ctx.MustArg("params").Data.([]Value)
 			typesV := ctx.MustArg("types").Data.([]Value)
-			retT := ctx.MustArg("ret").Data.(S)
-			body := ctx.MustArg("body").Data.(S)
+
+			// NEW: extract ASTs from TypeValue
+			retTV := ctx.MustArg("ret").Data.(*TypeValue)
+			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
+
 			isOr := ctx.MustArg("isOracle").Data.(bool)
 			exAny := ctx.MustArg("examples")
 
@@ -727,7 +755,7 @@ func (ip *Interpreter) initCore() {
 				names[i] = namesV[i].Data.(string)
 			}
 			for i := range typesV {
-				types[i] = typesV[i].Data.(S)
+				types[i] = typesV[i].Data.(*TypeValue).Ast
 			}
 
 			hidden := false
@@ -745,13 +773,12 @@ func (ip *Interpreter) initCore() {
 			return FunVal(&Fun{
 				Params:     names,
 				ParamTypes: types,
-				ReturnType: retT,
-				Body:       body,
+				ReturnType: retTV.Ast,
+				Body:       bodyTV.Ast,
 				Env:        ctx.Env(),
 				HiddenNull: hidden,
-
-				IsOracle: isOr,
-				Examples: exVals,
+				IsOracle:   isOr,
+				Examples:   exVals,
 			})
 		})
 
@@ -928,7 +955,19 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 	case VTFun:
 		return a.Data.(*Fun) == b.Data.(*Fun)
 	case VTType:
-		return equalS(a.Data.(S), b.Data.(S))
+		ta := a.Data.(*TypeValue)
+		tb := b.Data.(*TypeValue)
+		ea := ta.Env
+		if ea == nil {
+			ea = ip.Core
+		}
+		eb := tb.Env
+		if eb == nil {
+			eb = ip.Core
+		}
+		ra := ip.resolveType(ta.Ast, ea)
+		rb := ip.resolveType(tb.Ast, eb)
+		return equalS(ra, rb)
 	default:
 		return false
 	}

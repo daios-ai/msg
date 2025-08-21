@@ -83,6 +83,18 @@ func (o *out) annot(text string) {
 	}
 }
 
+// unwraps the current VTType payload to its AST (supports legacy S as well).
+func typeAst(data any) S {
+	switch tv := data.(type) {
+	case *TypeValue:
+		return tv.Ast
+	case S: // legacy fallback
+		return tv
+	default:
+		return S{}
+	}
+}
+
 /* ---------- source -> pretty (AST printer) ---------- */
 
 // Pretty parses MindScript source and returns a formatted version (no colors).
@@ -1018,7 +1030,8 @@ func writeValue(o *out, v Value) {
 		}
 
 	case VTType:
-		typ := FormatType(v.Data.(S))
+		ast := typeAst(v.Data)
+		typ := FormatType(ast)
 		if strings.Contains(typ, "\n") {
 			lines := strings.Split(typ, "\n")
 			for i, ln := range lines {
@@ -1105,8 +1118,9 @@ func isValueMultiline(v Value) bool {
 		return line == "" || len(line) > MaxInlineWidth
 
 	case VTType:
-		t := v.Data.(S)
+		t := typeAst(v.Data)
 		return len(t) > 0 && t[0].(string) == "map" && len(t) > 1
+
 	default:
 		return false
 	}

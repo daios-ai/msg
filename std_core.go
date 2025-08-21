@@ -116,26 +116,6 @@ Params:
 
 Returns: Type`)
 
-	// typeOf(x: Any) -> Type
-	ip.RegisterNative(
-		"typeOf",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			return TypeVal(ip.ValueToType(x, ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
-
-This inspects a runtime value and produces its structural Type.
-Useful together with isType/isSubtype for ad-hoc validation.
-
-Params:
-  x: Any — a runtime value
-
-Returns: Type`)
-
 	ip.RegisterNative(
 		"isType",
 		[]ParamSpec{
@@ -145,11 +125,11 @@ Returns: Type`)
 		S{"id", "Bool"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			x := ctx.MustArg("x")
-			tv := ctx.MustArg("T")
-			if tv.Tag != VTType {
+			Tv := ctx.MustArg("T")
+			if Tv.Tag != VTType {
 				fail("isType expects a Type as second argument")
 			}
-			return Bool(ip.IsType(x, tv.Data.(S), ctx.Env()))
+			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
 		},
 	)
 	setBuiltinDoc(ip, "isType", `Check whether a value conforms to a Type.
@@ -174,7 +154,9 @@ Returns: Bool`)
 			if Av.Tag != VTType || Bv.Tag != VTType {
 				fail("isSubtype expects Types as both arguments")
 			}
-			return Bool(ip.IsSubtype(Av.Data.(S), Bv.Data.(S), ctx.Env()))
+			A := ip.resolveTypeValue(Av, ctx.Env())
+			B := ip.resolveTypeValue(Bv, ctx.Env())
+			return Bool(ip.IsSubtype(A, B, ctx.Env()))
 		},
 	)
 	setBuiltinDoc(ip, "isSubtype", `Structural subtype test: A <: B.
@@ -276,6 +258,13 @@ Returns: Module (as a value with exported bindings)`)
 
 			exports := make(map[string]Value, len(modEnv.table))
 			for k, v := range modEnv.table {
+				if v.Tag == VTType {
+					tv := v.Data.(*TypeValue)
+					if tv.Env == nil {
+						exports[k] = TypeValIn(tv.Ast, modEnv)
+						continue
+					}
+				}
 				exports[k] = v
 			}
 			return Value{Tag: VTModule, Data: &Module{Name: "mem:" + name, Exports: exports}}
@@ -406,7 +395,9 @@ Returns: Type`)
 		func(ip *Interpreter, ctx CallCtx) Value {
 			av := ctx.MustArg("a")
 			bv := ctx.MustArg("b")
-			return Bool(equalS(av.Data.(S), bv.Data.(S)))
+			A := ip.resolveTypeValue(av, ctx.Env())
+			B := ip.resolveTypeValue(bv, ctx.Env())
+			return Bool(equalS(A, B))
 		},
 	)
 	setBuiltinDoc(ip, "typeEquals", `Structural equality on Types.
@@ -431,7 +422,7 @@ Returns: Bool`)
 		}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			tv := ctx.MustArg("t")
-			t := ip.ResolveType(tv.Data.(S), ctx.Env())
+			t := ip.resolveTypeValue(tv, ctx.Env())
 			if len(t) == 0 || t[0].(string) != "map" {
 				return Arr(nil)
 			}
@@ -465,8 +456,7 @@ Returns: [{name:Str, type:Type, required:Bool}]`)
 		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
 		S{"unop", "?", S{"id", "Type"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			t := ip.ResolveType(tv.Data.(S), ctx.Env())
+			t := ip.resolveTypeValue(ctx.MustArg("t"), ctx.Env())
 			if len(t) == 2 && t[0].(string) == "array" {
 				return TypeVal(t[1].(S))
 			}
@@ -486,8 +476,7 @@ Returns: Type?`)
 		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
 		S{"id", "Bool"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			t := ip.ResolveType(tv.Data.(S), ctx.Env())
+			t := ip.resolveTypeValue(ctx.MustArg("t"), ctx.Env())
 			return Bool(len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?")
 		},
 	)
@@ -504,8 +493,8 @@ Returns: Bool`)
 		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
 		S{"id", "Type"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t")
-			bt, _ := deopt(ip.ResolveType(tv.Data.(S), ctx.Env()))
+			t := ip.resolveTypeValue(ctx.MustArg("t"), ctx.Env())
+			bt, _ := deopt(t)
 			return TypeVal(bt)
 		},
 	)

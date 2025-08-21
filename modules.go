@@ -132,6 +132,13 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 	// --- snapshot exports ---
 	exports := make(map[string]Value, len(modEnv.table))
 	for k, v := range modEnv.table {
+		if v.Tag == VTType {
+			tv := v.Data.(*TypeValue)
+			if tv.Env == nil {
+				exports[k] = TypeValIn(tv.Ast, modEnv)
+				continue
+			}
+		}
 		exports[k] = v
 	}
 

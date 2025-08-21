@@ -1,6 +1,7 @@
 package mindscript
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -45,21 +46,19 @@ func registerAssertingFakeOracle(ip *Interpreter) {
 		},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			outType := ctx.MustArg("outType").Data.(S)
-
-			// helpers
-			isAny := func(t S) bool { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
-			isNullable := func(t S) bool { return len(t) >= 3 && t[0] == "unop" && t[1] == "?" }
-
-			switch {
-			case isAny(outType):
-				// OK: Any must NOT be wrapped (Any? == Any)
-			case isNullable(outType):
-				// OK: non-Any should be nullable
-			default:
-				return annotNull("outType was not nullable")
+			// Use the stable, public surface to inspect a Type value.
+			otV := ctx.MustArg("outType")
+			if otV.Tag != VTType {
+				return annotNull("outType is not a Type")
 			}
-			return Str(`{"ok":true}`)
+			// External API: textual form via FormatValue → FormatType.
+			ot := strings.TrimSpace(FormatValue(otV))
+
+			// Accept "Any" exactly; otherwise require a nullable (ends with '?').
+			if ot == "Any" || strings.HasSuffix(ot, "?") {
+				return Str(`{"ok":true}`)
+			}
+			return annotNull("outType was not nullable")
 		},
 	)
 	if v, err := ip.Core.Get("__oracle_execute"); err == nil {

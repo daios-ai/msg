@@ -246,8 +246,7 @@ func Test_Interpreter_Type_Optional_Postfix_Runtime_Value(t *testing.T) {
 	if v.Tag != VTType {
 		t.Fatalf("want VTType, got %#v", v)
 	}
-	// The stored type expr should be ("unop", "?", ("id","Str"))
-	expr := v.Data.(S)
+	expr := typeAstFromValueData(v.Data)
 	if expr[0].(string) != "unop" || expr[1].(string) != "?" {
 		t.Fatalf("type expr shape wrong: %#v", expr)
 	}

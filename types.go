@@ -332,9 +332,11 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 			}
 			if e != nil {
 				if v, err := e.Get(name); err == nil && v.Tag == VTType {
+					tv := v.Data.(*TypeValue)
 					seen[name] = true
 					defer func() { delete(seen, name) }()
-					return go1(v.Data.(S), e)
+					// recurse with the alias's own env (not the caller's env)
+					return go1(tv.Ast, tv.Env)
 				}
 			}
 			return x

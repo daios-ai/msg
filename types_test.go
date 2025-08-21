@@ -26,7 +26,11 @@ func typeS(t *testing.T, ip *Interpreter, src string) S {
 	if v.Tag != VTType {
 		t.Fatalf("want VTType, got %#v", v)
 	}
-	return v.Data.(S)
+	tv, ok := v.Data.(*TypeValue)
+	if !ok {
+		t.Fatalf("VTType payload was %T (want *TypeValue)", v.Data)
+	}
+	return tv.Ast
 }
 
 // assert helpers for annotated-null expectations

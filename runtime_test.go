@@ -284,13 +284,13 @@ fun(x:Int) -> Int do x + 1 end
 	if isN.Tag != VTBool || !isN.Data.(bool) {
 		t.Fatalf("isNullable failed: %#v", isN)
 	}
-	bt := evalWithIP(t, ip, `baseType(type Int?)`)
-	if bt.Tag != VTType || bt.Data.(S)[0].(string) != "id" || bt.Data.(S)[1].(string) != "Int" {
-		t.Fatalf("baseType wrong: %#v", bt)
+	eqBase := evalWithIP(t, ip, `typeEquals(baseType(type Int?), type Int)`)
+	if eqBase.Tag != VTBool || !eqBase.Data.(bool) {
+		t.Fatalf("baseType wrong: %#v", eqBase)
 	}
-	ae := evalWithIP(t, ip, `arrayElemType(type [Str])`)
-	if ae.Tag != VTType || ae.Data.(S)[1].(string) != "Str" {
-		t.Fatalf("arrayElemType wrong: %#v", ae)
+	eqElem := evalWithIP(t, ip, `typeEquals(arrayElemType(type [Str]), type Str)`)
+	if eqElem.Tag != VTBool || !eqElem.Data.(bool) {
+		t.Fatalf("arrayElemType wrong: %#v", eqElem)
 	}
 	teq := evalWithIP(t, ip, `typeEquals(type Int, type Int)`)
 	if teq.Tag != VTBool || !teq.Data.(bool) {
@@ -1016,20 +1016,15 @@ func Test_RT_TypeStringToJSONSchema_Convenience(t *testing.T) {
 // Builtin: jsonSchemaStringToType — end-to-end parse→convert
 func Test_RT_JSONSchemaStringToType_Convenience(t *testing.T) {
 	ip := NewRuntime()
-
-	src := `
-		jsonSchemaStringToType("{\"type\":\"array\",\"items\":{\"type\":\"number\"}}")
-	`
-	out, err := ip.EvalSource(src)
+	out, err := ip.EvalSource(`jsonSchemaStringToType("{\"type\":\"array\",\"items\":{\"type\":\"number\"}}")`)
 	if err != nil {
 		t.Fatalf("Eval error: %v", err)
 	}
 	if out.Tag != VTType {
 		t.Fatalf("expected Type; got %v", out.Tag)
 	}
-	ms := out.Data.(S)
-	if len(ms) < 2 || ms[0].(string) != "array" || !equalS(ms[1].(S), S{"id", "Num"}) {
-		t.Fatalf("expected [array [id Num]]; got %v", ms)
+	if got := strings.TrimSpace(FormatValue(out)); got != "[Num]" {
+		t.Fatalf("expected [Num]; got %q", got)
 	}
 }
 
@@ -1159,14 +1154,11 @@ func Test_RT_JSONSchemaStringToType_BadJSON_YieldsAnnotatedNull(t *testing.T) {
 func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
 	ip := NewRuntime()
 
-	src := `
-		jsonSchemaToType("not an object")
-	`
-	out, err := ip.EvalSource(src)
+	out, err := ip.EvalSource(`jsonSchemaToType("not an object")`)
 	if err != nil {
 		t.Fatalf("Eval error: %v", err)
 	}
-	if out.Tag != VTType || !equalS(out.Data.(S), S{"id", "Any"}) {
-		t.Fatalf("expected Any; got %v", out)
+	if out.Tag != VTType || strings.TrimSpace(FormatValue(out)) != "Any" {
+		t.Fatalf("expected Any; got %v", FormatValue(out))
 	}
 }

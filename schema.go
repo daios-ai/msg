@@ -15,23 +15,27 @@ import (
 // Aliases referenced by ("id","Name") that are bound in env to VTType are emitted
 // as {"$ref":"#/$defs/Name"} and materialized under "$defs".
 func (ip *Interpreter) TypeValueToJSONSchema(tv Value, env *Env) map[string]any {
-	// Pull S-expr, but also accept a top-level S-annot from literals.
-	tS, _ := tv.Data.(S)
+	tS := typeAstFromValueData(tv.Data)
+
+	// If caller didn’t pass an env, prefer the type’s captured env (when present)
+	if env == nil {
+		if tvv, ok := tv.Data.(*TypeValue); ok && tvv.Env != nil {
+			env = tvv.Env
+		}
+	}
+
 	sAnnot, base := popTopAnnotIfAny(tS)
 
 	defs := map[string]any{}
-	vis := map[string]bool{} // for cycle-guard on defs
+	vis := map[string]bool{}
 	root := ip.msTypeToSchema(base, env, defs, vis)
 
-	// Top-level description: prefer Value.Annot; fallback to S-annot.
 	if tv.Annot != "" {
 		root["description"] = tv.Annot
 	} else if sAnnot != "" {
 		root["description"] = sAnnot
 	}
-
 	if len(defs) > 0 {
-		// Attach $defs at top-level
 		root["$defs"] = defs
 	}
 	return root
@@ -103,6 +107,18 @@ func popTopAnnotIfAny(t S) (string, S) {
 	return "", t
 }
 
+// schema.go (near the top, private helper)
+func typeAstFromValueData(data any) S {
+	switch tv := data.(type) {
+	case *TypeValue:
+		return tv.Ast
+	case S: // legacy payload
+		return tv
+	default:
+		return S{} // sentinel "empty"
+	}
+}
+
 // -----------------------------------------------------------------------------
 // MindScript Type (S) -> JSON Schema
 // -----------------------------------------------------------------------------
@@ -159,7 +175,7 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 						visiting[name] = true
 						// Expand the DEFINITION using the aliased body,
 						// but DO NOT resolve the *reference* itself.
-						defs[name] = ip.msTypeToSchema(v.Data.(S), env, defs, visiting)
+						defs[name] = ip.msTypeToSchema(typeAstFromValueData(v.Data), env, defs, visiting)
 						delete(visiting, name)
 					}
 					return map[string]any{"$ref": "#/$defs/" + name}

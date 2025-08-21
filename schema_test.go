@@ -7,6 +7,19 @@ import (
 	"testing"
 )
 
+// Helper: extract the S-expr AST from a VTType Value using *TypeValue.
+func typeSFromValue(t *testing.T, v Value) S {
+	t.Helper()
+	if v.Tag != VTType {
+		t.Fatalf("expected VTType, got %#v", v)
+	}
+	tv, ok := v.Data.(*TypeValue)
+	if !ok || tv == nil {
+		t.Fatalf("expected *TypeValue payload, got %#v", v.Data)
+	}
+	return tv.Ast
+}
+
 // -----------------------------
 // MindScript Type -> JSON Schema
 // -----------------------------
@@ -202,7 +215,7 @@ func Test_Schema_JSONPrimitives_ToMS(t *testing.T) {
 		{map[string]any{"type": "string"}, S{"id", "Str"}},
 	}
 	for _, c := range cases {
-		got := ip.JSONSchemaToTypeValue(c.js).Data.(S)
+		got := typeSFromValue(t, ip.JSONSchemaToTypeValue(c.js))
 		if !equalS(got, c.ms) {
 			t.Fatalf("JSON->MS %v => %v; want %v", c.js, got, c.ms)
 		}
@@ -214,7 +227,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 
 	// type: ["integer", "null"]
 	m1 := map[string]any{"type": []any{"integer", "null"}}
-	got := ip.JSONSchemaToTypeValue(m1).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(m1))
 	want := S{"unop", "?", S{"id", "Int"}}
 	if !equalS(got, want) {
 		t.Fatalf("nullable via type[] got %v; want %v", got, want)
@@ -222,7 +235,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 
 	// anyOf: [ {type:string}, {type:null} ]
 	m2 := map[string]any{"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}}}
-	got = ip.JSONSchemaToTypeValue(m2).Data.(S)
+	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(m2))
 	want = S{"unop", "?", S{"id", "Str"}}
 	if !equalS(got, want) {
 		t.Fatalf("nullable via anyOf got %v; want %v", got, want)
@@ -230,7 +243,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 
 	// oneOf: [ {type:number}, {type:null} ]
 	m3 := map[string]any{"oneOf": []any{map[string]any{"type": "number"}, map[string]any{"type": "null"}}}
-	got = ip.JSONSchemaToTypeValue(m3).Data.(S)
+	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(m3))
 	want = S{"unop", "?", S{"id", "Num"}}
 	if !equalS(got, want) {
 		t.Fatalf("nullable via oneOf got %v; want %v", got, want)
@@ -238,7 +251,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 
 	// OpenAPI nullable: true
 	m4 := map[string]any{"type": "string", "nullable": true}
-	got = ip.JSONSchemaToTypeValue(m4).Data.(S)
+	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(m4))
 	want = S{"unop", "?", S{"id", "Str"}}
 	if !equalS(got, want) {
 		t.Fatalf("nullable:true got %v; want %v", got, want)
@@ -249,14 +262,14 @@ func Test_Schema_JSONArray_ToMS(t *testing.T) {
 	ip := NewInterpreter()
 
 	js := map[string]any{"type": "array", "items": map[string]any{"type": "number"}}
-	got := ip.JSONSchemaToTypeValue(js).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	want := S{"array", S{"id", "Num"}}
 	if !equalS(got, want) {
 		t.Fatalf("array got %v; want %v", got, want)
 	}
 
 	// Missing items -> array[Any]
-	got = ip.JSONSchemaToTypeValue(map[string]any{"type": "array"}).Data.(S)
+	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(map[string]any{"type": "array"}))
 	want = S{"array", S{"id", "Any"}}
 	if !equalS(got, want) {
 		t.Fatalf("array default items Any got %v; want %v", got, want)
@@ -275,7 +288,7 @@ func Test_Schema_JSONObject_ToMS(t *testing.T) {
 		"required": []any{"age"},
 	}
 
-	ms := ip.JSONSchemaToTypeValue(schema).Data.(S)
+	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(schema))
 	if len(ms) == 0 || ms[0].(string) != "map" {
 		t.Fatalf("expected map; got %v", ms)
 	}
@@ -323,7 +336,7 @@ func Test_Schema_JSONEnum_ToMS(t *testing.T) {
 			map[string]any{"k": "v"},
 		},
 	}
-	got := ip.JSONSchemaToTypeValue(js).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	// only verify tag and length
 	if len(got) == 0 || got[0].(string) != "enum" || len(got) != 7 {
 		t.Fatalf("enum conversion unexpected: %v", got)
@@ -340,7 +353,7 @@ func Test_Schema_JSONRefs_ToMS(t *testing.T) {
 		},
 		"$ref": "#/$defs/Pet",
 	}
-	got := ip.JSONSchemaToTypeValue(doc).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(doc))
 	want := S{"id", "Pet"}
 	if !equalS(got, want) {
 		t.Fatalf("$ref #/$defs/Pet -> %v; want %v", got, want)
@@ -355,7 +368,7 @@ func Test_Schema_JSONRefs_ToMS(t *testing.T) {
 		},
 		"$ref": "#/components/schemas/Thing",
 	}
-	got = ip.JSONSchemaToTypeValue(doc).Data.(S)
+	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(doc))
 	want = S{"id", "Str"}
 	if !equalS(got, want) {
 		t.Fatalf("resolving local pointer -> %v; want %v", got, want)
@@ -373,7 +386,7 @@ func Test_Schema_JSONUnsupported_Unions_ToAny(t *testing.T) {
 			map[string]any{"type": "integer"},
 		},
 	}
-	got := ip.JSONSchemaToTypeValue(js).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	if !isId(got, "Any") {
 		t.Fatalf("complex anyOf should map to Any; got %v", got)
 	}
@@ -386,7 +399,7 @@ func Test_Schema_JSONConstraints_Ignored(t *testing.T) {
 		"type":    "string",
 		"pattern": "^[a-z]+$",
 	}
-	got := ip.JSONSchemaToTypeValue(js).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	if !isId(got, "Str") {
 		t.Fatalf("string with pattern should still be Str; got %v", got)
 	}
@@ -405,7 +418,7 @@ func Test_Schema_Roundtrip_MS_to_JSON_to_MS(t *testing.T) {
 		S{"pair", S{"str", "tags"}, S{"array", S{"id", "Str"}}},
 	}
 	js := ip.TypeValueToJSONSchema(TypeVal(ms), env)
-	got := ip.JSONSchemaToTypeValue(js).Data.(S)
+	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	// We expect equal shape (order-insensitive by our equality)
 	if !equalS(got, ms) {
 		t.Fatalf("round-trip mismatch: got %v; want %v", got, ms)
@@ -500,7 +513,7 @@ func Test_Schema_Enum_JSONNumber_IntVsNum(t *testing.T) {
 	ip := NewInterpreter()
 
 	js := map[string]any{"enum": []any{float64(2), float64(2.5)}}
-	ms := ip.JSONSchemaToTypeValue(js).Data.(S)
+	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	if len(ms) != 3 || ms[0].(string) != "enum" {
 		t.Fatalf("unexpected ms enum: %v", ms)
 	}
@@ -528,7 +541,7 @@ func Test_Schema_Alias_Roundtrip_Smoke(t *testing.T) {
 
 	// MS -> JSON ($defs) -> MS
 	js := ip.TypeValueToJSONSchema(TypeVal(S{"id", "Order"}), env)
-	ms := ip.JSONSchemaToTypeValue(js).Data.(S)
+	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 
 	// The top-level will typically be ("id","Order") due to $ref handling
 	if !isId(ms, "Order") {
@@ -584,7 +597,7 @@ func Test_Schema_JSON_ComplexOneOf_ToAny(t *testing.T) {
 			map[string]any{"type": "null"},
 		},
 	}
-	ms := ip.JSONSchemaToTypeValue(doc).Data.(S)
+	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(doc))
 	if !isId(ms, "Any") {
 		t.Fatalf("complex oneOf should map to Any; got %v", ms)
 	}
@@ -648,7 +661,7 @@ func Test_Schema_Helper_JSONSchemaStringToObject_Integration(t *testing.T) {
 		t.Fatalf("parse JSON schema string: %v", err)
 	}
 	ip := NewInterpreter()
-	ms := ip.JSONSchemaToTypeValue(m).Data.(S)
+	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(m))
 	// For $ref to #/$defs/User, we map to ("id","User")
 	if !isId(ms, "User") {
 		t.Fatalf("expected id(User); got %v", ms)

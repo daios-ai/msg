@@ -99,6 +99,39 @@ func equalS(a, b S) bool {
 		return false
 	}
 
+	// Order-insensitive equality for maps: compare by field name/required/type.
+	if ta == "map" {
+		fa := mapTypeFields(a)
+		fb := mapTypeFields(b)
+		if len(fa) != len(fb) {
+			return false
+		}
+		for k, va := range fa {
+			vb, ok := fb[k]
+			if !ok || va.required != vb.required || !equalS(va.typ, vb.typ) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Order-insensitive equality for enums: set comparison on literal S-exprs.
+	if ta == "enum" {
+		if len(a) != len(b) { // quick length check
+			return false
+		}
+	outer:
+		for i := 1; i < len(a); i++ {
+			for j := 1; j < len(b); j++ {
+				if equalS(a[i].(S), b[j].(S)) {
+					continue outer
+				}
+			}
+			return false
+		}
+		return true
+	}
+
 	for i := 1; i < len(a); i++ {
 		if !equalNode(a[i], b[i]) {
 			return false
@@ -760,9 +793,24 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 
 	// ---- Functions: pointwise ----
 	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
-		inU := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
-		outU := ip.unifyTypes(t1[3].(S), t2[3].(S), env)
-		return S{"binop", "->", inU, outU}
+		// f1 = A1 -> B1, f2 = A2 -> B2
+		a1, b1 := t1[2].(S), t1[3].(S)
+		a2, b2 := t2[2].(S), t2[3].(S)
+
+		// Param GLB (contravariant):
+		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
+		var param S
+		if ip.isSubtype(a1, a2, env) {
+			param = a1
+		} else if ip.isSubtype(a2, a1, env) {
+			param = a2
+		} else {
+			return S{"id", "Any"}
+		}
+
+		// Return LUB (covariant):
+		ret := ip.unifyTypes(b1, b2, env)
+		return S{"binop", "->", param, ret}
 	}
 	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
 		return S{"id", "Any"}

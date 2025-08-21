@@ -1,4 +1,4 @@
-// cmd/cli/mindscript.go
+// cmd/cli/main.go
 package main
 
 import (
@@ -265,59 +265,19 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 		b.WriteString(line)
 
 		src := b.String()
-		_, perr := mindscript.ParseSExpr(src)
+		// Use the interactive parser: it reports need-more-input cases via IncompleteError.
+		_, perr := mindscript.ParseSExprInteractive(src)
 		if perr == nil {
 			// Complete and valid.
 			return src, true
 		}
-		// Decide if this looks incomplete (keep reading) or a real error (stop).
-		if looksIncomplete(perr) || endsWithOpenAnnotation(src) {
+		// Keep reading only when the parser/lexer signalled an interactive incompleteness.
+		if mindscript.IsIncomplete(perr) {
 			continue
 		}
 		// Real error → return current buffer so the caller can print it.
 		return src, true
 	}
-}
-
-// endsWithOpenAnnotation reports whether the current source ends with
-// one or more annotation lines ('# ...' with optional leading spaces,
-// but NOT '##' comments) and no following expression yet.
-func endsWithOpenAnnotation(src string) bool {
-	s := strings.TrimRight(src, " \t\r\n")
-	if s == "" {
-		return false
-	}
-	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
-		s = s[i+1:]
-	}
-	line := strings.TrimLeft(s, " \t")
-	if strings.HasPrefix(line, "##") {
-		return false // true comment
-	}
-	return strings.HasPrefix(line, "#") // annotation needs an expr next
-}
-
-// looksIncomplete classifies parse/lex errors that likely mean “need more input”.
-func looksIncomplete(err error) bool {
-	msg := strings.ToLower(err.Error())
-	// Typical parser “expected …” when a block/paren/string isn’t closed.
-	if strings.Contains(msg, "expected ')'") ||
-		strings.Contains(msg, "expected ']'") ||
-		strings.Contains(msg, "expected '}'") ||
-		strings.Contains(msg, "expected 'end'") ||
-		strings.Contains(msg, "expected '(' to start parameters") ||
-		strings.Contains(msg, "expected ':' after key") ||
-		strings.Contains(msg, "expected 'then'") {
-		return true
-	}
-	// Lexer “unfinished” cases (strings/escapes/annotation blocks).
-	if strings.Contains(msg, "string was not terminated") ||
-		strings.Contains(msg, "unfinished escape sequence") ||
-		strings.Contains(msg, "unicode escape was not terminated") ||
-		strings.Contains(msg, "incomplete annotation") {
-		return true
-	}
-	return false
 }
 
 // stripStrings is retained only for endsWithOpenAnnotation helper if you keep it;

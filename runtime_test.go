@@ -1162,3 +1162,24 @@ func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
 		t.Fatalf("expected Any; got %v", FormatValue(out))
 	}
 }
+
+func Test_RT_BaseType_StripsNullable_AndResolvesAliases(t *testing.T) {
+	ip := NewRuntime()
+	src := `let T = type Int?
+	baseType(T)
+	`
+	// Define alias persistently
+	out, err := ip.EvalSource(src)
+	if err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	// baseType(T) -> Int
+	if out.Tag != VTType {
+		t.Fatalf("want VTType, got %#v", FormatValue(out))
+	}
+	tv := out.Data.(*TypeValue)
+	if !equalS(tv.Ast, typeS(t, ip, `Int`)) {
+		t.Fatalf("baseType failed, got %#v", tv.Ast)
+	}
+}

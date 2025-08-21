@@ -243,9 +243,64 @@ func Test_Types_FunctionChains_SubtypeAndUnify(t *testing.T) {
 	if !ip.isSubtype(sub, super, ip.Global) {
 		t.Fatalf("chained function subtype failed")
 	}
+	// LUB(Int->Int->Int, Num->Num->Num) = Int -> Int -> Num
 	u := ip.unifyTypes(typeS(t, ip, `Int -> Int -> Int`), typeS(t, ip, `Num -> Num -> Num`), ip.Global)
-	if !ip.isSubtype(u, typeS(t, ip, `Num -> Num -> Num`), ip.Global) {
-		t.Fatalf("function unify failed, got %#v", u)
+	want := typeS(t, ip, `Int -> Int -> Num`)
+	if !equalS(u, want) {
+		t.Fatalf("function unify mismatch:\n got  %#v\n want %#v", u, want)
+	}
+	// And the result must be a supertype of both inputs
+	if !ip.isSubtype(typeS(t, ip, `Int -> Int -> Int`), u, ip.Global) ||
+		!ip.isSubtype(typeS(t, ip, `Num -> Num -> Num`), u, ip.Global) {
+		t.Fatalf("unify result must be a supertype of both inputs; got %#v", u)
+	}
+}
+
+func Test_Types_Unify_Functions_ParamGLB_ReturnLUB(t *testing.T) {
+	ip := newIP()
+	f1 := typeS(t, ip, `Int -> Int`)
+	f2 := typeS(t, ip, `Num -> Num`)
+	u := ip.unifyTypes(f1, f2, ip.Global)
+
+	// GLB(param) = Int, LUB(return) = Num  =>  Int -> Num
+	want := typeS(t, ip, `Int -> Num`)
+	if !equalS(u, want) {
+		t.Fatalf("function unify mismatch: got %#v, want %#v", u, want)
+	}
+	if !ip.isSubtype(f1, u, ip.Global) || !ip.isSubtype(f2, u, ip.Global) {
+		t.Fatalf("unify result must be a supertype of both inputs")
+	}
+}
+
+func Test_Types_Unify_Functions_UnrelatedParams_YieldsAny(t *testing.T) {
+	ip := newIP()
+	u := ip.unifyTypes(typeS(t, ip, `Int -> Num`), typeS(t, ip, `Str -> Num`), ip.Global)
+	if !equalS(u, typeS(t, ip, `Any`)) {
+		t.Fatalf("unifying functions with unrelated params should yield Any, got %#v", u)
+	}
+}
+
+func Test_Types_Unify_Functions_EnumParam_Meet(t *testing.T) {
+	ip := newIP()
+	u := ip.unifyTypes(typeS(t, ip, `Str -> Str`), typeS(t, ip, `Enum["a","b"] -> Str`), ip.Global)
+	want := typeS(t, ip, `Enum["a","b"] -> Str`)
+	if !equalS(u, want) {
+		t.Fatalf("function unify (enum param) mismatch: got %#v, want %#v", u, want)
+	}
+	// Supertype property
+	if !ip.isSubtype(typeS(t, ip, `Str -> Str`), u, ip.Global) ||
+		!ip.isSubtype(typeS(t, ip, `Enum["a","b"] -> Str`), u, ip.Global) {
+		t.Fatalf("unify result must be a supertype of both function types")
+	}
+}
+
+func Test_Types_Unify_Functions_NestedNullableReturns(t *testing.T) {
+	ip := newIP()
+	u := ip.unifyTypes(typeS(t, ip, `Int -> (Int -> Int?)`), typeS(t, ip, `Num -> (Num -> Null)`), ip.Global)
+	// Param GLB: Int; inner param GLB: Int; inner return LUB: Int?
+	want := typeS(t, ip, `Int -> Int -> Int?`)
+	if !equalS(u, want) {
+		t.Fatalf("nested function unify mismatch: got %#v, want %#v", u, want)
 	}
 }
 

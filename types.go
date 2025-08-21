@@ -23,6 +23,9 @@
 //  4. No open sum types beyond T? (nullable) and Any (top).
 //  5. Function types use parameter **contravariance** and return **covariance**.
 //     (Matches soundness for callable subtyping; works well with currying).
+//  6. Null as Failure: In MindScript, the value null universally represents failure
+//     or no answer. A function whose return type is T? means: “returns a T on
+//     success, or null to signal failure.”
 //
 // Implementation notes:
 //   - Types are S-exprs (same shape as AST):

@@ -1,9 +1,17 @@
 package mindscript
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
+
+// Reminder: Null as Failure
+// In MindScript, the value null universally represents failure or no answer.
+// A function whose return type is T? means: “returns a T on success, or null to signal failure.”
+// Oracles follow the same rule. Their backends may return null to indicate the LLM could not produce a valid answer.
+// Example pairs for oracles must contain successful outputs (never null).
+// When an oracle’s declared return type is Str, the literal string "null" is not a valid successful result.
 
 // execOracle: centralize parsing + type-checking; oracle returns are always nullable.
 //
@@ -26,10 +34,12 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 		inT = ip.resolveType(f.ParamTypes[0], f.Env)
 	}
 	declOutT := ip.resolveType(f.ReturnType, f.Env) // declared success type T
-
 	// Oracle returns are *always* nullable: T?  (but Any? == Any → don't wrap)
 	outTNullable := ensureNullableUnlessAny(declOutT)
 	baseOut := stripNullable(outTNullable) // base(T) after making nullable
+
+	// Validate examples
+	validated := ip.validateExamples(f.Examples, inT, baseOut, f.Env)
 
 	// Locate executor
 	hook, err := ip.Global.Get("__oracle_execute")
@@ -42,7 +52,7 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 		Str(prompt),
 		TypeVal(inT),
 		TypeVal(outTNullable),
-		Arr(append([]Value(nil), f.Examples...)),
+		Arr(validated),
 	})
 
 	// Null from executor = legitimate oracle failure (already annotated if any)
@@ -104,7 +114,9 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 	if len(f.ParamTypes) == 1 {
 		inT = ip.resolveType(f.ParamTypes[0], f.Env)
 	}
-	outT := ip.resolveType(f.ReturnType, f.Env)
+	outTResolved := ip.resolveType(f.ReturnType, f.Env)
+	// Use non-null success type for prompt/schema:
+	outSuccess := stripNullable(outTResolved)
 
 	// 2) Prefer MindScript hook: __oracle_build_prompt
 	if ip != nil && ip.Global != nil {
@@ -113,7 +125,7 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 			res := ip.Apply(hook, []Value{
 				Str(instruction),
 				TypeVal(inT),
-				TypeVal(outT),
+				TypeVal(outSuccess),
 				ex,
 			})
 			if res.Tag == VTStr {
@@ -123,12 +135,41 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 		}
 	}
 
-	// 3) Go fallback using the pretty printers already in the runtime
+	// 3) Go fallback using JSON Schemas from schema.go
+	pretty := func(m map[string]any) string {
+		bs, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return "{}"
+		}
+		return string(bs)
+	}
+
+	// Build JSON Schemas for input and output.
+	// We wrap them under top-level objects: {"input": <in>}, {"output": <out>}
+	inSchemaInner := ip.TypeValueToJSONSchema(TypeValIn(inT, f.Env), f.Env)
+	outSchemaInner := ip.TypeValueToJSONSchema(TypeValIn(outSuccess, f.Env), f.Env) // success type (non-null)
+
+	inputDoc := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"input": inSchemaInner,
+		},
+		"required": []any{"input"},
+	}
+	outputDoc := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"output": outSchemaInner,
+		},
+		"required": []any{"output"},
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n\n", instruction)
-	fmt.Fprintf(&b, "INPUT TYPE:\n%s\n\n", indentBlock(FormatType(inT), 2))
-	fmt.Fprintf(&b, "OUTPUT TYPE:\n%s\n\n", indentBlock(FormatType(outT), 2))
+	fmt.Fprintf(&b, "INPUT JSON SCHEMA:\n\n%s\n\n", indentBlock(pretty(inputDoc), 2))
+	fmt.Fprintf(&b, "OUTPUT JSON SCHEMA:\n\n%s\n\n", indentBlock(pretty(outputDoc), 2))
 
+	// Examples: format as JSON objects { "input": <..> } / { "output": <..> }
 	if len(f.Examples) > 0 {
 		fmt.Fprintf(&b, "EXAMPLES:\n")
 		for i, ex := range f.Examples {
@@ -137,8 +178,13 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 				if len(xs) == 2 {
 					inStr := FormatValue(xs[0])
 					outStr := FormatValue(xs[1])
-					fmt.Fprintf(&b, "  #%d\n  INPUT:\n%s\n  OUTPUT:\n%s\n",
-						i+1, indentBlock(inStr, 4), indentBlock(outStr, 4))
+					fmt.Fprintf(
+						&b,
+						"  #%d\n  INPUT:\n%s\n  OUTPUT:\n%s\n",
+						i+1,
+						indentBlock(fmt.Sprintf(`{"input": %s}`, inStr), 4),
+						indentBlock(fmt.Sprintf(`{"output": %s}`, outStr), 4),
+					)
 					continue
 				}
 			}
@@ -148,8 +194,8 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 	}
 
 	fmt.Fprintf(&b, "TASK:\n")
-	fmt.Fprintf(&b, "Given the INPUT (which conforms to the INPUT TYPE), produce an OUTPUT that conforms to the OUTPUT TYPE.\n")
-	fmt.Fprintf(&b, "Respond with only the content of the output (no code fences or extra prose).\n")
+	fmt.Fprintf(&b, "Given the INPUT (matching the INPUT JSON SCHEMA), produce an OUTPUT that matches the OUTPUT JSON SCHEMA.\n")
+	fmt.Fprintf(&b, "Respond with only the OUTPUT JSON value (no extra prose, no code fences).\n")
 	return b.String()
 }
 
@@ -165,8 +211,6 @@ func indentBlock(s string, n int) string {
 
 // Expose the last prompt for testing / REPL demo.
 func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
-
-// ---- small helpers (engine-side only) ----
 
 // ---- helpers ----
 
@@ -211,6 +255,28 @@ func unwrapFenced(s string) string {
 		s = strings.TrimSpace(s)
 	}
 	return s
+}
+
+func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env) []Value {
+	ok := make([]Value, 0, len(exs))
+	for _, ex := range exs {
+		if ex.Tag != VTArray {
+			continue
+		}
+		xs := ex.Data.([]Value)
+		if len(xs) != 2 {
+			continue
+		}
+		vin, vout := xs[0], xs[1]
+		if !ip.isType(vin, inT, env) {
+			continue
+		}
+		if !ip.isType(vout, outBase, env) {
+			continue
+		}
+		ok = append(ok, ex)
+	}
+	return ok
 }
 
 // callGlobal1 calls a global builtin (like jsonParse) with one arg.

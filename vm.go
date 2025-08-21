@@ -26,6 +26,7 @@ const (
 
 	// stack/values
 	opMakeArr // pop N → array; imm = N
+	opPop     // pop and discard top of stack
 
 	// property & index
 	opGetProp // obj.get(name);   imm = const index (name as VTStr)
@@ -49,8 +50,6 @@ const (
 	opJump        // ip = imm
 	opJumpIfFalse // pop cond; if false => ip = imm
 	opReturn      // pop v; signal Return with v
-	opBreak       // signal Break with top (or null if empty)
-	opContinue    // signal Continue with top (or null if empty)
 
 	// calls/closures
 	opCall // argc = imm; pops argc args then callee; pushes result
@@ -87,8 +86,6 @@ type vmStatus int
 const (
 	vmOK vmStatus = iota
 	vmReturn
-	vmBreak
-	vmContinue
 	vmRuntimeError
 )
 
@@ -282,6 +279,12 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 			m.sp = start
 			m.push(Arr(elems))
 
+		// ---- pop value from stack ----
+		case opPop:
+			if m.sp == 0 {
+				return m.fail("pop on empty stack")
+			}
+			m.sp--
 		// ---- properties / indices ----
 		case opGetProp:
 			if int(imm) >= len(consts) {
@@ -414,20 +417,6 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 				v = m.pop()
 			}
 			return vmResult{status: vmReturn, value: v}
-
-		case opBreak:
-			v := m.top()
-			if m.sp == 0 {
-				v = Null
-			}
-			return vmResult{status: vmBreak, value: v}
-
-		case opContinue:
-			v := m.top()
-			if m.sp == 0 {
-				v = Null
-			}
-			return vmResult{status: vmContinue, value: v}
 
 		// ---- calls ----
 		case opCall:

@@ -420,6 +420,18 @@ func (p *parser) expr(minBP int) (S, error) {
 			continue
 		case PERIOD:
 			p.i++
+			// NEW: obj.(EXPR) → idx(obj, EXPR)
+			if p.match(LROUND) || p.match(CLROUND) {
+				ex, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.need(RROUND, "expected ')' after computed property"); err != nil {
+					return nil, err
+				}
+				left = L("idx", left, ex)
+				continue
+			}
 			if p.match(INTEGER) { // obj.90 → idx(obj, 90)
 				left = L("idx", left, L("int", p.prev().Literal))
 				continue
@@ -429,7 +441,7 @@ func (p *parser) expr(minBP int) (S, error) {
 				continue
 			}
 			g := p.peek()
-			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected property name or integer after '.'"}
+			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected property name, integer, or '(expr)' after '.'"}
 		}
 		break
 	}

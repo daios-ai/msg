@@ -279,12 +279,12 @@ func Test_Interpreter_TopLevel_Return_Exits_Program(t *testing.T) {
 
 func Test_Interpreter_TopLevel_Break_Exits_Program(t *testing.T) {
 	v := evalSrc(t, `break(7)`)
-	wantAnnotatedNullContains(t, v, "break")
+	wantInt(t, v, 7)
 }
 
 func Test_Interpreter_TopLevel_Continue_Returns_AnnotatedNull(t *testing.T) {
 	v := evalSrc(t, `continue(0)`)
-	wantAnnotatedNullContains(t, v, "continue")
+	wantInt(t, v, 0)
 }
 
 func Test_Interpreter_ShortCircuit_And_Or(t *testing.T) {
@@ -786,7 +786,7 @@ for let x in [1,2] do
   s = s + x
 end
 `)
-	wantNull(t, v)
+	wantInt(t, v, 3)
 }
 
 func Test_Interpreter_While_Continue_Expression_Value_Null(t *testing.T) {
@@ -810,8 +810,7 @@ func Test_Interpreter_For_Iterator_AnnotatedNull_Propagates(t *testing.T) {
 	// Iterator returns an annotated null; for-loop should propagate it out.
 	src := `
 let bad = fun() -> Int? do
-  # oops
-  return(continue(0))  ## cause annotated null
+  return #(oops) null ## causes annotated null
 end
 let sum = 0
 for let x in bad do
@@ -820,7 +819,7 @@ end
 sum
 `
 	v := evalSrc(t, src)
-	wantAnnotatedNullContains(t, v, "continue")
+	wantAnnotatedNullContains(t, v, "oops")
 }
 
 func Test_Interpreter_For_ZeroArgIterator_Works(t *testing.T) {
@@ -1286,4 +1285,59 @@ let Input = type {
 	if !strings.Contains(out, "input!") || !strings.Contains(out, "Int") {
 		t.Fatalf("missing field in output:\n%s", out)
 	}
+}
+
+func Test_Interpreter_Assign_Map_With_Computed_Index(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `let obj = {name: "Pedro", age: 17}`)
+
+	// Success paths
+	mustEvalPersistent(t, ip, `obj["na" + "me"] = "Juan"`)
+	wantStr(t, mustEvalPersistent(t, ip, `obj.name`), "Juan")
+
+	mustEvalPersistent(t, ip, `obj.("na" + "me") = "Maria"`)
+	wantStr(t, mustEvalPersistent(t, ip, `obj.name`), "Maria")
+
+	// Failure path (int index on map) — expect generic engine message
+	v := mustEvalPersistent(t, ip, `obj.(0 + 1) = "X"`)
+	wantAnnotatedNullContains(t, v, "index assignment requires array[int] or map[string]")
+}
+
+func Test_Interpreter_Assign_Array_With_Computed_Index(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `let arr = ["Pedro", 17]`)
+
+	// Bracket with computed index
+	mustEvalPersistent(t, ip, `arr[0 + 1] = "Juan"`)
+	wantStr(t, mustEvalPersistent(t, ip, `arr[1]`), "Juan") // no str(...)
+
+	// Dot-paren with computed index
+	mustEvalPersistent(t, ip, `arr.(0 + 1) = "Maria"`)
+	wantStr(t, mustEvalPersistent(t, ip, `arr[1]`), "Maria")
+
+	// Negative index writeback supported
+	mustEvalPersistent(t, ip, `arr[-1] = "Tail"`)
+	wantStr(t, mustEvalPersistent(t, ip, `arr[1]`), "Tail")
+
+	// Failure: string index on array
+	v := mustEvalPersistent(t, ip, `arr.("1") = "X"`)
+	wantAnnotatedNullContains(t, v, "index assignment requires array[int] or map[string]")
+}
+
+func Test_Interpreter_Assign_Through_Nested_Computed_Keys(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `
+		let key = "na" + "me"
+		let idx = 0 + 1
+		let obj = {name: "Pedro", age: 17}
+		let arr = ["Pedro", 17]
+	`)
+
+	// Map
+	mustEvalPersistent(t, ip, `obj.(key) = "Zed"`)
+	wantStr(t, mustEvalPersistent(t, ip, `obj.name`), "Zed")
+
+	// Array
+	mustEvalPersistent(t, ip, `arr.(idx) = 99`)
+	wantInt(t, mustEvalPersistent(t, ip, `arr[1]`), 99)
 }

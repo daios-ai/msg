@@ -402,3 +402,78 @@ let mute = fun(_: Any) -> Null do null end
 
 
 
+
+## -----------------------------
+## Oracle bootstrap (default backend: Ollama)
+## -----------------------------
+
+# Internal: do we already have an executor installed?
+let _oracle_is_configured = fun() -> Bool do
+  let probe = try(fun() do __oracle_execute end)
+  probe.ok and __is_fun(probe.value)
+end
+
+# Public: ensure there is an oracle backend; returns active backend name or null on failure.
+# By default, imports llm/backends, registers "ollama", configures localhost, and installs dispatcher.
+let oracleEnsure = fun() -> Str? do
+  if _oracle_is_configured() then
+    # An executor is already present; don't override.
+    null
+  else
+    let m1 = try(fun() do import("llm.ms") end)
+    if not m1.ok then
+      # { "llm.ms not found; oracles unavailable." }
+      null
+    else
+      let llm = m1.value
+      let m2 = try(fun() do import("backends.ms") end)
+      if not m2.ok then
+        # { "backends.ms not found; oracles unavailable." }
+        null
+      else
+        let be = m2.value
+        # Build state and register Ollama
+        let st = llm.new()
+        llm.register(st, "ollama", be.makeOllama())
+        # Default local config; safe if Ollama isn't running yet (only used at call time).
+        llm.configure(st, "ollama", { baseURL: "http://localhost:11434", model: "llama3.1" })
+        llm.use(st, "ollama")
+        __oracle_execute = llm.dispatcher(st)
+        # Optionally expose state for later tweaks
+        __llm_state = st
+        "ollama"
+      end
+    end
+  end
+end
+
+# Public: query/switch ergonomics (no-throw convenience).
+let oracleBackend = fun() -> Str? do
+  if not _oracle_is_configured() then oracleEnsure() end
+  let p = try(fun() do __llm_state end)
+  if not p.ok then null else
+    let llm = import("llm.ms")
+    llm.current(p.value)
+  end
+end
+
+let oracleUse = fun(name: Str, cfg: {Str: Any}?) -> Str? do
+  let p = try(fun() do __llm_state end)
+  if not p.ok then
+    oracleEnsure()
+    let q = try(fun() do __llm_state end)
+    if not q.ok then null else
+      let llm = import("llm.ms")
+      if cfg != null then llm.configure(q.value, name, cfg) end
+      llm.use(q.value, name)
+    end
+  else
+    let st = p.value
+    let llm = import("llm.ms")
+    if cfg != null then llm.configure(st, name, cfg) end
+    llm.use(st, name)
+  end
+end
+
+# Auto-bootstrap on std load, but don’t crash if libs are missing.
+oracleEnsure()

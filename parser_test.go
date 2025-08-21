@@ -1002,3 +1002,48 @@ func Test_Parser_Control_Return_Forms_SameAST(t *testing.T) {
 		t.Fatalf("return forms not equivalent:\n%s\n%s", string(j1), string(j2))
 	}
 }
+func Test_Parser_ComputedDotIndex_Read_And_Assign(t *testing.T) {
+	// obj.("na"+"me")       → idx(obj, ("binop","+","na","me"))
+	root := mustParse(t, `obj.("na" + "me")`)
+	expr := kid(root, 0)
+	wantTag(t, expr, "idx")
+	wantTag(t, kid(expr, 0), "id") // obj
+	ix := kid(expr, 1)
+	wantTag(t, ix, "binop")
+	if ix[1].(string) != "+" {
+		t.Fatalf("want '+', got %v", ix[1])
+	}
+
+	// obj.("na"+"me") = "Juan"   → assign( idx(obj, binop+), "Juan")
+	root2 := mustParse(t, `obj.("na" + "me") = "Juan"`)
+	assign := kid(root2, 0)
+	wantTag(t, assign, "assign")
+	lhs := kid(assign, 0)
+	wantTag(t, lhs, "idx")
+	wantTag(t, kid(lhs, 0), "id")    // obj
+	wantTag(t, kid(lhs, 1), "binop") // ("+" ...)
+	wantTag(t, kid(assign, 1), "str")
+}
+
+func Test_Parser_ComputedDotIndex_Array(t *testing.T) {
+	// arr.(0 + 1)            → idx(arr, ("binop","+","0","1"))
+	root := mustParse(t, `arr.(0 + 1)`)
+	expr := kid(root, 0)
+	wantTag(t, expr, "idx")
+	wantTag(t, kid(expr, 0), "id") // arr
+	ix := kid(expr, 1)
+	wantTag(t, ix, "binop")
+	if ix[1].(string) != "+" {
+		t.Fatalf("want '+', got %v", ix[1])
+	}
+
+	// arr.(0 + 1) = "Juan"   → assign(idx(arr, binop+), "Juan")
+	root2 := mustParse(t, `arr.(0 + 1) = "Juan"`)
+	assign := kid(root2, 0)
+	wantTag(t, assign, "assign")
+	lhs := kid(assign, 0)
+	wantTag(t, lhs, "idx")
+	wantTag(t, kid(lhs, 0), "id")    // arr
+	wantTag(t, kid(lhs, 1), "binop") // ("+" ...)
+	wantTag(t, kid(assign, 1), "str")
+}

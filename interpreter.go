@@ -161,8 +161,6 @@ func (e *Env) Get(name string) (Value, error) {
 // -----------------------------------------------------------------------------
 
 type returnSig struct{ v Value }
-type breakSig struct{ v Value }
-type contSig struct{ v Value }
 type rtErr struct{ msg string }
 
 func fail(msg string)          { panic(rtErr{msg: msg}) }
@@ -339,10 +337,6 @@ func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err er
 				switch sig := r.(type) {
 				case returnSig:
 					out, err = sig.v, nil
-				case breakSig:
-					out, err = sig.v, nil
-				case contSig:
-					out, err = errNull("continue outside of loop"), nil
 				case rtErr:
 					out, err = errNull(sig.msg), nil
 				case error:
@@ -359,10 +353,6 @@ func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err er
 	switch res.status {
 	case vmOK, vmReturn:
 		return res.value, nil
-	case vmBreak:
-		return errNull("break outside of loop"), nil
-	case vmContinue:
-		return errNull("continue outside of loop"), nil
 	case vmRuntimeError:
 		return res.value, nil
 	default:
@@ -517,10 +507,6 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 			fail("return type mismatch")
 		}
 		return res.value
-	case vmBreak:
-		panic(breakSig{res.value})
-	case vmContinue:
-		panic(contSig{res.value})
 	case vmRuntimeError:
 		return res.value
 	default:
@@ -742,7 +728,7 @@ func (ip *Interpreter) initCore() {
 			namesV := ctx.MustArg("params").Data.([]Value)
 			typesV := ctx.MustArg("types").Data.([]Value)
 
-			// NEW: extract ASTs from TypeValue
+			// Extract ASTs from TypeValue
 			retTV := ctx.MustArg("ret").Data.(*TypeValue)
 			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
 
@@ -770,10 +756,18 @@ func (ip *Interpreter) initCore() {
 				exVals = append([]Value(nil), exAny.Data.([]Value)...)
 			}
 
+			// Return type modification:
+			//   - normal funs: T
+			//   - oracles: ensureNullableUnlessAny(T)  (operationally nullable)
+			retAst := retTV.Ast
+			if isOr {
+				retAst = ensureNullableUnlessAny(retAst)
+			}
+
 			return FunVal(&Fun{
 				Params:     names,
 				ParamTypes: types,
-				ReturnType: retTV.Ast,
+				ReturnType: retAst,
 				Body:       bodyTV.Ast,
 				Env:        ctx.Env(),
 				HiddenNull: hidden,
@@ -989,13 +983,13 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 	case "decl":
 		env.Define(target[1].(string), value)
 	case "get":
-		obj := ip.evalSimple(target[1].(S), env)
+		obj := ip.evalFull(target[1].(S), env)
+		// Key may be literal or computed; evaluate fully if needed.
 		var keyStr string
-		switch target[2].(S)[0].(string) {
-		case "id", "str":
-			keyStr = target[2].(S)[1].(string)
-		default:
-			k := ip.evalSimple(target[2].(S), env)
+		if ks := target[2].(S); len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
+			keyStr = ks[1].(string)
+		} else {
+			k := ip.evalFull(target[2].(S), env)
 			if k.Tag != VTStr {
 				fail("object assignment requires map and string key")
 			}
@@ -1014,7 +1008,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 		}
 		fail("object assignment requires map and string key")
 	case "idx":
-		obj, idx := ip.evalSimple(target[1].(S), env), ip.evalSimple(target[2].(S), env)
+		obj, idx := ip.evalFull(target[1].(S), env), ip.evalFull(target[2].(S), env)
 		if obj.Tag == VTArray && idx.Tag == VTInt {
 			xs := obj.Data.([]Value)
 			if len(xs) == 0 {
@@ -1030,7 +1024,16 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			xs[i] = value
 			return
 		}
-		fail("index assignment requires array[int]")
+		if obj.Tag == VTMap && idx.Tag == VTStr {
+			mo := obj.Data.(*MapObject)
+			k := idx.Data.(string)
+			if _, exists := mo.Entries[k]; !exists {
+				mo.Keys = append(mo.Keys, k)
+			}
+			mo.Entries[k] = value
+			return
+		}
+		fail("index assignment requires array[int] or map[string]")
 	case "darr":
 		if value.Tag != VTArray {
 			for i := 1; i < len(target); i++ {
@@ -1103,6 +1106,32 @@ func (ip *Interpreter) evalSimple(n S, env *Env) Value {
 	}
 }
 
+// evalFull: evaluate an arbitrary expression in the given env.
+// If it produces an annotated-null (runtime error), propagate as a failure.
+func (ip *Interpreter) evalFull(n S, env *Env) Value {
+	em := newEmitter(ip)
+	em.emitExpr(n)
+	em.emit(opReturn, 0)
+	ch := em.chunk()
+	res := ip.runChunk(ch, env, 0)
+	switch res.status {
+	case vmOK, vmReturn:
+		// Treat annotated-null as an error here to match assignment error semantics.
+		if res.value.Tag == VTNull && res.value.Annot != "" {
+			fail(res.value.Annot)
+		}
+		return res.value
+	case vmRuntimeError:
+		if res.value.Tag == VTNull && res.value.Annot != "" {
+			fail(res.value.Annot)
+		}
+		fail("runtime error")
+	default:
+		fail("unknown VM status")
+	}
+	return Null
+}
+
 // Iterator expansion (single scoped implementation).
 func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 	switch iter.Tag {
@@ -1154,17 +1183,90 @@ type emitter struct {
 	ip        *Interpreter
 	code      []uint32
 	consts    []Value
-	loopStack []loopLbls
+	ctrlStack []ctrlCtx // generic block/loop control stack
 }
 
-type loopLbls struct {
-	head       int
-	contTarget int
+// ---------- control contexts (generic for blocks and loops) ----------
+//
+// Break/continue semantics:
+// - We support “break from the nearest block” by lowering `break x` / `continue y`
+//   to forward jumps recorded in the nearest *loop* context if present, otherwise
+//   the nearest plain *block* context. Each target gate ensures the prior
+//   expression value is saved to the block/loop’s `$last_*` slot so the block
+//   (or loop expression) yields that value. No dedicated VM opcodes or statuses
+//   are emitted/handled for break/continue.
+
+type ctrlCtx struct {
+	isLoop     bool
 	breakJumps []int
 	contJumps  []int
 }
 
+func (e *emitter) pushBlockCtx() { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: false}) }
+func (e *emitter) pushLoopCtx()  { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: true}) }
+func (e *emitter) popCtx() ctrlCtx {
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	e.ctrlStack = e.ctrlStack[:i]
+	return c
+}
+
+// Prefer the nearest *loop* ctx; else the nearest plain block ctx.
+func (e *emitter) addBreakJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.breakJumps = append(c.breakJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.breakJumps = append(c.breakJumps, at)
+	e.ctrlStack[i] = c
+}
+func (e *emitter) addContJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.contJumps = append(c.contJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.contJumps = append(c.contJumps, at)
+	e.ctrlStack[i] = c
+}
+
+// ---------- tiny bytecode helpers used by loops ----------
+
+// Preload "__assign_set(Type($last))" so any exit path can just CALL 2 with a value on top.
+func (e *emitter) preloadAssignToLast(lastName string) {
+	e.emit(opLoadGlobal, e.ks("__assign_set"))
+	e.emit(opConst, e.k(TypeVal(S{"id", lastName})))
+}
+
+// Consumes the value on stack (the body result), assigns to $last, and jumps to head.
+func (e *emitter) saveLastAndJumpHead(head int) {
+	e.emit(opCall, 2) // __assign_set(Type($last), <top>)
+	e.emit(opPop, 0)  // drop assign result
+	e.emit(opJump, uint32(head))
+}
+
+// Patch a set of recorded jumps to a gate that also saves last.
+func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
+	for _, at := range jumps {
+		e.patch(at, gate)
+	}
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+}
+
 func newEmitter(ip *Interpreter) *emitter { return &emitter{ip: ip} }
+
 func (e *emitter) k(v Value) uint32 {
 	for i := range e.consts {
 		if e.ip.deepEqual(e.consts[i], v) {
@@ -1234,9 +1336,43 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opLoadGlobal, e.ks(n[1].(string)))
 
 	case "block":
-		for i := 1; i < len(n); i++ {
-			e.emitExpr(n[i].(S))
+		e.pushBlockCtx()
+
+		nItems := len(n) - 1
+		if nItems <= 0 {
+			e.emit(opConst, e.k(Null))
+		} else {
+			for i := 1; i <= nItems; i++ {
+				e.emitExpr(n[i].(S))
+				if i < nItems {
+					e.emit(opPop, 0) // discard intermediates
+				}
+			}
 		}
+
+		// All early exits (break/continue) from this block land here:
+		exit := e.here()
+		ctx := e.popCtx()
+		for _, at := range ctx.breakJumps {
+			e.patch(at, exit)
+		}
+		for _, at := range ctx.contJumps {
+			e.patch(at, exit)
+		}
+
+	case "break":
+		e.emitExpr(n[1].(S)) // leave value on stack
+		at := e.here()
+		e.emit(opJump, 0) // we'll patch target
+		e.addBreakJump(at)
+		return // important: don't fall through
+
+	case "continue":
+		e.emitExpr(n[1].(S))
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addContJump(at)
+		return
 
 	// unary
 	case "unop":
@@ -1467,34 +1603,6 @@ func (e *emitter) emitExpr(n S) {
 	case "return":
 		e.emitExpr(n[1].(S))
 		e.emit(opReturn, 0)
-	case "break":
-		e.emitExpr(n[1].(S))
-		if len(e.loopStack) == 0 {
-			e.emit(opBreak, 0)
-		} else {
-			i := len(e.loopStack) - 1
-			lbl := e.loopStack[i]
-			at := e.here()
-			e.emit(opJump, 0)
-			lbl.breakJumps = append(lbl.breakJumps, at)
-			e.loopStack[i] = lbl
-		}
-	case "continue":
-		e.emitExpr(n[1].(S))
-		if len(e.loopStack) == 0 {
-			e.emit(opContinue, 0)
-		} else {
-			i := len(e.loopStack) - 1
-			lbl := e.loopStack[i]
-			if lbl.contTarget >= 0 {
-				e.emit(opJump, uint32(lbl.contTarget))
-			} else {
-				at := e.here()
-				e.emit(opJump, 0)
-				lbl.contJumps = append(lbl.contJumps, at)
-				e.loopStack[i] = lbl
-			}
-		}
 
 	// if/elif/else
 	case "if":
@@ -1535,38 +1643,61 @@ func (e *emitter) emitExpr(n S) {
 	case "while":
 		cond := n[1].(S)
 		body := n[2].(S)
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+
 		head := e.here()
 		e.emitExpr(cond)
 		jf := e.here()
-		e.emit(opJumpIfFalse, 0)
+		e.emit(opJumpIfFalse, 0) // -> end
 
-		l := loopLbls{head: head, contTarget: head}
-		e.loopStack = append(e.loopStack, l)
+		// Preload assign callee+target once per iteration
+		e.preloadAssignToLast(lastName)
 
-		e.emitExpr(body)
+		// Body runs under a loop control context so break/continue target loop gates
+		e.pushLoopCtx()
+		e.emitExpr(body) // (body is a block; it may early-exit itself too)
+		loopCtx := e.popCtx()
+
+		// Normal fallthrough → save last and iterate
+		e.saveLastAndJumpHead(head)
+
+		// Continue gate: patch continues to here, save last, jump head
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
 		e.emit(opJump, uint32(head))
 
+		// Break gate: patch breaks to here, save last, then jump end
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		// End
 		end := e.here()
 		e.patch(jf, end)
-		i := len(e.loopStack) - 1
-		lbl := e.loopStack[i]
-		for _, at := range lbl.breakJumps {
-			e.patch(at, end)
-		}
-		e.loopStack = e.loopStack[:i]
+		e.patch(jEnd, end)
 
-	// for (iterator lowering)
+		e.emit(opLoadGlobal, e.ks(lastName)) // loop value
+
+		// for (iterator lowering)
 	case "for":
 		target := n[1].(S)
 		iterExpr := n[2].(S)
 		body := n[3].(S)
 
+		// Prepare iterator
 		iterName := fmt.Sprintf("$iter_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", iterName}},
 			S{"call", S{"id", "__to_iter"}, iterExpr})
 
 		tmpName := fmt.Sprintf("$tmp_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+
+		// $last := null
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
 
 		head := e.here()
 
@@ -1575,44 +1706,60 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
 		e.emit(opLoadGlobal, e.ks(iterName))
 		e.emit(opConst, e.k(Null))
-		e.emit(opCall, 1)
-		e.emit(opCall, 2)
+		e.emit(opCall, 1) // call iterator
+		e.emit(opCall, 2) // assign tmp
 
 		// stop?
 		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
 		e.emit(opLoadGlobal, e.ks(tmpName))
 		e.emit(opCall, 1)
 		jBody := e.here()
-		e.emit(opJumpIfFalse, 0)
+		e.emit(opJumpIfFalse, 0) // -> body
 		jEnd := e.here()
-		e.emit(opJump, 0)
+		e.emit(opJump, 0) // -> end
 
+		// body:
 		bodyStart := e.here()
 		e.patch(jBody, bodyStart)
 
+		// Preload assign callee+target for $last
+		e.preloadAssignToLast(lastName)
+
+		// Bind loop target
 		assignName := "__assign_set"
 		switch target[0].(string) {
 		case "decl", "darr", "dobj", "annot":
 			assignName = "__assign_def"
 		}
 		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
+		e.emit(opPop, 0)
 
-		lbl := loopLbls{head: head, contTarget: head}
-		e.loopStack = append(e.loopStack, lbl)
+		// Body under a loop control-context
+		e.pushLoopCtx()
+		e.emitExpr(body) // leaves value
+		loopCtx := e.popCtx()
 
-		e.emitExpr(body)
+		// Normal fallthrough: save last, jump head
+		e.saveLastAndJumpHead(head)
+
+		// Continue gate
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
 		e.emit(opJump, uint32(head))
 
+		// Break gate
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jToEnd := e.here()
+		e.emit(opJump, 0)
+
+		// end:
 		end := e.here()
 		e.patch(jEnd, end)
-		i := len(e.loopStack) - 1
-		lrec := e.loopStack[i]
-		for _, at := range lrec.breakJumps {
-			e.patch(at, end)
-		}
-		e.loopStack = e.loopStack[:i]
+		e.patch(jToEnd, end)
 
-		e.emit(opConst, e.k(Null)) // for-expression value is null
+		// for-expression value = $last
+		e.emit(opLoadGlobal, e.ks(lastName))
 
 	// type / annotation
 	case "type":

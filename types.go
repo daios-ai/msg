@@ -34,7 +34,7 @@
 //     ("binop","->", A, B)                    // function A -> B (right-assoc chains)
 //   - Aliases: ("id", name) resolved from env when bound to VTType (spliced S).
 //   - This file provides: resolveType, isType, isSubtype, unifyTypes, valueToTypeS,
-//     and helpers (equalS/mapTypeFields/deopt/...).
+//     and helpers (equalS/mapTypeFields/...).
 package mindscript
 
 // NOTE: no imports needed
@@ -131,31 +131,6 @@ func equalNode(x, y any) bool {
 	default:
 		return x == y
 	}
-}
-
-// deopt: ("unop","?", X) => (X, true);  Null => (Any, true) for unification purposes
-func deopt(t S) (base S, opt bool) {
-	if len(t) == 0 {
-		return S{"id", "Any"}, false
-	}
-	switch t[0].(string) {
-	case "unop":
-		if len(t) >= 3 && t[1].(string) == "?" {
-			return t[2].(S), true
-		}
-	case "id":
-		if t[1].(string) == "Null" {
-			return S{"id", "Any"}, true
-		}
-	}
-	return t, false
-}
-
-func reopt(base S, opt bool) S {
-	if !opt {
-		return base
-	}
-	return S{"unop", "?", base}
 }
 
 // Deep equality on Values for the literal space used by enums (null/bool/int/num/str/array/map).

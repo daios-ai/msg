@@ -8,6 +8,7 @@ package mindscript
 
 import (
 	"fmt"
+	"math"
 )
 
 // -----------------------------
@@ -173,10 +174,15 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 			}
 			return Num(lf / rf), nil
 		case opMod:
+			// guard zero (match division error text)
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("division by zero")
+				return Null, &res
+			}
 			if bothInt {
 				return Int(a.Data.(int64) % b.Data.(int64)), nil
 			}
-			return Num(float64(int64(lf)) - float64(int64(lf)/int64(rf))*rf), nil
+			return Num(math.Mod(lf, rf)), nil
 		case opLt:
 			if bothInt {
 				return Bool(a.Data.(int64) < b.Data.(int64)), nil

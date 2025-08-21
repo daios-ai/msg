@@ -487,23 +487,44 @@ Params:
 
 Returns: Bool`)
 
-	// baseType(t: Type) -> Type
 	ip.RegisterNative(
 		"baseType",
 		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
 		S{"id", "Type"},
 		func(ip *Interpreter, ctx CallCtx) Value {
+			// Resolve aliases first, using the type value's own env if provided.
 			t := ip.resolveTypeValue(ctx.MustArg("t"), ctx.Env())
-			bt, _ := deopt(t)
-			return TypeVal(bt)
+
+			// If nullable, strip the '?' wrapper: ("unop","?", X) => X
+			if len(t) >= 3 {
+				if tag, ok := t[0].(string); ok && tag == "unop" {
+					if op, ok := t[1].(string); ok && op == "?" {
+						if inner, ok := t[2].(S); ok {
+							return TypeVal(inner)
+						}
+					}
+				}
+			}
+
+			// (Optional) keep historical behavior: Null -> Any.
+			if len(t) >= 2 {
+				if tag, ok := t[0].(string); ok && tag == "id" {
+					if name, ok := t[1].(string); ok && name == "Null" {
+						return TypeVal(S{"id", "Any"})
+					}
+				}
+			}
+
+			// Otherwise, return the resolved type unchanged.
+			return TypeVal(t)
 		},
 	)
 	setBuiltinDoc(ip, "baseType", `Strip nullable from T? and return the base Type.
 
-Params:
-  t: Type
+	Params:
+	  t: Type
 
-Returns: Type`)
+	Returns: Type`)
 
 	// doc(x: Any) -> Str?
 	ip.RegisterNative(

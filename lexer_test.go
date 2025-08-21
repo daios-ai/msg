@@ -341,6 +341,7 @@ person.name = "Sarah"`
 		t.Fatalf("did not find `person.name = \"Sarah\"` sequence in tokens")
 	}
 }
+
 func Test_Lexer_Object_Annotations_TokenFlow(t *testing.T) {
 	src := `{
 # the name
@@ -376,5 +377,15 @@ available: #(status) "yes"
 	}
 	if anns[0] != "the name" || anns[1] != "the age" || anns[2] != "status" {
 		t.Fatalf("unexpected annotation texts: %v", anns)
+	}
+}
+
+// --- NEW: interactive-mode lexer behavior ----------------------------------
+
+func Test_Lexer_Interactive_Unterminated_String_IsIncomplete(t *testing.T) {
+	l := NewLexerInteractive(`"hello`)
+	_, err := l.Scan()
+	if err == nil || !IsIncomplete(err) {
+		t.Fatalf("expected IncompleteError for unterminated string, got %v", err)
 	}
 }

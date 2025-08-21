@@ -1,4 +1,4 @@
-// parser_pratt.go
+// parser_pratt.go (interactive-ready, newline-sensitive control keywords)
 package mindscript
 
 import (
@@ -31,10 +31,23 @@ func ParseSExpr(src string) (S, error) {
 	return p.program()
 }
 
+// Interactive entry: produces IncompleteError (instead of ParseError) when input
+// ends mid-construct (e.g., missing ')', 'end', RHS of operator, etc.).
+func ParseSExprInteractive(src string) (S, error) {
+	lex := NewLexerInteractive(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, interactive: true}
+	return p.program()
+}
+
 // ---------- core Pratt parser ----------
 type parser struct {
-	toks []Token
-	i    int
+	toks        []Token
+	i           int
+	interactive bool
 }
 
 func (p *parser) atEnd() bool { return p.peek().Type == EOF }
@@ -62,7 +75,17 @@ func (p *parser) need(t TokenType, msg string) (Token, error) {
 		return p.prev(), nil
 	}
 	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return Token{}, &IncompleteError{Line: g.Line, Col: g.Col, Msg: msg}
+	}
 	return Token{}, &ParseError{Line: g.Line, Col: g.Col, Msg: msg}
+}
+
+func (p *parser) nextTokenIsOnSameLine(as Token) bool {
+	if p.atEnd() {
+		return false
+	}
+	return p.peek().Line == as.Line
 }
 
 // precedence (higher binds tighter)
@@ -139,6 +162,10 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("null")
 
 	case MINUS, NOT:
+		// unary operators require a RHS expression
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after unary operator"}
+		}
 		r, err := p.expr(80)
 		if err != nil {
 			return nil, err
@@ -202,6 +229,9 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 		var ret any = L("id", "Any")
 		if p.match(ARROW) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected return type after '->'"}
+			}
 			r, err := p.expr(0)
 			if err != nil {
 				return nil, err
@@ -221,15 +251,21 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 		var out any = L("id", "Any")
 		if p.match(ARROW) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected output type after '->'"}
+			}
 			o, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
 			out = o
 		}
-		// NEW: accept any expression after `from`
+		// accept any expression after `from`
 		var src any = L("array")
 		if p.match(FROM) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after 'from'"}
+			}
 			ex, err := p.expr(0)
 			if err != nil {
 				return nil, err
@@ -239,24 +275,31 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("oracle", params, out, src)
 
 	case RETURN, BREAK, CONTINUE:
-		if !p.match(CLROUND) {
-			g := p.peek()
-			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '(' after control keyword"}
-		}
-		x, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := p.need(RROUND, "expected ')'"); err != nil {
-			return nil, err
-		}
-		switch t.Type {
-		case RETURN:
-			left = L("return", x)
-		case BREAK:
-			left = L("break", x)
-		default:
-			left = L("continue", x)
+		// New behavior:
+		// - If the next token is on the SAME line, parse a following expression.
+		// - If the next token is on a NEW line or we're at EOF, treat as <kw> null.
+		if !p.nextTokenIsOnSameLine(t) {
+			switch t.Type {
+			case RETURN:
+				left = L("return", L("null"))
+			case BREAK:
+				left = L("break", L("null"))
+			default:
+				left = L("continue", L("null"))
+			}
+		} else {
+			x, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			switch t.Type {
+			case RETURN:
+				left = L("return", x)
+			case BREAK:
+				left = L("break", x)
+			default:
+				left = L("continue", x)
+			}
 		}
 
 	case IF:
@@ -297,11 +340,18 @@ func (p *parser) expr(minBP int) (S, error) {
 		if tag, _ := pat[0].(string); tag == "darr" || tag == "dobj" {
 			if p.peek().Type != ASSIGN {
 				g := p.peek()
+				// If input ended, mark as incomplete
+				if p.interactive && g.Type == EOF {
+					return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
+				}
 				return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
 			}
 		}
 
 	case TYPECONS: // "type" <expr>
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected type expression after 'type'"}
+		}
 		x, err := p.expr(0)
 		if err != nil {
 			return nil, err
@@ -310,6 +360,9 @@ func (p *parser) expr(minBP int) (S, error) {
 
 	case ANNOTATION:
 		// wrap next expression
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
+		}
 		x, err := p.expr(0)
 		if err != nil {
 			return nil, err
@@ -321,6 +374,9 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("annot", L("str", txt), x)
 
 	default:
+		if t.Type == EOF && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "unexpected end of input"}
+		}
 		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme)}
 	}
 
@@ -396,6 +452,9 @@ func (p *parser) expr(minBP int) (S, error) {
 			return nil, &ParseError{Line: op.Line, Col: op.Col, Msg: "invalid assignment target"}
 		}
 
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: op.Line, Col: op.Col, Msg: "expected expression after operator"}
+		}
 		right, err := p.expr(nextBP)
 		if err != nil {
 			return nil, err
@@ -435,9 +494,8 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 }
 
 func (p *parser) params() (S, error) {
-	if !p.match(CLROUND) {
-		g := p.peek()
-		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '(' to start parameters"}
+	if _, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
+		return nil, err
 	}
 	if p.match(RROUND) {
 		return L("array"), nil
@@ -450,6 +508,9 @@ func (p *parser) params() (S, error) {
 		}
 		var t any = L("id", "Any")
 		if p.match(COLON) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: idTok.Line, Col: idTok.Col, Msg: "expected type after ':'"}
+			}
 			e, err := p.expr(0) // parse type as expression
 			if err != nil {
 				return nil, err
@@ -592,6 +653,10 @@ func (p *parser) forTarget() (S, error) {
 		if err == nil {
 			return pt, nil // e.g., ("darr", ...), ("dobj", ...)
 		}
+		// In interactive mode, bubble up incompleteness instead of falling back
+		if p.interactive && IsIncomplete(err) {
+			return nil, err
+		}
 		p.i = save // fall back below if pattern parse fails
 	}
 
@@ -652,6 +717,9 @@ func (p *parser) declPattern() (S, error) {
 		return p.objectDeclPattern()
 	}
 	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
+	}
 	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
 }
 
@@ -713,6 +781,9 @@ func (p *parser) readKeyString() (S, error) {
 	}
 
 	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected key"}
+	}
 	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key"}
 }
 

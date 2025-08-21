@@ -3,6 +3,7 @@ package mindscript
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,23 @@ func mustParse(t *testing.T, src string) S {
 		t.Fatalf("Parse error: %v\nsource:\n%s", err, src)
 	}
 	return sexpr
+}
+
+func mustParseInteractive(t *testing.T, src string) S {
+	t.Helper()
+	sexpr, err := ParseSExprInteractive(src)
+	if err != nil {
+		t.Fatalf("Parse (interactive) error: %v\nsource:\n%s", err, src)
+	}
+	return sexpr
+}
+
+func mustIncomplete(t *testing.T, src string) {
+	t.Helper()
+	_, err := ParseSExprInteractive(src)
+	if err == nil || !IsIncomplete(err) {
+		t.Fatalf("expected IncompleteError, got %v\nsource:\n%s", err, src)
+	}
 }
 
 func wantTag(t *testing.T, n S, tag string) {
@@ -194,13 +212,17 @@ func Test_Parser_For_Targets(t *testing.T) {
 		t.Fatalf("expected invalid for-target error, got %v", err)
 	}
 }
+func Test_Parser_Control_Return_Break_Continue_FormsEquivalent(t *testing.T) {
+	a1 := mustParse(t, `return(1) break(0) continue(null)`)
+	a2 := mustParse(t, `return 1 break 0 continue null`)
 
-func Test_Parser_Control_Return_Break_Continue(t *testing.T) {
-	root := mustParse(t, `return(1) break(0) continue(null)`)
-	ch := root[1:]
-	want := []string{"return", "break", "continue"}
-	for i, tag := range want {
-		wantTag(t, ch[i].(S), tag)
+	// Compare the three statements pairwise
+	for i := 0; i < 3; i++ {
+		n1 := a1[i+1].(S)
+		n2 := a2[i+1].(S)
+		if !reflect.DeepEqual(n1, n2) {
+			t.Fatalf("ASTs differ for statement %d:\nwith parens: %s\nno parens:  %s", i, dump(n1), dump(n2))
+		}
 	}
 }
 
@@ -278,14 +300,13 @@ func Test_Parser_Error_Missing_RParen(t *testing.T) {
 	}
 }
 
-func Test_Parser_Control_MustUseTildeParen(t *testing.T) {
-	// Space → '(' (grouping) → should error for control keywords
-	if _, err := ParseSExpr(`return (1)`); err == nil {
-		t.Fatalf("expected error when using spaced '(' after return")
-	}
-	// Adjacent → '~(' tokenized as CLROUND → should succeed
-	if _, err := ParseSExpr(`return(1)`); err != nil {
-		t.Fatalf("unexpected: %v", err)
+func Test_Parser_Control_SameLine_Grouping_OK(t *testing.T) {
+	r1 := mustParse(t, `return(1)`)
+	r2 := mustParse(t, `return (1)`)
+	j1, _ := json.Marshal(kid(r1, 0))
+	j2, _ := json.Marshal(kid(r2, 0))
+	if string(j1) != string(j2) {
+		t.Fatalf("ASTs should match for return(1) vs return (1)\n%s\n%s", string(j1), string(j2))
 	}
 }
 
@@ -381,7 +402,7 @@ func Test_Parser_Type_Arrow_RightAssociative(t *testing.T) {
 	r := arrow[3].(S) // binop rhs
 	wantTag(t, r, "binop")
 	if r[1].(string) != "->" {
-		t.Fatalf("right not nested '->': %v", r)
+		t.Fatalf("right not nested '->': %v", r[1])
 	}
 }
 
@@ -733,6 +754,7 @@ func Test_Parser_AnyWord_As_Map_Key(t *testing.T) {
 		}
 	}
 }
+
 func Test_Parser_Let_Array_Destructuring(t *testing.T) {
 	src := `let [x, y] = arr`
 	root := mustParse(t, src)
@@ -884,4 +906,99 @@ func Test_Parser_For_BareId_ImplicitDecl(t *testing.T) {
 	}
 	body := kid(forNode, 2)
 	wantTag(t, body, "block")
+}
+
+// --- NEW: control-keyword newline semantics --------------------------------
+
+func Test_Parser_Control_NewlineMeansNullAndNextExpr(t *testing.T) {
+	src := "return\n(1 + 2)"
+	root := mustParse(t, src)
+	if len(root) != 3 {
+		t.Fatalf("expected two top-level expressions, got %d\n%s", len(root)-1, dump(root))
+	}
+	ret := kid(root, 0)
+	wantTag(t, ret, "return")
+	if head(ret[1].(S)) != "null" {
+		t.Fatalf("newline 'return' should default to null, got %s", dump(ret))
+	}
+	expr := kid(root, 1)
+	wantTag(t, expr, "binop")
+	if expr[1].(string) != "+" {
+		t.Fatalf("want '+', got %v", expr[1])
+	}
+}
+
+// Newline after a control keyword ⇒ defaults to null, and starts a new statement.
+func Test_Parser_Control_BareOnNewlines_DefaultsToNull(t *testing.T) {
+	src := "return\nbreak\ncontinue\n"
+	root := mustParse(t, src)
+
+	// block + 3 children
+	if len(root) != 4 {
+		t.Fatalf("want three statements, got %d\n%s", len(root)-1, dump(root))
+	}
+	for i, tag := range []string{"return", "break", "continue"} {
+		stmt := kid(root, i)
+		wantTag(t, stmt, tag)
+		wantTag(t, stmt[1].(S), "null")
+	}
+}
+
+// Same-line controls chain as a single expression: return (break (continue null))
+func Test_Parser_Control_SameLine_ChainsAsSingleExpr(t *testing.T) {
+	root := mustParse(t, `return break continue`)
+
+	// block + 1 child (the chained expression)
+	if len(root) != 2 {
+		t.Fatalf("want one statement, got %d\n%s", len(root)-1, dump(root))
+	}
+	r := kid(root, 0)
+	wantTag(t, r, "return")
+	b := r[1].(S)
+	wantTag(t, b, "break")
+	c := b[1].(S)
+	wantTag(t, c, "continue")
+	wantTag(t, c[1].(S), "null")
+}
+
+// --- NEW: interactive-mode parser behavior ---------------------------------
+
+func Test_Interactive_Incomplete_Grouping_IsIncomplete(t *testing.T) {
+	mustIncomplete(t, "let x = (")
+}
+
+func Test_Interactive_Incomplete_Block_IsIncomplete(t *testing.T) {
+	mustIncomplete(t, "do x")
+	mustIncomplete(t, "if a then x")
+}
+
+func Test_Interactive_Incomplete_Params_IsIncomplete(t *testing.T) {
+	mustIncomplete(t, "fun(a: Str")
+}
+
+func Test_Interactive_InlineAnnotation_Unterminated_IsIncomplete(t *testing.T) {
+	mustIncomplete(t, "#(note")
+}
+
+func Test_Interactive_Completes_WhenClosed(t *testing.T) {
+	full := "let x = (\n  1 + 1\n)\n"
+	a := mustParseInteractive(t, full)
+	b := mustParse(t, full)
+	ja, _ := json.Marshal(a)
+	jb, _ := json.Marshal(b)
+	if string(ja) != string(jb) {
+		t.Fatalf("interactive vs normal AST differ:\n%s\n%s", string(ja), string(jb))
+	}
+}
+
+// --- NEW: sanity checks for equivalence of forms across whitespace ----------
+
+func Test_Parser_Control_Return_Forms_SameAST(t *testing.T) {
+	r1 := mustParse(t, `return 1`)
+	r2 := mustParse(t, `return(1)`)
+	j1, _ := json.Marshal(kid(r1, 0))
+	j2, _ := json.Marshal(kid(r2, 0))
+	if string(j1) != string(j2) {
+		t.Fatalf("return forms not equivalent:\n%s\n%s", string(j1), string(j2))
+	}
 }

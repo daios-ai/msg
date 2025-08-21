@@ -30,3 +30,44 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Go build/test artifacts ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.cover
+*.coverprofile
+coverage.*
+cover.out
+bin/
+build/
+
+# --- Editor junk ---
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# --- VS Code extension (Node/TypeScript) ---
+node_modules/
+dist/
+out/
+.vscode-test/
+*.tsbuildinfo
+*.vsix
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

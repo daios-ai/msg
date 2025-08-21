@@ -1,519 +1,2915 @@
-=== BEGIN FILE: types_test.go ===
+=== BEGIN FILE: types.go ===
+// types.go
+//
+// MindScript Type & Schema system (runtime-focused)
+//
+// Goals / design (practical, JSON-friendly, duck-typed):
+//  1. “Natural” typeOf: For concrete values, infer loose shapes. Example:
+//     typeOf({name:"Pedro"}) = {name: Str}          // optional field
+//     Arrays unify element types conservatively (e.g., [1, null] → [Int?]).
+//  2. Precise runtime checks:
+//     - isType(v, T) checks v conforms to T.
+//     - isSubtype(A, B) is structural and sound.
+//     - Objects: required fields must not be relaxed; optional fields can be absent.
+//     - Extra fields in values are allowed (open-world objects).
+//  3. Enums as finite literal sets (not general sum types):
+//     Enum members can be arbitrary literals (null/bool/int/num/str/array/map).
+//     isType compares by deep equality to literal values.
+//     Subtyping:
+//     • Enum[X...] <: Enum[Y...]  iff every X is in Y (by structural equality).
+//     • Enum[X...] <: T           iff every literal X conforms to T (great for duck-typing).
+//     Unification:
+//     • Enum ∪ Enum  = structural set union.
+//     • Enum ∪ T     = T if all literals ∈ T; otherwise Any.
+//  4. No open sum types beyond T? (nullable) and Any (top).
+//  5. Function types use parameter **contravariance** and return **covariance**.
+//     (Matches soundness for callable subtyping; works well with currying).
+//
+// Implementation notes:
+//   - Types are S-exprs (same shape as AST):
+//     ("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
+//     ("unop","?", T)                         // nullable
+//     ("array", T)                            // homogeneous arrays
+//     ("map", ("pair" | "pair!", ("str",k), T) ...)
+//     ("enum", literalS, literalS, ...)
+//     ("binop","->", A, B)                    // function A -> B (right-assoc chains)
+//   - Aliases: ("id", name) resolved from env when bound to VTType (spliced S).
+//   - This file provides: resolveType, isType, isSubtype, unifyTypes, valueToTypeS,
+//     and helpers (equalS/mapTypeFields/...).
+package mindscript
+
+// NOTE: no imports needed
+
+// -----------------------------
+// Helpers
+// -----------------------------
+
+func isBuiltinTypeName(name string) bool {
+	switch name {
+	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
+		return true
+	default:
+		return false
+	}
+}
+
+func isId(t S, name string) bool {
+	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+}
+
+// ("map", ("pair"| "pair!", ("str",k), T)...)
+type objField struct {
+	required bool
+	typ      S
+}
+
+func mapTypeFields(t S) map[string]objField {
+	fs := map[string]objField{}
+	for i := 1; i < len(t); i++ {
+		p := t[i].(S)
+		if len(p) < 3 {
+			continue
+		}
+		ptag := p[0].(string) // "pair" or "pair!"
+		keyNode := p[1].(S)   // ("str", k)
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			continue
+		}
+		k := keyNode[1].(string)
+		required := ptag == "pair!"
+		fs[k] = objField{required: required, typ: p[2].(S)}
+	}
+	return fs
+}
+
+// Structural equality for S-exprs (no fmt, no allocs).
+func equalS(a, b S) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+
+	ta, ok := a[0].(string)
+	if !ok {
+		return false
+	}
+	tb, ok := b[0].(string)
+	if !ok || ta != tb {
+		return false
+	}
+
+	for i := 1; i < len(a); i++ {
+		if !equalNode(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// Compares two S nodes or scalars used inside S.
+func equalNode(x, y any) bool {
+	switch xv := x.(type) {
+	case []any: // covers S too
+		yv, ok := y.([]any)
+		if !ok {
+			return false
+		}
+		return equalS(xv, yv)
+	case string:
+		ys, ok := y.(string)
+		return ok && xv == ys
+	case int64:
+		yi, ok := y.(int64)
+		return ok && xv == yi
+	case float64:
+		yf, ok := y.(float64)
+		return ok && xv == yf
+	case bool:
+		yb, ok := y.(bool)
+		return ok && xv == yb
+	default:
+		return x == y
+	}
+}
+
+// Deep equality on Values for the literal space used by enums (null/bool/int/num/str/array/map).
+func deepEqual(a, b Value) bool {
+	if a.Tag != b.Tag {
+		return false
+	}
+	switch a.Tag {
+	case VTNull:
+		return true
+	case VTBool:
+		return a.Data.(bool) == b.Data.(bool)
+	case VTInt:
+		return a.Data.(int64) == b.Data.(int64)
+	case VTNum:
+		return a.Data.(float64) == b.Data.(float64)
+	case VTStr:
+		return a.Data.(string) == b.Data.(string)
+	case VTArray:
+		ax := a.Data.([]Value)
+		bx := b.Data.([]Value)
+		if len(ax) != len(bx) {
+			return false
+		}
+		for i := range ax {
+			if !deepEqual(ax[i], bx[i]) {
+				return false
+			}
+		}
+		return true
+	case VTMap:
+		am := a.Data.(*MapObject)
+		bm := b.Data.(*MapObject)
+		if len(am.Entries) != len(bm.Entries) {
+			return false
+		}
+		for k, av := range am.Entries {
+			bv, ok := bm.Entries[k]
+			if !ok || !deepEqual(av, bv) {
+				return false
+			}
+		}
+		return true
+	default:
+		// Not expected for enum literals
+		return false
+	}
+}
+
+// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
+// Allowed forms: null/bool/int/num/str/array/map with literal children.
+// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
+func (ip *Interpreter) litToValue(lit S) (Value, bool) {
+	if len(lit) == 0 {
+		return Null, false
+	}
+	switch lit[0].(string) {
+	case "null":
+		return Null, true
+	case "bool":
+		return Bool(lit[1].(bool)), true
+	case "int":
+		return Int(lit[1].(int64)), true
+	case "num":
+		return Num(lit[1].(float64)), true
+	case "str":
+		return Str(lit[1].(string)), true
+	case "array":
+		out := make([]Value, 0, len(lit)-1)
+		for i := 1; i < len(lit); i++ {
+			v, ok := ip.litToValue(lit[i].(S))
+			if !ok {
+				return Null, false
+			}
+			out = append(out, v)
+		}
+		return Arr(out), true
+	case "map":
+		m := make(map[string]Value, len(lit)-1)
+		for i := 1; i < len(lit); i++ {
+			p := lit[i].(S)
+			if len(p) < 3 {
+				return Null, false
+			}
+			keyNode := p[1].(S)
+			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+				return Null, false
+			}
+			k := keyNode[1].(string)
+			v, ok := ip.litToValue(p[2].(S))
+			if !ok {
+				return Null, false
+			}
+			m[k] = v
+		}
+		return Map(m), true
+	default:
+		return Null, false
+	}
+}
+
+// -----------------------------
+// Value → Type inference (typeOf-like behavior)
+// -----------------------------
+
+func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
+	switch v.Tag {
+	case VTNull:
+		return S{"id", "Null"}
+	case VTBool:
+		return S{"id", "Bool"}
+	case VTInt:
+		return S{"id", "Int"}
+	case VTNum:
+		return S{"id", "Num"}
+	case VTStr:
+		return S{"id", "Str"}
+
+	case VTArray:
+		xs := v.Data.([]Value)
+		if len(xs) == 0 {
+			return S{"array", S{"id", "Any"}}
+		}
+		elem := ip.valueToTypeS(xs[0], env)
+		for i := 1; i < len(xs); i++ {
+			elem = ip.unifyTypes(elem, ip.valueToTypeS(xs[i], env), env)
+		}
+		return S{"array", elem}
+
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		out := S{"map"}
+		// For a single observed map, infer optional fields (no required).
+		for k, vv := range mo.Entries {
+			out = append(out, S{"pair", S{"str", k}, ip.valueToTypeS(vv, env)})
+		}
+		return out
+
+	case VTFun:
+		f := v.Data.(*Fun)
+		t := f.ReturnType
+		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+			t = S{"binop", "->", f.ParamTypes[i], t}
+		}
+		return t
+
+	case VTType:
+		return S{"id", "Type"}
+
+	default:
+		return S{"id", "Any"}
+	}
+}
+
+// -----------------------------
+// Alias resolution for types
+// -----------------------------
+
+func (ip *Interpreter) resolveType(t S, env *Env) S {
+	seen := map[string]bool{}
+	var go1 func(S, *Env) S
+	go1 = func(x S, e *Env) S {
+		if len(x) == 0 {
+			return x
+		}
+		switch x[0].(string) {
+		case "id":
+			name := x[1].(string)
+			if isBuiltinTypeName(name) {
+				return x
+			}
+			if seen[name] {
+				return x // guard cycles
+			}
+			if e != nil {
+				if v, err := e.Get(name); err == nil && v.Tag == VTType {
+					tv := v.Data.(*TypeValue)
+					seen[name] = true
+					defer func() { delete(seen, name) }()
+					// recurse with the alias's own env (not the caller's env)
+					return go1(tv.Ast, tv.Env)
+				}
+			}
+			return x
+		case "unop":
+			if len(x) >= 3 && x[1].(string) == "?" {
+				return S{"unop", "?", go1(x[2].(S), e)}
+			}
+			return x
+		case "array":
+			if len(x) == 2 {
+				return S{"array", go1(x[1].(S), e)}
+			}
+			out := S{"array"}
+			for i := 1; i < len(x); i++ {
+				out = append(out, go1(x[i].(S), e))
+			}
+			return out
+		case "map":
+			out := S{"map"}
+			for i := 1; i < len(x); i++ {
+				p := x[i].(S)
+				ttag := p[0].(string)
+				key := p[1].(S)
+				typ := go1(p[2].(S), e)
+				out = append(out, S{ttag, key, typ})
+			}
+			return out
+		case "enum":
+			return x
+		case "binop":
+			if len(x) >= 4 && x[1].(string) == "->" {
+				return S{"binop", "->", go1(x[2].(S), e), go1(x[3].(S), e)}
+			}
+			return x
+		default:
+			return x
+		}
+	}
+	return go1(t, env)
+}
+
+// -----------------------------
+// Runtime type checking
+// -----------------------------
+
+func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
+	t = ip.resolveType(t, env)
+	if len(t) == 0 {
+		return false
+	}
+
+	switch t[0].(string) {
+	case "id":
+		switch t[1].(string) {
+		case "Any":
+			return true
+		case "Null":
+			return v.Tag == VTNull
+		case "Bool":
+			return v.Tag == VTBool
+		case "Int":
+			return v.Tag == VTInt
+		case "Num":
+			return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
+		case "Str":
+			return v.Tag == VTStr
+		case "Type":
+			return v.Tag == VTType
+		default:
+			return false
+		}
+
+	case "unop":
+		if t[1].(string) != "?" {
+			return false
+		}
+		if v.Tag == VTNull {
+			return true
+		}
+		return ip.isType(v, t[2].(S), env)
+
+	case "array":
+		if v.Tag != VTArray {
+			return false
+		}
+		// If no element type provided, treat as [Any]
+		elemT := S{"id", "Any"}
+		if len(t) == 2 {
+			elemT = t[1].(S)
+		}
+		for _, elem := range v.Data.([]Value) {
+			if !ip.isType(elem, elemT, env) {
+				return false
+			}
+		}
+		return true
+
+	case "map":
+		if v.Tag != VTMap {
+			return false
+		}
+		fs := mapTypeFields(t)
+		mo := v.Data.(*MapObject)
+		for name, f := range fs {
+			val, ok := mo.Entries[name]
+			if !ok {
+				if f.required {
+					return false
+				}
+				continue
+			}
+			if !ip.isType(val, f.typ, env) {
+				return false
+			}
+		}
+		return true
+
+	case "enum":
+		// Deeply equal to one of the literal values
+		for i := 1; i < len(t); i++ {
+			lv, ok := ip.litToValue(t[i].(S))
+			if !ok {
+				continue
+			}
+			if deepEqual(lv, v) {
+				return true
+			}
+		}
+		return false
+
+	case "binop":
+		if t[1].(string) != "->" || v.Tag != VTFun {
+			return false
+		}
+		// value's function type
+		f := v.Data.(*Fun)
+		ft := f.ReturnType
+		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+			ft = S{"binop", "->", f.ParamTypes[i], ft}
+		}
+		return ip.isSubtype(ft, t, env)
+	}
+
+	return false
+}
+
+// -----------------------------
+// Structural subtyping  t1 <: t2
+// -----------------------------
+
+func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
+	a = ip.resolveType(a, env)
+	b = ip.resolveType(b, env)
+
+	if equalS(a, b) {
+		return true
+	}
+
+	isOpt := func(t S) bool { return len(t) >= 2 && t[0].(string) == "unop" && t[1].(string) == "?" }
+	unwrapOpt := func(t S) S { return t[2].(S) }
+
+	// Top
+	if b[0].(string) == "id" && b[1].(string) == "Any" {
+		return true
+	}
+	// Optional RHS
+	if isOpt(b) {
+		inner := unwrapOpt(b)
+		if ip.isSubtype(a, inner, env) {
+			return true
+		}
+		if a[0].(string) == "id" && a[1].(string) == "Null" {
+			return true
+		}
+	}
+	// Int <: Num
+	if a[0].(string) == "id" && a[1].(string) == "Int" &&
+		b[0].(string) == "id" && b[1].(string) == "Num" {
+		return true
+	}
+	// A? <: B?  iff  A <: B
+	if isOpt(a) && isOpt(b) {
+		return ip.isSubtype(unwrapOpt(a), unwrapOpt(b), env)
+	}
+	// Identical primitive IDs
+	if a[0].(string) == "id" && b[0].(string) == "id" {
+		return a[1].(string) == b[1].(string)
+	}
+
+	// Arrays: elementwise covariance
+	if a[0].(string) == "array" && b[0].(string) == "array" {
+		elemA := S{"id", "Any"}
+		if len(a) == 2 {
+			elemA = a[1].(S)
+		}
+		elemB := S{"id", "Any"}
+		if len(b) == 2 {
+			elemB = b[1].(S)
+		}
+		return ip.isSubtype(elemA, elemB, env)
+	}
+
+	// Maps: must provide all required fields of b with compatible types,
+	// and cannot relax requiredness.
+	if a[0].(string) == "map" && b[0].(string) == "map" {
+		reqB := mapTypeFields(b)
+		haveA := mapTypeFields(a)
+		for name, fb := range reqB {
+			fa, ok := haveA[name]
+			if !ok {
+				if fb.required {
+					return false
+				}
+				continue
+			}
+			if fb.required && !fa.required {
+				return false
+			}
+			if !ip.isSubtype(fa.typ, fb.typ, env) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Enums:
+	// 1) Enum ⊆ Enum by literal inclusion (structural equality on literal S)
+	if a[0].(string) == "enum" && b[0].(string) == "enum" {
+		for i := 1; i < len(a); i++ {
+			found := false
+			for j := 1; j < len(b); j++ {
+				if equalS(a[i].(S), b[j].(S)) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	// 2) Enum <: T if every member conforms to T
+	if a[0].(string) == "enum" {
+		for i := 1; i < len(a); i++ {
+			lv, ok := ip.litToValue(a[i].(S))
+			if !ok || !ip.isType(lv, b, env) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Functions: param contravariant, return covariant (right-assoc)
+	if a[0].(string) == "binop" && a[1].(string) == "->" &&
+		b[0].(string) == "binop" && b[1].(string) == "->" {
+		aParam, aRest := a[2].(S), a[3].(S)
+		bParam, bRest := b[2].(S), b[3].(S)
+		if !ip.isSubtype(bParam, aParam, env) { // contra
+			return false
+		}
+		return ip.isSubtype(aRest, bRest, env) // co (right)
+	}
+
+	return false
+}
+
+// -----------------------------
+// Unification (least common supertype)
+// -----------------------------
+
+func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
+	t1 = ip.resolveType(t1, env)
+	t2 = ip.resolveType(t2, env)
+
+	// Any absorbs
+	if isId(t1, "Any") {
+		return t1
+	}
+	if isId(t2, "Any") {
+		return t2
+	}
+
+	// ---- Null / Nullable ----
+	if isId(t1, "Null") && isId(t2, "Null") {
+		return t1
+	}
+	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
+		return t2
+	}
+	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
+		return t1
+	}
+	if isId(t1, "Null") {
+		return S{"unop", "?", t2}
+	}
+	if isId(t2, "Null") {
+		return S{"unop", "?", t1}
+	}
+
+	// Nullable normalization
+	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
+	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
+	if isOpt1 && isOpt2 {
+		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+	if isOpt1 {
+		u := ip.unifyTypes(t1[2].(S), t2, env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+	if isOpt2 {
+		u := ip.unifyTypes(t1, t2[2].(S), env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+
+	// ---- Primitives (incl. Int ⊔ Num = Num) ----
+	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
+		n1 := t1[1].(string)
+		n2 := t2[1].(string)
+		if n1 == n2 {
+			return t1
+		}
+		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
+			return S{"id", "Num"}
+		}
+		return S{"id", "Any"}
+	}
+
+	// ---- Arrays ----
+	if t1[0].(string) == "array" && t2[0].(string) == "array" {
+		e1 := S{"id", "Any"}
+		e2 := S{"id", "Any"}
+		if len(t1) == 2 {
+			e1 = t1[1].(S)
+		}
+		if len(t2) == 2 {
+			e2 = t2[1].(S)
+		}
+		elem := ip.unifyTypes(e1, e2, env)
+		return S{"array", elem}
+	}
+	if t1[0].(string) == "array" || t2[0].(string) == "array" {
+		return S{"id", "Any"}
+	}
+
+	// ---- Maps: fieldwise unify; required OR ----
+	if t1[0].(string) == "map" && t2[0].(string) == "map" {
+		f1 := mapTypeFields(t1)
+		f2 := mapTypeFields(t2)
+		keys := map[string]struct{}{}
+		for k := range f1 {
+			keys[k] = struct{}{}
+		}
+		for k := range f2 {
+			keys[k] = struct{}{}
+		}
+		out := S{"map"}
+		for k := range keys {
+			s1, ok1 := f1[k]
+			s2, ok2 := f2[k]
+			switch {
+			case ok1 && ok2:
+				ut := ip.unifyTypes(s1.typ, s2.typ, env)
+				req := s1.required || s2.required
+				tag := "pair"
+				if req {
+					tag = "pair!"
+				}
+				out = append(out, S{tag, S{"str", k}, ut})
+			case ok1 && !ok2:
+				out = append(out, S{"pair", S{"str", k}, s1.typ})
+			case !ok1 && ok2:
+				out = append(out, S{"pair", S{"str", k}, s2.typ})
+			}
+		}
+		return out
+	}
+	if t1[0].(string) == "map" || t2[0].(string) == "map" {
+		return S{"id", "Any"}
+	}
+
+	// ---- Enums ----
+	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
+		union := S{"enum"}
+		seen := func(x S) bool {
+			for i := 1; i < len(union); i++ {
+				if equalS(union[i].(S), x) {
+					return true
+				}
+			}
+			return false
+		}
+		for i := 1; i < len(t1); i++ {
+			x := t1[i].(S)
+			if !seen(x) {
+				union = append(union, x)
+			}
+		}
+		for i := 1; i < len(t2); i++ {
+			x := t2[i].(S)
+			if !seen(x) {
+				union = append(union, x)
+			}
+		}
+		return union
+	}
+	// enum ⊔ Type → Type if all members fit; else Any
+	if t1[0].(string) == "enum" {
+		all := true
+		for i := 1; i < len(t1); i++ {
+			lv, ok := ip.litToValue(t1[i].(S))
+			if !ok || !ip.isType(lv, t2, env) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return t2
+		}
+		return S{"id", "Any"}
+	}
+	if t2[0].(string) == "enum" {
+		all := true
+		for i := 1; i < len(t2); i++ {
+			lv, ok := ip.litToValue(t2[i].(S))
+			if !ok || !ip.isType(lv, t1, env) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return t1
+		}
+		return S{"id", "Any"}
+	}
+
+	// ---- Functions: pointwise ----
+	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
+		inU := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
+		outU := ip.unifyTypes(t1[3].(S), t2[3].(S), env)
+		return S{"binop", "->", inU, outU}
+	}
+	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
+		return S{"id", "Any"}
+	}
+
+	return S{"id", "Any"}
+}
+=== END FILE: types.go ===
+
+=== BEGIN FILE: interpreter.go ===
+// interpreter.go
+//
+// MindScript "interpreter" — JIT compiler + VM runner
+// ----------------------------------------------------
+// Public API stays the same. Internally we compile S-expr AST to bytecode
+// (a Chunk) and execute it on the VM (vm.go). This version removes duplication
+// by unifying call/exec paths, iterator helpers, and VM entry/exit plumbing.
+
 package mindscript
 
 import (
 	"fmt"
-	"strings"
-	"testing"
+	"strconv"
 )
 
-// --- small helpers ----------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Stable runtime model (unchanged)
+// -----------------------------------------------------------------------------
 
-func newIP() *Interpreter { return NewInterpreter() }
+type ValueTag int
 
-func evalWithIP(t *testing.T, ip *Interpreter, src string) Value {
-	t.Helper()
-	v, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v\nsource:\n%s", err, src)
+const (
+	VTNull ValueTag = iota
+	VTBool
+	VTInt
+	VTNum
+	VTStr
+	VTArray
+	VTMap
+	VTFun
+	VTType
+	VTModule
+	VTHandle
+)
+
+type Value struct {
+	Tag   ValueTag
+	Data  interface{}
+	Annot string
+}
+
+func (v Value) String() string {
+	switch v.Tag {
+	case VTNull:
+		return "null"
+	case VTBool:
+		return fmt.Sprintf("%v", v.Data.(bool))
+	case VTInt:
+		return strconv.FormatInt(v.Data.(int64), 10)
+	case VTNum:
+		return strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+	case VTStr:
+		return fmt.Sprintf("%q", v.Data.(string))
+	case VTArray:
+		return fmt.Sprintf("<array len=%d>", len(v.Data.([]Value)))
+	case VTMap:
+		return "<map>"
+	case VTFun:
+		return "<fun>"
+	case VTType:
+		return "<type>"
+	case VTModule:
+		return "<module>"
+	default:
+		return "<unknown>"
 	}
+}
+
+func withAnnot(v Value, ann string) Value { v.Annot = ann; return v }
+
+var Null = Value{Tag: VTNull}
+
+func Bool(b bool) Value    { return Value{Tag: VTBool, Data: b} }
+func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
+func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
+func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
+func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: xs} }
+
+// MapObject holds entries + per-key annotations, and preserves insertion order.
+type MapObject struct {
+	Entries map[string]Value
+	KeyAnn  map[string]string
+	Keys    []string // insertion order of keys (unique)
+}
+
+func Map(m map[string]Value) Value {
+	// When constructing from a plain map (rare), we don't know order,
+	// so keep whatever iteration order Go gives. Literals go via __map_from.
+	mo := &MapObject{
+		Entries: m,
+		KeyAnn:  map[string]string{},
+	}
+	mo.Keys = make([]string, 0, len(m))
+	for k := range m {
+		mo.Keys = append(mo.Keys, k)
+	}
+	return Value{Tag: VTMap, Data: mo}
+}
+
+type TypeValue struct {
+	Ast S
+	Env *Env // lexical scope where this type was defined
+}
+
+func TypeVal(expr S) Value { return Value{Tag: VTType, Data: &TypeValue{Ast: expr}} }
+func TypeValIn(expr S, env *Env) Value {
+	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
+}
+
+// Closures keep AST for introspection + a compiled chunk for speed.
+type Fun struct {
+	Params     []string
+	Body       S
+	Env        *Env
+	ParamTypes []S
+	ReturnType S
+	HiddenNull bool
+
+	Chunk      *Chunk // JIT result
+	NativeName string // non-empty for natives
+
+	IsOracle bool    // marks this function as an "oracle"
+	Examples []Value // optional: array of [input, output] pairs (Values)
+}
+
+func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
+
+// -----------------------------------------------------------------------------
+// Environments (unchanged API)
+// -----------------------------------------------------------------------------
+
+type Env struct {
+	parent *Env
+	table  map[string]Value
+}
+
+func NewEnv(parent *Env) *Env              { return &Env{parent: parent, table: make(map[string]Value)} }
+func (e *Env) Define(name string, v Value) { e.table[name] = v }
+func (e *Env) Set(name string, v Value) error {
+	if _, ok := e.table[name]; ok {
+		e.table[name] = v
+		return nil
+	}
+	if e.parent != nil {
+		return e.parent.Set(name, v)
+	}
+	return fmt.Errorf("undefined variable: %s", name)
+}
+func (e *Env) Get(name string) (Value, error) {
+	if v, ok := e.table[name]; ok {
+		return v, nil
+	}
+	if e.parent != nil {
+		return e.parent.Get(name)
+	}
+	return Value{}, fmt.Errorf("undefined variable: %s", name)
+}
+
+// -----------------------------------------------------------------------------
+// Control & errors (unchanged surface)
+// -----------------------------------------------------------------------------
+
+type returnSig struct{ v Value }
+type breakSig struct{ v Value }
+type contSig struct{ v Value }
+type rtErr struct{ msg string }
+
+func fail(msg string)          { panic(rtErr{msg: msg}) }
+func errNull(msg string) Value { return withAnnot(Null, msg) }
+func annotNull(msg string) Value {
+	return Value{Tag: VTNull, Annot: msg}
+}
+
+// -----------------------------------------------------------------------------
+// Public engine interfaces (unchanged)
+// -----------------------------------------------------------------------------
+
+type ParamSpec struct {
+	Name string
+	Type S
+}
+
+type Callable interface {
+	Arity() int
+	ParamSpecs() []ParamSpec
+	ReturnType() S
+	Doc() string
+	ClosureEnv() *Env
+}
+
+type CallCtx interface {
+	Arg(name string) (Value, bool)
+	MustArg(name string) Value
+	Env() *Env
+}
+
+type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
+
+type Interpreter struct {
+	Global    *Env
+	Core      *Env
+	modules   map[string]*moduleRec
+	native    map[string]NativeImpl
+	loadStack []string
+
+	// --- Oracle debug/observability (stub) ---
+	oracleLastPrompt string
+}
+
+func NewInterpreter() *Interpreter {
+	ip := &Interpreter{}
+	ip.Core = NewEnv(nil)
+	ip.Global = NewEnv(ip.Core) // built-ins visible in program env
+	ip.initCore()
+	return ip
+}
+
+// -----------------------------------------------------------------------------
+// Public API — thin wrappers around unified engine
+// -----------------------------------------------------------------------------
+
+func (ip *Interpreter) EvalSource(src string) (Value, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return Value{}, WrapErrorWithSource(err, src)
+	}
+	return ip.Eval(ast)
+}
+func (ip *Interpreter) Eval(root S) (Value, error) {
+	return ip.runTop(root, NewEnv(ip.Global), false)
+}
+
+func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return Value{}, WrapErrorWithSource(err, src)
+	}
+	return ip.EvalPersistent(ast)
+}
+func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
+	return ip.runTop(root, ip.Global, false)
+}
+
+func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
+	return ip.runTop(ast, env, false)
+}
+func (ip *Interpreter) EvalASTUncaught(ast S, env *Env, topBlockToSameEnv bool) Value {
+	// 'topBlockToSameEnv' kept for API compatibility; no longer used.
+	v, _ := ip.runTop(ast, env, true)
 	return v
 }
 
-// parse `type <expr>` and return the underlying type S (the AST stored in VTType)
-func typeS(t *testing.T, ip *Interpreter, src string) S {
-	t.Helper()
-	v := evalWithIP(t, ip, "type "+src)
+// Apply/Call — preserved API; use unified scoped engine underneath.
+func (ip *Interpreter) Apply(fn Value, args []Value) Value { return ip.applyArgsScoped(fn, args, nil) }
+func (ip *Interpreter) Call0(fn Value) Value               { return ip.applyArgsScoped(fn, nil, nil) }
+func (ip *Interpreter) FunMeta(fn Value) (Callable, bool) {
+	if fn.Tag != VTFun {
+		return nil, false
+	}
+	return &funCallable{f: fn.Data.(*Fun), doc: fn.Annot}, true
+}
+func (ip *Interpreter) ResolveType(t S, env *Env) S        { return ip.resolveType(t, env) }
+func (ip *Interpreter) IsType(v Value, t S, env *Env) bool { return ip.isType(v, t, env) }
+func (ip *Interpreter) IsSubtype(a, b S, env *Env) bool    { return ip.isSubtype(a, b, env) }
+func (ip *Interpreter) UnifyTypes(a, b S, env *Env) S      { return ip.unifyTypes(a, b, env) }
+func (ip *Interpreter) ValueToType(v Value, env *Env) S    { return ip.valueToTypeS(v, env) }
+func withScope(parent, override *Env) *Env {
+	if override != nil {
+		return override
+	}
+	return parent
+}
+func isNumber(v Value) bool { return v.Tag == VTInt || v.Tag == VTNum }
+func toFloat(v Value) float64 {
+	if v.Tag == VTInt {
+		return float64(v.Data.(int64))
+	}
+	return v.Data.(float64)
+}
+
+// Given a Value of type VTType, resolve its AST using its own env if present;
+// otherwise fall back to the provided env.
+func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
 	if v.Tag != VTType {
-		t.Fatalf("want VTType, got %#v", v)
+		return S{"id", "Any"} // defensive default; you can fail(...) if you prefer
 	}
-	tv, ok := v.Data.(*TypeValue)
-	if !ok {
-		t.Fatalf("VTType payload was %T (want *TypeValue)", v.Data)
+	tv := v.Data.(*TypeValue)
+	env := tv.Env
+	if env == nil {
+		env = fallback
 	}
-	return tv.Ast
+	return ip.resolveType(tv.Ast, env)
 }
 
-// assert helpers for annotated-null expectations
-func wantAnnotatedContains(t *testing.T, v Value, substr string) {
-	t.Helper()
-	if v.Tag != VTNull {
-		t.Fatalf("want annotated null, got %#v", v)
-	}
-	if v.Annot == "" || !strings.Contains(strings.ToLower(v.Annot), strings.ToLower(substr)) {
-		t.Fatalf("want annotated null containing %q, got %#v", substr, v)
-	}
+// -----------------------------------------------------------------------------
+// Callable/CallCtx
+// -----------------------------------------------------------------------------
+
+type funCallable struct {
+	f   *Fun
+	doc string
 }
 
-// --- isType (runtime checking) ----------------------------------------------
-
-func Test_Types_IsType_ArrayNullable(t *testing.T) {
-	ip := newIP()
-	// value: [1, 3, null]
-	val := evalWithIP(t, ip, "[1,3,null]")
-	// type: [Int?]
-	ts := typeS(t, ip, "[Int?]")
-
-	if !ip.isType(val, ts, ip.Global) {
-		t.Fatalf("expected [1,3,null] to match type [Int?]")
+func (c *funCallable) Arity() int { return len(c.f.Params) }
+func (c *funCallable) ParamSpecs() []ParamSpec {
+	ps := make([]ParamSpec, len(c.f.Params))
+	for i := range c.f.Params {
+		ps[i] = ParamSpec{Name: c.f.Params[i], Type: c.f.ParamTypes[i]}
 	}
+	return ps
+}
+func (c *funCallable) ReturnType() S    { return c.f.ReturnType }
+func (c *funCallable) Doc() string      { return c.doc }
+func (c *funCallable) ClosureEnv() *Env { return c.f.Env }
+
+type callCtx struct {
+	argEnv *Env // holds bound arguments
+	scope  *Env // where side effects should land (program/call-site env)
 }
 
-func Test_Types_IsType_Map_Required_Optional(t *testing.T) {
-	ip := newIP()
-
-	// Matches: required field present and typed; optional may be absent
-	val1 := evalWithIP(t, ip, `{name: "Ada"}`)
-	t1 := typeS(t, ip, `{name!: Str, age: Int?}`)
-	if !ip.isType(val1, t1, ip.Global) {
-		t.Fatalf("expected {name:\"Ada\"} to match {name!: Str, age: Int?}")
+func (c *callCtx) Arg(name string) (Value, bool) { v, err := c.argEnv.Get(name); return v, err == nil }
+func (c *callCtx) MustArg(name string) Value {
+	if v, ok := c.Arg(name); ok {
+		return v
 	}
-
-	// Fails: missing required field
-	val2 := evalWithIP(t, ip, `{age: 42}`)
-	if ip.isType(val2, t1, ip.Global) {
-		t.Fatalf("did not expect {age:42} to match {name!: Str, age: Int?}")
-	}
+	fail("missing argument: " + name)
+	return Null
 }
+func (c *callCtx) Env() *Env { return c.scope }
 
-// --- isSubtype (structural subtyping) ---------------------------------------
+// -----------------------------------------------------------------------------
+// Unified VM entry/exit plumbing
+// -----------------------------------------------------------------------------
 
-func Test_Types_Subtype_Arrays_And_Nullable(t *testing.T) {
-	ip := newIP()
-	intArr := typeS(t, ip, `[Int]`)
-	numArr := typeS(t, ip, `[Num]`)
-	if !ip.isSubtype(intArr, numArr, ip.Global) {
-		t.Fatalf("[Int] <: [Num] expected")
-	}
-	intOpt := typeS(t, ip, `Int?`)
-	numOpt := typeS(t, ip, `Num?`)
-	if !ip.isSubtype(intOpt, numOpt, ip.Global) {
-		t.Fatalf("Int? <: Num? expected")
-	}
-}
-
-func Test_Types_Subtype_Objects_RequiredPropagation(t *testing.T) {
-	ip := newIP()
-	// required(super) ⊆ required(sub)
-	sub := typeS(t, ip, `{name!: Str, age: Int}`) // requires name
-	super := typeS(t, ip, `{name!: Str}`)         // requires name
-	if !ip.isSubtype(sub, super, ip.Global) {
-		t.Fatalf("{name!:Str,age:Int} <: {name!:Str} expected")
-	}
-
-	// super requires name!, sub only has optional name → not a subtype
-	sub2 := typeS(t, ip, `{name: Str}`) // optional name
-	if ip.isSubtype(sub2, super, ip.Global) {
-		t.Fatalf("{name:Str} </: {name!:Str} expected")
-	}
-}
-
-func Test_Types_Subtype_Functions_ContraParams_CoReturn(t *testing.T) {
-	ip := newIP()
-	// Parameter contravariance: Num->Str <: Int->Str (since Int <: Num).
-	sub := typeS(t, ip, `Num -> Str`)
-	super := typeS(t, ip, `Int -> Str`)
-	if !ip.isSubtype(sub, super, ip.Global) {
-		t.Fatalf("Num->Str <: Int->Str expected (param contravariance)")
+func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err error) {
+	if !uncaught {
+		defer func() {
+			if r := recover(); r != nil {
+				switch sig := r.(type) {
+				case returnSig:
+					out, err = sig.v, nil
+				case breakSig:
+					out, err = sig.v, nil
+				case contSig:
+					out, err = errNull("continue outside of loop"), nil
+				case rtErr:
+					out, err = errNull(sig.msg), nil
+				case error:
+					out, err = Null, sig
+				default:
+					out, err = errNull(fmt.Sprintf("runtime panic: %v", r)), nil
+				}
+			}
+		}()
 	}
 
-	// Return covariance: Int -> Int  <:  Int -> Num
-	sub2 := typeS(t, ip, `Int -> Int`)
-	super2 := typeS(t, ip, `Int -> Num`)
-	if !ip.isSubtype(sub2, super2, ip.Global) {
-		t.Fatalf("Int->Int <: Int->Num expected")
+	ch := ip.jitTop(ast)
+	res := ip.runChunk(ch, env, 0)
+	switch res.status {
+	case vmOK, vmReturn:
+		return res.value, nil
+	case vmBreak:
+		return errNull("break outside of loop"), nil
+	case vmContinue:
+		return errNull("continue outside of loop"), nil
+	case vmRuntimeError:
+		return res.value, nil
+	default:
+		return errNull("unknown VM status"), nil
 	}
 }
 
-// --- Unification via valueToTypeS (typeOf-like inference) -------------------
+// Build a one-off top-level function: optionally execute ("block", …) directly in env.
+func (ip *Interpreter) jitTop(ast S) *Chunk {
+	f := &Fun{
+		ReturnType: S{"id", "Any"},
+		Body:       ast,
+	}
+	ip.ensureChunk(f)
+	return f.Chunk
+}
 
-func Test_Types_Unify_Array_Inference_To_IntOptional(t *testing.T) {
-	ip := newIP()
-	v := evalWithIP(t, ip, `[1, 3, null]`)
-	got := ip.valueToTypeS(v, ip.Global)
+func (ip *Interpreter) ensureChunk(f *Fun) {
+	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
+		return
+	}
+	em := newEmitter(ip)
+	em.emitFunBody(f.Body)
+	f.Chunk = em.chunk()
+}
 
-	want := typeS(t, ip, `[Int?]`)
-	if !ip.isSubtype(got, want, ip.Global) || !ip.isSubtype(want, got, ip.Global) {
-		t.Fatalf("inferred array type mismatch: got %#v, want %#v", got, want)
+// -----------------------------------------------------------------------------
+// Calls / currying — unified “scoped” engine used by public wrappers
+// -----------------------------------------------------------------------------
+
+func (ip *Interpreter) applyArgsScoped(fnVal Value, args []Value, callSite *Env) Value {
+	if fnVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fnVal.Data.(*Fun)
+
+	// Zero-arg application
+	if len(args) == 0 {
+		switch len(f.Params) {
+		case 0:
+			return ip.execFunBodyScoped(fnVal, callSite)
+		case 1:
+			if ip.isType(Null, f.ParamTypes[0], f.Env) {
+				return ip.applyOneScoped(fnVal, Null, callSite)
+			}
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		default:
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		}
+	}
+
+	cur := fnVal
+	for i := 0; i < len(args); i++ {
+		cur = ip.applyOneScoped(cur, args[i], callSite)
+	}
+	return cur
+}
+
+func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Value {
+	if fnVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fnVal.Data.(*Fun)
+
+	// Already saturated → execute then keep applying (currying chains).
+	if len(f.Params) == 0 {
+		res := ip.execFunBodyScoped(fnVal, callSite)
+		if res.Tag != VTFun {
+			fail("too many arguments")
+		}
+		return ip.applyOneScoped(res, arg, callSite)
+	}
+
+	// Type check against next parameter.
+	paramName := f.Params[0]
+	paramType := f.ParamTypes[0]
+	if !ip.isType(arg, paramType, f.Env) {
+		fail(fmt.Sprintf("type mismatch in parameter '%s'", paramName))
+	}
+
+	// Bind argument into a fresh call env. For natives, the binding/side effects
+	// should land under the *call-site* env (program scope). For user functions,
+	// keep closure semantics.
+	parent := f.Env
+	if f.NativeName != "" && callSite != nil {
+		if f.Env == nil || f.Env == ip.Core {
+			parent = callSite
+		}
+	}
+	callEnv := NewEnv(parent)
+	callEnv.Define(paramName, arg)
+
+	// More params left → return partially-applied closure.
+	if len(f.Params) > 1 {
+		return FunVal(&Fun{
+			Params:     append([]string{}, f.Params[1:]...),
+			ParamTypes: append([]S{}, f.ParamTypes[1:]...),
+			ReturnType: f.ReturnType,
+			Body:       f.Body,
+			Env:        callEnv,
+			HiddenNull: f.HiddenNull,
+			Chunk:      f.Chunk,
+			NativeName: f.NativeName,
+		})
+	}
+
+	// Last arg supplied → execute (preserve the original function's annotation).
+	execFun := &Fun{
+		ReturnType: f.ReturnType,
+		Body:       f.Body,
+		Env:        callEnv,
+		Chunk:      f.Chunk,
+		NativeName: f.NativeName,
+		IsOracle:   f.IsOracle,
+		Examples:   f.Examples,
+		HiddenNull: f.HiddenNull,
+	}
+	execVal := FunVal(execFun)
+	execVal.Annot = fnVal.Annot // keep the informal doc across application
+	return ip.execFunBodyScoped(execVal, callSite)
+}
+
+func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
+	if funVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := funVal.Data.(*Fun)
+	// Native fast path
+	if f.NativeName != "" {
+		impl, ok := ip.native[f.NativeName]
+		if !ok {
+			fail(fmt.Sprintf("unknown native %q", f.NativeName))
+		}
+		scope := withScope(f.Env, callSite) // where side effects land
+		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
+		if !ip.isType(res, f.ReturnType, f.Env) {
+			fail("return type mismatch")
+		}
+		return res
+	}
+
+	if f.IsOracle {
+		return ip.execOracle(funVal, callSite)
+	}
+
+	// User-defined function
+	ip.ensureChunk(f)
+	res := ip.runChunk(f.Chunk, f.Env, 0)
+	switch res.status {
+	case vmOK, vmReturn:
+		if !ip.isType(res.value, f.ReturnType, f.Env) {
+			fail("return type mismatch")
+		}
+		return res.value
+	case vmBreak:
+		panic(breakSig{res.value})
+	case vmContinue:
+		panic(contSig{res.value})
+	case vmRuntimeError:
+		return res.value
+	default:
+		return errNull("unknown VM status")
 	}
 }
 
-func Test_Types_Unify_Objects_Fieldwise(t *testing.T) {
-	ip := newIP()
-	// Unify [{"name":"a"}, {"age":1}]  ~> {name: Str, age: Int} (both optional)
-	v := evalWithIP(t, ip, `[ {name:"a"}, {age:1} ]`)
-	// Infer element type by unifying the two map element types:
-	arrT := ip.valueToTypeS(v, ip.Global) // should be ("array", elemT)
-	if len(arrT) != 2 || arrT[0].(string) != "array" {
-		t.Fatalf("expected array type, got %#v", arrT)
-	}
-	elemT := arrT[1].(S)
+// -----------------------------------------------------------------------------
+// Internal natives (concise registration helpers + same semantics)
+// -----------------------------------------------------------------------------
 
-	want := typeS(t, ip, `{name: Str, age: Int}`)
-	if !ip.isSubtype(elemT, want, ip.Global) || !ip.isSubtype(want, elemT, ip.Global) {
-		t.Fatalf("inferred object element type mismatch: got %#v, want %#v", elemT, want)
+func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, impl NativeImpl) {
+	if ip.native == nil {
+		ip.native = map[string]NativeImpl{}
+	}
+	ip.native[name] = impl
+
+	if ip.Core == nil {
+		ip.Core = NewEnv(nil)
+	}
+	names := make([]string, len(params))
+	types := make([]S, len(params))
+	for i, p := range params {
+		names[i], types[i] = p.Name, p.Type
+	}
+	ip.Core.Define(name, FunVal(&Fun{
+		Params:     names,
+		ParamTypes: types,
+		ReturnType: ret,
+		Body:       S{"native", name},
+		Env:        ip.Core,
+		NativeName: name,
+	}))
+}
+
+// tiny sugar to cut native boilerplate
+func (ip *Interpreter) reg(name string, params []ParamSpec, ret S, body func(ctx CallCtx) Value) {
+	ip.RegisterNative(name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
+}
+
+func (ip *Interpreter) initCore() {
+	if ip.Core == nil {
+		ip.Core = NewEnv(nil)
+	}
+
+	// __assign_set(target: Type, value: Any) -> Any
+	ip.reg("__assign_set",
+		[]ParamSpec{{"target", S{"id", "Type"}}, {"value", S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			t := ctx.MustArg("target")
+			v := ctx.MustArg("value")
+			tv := t.Data.(*TypeValue)
+			ip.assignTo(tv.Ast, v, ctx.Env())
+			return v
+		})
+
+	// __assign_def(target: Type, value: Any) -> Any
+	ip.reg("__assign_def",
+		[]ParamSpec{{"target", S{"id", "Type"}}, {"value", S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			t := ctx.MustArg("target")
+			v := ctx.MustArg("value")
+			tv := t.Data.(*TypeValue)
+			ip.assignTo(tv.Ast, v, ctx.Env(), true)
+			return v
+		})
+
+	// __plus (numbers/strings/arrays/maps)
+	ip.reg("__plus",
+		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			a, b := ctx.MustArg("a"), ctx.MustArg("b")
+			// NOTE: annotations are meta; equality ignores .Annot on values and on map keys.
+			if isNumber(a) && isNumber(b) {
+				if a.Tag == VTInt && b.Tag == VTInt {
+					return Int(a.Data.(int64) + b.Data.(int64))
+				}
+				return Num(toFloat(a) + toFloat(b))
+			}
+			if a.Tag == VTStr && b.Tag == VTStr {
+				return Str(a.Data.(string) + b.Data.(string))
+			}
+			if a.Tag == VTArray && b.Tag == VTArray {
+				x := append(append([]Value{}, a.Data.([]Value)...), b.Data.([]Value)...)
+				return Arr(x)
+			}
+			if a.Tag == VTMap && b.Tag == VTMap {
+				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
+				out := &MapObject{
+					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
+					KeyAnn:  make(map[string]string, len(am.KeyAnn)+len(bm.KeyAnn)),
+					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
+				}
+				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
+
+				// start with LHS order/content
+				for _, k := range am.Keys {
+					out.Keys = append(out.Keys, k)
+					seen[k] = struct{}{}
+				}
+				for k, v := range am.Entries {
+					out.Entries[k] = v
+				}
+				for k, ann := range am.KeyAnn {
+					out.KeyAnn[k] = ann
+				}
+
+				// overlay RHS values/annotations; append new keys in RHS order
+				for _, k := range bm.Keys {
+					if _, ok := seen[k]; !ok {
+						out.Keys = append(out.Keys, k)
+						seen[k] = struct{}{}
+					}
+				}
+				for k, v := range bm.Entries {
+					out.Entries[k] = v
+				}
+				for k, ann := range bm.KeyAnn {
+					out.KeyAnn[k] = ann
+				}
+
+				return Value{Tag: VTMap, Data: out}
+			}
+
+			return errNull("unsupported operands for '+'")
+		})
+
+	// resolve type at runtime
+	ip.reg("__resolve_type",
+		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
+		func(ctx CallCtx) Value {
+			t := ctx.MustArg("t")
+			resolved := ip.resolveTypeValue(t, ctx.Env())
+			return TypeVal(resolved) // structural; env can be nil
+		})
+
+	// annotate a value
+	ip.reg("__annotate",
+		[]ParamSpec{{"text", S{"id", "Str"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			return withAnnot(ctx.MustArg("v"), ctx.MustArg("text").Data.(string))
+		})
+
+	// collect for-each elements
+	ip.reg("__collect_for_elems",
+		[]ParamSpec{{"iter", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ctx CallCtx) (out Value) {
+			defer func() {
+				if r := recover(); r != nil {
+					if e, ok := r.(rtErr); ok {
+						out = errNull(e.msg)
+						return
+					}
+					panic(r)
+				}
+			}()
+			out = Arr(ip.collectForElemsScoped(ctx.MustArg("iter"), ctx.Env()))
+			return
+		})
+
+	// map from key/value arrays (keys are Str; preserve annotations and insertion order)
+	ip.reg("__map_from",
+		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			ka := ctx.MustArg("keys").Data.([]Value)
+			va := ctx.MustArg("vals").Data.([]Value)
+			if len(ka) != len(va) {
+				return errNull("map_from: mismatched arity")
+			}
+			mo := &MapObject{
+				Entries: make(map[string]Value, len(ka)),
+				KeyAnn:  make(map[string]string, len(ka)),
+				Keys:    make([]string, 0, len(ka)),
+			}
+			for i := range ka {
+				if ka[i].Tag != VTStr {
+					return errNull("map key must be string")
+				}
+				k := ka[i].Data.(string)
+				mo.Entries[k] = va[i]
+				mo.Keys = append(mo.Keys, k)
+				if ann := ka[i].Annot; ann != "" {
+					mo.KeyAnn[k] = ann
+				}
+			}
+			return Value{Tag: VTMap, Data: mo}
+		})
+
+	// len(array|map)
+	ip.reg("__len",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
+		func(ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			switch x.Tag {
+			case VTArray:
+				return Int(int64(len(x.Data.([]Value))))
+			case VTMap:
+				return Int(int64(len(x.Data.(*MapObject).Entries)))
+			default:
+				return errNull("len expects array or map")
+			}
+		})
+
+	// make_fun(params:[str], types:[Type], ret:Type, body:Type) -> Fun
+	// interpreter.go (initCore)
+	ip.reg("__make_fun",
+		[]ParamSpec{
+			{"params", S{"array", S{"id", "Str"}}},
+			{"types", S{"array", S{"id", "Type"}}},
+			{"ret", S{"id", "Type"}},
+			{"body", S{"id", "Type"}},
+			{"isOracle", S{"id", "Bool"}},
+			{"examples", S{"id", "Any"}},
+		},
+		S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			namesV := ctx.MustArg("params").Data.([]Value)
+			typesV := ctx.MustArg("types").Data.([]Value)
+
+			// NEW: extract ASTs from TypeValue
+			retTV := ctx.MustArg("ret").Data.(*TypeValue)
+			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
+
+			isOr := ctx.MustArg("isOracle").Data.(bool)
+			exAny := ctx.MustArg("examples")
+
+			names := make([]string, len(namesV))
+			types := make([]S, len(typesV))
+			for i := range namesV {
+				names[i] = namesV[i].Data.(string)
+			}
+			for i := range typesV {
+				types[i] = typesV[i].Data.(*TypeValue).Ast
+			}
+
+			hidden := false
+			if len(names) == 0 {
+				names = []string{"_"}
+				types = []S{S{"id", "Null"}}
+				hidden = true
+			}
+
+			var exVals []Value
+			if exAny.Tag == VTArray {
+				exVals = append([]Value(nil), exAny.Data.([]Value)...)
+			}
+
+			return FunVal(&Fun{
+				Params:     names,
+				ParamTypes: types,
+				ReturnType: retTV.Ast,
+				Body:       bodyTV.Ast,
+				Env:        ctx.Env(),
+				HiddenNull: hidden,
+				IsOracle:   isOr,
+				Examples:   exVals,
+			})
+		})
+
+	// is function?
+	ip.reg("__is_fun",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
+		func(ctx CallCtx) Value { return Bool(ctx.MustArg("x").Tag == VTFun) })
+
+	// iterator control: stop on plain null; annotated-null is error
+	ip.reg("__iter_should_stop",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
+		func(ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			if v.Tag == VTNull {
+				if v.Annot != "" {
+					fail(v.Annot)
+				}
+				return Bool(true)
+			}
+			return Bool(false)
+		})
+
+	// __to_iter: coerce arrays/maps to iterators; pass through properly-shaped fun
+	ip.RegisterNative("__to_iter",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+
+			// Already iterator? must be Null -> Any?
+			if x.Tag == VTFun {
+				f := x.Data.(*Fun)
+				if len(f.Params) == 1 && ip.isType(Null, f.ParamTypes[0], f.Env) {
+					return x
+				}
+				return annotNull("for expects array, map, or iterator function (Null -> Any?)")
+			}
+
+			// Array → iterator
+			if x.Tag == VTArray {
+				env := NewEnv(ctx.Env())
+				env.Define("$arr", x)
+				env.Define("$i", Int(0))
+
+				body := S{"if",
+					S{"pair",
+						S{"binop", "<",
+							S{"id", "$i"},
+							S{"call", S{"id", "__len"}, S{"id", "$arr"}},
+						},
+						S{"block",
+							S{"assign", S{"id", "$i"},
+								S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
+							},
+							S{"idx",
+								S{"id", "$arr"},
+								S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
+							},
+						},
+					},
+					S{"block", S{"null"}},
+				}
+
+				return FunVal(&Fun{
+					Params:     []string{"_"},
+					ParamTypes: []S{S{"id", "Null"}},
+					ReturnType: S{"unop", "?", S{"id", "Any"}},
+					Body:       body,
+					Env:        env,
+				})
+			}
+
+			// Map → iterator (yields [key, value]) preserving insertion order;
+			// keys are Str values that carry their annotation (if any).
+			if x.Tag == VTMap {
+				mo := x.Data.(*MapObject)
+
+				env := NewEnv(ctx.Env())
+				env.Define("$map", x)
+				// Precompute ordered keys as Values (with annotations)
+				keyVals := make([]Value, 0, len(mo.Keys))
+				for _, k := range mo.Keys {
+					s := Str(k)
+					if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+						s = withAnnot(s, ann)
+					}
+					keyVals = append(keyVals, s)
+				}
+				env.Define("$keys", Arr(keyVals))
+				env.Define("$i", Int(0))
+
+				body := S{"if",
+					S{"pair",
+						S{"binop", "<",
+							S{"id", "$i"},
+							S{"call", S{"id", "__len"}, S{"id", "$keys"}},
+						},
+						S{"block",
+							// k := keys[i]
+							S{"assign", S{"decl", "$k"},
+								S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
+							},
+							// i := i + 1
+							S{"assign", S{"id", "$i"},
+								S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
+							},
+							// [k, map[k]]
+							S{"array",
+								S{"id", "$k"},
+								S{"idx", S{"id", "$map"}, S{"id", "$k"}},
+							},
+						},
+					},
+					S{"block", S{"null"}},
+				}
+
+				return FunVal(&Fun{
+					Params:     []string{"_"},
+					ParamTypes: []S{S{"id", "Null"}},
+					ReturnType: S{"unop", "?", S{"id", "Any"}},
+					Body:       body,
+					Env:        env,
+				})
+			}
+
+			return annotNull("for expects array, map, or iterator function (Null -> Any?)")
+		})
+}
+
+// -----------------------------------------------------------------------------
+// Deep equal & helpers (unchanged semantics)
+// -----------------------------------------------------------------------------
+
+func (ip *Interpreter) deepEqual(a, b Value) bool {
+	if isNumber(a) && isNumber(b) {
+		return toFloat(a) == toFloat(b)
+	}
+	if a.Tag != b.Tag {
+		return false
+	}
+	switch a.Tag {
+	case VTNull:
+		return true
+	case VTBool:
+		return a.Data.(bool) == b.Data.(bool)
+	case VTInt:
+		return a.Data.(int64) == b.Data.(int64)
+	case VTNum:
+		return a.Data.(float64) == b.Data.(float64)
+	case VTStr:
+		return a.Data.(string) == b.Data.(string) // ignore a.Annot / b.Annot
+	case VTArray:
+		ax, bx := a.Data.([]Value), b.Data.([]Value)
+		if len(ax) != len(bx) {
+			return false
+		}
+		for i := range ax {
+			if !ip.deepEqual(ax[i], bx[i]) {
+				return false
+			}
+		}
+		return true
+	case VTMap:
+		am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
+		if len(am.Entries) != len(bm.Entries) {
+			return false
+		}
+		for k, av := range am.Entries {
+			bv, ok := bm.Entries[k]
+			if !ok || !ip.deepEqual(av, bv) {
+				return false
+			}
+		}
+		return true
+	case VTFun:
+		return a.Data.(*Fun) == b.Data.(*Fun)
+	case VTType:
+		ta := a.Data.(*TypeValue)
+		tb := b.Data.(*TypeValue)
+		ea := ta.Env
+		if ea == nil {
+			ea = ip.Core
+		}
+		eb := tb.Env
+		if eb == nil {
+			eb = ip.Core
+		}
+		ra := ip.resolveType(ta.Ast, ea)
+		rb := ip.resolveType(tb.Ast, eb)
+		return equalS(ra, rb)
+	default:
+		return false
 	}
 }
 
-// --- Runtime enforcement at call sites (param and return) -------------------
-
-func Test_Types_Runtime_Param_Mismatch_AnnotatedNull(t *testing.T) {
-	ip := newIP()
-	// (fun(x:Int)->Int do x end)("str")
-	src := `(fun(x: Int) -> Int do x end)("str")`
-	v := evalWithIP(t, ip, src)
-	wantAnnotatedContains(t, v, "type mismatch")
-}
-
-func Test_Types_Runtime_Return_Mismatch_AnnotatedNull(t *testing.T) {
-	ip := newIP()
-	// fun()->Int returns "nope" (Str) → annotated null
-	src := `(fun() -> Int do "nope" end)()`
-	v := evalWithIP(t, ip, src)
-	wantAnnotatedContains(t, v, "return type mismatch")
-}
-
-func Test_Types_Alias_Resolution_And_CycleGuard(t *testing.T) {
-	ip := newIP()
-
-	// Persist the alias so resolveType can find it in ip.Global
-	if _, err := ip.EvalPersistentSource(`let Age = type Int`); err != nil {
-		t.Fatalf("setup error: %v", err)
-	}
-
-	// Using the alias should now type-check and pass 1 through
-	v := evalWithIP(t, ip, `(fun(x: Age) -> Age do x end)(1)`)
-	if v.Tag != VTInt || v.Data.(int64) != 1 {
-		t.Fatalf("alias not respected, got %#v", v)
-	}
-
-	// Cycle guard: defining T = type T should not infinitely expand
-	if _, err := ip.EvalPersistentSource(`let T = type T`); err != nil {
-		t.Fatalf("setup error: %v", err)
-	}
-
-	// type T should remain an unresolved id node ("id","T")
-	typ := typeS(t, ip, `T`)
-	if typ[0].(string) != "id" || typ[1].(string) != "T" {
-		t.Fatalf("cycle guard failed, got %#v", typ)
-	}
-
-	// Unknown id that didn't resolve => closed world: false
-	if ip.isType(Int(1), typ, ip.Global) {
-		t.Fatalf("unresolved id should not match values")
-	}
-}
-
-func Test_Types_Map_ExtraFieldsAllowed(t *testing.T) {
-	ip := newIP()
-	val := evalWithIP(t, ip, `{name:"Ada", age:36, lang:"EN"}`)
-	typ := typeS(t, ip, `{name!: Str}`)
-	if !ip.isType(val, typ, ip.Global) {
-		t.Fatalf("extra fields should be allowed")
-	}
-}
-
-func Test_Types_IsType_FunctionValueAgainstType(t *testing.T) {
-	ip := newIP()
-	// With contravariant params: Num->Str <: Int->Str
-	fn := evalWithIP(t, ip, `fun(x: Num) -> Str do "ok" end`)
-	want := typeS(t, ip, `Int -> Str`)
-	if !ip.isType(fn, want, ip.Global) { // Num->Str <: Int->Str
-		t.Fatalf("function value should satisfy type via param contravariance")
-	}
-}
-
-func Test_Types_Unify_NullableRules(t *testing.T) {
-	ip := newIP()
-	u1 := ip.unifyTypes(typeS(t, ip, `Null`), typeS(t, ip, `Int`), ip.Global)
-	if fmt.Sprintf("%#v", u1) != fmt.Sprintf("%#v", typeS(t, ip, `Int?`)) {
-		t.Fatalf("Null ⊔ Int = Int?; got %#v", u1)
-	}
-	u2 := ip.unifyTypes(typeS(t, ip, `Int?`), typeS(t, ip, `Str?`), ip.Global)
-	// (Int ⊔ Str) = Any → drop '?'
-	if !ip.isSubtype(u2, typeS(t, ip, `Any`), ip.Global) || !ip.isSubtype(typeS(t, ip, `Any`), u2, ip.Global) {
-		t.Fatalf("Int? ⊔ Str? should widen to Any (not Any?)")
-	}
-}
-
-func Test_Types_FunctionChains_SubtypeAndUnify(t *testing.T) {
-	ip := newIP()
-	// Param contravariance across chains:
-	sub := typeS(t, ip, `Num -> Str -> Num`)
-	super := typeS(t, ip, `Int -> Str -> Num`)
-	if !ip.isSubtype(sub, super, ip.Global) {
-		t.Fatalf("chained function subtype failed")
-	}
-	u := ip.unifyTypes(typeS(t, ip, `Int -> Int -> Int`), typeS(t, ip, `Num -> Num -> Num`), ip.Global)
-	if !ip.isSubtype(u, typeS(t, ip, `Num -> Num -> Num`), ip.Global) {
-		t.Fatalf("function unify failed, got %#v", u)
-	}
-}
-
-func Test_Types_ArrayShape_Robustness(t *testing.T) {
-	ip := newIP()
-	v := evalWithIP(t, ip, `[1,2,3]`)
-	// Simulate malformed type node: ("array", Int, Num)
-	mt := S{"array", S{"id", "Int"}, S{"id", "Num"}}
-	if !ip.isType(v, mt, ip.Global) { // current resolveType keeps children; isType should default elem to Any or handle 1st
-		t.Fatalf("array shape robustness")
-	}
-}
-
-func Test_Types_Runtime_Param_AliasMismatch(t *testing.T) {
-	ip := newIP()
-	evalWithIP(t, ip, `let Age = type Int`)
-	v := evalWithIP(t, ip, `(fun(x: Age) -> Int do x end)("nope")`)
-	wantAnnotatedContains(t, v, "type mismatch")
-}
-
-// --- Enums -------------------------------------------------------------------
-
-func Test_Types_Enum_IsType_StringLiterals(t *testing.T) {
-	ip := newIP()
-
-	v1 := evalWithIP(t, ip, `"a"`)
-	v2 := evalWithIP(t, ip, `"b"`)
-	v3 := evalWithIP(t, ip, `"z"`)
-
-	// Enum of strings
-	et := typeS(t, ip, `Enum["a","b","c"]`)
-
-	if !ip.isType(v1, et, ip.Global) || !ip.isType(v2, et, ip.Global) {
-		t.Fatalf(`expected "a" and "b" to be in Enum["a","b","c"]`)
-	}
-	if ip.isType(v3, et, ip.Global) {
-		t.Fatalf(`"z" should not be in Enum["a","b","c"]`)
+// assignTo (unchanged error texts & semantics).
+func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine ...bool) {
+	allowDefine := len(optAllowDefine) > 0 && optAllowDefine[0]
+	switch target[0].(string) {
+	case "id":
+		name := target[1].(string)
+		if err := env.Set(name, value); err != nil {
+			if allowDefine {
+				env.Define(name, value)
+				return
+			}
+			fail(err.Error())
+		}
+	case "decl":
+		env.Define(target[1].(string), value)
+	case "get":
+		obj := ip.evalSimple(target[1].(S), env)
+		var keyStr string
+		switch target[2].(S)[0].(string) {
+		case "id", "str":
+			keyStr = target[2].(S)[1].(string)
+		default:
+			k := ip.evalSimple(target[2].(S), env)
+			if k.Tag != VTStr {
+				fail("object assignment requires map and string key")
+			}
+			keyStr = k.Data.(string)
+		}
+		if obj.Tag == VTMap {
+			mo := obj.Data.(*MapObject)
+			if _, exists := mo.Entries[keyStr]; !exists {
+				mo.Keys = append(mo.Keys, keyStr)
+			}
+			mo.Entries[keyStr] = value
+			return
+		}
+		if obj.Tag == VTModule {
+			fail("cannot assign to module exports")
+		}
+		fail("object assignment requires map and string key")
+	case "idx":
+		obj, idx := ip.evalSimple(target[1].(S), env), ip.evalSimple(target[2].(S), env)
+		if obj.Tag == VTArray && idx.Tag == VTInt {
+			xs := obj.Data.([]Value)
+			if len(xs) == 0 {
+				fail("index on empty array")
+			}
+			i := int(idx.Data.(int64))
+			if i < 0 {
+				i = (i%len(xs) + len(xs)) % len(xs)
+			}
+			if i < 0 || i >= len(xs) {
+				fail("array index out of range")
+			}
+			xs[i] = value
+			return
+		}
+		fail("index assignment requires array[int]")
+	case "darr":
+		if value.Tag != VTArray {
+			for i := 1; i < len(target); i++ {
+				ip.assignTo(target[i].(S), annotNull("array pattern: RHS is not an array"), env, true)
+			}
+			return
+		}
+		xs := value.Data.([]Value)
+		for i := 1; i < len(target); i++ {
+			if i-1 < len(xs) {
+				ip.assignTo(target[i].(S), xs[i-1], env, true)
+			} else {
+				ip.assignTo(target[i].(S), annotNull(fmt.Sprintf("array pattern: missing element #%d", i-1)), env, true)
+			}
+		}
+	case "dobj":
+		if value.Tag != VTMap {
+			for i := 1; i < len(target); i++ {
+				p := target[i].(S) // ("pair", key, pattern)
+				ip.assignTo(p[2].(S), annotNull("object pattern: RHS is not a map"), env, true)
+			}
+			return
+		}
+		mo := value.Data.(*MapObject)
+		m := mo.Entries
+		for i := 1; i < len(target); i++ {
+			p := target[i].(S)
+			k := unwrapKeyStr(p[1].(S))
+			if v, ok := m[k]; ok {
+				ip.assignTo(p[2].(S), v, env, true)
+			} else {
+				ip.assignTo(p[2].(S), annotNull(fmt.Sprintf("object pattern: missing key '%s'", k)), env, true)
+			}
+		}
+	case "annot":
+		text := target[1].(S)[1].(string)
+		sub := target[2].(S)
+		if len(sub) > 0 && sub[0].(string) == "decl" {
+			env.Define(sub[1].(string), withAnnot(value, text))
+			return
+		}
+		ip.assignTo(sub, value, env, true)
+	default:
+		fail("invalid assignment target")
 	}
 }
 
-func Test_Types_Enum_IsType_IntLiterals(t *testing.T) {
-	ip := newIP()
-
-	v1 := evalWithIP(t, ip, `42`)
-	v2 := evalWithIP(t, ip, `7`)
-
-	et := typeS(t, ip, `Enum[42, 7]`)
-
-	if !ip.isType(v1, et, ip.Global) || !ip.isType(v2, et, ip.Global) {
-		t.Fatalf("expected 42 and 7 to be in Enum[42,7]")
+// evalSimple: minimal subset used by assignTo.
+func (ip *Interpreter) evalSimple(n S, env *Env) Value {
+	switch n[0].(string) {
+	case "id":
+		v, err := env.Get(n[1].(string))
+		if err != nil {
+			fail(err.Error())
+		}
+		return v
+	case "str":
+		return Str(n[1].(string))
+	case "int":
+		return Int(n[1].(int64))
+	case "num":
+		return Num(n[1].(float64))
+	case "bool":
+		return Bool(n[1].(bool))
+	case "null":
+		return Null
+	default:
+		fail("unsupported simple eval")
+		return Null
 	}
 }
 
-func Test_Types_Enum_Subtype_SetInclusion(t *testing.T) {
-	ip := newIP()
-
-	sub := typeS(t, ip, `Enum["a","b"]`)
-	super := typeS(t, ip, `Enum["a","b","c"]`)
-	if !ip.isSubtype(sub, super, ip.Global) {
-		t.Fatalf(`Enum["a","b"] <: Enum["a","b","c"] expected`)
-	}
-
-	// Not a subtype when sub has a value absent in super
-	notSub := typeS(t, ip, `Enum["x"]`)
-	if ip.isSubtype(notSub, super, ip.Global) {
-		t.Fatalf(`Enum["x"] </: Enum["a","b","c"] expected`)
-	}
-}
-
-func Test_Types_Enum_Unify_Union(t *testing.T) {
-	ip := newIP()
-
-	a := typeS(t, ip, `Enum["red","green"]`)
-	b := typeS(t, ip, `Enum["green","blue"]`)
-	u := ip.unifyTypes(a, b, ip.Global)
-
-	want := typeS(t, ip, `Enum["red","green","blue"]`)
-	if !ip.isSubtype(u, want, ip.Global) || !ip.isSubtype(want, u, ip.Global) {
-		t.Fatalf("enum union mismatch: got %#v, want %#v", u, want)
-	}
-}
-
-func Test_Types_Enum_Unify_WithStr_WidensToStr(t *testing.T) {
-	ip := newIP()
-
-	e := typeS(t, ip, `Enum["x","y"]`)
-	s := typeS(t, ip, `Str`)
-	u := ip.unifyTypes(e, s, ip.Global)
-
-	if !ip.isSubtype(u, s, ip.Global) || !ip.isSubtype(s, u, ip.Global) {
-		t.Fatalf("Enum ⊔ Str should unify to Str, got %#v", u)
-	}
-}
-
-func Test_Types_Enum_Nullable(t *testing.T) {
-	ip := newIP()
-
-	// value may be null or one of the enum values
-	v1 := evalWithIP(t, ip, `null`)
-	v2 := evalWithIP(t, ip, `"go"`)
-
-	tEnumOpt := typeS(t, ip, `Enum["go","py"]?`)
-
-	if !ip.isType(v1, tEnumOpt, ip.Global) || !ip.isType(v2, tEnumOpt, ip.Global) {
-		t.Fatalf("nullable enum acceptance failed")
+// Iterator expansion (single scoped implementation).
+func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
+	switch iter.Tag {
+	case VTArray:
+		return append([]Value(nil), iter.Data.([]Value)...)
+	case VTMap:
+		mo := iter.Data.(*MapObject)
+		out := make([]Value, 0, len(mo.Keys))
+		for _, k := range mo.Keys {
+			keyV := Str(k)
+			if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+				keyV = withAnnot(keyV, ann)
+			}
+			out = append(out, Arr([]Value{keyV, mo.Entries[k]}))
+		}
+		return out
+	case VTFun:
+		f := iter.Data.(*Fun)
+		if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
+			name := "_"
+			if len(f.Params) > 0 {
+				name = f.Params[0]
+			}
+			fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
+		}
+		out := []Value{}
+		for {
+			next := ip.applyArgsScoped(iter, []Value{Null}, scope)
+			if next.Tag == VTNull {
+				if next.Annot != "" {
+					fail(next.Annot)
+				}
+				break
+			}
+			out = append(out, next)
+		}
+		return out
+	default:
+		fail("for expects array, map, or iterator function (Null -> Any)")
+		return nil
 	}
 }
 
-// --- Enums with runtime enforcement -----------------------------------------
+// -----------------------------------------------------------------------------
+// JIT compiler (emitter helpers to reduce boilerplate)
+// -----------------------------------------------------------------------------
 
-func Test_Types_Runtime_Param_Enum_Ok_And_Mismatch(t *testing.T) {
-	ip := newIP()
-
-	ok := evalWithIP(t, ip, `(fun(x: Enum["small","large"]) -> Str do "ok" end)("small")`)
-	if ok.Tag != VTStr || ok.Data.(string) != "ok" {
-		t.Fatalf("enum param should accept matching literal, got %#v", ok)
-	}
-
-	bad := evalWithIP(t, ip, `(fun(x: Enum["small","large"]) -> Str do "ok" end)("medium")`)
-	wantAnnotatedContains(t, bad, "type mismatch")
+type emitter struct {
+	ip        *Interpreter
+	code      []uint32
+	consts    []Value
+	loopStack []loopLbls
 }
 
-// --- Aliases to enums --------------------------------------------------------
-
-func Test_Types_Alias_To_Enum(t *testing.T) {
-	ip := newIP()
-
-	if _, err := ip.EvalPersistentSource(`let Color = type Enum["red","blue"]`); err != nil {
-		t.Fatalf("setup error: %v", err)
-	}
-
-	v := evalWithIP(t, ip, `(fun(x: Color) -> Str do "ok" end)("red")`)
-	if v.Tag != VTStr {
-		t.Fatalf("alias to enum should work, got %#v", v)
-	}
-
-	bad := evalWithIP(t, ip, `(fun(x: Color) -> Str do "ok" end)("green")`)
-	wantAnnotatedContains(t, bad, "type mismatch")
+type loopLbls struct {
+	head       int
+	contTarget int
+	breakJumps []int
+	contJumps  []int
 }
 
-// --- Arrays, nullables, and inference ---------------------------------------
-
-func Test_Types_ArrayOfEnum_IsType_And_Inference(t *testing.T) {
-	ip := newIP()
-
-	val := evalWithIP(t, ip, `["a","b","a"]`)
-	tt := typeS(t, ip, `[Enum["a","b"]]`)
-	if !ip.isType(val, tt, ip.Global) {
-		t.Fatalf(`["a","b","a"] should match [Enum["a","b"]]`)
+func newEmitter(ip *Interpreter) *emitter { return &emitter{ip: ip} }
+func (e *emitter) k(v Value) uint32 {
+	for i := range e.consts {
+		if e.ip.deepEqual(e.consts[i], v) {
+			return uint32(i)
+		}
 	}
+	e.consts = append(e.consts, v)
+	return uint32(len(e.consts) - 1)
+}
+func (e *emitter) ks(s string) uint32         { return e.k(Str(s)) }
+func (e *emitter) emit(op opcode, imm uint32) { e.code = append(e.code, pack(op, imm)) }
+func (e *emitter) patch(at int, to int)       { e.code[at] = pack(uop(e.code[at]), uint32(to)) }
+func (e *emitter) here() int                  { return len(e.code) }
+func (e *emitter) chunk() *Chunk              { return &Chunk{Code: e.code, Consts: e.consts} }
 
-	// Inference for ["a","b"] should yield an array whose element type
-	// is <= Str (it may be exactly Str, which is fine).
-	val2 := evalWithIP(t, ip, `["a","b"]`)
-	arrT := ip.valueToTypeS(val2, ip.Global)
-	if len(arrT) != 2 || arrT[0].(string) != "array" {
-		t.Fatalf("expected array type, got %#v", arrT)
+// small helpers
+func (e *emitter) callBuiltin(name string, args ...S) {
+	e.emit(opLoadGlobal, e.ks(name))
+	for _, a := range args {
+		e.emitExpr(a)
 	}
-	elemT := arrT[1].(S)
-	if !ip.isSubtype(elemT, typeS(t, ip, `Str`), ip.Global) {
-		t.Fatalf(`element type should be <= Str, got %#v`, elemT)
-	}
+	e.emit(opCall, uint32(len(args)))
 }
 
-func Test_Types_NestedNullableArrays(t *testing.T) {
-	ip := newIP()
-
-	v := evalWithIP(t, ip, `[[1, null], null]`)
-	tok := typeS(t, ip, `[ [Int?]? ]`) // outer array of (nullable array of Int?)
-	if !ip.isType(v, tok, ip.Global) {
-		t.Fatalf("nested nullable arrays should match")
+// unwrapKeyStr returns the string name for a map key S-node.
+// Accepts ("str", name) or ("annot", ("str", text), <key>), recursively.
+func unwrapKeyStr(k S) string {
+	for len(k) > 0 && k[0].(string) == "annot" {
+		k = k[2].(S) // skip to the wrapped key
 	}
+	// Parser emits keys as ("str", name).
+	if len(k) >= 2 && k[0].(string) == "str" {
+		return k[1].(string)
+	}
+	fail("map key is not a string")
+	return ""
 }
 
-// --- Maps with enums and required/optional ----------------------------------
-
-func Test_Types_Map_Field_Enum_Required_Optional(t *testing.T) {
-	ip := newIP()
-
-	v1 := evalWithIP(t, ip, `{name:"Ada", color:"red"}`)
-	v2 := evalWithIP(t, ip, `{name:"Ada"}`)
-
-	// color is optional enum; name is required string
-	tmap := typeS(t, ip, `{name!: Str, color: Enum["red","blue"]}`)
-	if !ip.isType(v1, tmap, ip.Global) {
-		t.Fatalf("optional enum field present should pass")
-	}
-	if !ip.isType(v2, tmap, ip.Global) {
-		t.Fatalf("optional enum field absent should pass")
-	}
+// Entry
+func (e *emitter) emitFunBody(body S) {
+	e.emitExpr(body)
+	e.emit(opReturn, 0)
 }
 
-func Test_Types_Unify_Maps_Required_OR_Rule(t *testing.T) {
-	ip := newIP()
+// ---- Expressions ----
 
-	// Required flag should OR on unify
-	m1 := typeS(t, ip, `{a!: Int}`) // a required
-	m2 := typeS(t, ip, `{a:  Num}`) // a optional
-	u := ip.unifyTypes(m1, m2, ip.Global)
+func (e *emitter) emitExpr(n S) {
+	if len(n) == 0 {
+		e.emit(opConst, e.k(Null))
+		return
+	}
+	switch n[0].(string) {
 
-	// expect {a!: Num}  (type unified to Num, required ORed)
-	want := typeS(t, ip, `{a!: Num}`)
-	if !ip.isSubtype(u, want, ip.Global) || !ip.isSubtype(want, u, ip.Global) {
-		t.Fatalf("map unify required OR rule failed: got %#v, want %#v", u, want)
+	// literals
+	case "int":
+		e.emit(opConst, e.k(Int(n[1].(int64))))
+	case "num":
+		e.emit(opConst, e.k(Num(n[1].(float64))))
+	case "str":
+		e.emit(opConst, e.k(Str(n[1].(string))))
+	case "bool":
+		e.emit(opConst, e.k(Bool(n[1].(bool))))
+	case "null":
+		e.emit(opConst, e.k(Null))
+
+	case "id":
+		e.emit(opLoadGlobal, e.ks(n[1].(string)))
+
+	case "block":
+		for i := 1; i < len(n); i++ {
+			e.emitExpr(n[i].(S))
+		}
+
+	// unary
+	case "unop":
+		op := n[1].(string)
+		if op == "?" { // type-only; signal runtime error if appears in terms
+			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
+			return
+		}
+		e.emitExpr(n[2].(S))
+		switch op {
+		case "not":
+			e.emit(opNot, 0)
+		case "-":
+			e.emit(opNeg, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unknown unary op")))
+		}
+
+	// binary (short-circuit for and/or; others via helpers)
+	case "binop":
+		op := n[1].(string)
+		if op == "and" || op == "or" {
+			e.emitExpr(n[2].(S))
+			if op == "and" {
+				jf := e.here()
+				e.emit(opJumpIfFalse, 0)
+				e.emitExpr(n[3].(S))
+				jend := e.here()
+				e.emit(opJump, 0)
+				lfalse := e.here()
+				e.emit(opConst, e.k(Bool(false)))
+				lend := e.here()
+				e.patch(jf, lfalse)
+				e.patch(jend, lend)
+			} else {
+				jf := e.here()
+				e.emit(opJumpIfFalse, 0)
+				e.emit(opConst, e.k(Bool(true)))
+				jend := e.here()
+				e.emit(opJump, 0)
+				lrhs := e.here()
+				e.patch(jf, lrhs)
+				e.emitExpr(n[3].(S))
+				lend := e.here()
+				e.patch(jend, lend)
+			}
+			return
+		}
+		a, b := n[2].(S), n[3].(S)
+		switch op {
+		case "==":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opEq, 0)
+		case "!=":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opNe, 0)
+		case "+":
+			e.callBuiltin("__plus", a, b)
+		case "-":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opSub, 0)
+		case "*":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opMul, 0)
+		case "/":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opDiv, 0)
+		case "%":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opMod, 0)
+		case "<":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opLt, 0)
+		case "<=":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opLe, 0)
+		case ">":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opGt, 0)
+		case ">=":
+			e.emitExpr(a)
+			e.emitExpr(b)
+			e.emit(opGe, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unsupported operator")))
+		}
+
+	case "assign":
+		lhs := n[1].(S)
+		opName := "__assign_set"
+		switch lhs[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			opName = "__assign_def"
+		}
+		e.emit(opLoadGlobal, e.ks(opName))
+		e.emit(opConst, e.k(TypeVal(lhs)))
+		e.emitExpr(n[2].(S))
+		e.emit(opCall, 2)
+
+	case "decl": // let x → define null
+		e.callBuiltin("__assign_def", S{"type", n}, S{"null"})
+
+	// arrays & maps
+	case "array":
+		for i := 1; i < len(n); i++ {
+			e.emitExpr(n[i].(S))
+		}
+		e.emit(opMakeArr, uint32(len(n)-1))
+
+	case "map":
+		// Build keys/vals arrays; for keys, emit the key node as-is
+		// (can be "str" or "annot(..., str)"), so annotations become part of the Str Value.
+		keys := S{"array"}
+		vals := S{"array"}
+		for i := 1; i < len(n); i++ {
+			p := n[i].(S)       // ("pair"|"pair!", keyNode, valueExpr)
+			keyNode := p[1].(S) // "str" or "annot"
+			valExpr := p[2].(S) // value expr
+			keys = append(keys, keyNode)
+			vals = append(vals, valExpr)
+		}
+		// call __map_from(keys, vals)
+		e.emit(opLoadGlobal, e.ks("__map_from"))
+		for i := 1; i < len(keys); i++ {
+			e.emitExpr(keys[i].(S))
+		}
+		e.emit(opMakeArr, uint32(len(keys)-1))
+		for i := 1; i < len(vals); i++ {
+			e.emitExpr(vals[i].(S))
+		}
+		e.emit(opMakeArr, uint32(len(vals)-1))
+		e.emit(opCall, 2)
+
+	// property / index
+	case "get":
+		e.emitExpr(n[1].(S))
+		e.emit(opGetProp, e.ks(n[2].(S)[1].(string)))
+	case "idx":
+		e.emitExpr(n[1].(S))
+		e.emitExpr(n[2].(S))
+		e.emit(opGetIdx, 0)
+
+	// calls
+	case "call":
+		e.emitExpr(n[1].(S))
+		for i := 2; i < len(n); i++ {
+			e.emitExpr(n[i].(S))
+		}
+		e.emit(opCall, uint32(len(n)-2))
+
+	case "fun":
+		params := n[1].(S)
+		namesArr := make([]Value, 0, len(params)-1)
+		typesArr := make([]Value, 0, len(params)-1)
+		for i := 1; i < len(params); i++ {
+			p := params[i].(S)
+			namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+			t := p[2].(S)
+			if len(t) == 0 {
+				t = S{"id", "Any"}
+			}
+			typesArr = append(typesArr, TypeVal(t))
+		}
+		retT := n[2].(S)
+		if len(retT) == 0 {
+			retT = S{"id", "Any"}
+		}
+
+		e.emit(opLoadGlobal, e.ks("__make_fun"))
+		for _, v := range namesArr {
+			e.emit(opConst, e.k(v))
+		}
+		e.emit(opMakeArr, uint32(len(namesArr)))
+		for _, v := range typesArr {
+			e.emit(opConst, e.k(v))
+		}
+		e.emit(opMakeArr, uint32(len(typesArr)))
+		e.emit(opConst, e.k(TypeVal(retT)))
+		e.emit(opConst, e.k(TypeVal(n[3].(S))))
+		e.emit(opConst, e.k(Bool(false)))
+		e.emit(opConst, e.k(Null))
+		e.emit(opCall, 6)
+
+	case "oracle":
+		// n = ("oracle", params, retType, examplesExpr)
+		params := n[1].(S)
+		namesArr := make([]Value, 0, len(params)-1)
+		typesArr := make([]Value, 0, len(params)-1)
+		for i := 1; i < len(params); i++ {
+			p := params[i].(S)
+			namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+			t := p[2].(S)
+			if len(t) == 0 {
+				t = S{"id", "Any"}
+			}
+			typesArr = append(typesArr, TypeVal(t))
+		}
+		retT := n[2].(S)
+		if len(retT) == 0 {
+			retT = S{"id", "Any"}
+		}
+
+		e.emit(opLoadGlobal, e.ks("__make_fun"))
+		for _, v := range namesArr {
+			e.emit(opConst, e.k(v))
+		}
+		e.emit(opMakeArr, uint32(len(namesArr)))
+		for _, v := range typesArr {
+			e.emit(opConst, e.k(v))
+		}
+		e.emit(opMakeArr, uint32(len(typesArr)))
+		e.emit(opConst, e.k(TypeVal(retT)))
+		e.emit(opConst, e.k(TypeVal(S{"oracle"})))
+		e.emit(opConst, e.k(Bool(true)))
+		e.emitExpr(n[3].(S))
+		e.emit(opCall, 6)
+
+	// control
+	case "return":
+		e.emitExpr(n[1].(S))
+		e.emit(opReturn, 0)
+	case "break":
+		e.emitExpr(n[1].(S))
+		if len(e.loopStack) == 0 {
+			e.emit(opBreak, 0)
+		} else {
+			i := len(e.loopStack) - 1
+			lbl := e.loopStack[i]
+			at := e.here()
+			e.emit(opJump, 0)
+			lbl.breakJumps = append(lbl.breakJumps, at)
+			e.loopStack[i] = lbl
+		}
+	case "continue":
+		e.emitExpr(n[1].(S))
+		if len(e.loopStack) == 0 {
+			e.emit(opContinue, 0)
+		} else {
+			i := len(e.loopStack) - 1
+			lbl := e.loopStack[i]
+			if lbl.contTarget >= 0 {
+				e.emit(opJump, uint32(lbl.contTarget))
+			} else {
+				at := e.here()
+				e.emit(opJump, 0)
+				lbl.contJumps = append(lbl.contJumps, at)
+				e.loopStack[i] = lbl
+			}
+		}
+
+	// if/elif/else
+	case "if":
+		arms := n[1:]
+		jends := []int{}
+		hasElse := false
+		if len(arms) > 0 {
+			if last, ok := arms[len(arms)-1].(S); ok && last[0].(string) == "block" {
+				hasElse = true
+			}
+		}
+		limit := len(arms)
+		if hasElse {
+			limit--
+		}
+		for i := 0; i < limit; i++ {
+			p := arms[i].(S)
+			e.emitExpr(p[1].(S))
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
+			e.emitExpr(p[2].(S))
+			jend := e.here()
+			e.emit(opJump, 0)
+			jends = append(jends, jend)
+			e.patch(jf, e.here())
+		}
+		if hasElse {
+			e.emitExpr(arms[len(arms)-1].(S))
+		} else {
+			e.emit(opConst, e.k(Null))
+		}
+		tail := e.here()
+		for _, at := range jends {
+			e.patch(at, tail)
+		}
+
+	// while
+	case "while":
+		cond := n[1].(S)
+		body := n[2].(S)
+		head := e.here()
+		e.emitExpr(cond)
+		jf := e.here()
+		e.emit(opJumpIfFalse, 0)
+
+		l := loopLbls{head: head, contTarget: head}
+		e.loopStack = append(e.loopStack, l)
+
+		e.emitExpr(body)
+		e.emit(opJump, uint32(head))
+
+		end := e.here()
+		e.patch(jf, end)
+		i := len(e.loopStack) - 1
+		lbl := e.loopStack[i]
+		for _, at := range lbl.breakJumps {
+			e.patch(at, end)
+		}
+		e.loopStack = e.loopStack[:i]
+
+	// for (iterator lowering)
+	case "for":
+		target := n[1].(S)
+		iterExpr := n[2].(S)
+		body := n[3].(S)
+
+		iterName := fmt.Sprintf("$iter_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", iterName}},
+			S{"call", S{"id", "__to_iter"}, iterExpr})
+
+		tmpName := fmt.Sprintf("$tmp_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+
+		head := e.here()
+
+		// tmp = iter(null)
+		e.emit(opLoadGlobal, e.ks("__assign_set"))
+		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
+		e.emit(opLoadGlobal, e.ks(iterName))
+		e.emit(opConst, e.k(Null))
+		e.emit(opCall, 1)
+		e.emit(opCall, 2)
+
+		// stop?
+		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
+		e.emit(opLoadGlobal, e.ks(tmpName))
+		e.emit(opCall, 1)
+		jBody := e.here()
+		e.emit(opJumpIfFalse, 0)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		bodyStart := e.here()
+		e.patch(jBody, bodyStart)
+
+		assignName := "__assign_set"
+		switch target[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			assignName = "__assign_def"
+		}
+		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
+
+		lbl := loopLbls{head: head, contTarget: head}
+		e.loopStack = append(e.loopStack, lbl)
+
+		e.emitExpr(body)
+		e.emit(opJump, uint32(head))
+
+		end := e.here()
+		e.patch(jEnd, end)
+		i := len(e.loopStack) - 1
+		lrec := e.loopStack[i]
+		for _, at := range lrec.breakJumps {
+			e.patch(at, end)
+		}
+		e.loopStack = e.loopStack[:i]
+
+		e.emit(opConst, e.k(Null)) // for-expression value is null
+
+	// type / annotation
+	case "type":
+		e.emit(opConst, e.k(TypeVal(n[1].(S))))
+	case "annot":
+		text := n[1].(S)[1].(string)
+		subj := n[2].(S)
+
+		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
+		if len(subj) > 0 && subj[0].(string) == "assign" {
+			lhs := subj[1].(S)
+			rhs := subj[2].(S)
+
+			opName := "__assign_set"
+			switch lhs[0].(string) {
+			case "decl", "darr", "dobj", "annot":
+				opName = "__assign_def"
+			}
+
+			// push assign function
+			e.emit(opLoadGlobal, e.ks(opName))
+			// arg1: Type(lhs)
+			e.emit(opConst, e.k(TypeVal(lhs)))
+			// arg2: __annotate(text, rhs)
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.emitExpr(rhs)
+			e.emit(opCall, 2) // -> annotated RHS
+			// call assign(Type(lhs), annotatedRHS)
+			e.emit(opCall, 2)
+			return
+		}
+
+		// #(doc) (let x)  ==>  let x = #(doc) null
+		if len(subj) > 0 && subj[0].(string) == "decl" {
+			e.emit(opLoadGlobal, e.ks("__assign_def"))
+			e.emit(opConst, e.k(TypeVal(subj))) // Type(decl)
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.emit(opConst, e.k(Null))
+			e.emit(opCall, 2) // __annotate(text, null)
+			e.emit(opCall, 2) // __assign_def(Type(decl), annotatedNull)
+			return
+		}
+
+		// default: #(doc) expr  ==>  __annotate(doc, expr)
+		e.callBuiltin("__annotate", S{"str", text}, subj)
+
+	default:
+		e.emit(opConst, e.k(errNull("unknown AST tag")))
 	}
 }
+=== END FILE: interpreter.go ===
 
-// --- Functions + enums, chained arrows --------------------------------------
+=== BEGIN FILE: vm.go ===
+// vm.go
+package mindscript
 
-func Test_Types_Function_Param_Enum_Contravariance(t *testing.T) {
-	ip := newIP()
+// A minimal, internal bytecode VM.
+// - Goroutine-safe (no package-level mutability).
+// - Preserves the public, stable engine surface (Interpreter methods).
+// - CALL delegates to Interpreter.Apply to keep currying & native dispatch.
 
-	// Param contravariance with enums:
-	// Str -> Str  <:  Enum["a"] -> Str  (since Enum["a"] <: Str)
-	sub := typeS(t, ip, `Str -> Str`)
-	super := typeS(t, ip, `Enum["a"] -> Str`)
-	if !ip.isSubtype(sub, super, ip.Global) {
-		t.Fatalf("Str->Str <: Enum[\"a\"]->Str expected (param contravariance)")
+import (
+	"fmt"
+	"math"
+)
+
+// -----------------------------
+// Instruction encoding
+// -----------------------------
+
+type opcode uint8
+
+const (
+	opNop opcode = iota
+
+	// constants & globals
+	opConst      // push consts[k]
+	opLoadGlobal // push Env[name];  imm = const index (name as VTStr)
+
+	// stack/values
+	opMakeArr // pop N → array; imm = N
+
+	// property & index
+	opGetProp // obj.get(name);   imm = const index (name as VTStr)
+	opGetIdx  // pop idx,obj → push obj[idx]
+
+	// arithmetic / compare / unary
+	opSub
+	opMul
+	opDiv
+	opMod
+	opEq
+	opNe
+	opLt
+	opLe
+	opGt
+	opGe
+	opNeg
+	opNot
+
+	// control flow
+	opJump        // ip = imm
+	opJumpIfFalse // pop cond; if false => ip = imm
+	opReturn      // pop v; signal Return with v
+	opBreak       // signal Break with top (or null if empty)
+	opContinue    // signal Continue with top (or null if empty)
+
+	// calls/closures
+	opCall // argc = imm; pops argc args then callee; pushes result
+)
+
+// pack/unpack helpers
+func pack(op opcode, imm uint32) uint32 { return uint32(op)<<24 | (imm & 0xFFFFFF) }
+func uop(i uint32) opcode               { return opcode(i >> 24) }
+func uimm(i uint32) uint32              { return i & 0xFFFFFF }
+
+// unwrap a VTMap to *MapObject (nil if not a map)
+func asMap(v Value) *MapObject {
+	if v.Tag != VTMap {
+		return nil
 	}
+	return v.Data.(*MapObject)
 }
 
-func Test_Types_FunctionValue_Against_EnumParamType(t *testing.T) {
-	ip := newIP()
+// -----------------------------
+// Bytecode container (internal)
+// -----------------------------
 
-	// Provide a function with a broader param (Str),
-	// check it against a type expecting a narrower Enum[...] param.
-	f := evalWithIP(t, ip, `fun(x: Str) -> Str do "ok" end`)
-	ty := typeS(t, ip, `Enum["dev","prod"] -> Str`)
-	if !ip.isType(f, ty, ip.Global) { // Str->Str <: Enum[...] -> Str
-		t.Fatalf("function value should satisfy Enum[...] -> Str via param contravariance")
-	}
+type Chunk struct {
+	Code   []uint32
+	Consts []Value
 }
-func Test_Types_Alias_State_With_Enum(t *testing.T) {
-	ip := newIP()
 
-	// Define the alias persistently so resolveType can find it.
-	if _, err := ip.EvalPersistentSource(`let State = type {id: Int, status!: Enum["running","terminated"]}`); err != nil {
-		t.Fatalf("setup error: %v", err)
-	}
+// -----------------------------
+// VM status/result
+// -----------------------------
 
-	// 1) Value matches the alias (id optional, status required, enum ok)
-	okVal := evalWithIP(t, ip, `{id: 1, status: "running"}`)
-	if !ip.isType(okVal, typeS(t, ip, `State`), ip.Global) {
-		t.Fatalf(`expected {id:1,status:"running"} to match State`)
-	}
+type vmStatus int
 
-	// 2) Enum mismatch should fail isType
-	badEnum := evalWithIP(t, ip, `{id: 1, status: "paused"}`)
-	if ip.isType(badEnum, typeS(t, ip, `State`), ip.Global) {
-		t.Fatalf(`did not expect {id:1,status:"paused"} to match State`)
-	}
+const (
+	vmOK vmStatus = iota
+	vmReturn
+	vmBreak
+	vmContinue
+	vmRuntimeError
+)
 
-	// 3) Missing required status → fail
-	missingStatus := evalWithIP(t, ip, `{id: 1}`)
-	if ip.isType(missingStatus, typeS(t, ip, `State`), ip.Global) {
-		t.Fatalf(`did not expect {id:1} to match State (status! missing)`)
-	}
-
-	// 4) Using State in a function parameter (ok)
-	okCall := evalWithIP(t, ip, `(fun(s: State) -> Str do s.status end)({status: "terminated"})`)
-	if okCall.Tag != VTStr || okCall.Data.(string) != "terminated" {
-		t.Fatalf(`expected function to return "terminated", got %#v`, okCall)
-	}
-
-	// 5) Using State in a function parameter (enum mismatch → annotated null)
-	badCall := evalWithIP(t, ip, `(fun(s: State) -> Str do s.status end)({status: "paused"})`)
-	wantAnnotatedContains(t, badCall, "type mismatch")
+type vmResult struct {
+	status vmStatus
+	value  Value
 }
-=== END FILE: types_test.go ===
+
+// -----------------------------
+// VM machine
+// -----------------------------
+
+type vm struct {
+	ip    *Interpreter
+	chunk *Chunk
+	env   *Env
+	stack []Value
+	sp    int
+	iptr  int
+}
+
+func (m *vm) push(v Value) {
+	if m.sp >= len(m.stack) {
+		newCap := len(m.stack) * 2
+		if newCap == 0 {
+			newCap = 16
+		}
+		ns := make([]Value, newCap)
+		copy(ns, m.stack)
+		m.stack = ns
+	}
+	m.stack[m.sp] = v
+	m.sp++
+}
+
+func (m *vm) pop() Value {
+	if m.sp == 0 {
+		return errNull("stack underflow")
+	}
+	m.sp--
+	return m.stack[m.sp]
+}
+
+func (m *vm) top() Value {
+	if m.sp == 0 {
+		return Null
+	}
+	return m.stack[m.sp-1]
+}
+
+func (m *vm) fail(msg string) vmResult {
+	return vmResult{status: vmRuntimeError, value: errNull(msg)}
+}
+
+// -----------------------------
+// Numeric helpers (mirror interpreter semantics)
+// -----------------------------
+
+// Numeric helpers (mirror interpreter semantics)
+func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
+	// numbers
+	if isNumber(a) && isNumber(b) {
+		lf, rf := toFloat(a), toFloat(b)
+		bothInt := a.Tag == VTInt && b.Tag == VTInt
+		switch op {
+		case opSub:
+			if bothInt {
+				return Int(a.Data.(int64) - b.Data.(int64)), nil
+			}
+			return Num(lf - rf), nil
+		case opMul:
+			if bothInt {
+				return Int(a.Data.(int64) * b.Data.(int64)), nil
+			}
+			return Num(lf * rf), nil
+		case opDiv:
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("division by zero")
+				return Null, &res
+			}
+			if bothInt {
+				return Int(a.Data.(int64) / b.Data.(int64)), nil
+			}
+			return Num(lf / rf), nil
+		case opMod:
+			// guard zero (match division error text)
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("division by zero")
+				return Null, &res
+			}
+			if bothInt {
+				return Int(a.Data.(int64) % b.Data.(int64)), nil
+			}
+			return Num(math.Mod(lf, rf)), nil
+		case opLt:
+			if bothInt {
+				return Bool(a.Data.(int64) < b.Data.(int64)), nil
+			}
+			return Bool(lf < rf), nil
+		case opLe:
+			if bothInt {
+				return Bool(a.Data.(int64) <= b.Data.(int64)), nil
+			}
+			return Bool(lf <= rf), nil
+		case opGt:
+			if bothInt {
+				return Bool(a.Data.(int64) > b.Data.(int64)), nil
+			}
+			return Bool(lf > rf), nil
+		case opGe:
+			if bothInt {
+				return Bool(a.Data.(int64) >= b.Data.(int64)), nil
+			}
+			return Bool(lf >= rf), nil
+		}
+	}
+
+	// string comparisons
+	if a.Tag == VTStr && b.Tag == VTStr {
+		as, bs := a.Data.(string), b.Data.(string)
+		switch op {
+		case opLt:
+			return Bool(as < bs), nil
+		case opLe:
+			return Bool(as <= bs), nil
+		case opGt:
+			return Bool(as > bs), nil
+		case opGe:
+			return Bool(as >= bs), nil
+		}
+	}
+	return Value{}, &vmResult{status: vmRuntimeError, value: errNull("bad numeric operator")}
+}
+
+// -----------------------------
+// VM runner
+// -----------------------------
+
+func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResult {
+	m := &vm{
+		ip:    ip,
+		chunk: chunk,
+		// evaluate in the provided environment (global-chain root for this run)
+		env:   env,
+		stack: make([]Value, 0, initStackCap),
+	}
+	code := chunk.Code
+	consts := chunk.Consts
+
+	for m.iptr < len(code) {
+		raw := code[m.iptr]
+		m.iptr++
+		opc := uop(raw)
+		imm := uimm(raw)
+
+		switch opc {
+
+		case opNop:
+			// no-op
+
+		// ---- constants & globals ----
+		case opConst:
+			if int(imm) >= len(consts) {
+				return m.fail("const index out of range")
+			}
+			m.push(consts[imm])
+
+		case opLoadGlobal:
+			if int(imm) >= len(consts) {
+				return m.fail("name index out of range")
+			}
+			k := consts[imm]
+			if k.Tag != VTStr {
+				return m.fail("global name must be string const")
+			}
+			v, err := m.env.Get(k.Data.(string))
+			if err != nil {
+				return m.fail(err.Error())
+			}
+			m.push(v)
+
+		// ---- arrays ----
+		case opMakeArr:
+			n := int(imm)
+			if n < 0 || n > m.sp {
+				return m.fail("bad array size")
+			}
+			start := m.sp - n
+			elems := make([]Value, n)
+			copy(elems, m.stack[start:m.sp])
+			m.sp = start
+			m.push(Arr(elems))
+
+		// ---- properties / indices ----
+		case opGetProp:
+			if int(imm) >= len(consts) {
+				return m.fail("name index out of range")
+			}
+			k := consts[imm]
+			if k.Tag != VTStr {
+				return m.fail("property name must be string const")
+			}
+			obj := m.pop()
+			key := k.Data.(string)
+
+			// Map lookup: use MapObject entries (annotation on keys is meta)
+			if obj.Tag == VTMap {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("property get requires map or module with string key")
+				}
+				if v, ok := mo.Entries[key]; ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown property %q", key))
+			}
+
+			// Module export lookup stays the same
+			if obj.Tag == VTModule {
+				mod := obj.Data.(*Module)
+				if v, ok := mod.get(key); ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown property %q on module", key))
+			}
+
+			return m.fail("property get requires map or module with string key")
+
+		case opGetIdx:
+			idx := m.pop()
+			obj := m.pop()
+
+			// array[int]
+			if obj.Tag == VTArray && idx.Tag == VTInt {
+				xs := obj.Data.([]Value)
+				if len(xs) == 0 {
+					return m.fail("index on empty array")
+				}
+				i := int(idx.Data.(int64))
+				if i < 0 {
+					i = (i%len(xs) + len(xs)) % len(xs)
+				}
+				if i < 0 || i >= len(xs) {
+					return m.fail("array index out of range")
+				}
+				m.push(xs[i])
+				break
+			}
+
+			// map[string]
+			if obj.Tag == VTMap && idx.Tag == VTStr {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("index requires array[int] or map[string]")
+				}
+				k := idx.Data.(string)
+				if v, ok := mo.Entries[k]; ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown key %q", k))
+			}
+
+			return m.fail("index requires array[int] or map[string]")
+
+		// ---- arithmetic / compare / unary ----
+
+		case opSub, opMul, opDiv, opMod, opLt, opLe, opGt, opGe:
+			b := m.pop()
+			a := m.pop()
+			if out, failRes := m.binNum(opc, a, b); failRes != nil {
+				return *failRes
+			} else {
+				m.push(out)
+			}
+
+		case opEq, opNe:
+			b := m.pop()
+			a := m.pop()
+			eq := m.ip.deepEqual(a, b)
+			if opc == opEq {
+				m.push(Bool(eq))
+			} else {
+				m.push(Bool(!eq))
+			}
+
+		case opNeg:
+			x := m.pop()
+			switch x.Tag {
+			case VTInt:
+				m.push(Int(-x.Data.(int64)))
+			case VTNum:
+				m.push(Num(-x.Data.(float64)))
+			default:
+				return m.fail("unary - expects number")
+			}
+
+		case opNot:
+			x := m.pop()
+			if x.Tag != VTBool {
+				return m.fail("not expects boolean")
+			}
+			m.push(Bool(!x.Data.(bool)))
+
+		// ---- control flow ----
+		case opJump:
+			m.iptr = int(imm)
+
+		case opJumpIfFalse:
+			cond := m.pop()
+			if cond.Tag != VTBool {
+				return m.fail("condition must be boolean")
+			}
+			if !cond.Data.(bool) {
+				m.iptr = int(imm)
+			}
+
+		case opReturn:
+			var v Value = Null
+			if m.sp > 0 {
+				v = m.pop()
+			}
+			return vmResult{status: vmReturn, value: v}
+
+		case opBreak:
+			v := m.top()
+			if m.sp == 0 {
+				v = Null
+			}
+			return vmResult{status: vmBreak, value: v}
+
+		case opContinue:
+			v := m.top()
+			if m.sp == 0 {
+				v = Null
+			}
+			return vmResult{status: vmContinue, value: v}
+
+		// ---- calls ----
+		case opCall:
+			nargs := int(imm)
+
+			// Stack layout (top on the right):
+			// [..., callee, arg1, ..., argN]
+			calleeIdx := m.sp - nargs - 1
+			if calleeIdx < 0 {
+				return m.fail("stack underflow in call")
+			}
+			callee := m.stack[calleeIdx]
+
+			// Collect args in order
+			args := make([]Value, nargs)
+			copy(args, m.stack[calleeIdx+1:m.sp])
+
+			// Pop callee + args
+			m.sp = calleeIdx
+			m.stack = m.stack[:m.sp]
+
+			// Use current frame env as the call-site (for natives & closures)
+			res := m.ip.applyArgsScoped(callee, args, m.env)
+
+			// Push result
+			m.push(res)
+
+		default:
+			return m.fail("unknown opcode")
+		}
+	}
+
+	if m.sp == 0 {
+		return vmResult{status: vmOK, value: Null}
+	}
+	return vmResult{status: vmOK, value: m.top()}
+}
+=== END FILE: vm.go ===
 

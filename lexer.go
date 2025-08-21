@@ -1,4 +1,4 @@
-// mindscript_lexer.go (refactored)
+// mindscript_lexer.go (refactored, with interactive mode)
 package mindscript
 
 import (
@@ -128,6 +128,24 @@ var keywords = map[string]TokenType{
 	"Enum":     ENUM,
 }
 
+// ---------- public, shared errors ----------
+
+// Parse-time code will also use this to detect "need more input" cases.
+type IncompleteError struct {
+	Line int
+	Col  int
+	Msg  string
+}
+
+func (e *IncompleteError) Error() string {
+	return fmt.Sprintf("INCOMPLETE at %d:%d: %s", e.Line, e.Col, e.Msg)
+}
+
+func IsIncomplete(err error) bool {
+	_, ok := err.(*IncompleteError)
+	return ok
+}
+
 // Lexer scans a MindScript source string into tokens.
 type Lexer struct {
 	src              string
@@ -141,6 +159,9 @@ type Lexer struct {
 	// precise token start position
 	tokStartLine int
 	tokStartCol  int
+
+	// interactive mode: produce IncompleteError for unterminated constructs at EOF
+	interactive bool
 }
 
 // NewLexer creates a new lexer for the given source.
@@ -149,6 +170,17 @@ func NewLexer(src string) *Lexer {
 		src:  src,
 		line: 1,
 		col:  0,
+	}
+}
+
+// NewLexerInteractive creates a lexer that reports IncompleteError on EOF for
+// unterminated strings and inline #( ... ) / ##( ... ) blocks.
+func NewLexerInteractive(src string) *Lexer {
+	return &Lexer{
+		src:         src,
+		line:        1,
+		col:         0,
+		interactive: true,
 	}
 }
 
@@ -274,6 +306,10 @@ func (l *Lexer) err(msg string) error {
 	return &LexError{Line: l.line, Col: l.col, Msg: msg}
 }
 
+func (l *Lexer) errIncomplete(msg string) error {
+	return &IncompleteError{Line: l.line, Col: l.col, Msg: msg}
+}
+
 // ----- scanners -----
 
 // scanString parses a JSON-style string literal (single or double quotes).
@@ -293,6 +329,9 @@ func (l *Lexer) scanString() (string, error) {
 		}
 		if ch == '\\' {
 			if l.isAtEnd() {
+				if l.interactive {
+					return "", l.errIncomplete("unfinished escape sequence")
+				}
 				return "", l.err("unfinished escape sequence")
 			}
 			esc, _ := l.advance()
@@ -321,6 +360,9 @@ func (l *Lexer) scanString() (string, error) {
 				for i := 0; i < 4; i++ {
 					b, ok := l.peek()
 					if !ok || !isHex(b) {
+						if l.interactive {
+							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
+						}
 						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
 					}
 					hex += string(b)
@@ -344,6 +386,9 @@ func (l *Lexer) scanString() (string, error) {
 							for i := 0; i < 4; i++ {
 								b, ok := l.peek()
 								if !ok || !isHex(b) {
+									if l.interactive {
+										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
+									}
 									return "", l.err("unicode surrogate pair low was not terminated")
 								}
 								hex2 += string(b)
@@ -385,6 +430,9 @@ func (l *Lexer) scanString() (string, error) {
 		out = append(out, r)
 		l.cur += size
 		l.col += size - 1
+	}
+	if l.interactive {
+		return "", l.errIncomplete("string was not terminated")
 	}
 	return "", l.err("string was not terminated")
 }
@@ -595,6 +643,9 @@ func (l *Lexer) scanInlineParens() (string, error) {
 	for {
 		b, ok := l.peek()
 		if !ok {
+			if l.interactive {
+				return "", l.errIncomplete("inline block was not terminated with ')'")
+			}
 			return "", l.err("inline block was not terminated with ')'")
 		}
 		if b == ')' {

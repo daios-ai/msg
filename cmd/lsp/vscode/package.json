@@ -1,0 +1,43 @@
+{
+  "name": "mindscript-vscode",
+  "displayName": "MindScript",
+  "description": "MindScript language support (LSP client)",
+  "version": "0.0.1",
+  "publisher": "yourname",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:mindscript"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      { "id": "mindscript", "aliases": ["MindScript", "mindscript"], "extensions": [".ms"] }
+    ],
+    "commands": [
+      { "command": "mindscript.startServer", "title": "MindScript: Start Server" }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "MindScript",
+      "properties": {
+        "mindscript.serverPath": {
+          "type": "string",
+          "description": "Path to the MindScript LSP server binary (e.g. ./cmd/lsp built output).",
+          "default": "mindscript-lsp"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.4.0",
+    "vscode": "^1.1.37"
+  }
+}

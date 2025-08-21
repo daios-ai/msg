@@ -279,7 +279,7 @@ func Test_Interpreter_TopLevel_Return_Exits_Program(t *testing.T) {
 
 func Test_Interpreter_TopLevel_Break_Exits_Program(t *testing.T) {
 	v := evalSrc(t, `break(7)`)
-	wantInt(t, v, 7)
+	wantAnnotatedNullContains(t, v, "break")
 }
 
 func Test_Interpreter_TopLevel_Continue_Returns_AnnotatedNull(t *testing.T) {
@@ -762,19 +762,6 @@ range(5, 8)  ## return the iterator
 	wantRet := S{"unop", "?", S{"id", "Int"}}
 	if !ip.IsSubtype(callable.ReturnType(), wantRet, nil) || !ip.IsSubtype(wantRet, callable.ReturnType(), nil) {
 		t.Fatalf("return type: want Int?, got %v", callable.ReturnType())
-	}
-}
-
-// ------------------------------------------------------------
-// Control keywords & spacing
-// ------------------------------------------------------------
-
-func Test_Interpreter_Control_Keywords_RequireNoSpaceBeforeParen(t *testing.T) {
-	// The parser requires CLROUND immediately after control keywords.
-	ip := NewInterpreter()
-	_, err := ip.EvalSource("return (1)")
-	if err == nil {
-		t.Fatalf("expected parse error from space before '(' after 'return'")
 	}
 }
 

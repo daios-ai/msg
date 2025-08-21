@@ -227,7 +227,7 @@ func (ip *Interpreter) EvalSource(src string) (Value, error) {
 	return ip.Eval(ast)
 }
 func (ip *Interpreter) Eval(root S) (Value, error) {
-	return ip.runTop(root, NewEnv(ip.Global), true, false)
+	return ip.runTop(root, NewEnv(ip.Global), false)
 }
 
 func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
@@ -238,14 +238,15 @@ func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
 	return ip.EvalPersistent(ast)
 }
 func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
-	return ip.runTop(root, ip.Global, true, false)
+	return ip.runTop(root, ip.Global, false)
 }
 
 func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
-	return ip.runTop(ast, env, false, false)
+	return ip.runTop(ast, env, false)
 }
 func (ip *Interpreter) EvalASTUncaught(ast S, env *Env, topBlockToSameEnv bool) Value {
-	v, _ := ip.runTop(ast, env, topBlockToSameEnv, true)
+	// 'topBlockToSameEnv' kept for API compatibility; no longer used.
+	v, _ := ip.runTop(ast, env, true)
 	return v
 }
 
@@ -331,7 +332,7 @@ func (c *callCtx) Env() *Env { return c.scope }
 // Unified VM entry/exit plumbing
 // -----------------------------------------------------------------------------
 
-func (ip *Interpreter) runTop(ast S, env *Env, topBlockToSameEnv bool, uncaught bool) (out Value, err error) {
+func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err error) {
 	if !uncaught {
 		defer func() {
 			if r := recover(); r != nil {
@@ -353,13 +354,13 @@ func (ip *Interpreter) runTop(ast S, env *Env, topBlockToSameEnv bool, uncaught 
 		}()
 	}
 
-	ch := ip.jitTop(ast, topBlockToSameEnv)
+	ch := ip.jitTop(ast)
 	res := ip.runChunk(ch, env, 0)
 	switch res.status {
 	case vmOK, vmReturn:
 		return res.value, nil
 	case vmBreak:
-		return res.value, nil
+		return errNull("break outside of loop"), nil
 	case vmContinue:
 		return errNull("continue outside of loop"), nil
 	case vmRuntimeError:
@@ -370,21 +371,20 @@ func (ip *Interpreter) runTop(ast S, env *Env, topBlockToSameEnv bool, uncaught 
 }
 
 // Build a one-off top-level function: optionally execute ("block", …) directly in env.
-func (ip *Interpreter) jitTop(ast S, topBlockToSameEnv bool) *Chunk {
+func (ip *Interpreter) jitTop(ast S) *Chunk {
 	f := &Fun{
 		ReturnType: S{"id", "Any"},
 		Body:       ast,
 	}
-	ip.ensureChunk(f, topBlockToSameEnv)
+	ip.ensureChunk(f)
 	return f.Chunk
 }
 
-func (ip *Interpreter) ensureChunk(f *Fun, topBlockToSameEnv bool) {
+func (ip *Interpreter) ensureChunk(f *Fun) {
 	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
 		return
 	}
 	em := newEmitter(ip)
-	em.topBlockToSameEnv = topBlockToSameEnv
 	em.emitFunBody(f.Body)
 	f.Chunk = em.chunk()
 }
@@ -509,7 +509,7 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 	}
 
 	// User-defined function
-	ip.ensureChunk(f, false)
+	ip.ensureChunk(f)
 	res := ip.runChunk(f.Chunk, f.Env, 0)
 	switch res.status {
 	case vmOK, vmReturn:
@@ -1151,11 +1151,10 @@ func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 // -----------------------------------------------------------------------------
 
 type emitter struct {
-	ip                *Interpreter
-	code              []uint32
-	consts            []Value
-	topBlockToSameEnv bool
-	loopStack         []loopLbls
+	ip        *Interpreter
+	code      []uint32
+	consts    []Value
+	loopStack []loopLbls
 }
 
 type loopLbls struct {

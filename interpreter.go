@@ -459,8 +459,12 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		})
 	}
 
-	// Last arg supplied → execute (preserve the original function's annotation).
+	// Last arg supplied → execute.
+	// Preserve ParamTypes metadata so oracles can still see the declared input type.
 	execFun := &Fun{
+		// Fully saturated: no remaining parameters, but keep ParamTypes for metadata.
+		Params:     nil,
+		ParamTypes: append([]S(nil), f.ParamTypes...),
 		ReturnType: f.ReturnType,
 		Body:       f.Body,
 		Env:        callEnv,

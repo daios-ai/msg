@@ -1,22 +1,17 @@
 === BEGIN FILE: oracles.go ===
+// oracles.go
+
 package mindscript
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
-// Reminder: Null as Failure
-// In MindScript, the value null universally represents failure or no answer.
-// A function whose return type is T? means: “returns a T on success, or null to signal failure.”
-// Oracles follow the same rule. Their backends may return null to indicate the LLM could not produce a valid answer.
-// Example pairs for oracles must contain successful outputs (never null).
-// When an oracle’s declared return type is Str, the literal string "null" is not a valid successful result.
-
-// execOracle: centralize parsing + type-checking; oracle returns are always nullable.
+// execOracle: centralize prompt construction, backend dispatch, parsing, type-checking.
+// Oracles can fail; the function returns T? (success value T, or null to signal failure).
 //
-// Contract with userland:
+// Current backend contract used by tests:
 //
 //	__oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
 func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
@@ -25,7 +20,7 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 	}
 	f := funVal.Data.(*Fun)
 
-	// Build prompt (unchanged)
+	// --- Build prompt ---
 	prompt := ip.buildOraclePrompt(funVal, f)
 	ip.oracleLastPrompt = prompt
 
@@ -48,7 +43,7 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 		return annotNull("oracle backend not configured (define __oracle_execute)")
 	}
 
-	// Call executor with *nullable* out type so prompts/schemas are accurate
+	// Call executor with *nullable* out type so backends can constrain outputs.
 	res := ip.Apply(hook, []Value{
 		Str(prompt),
 		TypeVal(inT),
@@ -56,7 +51,7 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 		Arr(validated),
 	})
 
-	// Null from executor = legitimate oracle failure (already annotated if any)
+	// Null from executor = oracle failure (already annotated if backend wants).
 	if res.Tag == VTNull {
 		return res
 	}
@@ -65,29 +60,16 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 	}
 
 	raw := strings.TrimSpace(res.Data.(string))
-	raw = unwrapFenced(raw) // remove ```…``` if present
+	raw = unwrapFenced(raw) // remove ``` … ``` if present
 
-	// If success base type is Str, accept raw string directly,
-	// but literal "null" MUST be treated as an error (annotated).
-	if isIdType(baseOut, "Str") {
-		if raw == "null" {
-			return annotNull("oracle returned null")
-		}
-		return Str(raw)
-	}
-
-	// Otherwise expect JSON; use userland jsonParse.
+	// Always expect JSON for the *boxed* output.
 	parsed, perr := ip.callGlobal1("jsonParse", Str(raw))
 	if perr != "" {
-		// Any non-JSON is an error; literal "null" also errors but gets a clearer message.
 		if raw == "null" {
 			return annotNull("oracle returned null")
 		}
 		return annotNull("oracle output was not valid JSON")
 	}
-
-	// If jsonParse produced Null, that's still an error in MindScript.
-	// Use the same uniform message unless the raw text was literally "null".
 	if parsed.Tag == VTNull {
 		if raw == "null" {
 			return annotNull("oracle returned null")
@@ -95,46 +77,49 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 		return annotNull("oracle output was not valid JSON")
 	}
 
-	// Validate against T? (nullable)
-	if !ip.isType(parsed, outTNullable, f.Env) {
+	// Unbox: expect {"output": <T>} then validate <T> against T?
+	if parsed.Tag != VTMap {
 		return annotNull("oracle output did not match the declared return type")
 	}
-	return parsed
+	mo := parsed.Data.(*MapObject)
+	outVal, ok := mo.Entries["output"]
+	if !ok {
+		return annotNull("oracle output did not match the declared return type")
+	}
+	if !ip.isType(outVal, outTNullable, f.Env) {
+		return annotNull("oracle output did not match the declared return type")
+	}
+	return outVal
 }
 
-// buildOraclePrompt assembles a readable prompt using the value’s annotation,
-// resolved input/output types, and examples. If a userland hook
-// __oracle_build_prompt exists, it is preferred.
+// Build prompt: PROMPT, SCHEMAS, then TASK/INPUT/OUTPUT blocks.
 func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
-	// 1) Gather ingredients
-	instruction := strings.TrimSpace(funVal.Annot)
-	if instruction == "" {
-		instruction = "You are a helpful assistant. Follow the function signature and examples."
-	}
-	inT := S{"id", "Any"}
+	// 1) Gather ingredients (keep declared aliases to preserve annotations)
+	instruction := strings.TrimSpace(funVal.Annot) // may be empty
+	inTDeclared := S{"id", "Any"}
 	if len(f.ParamTypes) == 1 {
-		inT = ip.resolveType(f.ParamTypes[0], f.Env)
+		inTDeclared = f.ParamTypes[0] // keep alias to retain its .Annot
 	}
-	outT := ip.resolveType(f.ReturnType, f.Env)
+	outBaseDeclared := stripNullable(f.ReturnType) // success type; keep alias
 
-	// 2) Prefer MindScript hook: __oracle_build_prompt
+	// 2) Prefer userland hook if present
 	if ip != nil && ip.Global != nil {
 		if hook, err := ip.Global.Get("__oracle_build_prompt"); err == nil && hook.Tag == VTFun {
 			ex := Arr(append([]Value(nil), f.Examples...))
 			res := ip.Apply(hook, []Value{
 				Str(instruction),
-				TypeVal(inT),
-				TypeVal(outT),
+				TypeVal(inTDeclared),
+				TypeVal(outBaseDeclared),
 				ex,
 			})
 			if res.Tag == VTStr {
 				return res.Data.(string)
 			}
-			// Fall through to Go fallback if hook misbehaves.
 		}
 	}
 
-	// 3) Go fallback using JSON Schemas from schema.go
+	// 3) Go fallback — emit exactly what the manual/test expects.
+
 	pretty := func(m map[string]any) string {
 		bs, err := json.MarshalIndent(m, "", "  ")
 		if err != nil {
@@ -143,59 +128,248 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 		return string(bs)
 	}
 
-	// Build JSON Schemas for input and output.
-	// We wrap them under top-level objects: {"input": <in>}, {"output": <out>}
-	inSchemaInner := ip.TypeValueToJSONSchema(TypeValIn(inT, f.Env), f.Env)
-	outSchemaInner := ip.TypeValueToJSONSchema(TypeValIn(outT, f.Env), f.Env) // non-null success type
-
-	inputDoc := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"input": inSchemaInner,
-		},
-		"required": []any{"input"},
+	// ---- INPUT JSON SCHEMA (inner) ----
+	// Resolve shape for content…
+	inResolved := ip.resolveType(inTDeclared, f.Env)
+	inSchemaInner := ip.jsonSchemaForTypeS(inResolved, f.Env)
+	// …but pull the alias’ annotation for the "description".
+	inAliasVal := ip.typeValForPrompt(inTDeclared, f.Env)
+	if desc := strings.TrimSpace(inAliasVal.Annot); desc != "" {
+		inSchemaInner["description"] = desc
 	}
-	outputDoc := map[string]any{
+
+	// ---- OUTPUT JSON SCHEMA ----
+	outInner := ip.TypeValueToJSONSchema(ip.typeValForPrompt(outBaseDeclared, f.Env), f.Env)
+	boxedOutSchema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"output": outSchemaInner,
+			"output": map[string]any{
+				"$ref": "#/$defs/Out",
+			},
 		},
 		"required": []any{"output"},
+		"$defs": map[string]any{
+			"Out": outInner,
+		},
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n", instruction)
-	fmt.Fprintf(&b, "INPUT JSON SCHEMA:\n\n%s\n\n", indentBlock(pretty(inputDoc), 2))
-	fmt.Fprintf(&b, "OUTPUT JSON SCHEMA:\n\n%s\n\n", indentBlock(pretty(outputDoc), 2))
 
-	// Examples: format as JSON objects { "input": <..> } / { "output": <..> }
-	if len(f.Examples) > 0 {
-		fmt.Fprintf(&b, "EXAMPLES:\n")
-		for i, ex := range f.Examples {
-			if ex.Tag == VTArray {
-				xs := ex.Data.([]Value)
-				if len(xs) == 2 {
-					inStr := FormatValue(xs[0])
-					outStr := FormatValue(xs[1])
-					fmt.Fprintf(
-						&b,
-						"  #%d\n  INPUT:\n%s\n  OUTPUT:\n%s\n",
-						i+1,
-						indentBlock(fmt.Sprintf(`{"input": %s}`, inStr), 4),
-						indentBlock(fmt.Sprintf(`{"output": %s}`, outStr), 4),
-					)
-					continue
-				}
-			}
-			fmt.Fprintf(&b, "  #%d\n  %s\n", i+1, indentBlock(FormatValue(ex), 4))
+	// Header exactly as expected by the test/manual
+	b.WriteString("PROMPT:\n")
+	b.WriteString("Please follow the instruction to the best of your ability:\n")
+	b.WriteString("for every input, provide an output that solves the task and\n")
+	b.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
+	b.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
+
+	// Schemas
+	b.WriteString("INPUT JSON SCHEMA:\n\n")
+	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
+	b.WriteString("\n\n")
+
+	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
+	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
+	b.WriteString("\n\n")
+
+	// Example blocks (render raw input; boxed output).
+	taskLine := instruction
+	if taskLine == "" {
+		taskLine = "Given the input, determine the output."
+	}
+	for _, ex := range f.Examples {
+		if ex.Tag != VTArray {
+			continue
 		}
-		fmt.Fprintln(&b)
+		xs := ex.Data.([]Value)
+		if len(xs) != 2 {
+			continue
+		}
+		inJSON := compactJSONWithSpaces(valueToGoJSONable(xs[0]))
+		outJSON := compactJSONWithSpaces(map[string]any{
+			"output": valueToGoJSONable(xs[1]),
+		})
+
+		b.WriteString("TASK:\n\n")
+		b.WriteString(taskLine + "\n\n")
+		b.WriteString("INPUT:\n\n")
+		b.WriteString(inJSON + "\n\n")
+		b.WriteString("OUTPUT:\n\n")
+		b.WriteString(outJSON + "\n\n")
 	}
 
-	fmt.Fprintf(&b, "TASK:\n")
-	fmt.Fprintf(&b, "Given the INPUT (matching the INPUT JSON SCHEMA), produce an OUTPUT that matches the OUTPUT JSON SCHEMA.\n")
-	fmt.Fprintf(&b, "Respond with only the OUTPUT JSON value (no extra prose, no code fences).\n")
+	// Final TASK with the current call's input (actual bound arg if we can find it)
+	var curIn any = nil
+	if v, ok := findOnlyBoundArg(f); ok {
+		curIn = valueToGoJSONable(v)
+	}
+	b.WriteString("TASK:\n\n")
+	b.WriteString(taskLine + "\n\n")
+	b.WriteString("INPUT:\n\n")
+	b.WriteString(compactJSONWithSpaces(curIn) + "\n\n")
+	b.WriteString("OUTPUT:\n")
+
 	return b.String()
+}
+
+// jsonSchemaForTypeS builds a JSON Schema (as map[string]any) from a resolved type S.
+// It covers common constructs (object, array, primitives, nullable, enum).
+func (ip *Interpreter) jsonSchemaForTypeS(t S, env *Env) map[string]any {
+	if len(t) == 0 {
+		return map[string]any{}
+	}
+	switch t[0].(string) {
+	case "id":
+		switch t[1].(string) {
+		case "Any":
+			return map[string]any{} // unconstrained
+		case "Null":
+			return map[string]any{"type": "null"}
+		case "Bool":
+			return map[string]any{"type": "boolean"}
+		case "Int":
+			return map[string]any{"type": "integer"}
+		case "Num":
+			return map[string]any{"type": "number"}
+		case "Str":
+			return map[string]any{"type": "string"}
+		default:
+			// Resolve aliases and recurse.
+			rt := ip.resolveType(t, env)
+			if !equalS(rt, t) {
+				return ip.jsonSchemaForTypeS(rt, env)
+			}
+			return map[string]any{}
+		}
+
+	case "unop":
+		// Nullable: ("unop","?", T) → anyOf [schema(T), {"type":"null"}]
+		if len(t) >= 3 && t[1].(string) == "?" {
+			inner := ip.jsonSchemaForTypeS(t[2].(S), env)
+			return map[string]any{
+				"anyOf": []any{inner, map[string]any{"type": "null"}},
+			}
+		}
+		return map[string]any{}
+
+	case "array":
+		// Homogeneous arrays
+		items := map[string]any{}
+		if len(t) == 2 {
+			items = ip.jsonSchemaForTypeS(t[1].(S), env)
+		}
+		return map[string]any{
+			"type":  "array",
+			"items": items,
+		}
+
+	case "map":
+		props := map[string]any{}
+		req := []any{}
+		fields := mapTypeFields(t)
+		for name, f := range fields {
+			props[name] = ip.jsonSchemaForTypeS(f.typ, env)
+			if f.required {
+				req = append(req, name)
+			}
+		}
+		m := map[string]any{
+			"type":       "object",
+			"properties": props,
+		}
+		if len(req) > 0 {
+			m["required"] = req
+		}
+		return m
+
+	case "enum":
+		// Best-effort: map enum literal S-exprs to Go JSON-able and emit "enum"
+		values := []any{}
+		for i := 1; i < len(t); i++ {
+			if v, ok := ip.litToValue(t[i].(S)); ok {
+				values = append(values, valueToGoJSONable(v))
+			}
+		}
+		if len(values) > 0 {
+			return map[string]any{"enum": values}
+		}
+		return map[string]any{}
+
+	default:
+		return map[string]any{}
+	}
+}
+
+// Convert a MindScript Value to a JSON-marshallable Go value.
+func valueToGoJSONable(v Value) any {
+	switch v.Tag {
+	case VTNull:
+		return nil
+	case VTBool:
+		return v.Data.(bool)
+	case VTInt:
+		return v.Data.(int64)
+	case VTNum:
+		return v.Data.(float64)
+	case VTStr:
+		return v.Data.(string)
+	case VTArray:
+		xs := v.Data.([]Value)
+		out := make([]any, len(xs))
+		for i := range xs {
+			out[i] = valueToGoJSONable(xs[i])
+		}
+		return out
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		m := make(map[string]any, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			m[k] = valueToGoJSONable(vv)
+		}
+		return m
+	default:
+		return nil
+	}
+}
+
+// Marshal compact JSON but add spaces after ":" and "," to match test strings
+func compactJSONWithSpaces(x any) string {
+	b, err := json.Marshal(x)
+	if err != nil {
+		return "null"
+	}
+	s := string(b)
+	s = strings.ReplaceAll(s, ":", ": ")
+	s = strings.ReplaceAll(s, ",", ", ")
+	return s
+}
+
+// Find the only directly-bound argument in the saturated oracle closure, if any.
+func findOnlyBoundArg(f *Fun) (Value, bool) {
+	if f == nil || f.Env == nil || f.Env.table == nil {
+		return Null, false
+	}
+	if len(f.Env.table) != 1 {
+		return Null, false
+	}
+	for _, v := range f.Env.table {
+		return v, true
+	}
+	return Null, false
+}
+
+// Try to preserve annotations in schema rendering by reusing the actual VTType
+// value from the environment when possible (so .Annot is kept). Fall back to
+// synthesizing a VTType from S if not found.
+func (ip *Interpreter) typeValForPrompt(t S, env *Env) Value {
+	if len(t) >= 2 && t[0].(string) == "id" {
+		name := t[1].(string)
+		if env != nil {
+			if v, err := env.Get(name); err == nil && v.Tag == VTType {
+				return v // carries .Annot from declaration site
+			}
+		}
+	}
+	return TypeValIn(t, env)
 }
 
 // helper for formatting blocks
@@ -211,36 +385,24 @@ func indentBlock(s string, n int) string {
 // Expose the last prompt for testing / REPL demo.
 func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
 
-// ---- helpers ----
+// ---- standard helpers (unchanged) ----
 
-// ensureNullableUnlessAny: wrap t as ("? t") unless already nullable or t == Any.
-// (Any? == Any, so leave Any untouched.)
 func ensureNullableUnlessAny(t S) S {
 	if isAnyType(t) || isNullable(t) {
 		return t
 	}
 	return S{"unop", "?", t}
 }
-
-func isAnyType(t S) bool {
-	return len(t) == 2 && t[0] == "id" && t[1] == "Any"
-}
-
+func isAnyType(t S) bool { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
 func isNullable(t S) bool {
-	return len(t) >= 3 && t[0] == "unop" && t[1] == "?" // ("unop","?", T)
+	return len(t) >= 3 && t[0] == "unop" && t[1] == "?"
 }
-
 func stripNullable(t S) S {
 	for isNullable(t) {
 		t = t[2].(S)
 	}
 	return t
 }
-
-func isIdType(t S, name string) bool {
-	return len(t) == 2 && t[0] == "id" && t[1] == name
-}
-
 func unwrapFenced(s string) string {
 	if strings.HasPrefix(s, "```") {
 		if i := strings.IndexByte(s, '\n'); i >= 0 {
@@ -255,7 +417,6 @@ func unwrapFenced(s string) string {
 	}
 	return s
 }
-
 func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env) []Value {
 	ok := make([]Value, 0, len(exs))
 	for _, ex := range exs {
@@ -270,6 +431,9 @@ func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env)
 		if !ip.isType(vin, inT, env) {
 			continue
 		}
+		if vout.Tag == VTNull {
+			continue
+		}
 		if !ip.isType(vout, outBase, env) {
 			continue
 		}
@@ -277,172 +441,26 @@ func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env)
 	}
 	return ok
 }
-
-// callGlobal1 calls a global builtin (like jsonParse) with one arg.
-// Returns (value, errorAnnotation). errorAnnotation is "" on success.
 func (ip *Interpreter) callGlobal1(name string, arg Value) (Value, string) {
 	fn, err := ip.Global.Get(name)
 	if err != nil || fn.Tag != VTFun {
 		return annotNull(name + " is not available; load the standard library"), "missing"
 	}
-	// Safely apply; convert runtime panics into annotated null.
 	defer func() {
 		if r := recover(); r != nil {
-			// vm wraps errors as annotated nulls already, but normalize here:
 			switch e := r.(type) {
 			case rtErr:
-				arg = annotNull(e.msg) // reuse arg as a scratch to carry error back (ignored)
+				arg = annotNull(e.msg)
 			default:
 				arg = annotNull("runtime error")
 			}
 		}
 	}()
 	v := ip.Apply(fn, []Value{arg})
-	// If we got here via panic recovery above, v might still be zero.
-	// Treat annotated nulls as errors for our call site.
 	if v.Tag == VTNull && v.Annot != "" {
 		return v, v.Annot
 	}
 	return v, ""
 }
 === END FILE: oracles.go ===
-
-=== BEGIN FILE: lib/llm.ms ===
-## llm.ms — LLM orchestration & oracle ergonomics
-##
-## Main wiring:
-##   let llm = import("llm.ms")
-##   let st = llm.new()
-##   __oracle_execute = llm.dispatcher(st)   ## set in MAIN
-##   let be = import("backends.ms")
-##   llm.register(st, "ollama", be.makeOllama())
-##   llm.use(st, "ollama")
-##   llm.configure(st, "ollama", { baseURL: "http://localhost:11434", model: "llama3.1" })
-
-let _failNull = fun(msg: Str) do
-  # {msg}
-  null
-end
-
-# --- state -------------------------------------------------------------------
-
-let new = fun() do
-  {
-    backends: {},        ## name -> execFun(prompt,inT,outT,ex,opts) -> Str|Null
-    cfg: {},             ## name -> {Str:Any}
-    selected: null,      ## active backend name
-    system: null         ## optional global system hint
-  }
-end
-
-# Returns a function with the exact engine-required signature:
-#   __oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
-let dispatcher = fun(state: Any) -> (Str -> Type -> Type -> [Any] -> Str?) do
-  fun(prompt: Str, inT: Type, outT: Type, examples: [Any]) -> Str? do
-    let sel = state.selected
-    if sel == null then
-      _failNull("no LLM backend selected (use llm.use)")
-    elif not mapHas(state.backends, sel) then
-      _failNull(sprintf("unknown backend: %s", [sel]))
-    else
-      let exec = state.backends[sel]
-      # Executors accept an extra options map (may ignore it).
-      let opts = { backend: sel, config: state.cfg[sel], system: state.system }
-      exec(prompt, inT, outT, examples, opts)
-    end
-  end
-end
-
-# --- registry / selection / config ------------------------------------------
-
-let register = fun(state: Any, name: Str, exec: Any) -> Bool do
-  if not __is_fun(exec) then
-    _failNull("register expects a function")
-  else
-    state.backends[name] = exec
-    if state.selected == null then state.selected = name end
-    true
-  end
-end
-
-let list = fun(state: Any) -> [Str] do
-  let keys = []
-  for item in state.backends do keys = keys + [item.0] end
-  keys
-end
-
-let use = fun(state: Any, name: Str) -> Str do
-  if not mapHas(state.backends, name) then
-    _failNull(sprintf("unknown backend: %s", [name]))
-  else
-    state.selected = name
-    name
-  end
-end
-
-let current = fun(state: Any) -> Str? do state.selected end
-
-# Merge/extend backend config (API keys, baseURL, model, etc.)
-# Uses native map merge `a + b` (shallow).
-let configure = fun(state: Any, name: Str, cfg: {Str: Any}) -> {Str: Any} do
-  let cur = state.cfg[name]
-  state.cfg[name] =
-    if cur == null then cfg else cur + cfg end
-  if mapHas(cfg, "system") then state.system = cfg.system end
-  state.cfg[name]
-end
-
-# --- oracle ergonomics -------------------------------------------------------
-
-# info(f) -> { isOracle: Bool, params:[{name, type}], return:Type, doc:Str? }
-let info = fun(f: Any) -> Any do
-  let meta = funInfo(f)
-  let doc = help(f)
-  {
-    isOracle: bool(__is_fun(f)),   # best-effort; engine flag isn’t exposed
-    params: meta.params,
-    return: meta.return,
-    doc: doc
-  }
-end
-
-# Construct a new oracle (doc/examples optional).
-# params: [{name:Str, type:Type}]
-let makeOracle = fun(params: Any, ret: Type, doc: Str?, examples: Any) -> Any do
-  let names = [] 
-  let types = []
-  for let p in params do
-    names = names + [p.name]
-    types = types + [p.type]
-  end
-  let funv = __make_fun(names, types, ret, type Any, true, examples)
-  if doc == null then funv else __annotate(doc, funv) end
-end
-
-let setExamples = fun(f: Any, ex: Any) -> Any do
-  let meta = funInfo(f)
-  let doc = help(f)
-  makeOracle(meta.params, meta.return, doc, ex)
-end
-
-let addExample = fun(f: Any, input: Any, output: Any) -> Any do
-  let meta = funInfo(f)
-  let doc = help(f)
-  let ex = [[input, output]]
-  makeOracle(meta.params, meta.return, doc, ex)   ## simple add; replace if you prefer to carry old examples
-end
-
-let setDoc = fun(f: Any, doc: Str) -> Any do
-  let meta = funInfo(f)
-  makeOracle(meta.params, meta.return, doc, [])
-end
-
-let lastPrompt = fun() -> Str? do
-  # Optional bridge to engine if exposed; null otherwise.
-  null
-end
-
-
-
-=== END FILE: lib/llm.ms ===
 

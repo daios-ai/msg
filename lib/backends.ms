@@ -5,18 +5,23 @@
 ##
 ## The llm.dispatcher adapts it to the engine-required (__oracle_execute) signature.
 
-# --- shared helpers ----------------------------------------------------------
+## --- shared helpers ----------------------------------------------------------
 
+# Produce an annotated null (so the REPL shows the message above "null").
+# msg:Str -> Null
 let _failNull = fun(msg: Str) do
   # {msg}
   null
 end
 
+# JSON stringify helper.
+# x:Any -> Str
 let _json = fun(x: Any) -> Str do
   jsonStringify(x)
 end
 
 # Convert Types to JSON Schema objects (maps), falling back to {} on error.
+# (inT:Type, outT:Type) -> {in:Any, out:Any}
 let _schemas = fun(inT: Type, outT: Type) -> Any do
   {
     in:  typeToJSONSchema(inT),
@@ -24,7 +29,8 @@ let _schemas = fun(inT: Type, outT: Type) -> Any do
   }
 end
 
-# HTTP helper
+# HTTP helper that returns the raw response map on 2xx, annotated-null otherwise.
+# (url, method, headers, bodyObj) -> Any?
 let _httpJSON = fun(url: Str, method: Str, headers: {Str: Str}, bodyObj: Any) -> Any do
   let req = {
     url: url,
@@ -40,7 +46,10 @@ let _httpJSON = fun(url: Str, method: Str, headers: {Str: Str}, bodyObj: Any) ->
   end
 end
 
-# Heuristic content extractors (provider response → raw text)
+## Heuristic content extractors (provider response → raw text)
+
+# OpenAI responses API / chat
+# obj:{} -> Str?
 let _extractOpenAI = fun(obj: Any) -> Str? do
   # Try new "responses" API: { output_text: "..." }
   if mapHas(obj, "output_text") then
@@ -65,6 +74,8 @@ let _extractOpenAI = fun(obj: Any) -> Str? do
   end
 end
 
+# Anthropic messages
+# obj:{} -> Str?
 let _extractAnthropic = fun(obj: Any) -> Str? do
   # { content: [{type:"text", text:"..."}] }
   if mapHas(obj, "content") and size(obj.content) >= 1 then
@@ -75,13 +86,17 @@ let _extractAnthropic = fun(obj: Any) -> Str? do
   end
 end
 
+# Ollama /generate
+# obj:{} -> Str?
 let _extractOllama = fun(obj: Any) -> Str? do
   # { response: "..." } for /generate
   if mapHas(obj, "response") then obj.response else null end
 end
 
-# --- OpenAI ------------------------------------------------------------------
+## --- OpenAI ------------------------------------------------------------------
 
+# Create an OpenAI executor (Responses API if possible).
+# _:Null -> (prompt,inT,outT,examples,opts) -> Str?
 let makeOpenAI = fun() -> Any do
   fun(prompt: Str, inT: Type, outT: Type, examples: [Any], opts: Any) -> Str? do
     let cfg = opts.config
@@ -103,7 +118,6 @@ let makeOpenAI = fun() -> Any do
 
       let response_format =
         if jsonMode then
-          # Best effort: ask for strict JSON by passing the output schema
           { "type": "json_schema", "json_schema": { "name": "mindscript_output", "schema": schemas.out } }
         else
           null
@@ -130,8 +144,10 @@ let makeOpenAI = fun() -> Any do
   end
 end
 
-# --- Anthropic ---------------------------------------------------------------
+## --- Anthropic ---------------------------------------------------------------
 
+# Create an Anthropic executor (messages API).
+# _:Null -> (prompt,inT,outT,examples,opts) -> Str?
 let makeAnthropic = fun() -> Any do
   fun(prompt: Str, inT: Type, outT: Type, examples: [Any], opts: Any) -> Str? do
     let cfg = opts.config
@@ -147,7 +163,7 @@ let makeAnthropic = fun() -> Any do
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
       }
-      # Anthropic doesn't take JSON Schema directly; strongly instruct + we can include schema in the system or user content.
+      # Anthropic doesn't take JSON Schema directly; embed schema strongly in the prompt.
       let body = {
         "model": model,
         "max_tokens": cfg.max_tokens or 2048,
@@ -167,8 +183,10 @@ let makeAnthropic = fun() -> Any do
   end
 end
 
-# --- Ollama ------------------------------------------------------------------
+## --- Ollama ------------------------------------------------------------------
 
+# Create an Ollama executor (local).
+# _:Null -> (prompt,inT,outT,examples,opts) -> Str?
 let makeOllama = fun() -> Any do
   fun(prompt: Str, inT: Type, outT: Type, examples: [Any], opts: Any) -> Str? do
     let cfg = opts.config or {}
@@ -201,3 +219,24 @@ let makeOllama = fun() -> Any do
   end
 end
 
+## --- Prompt debugger (no network) -------------------------------------------
+
+# A lightweight backend to **inspect the exact prompt** the engine built,
+# without calling any external LLM.
+#
+# Behavior:
+# • If the oracle's success type is Str (or nullable Str), returns the prompt string.
+# • Otherwise, returns an **annotated null** whose annotation contains the prompt
+#   (so the REPL prints the prompt above "null").
+#
+# _:Null -> (prompt,inT,outT,examples,opts) -> Str?
+let makePrompt = fun() -> Any do
+  fun(prompt: Str, _inT: Type, outT: Type, _examples: [Any], _opts: Any) -> Str? do
+    # Try to return raw prompt only when the schema expects Str (or Str?).
+    if isSubtype(type Str, outT) or isSubtype(type Str, __resolve_type(outT)) then
+      prompt
+    else
+      _failNull("DEBUG PROMPT:\n" + prompt)
+    end
+  end
+end

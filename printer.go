@@ -1,3 +1,82 @@
+// printer.go: pretty-printers for MindScript ASTs, types, and runtime values.
+//
+// What this file does
+// -------------------
+// This module provides the formatting layer for MindScript. It renders three
+// kinds of data to human-readable, stable strings:
+//
+//  1. Parsed source ASTs (S-expressions) → MindScript source code.
+//     - Entry points: Pretty(src), FormatSExpr(ast).
+//     - Produces whitespace- and newline-stable output with minimal
+//     parentheses, based on operator precedence. It understands all
+//     statement and expression tags emitted by the parser (e.g. "fun",
+//     "oracle", "for", "if/elif/else", "type", "block", "assign",
+//     "return/break/continue", arrays, maps, calls, indexing, properties,
+//     unary and binary operators).
+//     - Annotation nodes ("annot", ("str", text), <node>) become `# ...`
+//     line comments immediately above the printed construct.
+//     - Property names are emitted bare if they are identifier-like, otherwise
+//     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
+//     are rendered in a compact, readable form.
+//     - Formatting emits no space before '(' for calls and for 'fun(...)'
+//     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
+//
+//  2. Type ASTs (S-expressions) → compact type strings.
+//     - Entry point: FormatType(t).
+//     - Supported forms:
+//     • ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
+//     • ("unop","?", T)         → prints as `T?`
+//     • ("array", T)            → prints as `[T]`
+//     • ("map", ("pair"| "pair!", ("str",k), T) ...)
+//     Required fields print with a trailing `!` on the key.
+//     Key/value annotations (if wrapped in "annot") become `# ...` lines.
+//     • ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
+//     may be scalars, arrays, or maps.
+//     • ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
+//     right-associated chains.
+//     - Output is stable. Multi-line maps are rendered with sorted keys to
+//     avoid visual churn.
+//
+//  3. Runtime values (Value) → width-aware strings.
+//     - Entry point: FormatValue(v).
+//     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
+//     - Arrays and maps prefer a single-line rendering if it fits the
+//     `MaxInlineWidth` budget and no elements/keys force multi-line; else
+//     they fall back to pretty, multi-line output with indentation.
+//     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
+//     - Per-value annotations (Value.Annot) and per-key annotations in maps
+//     (MapObject.KeyAnn[name]) are printed as `# ...` header lines.
+//     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
+//     - Types (VTType) are printed by extracting the embedded type AST and
+//     delegating to FormatType.
+//     - Modules print as `<module: <pretty name>>` when available.
+//
+// Dependencies (other files)
+// --------------------------
+// • parser.go
+//   - S = []any (AST payload shape)
+//   - ParseSExpr(string) (used by Pretty)
+//   - AST tags: "block", "fun", "oracle", "for", "while", "if", "then", "elif",
+//     "else", "type", "return", "break", "continue", "assign", "array", "map",
+//     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
+//     "null", "unop", "binop", "decl", "darr", "dobj", "annot".
+//
+// • interpreter.go (runtime model)
+//   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
+//     VTFun, VTType, VTModule, VTHandle)
+//   - Fun, TypeValue, MapObject (Entries/KeyAnn/Keys).
+//
+// • modules.go (module loader)
+//   - Module struct and prettySpec(string) (used for VTModule display).
+//
+// • errors.go (shared errors)
+//   - WrapErrorWithSource(err, src) (used by Pretty).
+//
+// PUBLIC vs PRIVATE layout
+// ------------------------
+// This file is organized in two blocks:
+//  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
+//  2. PRIVATE: helper types and functions that implement the printers.
 package mindscript
 
 import (
@@ -8,11 +87,130 @@ import (
 	"unicode"
 )
 
-/* ---------- Public API ---------- */
+// ==============================
+// ========== PUBLIC ============
+// ==============================
+
+// MaxInlineWidth controls when arrays/maps are rendered on a single line
+// by FormatValue. If the one-line candidate exceeds this many characters,
+// or if any element/key is annotated or multiline by nature, the value is
+// rendered across multiple lines with indentation.
+//
+// This setting is read at call time and is safe to change between calls.
+var MaxInlineWidth = 80
+
+// Pretty parses a MindScript source string and returns a formatted version.
+//
+// Behavior:
+//   - Parses `src` via ParseSExpr (from parser.go). If parsing fails,
+//     the error is wrapped with source context via WrapErrorWithSource.
+//   - On success, it pretty-prints the resulting AST using FormatSExpr,
+//     producing stable, whitespace-normalized code.
+//   - Annotation nodes ("annot", ("str", text), X) print as `# text`
+//     lines directly above X.
+//   - Operators use minimal parentheses according to precedence/associativity:
+//   - "->" (lowest), "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
+//   - postfix call/index/get bind tightest; unary ("not", "-") binds tighter than
+//     binary arithmetic; assignment is the loosest among term operators.
+//   - Object/map keys are emitted unquoted if they match identifier syntax
+//     ([A-Za-z_][A-Za-z0-9_]*), else quoted with JSON-style escapes.
+//   - Destructuring declaration patterns ("decl"/"darr"/"dobj") and
+//     assignments print in a user-friendly layout.
+//
+// Errors:
+//   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
+func Pretty(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return "", WrapErrorWithSource(err, src)
+	}
+	return FormatSExpr(ast), nil
+}
+
+// FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
+//
+// Inputs:
+//   - n: an AST produced by parser.go (e.g., the result of ParseSExpr).
+//
+// Output policy:
+//   - Statements (fun/oracle/for/if/type/block/return/break/continue/assign)
+//     are rendered with keywords and indentation similar to Pretty.
+//   - Expressions are printed with minimal parentheses based on a fixed
+//     precedence table; property access vs calls/indexing binds tightly.
+//   - Arrays and maps are printed inline (AST form) without line-width heuristics;
+//     however, annotations on map keys are emitted as preceding `# ...` comment lines.
+//   - Annotation nodes wrap the printed construct with header comments.
+//
+// This function does not parse; it strictly formats the provided AST.
+func FormatSExpr(n S) string {
+	var b strings.Builder
+	p := pp{out: out{b: &b}}
+	p.printProgram(n)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// FormatType renders a type S-expression into a compact, human-readable string.
+//
+// Supported forms (see types.go for the type system):
+//   - ("id", name)              →  name
+//   - ("unop","?", T)           →  T?
+//   - ("array", T)              →  [T]
+//   - ("map", ("pair"| "pair!", ("str",k), T) ...)
+//   - Required fields print as `key!:`
+//   - Keys are quoted if not identifier-like
+//   - Key/value annotations (when wrapped in "annot") emit `# ...`
+//     lines above the field
+//   - ("enum", lit1, lit2, ...) →  Enum[lit1, lit2, ...] where literals may be
+//     scalars, arrays, or maps rendered in a type-literal form
+//   - ("binop","->", A, B)      →  (A) -> B ; right-assoc chains flatten
+//
+// Output is stable; when multi-line, map fields are sorted by key name for
+// readability and determinism.
+func FormatType(t S) string {
+	var b strings.Builder
+	o := out{b: &b}
+	writeType(&o, t)
+	return b.String()
+}
+
+// FormatValue renders a runtime Value into a stable, readable string.
+//
+// Layout policy:
+//   - Scalars: `null`, booleans, ints, floats (guaranteed to show a decimal
+//     point for non-scientific output), and quoted strings (with JSON-style escapes).
+//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line
+//     and total length ≤ MaxInlineWidth; otherwise multi-line with one element per
+//     line, indented, and with trailing commas omitted.
+//   - Maps (MapObject):
+//   - Keys are emitted in sorted order for stability.
+//   - Single-line `{ k1: v1, k2: v2 }` is used when feasible under the
+//     MaxInlineWidth budget and when no key carries a header annotation.
+//   - Multi-line maps indent each entry; key/value annotations are emitted
+//     as `# ...` lines immediately above the field.
+//   - Keys are quoted when not identifier-like.
+//   - Functions: printed as `<fun: name1:T1 -> name2:T2 -> R>`
+//   - Zero-arg closures display `_:Null` for the single implicit unit.
+//   - Types (VTType): the embedded type AST is pretty-printed via FormatType.
+//   - Modules: printed as `<module: pretty-name>` if available.
+//   - Value.Annot (header annotation): if non-empty, prints as leading `# ...`
+//     lines above the value.
+//
+// Width sensitivity is only applied to runtime arrays/maps (not AST/type forms),
+// and is controlled by MaxInlineWidth.
+func FormatValue(v Value) string {
+	var b strings.Builder
+	o := out{b: &b}
+	writeValue(&o, v)
+	return b.String()
+}
+
+//// END_OF_PUBLIC
+
+// ===============================
+// ========= PRIVATE =============
+// ===============================
 
 /* ---------- globals & tiny helpers ---------- */
-
-var MaxInlineWidth = 80 // width threshold for single-line arrays/maps
 
 func isIdent(s string) bool {
 	if s == "" {
@@ -96,23 +294,6 @@ func typeAst(data any) S {
 }
 
 /* ---------- source -> pretty (AST printer) ---------- */
-
-// Pretty parses MindScript source and returns a formatted version (no colors).
-func Pretty(src string) (string, error) {
-	ast, err := ParseSExpr(src)
-	if err != nil {
-		return "", WrapErrorWithSource(err, src)
-	}
-	return FormatSExpr(ast), nil
-}
-
-// FormatSExpr pretty-prints a parsed s-expr AST.
-func FormatSExpr(n S) string {
-	var b strings.Builder
-	p := pp{out: out{b: &b}}
-	p.printProgram(n)
-	return strings.TrimRight(b.String(), "\n")
-}
 
 type pp struct {
 	out out
@@ -680,15 +861,7 @@ func (p *pp) printPattern(n S) {
 	}
 }
 
-/* ---------- Type pretty-printer ---------- */
-
-// FormatType renders a type S-expr to a compact, readable string.
-func FormatType(t S) string {
-	var b strings.Builder
-	o := out{b: &b}
-	writeType(&o, t)
-	return b.String()
-}
+/* ---------- Type pretty-printer (private helpers) ---------- */
 
 func writeType(o *out, t S) {
 	tagOf := func(x S) string {
@@ -871,15 +1044,7 @@ func flattenArrow(t S) (params []S, ret S) {
 	}
 }
 
-/* ---------- Runtime value pretty-printer ---------- */
-
-// FormatValue returns a string for a runtime Value with width awareness.
-func FormatValue(v Value) string {
-	var b strings.Builder
-	o := out{b: &b}
-	writeValue(&o, v)
-	return b.String()
-}
+/* ---------- Runtime value pretty-printer (private helpers) ---------- */
 
 func mapOneLineMO(keys []string, mo *MapObject) string {
 	if len(keys) == 0 {

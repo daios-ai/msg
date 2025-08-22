@@ -1,5 +1,108 @@
-// oracles.go
-
+// oracles.go: Oracle execution & prompt building for MindScript
+//
+// What this file does
+// -------------------
+// MindScript “oracles” are functions whose implementation is delegated to an
+// external model (LLM or other backend). At runtime, calling an oracle builds
+// a prompt from four ingredients:
+//
+//  1. The oracle’s *instruction* (the function value’s .Annot text).
+//  2. The declared input type (parameter 0) and output success type
+//     (return type, made nullable operationally).
+//  3. Optional example pairs [input, output] for few-shot guidance.
+//  4. The current call’s concrete input.
+//
+// The prompt is then dispatched to a pluggable backend called
+// `__oracle_execute`. The backend returns either a raw string (model output)
+// or `null` to signal failure. The raw string is expected to be **valid JSON**
+// containing a single field:
+//
+//	{"output": <value>}
+//
+// The interpreter parses that JSON (via the standard library’s `jsonParse`),
+// validates `<value>` against the oracle’s **declared** return type (made
+// nullable at call-time), and returns the value or an annotated `null` to
+// signal a typed runtime failure.
+//
+// Public API (this file)
+// ----------------------
+//   - `(*Interpreter) LastOraclePrompt() string`
+//     Exposes the last prompt constructed for an oracle call. This is useful
+//     for testing and REPL exploration. It is *read-only* state.
+//
+// Internal responsibilities (private here)
+// ----------------------------------------
+//
+//   - `(*Interpreter) execOracle(...) Value`
+//     The oracle call engine used by the interpreter when executing an oracle
+//     function. It builds the prompt, calls `__oracle_execute`, parses and
+//     type-checks the result, and returns a nullable value (success or failure).
+//
+//   - `(*Interpreter) buildOraclePrompt(...) string`
+//     Constructs the portable prompt text. If a userland hook named
+//     `__oracle_build_prompt` is defined (a native MindScript function), it is
+//     given the opportunity to produce a custom prompt; otherwise a Go fallback
+//     prompt (documented below) is emitted. The fallback layout contains:
+//
+//     PROMPT:
+//     <generic guidance + instruction>
+//
+//     INPUT JSON SCHEMA:
+//     <pretty JSON Schema for the input type, using the alias annotation
+//     for "description" when available>
+//
+//     OUTPUT JSON SCHEMA:
+//     <pretty JSON Schema for an *object* with a required "output" field
+//     whose schema is the declared success type>
+//
+//     TASK / INPUT / OUTPUT blocks:
+//
+//   - One block per example, then one final block for the current input.
+//
+//   - Example OUTPUT blocks are the **boxed** object with the "output" key.
+//
+// - JSON Schema helpers for types & values used by the prompt builder.
+//
+// Dependencies on other files
+// ---------------------------
+// - interpreter.go
+//   - `Interpreter` type and fields (`Global`, `oracleLastPrompt`).
+//   - Value model: `Value`, `ValueTag`, constructors (e.g., `Str`, `Arr`),
+//     `Fun`, `Env`, and helper `annotNull`.
+//   - Engine hooks: `(*Interpreter) Apply` and `(*Interpreter) resolveType`,
+//     as well as type checks `isType`.
+//
+// - types.go
+//   - Type representation `S` (S-exprs) and helpers like `mapTypeFields`,
+//     `equalS`, and literal conversions `litToValue`.
+//
+// - schema.go
+//   - `(*Interpreter) TypeValueToJSONSchema(...)` to materialize JSON Schema
+//     for a (boxed) output type when building prompts.
+//
+// - std/lib.ms (MindScript native standard library):
+//   - A global function `jsonParse : Str -> Any` must be present for parsing
+//     raw model JSON. This is looked up from the global environment.
+//
+// - External hook contracts (MindScript space):
+//   - `__oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any])
+//     -> Str | Null`
+//     Backends must register this function. Returning `null` signals oracle
+//     failure; returning `Str` must be *raw JSON* without code fences.
+//   - Optional: `__oracle_build_prompt(instruction: Str, inType: Type,
+//     outType: Type, examples: [Any]) -> Str`
+//     If present, it can fully control the prompt string.
+//
+// Error & type semantics
+// ----------------------
+//   - Oracles are *operationally nullable*: if an oracle’s declared return type
+//     is `T`, the runtime treats it as `T?` (nullable) when validating results.
+//   - `null` results indicate failure; an *annotated* null carries a reason.
+//   - Output JSON must be an object with an `"output"` key whose value conforms
+//     to `T?` (after the runtime widens). Any mismatch yields an annotated null.
+//
+// NOTE: Only `LastOraclePrompt` is exported from this file. The rest is used
+// internally by the interpreter when an oracle function is called.
 package mindscript
 
 import (
@@ -7,10 +110,35 @@ import (
 	"strings"
 )
 
-// execOracle: centralize prompt construction, backend dispatch, parsing, type-checking.
-// Oracles can fail; the function returns T? (success value T, or null to signal failure).
+/* ===========================
+   PUBLIC
+   =========================== */
+
+// LastOraclePrompt returns the most recent prompt string that the interpreter
+// constructed for an oracle call during this process. This is intended for
+// testing, logging, and REPL inspection.
 //
-// Current backend contract used by tests:
+// Behavior
+//   - If no oracle has been executed yet, it returns the empty string.
+//   - Reading this value has no side effects and does not mutate any state.
+//
+// Notes
+//   - The prompt format depends on whether your program defines the optional
+//     `__oracle_build_prompt` hook. If present, that hook’s output becomes the
+//     recorded prompt; otherwise the built-in fallback format is recorded.
+//   - This function does not trigger any oracle execution by itself.
+func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
+
+//// END_OF_PUBLIC
+
+/* ===========================
+   PRIVATE
+   =========================== */
+
+// execOracle centralizes prompt construction, backend dispatch, parsing,
+// and type-checking. It returns a nullable value (success or failure).
+//
+// Current backend contract:
 //
 //	__oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
 func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
@@ -29,7 +157,7 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 		inT = ip.resolveType(f.ParamTypes[0], f.Env)
 	}
 	declOutT := ip.resolveType(f.ReturnType, f.Env) // declared success type T
-	// Oracle returns are *always* nullable: T?  (but Any? == Any → don't wrap)
+	// Oracle returns are always nullable: T?  (but Any? == Any → don't wrap)
 	outTNullable := ensureNullableUnlessAny(declOutT)
 	baseOut := stripNullable(outTNullable) // base(T) after making nullable
 
@@ -91,7 +219,9 @@ func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
 	return outVal
 }
 
-// Build prompt: PROMPT, SCHEMAS, then TASK/INPUT/OUTPUT blocks.
+// buildOraclePrompt constructs the prompt string for a given oracle function.
+// If a userland `__oracle_build_prompt` exists, it is used; otherwise a
+// deterministic fallback prompt is produced as documented in the file header.
 func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 	// 1) Gather ingredients (keep declared aliases to preserve annotations)
 	instruction := strings.TrimSpace(funVal.Annot) // may be empty
@@ -166,6 +296,7 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
 	b.WriteString("\n\n")
 
+	// Boxed output schema
 	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
 	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
 	b.WriteString("\n\n")
@@ -210,8 +341,8 @@ func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
 	return b.String()
 }
 
-// jsonSchemaForTypeS builds a JSON Schema (as map[string]any) from a resolved type S.
-// It covers common constructs (object, array, primitives, nullable, enum).
+// jsonSchemaForTypeS builds a JSON Schema (as map[string]any) from a **resolved**
+// type S. It covers common constructs (object, array, primitives, nullable, enum).
 func (ip *Interpreter) jsonSchemaForTypeS(t S, env *Env) map[string]any {
 	if len(t) == 0 {
 		return map[string]any{}
@@ -298,7 +429,7 @@ func (ip *Interpreter) jsonSchemaForTypeS(t S, env *Env) map[string]any {
 	}
 }
 
-// Convert a MindScript Value to a JSON-marshallable Go value.
+// valueToGoJSONable converts a MindScript Value to a JSON-marshallable Go value.
 func valueToGoJSONable(v Value) any {
 	switch v.Tag {
 	case VTNull:
@@ -330,7 +461,8 @@ func valueToGoJSONable(v Value) any {
 	}
 }
 
-// Marshal compact JSON but add spaces after ":" and "," to match test strings
+// compactJSONWithSpaces marshals compact JSON but adds spaces after ":" and ","
+// to match test strings (e.g., {"a": 1, "b": 2}).
 func compactJSONWithSpaces(x any) string {
 	b, err := json.Marshal(x)
 	if err != nil {
@@ -342,7 +474,8 @@ func compactJSONWithSpaces(x any) string {
 	return s
 }
 
-// Find the only directly-bound argument in the saturated oracle closure, if any.
+// findOnlyBoundArg returns the only directly-bound argument in the saturated
+// oracle closure, if any. This is used to render the final TASK/INPUT block.
 func findOnlyBoundArg(f *Fun) (Value, bool) {
 	if f == nil || f.Env == nil || f.Env.table == nil {
 		return Null, false
@@ -356,9 +489,9 @@ func findOnlyBoundArg(f *Fun) (Value, bool) {
 	return Null, false
 }
 
-// Try to preserve annotations in schema rendering by reusing the actual VTType
-// value from the environment when possible (so .Annot is kept). Fall back to
-// synthesizing a VTType from S if not found.
+// typeValForPrompt tries to preserve annotations in schema rendering by reusing
+// the actual VTType value from the environment (so .Annot is kept). Falls back
+// to synthesizing a VTType from S if not found.
 func (ip *Interpreter) typeValForPrompt(t S, env *Env) Value {
 	if len(t) >= 2 && t[0].(string) == "id" {
 		name := t[1].(string)
@@ -371,7 +504,7 @@ func (ip *Interpreter) typeValForPrompt(t S, env *Env) Value {
 	return TypeValIn(t, env)
 }
 
-// helper for formatting blocks
+// indentBlock prefixes each line in s with n spaces (used by prompt builder).
 func indentBlock(s string, n int) string {
 	pad := strings.Repeat(" ", n)
 	lines := strings.Split(s, "\n")
@@ -380,9 +513,6 @@ func indentBlock(s string, n int) string {
 	}
 	return strings.Join(lines, "\n")
 }
-
-// Expose the last prompt for testing / REPL demo.
-func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
 
 // ---- standard helpers (unchanged) ----
 
@@ -416,6 +546,7 @@ func unwrapFenced(s string) string {
 	}
 	return s
 }
+
 func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env) []Value {
 	ok := make([]Value, 0, len(exs))
 	for _, ex := range exs {
@@ -440,6 +571,9 @@ func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env)
 	}
 	return ok
 }
+
+// callGlobal1 invokes a global unary function by name and traps runtime errors,
+// returning the value and a non-empty error string when a failure is produced.
 func (ip *Interpreter) callGlobal1(name string, arg Value) (v Value, errStr string) {
 	fn, err := ip.Global.Get(name)
 	if err != nil || fn.Tag != VTFun {

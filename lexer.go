@@ -1,4 +1,99 @@
-// mindscript_lexer.go (refactored, with interactive mode)
+// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
+// MindScript language. It converts a source string into a linear stream of
+// tokens with accurate source positions and rich literal decoding.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-LEVEL OVERVIEW
+//
+// The lexer scans left→right and emits Token values, always ending with EOF.
+// Each token carries:
+//   - Type    — a TokenType enum
+//   - Lexeme  — the exact source slice (verbatim characters from the input)
+//   - Literal — the decoded value for literal tokens (e.g., bool/int/float/string)
+//   - Line/Col— 1-based line and 0-based column of the token’s start
+//
+// The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
+// whether there is immediate whitespace before the delimiter:
+//
+//	'('  → LROUND  if there IS preceding whitespace
+//	      CLROUND if there is NO preceding whitespace
+//	'['  → LSQUARE if there IS preceding whitespace
+//	      CLSQUARE if there is NO preceding whitespace
+//
+// Consequences (user-facing syntax):
+//
+//   - Calls and parameter lists require NO space before '('.
+//     f(x)           // call: uses CLROUND
+//     fun(x: T)      // function params: uses CLROUND
+//     oracle(x: T)   // oracle params: uses CLROUND
+//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
+//     parameter list; the parser will error.
+//
+//   - Indexing requires NO space before '['.
+//     arr[i]         // indexing: uses CLSQUARE
+//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
+//
+//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
+//     CLROUND participates in call/juxtaposition chains.
+//
+// This lets the parser distinguish grouping/indexing from juxtaposition/call-like
+// forms without lookbehind in the parser.
+//
+// The '.' character is context-sensitive:
+//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
+//     produced.
+//   - Otherwise it is PERIOD (typically for property access).
+//
+// IDENTIFIERS & KEYWORDS
+//
+//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
+//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
+//	After a PERIOD, both identifiers *and* quoted strings are treated as
+//	property names and forced to ID (even if the text is a keyword). This allows:
+//	    obj."then"   // ID with Literal="then"
+//	    obj.then     // ID with Literal="then"
+//
+// LITERALS
+//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
+//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
+//     bytes in the lexeme are validated and decoded.
+//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
+//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
+//   - BOOLEAN — “true” or “false” (Literal: bool).
+//   - NULL    — “null” (Literal: nil).
+//
+// COMMENTS vs ANNOTATIONS (hash syntax)
+//   - Line comment:       "## ... <newline>"           → ignored
+//   - Inline comment:     "##( ... )" (no nesting)     → ignored
+//   - Inline annotation:  "#( ... )"                   → emits ANNOTATION with text
+//   - Block annotations:  one or more consecutive lines where, after optional
+//     indentation, the first non-space is '#'. The leading '#' (and one optional
+//     following space/tab) are stripped; lines are joined with '\n', and a single
+//     ANNOTATION token is emitted. A blank/non-# line ends the block.
+//
+// ERRORS
+//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
+//     reported as *LexError* with precise location.
+//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
+//     strings or unterminated "#(...)" / "##(...)" inline blocks produce
+//     *IncompleteError* instead of LexError. Use IsIncomplete(err) to detect this
+//     and prompt for more input.
+//
+// OUTPUT
+//   - Scan returns the full token slice *including* the terminal EOF token.
+//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
+//     includes the quotes and escapes), while Literal carries the decoded value.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// FILE ORGANIZATION
+//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
+//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
+//
+// The PUBLIC API docs below are intentionally exhaustive so the behavior is
+// understandable without reading the implementation.
+//
+// ──────────────────────────────────────────────────────────────────────────────
 package mindscript
 
 import (
@@ -10,7 +105,54 @@ import (
 	"unicode/utf8"
 )
 
-// TokenType represents the kind of token.
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// TokenType is the enumeration of all token kinds the lexer can emit.
+// Most names are self-explanatory; groups are listed for clarity.
+//
+// Special:
+//
+//	EOF     — end-of-file sentinel (always the final token)
+//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
+//
+// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
+//
+//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
+//	RROUND            — ')'
+//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
+//	RSQUARE           — ']'
+//	LCURLY, RCURLY    — '{', '}'
+//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
+//
+// Operators:
+//
+//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
+//	ASSIGN                      — '='
+//	EQ, NEQ                     — '==', '!='
+//	LESS, LESS_EQ               — '<',  '<='
+//	GREATER, GREATER_EQ         — '>',  '>='
+//	BANG                        — '!' (used by the language in object/type literals)
+//	ARROW                       — '->'
+//
+// Literals & identifiers:
+//
+//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
+//
+// Keywords (produced when the identifier text equals these words, except when
+// forced to an ID after PERIOD/property access):
+//
+//	AND, OR, NOT,
+//	LET, DO, END, RETURN, BREAK, CONTINUE,
+//	IF, THEN, ELIF, ELSE,
+//	FUNCTION, ORACLE,
+//	FOR, IN, FROM, WHILE,
+//	TYPECONS, TYPE, ENUM
+//
+// Annotation:
+//
+//	ANNOTATION — emitted for "#( … )" lines or multi-line blocks starting with '#'.
 type TokenType int
 
 const (
@@ -20,7 +162,7 @@ const (
 
 	// Punctuation
 	LROUND   // "(" when preceded by whitespace
-	CLROUND  // "(" when not preceded by whitespace (call-close)
+	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
 	RROUND   // ")"
 	LSQUARE  // "["
 	CLSQUARE // "[" when not preceded by whitespace (index-close)
@@ -45,7 +187,7 @@ const (
 	LESS_EQ
 	GREATER
 	GREATER_EQ
-	BANG  // '!' used only in object/type literals to mark required fields: {name!: Str}
+	BANG  // "!" (required-field marker in object/type literals)
 	ARROW // "->"
 
 	// Literals & identifiers
@@ -80,20 +222,168 @@ const (
 	TYPE
 	ENUM
 
-	// Annotation block (from lines starting with '#')
+	// Annotation token (from lines starting with '#')
 	ANNOTATION
 )
 
-// Token is a lexical token with optional literal value.
+// Token is a single lexical unit produced by the lexer.
+//
+// Fields:
+//
+//	Type    — the TokenType kind.
+//	Lexeme  — the exact source slice comprising the token (verbatim, including
+//	          quotes for strings, escape sequences, etc.).
+//	Literal — a decoded value for literal tokens:
+//	          • STRING  → Go string with escapes and surrogate pairs resolved
+//	          • INTEGER → int64
+//	          • NUMBER  → float64
+//	          • BOOLEAN → bool
+//	          • NULL    → nil
+//	          Non-literal tokens usually carry nil or an unmodified string
+//	          (keywords may store their text; property IDs store the property name).
+//	Line    — 1-based line number at which this token starts.
+//	Col     — 0-based column index at which this token starts.
 type Token struct {
 	Type    TokenType
-	Lexeme  string      // raw text slice
-	Literal interface{} // parsed value for literals
+	Lexeme  string
+	Literal interface{}
 	Line    int
 	Col     int
 }
 
-// keywords map
+// LexError reports a lexical error detected during scanning (e.g., invalid
+// escape sequence, malformed number, unexpected character, invalid UTF-8).
+// In non-interactive mode, unterminated strings or inline "#(...)" / "##(...)"
+// also produce LexError.
+//
+// The error position (Line, Col) refers to the location where the lexer
+// detected the problem (generally close to the token’s start).
+type LexError struct {
+	Line int
+	Col  int
+	Msg  string
+}
+
+func (e *LexError) Error() string {
+	return fmt.Sprintf("LEXICAL ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
+}
+
+// IncompleteError signals that more input is required to complete a construct.
+// It is returned *only* by a lexer created with NewLexerInteractive when the
+// end of input is reached inside:
+//   - a string literal,
+//   - an inline annotation "#( ... )", or
+//   - an inline comment   "##( ... )".
+//
+// Use IsIncomplete(err) to detect this case in REPLs and prompt the user for
+// more lines instead of failing the parse.
+type IncompleteError struct {
+	Line int
+	Col  int
+	Msg  string
+}
+
+func (e *IncompleteError) Error() string {
+	return fmt.Sprintf("INCOMPLETE at %d:%d: %s", e.Line, e.Col, e.Msg)
+}
+
+// IsIncomplete reports whether err is an *IncompleteError. Helpful in REPLs
+// to distinguish “need more input” from real lexical errors.
+func IsIncomplete(err error) bool {
+	_, ok := err.(*IncompleteError)
+	return ok
+}
+
+// Lexer is a streaming tokenizer for MindScript.
+//
+// Construction:
+//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
+//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
+//     produce IncompleteError.
+//
+// Semantics:
+//   - Scan() returns the full token slice including EOF. It never panics for
+//     malformed input; instead it returns (nil, error).
+//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
+//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
+//     either preceding whitespace *or* the previous token cannot be a left operand.
+//     Otherwise '.' is PERIOD used for property access.
+//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
+//     even if it matches a keyword.
+//
+// Positioning:
+//   - Line numbers are 1-based; column indices are 0-based.
+//   - A token’s position is captured at the start of scanning that token.
+type Lexer struct {
+	// public type with no exported fields; use constructors + Scan()
+	src              string
+	start            int // start index of current token
+	cur              int // current index
+	line             int // 1-based
+	col              int // 0-based column within line
+	tokens           []Token
+	whitespaceBefore bool
+
+	// precise token start position
+	tokStartLine int
+	tokStartCol  int
+
+	// interactive mode: produce IncompleteError for unterminated constructs at EOF
+	interactive bool
+}
+
+// NewLexer creates a new lexer for the given source in normal mode.
+// Unterminated strings / "#(...)" / "##(...)" yield LexError.
+func NewLexer(src string) *Lexer {
+	return &Lexer{
+		src:  src,
+		line: 1,
+		col:  0,
+	}
+}
+
+// NewLexerInteractive creates a lexer in interactive mode.
+// Unterminated strings or inline paren blocks return IncompleteError at EOF,
+// allowing REPLs to request more input.
+func NewLexerInteractive(src string) *Lexer {
+	return &Lexer{
+		src:         src,
+		line:        1,
+		col:         0,
+		interactive: true,
+	}
+}
+
+// Scan tokenizes the entire source string and returns the resulting slice of
+// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
+//
+// Error behavior summary:
+//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
+//   - Interactive mode: returns *IncompleteError at EOF if a construct is
+//     unterminated; other issues still return *LexError.
+//
+// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
+// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
+func (l *Lexer) Scan() ([]Token, error) {
+	for {
+		tok, err := l.scanToken()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Type == EOF {
+			return l.tokens, nil
+		}
+	}
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                            PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// ---------------- keywords map (private) ----------------
+
 var keywords = map[string]TokenType{
 	"null":     NULL,
 	"false":    BOOLEAN,
@@ -128,61 +418,7 @@ var keywords = map[string]TokenType{
 	"Enum":     ENUM,
 }
 
-// ---------- public, shared errors ----------
-
-// Parse-time code will also use this to detect "need more input" cases.
-type IncompleteError struct {
-	Line int
-	Col  int
-	Msg  string
-}
-
-func (e *IncompleteError) Error() string {
-	return fmt.Sprintf("INCOMPLETE at %d:%d: %s", e.Line, e.Col, e.Msg)
-}
-
-func IsIncomplete(err error) bool {
-	_, ok := err.(*IncompleteError)
-	return ok
-}
-
-// Lexer scans a MindScript source string into tokens.
-type Lexer struct {
-	src              string
-	start            int // start index of current token
-	cur              int // current index
-	line             int // 1-based
-	col              int // 0-based column within line
-	tokens           []Token
-	whitespaceBefore bool
-
-	// precise token start position
-	tokStartLine int
-	tokStartCol  int
-
-	// interactive mode: produce IncompleteError for unterminated constructs at EOF
-	interactive bool
-}
-
-// NewLexer creates a new lexer for the given source.
-func NewLexer(src string) *Lexer {
-	return &Lexer{
-		src:  src,
-		line: 1,
-		col:  0,
-	}
-}
-
-// NewLexerInteractive creates a lexer that reports IncompleteError on EOF for
-// unterminated strings and inline #( ... ) / ##( ... ) blocks.
-func NewLexerInteractive(src string) *Lexer {
-	return &Lexer{
-		src:         src,
-		line:        1,
-		col:         0,
-		interactive: true,
-	}
-}
+// ---------------- core scanning helpers ----------------
 
 func (l *Lexer) isAtEnd() bool { return l.cur >= len(l.src) }
 
@@ -259,7 +495,7 @@ func (l *Lexer) skipWhitespace() {
 	}
 }
 
-// helpers
+// ---------------- small predicates ----------------
 
 func canBeLeftOperand(t TokenType) bool {
 	switch t {
@@ -290,17 +526,7 @@ func (l *Lexer) afterDotIsProperty() bool {
 	return p != nil && p.Type == PERIOD
 }
 
-// ----- errors -----
-
-type LexError struct {
-	Line int
-	Col  int
-	Msg  string
-}
-
-func (e *LexError) Error() string {
-	return fmt.Sprintf("LEXICAL ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
-}
+// ---------------- error builders ----------------
 
 func (l *Lexer) err(msg string) error {
 	return &LexError{Line: l.line, Col: l.col, Msg: msg}
@@ -310,7 +536,7 @@ func (l *Lexer) errIncomplete(msg string) error {
 	return &IncompleteError{Line: l.line, Col: l.col, Msg: msg}
 }
 
-// ----- scanners -----
+// ---------------- scanners ----------------
 
 // scanString parses a JSON-style string literal (single or double quotes).
 func (l *Lexer) scanString() (string, error) {
@@ -715,7 +941,7 @@ func (l *Lexer) dotStartsNumber() bool {
 	return false
 }
 
-// ----- main scanner -----
+// ---------------- main tokenization ----------------
 
 func (l *Lexer) scanToken() (Token, error) {
 	for {
@@ -881,18 +1107,5 @@ func (l *Lexer) scanToken() (Token, error) {
 		}
 
 		return Token{}, l.err(fmt.Sprintf("unexpected character: %q", ch))
-	}
-}
-
-// Scan tokenizes the entire source and returns tokens (EOF included).
-func (l *Lexer) Scan() ([]Token, error) {
-	for {
-		tok, err := l.scanToken()
-		if err != nil {
-			return nil, err
-		}
-		if tok.Type == EOF {
-			return l.tokens, nil
-		}
 	}
 }

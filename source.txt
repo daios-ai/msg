@@ -1,466 +1,1035 @@
-=== BEGIN FILE: oracles.go ===
-// oracles.go
-
+=== BEGIN FILE: parser.go ===
+// parser.go: Pratt parser for MindScript that produces Lisp-style S-expressions.
+//
+// OVERVIEW
+// --------
+// This file implements a newline-aware, interactive-ready Pratt parser for the
+// MindScript language. The parser consumes the token stream produced by the
+// lexer (see lexer.go) and returns a compact, Lisp-y S-expression (AST) where
+// each node is encoded as []any with a leading tag string, e.g.:
+//
+//	("binop", "+", ("int", 1), ("id", "x"))
+//
+// DEPENDENCIES
+// ------------
+// • lexer.go — provides:
+//   - Token / TokenType definitions and all token kinds used here
+//   - Lexer, NewLexer, NewLexerInteractive
+//   - IncompleteError and IsIncomplete(err)
+//
+// • standard library: fmt (for error messages)
+//
+// PARSING MODE & INTERACTIVITY
+// ----------------------------
+// Two entry points are provided:
+//
+//	ParseSExpr(src string)            — normal parsing (unterminated input is a ParseError)
+//	ParseSExprInteractive(src string) — REPL-friendly (unterminated input becomes IncompleteError)
+//
+// In interactive mode, reaching EOF inside a construct (e.g., missing ')', ']', '}', 'end',
+// or RHS after an operator/unary) yields IncompleteError with a precise position.
+//
+// OUTPUT SHAPE (AST)
+// ------------------
+// The result is always a top-level block:
+//
+//	("block", expr1, expr2, ...)
+//
+// Node forms (tags) the parser emits:
+//
+// Literals & identifiers:
+//
+//	("id",   name)           // identifiers and builtin TYPE tokens (e.g., "Int") used as names
+//	("int",  int64)
+//	("num",  float64)
+//	("str",  string)
+//	("bool", bool)
+//	("null")
+//
+// Unary/postfix:
+//
+//	("unop", "-",   expr)    // prefix minus
+//	("unop", "not", expr)    // logical not
+//	("unop", "?",   expr)    // postfix optional operator
+//
+// Calls / property / indexing:
+//
+//	("call", callee, arg1, arg2, ...)
+//	("idx",  object, indexExpr)                // obj[expr] or obj.<integer> or obj.(expr)
+//	("get",  object, ("str", propertyName))    // obj.<id> or obj."string"
+//
+// Arrays & maps:
+//
+//	("array", elements...)
+//	("map", ("pair",  keyStrExpr, valueExpr)*)
+//	("map", ("pair!", keyStrExpr, valueExpr)* ) // key marked required via '!' in literal (e.g., {name!: "x"})
+//
+// Enum sugar:
+//
+//	Enum[ e1, e2, ... ] → ("enum", e1, e2, ...)
+//
+// Functions & oracles:
+//
+//	fun (p1[: T], p2[: T], ...) [-> Ret] do ... end
+//	   → ("fun",   paramsArray, RetOr("id","Any"), bodyBlock)
+//	oracle (p1[: T], ...) [-> Out] [from SourceExpr]
+//	   → ("oracle", paramsArray, OutOr("id","Any"), SourceOr("array"))
+//
+// where paramsArray is ("array", ("pair", ("id", name), typeExpr), ...).
+//
+// Blocks and control:
+//
+//	do ... end                → ("block", ...)
+//	if cond then … elif … else … end
+//	   → ("if", ("pair", cond1, thenBlock1), ("pair", cond2, thenBlock2), [, elseBlock])
+//	for <target> in <iter> do ... end → ("for", target, iter, body)
+//	while cond do ... end             → ("while", cond, body)
+//
+// Return/break/continue (newline-sensitive):
+//
+//	If the next token is on the SAME line → take a following expression.
+//	Else (or at EOF)                      → implicit null.
+//	Examples:
+//	  return 1      → ("return", ("int", 1))
+//	  return\nx     → ("return", ("null"))
+//
+// Declaration patterns (used by `let` and `for` targets):
+//
+//	("decl", name)                        // let x
+//	("darr", p1, p2, ...)                 // let [a, b, ...]
+//	("dobj", ("pair", keyStrExpr, p), ...) // let {k: p, ...}
+//
+// Annotations may wrap the next pattern or expression:
+//
+//	("annot", ("str", text), node)
+//
+// Operators & precedence (higher binds tighter; '=' and '->' are right-assoc):
+//
+//	70: * / %
+//	60: + -
+//	50: < <= > >=
+//	40: == !=
+//	30: and
+//	20: or
+//	15: ->
+//	10: =
+//
+// '=' yields ("assign", target, value) and requires an assignable target: one of
+// "id", "get", "idx", "decl", "darr", "dobj".
+//
+// ERROR MODEL
+// -----------
+// • ParseError  — structural/grammar problems with location.
+// • IncompleteError (interactive mode) — source ended while a construct was incomplete.
+//
+// NOTE ON TOKENS & NEWLINES
+// -------------------------
+// The parser relies on token positions provided by the lexer. For newline-sensitive
+// behavior of return/break/continue, it checks whether the next token shares the same line.
+//
+// The complete behavior above is sufficient to consume this API without reading the
+// implementation details below.
 package mindscript
 
 import (
-	"encoding/json"
-	"strings"
+	"fmt"
 )
 
-// execOracle: centralize prompt construction, backend dispatch, parsing, type-checking.
-// Oracles can fail; the function returns T? (success value T, or null to signal failure).
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// S is the S-expression node representation used by the parser.
+// It is a []any whose first element is a string tag (e.g., "binop", "id", "array").
+// Subsequent elements are the node’s children or data.
 //
-// Current backend contract used by tests:
+// Common node forms (non-exhaustive):
 //
-//	__oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
-func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
-	if funVal.Tag != VTFun {
-		return annotNull("oracle: not a function")
-	}
-	f := funVal.Data.(*Fun)
+//	("block", n1, n2, ...)
+//	("id",   name)            // string name
+//	("int",  int64)
+//	("num",  float64)
+//	("str",  string)
+//	("bool", bool)
+//	("null")
+//	("unop", op, rhs)         // op is string: "-", "not", "?"
+//	("binop", op, lhs, rhs)   // op is string: "+", "and", "==", ...
+//	("assign", target, value) // "="
+//	("call", callee, arg...)
+//	("get",  obj, ("str", name))
+//	("idx",  obj, indexExpr)
+//	("array", ...)
+//	("map", ("pair",  keyStrExpr, value)*)
+//	("map", ("pair!", keyStrExpr, value)*)
+//	("enum", ...)
+//	("fun", paramsArray, retTypeExprOrAny, bodyBlock)
+//	("oracle", paramsArray, outTypeExprOrAny, sourceExprOrEmptyArray)
+//	("if", ("pair", cond, thenBlock)* [, elseBlock])
+//	("while", cond, bodyBlock)
+//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//	("decl", name) | ("darr", ...) | ("dobj", ("pair", keyStrExpr, pat)*)
+//	("annot", ("str", text), wrappedNode)
+type S = []any
 
-	// --- Build prompt ---
-	prompt := ip.buildOraclePrompt(funVal, f)
-	ip.oracleLastPrompt = prompt
+// L is a small helper to build S-expression nodes. The first argument is the
+// string tag; the remaining arguments are appended as children.
+func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
 
-	// Resolve types
-	inT := S{"id", "Any"}
-	if len(f.ParamTypes) == 1 {
-		inT = ip.resolveType(f.ParamTypes[0], f.Env)
-	}
-	declOutT := ip.resolveType(f.ReturnType, f.Env) // declared success type T
-	// Oracle returns are *always* nullable: T?  (but Any? == Any → don't wrap)
-	outTNullable := ensureNullableUnlessAny(declOutT)
-	baseOut := stripNullable(outTNullable) // base(T) after making nullable
-
-	// Validate examples
-	validated := ip.validateExamples(f.Examples, inT, baseOut, f.Env)
-
-	// Locate executor
-	hook, err := ip.Global.Get("__oracle_execute")
-	if err != nil || hook.Tag != VTFun {
-		return annotNull("oracle backend not configured (define __oracle_execute)")
-	}
-
-	// Call executor with *nullable* out type so backends can constrain outputs.
-	res := ip.Apply(hook, []Value{
-		Str(prompt),
-		TypeVal(inT),
-		TypeVal(outTNullable),
-		Arr(validated),
-	})
-
-	// Null from executor = oracle failure (already annotated if backend wants).
-	if res.Tag == VTNull {
-		return res
-	}
-	if res.Tag != VTStr {
-		return annotNull("oracle executor must return Str (raw model output) or null")
-	}
-
-	raw := strings.TrimSpace(res.Data.(string))
-	raw = unwrapFenced(raw) // remove ``` … ``` if present
-
-	// Always expect JSON for the *boxed* output.
-	parsed, perr := ip.callGlobal1("jsonParse", Str(raw))
-	if perr != "" {
-		if raw == "null" {
-			return annotNull("oracle returned null")
-		}
-		return annotNull("oracle output was not valid JSON")
-	}
-	if parsed.Tag == VTNull {
-		if raw == "null" {
-			return annotNull("oracle returned null")
-		}
-		return annotNull("oracle output was not valid JSON")
-	}
-
-	// Unbox: expect {"output": <T>} then validate <T> against T?
-	if parsed.Tag != VTMap {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	mo := parsed.Data.(*MapObject)
-	outVal, ok := mo.Entries["output"]
-	if !ok {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	if !ip.isType(outVal, outTNullable, f.Env) {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	return outVal
+// ParseError reports a non-interactive parse failure with a location.
+// Typical causes: unexpected tokens, missing delimiters, invalid assignment target.
+type ParseError struct {
+	Line, Col int
+	Msg       string
 }
 
-// Build prompt: PROMPT, SCHEMAS, then TASK/INPUT/OUTPUT blocks.
-func (ip *Interpreter) buildOraclePrompt(funVal Value, f *Fun) string {
-	// 1) Gather ingredients (keep declared aliases to preserve annotations)
-	instruction := strings.TrimSpace(funVal.Annot) // may be empty
-	inTDeclared := S{"id", "Any"}
-	if len(f.ParamTypes) == 1 {
-		inTDeclared = f.ParamTypes[0] // keep alias to retain its .Annot
-	}
-	outBaseDeclared := stripNullable(f.ReturnType) // success type; keep alias
-
-	// 2) Prefer userland hook if present
-	if ip != nil && ip.Global != nil {
-		if hook, err := ip.Global.Get("__oracle_build_prompt"); err == nil && hook.Tag == VTFun {
-			ex := Arr(append([]Value(nil), f.Examples...))
-			res := ip.Apply(hook, []Value{
-				Str(instruction),
-				TypeVal(inTDeclared),
-				TypeVal(outBaseDeclared),
-				ex,
-			})
-			if res.Tag == VTStr {
-				return res.Data.(string)
-			}
-		}
-	}
-
-	// 3) Go fallback — emit exactly what the manual/test expects.
-
-	pretty := func(m map[string]any) string {
-		bs, err := json.MarshalIndent(m, "", "  ")
-		if err != nil {
-			return "{}"
-		}
-		return string(bs)
-	}
-
-	// ---- INPUT JSON SCHEMA (inner) ----
-	// Resolve shape for content…
-	inResolved := ip.resolveType(inTDeclared, f.Env)
-	inSchemaInner := ip.jsonSchemaForTypeS(inResolved, f.Env)
-	// …but pull the alias’ annotation for the "description".
-	inAliasVal := ip.typeValForPrompt(inTDeclared, f.Env)
-	if desc := strings.TrimSpace(inAliasVal.Annot); desc != "" {
-		inSchemaInner["description"] = desc
-	}
-
-	// ---- OUTPUT JSON SCHEMA ----
-	outInner := ip.TypeValueToJSONSchema(ip.typeValForPrompt(outBaseDeclared, f.Env), f.Env)
-	boxedOutSchema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"output": map[string]any{
-				"$ref": "#/$defs/Out",
-			},
-		},
-		"required": []any{"output"},
-		"$defs": map[string]any{
-			"Out": outInner,
-		},
-	}
-
-	var b strings.Builder
-
-	// Header exactly as expected by the test/manual
-	b.WriteString("PROMPT:\n")
-	b.WriteString("Please follow the instruction to the best of your ability:\n")
-	b.WriteString("for every input, provide an output that solves the task and\n")
-	b.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
-	b.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
-
-	// Schemas
-	b.WriteString("INPUT JSON SCHEMA:\n\n")
-	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
-	b.WriteString("\n\n")
-
-	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
-	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
-	b.WriteString("\n\n")
-
-	// Example blocks (render raw input; boxed output).
-	taskLine := instruction
-	if taskLine == "" {
-		taskLine = "Given the input, determine the output."
-	}
-	for _, ex := range f.Examples {
-		if ex.Tag != VTArray {
-			continue
-		}
-		xs := ex.Data.([]Value)
-		if len(xs) != 2 {
-			continue
-		}
-		inJSON := compactJSONWithSpaces(valueToGoJSONable(xs[0]))
-		outJSON := compactJSONWithSpaces(map[string]any{
-			"output": valueToGoJSONable(xs[1]),
-		})
-
-		b.WriteString("TASK:\n\n")
-		b.WriteString(taskLine + "\n\n")
-		b.WriteString("INPUT:\n\n")
-		b.WriteString(inJSON + "\n\n")
-		b.WriteString("OUTPUT:\n\n")
-		b.WriteString(outJSON + "\n\n")
-	}
-
-	// Final TASK with the current call's input (actual bound arg if we can find it)
-	var curIn any = nil
-	if v, ok := findOnlyBoundArg(f); ok {
-		curIn = valueToGoJSONable(v)
-	}
-	b.WriteString("TASK:\n\n")
-	b.WriteString(taskLine + "\n\n")
-	b.WriteString("INPUT:\n\n")
-	b.WriteString(compactJSONWithSpaces(curIn) + "\n\n")
-	b.WriteString("OUTPUT:\n")
-
-	return b.String()
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("PARSE ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
 }
 
-// jsonSchemaForTypeS builds a JSON Schema (as map[string]any) from a resolved type S.
-// It covers common constructs (object, array, primitives, nullable, enum).
-func (ip *Interpreter) jsonSchemaForTypeS(t S, env *Env) map[string]any {
-	if len(t) == 0 {
-		return map[string]any{}
-	}
-	switch t[0].(string) {
-	case "id":
-		switch t[1].(string) {
-		case "Any":
-			return map[string]any{} // unconstrained
-		case "Null":
-			return map[string]any{"type": "null"}
-		case "Bool":
-			return map[string]any{"type": "boolean"}
-		case "Int":
-			return map[string]any{"type": "integer"}
-		case "Num":
-			return map[string]any{"type": "number"}
-		case "Str":
-			return map[string]any{"type": "string"}
-		default:
-			// Resolve aliases and recurse.
-			rt := ip.resolveType(t, env)
-			if !equalS(rt, t) {
-				return ip.jsonSchemaForTypeS(rt, env)
-			}
-			return map[string]any{}
-		}
-
-	case "unop":
-		// Nullable: ("unop","?", T) → anyOf [schema(T), {"type":"null"}]
-		if len(t) >= 3 && t[1].(string) == "?" {
-			inner := ip.jsonSchemaForTypeS(t[2].(S), env)
-			return map[string]any{
-				"anyOf": []any{inner, map[string]any{"type": "null"}},
-			}
-		}
-		return map[string]any{}
-
-	case "array":
-		// Homogeneous arrays
-		items := map[string]any{}
-		if len(t) == 2 {
-			items = ip.jsonSchemaForTypeS(t[1].(S), env)
-		}
-		return map[string]any{
-			"type":  "array",
-			"items": items,
-		}
-
-	case "map":
-		props := map[string]any{}
-		req := []any{}
-		fields := mapTypeFields(t)
-		for name, f := range fields {
-			props[name] = ip.jsonSchemaForTypeS(f.typ, env)
-			if f.required {
-				req = append(req, name)
-			}
-		}
-		m := map[string]any{
-			"type":       "object",
-			"properties": props,
-		}
-		if len(req) > 0 {
-			m["required"] = req
-		}
-		return m
-
-	case "enum":
-		// Best-effort: map enum literal S-exprs to Go JSON-able and emit "enum"
-		values := []any{}
-		for i := 1; i < len(t); i++ {
-			if v, ok := ip.litToValue(t[i].(S)); ok {
-				values = append(values, valueToGoJSONable(v))
-			}
-		}
-		if len(values) > 0 {
-			return map[string]any{"enum": values}
-		}
-		return map[string]any{}
-
-	default:
-		return map[string]any{}
-	}
-}
-
-// Convert a MindScript Value to a JSON-marshallable Go value.
-func valueToGoJSONable(v Value) any {
-	switch v.Tag {
-	case VTNull:
-		return nil
-	case VTBool:
-		return v.Data.(bool)
-	case VTInt:
-		return v.Data.(int64)
-	case VTNum:
-		return v.Data.(float64)
-	case VTStr:
-		return v.Data.(string)
-	case VTArray:
-		xs := v.Data.([]Value)
-		out := make([]any, len(xs))
-		for i := range xs {
-			out[i] = valueToGoJSONable(xs[i])
-		}
-		return out
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		m := make(map[string]any, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			m[k] = valueToGoJSONable(vv)
-		}
-		return m
-	default:
-		return nil
-	}
-}
-
-// Marshal compact JSON but add spaces after ":" and "," to match test strings
-func compactJSONWithSpaces(x any) string {
-	b, err := json.Marshal(x)
+// ParseSExpr parses a MindScript source string into an S-expression AST.
+// It lexes the source using NewLexer (normal mode) and parses according to the
+// grammar summarized in the file header comments.
+//
+// Returns:
+//   - S  — a top-level ("block", ...) node.
+//   - error — *ParseError on grammar problems, or lexer errors propagated.
+//
+// Newline-sensitive control:
+//
+//	return/break/continue take an expression only if the next token is on the same line;
+//	otherwise they default to ("null").
+//
+// Property/index/call chaining:
+//   - Calls:           f(args...)             → ("call", f, args...)
+//   - Index:           a[b]                   → ("idx", a, b)
+//   - Computed dot:    a.(expr)               → ("idx", a, expr)
+//   - Numeric dot:     a.42                   → ("idx", a, ("int", 42))
+//   - Named property:  a.name / a."name"      → ("get", a, ("str", "name"))
+//
+// Operators:
+//
+//	Precedence and associativity are as listed in the header; "=" and "->" are right-assoc.
+//	"=" yields ("assign", target, value) and requires assignable targets.
+func ParseSExpr(src string) (S, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
 	if err != nil {
-		return "null"
+		return nil, err
 	}
-	s := string(b)
-	s = strings.ReplaceAll(s, ":", ": ")
-	s = strings.ReplaceAll(s, ",", ", ")
-	return s
+	p := &parser{toks: toks}
+	return p.program()
 }
 
-// Find the only directly-bound argument in the saturated oracle closure, if any.
-func findOnlyBoundArg(f *Fun) (Value, bool) {
-	if f == nil || f.Env == nil || f.Env.table == nil {
-		return Null, false
+// ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
+// and returns *IncompleteError when the input ends mid-construct (e.g., missing
+// ')', ']', '}', 'end', or the RHS of an operator/unary).
+//
+// Use IsIncomplete(err) to detect this case in a REPL and request more input.
+func ParseSExprInteractive(src string) (S, error) {
+	lex := NewLexerInteractive(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
 	}
-	if len(f.Env.table) != 1 {
-		return Null, false
-	}
-	for _, v := range f.Env.table {
-		return v, true
-	}
-	return Null, false
+	p := &parser{toks: toks, interactive: true}
+	return p.program()
 }
 
-// Try to preserve annotations in schema rendering by reusing the actual VTType
-// value from the environment when possible (so .Annot is kept). Fall back to
-// synthesizing a VTType from S if not found.
-func (ip *Interpreter) typeValForPrompt(t S, env *Env) Value {
-	if len(t) >= 2 && t[0].(string) == "id" {
-		name := t[1].(string)
-		if env != nil {
-			if v, err := env.Get(name); err == nil && v.Tag == VTType {
-				return v // carries .Annot from declaration site
-			}
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                           PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// Pratt parser state
+type parser struct {
+	toks        []Token
+	i           int
+	interactive bool
+}
+
+func (p *parser) atEnd() bool { return p.peek().Type == EOF }
+func (p *parser) peek() Token {
+	if p.i >= len(p.toks) {
+		return p.toks[len(p.toks)-1]
+	}
+	return p.toks[p.i]
+}
+func (p *parser) prev() Token { return p.toks[p.i-1] }
+func (p *parser) match(tt ...TokenType) bool {
+	if p.atEnd() {
+		return false
+	}
+	for _, t := range tt {
+		if p.peek().Type == t {
+			p.i++
+			return true
 		}
 	}
-	return TypeValIn(t, env)
+	return false
 }
-
-// helper for formatting blocks
-func indentBlock(s string, n int) string {
-	pad := strings.Repeat(" ", n)
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = pad + lines[i]
+func (p *parser) need(t TokenType, msg string) (Token, error) {
+	if p.match(t) {
+		return p.prev(), nil
 	}
-	return strings.Join(lines, "\n")
-}
-
-// Expose the last prompt for testing / REPL demo.
-func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
-
-// ---- standard helpers (unchanged) ----
-
-func ensureNullableUnlessAny(t S) S {
-	if isAnyType(t) || isNullable(t) {
-		return t
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return Token{}, &IncompleteError{Line: g.Line, Col: g.Col, Msg: msg}
 	}
-	return S{"unop", "?", t}
+	return Token{}, &ParseError{Line: g.Line, Col: g.Col, Msg: msg}
 }
-func isAnyType(t S) bool { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
-func isNullable(t S) bool {
-	return len(t) >= 3 && t[0] == "unop" && t[1] == "?"
-}
-func stripNullable(t S) S {
-	for isNullable(t) {
-		t = t[2].(S)
+
+func (p *parser) nextTokenIsOnSameLine(as Token) bool {
+	if p.atEnd() {
+		return false
 	}
-	return t
+	return p.peek().Line == as.Line
 }
-func unwrapFenced(s string) string {
-	if strings.HasPrefix(s, "```") {
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			s = s[i+1:]
+
+// precedence (higher binds tighter)
+func lbp(t TokenType) (int, bool) {
+	switch t {
+	case ARROW:
+		return 15, true // low precedence, right-assoc
+	case MULT, DIV, MOD:
+		return 70, true
+	case PLUS, MINUS:
+		return 60, true
+	case LESS, LESS_EQ, GREATER, GREATER_EQ:
+		return 50, true
+	case EQ, NEQ:
+		return 40, true
+	case AND:
+		return 30, true
+	case OR:
+		return 20, true
+	case ASSIGN: // '=' right-assoc
+		return 10, true
+	}
+	return 0, false
+}
+
+func (p *parser) program() (S, error) {
+	var items []any
+	for !p.atEnd() {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, e)
+	}
+	return L("block", items...), nil
+}
+
+func (p *parser) expr(minBP int) (S, error) {
+	// ---- prefix ----
+	t := p.peek()
+	p.i++
+	var left S
+	switch t.Type {
+	case ID, TYPE:
+		// Identifiers and capitalized built-in types behave the same in expressions.
+		left = L("id", t.Literal)
+
+	case ENUM:
+		// Enum[ ... ] sugar → ("enum", ...)
+		if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
+			p.i++
+			arr, err := p.arrayLiteralAfterOpen()
+			if err != nil {
+				return nil, err
+			}
+			it := make([]any, 0, len(arr)-1)
+			for i := 1; i < len(arr); i++ {
+				it = append(it, arr[i])
+			}
+			left = L("enum", it...)
 		} else {
-			return s
+			left = L("id", t.Literal)
 		}
-		if j := strings.LastIndex(s, "```"); j >= 0 {
-			s = s[:j]
+
+	case INTEGER:
+		left = L("int", t.Literal)
+	case NUMBER:
+		left = L("num", t.Literal)
+	case STRING:
+		left = L("str", t.Literal)
+	case BOOLEAN:
+		left = L("bool", t.Literal)
+	case NULL:
+		left = L("null")
+
+	case MINUS, NOT:
+		// unary operators require a RHS expression
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after unary operator"}
 		}
-		s = strings.TrimSpace(s)
-	}
-	return s
-}
-func (ip *Interpreter) validateExamples(exs []Value, inT S, outBase S, env *Env) []Value {
-	ok := make([]Value, 0, len(exs))
-	for _, ex := range exs {
-		if ex.Tag != VTArray {
-			continue
+		r, err := p.expr(80)
+		if err != nil {
+			return nil, err
 		}
-		xs := ex.Data.([]Value)
-		if len(xs) != 2 {
-			continue
+		left = L("unop", t.Lexeme, r)
+
+	case LROUND, CLROUND:
+		inner, err := p.expr(0)
+		if err != nil {
+			return nil, err
 		}
-		vin, vout := xs[0], xs[1]
-		if !ip.isType(vin, inT, env) {
-			continue
+		if _, err := p.need(RROUND, "expected ')'"); err != nil {
+			return nil, err
 		}
-		if vout.Tag == VTNull {
-			continue
+		left = inner
+
+	case LSQUARE, CLSQUARE:
+		a, err := p.arrayLiteralAfterOpen()
+		if err != nil {
+			return nil, err
 		}
-		if !ip.isType(vout, outBase, env) {
-			continue
+		left = a
+
+	case LCURLY:
+		// map literal {k: v, ...} where k is id or string; id may have trailing '!' for required
+		if p.match(RCURLY) {
+			left = L("map")
+		} else {
+			var pairs []any
+			for {
+				k, req, err := p.keyRequired()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+					return nil, err
+				}
+				v, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				tag := "pair"
+				if req {
+					tag = "pair!"
+				}
+				pairs = append(pairs, L(tag, k, v))
+				if !p.match(COMMA) {
+					break
+				}
+			}
+			if _, err := p.need(RCURLY, "expected '}'"); err != nil {
+				return nil, err
+			}
+			left = L("map", pairs...)
 		}
-		ok = append(ok, ex)
-	}
-	return ok
-}
-func (ip *Interpreter) callGlobal1(name string, arg Value) (Value, string) {
-	fn, err := ip.Global.Get(name)
-	if err != nil || fn.Tag != VTFun {
-		return annotNull(name + " is not available; load the standard library"), "missing"
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case rtErr:
-				arg = annotNull(e.msg)
+
+	case FUNCTION:
+		params, err := p.params()
+		if err != nil {
+			return nil, err
+		}
+		var ret any = L("id", "Any")
+		if p.match(ARROW) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected return type after '->'"}
+			}
+			r, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			ret = r
+		}
+		body, err := p.parseBlock(true) // require 'do'
+		if err != nil {
+			return nil, err
+		}
+		left = L("fun", params, ret, body)
+
+	case ORACLE:
+		params, err := p.params()
+		if err != nil {
+			return nil, err
+		}
+		var out any = L("id", "Any")
+		if p.match(ARROW) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected output type after '->'"}
+			}
+			o, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			out = o
+		}
+		// accept any expression after `from`
+		var src any = L("array")
+		if p.match(FROM) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after 'from'"}
+			}
+			ex, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			src = ex
+		}
+		left = L("oracle", params, out, src)
+
+	case RETURN, BREAK, CONTINUE:
+		// Newline-sensitive behavior; see file header.
+		if !p.nextTokenIsOnSameLine(t) {
+			switch t.Type {
+			case RETURN:
+				left = L("return", L("null"))
+			case BREAK:
+				left = L("break", L("null"))
 			default:
-				arg = annotNull("runtime error")
+				left = L("continue", L("null"))
+			}
+		} else {
+			x, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			switch t.Type {
+			case RETURN:
+				left = L("return", x)
+			case BREAK:
+				left = L("break", x)
+			default:
+				left = L("continue", x)
 			}
 		}
-	}()
-	v := ip.Apply(fn, []Value{arg})
-	if v.Tag == VTNull && v.Annot != "" {
-		return v, v.Annot
+
+	case IF:
+		thenIf, err := p.ifExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = thenIf
+
+	case DO:
+		// do ... end
+		body, err := p.parseBlock(false) // 'do' already consumed
+		if err != nil {
+			return nil, err
+		}
+		left = body
+
+	case FOR:
+		f, err := p.forExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = f
+
+	case WHILE:
+		w, err := p.whileExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = w
+
+	case LET:
+		pat, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		left = pat
+		if tag, _ := pat[0].(string); tag == "darr" || tag == "dobj" {
+			if p.peek().Type != ASSIGN {
+				g := p.peek()
+				// If input ended, mark as incomplete
+				if p.interactive && g.Type == EOF {
+					return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
+				}
+				return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
+			}
+		}
+
+	case TYPECONS: // "type" <expr>
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected type expression after 'type'"}
+		}
+		x, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		left = L("type", x)
+
+	case ANNOTATION:
+		// wrap next expression
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
+		}
+		x, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		txt := ""
+		if s, ok := t.Literal.(string); ok {
+			txt = s
+		}
+		left = L("annot", L("str", txt), x)
+
+	default:
+		if t.Type == EOF && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "unexpected end of input"}
+		}
+		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme)}
 	}
-	return v, ""
+
+	// ---- postfix chain: call (), index [], get . ----
+	for {
+		switch p.peek().Type {
+		case QUESTION:
+			p.i++
+			left = L("unop", "?", left)
+			continue
+		case CLROUND:
+			p.i++
+			var args []any
+			if !p.match(RROUND) {
+				for {
+					a, err := p.expr(0)
+					if err != nil {
+						return nil, err
+					}
+					args = append(args, a)
+					if !p.match(COMMA) {
+						break
+					}
+				}
+				if _, err := p.need(RROUND, "expected ')'"); err != nil {
+					return nil, err
+				}
+			}
+			left = L("call", append([]any{left}, args...)...)
+			continue
+		case CLSQUARE:
+			p.i++
+			idx, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
+				return nil, err
+			}
+			left = L("idx", left, idx)
+			continue
+		case PERIOD:
+			p.i++
+			// obj.(EXPR) → idx(obj, EXPR)
+			if p.match(LROUND) || p.match(CLROUND) {
+				ex, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.need(RROUND, "expected ')' after computed property"); err != nil {
+					return nil, err
+				}
+				left = L("idx", left, ex)
+				continue
+			}
+			if p.match(INTEGER) { // obj.90 → idx(obj, 90)
+				left = L("idx", left, L("int", p.prev().Literal))
+				continue
+			}
+			if p.match(ID) || p.match(STRING) {
+				left = L("get", left, L("str", p.prev().Literal))
+				continue
+			}
+			g := p.peek()
+			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected property name, integer, or '(expr)' after '.'"}
+		}
+		break
+	}
+
+	// ---- infix ops ----
+	for {
+		op := p.peek()
+		bp, ok := lbp(op.Type)
+		if !ok || bp < minBP {
+			break
+		}
+		p.i++
+
+		nextBP := bp + 1
+		if op.Type == ASSIGN || op.Type == ARROW { // right-assoc
+			nextBP = bp
+		}
+
+		if op.Type == ASSIGN && !assignable(left) {
+			return nil, &ParseError{Line: op.Line, Col: op.Col, Msg: "invalid assignment target"}
+		}
+
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: op.Line, Col: op.Col, Msg: "expected expression after operator"}
+		}
+		right, err := p.expr(nextBP)
+		if err != nil {
+			return nil, err
+		}
+		if op.Type == ASSIGN {
+			left = L("assign", left, right)
+		} else {
+			left = L("binop", op.Lexeme, left, right)
+		}
+	}
+
+	return left, nil
 }
-=== END FILE: oracles.go ===
+
+// ---------- helpers ----------
+
+func (p *parser) arrayLiteralAfterOpen() (S, error) {
+	// We’ve already consumed the opening '['
+	if p.match(RSQUARE) {
+		return L("array"), nil
+	}
+	var elems []any
+	for {
+		it, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, it)
+		if !p.match(COMMA) {
+			break
+		}
+	}
+	if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
+		return nil, err
+	}
+	return L("array", elems...), nil
+}
+
+func (p *parser) params() (S, error) {
+	if _, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
+		return nil, err
+	}
+	if p.match(RROUND) {
+		return L("array"), nil
+	}
+	var ps []any
+	for {
+		idTok, err := p.need(ID, "expected parameter name")
+		if err != nil {
+			return nil, err
+		}
+		var t any = L("id", "Any")
+		if p.match(COLON) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: idTok.Line, Col: idTok.Col, Msg: "expected type after ':'"}
+			}
+			e, err := p.expr(0) // parse type as expression
+			if err != nil {
+				return nil, err
+			}
+			t = e
+		}
+		ps = append(ps, L("pair", L("id", idTok.Literal), t))
+		if !p.match(COMMA) {
+			break
+		}
+	}
+	if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
+		return nil, err
+	}
+	return L("array", ps...), nil
+}
+
+// ifExpr builds: ("if", ("pair", cond1, thenBlk1), ("pair", cond2, thenBlk2), ..., [elseBlk?])
+// NOTE: The final element, if present, is a bare ("block", ...) for 'else', not wrapped in a tag.
+func (p *parser) ifExpr() (S, error) {
+	cond, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(THEN, "expected 'then'"); err != nil {
+		return nil, err
+	}
+	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
+	if err != nil {
+		return nil, err
+	}
+	arms := []any{L("pair", cond, thenBlk)}
+	for p.match(ELIF) {
+		c, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.need(THEN, "expected 'then'"); err != nil {
+			return nil, err
+		}
+		b, err := p.blockUntil(END, ELIF, ELSE)
+		if err != nil {
+			return nil, err
+		}
+		arms = append(arms, L("pair", c, b))
+	}
+	var elseTail []any
+	if p.match(ELSE) {
+		b, err := p.blockUntil(END)
+		if err != nil {
+			return nil, err
+		}
+		elseTail = []any{b}
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return L("if", append(arms, elseTail...)...), nil
+}
+
+// Parse a block; if requireDo is true, assert a leading 'do'.
+// Always requires a trailing 'end'.
+func (p *parser) parseBlock(requireDo bool) (S, error) {
+	if requireDo {
+		if _, err := p.need(DO, "expected 'do'"); err != nil {
+			return nil, err
+		}
+	}
+	b, err := p.blockUntil(END)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func (p *parser) blockUntil(stops ...TokenType) (S, error) {
+	stop := map[TokenType]bool{}
+	for _, s := range stops {
+		stop[s] = true
+	}
+	var items []any
+	for !p.atEnd() && !stop[p.peek().Type] {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, e)
+	}
+	return L("block", items...), nil
+}
+
+func (p *parser) forExpr() (S, error) {
+	// for <target> in <expr> do ... end
+	tgt, err := p.forTarget()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(IN, "expected 'in'"); err != nil {
+		return nil, err
+	}
+	iter, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	return L("for", tgt, iter, body), nil
+}
+
+func (p *parser) whileExpr() (S, error) {
+	// while COND do ... end
+	cond, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	return L("while", cond, body), nil
+}
+
+func (p *parser) forTarget() (S, error) {
+	// Allow explicit `let <pattern>`
+	if p.match(LET) {
+		return p.declPattern()
+	}
+
+	// If the next token clearly starts a pattern, parse a *declaration* pattern
+	// (implicit binding) just like Python: `for [k, v] in ...` or `for {k:x} in ...`.
+	switch p.peek().Type {
+	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
+		save := p.i
+		pt, err := p.declPattern()
+		if err == nil {
+			return pt, nil // e.g., ("darr", ...), ("dobj", ...)
+		}
+		// In interactive mode, bubble up incompleteness instead of falling back
+		if p.interactive && IsIncomplete(err) {
+			return nil, err
+		}
+		p.i = save // fall back below if pattern parse fails
+	}
+
+	// Otherwise, parse a simple prim+postfix expression and require it's assignable
+	save := p.i
+	e, err := p.expr(90)
+	if err != nil {
+		return nil, err
+	}
+	if !assignable(e) {
+		p.i = save
+		g := p.peek()
+		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "invalid for-target (must be id/get/idx/decl/pattern)"}
+	}
+
+	// Bare id → implicit declaration, same as before
+	if e[0].(string) == "id" {
+		return L("decl", e[1].(string)), nil
+	}
+	return e, nil
+}
+
+func assignable(n S) bool {
+	if len(n) == 0 {
+		return false
+	}
+	switch n[0] {
+	case "id", "get", "idx", "decl", "darr", "dobj":
+		return true
+	default:
+		return false
+	}
+}
+
+// ----- Declaration patterns (with annotation wrapper) -----
+
+func (p *parser) declPattern() (S, error) {
+	// Allow stacked line-leading annotations to wrap the next pattern
+	if p.match(ANNOTATION) {
+		txt := ""
+		if s, ok := p.prev().Literal.(string); ok {
+			txt = s
+		}
+		sub, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		return L("annot", L("str", txt), sub), nil
+	}
+
+	if p.match(ID) {
+		return L("decl", p.prev().Literal), nil
+	}
+	if p.match(LSQUARE, CLSQUARE) {
+		return p.arrayDeclPattern()
+	}
+	if p.match(LCURLY) {
+		return p.objectDeclPattern()
+	}
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
+	}
+	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
+}
+
+func (p *parser) arrayDeclPattern() (S, error) {
+	if p.match(RSQUARE) {
+		return L("darr"), nil
+	}
+	var parts []any
+	for {
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, pt)
+		if !p.match(COMMA) {
+			break
+		}
+	}
+	if _, err := p.need(RSQUARE, "expected ']' in array pattern"); err != nil {
+		return nil, err
+	}
+	return L("darr", parts...), nil
+}
+
+// read a key token and turn it into ("str", key)
+func (p *parser) readKeyString() (S, error) {
+	// Allow annotation(s) directly in front of the key.
+	if p.match(ANNOTATION) {
+		txt := ""
+		if s, ok := p.prev().Literal.(string); ok {
+			txt = s
+		}
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		return L("annot", L("str", txt), k), nil
+	}
+
+	// Quoted key.
+	if p.match(STRING) {
+		return L("str", p.prev().Literal), nil
+	}
+
+	// Any word-like token (identifier, built-in type, or keyword), plus true/false/null.
+	t := p.peek()
+	switch t.Type {
+	case ID, TYPE,
+		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
+		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
+		TYPECONS, ENUM,
+		BOOLEAN, NULL:
+		p.i++
+		name := t.Lexeme
+		if s, ok := t.Literal.(string); ok { // ID/TYPE carry string Literal
+			name = s
+		}
+		return L("str", name), nil
+	}
+
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected key"}
+	}
+	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key"}
+}
+
+func (p *parser) keyRequired() (key S, required bool, err error) {
+	k, err := p.readKeyString()
+	if err != nil {
+		return nil, false, err
+	}
+	req := p.match(BANG)
+	return k, req, nil
+}
+
+func (p *parser) objectDeclPattern() (S, error) {
+	if p.match(RCURLY) {
+		return L("dobj"), nil
+	}
+	var pairs []any
+	for {
+		key, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
+			return nil, err
+		}
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, L("pair", key, pt))
+		if !p.match(COMMA) {
+			break
+		}
+	}
+	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
+		return nil, err
+	}
+	return L("dobj", pairs...), nil
+}
+=== END FILE: parser.go ===
 

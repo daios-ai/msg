@@ -1,16 +1,211 @@
-// parser_pratt.go (interactive-ready, newline-sensitive control keywords)
+// parser.go: Pratt parser for MindScript that produces Lisp-style S-expressions.
+//
+// OVERVIEW
+// --------
+// This file implements a newline-aware, interactive-ready Pratt parser for the
+// MindScript language. The parser consumes the token stream produced by the
+// lexer (see lexer.go) and returns a compact, Lisp-y S-expression (AST) where
+// each node is encoded as []any with a leading tag string, e.g.:
+//
+//	("binop", "+", ("int", 1), ("id", "x"))
+//
+// DEPENDENCIES
+// ------------
+// • lexer.go — provides:
+//   - Token / TokenType definitions and all token kinds used here
+//   - Lexer, NewLexer, NewLexerInteractive
+//   - IncompleteError and IsIncomplete(err)
+//
+// • standard library: fmt (for error messages)
+//
+// PARSING MODE & INTERACTIVITY
+// ----------------------------
+// Two entry points are provided:
+//
+//	ParseSExpr(src string)            — normal parsing (unterminated input is a ParseError)
+//	ParseSExprInteractive(src string) — REPL-friendly (unterminated input becomes IncompleteError)
+//
+// In interactive mode, reaching EOF inside a construct (e.g., missing ')', ']', '}', 'end',
+// or RHS after an operator/unary) yields IncompleteError with a precise position.
+//
+// OUTPUT SHAPE (AST)
+// ------------------
+// The result is always a top-level block:
+//
+//	("block", expr1, expr2, ...)
+//
+// Node forms (tags) the parser emits:
+//
+// Literals & identifiers:
+//
+//	("id",   name)           // identifiers and builtin TYPE tokens (e.g., "Int") used as names
+//	("int",  int64)
+//	("num",  float64)
+//	("str",  string)
+//	("bool", bool)
+//	("null")
+//
+// Unary/postfix:
+//
+//	("unop", "-",   expr)    // prefix minus
+//	("unop", "not", expr)    // logical not
+//	("unop", "?",   expr)    // postfix optional operator
+//
+// Calls / property / indexing:
+//
+//	("call", callee, arg1, arg2, ...)
+//	("idx",  object, indexExpr)                // obj[expr] or obj.<integer> or obj.(expr)
+//	("get",  object, ("str", propertyName))    // obj.<id> or obj."string"
+//
+// Arrays & maps:
+//
+//	("array", elements...)
+//	("map", ("pair",  keyStrExpr, valueExpr)*)
+//	("map", ("pair!", keyStrExpr, valueExpr)* ) // key marked required via '!' in literal (e.g., {name!: "x"})
+//
+// Enum sugar:
+//
+//	Enum[ e1, e2, ... ] → ("enum", e1, e2, ...)
+//
+// Functions & oracles:
+//
+//	fun (p1[: T], p2[: T], ...) [-> Ret] do ... end
+//	   → ("fun",   paramsArray, RetOr("id","Any"), bodyBlock)
+//	oracle (p1[: T], ...) [-> Out] [from SourceExpr]
+//	   → ("oracle", paramsArray, OutOr("id","Any"), SourceOr("array"))
+//
+// where paramsArray is ("array", ("pair", ("id", name), typeExpr), ...).
+//
+// Blocks and control:
+//
+//	do ... end                → ("block", ...)
+//	if cond then … elif … else … end
+//	   → ("if", ("pair", cond1, thenBlock1), ("pair", cond2, thenBlock2), [, elseBlock])
+//	for <target> in <iter> do ... end → ("for", target, iter, body)
+//	while cond do ... end             → ("while", cond, body)
+//
+// Return/break/continue (newline-sensitive):
+//
+//	If the next token is on the SAME line → take a following expression.
+//	Else (or at EOF)                      → implicit null.
+//	Examples:
+//	  return 1      → ("return", ("int", 1))
+//	  return\nx     → ("return", ("null"))
+//
+// Declaration patterns (used by `let` and `for` targets):
+//
+//	("decl", name)                        // let x
+//	("darr", p1, p2, ...)                 // let [a, b, ...]
+//	("dobj", ("pair", keyStrExpr, p), ...) // let {k: p, ...}
+//
+// Annotations may wrap the next pattern or expression:
+//
+//	("annot", ("str", text), node)
+//
+// Operators & precedence (higher binds tighter; '=' and '->' are right-assoc):
+//
+//	70: * / %
+//	60: + -
+//	50: < <= > >=
+//	40: == !=
+//	30: and
+//	20: or
+//	15: ->
+//	10: =
+//
+// '=' yields ("assign", target, value) and requires an assignable target: one of
+// "id", "get", "idx", "decl", "darr", "dobj".
+//
+// ERROR MODEL
+// -----------
+// • ParseError  — structural/grammar problems with location.
+// • IncompleteError (interactive mode) — source ended while a construct was incomplete.
+//
+// NOTE ON WHITESPACE RULE FOR CALLS/PARAM LISTS
+// -------------------------------------
+// The lexer classifies '(' and '[' based on *immediate* preceding whitespace:
+//
+//   - '('  → LROUND  if there IS preceding whitespace
+//     → CLROUND if there is NO preceding whitespace
+//   - '['  → LSQUARE if there IS preceding whitespace
+//     → CLSQUARE if there is NO preceding whitespace
+//
+// This distinction lets the parser treat juxtaposition forms as calls/indexing
+// without lookbehind, and treat spaced forms as grouping/array literals.
+//
+// Consequences (important user-facing syntax):
+//
+//   - Calls and parameter lists require NO space before '(':
+//     f(x)         // call: CLROUND
+//     fun(x: T)    // function params: CLROUND
+//     oracle(x: T) // oracle params: CLROUND
+//     Using a space changes the token to LROUND and will NOT be seen as a call.
+//     Example: "f (x)" parses as identifier 'f' followed by a grouped expression,
+//     not a function call.
+//
+//   - Indexing requires NO space before '[':
+//     arr[i]    // CLSQUARE (indexing)
+//     With a space ("arr [i]"), '[' becomes LSQUARE and is NOT treated as indexing.
+//
+//   - Plain grouping still works with both LROUND/CLROUND:
+//     (expr)   // grouping
+//     but only CLROUND participates in call/postfix chains.
+//
+// NOTE ON TOKENS & NEWLINES
+// -------------------------
+// The parser relies on token positions provided by the lexer. For newline-sensitive
+// behavior of return/break/continue, it checks whether the next token shares the same line.
+//
+// The complete behavior above is sufficient to consume this API without reading the
+// implementation details below.
 package mindscript
 
 import (
 	"fmt"
 )
 
-// S expression: ("tag" children/atoms...)
-// Represented as []any so it serializes naturally and stays Lisp-y.
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// S is the S-expression node representation used by the parser.
+// It is a []any whose first element is a string tag (e.g., "binop", "id", "array").
+// Subsequent elements are the node’s children or data.
+//
+// Common node forms (non-exhaustive):
+//
+//	("block", n1, n2, ...)
+//	("id",   name)            // string name
+//	("int",  int64)
+//	("num",  float64)
+//	("str",  string)
+//	("bool", bool)
+//	("null")
+//	("unop", op, rhs)         // op is string: "-", "not", "?"
+//	("binop", op, lhs, rhs)   // op is string: "+", "and", "==", ...
+//	("assign", target, value) // "="
+//	("call", callee, arg...)
+//	("get",  obj, ("str", name))
+//	("idx",  obj, indexExpr)
+//	("array", ...)
+//	("map", ("pair",  keyStrExpr, value)*)
+//	("map", ("pair!", keyStrExpr, value)*)
+//	("enum", ...)
+//	("fun", paramsArray, retTypeExprOrAny, bodyBlock)
+//	("oracle", paramsArray, outTypeExprOrAny, sourceExprOrEmptyArray)
+//	("if", ("pair", cond, thenBlock)* [, elseBlock])
+//	("while", cond, bodyBlock)
+//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//	("decl", name) | ("darr", ...) | ("dobj", ("pair", keyStrExpr, pat)*)
+//	("annot", ("str", text), wrappedNode)
 type S = []any
 
+// L is a small helper to build S-expression nodes. The first argument is the
+// string tag; the remaining arguments are appended as children.
 func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
 
+// ParseError reports a non-interactive parse failure with a location.
+// Typical causes: unexpected tokens, missing delimiters, invalid assignment target.
 type ParseError struct {
 	Line, Col int
 	Msg       string
@@ -20,7 +215,30 @@ func (e *ParseError) Error() string {
 	return fmt.Sprintf("PARSE ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
 }
 
-// ---------- public entry ----------
+// ParseSExpr parses a MindScript source string into an S-expression AST.
+// It lexes the source using NewLexer (normal mode) and parses according to the
+// grammar summarized in the file header comments.
+//
+// Returns:
+//   - S  — a top-level ("block", ...) node.
+//   - error — *ParseError on grammar problems, or lexer errors propagated.
+//
+// Newline-sensitive control:
+//
+//	return/break/continue take an expression only if the next token is on the same line;
+//	otherwise they default to ("null").
+//
+// Property/index/call chaining:
+//   - Calls:           f(args...)             → ("call", f, args...)
+//   - Index:           a[b]                   → ("idx", a, b)
+//   - Computed dot:    a.(expr)               → ("idx", a, expr)
+//   - Numeric dot:     a.42                   → ("idx", a, ("int", 42))
+//   - Named property:  a.name / a."name"      → ("get", a, ("str", "name"))
+//
+// Operators:
+//
+//	Precedence and associativity are as listed in the header; "=" and "->" are right-assoc.
+//	"=" yields ("assign", target, value) and requires assignable targets.
 func ParseSExpr(src string) (S, error) {
 	lex := NewLexer(src)
 	toks, err := lex.Scan()
@@ -31,8 +249,11 @@ func ParseSExpr(src string) (S, error) {
 	return p.program()
 }
 
-// Interactive entry: produces IncompleteError (instead of ParseError) when input
-// ends mid-construct (e.g., missing ')', 'end', RHS of operator, etc.).
+// ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
+// and returns *IncompleteError when the input ends mid-construct (e.g., missing
+// ')', ']', '}', 'end', or the RHS of an operator/unary).
+//
+// Use IsIncomplete(err) to detect this case in a REPL and request more input.
 func ParseSExprInteractive(src string) (S, error) {
 	lex := NewLexerInteractive(src)
 	toks, err := lex.Scan()
@@ -43,7 +264,13 @@ func ParseSExprInteractive(src string) (S, error) {
 	return p.program()
 }
 
-// ---------- core Pratt parser ----------
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                           PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// Pratt parser state
 type parser struct {
 	toks        []Token
 	i           int
@@ -275,9 +502,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("oracle", params, out, src)
 
 	case RETURN, BREAK, CONTINUE:
-		// New behavior:
-		// - If the next token is on the SAME line, parse a following expression.
-		// - If the next token is on a NEW line or we're at EOF, treat as <kw> null.
+		// Newline-sensitive behavior; see file header.
 		if !p.nextTokenIsOnSameLine(t) {
 			switch t.Type {
 			case RETURN:
@@ -420,7 +645,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			continue
 		case PERIOD:
 			p.i++
-			// NEW: obj.(EXPR) → idx(obj, EXPR)
+			// obj.(EXPR) → idx(obj, EXPR)
 			if p.match(LROUND) || p.match(CLROUND) {
 				ex, err := p.expr(0)
 				if err != nil {
@@ -484,7 +709,7 @@ func (p *parser) expr(minBP int) (S, error) {
 // ---------- helpers ----------
 
 func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	// We’ve already consumed the opening '[' or '~['
+	// We’ve already consumed the opening '['
 	if p.match(RSQUARE) {
 		return L("array"), nil
 	}

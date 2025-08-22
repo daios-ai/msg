@@ -1,19 +1,97 @@
-// vm.go
+// vm.go: minimal bytecode virtual machine for MindScript.
+//
+// OVERVIEW
+// --------
+// This file implements a compact, goroutine-safe, stack-based VM that executes
+// MindScript bytecode ("Chunk") and returns a result Value. The VM is *intended
+// to be internal* to the package: it exposes only the Chunk container in the
+// public section; everything else (opcodes, instruction encoding, VM loop) is
+// private implementation detail.
+//
+// Execution model
+//   - The interpreter (see interpreter.go) lowers S-expr AST into a Chunk using
+//     a small emitter. This VM then executes that Chunk in a given lexical Env.
+//   - The VM keeps the public engine surface stable by delegating CALL to
+//     Interpreter.Apply semantics via a private helper (applyArgsScoped). That
+//     preserves currying, native dispatch, type checks, and call-site scoping.
+//   - Runtime errors inside the VM are reported as annotated null Values and
+//     surfaced via a vmRuntimeError status to the interpreter.
+//
+// Instruction encoding (private)
+//   - 32-bit instruction: [ opcode:8 | imm:24 ].
+//   - Opcodes cover constants/globals, stack ops, property/index access,
+//     arithmetic/compare/unary, control flow, and calls.
+//   - The emitter (interpreter.go) constructs instruction words via `pack`.
+//     Decoding uses `uop` and `uimm`. These are all private to the package.
+//
+// Data & semantics used by the VM
+//   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
+//   - Env (lexical chain) for resolving globals
+//   - Interpreter methods: deepEqual, applyArgsScoped
+//   - Negative array indices wrap (Python-like): i := (i%len + len) % len
+//   - Property access on maps/modules; index access on arrays/maps
+//   - Numeric ops preserve integers where possible; division/mod guard zero;
+//     string relational comparisons are supported for <, <=, >, >=.
+//   - Control flow: Return yields vmReturn with a Value; fallthrough yields vmOK.
+//
+// DEPENDENCIES (other files)
+// --------------------------
+// • interpreter.go
+//   - Value/ValueTag/Null/Arr/Bool/Int/Num, MapObject, Env
+//   - (ip *Interpreter).deepEqual, (ip *Interpreter).applyArgsScoped
+//   - errNull, isNumber, toFloat helpers
+//
+// • modules.go (not shown here)
+//   - Module type and (m *Module).get(name) (used for VTModule property lookups)
+//
+// • parser.go / lexer.go (indirect; produce AST for the emitter that targets this VM)
+// • types.go (indirect; equality of types via deepEqual resolution)
+//
+// PUBLIC vs PRIVATE
+// -----------------
+// PUBLIC  : Chunk (bytecode container) — the only stable surface exported here.
+// PRIVATE : opcodes, instruction packing, VM loop/state, vmResult/status, helpers.
 package mindscript
-
-// A minimal, internal bytecode VM.
-// - Goroutine-safe (no package-level mutability).
-// - Preserves the public, stable engine surface (Interpreter methods).
-// - CALL delegates to Interpreter.Apply to keep currying & native dispatch.
 
 import (
 	"fmt"
 	"math"
 )
 
-// -----------------------------
-// Instruction encoding
-// -----------------------------
+////////////////////////////////////////////////////////////////////////////////
+//                                   PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// Chunk is an immutable bytecode container executed by the VM.
+//
+// Layout:
+//
+//	Code   — instruction stream; each instruction is a 32-bit word where the
+//	         high 8 bits encode the opcode and the low 24 bits hold an unsigned
+//	         immediate (operand). The encoding details are private to the VM.
+//	Consts — constant pool referenced by instructions (e.g., opConst pushes
+//	         Consts[k], opLoadGlobal/opGetProp carry string names as VTStr).
+//
+// Producer & consumer:
+//   - Produced by the internal emitter (see interpreter.go) from an S-expr AST.
+//   - Consumed only by the VM entry (private) to execute code in an Env.
+//
+// Stability contract:
+//   - The existence of Chunk and its fields is stable for code that needs to
+//     hand bytecode across subsystems within this package. The instruction set
+//     and encoding are *not* public API.
+type Chunk struct {
+	Code   []uint32
+	Consts []Value
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// ---------- Instruction encoding (private) ----------
 
 type opcode uint8
 
@@ -68,18 +146,7 @@ func asMap(v Value) *MapObject {
 	return v.Data.(*MapObject)
 }
 
-// -----------------------------
-// Bytecode container (internal)
-// -----------------------------
-
-type Chunk struct {
-	Code   []uint32
-	Consts []Value
-}
-
-// -----------------------------
-// VM status/result
-// -----------------------------
+// ---------- VM status/result (private) ----------
 
 type vmStatus int
 
@@ -94,9 +161,7 @@ type vmResult struct {
 	value  Value
 }
 
-// -----------------------------
-// VM machine
-// -----------------------------
+// ---------- VM state & helpers (private) ----------
 
 type vm struct {
 	ip    *Interpreter
@@ -139,10 +204,6 @@ func (m *vm) top() Value {
 func (m *vm) fail(msg string) vmResult {
 	return vmResult{status: vmRuntimeError, value: errNull(msg)}
 }
-
-// -----------------------------
-// Numeric helpers (mirror interpreter semantics)
-// -----------------------------
 
 // Numeric helpers (mirror interpreter semantics)
 func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
@@ -220,10 +281,16 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 	return Value{}, &vmResult{status: vmRuntimeError, value: errNull("bad numeric operator")}
 }
 
-// -----------------------------
-// VM runner
-// -----------------------------
+// ---------- VM entry point (private) ----------
 
+// runChunk executes a bytecode Chunk in the provided environment.
+// It implements the full instruction set and returns:
+//   - vmOK          with the top-of-stack (or Null) if the program fell through,
+//   - vmReturn      with the explicit return value,
+//   - vmRuntimeError with an annotated-null explaining the error.
+//
+// Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
+// currying, native dispatch, type checks, and call-site scoping.
 func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResult {
 	m := &vm{
 		ip:    ip,
@@ -285,6 +352,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 				return m.fail("pop on empty stack")
 			}
 			m.sp--
+
 		// ---- properties / indices ----
 		case opGetProp:
 			if int(imm) >= len(consts) {
@@ -310,7 +378,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 				return m.fail(fmt.Sprintf("unknown property %q", key))
 			}
 
-			// Module export lookup stays the same
+			// Module export lookup
 			if obj.Tag == VTModule {
 				mod := obj.Data.(*Module)
 				if v, ok := mod.get(key); ok {
@@ -360,7 +428,6 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 			return m.fail("index requires array[int] or map[string]")
 
 		// ---- arithmetic / compare / unary ----
-
 		case opSub, opMul, opDiv, opMod, opLt, opLe, opGt, opGe:
 			b := m.pop()
 			a := m.pop()

@@ -1,4 +1,52 @@
-// schema.go
+// schema.go: bidirectional conversion between MindScript types and JSON Schema.
+//
+// Overview
+// --------
+// This file implements the value-centric bridge between MindScript’s type system
+// (expressed as S-expressions and runtime VTType values) and JSON Schema. It
+// provides:
+//   - S-expr/VTType → JSON Schema (with alias preservation via $ref + $defs)
+//   - JSON Schema   → MindScript S-expr/VTType (best-effort, widening unknowns)
+//   - Two small helpers to parse a type string and parse a JSON Schema string.
+//
+// Key design choices
+// ------------------
+//   - Alias preservation: We *do not* resolve type aliases during S→Schema
+//     conversion. A type reference ("id","User") becomes {"$ref":"#/$defs/User"},
+//     and we simultaneously materialize its definition under "$defs". This keeps
+//     schemas stable and avoids inlining large graphs. Cycles are guarded.
+//   - Open-world objects: MindScript objects allow extra fields; we therefore do
+//     not emit "additionalProperties": false. (Callers can post-process if needed.)
+//   - Nullable handling: For built-ins we prefer the short form
+//     "type": ["<kind>", "null"]. Otherwise we emit anyOf [ <schema(T)>, {type:null} ]
+//     so that references remain references instead of getting inlined.
+//   - Functions: There is no faithful JSON-Schema analog for function types;
+//     we widen to Any ({}) on export and accept {} back as Any on import.
+//   - Enums: Literal enums can contain scalars, arrays, or maps. We deep-convert
+//     these both ways.
+//
+// Dependencies (within this package)
+// ----------------------------------
+//   - interpreter.go:   Value, ValueTag (VT*), TypeValue, withAnnot, TypeVal,
+//     Env, Interpreter, and the helper unwrapKeyStr (used to
+//     obtain a map key name from a type AST key node).
+//   - types.go:         S (the S-expr alias) and helper isId.
+//   - parser.go:        ParseSExpr (used by TypeStringToS).
+//
+// Public API surface (this file)
+// ------------------------------
+//
+//	func (ip *Interpreter) TypeValueToJSONSchema(tv Value, env *Env) map[string]any
+//	func (ip *Interpreter) JSONSchemaToTypeValue(doc map[string]any) Value
+//	func TypeStringToS(src string) (S, error)
+//	func JSONSchemaStringToObject(jsonStr string) (map[string]any, error)
+//
+// Notes
+// -----
+//   - The methods above are the supported public surface. All other identifiers
+//     in this file are private implementation details.
+//   - Behavior is documented thoroughly below so the API can be used without
+//     reading the private section.
 package mindscript
 
 import (
@@ -7,17 +55,60 @@ import (
 	"strings"
 )
 
-// Public API (value-centric)
-// --------------------------
+/* =======================================================================================
+   PUBLIC API
+   ======================================================================================= */
 
-// TypeValueToJSONSchema converts a MindScript **Type Value** (VTType) into a JSON Schema object.
-// The Value.Annot (if non-empty) is emitted as the top-level "description".
-// Aliases referenced by ("id","Name") that are bound in env to VTType are emitted
-// as {"$ref":"#/$defs/Name"} and materialized under "$defs".
+// TypeValueToJSONSchema converts a MindScript **type value** (Value.Tag == VTType)
+// into a JSON Schema root object.
+//
+// Input
+//
+//	tv   : a Value whose Tag is VTType. Its Data may be either *TypeValue (preferred)
+//	       or, for legacy payloads, an S (type S-expr). If tv.Annot is non-empty,
+//	       it becomes the schema "description" (unless a top-level type annotation
+//	       provides one; Value.Annot wins).
+//	env  : the environment used to resolve ("id","Alias") references into $ref/$defs.
+//	       If env == nil and tv.Data is *TypeValue with a non-nil Env, that Env is
+//	       used instead.
+//
+// Output
+//
+//	A map[string]any representing the JSON Schema root. When the converter encounters
+//	("id","Name") and env binds Name to a VTType, it emits {"$ref":"#/$defs/Name"}
+//	and materializes the aliased schema under "$defs"."Name". Cycles are handled by
+//	a visiting guard.
+//
+// Mapping summary
+//
+//	("id","Any")         → {}
+//	("id","Null")        → {"type":"null"}
+//	("id","Bool")        → {"type":"boolean"}
+//	("id","Int")         → {"type":"integer"}
+//	("id","Num")         → {"type":"number"}
+//	("id","Str")         → {"type":"string"}
+//	("unop","?", T)      → if T is builtin then {"type":[kind,"null"]}
+//	                       else {"anyOf":[ schema(T), {"type":"null"} ]}
+//	("array", T)         → {"type":"array","items":schema(T)}   (items:{} if T missing)
+//	("map", pairs...)    → {"type":"object","properties":{...},"required":[...]}.
+//	                       Key annotations (annot(...,"str")) become property "description".
+//	("enum", lits...)    → {"enum":[ json(lit)... ]}
+//	functions (A -> B)   → {}   (widened to Any)
+//	top-level ("annot", ("str",desc), T) lifts "description" when not provided by tv.Annot.
+//
+// Open-world: "additionalProperties" is intentionally omitted.
+//
+// Panics: none. This function only returns a map.
+//
+// Examples
+//
+//	// alias User := {name!: Str, age: Int?}
+//	ip.TypeValueToJSONSchema(TypeVal(S{"id","User"}), env) ==>
+//	  {"$ref":"#/$defs/User","$defs":{"User":{"type":"object", ...}}}
 func (ip *Interpreter) TypeValueToJSONSchema(tv Value, env *Env) map[string]any {
 	tS := typeAstFromValueData(tv.Data)
 
-	// If caller didn’t pass an env, prefer the type’s captured env (when present)
+	// Prefer the type’s defining env if caller didn’t supply one.
 	if env == nil {
 		if tvv, ok := tv.Data.(*TypeValue); ok && tvv.Env != nil {
 			env = tvv.Env
@@ -41,9 +132,36 @@ func (ip *Interpreter) TypeValueToJSONSchema(tv Value, env *Env) map[string]any 
 	return root
 }
 
-// JSONSchemaToTypeValue converts a JSON Schema (root object) into a MindScript **Type Value**.
-// The returned Value has Tag=VTType, Data=S (the type S-expr), and Annot filled from the
-// schema's top-level "description" (if present). Unsupported features widen to Any.
+// JSONSchemaToTypeValue converts a JSON Schema root object into a MindScript
+// **type value** (Value{Tag: VTType}).
+//
+// Input
+//
+//	doc : root JSON object (decoded into map[string]any). Extra/unknown fields are
+//	      ignored; unsupported features widen to Any. If doc == nil, returns Any.
+//
+// Output
+//
+//	A Value with Tag = VTType whose Data is an S (type S-expr). If the JSON Schema
+//	contains a top-level "description" string, it is propagated into Value.Annot.
+//
+// Mapping summary (subset)
+//
+//	{"type":"null"}        → ("id","Null")
+//	{"type":"boolean"}     → ("id","Bool")
+//	{"type":"integer"}     → ("id","Int")
+//	{"type":"number"}      → ("id","Num")
+//	{"type":"string"}      → ("id","Str")
+//	{"type":"array",items:X} → ("array", S(X))           (items missing ⇒ Any)
+//	{"type":"object", properties:{k:X}, required:[...]} → ("map", ("pair"| "pair!", ("str",k), S(X))...)
+//	{"enum":[...]}         → ("enum", litS...)
+//	{"nullable":true, ...} → S(...)?
+//	{"anyOf":[A,{"type":"null"}]} (or oneOf) → S(A)?
+//	{"type":["T","null"]}  → S(T)?
+//	{"$ref":"#/$defs/Name"}|{"$ref":"#/definitions/Name"} → ("id","Name")
+//	Other/remote $ref or complex unions → Any.
+//
+// Panics: none. This function only returns a Value.
 func (ip *Interpreter) JSONSchemaToTypeValue(doc map[string]any) Value {
 	if doc == nil {
 		return TypeVal(S{"id", "Any"})
@@ -56,11 +174,19 @@ func (ip *Interpreter) JSONSchemaToTypeValue(doc map[string]any) Value {
 	return withAnnot(TypeVal(t), annot)
 }
 
-// --- Tiny helpers: string -> S-expr type, string -> JSON object ---
-
-// TypeStringToS parses a MindScript *type* written as a single expression
-// into its S-expr form. It uses the existing Pratt parser.
-// Examples: "Int", "Str?", "[Int]", "{name!: Str}"
+// TypeStringToS parses a MindScript *type* written as a single expression into
+// its S-expr representation. It uses the normal Pratt parser.
+//
+// Input
+//
+//	src : a single type expression (e.g., "Int", "Str?", "[Int]", "{name!: Str}").
+//
+// Output
+//
+//	The S-expr for that type. If the parsed source contains more than one
+//	top-level expression, an error is returned.
+//
+// Panics: none. This function returns an error for invalid syntax.
 func TypeStringToS(src string) (S, error) {
 	ast, err := ParseSExpr(src)
 	if err != nil {
@@ -74,28 +200,33 @@ func TypeStringToS(src string) (S, error) {
 					return sub, nil
 				}
 			}
-			// If there are multiple expressions, treat that as an error for a type.
 			return nil, fmt.Errorf("expected a single type expression")
 		}
 	}
-	// If it's not a block (unlikely), return as-is.
 	return ast, nil
 }
 
-// JSONSchemaStringToObject parses a JSON Schema string into a Go map object
-// (suitable for JSONSchemaToTypeValue). Unsupported/extra fields are preserved.
+// JSONSchemaStringToObject decodes a JSON Schema document from a string into
+// a Go map suitable for JSONSchemaToTypeValue. Unknown fields are preserved.
+//
+// Note: by design the decoder does *not* use UseNumber; numeric literals are
+// decoded as float64 to match downstream expectations.
 func JSONSchemaStringToObject(jsonStr string) (map[string]any, error) {
 	var m map[string]any
 	dec := json.NewDecoder(strings.NewReader(jsonStr))
-	// NOTE: do NOT UseNumber here — downstream expects float64 for JSON numbers.
 	if err := dec.Decode(&m); err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
-// Internal tiny helper used above.
-// Extracts a single leading ("annot", ("str", text), inner) if present.
+//// END_OF_PUBLIC
+
+/* =======================================================================================
+   PRIVATE (implementation details)
+   ======================================================================================= */
+
+// popTopAnnotIfAny extracts a single leading ("annot", ("str", text), inner) if present.
 func popTopAnnotIfAny(t S) (string, S) {
 	if len(t) >= 3 {
 		if tag, _ := t[0].(string); tag == "annot" {
@@ -107,7 +238,7 @@ func popTopAnnotIfAny(t S) (string, S) {
 	return "", t
 }
 
-// schema.go (near the top, private helper)
+// typeAstFromValueData unwraps TypeValue payloads to their AST (and supports legacy S).
 func typeAstFromValueData(data any) S {
 	switch tv := data.(type) {
 	case *TypeValue:
@@ -119,12 +250,10 @@ func typeAstFromValueData(data any) S {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// MindScript Type (S) -> JSON Schema
-// -----------------------------------------------------------------------------
+// ----- MindScript Type (S) → JSON Schema -----
 
 func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiting map[string]bool) map[string]any {
-	// REMOVE this line:
+	// Intentionally DO NOT resolve aliases here — we want $ref + $defs, not inlining.
 	// t = ip.resolveType(t, env)
 	if len(t) == 0 {
 		return map[string]any{}
@@ -132,7 +261,7 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 
 	switch t[0].(string) {
 	case "annot":
-		// t = ("annot", ("str", text), subj)
+		// ("annot", ("str", text), subj)
 		text := ""
 		if s, ok := t[1].(S); ok && len(s) >= 2 && s[0].(string) == "str" {
 			text = s[1].(string)
@@ -148,7 +277,6 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 
 	case "id":
 		name := t[1].(string)
-		// Builtins
 		switch name {
 		case "Any":
 			return map[string]any{}
@@ -173,28 +301,24 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 					}
 					if _, ok := defs[name]; !ok {
 						visiting[name] = true
-						// Expand the DEFINITION using the aliased body,
-						// but DO NOT resolve the *reference* itself.
 						defs[name] = ip.msTypeToSchema(typeAstFromValueData(v.Data), env, defs, visiting)
 						delete(visiting, name)
 					}
 					return map[string]any{"$ref": "#/$defs/" + name}
 				}
 			}
-			// Unknown id → widen
 			return map[string]any{}
 		}
 
 	case "unop":
 		if len(t) >= 3 && t[1].(string) == "?" {
 			base := t[2].(S)
-			// Only treat **builtin** primitives specially; do NOT resolve aliases here.
 			if jt, ok := simpleJSONTypeName(base); ok {
 				return map[string]any{"type": []any{jt, "null"}}
 			}
 			return map[string]any{
 				"anyOf": []any{
-					ip.msTypeToSchema(base, env, defs, visiting), // will $ref if base is an alias like ("id","User")
+					ip.msTypeToSchema(base, env, defs, visiting),
 					map[string]any{"type": "null"},
 				},
 			}
@@ -208,29 +332,21 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 				"items": ip.msTypeToSchema(t[1].(S), env, defs, visiting),
 			}
 		}
-		// No element type → Any
-		return map[string]any{
-			"type":  "array",
-			"items": map[string]any{},
-		}
+		return map[string]any{"type": "array", "items": map[string]any{}}
 
 	case "map":
 		props := map[string]any{}
 		var req []any
-
 		for i := 1; i < len(t); i++ {
 			p := t[i].(S) // ("pair"|"pair!", keyNode, valType)
 			ptag := p[0].(string)
 			keyNode := p[1].(S)
 			valT := p[2].(S)
 
-			// 1) name (handles "str" and "annot(..., str)")
 			name := unwrapKeyStr(keyNode)
-
-			// 2) schema for value
 			ps := ip.msTypeToSchema(valT, env, defs, visiting)
 
-			// 3) description from key annotation, if present
+			// key annotation → property description
 			if len(keyNode) > 0 && keyNode[0].(string) == "annot" {
 				if desc, ok := keyNode[1].(S); ok && len(desc) >= 2 && desc[0].(string) == "str" {
 					ps["description"] = desc[1].(string)
@@ -242,7 +358,6 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 				req = append(req, name)
 			}
 		}
-
 		out := map[string]any{"type": "object", "properties": props}
 		if len(req) > 0 {
 			out["required"] = req
@@ -250,7 +365,6 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 		return out
 
 	case "enum":
-		// Convert each literal S to its JSON literal
 		en := []any{}
 		for i := 1; i < len(t); i++ {
 			if jv, ok := sLiteralToJSON(t[i].(S)); ok {
@@ -263,7 +377,7 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 		return map[string]any{"enum": en}
 
 	case "binop":
-		// Functions / arrows have no JSON Schema analog → Any
+		// functions have no JSON Schema analog
 		return map[string]any{}
 	default:
 		return map[string]any{}
@@ -336,15 +450,11 @@ func sLiteralToJSON(lit S) (any, bool) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// JSON Schema -> MindScript Type (S)
-// -----------------------------------------------------------------------------
+// ----- JSON Schema → MindScript Type (S) -----
 
 func (ip *Interpreter) schemaNodeToMSType(node any, root map[string]any, seen map[string]bool) S {
-	// Most nodes should be JSON objects
 	m, ok := node.(map[string]any)
 	if !ok {
-		// Enums handle literal arrays/values elsewhere; bare literal here → Any
 		return S{"id", "Any"}
 	}
 
@@ -354,16 +464,13 @@ func (ip *Interpreter) schemaNodeToMSType(node any, root map[string]any, seen ma
 			// Local pointers we understand: "#/$defs/Name" or "#/definitions/Name"
 			if strings.HasPrefix(ref, "#/") {
 				segs := splitJSONPointer(ref[2:])
-				// common layouts
 				if len(segs) == 2 && (segs[0] == "$defs" || segs[0] == "definitions") {
 					name := segs[1]
-					// Map to ("id","Name") — the env aliasing will handle actual resolution downstream.
 					return S{"id", name}
 				}
-				// If it points to some other place in the same doc, try to resolve the node
+				// If it points elsewhere in the same doc, try to resolve the node
 				target, ok := resolveJSONPointer(root, segs)
 				if ok {
-					// Convert that target; if recursion detected → Any
 					ptr := strings.Join(segs, "/")
 					if seen[ptr] {
 						return S{"id", "Any"}
@@ -395,13 +502,13 @@ func (ip *Interpreter) schemaNodeToMSType(node any, root map[string]any, seen ma
 		}
 	}
 
-	// OpenAPI nullable: true (best-effort)
+	// OpenAPI nullable: true
 	if nb, ok := m["nullable"].(bool); ok && nb {
 		inner := ip.schemaNodeToMSType(without(m, "nullable"), root, seen)
 		return S{"unop", "?", inner}
 	}
 
-	// anyOf / oneOf : accept the two-branch (T, null) shape for nullable
+	// anyOf / oneOf : accept 2-branch (T, null) as nullable
 	for _, key := range []string{"anyOf", "oneOf"} {
 		if v, has := m[key]; has {
 			if arr, ok := v.([]any); ok && len(arr) == 2 {
@@ -413,10 +520,8 @@ func (ip *Interpreter) schemaNodeToMSType(node any, root map[string]any, seen ma
 				if isId(b, "Null") {
 					return S{"unop", "?", a}
 				}
-				// Not a nullable pattern → unsupported union → Any
 				return S{"id", "Any"}
 			}
-			// Complex unions → Any
 			return S{"id", "Any"}
 		}
 	}
@@ -469,7 +574,7 @@ func (ip *Interpreter) schemaNodeToMSType(node any, root map[string]any, seen ma
 		}
 
 	case []any:
-		// Nullable via type: ["T","null"] (or null+T)
+		// type: ["T", "null"] (or reverse) → nullable
 		if len(tv) == 2 {
 			var a, b S
 			if s0, ok := stringOf(tv[0]); ok {
@@ -490,11 +595,10 @@ func (ip *Interpreter) schemaNodeToMSType(node any, root map[string]any, seen ma
 			}
 			return S{"id", "Any"}
 		}
-		// Complex unions → Any
 		return S{"id", "Any"}
 	}
 
-	// If we reach here, we either had constraints we don't model or unknown shapes.
+	// Unknown/unsupported → Any
 	return S{"id", "Any"}
 }
 
@@ -525,7 +629,7 @@ func jsonLiteralToS(j any) (S, bool) {
 			return S{"int", int64(v)}, true
 		}
 		return S{"num", v}, true
-	case int: // in case caller passed non-JSON-normalized map
+	case int:
 		return S{"int", int64(v)}, true
 	case int64:
 		return S{"int", v}, true
@@ -557,7 +661,6 @@ func jsonLiteralToS(j any) (S, bool) {
 }
 
 // JSON Pointer helpers (local refs)
-// ----------------------------------
 
 func splitJSONPointer(ptr string) []string {
 	if ptr == "" {

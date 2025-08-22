@@ -1,46 +1,82 @@
-// types.go
+// types.go: runtime type & schema system for MindScript.
 //
-// MindScript Type & Schema system (runtime-focused)
+// IMPLEMENTATION-ONLY FILE
+// ------------------------
+// This file contains the *private implementation* of the type engine used by
+// the public methods on *Interpreter* that live in interpreter.go:
+//
+//	ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
+//
+// Those exported methods are thin wrappers that delegate to the lower-case
+// functions defined here: resolveType, isType, isSubtype, unifyTypes,
+// valueToTypeS (plus helpers like litToValue/equalS).
 //
 // Goals / design (practical, JSON-friendly, duck-typed):
-//  1. “Natural” typeOf: For concrete values, infer loose shapes. Example:
-//     typeOf({name:"Pedro"}) = {name: Str}          // optional field
-//     Arrays unify element types conservatively (e.g., [1, null] → [Int?]).
-//  2. Precise runtime checks:
-//     - isType(v, T) checks v conforms to T.
-//     - isSubtype(A, B) is structural and sound.
-//     - Objects: required fields must not be relaxed; optional fields can be absent.
-//     - Extra fields in values are allowed (open-world objects).
-//  3. Enums as finite literal sets (not general sum types):
-//     Enum members can be arbitrary literals (null/bool/int/num/str/array/map).
-//     isType compares by deep equality to literal values.
-//     Subtyping:
-//     • Enum[X...] <: Enum[Y...]  iff every X is in Y (by structural equality).
-//     • Enum[X...] <: T           iff every literal X conforms to T (great for duck-typing).
-//     Unification:
-//     • Enum ∪ Enum  = structural set union.
-//     • Enum ∪ T     = T if all literals ∈ T; otherwise Any.
-//  4. No open sum types beyond T? (nullable) and Any (top).
-//  5. Function types use parameter **contravariance** and return **covariance**.
-//     (Matches soundness for callable subtyping; works well with currying).
-//  6. Null as Failure: In MindScript, the value null universally represents failure
-//     or no answer. A function whose return type is T? means: “returns a T on
-//     success, or null to signal failure.”
 //
-// Implementation notes:
-//   - Types are S-exprs (same shape as AST):
-//     ("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
-//     ("unop","?", T)                         // nullable
-//     ("array", T)                            // homogeneous arrays
-//     ("map", ("pair" | "pair!", ("str",k), T) ...)
-//     ("enum", literalS, literalS, ...)
-//     ("binop","->", A, B)                    // function A -> B (right-assoc chains)
-//   - Aliases: ("id", name) resolved from env when bound to VTType (spliced S).
-//   - This file provides: resolveType, isType, isSubtype, unifyTypes, valueToTypeS,
-//     and helpers (equalS/mapTypeFields/...).
+// OVERVIEW
+// --------
+// This file implements MindScript’s *runtime* type system. Types are represented
+// as S-expressions (the same light-weight shape the parser produces) and remain
+// entirely structural. The system is designed for practical, JSON-friendly
+// validation and inference:
+//
+//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
+//     {name:"Pedro"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
+//     Arrays unify element types conservatively; objects are “open-world”.
+//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
+//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
+//   - Arrays are covariant in element type.
+//   - Objects require that all *required* fields of `B` exist, with compatible
+//     types, and *requiredness cannot be relaxed*.
+//   - Extra fields on values are allowed (open-world).
+//   - Functions use parameter contravariance and return covariance.
+//   - `Int <: Num`, and `T?` means nullable.
+//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
+//     inference (e.g., arrays with mixed contents).
+//   - `ResolveType(T, env)` resolves identifiers bound to `VTType` in `env`,
+//     with cycle protection and resolution using the alias’s own environment.
+//   - Enums are finite sets of *literal* values (null/bool/int/num/str/array/map).
+//     Their typing, subtyping, and unification follow intuitive set semantics.
+//
+// TYPE SYNTAX (as S)
+// ------------------
+//
+//	("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
+//	("unop","?", T)                                // nullable T?
+//	("array", T)                                   // homogeneous arrays
+//	("map", ("pair" | "pair!", ("str",k), T) ...)  // object schema; "pair!" = required
+//	("enum", literalS, ...)                        // finite set of literal values
+//	("binop","->", A, B)                           // function A -> B (right-assoc)
+//
+// DEPENDENCIES (other files)
+// --------------------------
+// • parser.go
+//   - `type S = []any`  (S-expression node type)
+//
+// • interpreter.go
+//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
+//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
+//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
+//   - Environments: `Env` with `Get/Set/Define`
+//   - `type Interpreter` (receiver for public API methods)
+//
+// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
+//
+// PUBLIC VS PRIVATE
+// -----------------
+// PUBLIC  : Nothing.
+//
+// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
+//
+//	isSubtype, unifyTypes, valueToTypeS, literal conversion,
+//	structural S-equality, and field extraction.
 package mindscript
 
-// NOTE: no imports needed
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
 
 // -----------------------------
 // Helpers
@@ -169,8 +205,10 @@ func equalNode(x, y any) bool {
 	}
 }
 
-// Deep equality on Values for the literal space used by enums (null/bool/int/num/str/array/map).
-func deepEqual(a, b Value) bool {
+// Deep equality on Values for the literal space used by enums
+// (null/bool/int/num/str/array/map). Named *Lit* to avoid confusion with
+// (*Interpreter).deepEqual used elsewhere.
+func deepEqualLit(a, b Value) bool {
 	if a.Tag != b.Tag {
 		return false
 	}
@@ -192,7 +230,7 @@ func deepEqual(a, b Value) bool {
 			return false
 		}
 		for i := range ax {
-			if !deepEqual(ax[i], bx[i]) {
+			if !deepEqualLit(ax[i], bx[i]) {
 				return false
 			}
 		}
@@ -205,7 +243,7 @@ func deepEqual(a, b Value) bool {
 		}
 		for k, av := range am.Entries {
 			bv, ok := bm.Entries[k]
-			if !ok || !deepEqual(av, bv) {
+			if !ok || !deepEqualLit(av, bv) {
 				return false
 			}
 		}
@@ -472,7 +510,7 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			if !ok {
 				continue
 			}
-			if deepEqual(lv, v) {
+			if deepEqualLit(lv, v) {
 				return true
 			}
 		}

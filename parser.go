@@ -249,6 +249,31 @@ func ParseSExpr(src string) (S, error) {
 	return p.program()
 }
 
+// ParseSExprWithSpans parses `src` into an S-expression AST and also returns a
+// SpanIndex mapping each node (addressed by NodePath) to its source byte span.
+//
+// Behavior:
+//   - The AST is identical to ParseSExpr (stable contract).
+//   - Spans are recorded in post-order (children before parent).
+//   - Spans are half-open byte intervals [StartByte, EndByte) in `src`.
+//   - The top-level ("block", ...) is included.
+//
+// Errors mirror ParseSExpr; lexer errors and parse errors are propagated unchanged.
+func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, nil, err
+	}
+	p := &parser{toks: toks}
+	ast, err := p.program()
+	if err != nil {
+		return nil, nil, err
+	}
+	idx := BuildSpanIndexPostOrder(ast, p.post) // sidecar index (spans.go)
+	return ast, idx, nil
+}
+
 // ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
 // and returns *IncompleteError when the input ends mid-construct (e.g., missing
 // ')', ']', '}', 'end', or the RHS of an operator/unary).
@@ -275,6 +300,17 @@ type parser struct {
 	toks        []Token
 	i           int
 	interactive bool
+	post        []Span
+}
+
+// tokString returns a stable string for tokens used as identifier-like or key names.
+// It prefers Literal when it is a string (e.g., STRING tokens after '.' keep decoded text),
+// otherwise falls back to the verbatim Lexeme.
+func tokString(t Token) string {
+	if s, ok := t.Literal.(string); ok {
+		return s
+	}
+	return t.Lexeme
 }
 
 func (p *parser) atEnd() bool { return p.peek().Type == EOF }
@@ -347,10 +383,25 @@ func (p *parser) program() (S, error) {
 		}
 		items = append(items, e)
 	}
-	return L("block", items...), nil
+	root := L("block", items...)
+	// Append span for the top-level block: cover all non-EOF tokens.
+	// If there are no tokens besides EOF, leave span empty (Start=End=0).
+	startTok := 0
+	endTok := len(p.toks) - 2 // last non-EOF
+	if endTok >= startTok && len(p.toks) > 0 {
+		p.post = append(p.post, Span{
+			StartByte: p.toks[startTok].StartByte,
+			EndByte:   p.toks[endTok].EndByte,
+		})
+	} else {
+		p.post = append(p.post, Span{})
+	}
+	return root, nil
 }
 
 func (p *parser) expr(minBP int) (S, error) {
+	// Record the token index at which this expression starts.
+	nodeStartTok := p.i
 	// ---- prefix ----
 	t := p.peek()
 	p.i++
@@ -358,7 +409,7 @@ func (p *parser) expr(minBP int) (S, error) {
 	switch t.Type {
 	case ID, TYPE:
 		// Identifiers and capitalized built-in types behave the same in expressions.
-		left = L("id", t.Literal)
+		left = L("id", tokString(t))
 
 	case ENUM:
 		// Enum[ ... ] sugar → ("enum", ...)
@@ -374,7 +425,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			left = L("enum", it...)
 		} else {
-			left = L("id", t.Literal)
+			left = L("id", tokString(t))
 		}
 
 	case INTEGER:
@@ -662,7 +713,7 @@ func (p *parser) expr(minBP int) (S, error) {
 				continue
 			}
 			if p.match(ID) || p.match(STRING) {
-				left = L("get", left, L("str", p.prev().Literal))
+				left = L("get", left, L("str", tokString(p.prev())))
 				continue
 			}
 			g := p.peek()
@@ -702,7 +753,22 @@ func (p *parser) expr(minBP int) (S, error) {
 			left = L("binop", op.Lexeme, left, right)
 		}
 	}
-
+	// On completion of this node, append its span (post-order).
+	// Use tokens[nodeStartTok ... p.i-1].
+	if p.i-1 >= nodeStartTok && nodeStartTok < len(p.toks) {
+		endTok := p.i - 1
+		// Guard against EOF being the only thing consumed (shouldn't happen).
+		if endTok >= 0 && endTok < len(p.toks) {
+			p.post = append(p.post, Span{
+				StartByte: p.toks[nodeStartTok].StartByte,
+				EndByte:   p.toks[endTok].EndByte,
+			})
+		} else {
+			p.post = append(p.post, Span{})
+		}
+	} else {
+		p.post = append(p.post, Span{})
+	}
 	return left, nil
 }
 
@@ -754,7 +820,7 @@ func (p *parser) params() (S, error) {
 			}
 			t = e
 		}
-		ps = append(ps, L("pair", L("id", idTok.Literal), t))
+		ps = append(ps, L("pair", L("id", tokString(idTok)), t))
 		if !p.match(COMMA) {
 			break
 		}
@@ -931,21 +997,17 @@ func assignable(n S) bool {
 // ----- Declaration patterns (with annotation wrapper) -----
 
 func (p *parser) declPattern() (S, error) {
-	// Allow stacked line-leading annotations to wrap the next pattern
-	if p.match(ANNOTATION) {
-		txt := ""
-		if s, ok := p.prev().Literal.(string); ok {
-			txt = s
-		}
+	// Allow stacked line-leading annotations to wrap the next pattern.
+	if anns := p.consumeAnnotations(); len(anns) > 0 {
 		sub, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
-		return L("annot", L("str", txt), sub), nil
+		return p.wrapWithAnnotations(anns, sub), nil
 	}
 
 	if p.match(ID) {
-		return L("decl", p.prev().Literal), nil
+		return L("decl", tokString(p.prev())), nil
 	}
 	if p.match(LSQUARE, CLSQUARE) {
 		return p.arrayDeclPattern()
@@ -983,17 +1045,13 @@ func (p *parser) arrayDeclPattern() (S, error) {
 
 // read a key token and turn it into ("str", key)
 func (p *parser) readKeyString() (S, error) {
-	// Allow annotation(s) directly in front of the key.
-	if p.match(ANNOTATION) {
-		txt := ""
-		if s, ok := p.prev().Literal.(string); ok {
-			txt = s
-		}
+	// Allow stacked annotation(s) directly in front of the key.
+	if anns := p.consumeAnnotations(); len(anns) > 0 {
 		k, err := p.readKeyString()
 		if err != nil {
 			return nil, err
 		}
-		return L("annot", L("str", txt), k), nil
+		return p.wrapWithAnnotations(anns, k), nil
 	}
 
 	// Quoted key.
@@ -1001,17 +1059,12 @@ func (p *parser) readKeyString() (S, error) {
 		return L("str", p.prev().Literal), nil
 	}
 
-	// Any word-like token (identifier, built-in type, or keyword), plus true/false/null.
+	// Any word-like token (identifier, builtin TYPE, keywords, true/false/null).
 	t := p.peek()
-	switch t.Type {
-	case ID, TYPE,
-		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
-		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
-		TYPECONS, ENUM,
-		BOOLEAN, NULL:
+	if isWordLike(t.Type) {
 		p.i++
 		name := t.Lexeme
-		if s, ok := t.Literal.(string); ok { // ID/TYPE carry string Literal
+		if s, ok := t.Literal.(string); ok { // ID/TYPE/ENUM may carry string Literal
 			name = s
 		}
 		return L("str", name), nil
@@ -1022,6 +1075,18 @@ func (p *parser) readKeyString() (S, error) {
 		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected key"}
 	}
 	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key"}
+}
+
+// isWordLike reports tokens that can stand in for bare string keys.
+func isWordLike(tt TokenType) bool {
+	switch tt {
+	case ID, TYPE, ENUM, BOOLEAN, NULL,
+		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
+		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
+		TYPECONS:
+		return true
+	}
+	return false
 }
 
 func (p *parser) keyRequired() (key S, required bool, err error) {
@@ -1059,4 +1124,26 @@ func (p *parser) objectDeclPattern() (S, error) {
 		return nil, err
 	}
 	return L("dobj", pairs...), nil
+}
+
+// --- small helpers for annotations ---
+func (p *parser) consumeAnnotations() []string {
+	var texts []string
+	for p.match(ANNOTATION) {
+		txt := ""
+		if s, ok := p.prev().Literal.(string); ok {
+			txt = s
+		}
+		texts = append(texts, txt)
+	}
+	return texts
+}
+
+func (p *parser) wrapWithAnnotations(texts []string, node S) S {
+	// Outer to inner: the first annotation encountered should wrap outermost,
+	// so we apply in reverse to keep order intuitive for stacked blocks.
+	for i := len(texts) - 1; i >= 0; i-- {
+		node = L("annot", L("str", texts[i]), node)
+	}
+	return node
 }

@@ -245,11 +245,13 @@ const (
 //	Line    — 1-based line number at which this token starts.
 //	Col     — 0-based column index at which this token starts.
 type Token struct {
-	Type    TokenType
-	Lexeme  string
-	Literal interface{}
-	Line    int
-	Col     int
+	Type      TokenType
+	Lexeme    string
+	Literal   interface{}
+	Line      int
+	Col       int
+	StartByte int
+	EndByte   int
 }
 
 // LexError reports a lexical error detected during scanning (e.g., invalid
@@ -462,11 +464,13 @@ func (l *Lexer) rewindToStart() {
 func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
 	lex := l.src[l.start:l.cur]
 	tok := Token{
-		Type:    tt,
-		Lexeme:  lex,
-		Literal: lit,
-		Line:    l.tokStartLine,
-		Col:     l.tokStartCol,
+		Type:      tt,
+		Lexeme:    lex,
+		Literal:   lit,
+		Line:      l.tokStartLine,
+		Col:       l.tokStartCol,
+		StartByte: l.start,
+		EndByte:   l.cur,
 	}
 	l.tokens = append(l.tokens, tok)
 	l.start = l.cur
@@ -1364,6 +1368,31 @@ func ParseSExpr(src string) (S, error) {
 	return p.program()
 }
 
+// ParseSExprWithSpans parses `src` into an S-expression AST and also returns a
+// SpanIndex mapping each node (addressed by NodePath) to its source byte span.
+//
+// Behavior:
+//   - The AST is identical to ParseSExpr (stable contract).
+//   - Spans are recorded in post-order (children before parent).
+//   - Spans are half-open byte intervals [StartByte, EndByte) in `src`.
+//   - The top-level ("block", ...) is included.
+//
+// Errors mirror ParseSExpr; lexer errors and parse errors are propagated unchanged.
+func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, nil, err
+	}
+	p := &parser{toks: toks}
+	ast, err := p.program()
+	if err != nil {
+		return nil, nil, err
+	}
+	idx := BuildSpanIndexPostOrder(ast, p.post) // sidecar index (spans.go)
+	return ast, idx, nil
+}
+
 // ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
 // and returns *IncompleteError when the input ends mid-construct (e.g., missing
 // ')', ']', '}', 'end', or the RHS of an operator/unary).
@@ -1390,6 +1419,7 @@ type parser struct {
 	toks        []Token
 	i           int
 	interactive bool
+	post        []Span
 }
 
 func (p *parser) atEnd() bool { return p.peek().Type == EOF }
@@ -1462,10 +1492,25 @@ func (p *parser) program() (S, error) {
 		}
 		items = append(items, e)
 	}
-	return L("block", items...), nil
+	root := L("block", items...)
+	// Append span for the top-level block: cover all non-EOF tokens.
+	// If there are no tokens besides EOF, leave span empty (Start=End=0).
+	startTok := 0
+	endTok := len(p.toks) - 2 // last non-EOF
+	if endTok >= startTok && len(p.toks) > 0 {
+		p.post = append(p.post, Span{
+			StartByte: p.toks[startTok].StartByte,
+			EndByte:   p.toks[endTok].EndByte,
+		})
+	} else {
+		p.post = append(p.post, Span{})
+	}
+	return root, nil
 }
 
 func (p *parser) expr(minBP int) (S, error) {
+	// Record the token index at which this expression starts.
+	nodeStartTok := p.i
 	// ---- prefix ----
 	t := p.peek()
 	p.i++
@@ -1817,7 +1862,22 @@ func (p *parser) expr(minBP int) (S, error) {
 			left = L("binop", op.Lexeme, left, right)
 		}
 	}
-
+	// On completion of this node, append its span (post-order).
+	// Use tokens[nodeStartTok ... p.i-1].
+	if p.i-1 >= nodeStartTok && nodeStartTok < len(p.toks) {
+		endTok := p.i - 1
+		// Guard against EOF being the only thing consumed (shouldn't happen).
+		if endTok >= 0 && endTok < len(p.toks) {
+			p.post = append(p.post, Span{
+				StartByte: p.toks[nodeStartTok].StartByte,
+				EndByte:   p.toks[endTok].EndByte,
+			})
+		} else {
+			p.post = append(p.post, Span{})
+		}
+	} else {
+		p.post = append(p.post, Span{})
+	}
 	return left, nil
 }
 
@@ -2177,6 +2237,195 @@ func (p *parser) objectDeclPattern() (S, error) {
 }
 === END FILE: parser.go ===
 
+=== BEGIN FILE: spans.go ===
+// spans.go — Sidecar spans for MindScript ASTs (S-expressions)
+//
+// WHAT THIS MODULE DOES
+// =====================
+// This module provides a tiny, non-invasive mechanism to associate **source-code
+// byte spans** with nodes of a MindScript AST (encoded as the S-expression type
+// `S` from parser.go) **without modifying the AST itself**.
+//
+// The spans are modeled as half-open byte intervals `[StartByte, EndByte)`
+// relative to the original UTF-8 source. Line/column coordinates are intentionally
+// omitted here to keep the structure minimal; callers can derive them on demand
+// from the original source text.
+//
+// HOW SPANS ARE ASSOCIATED TO NODES
+// =================================
+// We use a *sidecar* structure (`SpanIndex`) keyed by a stable, structural
+// address called a **NodePath**. A `NodePath` is a slice of child indexes
+// into the AST tree: e.g. `[]int{0,2,1}` means “root’s 0th child → its 2nd
+// child → its 1st child”. Paths are defined against the S-expression shape
+// where a node is `[]any{tagString, child0, child1, ...}` — i.e. the first
+// element is the string tag, and child index 0 refers to the element at
+// S[1], child index 1 refers to S[2], etc.
+//
+// This file does **not** compute spans itself. Instead, the parser (or any
+// external producer) records one `Span` per AST node in **post-order**
+// (children before parent) while constructing or inspecting the tree, and
+// then calls `BuildSpanIndexPostOrder(ast, spans)` to bind those spans to
+// concrete paths via a deterministic walk of the AST in the same order.
+//
+// The result is a `SpanIndex` you can query with a `NodePath` to retrieve
+// the associated byte interval in the original source.
+//
+// DEPENDENCIES ON OTHER FILES
+// ===========================
+// • parser.go
+//   - Defines the S-expression node type alias `type S = []any`.
+//   - Produces the AST that this module indexes.
+//   - (Optional instrumentation) While parsing, record a `Span` per finished
+//     node in **post-order** (children first, then the node) using the token
+//     byte spans collected by the lexer.
+//
+// • lexer.go
+//   - Tokens should carry precise byte offsets (`StartByte`/`EndByte`) so that
+//     the parser can compute node spans as:
+//     node.StartByte = firstToken.StartByte
+//     node.EndByte   = lastToken.EndByte
+//
+// PERFORMANCE & CONCURRENCY
+// =========================
+// Building an index is O(n) in the number of AST nodes. `SpanIndex` is
+// read-only after construction and safe to share for concurrent reads.
+// Memory usage is one map entry per node (string key per `NodePath`).
+//
+// PUBLIC VS PRIVATE LAYOUT
+// ========================
+// The file is split into a PUBLIC API (types and functions you call) and a
+// PRIVATE section (helpers and internal details). The PUBLIC API is fully
+// documented so its behavior is understandable without reading the PRIVATE
+// code.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+package mindscript
+
+import (
+	"strconv"
+	"strings"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// Span represents a half-open byte interval [StartByte, EndByte) in the original
+// source text. Offsets are counted in bytes from the start of the UTF-8 source.
+// EndByte is exclusive.
+//
+// Line/column coordinates are not stored here to keep Span minimal; if you need
+// them, compute (line, col) from the original source using your preferred mapping.
+type Span struct {
+	StartByte int // inclusive
+	EndByte   int // exclusive
+}
+
+// NodePath is a stable structural address into an S-expression AST.
+// Each integer selects a child in the node's children array:
+//
+//	path element k  → child at S[k+1] (since S[0] is the string tag).
+//
+// Example:
+//
+//	// ("call", callee, arg0, arg1)
+//	//  tag   ^      ^ child0 ^ child1
+//	//  S[0]        S[1]      S[2]     S[3]
+//	path []int{0}   → callee
+//	path []int{2}   → arg1
+type NodePath []int
+
+// SpanIndex stores a sidecar mapping from NodePath → Span for an AST.
+// It is read-only after construction. Use Get to retrieve spans by path.
+//
+// Typical construction flow (performed by the parser or a post-pass):
+//  1. Walk/construct the AST while recording one Span per node in post-order.
+//  2. Call BuildSpanIndexPostOrder(ast, postorderSpans) to bind spans to paths.
+//  3. Query with si.Get(path) wherever you need source intervals.
+type SpanIndex struct {
+	byPath map[string]Span
+}
+
+// Get returns the span associated with the given path, if present.
+// The boolean is false if the path is unknown or the index is nil.
+//
+// A SpanIndex may be partial (e.g., producer skipped some nodes). In that case
+// only the recorded nodes will resolve to spans.
+func (si *SpanIndex) Get(p NodePath) (Span, bool) {
+	if si == nil {
+		return Span{}, false
+	}
+	sp, ok := si.byPath[pathKey(p)]
+	return sp, ok
+}
+
+// BuildSpanIndexPostOrder constructs a SpanIndex by walking the AST in
+// **post-order** (children before parent) and binding each visited node to
+// the next span from the provided `postorder` slice.
+//
+// Contract:
+//   - The `postorder` slice must list exactly one Span for each node in `root`
+//     in post-order. If it is longer, extras are ignored; if shorter, remaining
+//     nodes are left unindexed (Get will return (Span{}, false) for them).
+//   - The resulting index is read-only and safe for concurrent reads.
+//
+// Complexity: O(n) time and O(n) space where n is the number of AST nodes.
+//
+// Example usage (parser instrumentation idea):
+//
+//	// During parse, for each finished node (after parsing children):
+//	//   spans = append(spans, Span{StartByte:firstTok.StartByte, EndByte:lastTok.EndByte})
+//	idx := BuildSpanIndexPostOrder(ast, spans)
+//	sp, ok := idx.Get(NodePath{0,2}) // lookup "child 0's child 2"
+func BuildSpanIndexPostOrder(root S, postorder []Span) *SpanIndex {
+	si := &SpanIndex{byPath: make(map[string]Span, len(postorder))}
+	bindPostOrder(si, root, postorder)
+	return si
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                                 PRIVATE
+////////////////////////////////////////////////////////////////////////////////
+
+// pathKey serializes a NodePath to a compact "a.b.c" string used as the map key.
+func pathKey(p NodePath) string {
+	if len(p) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, x := range p {
+		if i > 0 {
+			sb.WriteByte('.')
+		}
+		sb.WriteString(strconv.Itoa(x))
+	}
+	return sb.String()
+}
+
+// bindPostOrder walks `root` in post-order, assigning spans from `postorder`
+// to each visited node, in order.
+func bindPostOrder(si *SpanIndex, root S, postorder []Span) {
+	i := 0
+	var walk func(n S, path NodePath)
+	walk = func(n S, path NodePath) {
+		// Visit children
+		for ci := 1; ci < len(n); ci++ {
+			if child, ok := n[ci].(S); ok {
+				walk(child, append(path, ci-1))
+			}
+		}
+		// Bind this node
+		if i < len(postorder) {
+			si.byPath[pathKey(path)] = postorder[i]
+			i++
+		}
+	}
+	walk(root, nil)
+}
+=== END FILE: spans.go ===
+
 === BEGIN FILE: printer.go ===
 // printer.go: pretty-printers for MindScript ASTs, types, and runtime values.
 //
@@ -2257,6 +2506,10 @@ func (p *parser) objectDeclPattern() (S, error) {
 // This file is organized in two blocks:
 //  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
 //  2. PRIVATE: helper types and functions that implement the printers.
+//
+// Formatting policy highlights:
+//   - Indentation uses **tabs** only (gofmt-style).
+//   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
 package mindscript
 
 import (
@@ -2278,6 +2531,10 @@ import (
 //
 // This setting is read at call time and is safe to change between calls.
 var MaxInlineWidth = 80
+
+// IndentWithTabs controls whether pretty output uses tabs (like gofmt) for
+// indentation. When false, two spaces are used.
+var IndentWithTabs = true
 
 // Pretty parses a MindScript source string and returns a formatted version.
 //
@@ -2305,6 +2562,25 @@ func Pretty(src string) (string, error) {
 		return "", WrapErrorWithSource(err, src)
 	}
 	return FormatSExpr(ast), nil
+}
+
+// Standardize returns the canonical source form ("standard_source_code"):
+//   - deterministic layout
+//   - indentation using tabs (configurable via IndentWithTabs)
+//   - exactly one trailing newline
+func Standardize(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return "", WrapErrorWithSource(err, src)
+	}
+	out := FormatSExpr(ast)
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	} else {
+		// ensure exactly one
+		out = strings.TrimRight(out, "\n") + "\n"
+	}
+	return out, nil
 }
 
 // FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
@@ -2446,7 +2722,7 @@ func (o *out) write(s string) { o.b.WriteString(s) }
 func (o *out) nl()            { o.b.WriteByte('\n') }
 func (o *out) pad() {
 	for i := 0; i < o.depth; i++ {
-		o.b.WriteString("  ")
+		o.b.WriteByte('\t')
 	}
 }
 func (o *out) line(s string)        { o.pad(); o.b.WriteString(s) }
@@ -2549,7 +2825,22 @@ func (p *pp) printStmt(n S) {
 	case "for":
 		p.pad()
 		p.write("for ")
-		p.printExpr(child(n, 0), 0)
+		tgt := child(n, 0)
+		// For targets that are declaration patterns, print them as patterns:
+		//  - ("decl", x)    → "let x"
+		//  - ("darr", ...)  → "[...]"  (no "let")
+		//  - ("dobj", ...)  → "{...}"  (no "let")
+		// Non-pattern assignables print as normal expressions.
+		if isDeclPattern(tgt) {
+			if tag(tgt) == "decl" {
+				p.write("let ")
+				p.printPattern(tgt) // prints just the name
+			} else {
+				p.printPattern(tgt)
+			}
+		} else {
+			p.printExpr(tgt, 0)
+		}
 		p.sp()
 		p.write("in ")
 		p.printExpr(child(n, 1), 0)
@@ -2558,6 +2849,20 @@ func (p *pp) printStmt(n S) {
 		p.nl()
 		p.out.withIndent(func() { p.printBlock(child(n, 2)) })
 		if len(child(n, 2)) > 1 {
+			p.nl()
+		}
+		p.pad()
+		p.write("end")
+
+	case "while":
+		p.pad()
+		p.write("while ")
+		p.printExpr(child(n, 0), 0)
+		p.sp()
+		p.write("do")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(child(n, 1)) })
+		if len(child(n, 1)) > 1 {
 			p.nl()
 		}
 		p.pad()
@@ -2842,7 +3147,7 @@ func (p *pp) printExpr(n S, _ctx int) {
 
 	case "decl":
 		p.write("let " + getId(n))
-	case "return", "break", "continue", "fun", "oracle", "for", "if", "type", "block", "annot":
+	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
 		p.printStmt(n)
 	default:
 		p.write("<" + tag(n) + ">")

@@ -77,6 +77,10 @@
 // This file is organized in two blocks:
 //  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
 //  2. PRIVATE: helper types and functions that implement the printers.
+//
+// Formatting policy highlights:
+//   - Indentation uses **tabs** only (gofmt-style).
+//   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
 package mindscript
 
 import (
@@ -98,6 +102,10 @@ import (
 //
 // This setting is read at call time and is safe to change between calls.
 var MaxInlineWidth = 80
+
+// IndentWithTabs controls whether pretty output uses tabs (like gofmt) for
+// indentation. When false, two spaces are used.
+var IndentWithTabs = true
 
 // Pretty parses a MindScript source string and returns a formatted version.
 //
@@ -125,6 +133,25 @@ func Pretty(src string) (string, error) {
 		return "", WrapErrorWithSource(err, src)
 	}
 	return FormatSExpr(ast), nil
+}
+
+// Standardize returns the canonical source form ("standard_source_code"):
+//   - deterministic layout
+//   - indentation using tabs (configurable via IndentWithTabs)
+//   - exactly one trailing newline
+func Standardize(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return "", WrapErrorWithSource(err, src)
+	}
+	out := FormatSExpr(ast)
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	} else {
+		// ensure exactly one
+		out = strings.TrimRight(out, "\n") + "\n"
+	}
+	return out, nil
 }
 
 // FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
@@ -266,7 +293,7 @@ func (o *out) write(s string) { o.b.WriteString(s) }
 func (o *out) nl()            { o.b.WriteByte('\n') }
 func (o *out) pad() {
 	for i := 0; i < o.depth; i++ {
-		o.b.WriteString("  ")
+		o.b.WriteByte('\t')
 	}
 }
 func (o *out) line(s string)        { o.pad(); o.b.WriteString(s) }
@@ -369,7 +396,22 @@ func (p *pp) printStmt(n S) {
 	case "for":
 		p.pad()
 		p.write("for ")
-		p.printExpr(child(n, 0), 0)
+		tgt := child(n, 0)
+		// For targets that are declaration patterns, print them as patterns:
+		//  - ("decl", x)    → "let x"
+		//  - ("darr", ...)  → "[...]"  (no "let")
+		//  - ("dobj", ...)  → "{...}"  (no "let")
+		// Non-pattern assignables print as normal expressions.
+		if isDeclPattern(tgt) {
+			if tag(tgt) == "decl" {
+				p.write("let ")
+				p.printPattern(tgt) // prints just the name
+			} else {
+				p.printPattern(tgt)
+			}
+		} else {
+			p.printExpr(tgt, 0)
+		}
 		p.sp()
 		p.write("in ")
 		p.printExpr(child(n, 1), 0)
@@ -378,6 +420,20 @@ func (p *pp) printStmt(n S) {
 		p.nl()
 		p.out.withIndent(func() { p.printBlock(child(n, 2)) })
 		if len(child(n, 2)) > 1 {
+			p.nl()
+		}
+		p.pad()
+		p.write("end")
+
+	case "while":
+		p.pad()
+		p.write("while ")
+		p.printExpr(child(n, 0), 0)
+		p.sp()
+		p.write("do")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(child(n, 1)) })
+		if len(child(n, 1)) > 1 {
 			p.nl()
 		}
 		p.pad()
@@ -662,7 +718,7 @@ func (p *pp) printExpr(n S, _ctx int) {
 
 	case "decl":
 		p.write("let " + getId(n))
-	case "return", "break", "continue", "fun", "oracle", "for", "if", "type", "block", "annot":
+	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
 		p.printStmt(n)
 	default:
 		p.write("<" + tag(n) + ">")

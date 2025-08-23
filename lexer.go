@@ -244,11 +244,13 @@ const (
 //	Line    — 1-based line number at which this token starts.
 //	Col     — 0-based column index at which this token starts.
 type Token struct {
-	Type    TokenType
-	Lexeme  string
-	Literal interface{}
-	Line    int
-	Col     int
+	Type      TokenType
+	Lexeme    string
+	Literal   interface{}
+	Line      int
+	Col       int
+	StartByte int
+	EndByte   int
 }
 
 // LexError reports a lexical error detected during scanning (e.g., invalid
@@ -316,13 +318,12 @@ func IsIncomplete(err error) bool {
 //   - A token’s position is captured at the start of scanning that token.
 type Lexer struct {
 	// public type with no exported fields; use constructors + Scan()
-	src              string
-	start            int // start index of current token
-	cur              int // current index
-	line             int // 1-based
-	col              int // 0-based column within line
-	tokens           []Token
-	whitespaceBefore bool
+	src    string
+	start  int // start index of current token
+	cur    int // current index
+	line   int // 1-based
+	col    int // 0-based column within line
+	tokens []Token
 
 	// precise token start position
 	tokStartLine int
@@ -336,9 +337,11 @@ type Lexer struct {
 // Unterminated strings / "#(...)" / "##(...)" yield LexError.
 func NewLexer(src string) *Lexer {
 	return &Lexer{
-		src:  src,
-		line: 1,
-		col:  0,
+		src: src,
+		// very rough guess to reduce reslices on big files
+		tokens: make([]Token, 0, len(src)/4),
+		line:   1,
+		col:    0,
 	}
 }
 
@@ -348,6 +351,7 @@ func NewLexer(src string) *Lexer {
 func NewLexerInteractive(src string) *Lexer {
 	return &Lexer{
 		src:         src,
+		tokens:      make([]Token, 0, len(src)/4),
 		line:        1,
 		col:         0,
 		interactive: true,
@@ -461,15 +465,16 @@ func (l *Lexer) rewindToStart() {
 func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
 	lex := l.src[l.start:l.cur]
 	tok := Token{
-		Type:    tt,
-		Lexeme:  lex,
-		Literal: lit,
-		Line:    l.tokStartLine,
-		Col:     l.tokStartCol,
+		Type:      tt,
+		Lexeme:    lex,
+		Literal:   lit,
+		Line:      l.tokStartLine,
+		Col:       l.tokStartCol,
+		StartByte: l.start,
+		EndByte:   l.cur,
 	}
 	l.tokens = append(l.tokens, tok)
 	l.start = l.cur
-	l.whitespaceBefore = false
 	return tok
 }
 
@@ -481,17 +486,29 @@ func (l *Lexer) previousToken() *Token {
 }
 
 func (l *Lexer) skipWhitespace() {
-	l.whitespaceBefore = false
 	for !l.isAtEnd() {
 		ch, _ := l.peek()
 		switch ch {
 		case ' ', '\r', '\n', '\t':
-			l.whitespaceBefore = true
 			l.advance()
 			l.start = l.cur
 		default:
 			return
 		}
+	}
+}
+
+// immediateWhitespaceBefore reports whether the byte immediately preceding the
+// current token start is ASCII whitespace. Called *after* skipWhitespace.
+func (l *Lexer) immediateWhitespaceBefore() bool {
+	if l.start == 0 {
+		return false
+	}
+	switch l.src[l.start-1] {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
 	}
 }
 
@@ -582,23 +599,35 @@ func (l *Lexer) scanString() (string, error) {
 				out = append(out, '\t')
 			case 'u':
 				// expect 4 hex digits
-				var hex string
+				toHex := func(b byte) int {
+					switch {
+					case b >= '0' && b <= '9':
+						return int(b - '0')
+					case b >= 'a' && b <= 'f':
+						return 10 + int(b-'a')
+					case b >= 'A' && b <= 'F':
+						return 10 + int(b-'A')
+					default:
+						return -1
+					}
+				}
+				val := 0
 				for i := 0; i < 4; i++ {
 					b, ok := l.peek()
-					if !ok || !isHex(b) {
+					if !ok {
 						if l.interactive {
 							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
 						}
 						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
 					}
-					hex += string(b)
+					d := toHex(b)
+					if d < 0 {
+						return "", l.err("invalid unicode escape")
+					}
+					val = (val << 4) | d
 					l.advance()
 				}
-				v, err := strconv.ParseInt(hex, 16, 32)
-				if err != nil {
-					return "", l.err("invalid unicode escape")
-				}
-				r := rune(v)
+				r := rune(val)
 
 				// handle surrogate pair \uD800-\uDBFF followed by \uDC00-\uDFFF
 				if 0xD800 <= r && r <= 0xDBFF {
@@ -608,23 +637,23 @@ func (l *Lexer) scanString() (string, error) {
 						l.advance()
 						if b2, ok := l.peek(); ok && b2 == 'u' {
 							l.advance()
-							var hex2 string
+							val2 := 0
 							for i := 0; i < 4; i++ {
 								b, ok := l.peek()
-								if !ok || !isHex(b) {
+								if !ok {
 									if l.interactive {
 										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
 									}
 									return "", l.err("unicode surrogate pair low was not terminated")
 								}
-								hex2 += string(b)
+								d := toHex(b)
+								if d < 0 {
+									return "", l.err("invalid unicode surrogate pair low")
+								}
+								val2 = (val2 << 4) | d
 								l.advance()
 							}
-							v2, err := strconv.ParseInt(hex2, 16, 32)
-							if err != nil {
-								return "", l.err("invalid unicode surrogate pair low")
-							}
-							r2 := rune(v2)
+							r2 := rune(val2)
 							if 0xDC00 <= r2 && r2 <= 0xDFFF {
 								cp := utf16.DecodeRune(r, r2)
 								out = append(out, cp)
@@ -676,9 +705,15 @@ func (l *Lexer) scanIdentifier() string {
 }
 
 // scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
+// Precondition: current position is at l.start and the first rune is either a digit
+//
+//	or a '.' that has already been verified to start a number.
 func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	sawDigits := false
-	// optional leading digits
+	sawDot := false
+	sawExp := false
+
+	// integral part (optional for leading '.')
 	for {
 		b, ok := l.peek()
 		if !ok || !isDigit(b) {
@@ -688,38 +723,25 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 		sawDigits = true
 	}
 
-	// decimal point with optional digits
-	sawDot := false
+	// fractional part
 	if b, ok := l.peek(); ok && b == '.' {
-		if sawDigits {
-			l.advance() // consume '.'
-			sawDot = true
-			for {
-				b, ok := l.peek()
-				if !ok || !isDigit(b) {
-					break
-				}
-				l.advance()
+		// Always consume '.'; at least one of integral or fractional must have digits.
+		l.advance()
+		sawDot = true
+		for {
+			b2, ok2 := l.peek()
+			if !ok2 || !isDigit(b2) {
+				break
 			}
-		} else if b2, ok2 := l.peekN(1); ok2 && isDigit(b2) {
-			l.advance() // consume '.'
-			sawDot = true
-			for {
-				b, ok := l.peek()
-				if !ok || !isDigit(b) {
-					break
-				}
-				l.advance()
-			}
+			l.advance()
 			sawDigits = true
 		}
 	}
 
-	// exponent
-	sawExp := false
+	// exponent part: ([eE][+-]?digits)?
 	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
 		save := l.cur
-		l.advance()
+		l.advance() // consume e/E
 		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
 			l.advance()
 		}
@@ -731,8 +753,11 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 					break
 				}
 				l.advance()
+				// Having an exponent implies there were digits overall, but we leave
+				// sawDigits alone—it already tracked integral/fractional digits.
 			}
 		} else {
+			// No digits after e/E (and optional sign) → backtrack, no exponent.
 			l.cur = save
 		}
 	}
@@ -935,7 +960,7 @@ func (l *Lexer) dotStartsNumber() bool {
 		return false
 	}
 	prev := l.previousToken()
-	if l.whitespaceBefore || prev == nil || !canBeLeftOperand(prev.Type) {
+	if l.immediateWhitespaceBefore() || prev == nil || !canBeLeftOperand(prev.Type) {
 		return true
 	}
 	return false
@@ -959,14 +984,14 @@ func (l *Lexer) scanToken() (Token, error) {
 		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
 		switch ch {
 		case '(':
-			if l.whitespaceBefore {
+			if l.immediateWhitespaceBefore() {
 				return l.addToken(LROUND, "("), nil
 			}
 			return l.addToken(CLROUND, "("), nil
 		case ')':
 			return l.addToken(RROUND, ")"), nil
 		case '[':
-			if l.whitespaceBefore {
+			if l.immediateWhitespaceBefore() {
 				return l.addToken(LSQUARE, "["), nil
 			}
 			return l.addToken(CLSQUARE, "["), nil
@@ -1100,7 +1125,7 @@ func (l *Lexer) scanToken() (Token, error) {
 					}
 					return l.addToken(BOOLEAN, false), nil
 				default:
-					return l.addToken(tt, lex), nil
+					return l.addToken(tt, nil), nil
 				}
 			}
 			return l.addToken(ID, lex), nil

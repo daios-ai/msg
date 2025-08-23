@@ -1,1035 +1,1472 @@
-=== BEGIN FILE: parser.go ===
-// parser.go: Pratt parser for MindScript that produces Lisp-style S-expressions.
+=== BEGIN FILE: cmd/lsp/main.go ===
+// cmd/lsp/main.go
 //
-// OVERVIEW
-// --------
-// This file implements a newline-aware, interactive-ready Pratt parser for the
-// MindScript language. The parser consumes the token stream produced by the
-// lexer (see lexer.go) and returns a compact, Lisp-y S-expression (AST) where
-// each node is encoded as []any with a leading tag string, e.g.:
+// Minimal Language Server Protocol (LSP) server for MindScript (improved).
+// - ONE FILE, stdlib-only.
+// - Implements: initialize, didOpen/didChange, hover, definition,
+//   completion, documentSymbol, references (best-effort), semantic tokens.
+// - Uses the existing mindscript package for parsing + lexing.
+// - Improvements over baseline:
+//   * Interactive parsing with precise diagnostics (line/col from engine).
+//   * Correct UTF-16 code-unit indexing for LSP positions.
+//   * Case-insensitive, tolerant Content-Length parsing.
+//   * Token-based word/refs/definition (ignores comments/strings).
+//   * Rich hover with function signatures and docstrings (locals + globals).
+//   * De-duplicated completions + language keywords.
+//   * Better symbol kinds and ranges derived from tokens where possible.
+//   * Semantic tokens that:
+//       - Color comments/annotations correctly,
+//       - Never split identifiers (sorted and delta-encoded properly),
+//       - Avoid coloring anything inside comments/annotations.
 //
-//	("binop", "+", ("int", 1), ("id", "x"))
-//
-// DEPENDENCIES
-// ------------
-// • lexer.go — provides:
-//   - Token / TokenType definitions and all token kinds used here
-//   - Lexer, NewLexer, NewLexerInteractive
-//   - IncompleteError and IsIncomplete(err)
-//
-// • standard library: fmt (for error messages)
-//
-// PARSING MODE & INTERACTIVITY
-// ----------------------------
-// Two entry points are provided:
-//
-//	ParseSExpr(src string)            — normal parsing (unterminated input is a ParseError)
-//	ParseSExprInteractive(src string) — REPL-friendly (unterminated input becomes IncompleteError)
-//
-// In interactive mode, reaching EOF inside a construct (e.g., missing ')', ']', '}', 'end',
-// or RHS after an operator/unary) yields IncompleteError with a precise position.
-//
-// OUTPUT SHAPE (AST)
-// ------------------
-// The result is always a top-level block:
-//
-//	("block", expr1, expr2, ...)
-//
-// Node forms (tags) the parser emits:
-//
-// Literals & identifiers:
-//
-//	("id",   name)           // identifiers and builtin TYPE tokens (e.g., "Int") used as names
-//	("int",  int64)
-//	("num",  float64)
-//	("str",  string)
-//	("bool", bool)
-//	("null")
-//
-// Unary/postfix:
-//
-//	("unop", "-",   expr)    // prefix minus
-//	("unop", "not", expr)    // logical not
-//	("unop", "?",   expr)    // postfix optional operator
-//
-// Calls / property / indexing:
-//
-//	("call", callee, arg1, arg2, ...)
-//	("idx",  object, indexExpr)                // obj[expr] or obj.<integer> or obj.(expr)
-//	("get",  object, ("str", propertyName))    // obj.<id> or obj."string"
-//
-// Arrays & maps:
-//
-//	("array", elements...)
-//	("map", ("pair",  keyStrExpr, valueExpr)*)
-//	("map", ("pair!", keyStrExpr, valueExpr)* ) // key marked required via '!' in literal (e.g., {name!: "x"})
-//
-// Enum sugar:
-//
-//	Enum[ e1, e2, ... ] → ("enum", e1, e2, ...)
-//
-// Functions & oracles:
-//
-//	fun (p1[: T], p2[: T], ...) [-> Ret] do ... end
-//	   → ("fun",   paramsArray, RetOr("id","Any"), bodyBlock)
-//	oracle (p1[: T], ...) [-> Out] [from SourceExpr]
-//	   → ("oracle", paramsArray, OutOr("id","Any"), SourceOr("array"))
-//
-// where paramsArray is ("array", ("pair", ("id", name), typeExpr), ...).
-//
-// Blocks and control:
-//
-//	do ... end                → ("block", ...)
-//	if cond then … elif … else … end
-//	   → ("if", ("pair", cond1, thenBlock1), ("pair", cond2, thenBlock2), [, elseBlock])
-//	for <target> in <iter> do ... end → ("for", target, iter, body)
-//	while cond do ... end             → ("while", cond, body)
-//
-// Return/break/continue (newline-sensitive):
-//
-//	If the next token is on the SAME line → take a following expression.
-//	Else (or at EOF)                      → implicit null.
-//	Examples:
-//	  return 1      → ("return", ("int", 1))
-//	  return\nx     → ("return", ("null"))
-//
-// Declaration patterns (used by `let` and `for` targets):
-//
-//	("decl", name)                        // let x
-//	("darr", p1, p2, ...)                 // let [a, b, ...]
-//	("dobj", ("pair", keyStrExpr, p), ...) // let {k: p, ...}
-//
-// Annotations may wrap the next pattern or expression:
-//
-//	("annot", ("str", text), node)
-//
-// Operators & precedence (higher binds tighter; '=' and '->' are right-assoc):
-//
-//	70: * / %
-//	60: + -
-//	50: < <= > >=
-//	40: == !=
-//	30: and
-//	20: or
-//	15: ->
-//	10: =
-//
-// '=' yields ("assign", target, value) and requires an assignable target: one of
-// "id", "get", "idx", "decl", "darr", "dobj".
-//
-// ERROR MODEL
-// -----------
-// • ParseError  — structural/grammar problems with location.
-// • IncompleteError (interactive mode) — source ended while a construct was incomplete.
-//
-// NOTE ON TOKENS & NEWLINES
-// -------------------------
-// The parser relies on token positions provided by the lexer. For newline-sensitive
-// behavior of return/break/continue, it checks whether the next token shares the same line.
-//
-// The complete behavior above is sufficient to consume this API without reading the
-// implementation details below.
-package mindscript
+// NOTE: This is a pragmatic, compact server intended to be extended.
+
+package main
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"unicode/utf8"
+
+	// Import your engine
+	mindscript "github.com/DAIOS-AI/msg"
 )
 
-////////////////////////////////////////////////////////////////////////////////
-//                                  PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
+// --------------------------- LSP wire types (trimmed) ------------------------
 
-// S is the S-expression node representation used by the parser.
-// It is a []any whose first element is a string tag (e.g., "binop", "id", "array").
-// Subsequent elements are the node’s children or data.
-//
-// Common node forms (non-exhaustive):
-//
-//	("block", n1, n2, ...)
-//	("id",   name)            // string name
-//	("int",  int64)
-//	("num",  float64)
-//	("str",  string)
-//	("bool", bool)
-//	("null")
-//	("unop", op, rhs)         // op is string: "-", "not", "?"
-//	("binop", op, lhs, rhs)   // op is string: "+", "and", "==", ...
-//	("assign", target, value) // "="
-//	("call", callee, arg...)
-//	("get",  obj, ("str", name))
-//	("idx",  obj, indexExpr)
-//	("array", ...)
-//	("map", ("pair",  keyStrExpr, value)*)
-//	("map", ("pair!", keyStrExpr, value)*)
-//	("enum", ...)
-//	("fun", paramsArray, retTypeExprOrAny, bodyBlock)
-//	("oracle", paramsArray, outTypeExprOrAny, sourceExprOrEmptyArray)
-//	("if", ("pair", cond, thenBlock)* [, elseBlock])
-//	("while", cond, bodyBlock)
-//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
-//	("decl", name) | ("darr", ...) | ("dobj", ("pair", keyStrExpr, pat)*)
-//	("annot", ("str", text), wrappedNode)
-type S = []any
-
-// L is a small helper to build S-expression nodes. The first argument is the
-// string tag; the remaining arguments are appended as children.
-func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
-
-// ParseError reports a non-interactive parse failure with a location.
-// Typical causes: unexpected tokens, missing delimiters, invalid assignment target.
-type ParseError struct {
-	Line, Col int
-	Msg       string
+type Position struct {
+	Line      int `json:"line"`
+	Character int `json:"character"` // UTF-16 code units
 }
 
-func (e *ParseError) Error() string {
-	return fmt.Sprintf("PARSE ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
+type Range struct {
+	Start Position `json:"start"`
+	End   Position `json:"end"`
 }
 
-// ParseSExpr parses a MindScript source string into an S-expression AST.
-// It lexes the source using NewLexer (normal mode) and parses according to the
-// grammar summarized in the file header comments.
-//
-// Returns:
-//   - S  — a top-level ("block", ...) node.
-//   - error — *ParseError on grammar problems, or lexer errors propagated.
-//
-// Newline-sensitive control:
-//
-//	return/break/continue take an expression only if the next token is on the same line;
-//	otherwise they default to ("null").
-//
-// Property/index/call chaining:
-//   - Calls:           f(args...)             → ("call", f, args...)
-//   - Index:           a[b]                   → ("idx", a, b)
-//   - Computed dot:    a.(expr)               → ("idx", a, expr)
-//   - Numeric dot:     a.42                   → ("idx", a, ("int", 42))
-//   - Named property:  a.name / a."name"      → ("get", a, ("str", "name"))
-//
-// Operators:
-//
-//	Precedence and associativity are as listed in the header; "=" and "->" are right-assoc.
-//	"=" yields ("assign", target, value) and requires assignable targets.
-func ParseSExpr(src string) (S, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
+}
+
+type TextDocumentIdentifier struct {
+	URI string `json:"uri"`
+}
+
+type TextDocumentItem struct {
+	URI        string `json:"uri"`
+	LanguageID string `json:"languageId"`
+	Version    int    `json:"version"`
+	Text       string `json:"text"`
+}
+
+type TextDocumentContentChangeEvent struct {
+	Range       *Range `json:"range,omitempty"`
+	RangeLength int    `json:"rangeLength,omitempty"`
+	Text        string `json:"text"`
+}
+
+type InitializeParams struct {
+	Capabilities any    `json:"capabilities"`
+	RootURI      string `json:"rootUri,omitempty"`
+}
+
+type ServerCapabilities struct {
+	TextDocumentSync   int  `json:"textDocumentSync"`
+	HoverProvider      bool `json:"hoverProvider"`
+	DefinitionProvider bool `json:"definitionProvider"`
+	CompletionProvider *struct {
+		TriggerCharacters []string `json:"triggerCharacters"`
+	} `json:"completionProvider,omitempty"`
+	DocumentSymbolProvider          bool `json:"documentSymbolProvider"`
+	ReferencesProvider              bool `json:"referencesProvider"`
+	WorkspaceSymbolProvider         bool `json:"workspaceSymbolProvider"`
+	DocumentFormattingProvider      bool `json:"documentFormattingProvider"`
+	DocumentRangeFormattingProvider bool `json:"documentRangeFormattingProvider"`
+	SemanticTokensProvider          *struct {
+		Legend struct {
+			TokenTypes     []string `json:"tokenTypes"`
+			TokenModifiers []string `json:"tokenModifiers"`
+		} `json:"legend"`
+		Full bool `json:"full"`
+	} `json:"semanticTokensProvider,omitempty"`
+}
+
+type SemanticTokensParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+type SemanticTokens struct {
+	Data []uint32 `json:"data"`
+}
+
+type InitializeResult struct {
+	Capabilities ServerCapabilities `json:"capabilities"`
+}
+
+type Request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type Response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Result  any             `json:"result,omitempty"`
+	Error   *ResponseError  `json:"error,omitempty"`
+}
+
+type ResponseError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type Diagnostic struct {
+	Range    Range  `json:"range"`
+	Severity int    `json:"severity,omitempty"` // 1 = Error
+	Code     string `json:"code,omitempty"`
+	Source   string `json:"source,omitempty"`
+	Message  string `json:"message"`
+}
+
+type PublishDiagnosticsParams struct {
+	URI         string       `json:"uri"`
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
+type Hover struct {
+	Contents MarkupContent `json:"contents"`
+	Range    *Range        `json:"range,omitempty"`
+}
+
+type MarkupContent struct {
+	Kind  string `json:"kind"`  // "plaintext" | "markdown"
+	Value string `json:"value"` // content
+}
+
+type CompletionItem struct {
+	Label            string `json:"label"`
+	Kind             int    `json:"kind,omitempty"`
+	Detail           string `json:"detail,omitempty"`
+	InsertText       string `json:"insertText,omitempty"`
+	InsertTextFormat int    `json:"insertTextFormat,omitempty"`
+}
+
+type DocumentSymbol struct {
+	Name           string           `json:"name"`
+	Detail         string           `json:"detail,omitempty"`
+	Kind           int              `json:"kind"`
+	Range          Range            `json:"range"`
+	SelectionRange Range            `json:"selectionRange"`
+	Children       []DocumentSymbol `json:"children,omitempty"`
+}
+
+// --------------------------- Server state ------------------------------------
+
+type symbolDef struct {
+	Name  string
+	Kind  string // "let" | "fun" | "type"
+	Range Range  // where it's declared
+	Doc   string // first line, if available
+	Sig   string // pretty signature for fun/oracle
+}
+
+type docState struct {
+	uri     string
+	text    string
+	lines   []int // line start offsets (byte indices)
+	symbols []symbolDef
+	tokens  []mindscript.Token
+}
+
+type server struct {
+	mu   sync.RWMutex
+	docs map[string]*docState
+	ip   *mindscript.Interpreter
+}
+
+func newServer() *server {
+	return &server{
+		docs: make(map[string]*docState),
+		ip:   mindscript.NewInterpreter(),
+	}
+}
+
+// snapshotDoc returns a consistent, read-only snapshot of a document.
+func (s *server) snapshotDoc(uri string) *docState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d := s.docs[uri]
+	if d == nil {
+		return nil
+	}
+	cp := *d // shallow copy the struct
+	if d.lines != nil {
+		cp.lines = append([]int(nil), d.lines...)
+	}
+	if d.tokens != nil {
+		cp.tokens = append([]mindscript.Token(nil), d.tokens...)
+	}
+	if d.symbols != nil {
+		cp.symbols = append([]symbolDef(nil), d.symbols...)
+	}
+	return &cp
+}
+
+// --------------------------- Transport (stdio, Content-Length) ---------------
+
+// stdout sink (swappable in tests)
+var stdoutSink io.Writer = os.Stdout
+
+func init() {
+	// During `go test`, silence unsolicited LSP notifications/responses unless
+	// explicitly overridden by tests (they replace stdoutSink themselves).
+	if strings.HasSuffix(os.Args[0], ".test") && os.Getenv("LSP_STDOUT") == "" {
+		stdoutSink = io.Discard
+	}
+}
+
+func readMsg(r *bufio.Reader) ([]byte, error) {
+	// Basic LSP framing: case-insensitive headers, tolerant of spacing
+	var contentLen int
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		if i := strings.IndexByte(line, ':'); i >= 0 {
+			key := strings.ToLower(strings.TrimSpace(line[:i]))
+			val := strings.TrimSpace(line[i+1:])
+			if key == "content-length" {
+				_, _ = fmt.Sscanf(val, "%d", &contentLen)
+			}
+		}
+	}
+	if contentLen <= 0 {
+		return nil, io.EOF
+	}
+	buf := make([]byte, contentLen)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
+
+func writeMsg(w io.Writer, v any) error {
+	body, err := json.Marshal(v)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	p := &parser{toks: toks}
-	return p.program()
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
+	b.Write(body)
+	_, err = w.Write(b.Bytes())
+	return err
 }
 
-// ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
-// and returns *IncompleteError when the input ends mid-construct (e.g., missing
-// ')', ']', '}', 'end', or the RHS of an operator/unary).
-//
-// Use IsIncomplete(err) to detect this case in a REPL and request more input.
-func ParseSExprInteractive(src string) (S, error) {
-	lex := NewLexerInteractive(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, err
+func (s *server) sendResponse(id json.RawMessage, result any, respErr *ResponseError) {
+	// JSON-RPC 2.0 requires either "result" or "error".
+	if respErr == nil && result == nil {
+		rawNull := json.RawMessage([]byte("null"))
+		_ = writeMsg(stdoutSink, Response{
+			JSONRPC: "2.0",
+			ID:      id,
+			Result:  rawNull, // explicit JSON null
+		})
+		return
 	}
-	p := &parser{toks: toks, interactive: true}
-	return p.program()
+	_ = writeMsg(stdoutSink, Response{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+		Error:   respErr,
+	})
 }
 
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                           PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-// Pratt parser state
-type parser struct {
-	toks        []Token
-	i           int
-	interactive bool
+func (s *server) notify(method string, params any) {
+	_ = writeMsg(stdoutSink, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	})
 }
 
-func (p *parser) atEnd() bool { return p.peek().Type == EOF }
-func (p *parser) peek() Token {
-	if p.i >= len(p.toks) {
-		return p.toks[len(p.toks)-1]
-	}
-	return p.toks[p.i]
-}
-func (p *parser) prev() Token { return p.toks[p.i-1] }
-func (p *parser) match(tt ...TokenType) bool {
-	if p.atEnd() {
-		return false
-	}
-	for _, t := range tt {
-		if p.peek().Type == t {
-			p.i++
-			return true
+// --------------------------- UTF-16 aware text utils -------------------------
+
+func lineOffsets(text string) []int {
+	offs := []int{0}
+	for i, r := range text {
+		if r == '\n' {
+			offs = append(offs, i+1)
 		}
 	}
-	return false
-}
-func (p *parser) need(t TokenType, msg string) (Token, error) {
-	if p.match(t) {
-		return p.prev(), nil
-	}
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		return Token{}, &IncompleteError{Line: g.Line, Col: g.Col, Msg: msg}
-	}
-	return Token{}, &ParseError{Line: g.Line, Col: g.Col, Msg: msg}
+	return offs
 }
 
-func (p *parser) nextTokenIsOnSameLine(as Token) bool {
-	if p.atEnd() {
-		return false
+func toU16(r rune) int {
+	if r < 0x10000 {
+		return 1
 	}
-	return p.peek().Line == as.Line
+	return 2 // surrogate pair
 }
 
-// precedence (higher binds tighter)
-func lbp(t TokenType) (int, bool) {
-	switch t {
-	case ARROW:
-		return 15, true // low precedence, right-assoc
-	case MULT, DIV, MOD:
-		return 70, true
-	case PLUS, MINUS:
-		return 60, true
-	case LESS, LESS_EQ, GREATER, GREATER_EQ:
-		return 50, true
-	case EQ, NEQ:
-		return 40, true
-	case AND:
-		return 30, true
-	case OR:
-		return 20, true
-	case ASSIGN: // '=' right-assoc
-		return 10, true
+func posToOffset(lines []int, p Position, text string) int {
+	if p.Line < 0 {
+		return 0
 	}
-	return 0, false
-}
-
-func (p *parser) program() (S, error) {
-	var items []any
-	for !p.atEnd() {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
+	if p.Line >= len(lines) {
+		return len(text)
+	}
+	i := lines[p.Line]
+	need := p.Character // in UTF-16 code units
+	for i < len(text) && need > 0 {
+		r, sz := utf8.DecodeRuneInString(text[i:])
+		if r == '\n' {
+			break
 		}
-		items = append(items, e)
+		need -= toU16(r)
+		i += sz
 	}
-	return L("block", items...), nil
+	return i
 }
 
-func (p *parser) expr(minBP int) (S, error) {
-	// ---- prefix ----
-	t := p.peek()
-	p.i++
-	var left S
-	switch t.Type {
-	case ID, TYPE:
-		// Identifiers and capitalized built-in types behave the same in expressions.
-		left = L("id", t.Literal)
-
-	case ENUM:
-		// Enum[ ... ] sugar → ("enum", ...)
-		if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
-			p.i++
-			arr, err := p.arrayLiteralAfterOpen()
-			if err != nil {
-				return nil, err
-			}
-			it := make([]any, 0, len(arr)-1)
-			for i := 1; i < len(arr); i++ {
-				it = append(it, arr[i])
-			}
-			left = L("enum", it...)
+func offsetToPos(lines []int, off int, text string) Position {
+	i, j := 0, len(lines)
+	for i+1 < j {
+		m := (i + j) / 2
+		if lines[m] <= off {
+			i = m
 		} else {
-			left = L("id", t.Literal)
+			j = m
 		}
+	}
+	u16 := 0
+	for k := lines[i]; k < off && k < len(text); {
+		r, sz := utf8.DecodeRuneInString(text[k:])
+		if r == '\n' {
+			break
+		}
+		u16 += toU16(r)
+		k += sz
+	}
+	return Position{Line: i, Character: u16}
+}
 
-	case INTEGER:
-		left = L("int", t.Literal)
-	case NUMBER:
-		left = L("num", t.Literal)
-	case STRING:
-		left = L("str", t.Literal)
-	case BOOLEAN:
-		left = L("bool", t.Literal)
-	case NULL:
-		left = L("null")
+func makeRange(lines []int, start, end int, text string) Range {
+	return Range{
+		Start: offsetToPos(lines, start, text),
+		End:   offsetToPos(lines, end, text),
+	}
+}
 
-	case MINUS, NOT:
-		// unary operators require a RHS expression
-		if p.atEnd() && p.interactive {
-			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after unary operator"}
-		}
-		r, err := p.expr(80)
-		if err != nil {
-			return nil, err
-		}
-		left = L("unop", t.Lexeme, r)
+// --------------------------- Diagnostics helpers -----------------------------
 
-	case LROUND, CLROUND:
-		inner, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := p.need(RROUND, "expected ')'"); err != nil {
-			return nil, err
-		}
-		left = inner
+func (s *server) clearDiagnostics(doc *docState) {
+	// LSP wants an array; avoid diagnostics:null
+	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
+		URI:         doc.uri,
+		Diagnostics: []Diagnostic{},
+	})
+}
 
-	case LSQUARE, CLSQUARE:
-		a, err := p.arrayLiteralAfterOpen()
-		if err != nil {
-			return nil, err
-		}
-		left = a
-
-	case LCURLY:
-		// map literal {k: v, ...} where k is id or string; id may have trailing '!' for required
-		if p.match(RCURLY) {
-			left = L("map")
-		} else {
-			var pairs []any
-			for {
-				k, req, err := p.keyRequired()
-				if err != nil {
-					return nil, err
-				}
-				if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-					return nil, err
-				}
-				v, err := p.expr(0)
-				if err != nil {
-					return nil, err
-				}
-				tag := "pair"
-				if req {
-					tag = "pair!"
-				}
-				pairs = append(pairs, L(tag, k, v))
-				if !p.match(COMMA) {
-					break
-				}
-			}
-			if _, err := p.need(RCURLY, "expected '}'"); err != nil {
-				return nil, err
-			}
-			left = L("map", pairs...)
-		}
-
-	case FUNCTION:
-		params, err := p.params()
-		if err != nil {
-			return nil, err
-		}
-		var ret any = L("id", "Any")
-		if p.match(ARROW) {
-			if p.atEnd() && p.interactive {
-				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected return type after '->'"}
-			}
-			r, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			ret = r
-		}
-		body, err := p.parseBlock(true) // require 'do'
-		if err != nil {
-			return nil, err
-		}
-		left = L("fun", params, ret, body)
-
-	case ORACLE:
-		params, err := p.params()
-		if err != nil {
-			return nil, err
-		}
-		var out any = L("id", "Any")
-		if p.match(ARROW) {
-			if p.atEnd() && p.interactive {
-				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected output type after '->'"}
-			}
-			o, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			out = o
-		}
-		// accept any expression after `from`
-		var src any = L("array")
-		if p.match(FROM) {
-			if p.atEnd() && p.interactive {
-				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after 'from'"}
-			}
-			ex, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			src = ex
-		}
-		left = L("oracle", params, out, src)
-
-	case RETURN, BREAK, CONTINUE:
-		// Newline-sensitive behavior; see file header.
-		if !p.nextTokenIsOnSameLine(t) {
-			switch t.Type {
-			case RETURN:
-				left = L("return", L("null"))
-			case BREAK:
-				left = L("break", L("null"))
-			default:
-				left = L("continue", L("null"))
-			}
-		} else {
-			x, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			switch t.Type {
-			case RETURN:
-				left = L("return", x)
-			case BREAK:
-				left = L("break", x)
-			default:
-				left = L("continue", x)
-			}
-		}
-
-	case IF:
-		thenIf, err := p.ifExpr()
-		if err != nil {
-			return nil, err
-		}
-		left = thenIf
-
-	case DO:
-		// do ... end
-		body, err := p.parseBlock(false) // 'do' already consumed
-		if err != nil {
-			return nil, err
-		}
-		left = body
-
-	case FOR:
-		f, err := p.forExpr()
-		if err != nil {
-			return nil, err
-		}
-		left = f
-
-	case WHILE:
-		w, err := p.whileExpr()
-		if err != nil {
-			return nil, err
-		}
-		left = w
-
-	case LET:
-		pat, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		left = pat
-		if tag, _ := pat[0].(string); tag == "darr" || tag == "dobj" {
-			if p.peek().Type != ASSIGN {
-				g := p.peek()
-				// If input ended, mark as incomplete
-				if p.interactive && g.Type == EOF {
-					return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
-				}
-				return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
-			}
-		}
-
-	case TYPECONS: // "type" <expr>
-		if p.atEnd() && p.interactive {
-			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected type expression after 'type'"}
-		}
-		x, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		left = L("type", x)
-
-	case ANNOTATION:
-		// wrap next expression
-		if p.atEnd() && p.interactive {
-			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
-		}
-		x, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		txt := ""
-		if s, ok := t.Literal.(string); ok {
-			txt = s
-		}
-		left = L("annot", L("str", txt), x)
-
+func (s *server) publishError(doc *docState, err error) {
+	// Incomplete input? Don't nag users mid-edit.
+	if _, ok := err.(*mindscript.IncompleteError); ok {
+		s.clearDiagnostics(doc)
+		return
+	}
+	line, col := 0, 0
+	switch e := err.(type) {
+	case *mindscript.ParseError:
+		line, col = e.Line, e.Col
+	case *mindscript.LexError:
+		line, col = e.Line, e.Col
 	default:
-		if t.Type == EOF && p.interactive {
-			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "unexpected end of input"}
+		// Unknown error: anchor at start of doc
+	}
+	if line > 0 {
+		line-- // LSP is 0-based; engine is 1-based lines
+	}
+	start := posToOffset(doc.lines, Position{Line: line, Character: col}, doc.text)
+	end := start
+	// If we can find a token on that line/col, expand; else +1 byte
+	if len(doc.tokens) > 0 {
+		for _, t := range doc.tokens {
+			if t.Line == line+1 && t.Col == col { // token start matches location
+				ts := posToOffset(doc.lines, Position{Line: t.Line - 1, Character: t.Col}, doc.text)
+				te := ts + len(t.Lexeme)
+				start, end = ts, te
+				break
+			}
 		}
-		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme)}
+	}
+	if end <= start {
+		end = start + 1
+	}
+	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
+		URI: doc.uri,
+		Diagnostics: []Diagnostic{{
+			Range:    makeRange(doc.lines, start, end, doc.text),
+			Severity: 1,
+			Source:   "mindscript",
+			Message:  err.Error(),
+		}},
+	})
+}
+
+// --------------------------- Cheap symbol scan -------------------------------
+
+// tokenName returns the identifier/property name for ID-like tokens.
+// After '.', the lexer puts the decoded property name in Literal.
+func tokenName(t mindscript.Token) string {
+	if s, ok := t.Literal.(string); ok {
+		return s
+	}
+	return t.Lexeme
+}
+
+// tokenSpan returns the [start,end) byte offsets of a token's lexeme in doc.text.
+// It is robust to occasional column off-by-ones by searching the token's line
+// for the exact lexeme near the reported column.
+func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
+	if t.Line < 1 || t.Line > len(doc.lines) {
+		return 0, 0
+	}
+	lineStart := doc.lines[t.Line-1]
+	lineEnd := len(doc.text)
+	if t.Line < len(doc.lines) {
+		lineEnd = doc.lines[t.Line]
+	}
+	line := doc.text[lineStart:lineEnd]
+
+	// primary guess: lineStart + Col
+	cand := t.Col
+	if cand < 0 {
+		cand = 0
+	}
+	if cand > len(line) {
+		cand = len(line)
+	}
+	try := func(at int) (int, int, bool) {
+		if at < 0 {
+			at = 0
+		}
+		if at+len(t.Lexeme) > len(line) {
+			return 0, 0, false
+		}
+		if line[at:at+len(t.Lexeme)] == t.Lexeme {
+			s := lineStart + at
+			return s, s + len(t.Lexeme), true
+		}
+		return 0, 0, false
 	}
 
-	// ---- postfix chain: call (), index [], get . ----
-	for {
-		switch p.peek().Type {
-		case QUESTION:
-			p.i++
-			left = L("unop", "?", left)
+	// 1) try exact position
+	if s, e, ok := try(cand); ok {
+		return s, e
+	}
+	// 2) try one char left (common off-by-one)
+	if s, e, ok := try(cand - 1); ok {
+		return s, e
+	}
+	// 3) small local search window around Col
+	const window = 8
+	from := cand - window
+	if from < 0 {
+		from = 0
+	}
+	idx := strings.Index(line[from:], t.Lexeme)
+	if idx >= 0 {
+		s := lineStart + from + idx
+		return s, s + len(t.Lexeme)
+	}
+	// 4) last resort: original naive slice (clamped)
+	s := lineStart + t.Col
+	e := s + len(t.Lexeme)
+	if s < 0 {
+		s = 0
+	}
+	if e > len(doc.text) {
+		e = len(doc.text)
+	}
+	if e < s {
+		e = s
+	}
+	return s, e
+}
+
+// Heuristic: find a definition site for name by scanning tokens for an ID equal to name
+// that has an ASSIGN ("=") later on the same line before a newline.
+func defRangeByTokens(doc *docState, name string) (Range, bool) {
+	for i := 0; i < len(doc.tokens); i++ {
+		t := doc.tokens[i]
+		if t.Type != mindscript.ID || tokenName(t) != name {
 			continue
-		case CLROUND:
-			p.i++
-			var args []any
-			if !p.match(RROUND) {
-				for {
-					a, err := p.expr(0)
-					if err != nil {
-						return nil, err
+		}
+		line := t.Line
+		// Look ahead on the same line for ASSIGN before newline
+		foundAssign := false
+		for j := i + 1; j < len(doc.tokens); j++ {
+			u := doc.tokens[j]
+			if u.Line != line {
+				break
+			}
+			if u.Type == mindscript.ASSIGN {
+				foundAssign = true
+				break
+			}
+		}
+		if foundAssign {
+			start, end := tokenSpan(doc, t)
+			return makeRange(doc.lines, start, end, doc.text), true
+		}
+	}
+	return Range{}, false
+}
+
+// formatFunSig builds a pretty signature from a ("fun", ...) AST node.
+func formatFunSig(name string, fun []any) string {
+	// ("fun", paramsArray, retType, body)
+	if len(fun) < 3 {
+		return name + "() -> Any"
+	}
+	ps, _ := fun[1].([]any)
+	var parts []string
+	if len(ps) > 0 && ps[0] == "array" {
+		for i := 1; i < len(ps); i++ {
+			p, _ := ps[i].([]any) // ("pair"| "pair!", ("id", name), typeS)
+			if len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
+				idNode, _ := p[1].([]any)
+				nameStr := "_"
+				if len(idNode) >= 2 && idNode[0] == "id" {
+					if s, ok := idNode[1].(string); ok {
+						nameStr = s
 					}
-					args = append(args, a)
-					if !p.match(COMMA) {
-						break
+				}
+				if tS, ok := p[2].([]any); ok {
+					parts = append(parts, fmt.Sprintf("%s: %s", nameStr, mindscript.FormatType(tS)))
+				} else {
+					parts = append(parts, nameStr+": Any")
+				}
+			}
+		}
+	}
+	ret := "Any"
+	if rt, ok := fun[2].([]any); ok {
+		ret = mindscript.FormatType(rt)
+	}
+	return fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), ret)
+}
+
+// analyze parses + lexes the document and extracts top-level symbols.
+// It also publishes diagnostics (or clears them) depending on parse status.
+func (s *server) analyze(doc *docState) {
+	doc.symbols = nil
+	doc.tokens = nil
+
+	// Lex first (even if parse fails) so diagnostics can highlight tokens.
+	if lex := mindscript.NewLexer(doc.text); lex != nil {
+		if toks, err := lex.Scan(); err == nil {
+			doc.tokens = toks
+		}
+	}
+
+	// Parse in interactive mode for friendlier mid-edit behavior.
+	ast, err := mindscript.ParseSExprInteractive(doc.text)
+	if err != nil {
+		s.publishError(doc, err)
+		return
+	}
+	s.clearDiagnostics(doc)
+
+	// Helper to append a symbol and compute its range via tokens where possible.
+	appendSym := func(name, kind, docline, sig string) {
+		r, ok := defRangeByTokens(doc, name)
+		if !ok {
+			// Fallback: naive text search
+			idx := strings.Index(doc.text, name)
+			if idx >= 0 {
+				r = makeRange(doc.lines, idx, idx+len(name), doc.text)
+			}
+		}
+		doc.symbols = append(doc.symbols, symbolDef{
+			Name:  name,
+			Kind:  kind,
+			Range: r,
+			Doc:   docline,
+			Sig:   sig,
+		})
+	}
+
+	firstLine := func(ann string) string {
+		ann = strings.TrimSpace(ann)
+		if nl := strings.IndexByte(ann, '\n'); nl >= 0 {
+			return strings.TrimSpace(ann[:nl])
+		}
+		return ann
+	}
+
+	// Walk top-level forms: ast is ("block", n1, n2, ...)
+	for i := 1; i < len(ast); i++ {
+		n, ok := ast[i].([]any)
+		if !ok || len(n) == 0 {
+			continue
+		}
+		tag, _ := n[0].(string)
+		switch tag {
+		case "annot":
+			// ("annot", ("str", doc), <sub>)
+			if len(n) < 3 {
+				continue
+			}
+			docNode, _ := n[1].([]any)
+			sub, _ := n[2].([]any)
+			docStr := ""
+			if len(docNode) >= 2 && docNode[0] == "str" {
+				if v, ok := docNode[1].(string); ok {
+					docStr = v
+				}
+			}
+			if len(sub) == 0 {
+				continue
+			}
+			switch sub[0] {
+			case "assign":
+				if len(sub) >= 3 {
+					lhs, _ := sub[1].([]any)
+					rhs, _ := sub[2].([]any)
+					if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
+						if nm, ok := lhs[1].(string); ok {
+							kind, sig := "let", ""
+							if len(rhs) > 0 {
+								switch rhs[0] {
+								case "fun":
+									kind = "fun"
+									sig = formatFunSig(nm, rhs)
+								case "oracle":
+									kind = "fun"
+									sig = nm + "(...) -> Any?" // conservative
+								case "type":
+									kind = "type"
+								}
+							}
+							appendSym(nm, kind, firstLine(docStr), sig)
+						}
 					}
 				}
-				if _, err := p.need(RROUND, "expected ')'"); err != nil {
-					return nil, err
+			case "decl":
+				if len(sub) >= 2 {
+					if nm, ok := sub[1].(string); ok {
+						appendSym(nm, "let", firstLine(docStr), "")
+					}
 				}
 			}
-			left = L("call", append([]any{left}, args...)...)
+		case "assign":
+			if len(n) < 3 {
+				continue
+			}
+			lhs, _ := n[1].([]any)
+			rhs, _ := n[2].([]any)
+			if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
+				if nm, ok := lhs[1].(string); ok {
+					kind, sig := "let", ""
+					if len(rhs) > 0 {
+						switch rhs[0] {
+						case "fun":
+							kind = "fun"
+							sig = formatFunSig(nm, rhs)
+						case "oracle":
+							kind = "fun"
+							sig = nm + "(...) -> Any?"
+						case "type":
+							kind = "type"
+						}
+					}
+					appendSym(nm, kind, "", sig)
+				}
+			}
+		case "decl":
+			if len(n) >= 2 {
+				if nm, ok := n[1].(string); ok {
+					appendSym(nm, "let", "", "")
+				}
+			}
+		default:
+			// top-level fun/oracle usually anonymous; skip
+		}
+	}
+}
+
+// --------------------------- Handlers ----------------------------------------
+
+func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
+	// Build the semantic tokens provider up front (avoid nil deref).
+	semProv := &struct {
+		Legend struct {
+			TokenTypes     []string `json:"tokenTypes"`
+			TokenModifiers []string `json:"tokenModifiers"`
+		} `json:"legend"`
+		Full bool `json:"full"`
+	}{Full: true}
+	semProv.Legend.TokenTypes = []string{
+		"keyword", "function", "type", "variable", "property", "string", "number", "comment",
+	}
+	semProv.Legend.TokenModifiers = []string{} // none for now
+
+	result := InitializeResult{
+		Capabilities: ServerCapabilities{
+			TextDocumentSync:   2, // Incremental
+			HoverProvider:      true,
+			DefinitionProvider: true,
+			CompletionProvider: &struct {
+				TriggerCharacters []string `json:"triggerCharacters"`
+			}{TriggerCharacters: []string{".", ":", "[", "("}},
+			DocumentSymbolProvider:          true,
+			ReferencesProvider:              true,
+			WorkspaceSymbolProvider:         false,
+			DocumentFormattingProvider:      false,
+			DocumentRangeFormattingProvider: false,
+			SemanticTokensProvider:          semProv,
+		},
+	}
+	s.sendResponse(id, result, nil)
+}
+
+func (s *server) onDidOpen(raw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentItem `json:"textDocument"`
+	}
+	_ = json.Unmarshal(raw, &params)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	doc := &docState{
+		uri:   params.TextDocument.URI,
+		text:  params.TextDocument.Text,
+		lines: lineOffsets(params.TextDocument.Text),
+	}
+	s.docs[doc.uri] = doc
+	s.analyze(doc)
+}
+
+func (s *server) onDidChange(raw json.RawMessage) {
+	var params struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+		ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"`
+	}
+	_ = json.Unmarshal(raw, &params)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	doc := s.docs[params.TextDocument.URI]
+	if doc == nil {
+		return
+	}
+	if len(params.ContentChanges) == 0 {
+		return
+	}
+	last := params.ContentChanges[len(params.ContentChanges)-1]
+	if last.Range == nil {
+		doc.text = last.Text
+	} else {
+		// Apply range edit (UTF-16 → byte offsets)
+		start := posToOffset(doc.lines, last.Range.Start, doc.text)
+		end := posToOffset(doc.lines, last.Range.End, doc.text)
+		var b bytes.Buffer
+		b.WriteString(doc.text[:start])
+		b.WriteString(last.Text)
+		if end < len(doc.text) {
+			b.WriteString(doc.text[end:])
+		}
+		doc.text = b.String()
+	}
+	doc.lines = lineOffsets(doc.text)
+	s.analyze(doc)
+}
+
+func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+
+	name, rng := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+
+	// Inspect the exact token under cursor
+	off := posToOffset(doc.lines, params.Position, doc.text)
+	_, tk, _, _, tokOK := tokenAtOffset(doc, off)
+
+	// Keywords / literals get a small doc hover
+	if tokOK {
+		if isKeyword(tk.Type) || tk.Type == mindscript.BOOLEAN {
+			word := tk.Lexeme
+			if tk.Type == mindscript.BOOLEAN {
+				// tk.Literal is a bool; normalize to "true"/"false"
+				if b, ok := tk.Literal.(bool); ok && b {
+					word = "true"
+				} else {
+					word = "false"
+				}
+			}
+			content := fmt.Sprintf("**keyword** `%s`", word)
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Document symbol (local) — show signature + first doc line if available
+	for _, sym := range doc.symbols {
+		if sym.Name == name {
+			var header string
+			switch sym.Kind {
+			case "fun":
+				if sym.Sig != "" {
+					header = fmt.Sprintf("**fun** `%s`", sym.Sig)
+				} else {
+					header = fmt.Sprintf("**fun** `%s`", sym.Name)
+				}
+			case "type":
+				header = fmt.Sprintf("**type** `%s`", sym.Name)
+			default:
+				header = fmt.Sprintf("**let** `%s`", sym.Name)
+			}
+			content := header
+			if txt := strings.TrimSpace(sym.Doc); txt != "" {
+				content += "\n\n" + txt
+			}
+			s.sendResponse(id, Hover{
+				Contents: MarkupContent{Kind: "markdown", Value: content},
+				Range:    &rng,
+			}, nil)
+			return
+		}
+	}
+
+	// Builtin types by name (IDs): Any, Null, Bool, Int, Num, Str, Type
+	if tokOK && tk.Type == mindscript.ID {
+		if docTxt, ok := builtinTypeDocs[name]; ok {
+			content := fmt.Sprintf("**type** `%s`\n\n%s", name, docTxt)
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Globals/core (natives, types)
+	if v, err := s.ip.Global.Get(name); err == nil {
+		switch v.Tag {
+		case mindscript.VTFun:
+			if meta, ok := s.ip.FunMeta(v); ok {
+				ps := meta.ParamSpecs()
+				parts := make([]string, 0, len(ps))
+				for _, p := range ps {
+					parts = append(parts, fmt.Sprintf("%s: %s", p.Name, mindscript.FormatType(p.Type)))
+				}
+				ret := mindscript.FormatType(meta.ReturnType())
+				content := fmt.Sprintf("**fun** `%s(%s) -> %s`", name, strings.Join(parts, ", "), ret)
+				if doc := meta.Doc(); doc != "" {
+					content += "\n\n" + strings.TrimSpace(doc)
+				}
+				s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+				return
+			}
+		case mindscript.VTType:
+			content := "**type** `" + name + "`"
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Final fallback: classify the token under cursor even without symbols/globals.
+	if tokOK && tk.Type == mindscript.ID {
+		kind := "identifier"
+		// property if preceded by '.'
+		idx := -1
+		for i, t := range doc.tokens {
+			if t == tk {
+				idx = i
+				break
+			}
+		}
+		if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
+			kind = "property"
+		} else if sy, ok := findSymbol(doc, name); ok && sy.Kind != "" {
+			kind = sy.Kind
+		} else if idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND {
+			kind = "fun"
+		} else if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTType {
+			kind = "type"
+		}
+		content := fmt.Sprintf("**%s** `%s`", kind, name)
+		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+		return
+	}
+	// Nothing sensible to show
+	s.sendResponse(id, nil, nil)
+}
+
+func (s *server) onDefinition(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	s.mu.RLock()
+	doc := s.docs[params.TextDocument.URI]
+	s.mu.RUnlock()
+	if doc == nil {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+
+	name, _ := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+	for _, sym := range doc.symbols {
+		if sym.Name == name {
+			s.sendResponse(id, Location{URI: doc.uri, Range: sym.Range}, nil)
+			return
+		}
+	}
+	s.sendResponse(id, nil, nil)
+}
+
+func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	s.mu.RLock()
+	doc := s.docs[params.TextDocument.URI]
+	s.mu.RUnlock()
+	if doc == nil {
+		s.sendResponse(id, []CompletionItem{}, nil)
+		return
+	}
+
+	seen := map[string]bool{}
+	items := make([]CompletionItem, 0, 64)
+
+	// Add document symbols
+	for _, sym := range doc.symbols {
+		if seen[sym.Name] {
 			continue
-		case CLSQUARE:
-			p.i++
-			idx, err := p.expr(0)
-			if err != nil {
-				return nil, err
+		}
+		seen[sym.Name] = true
+		kind := 6 // Variable
+		if sym.Kind == "fun" {
+			kind = 3 // Function
+		} else if sym.Kind == "type" {
+			kind = 5 // Class-ish for types
+		}
+		detail := sym.Kind
+		if sym.Kind == "fun" && sym.Sig != "" {
+			detail = sym.Sig
+		}
+		items = append(items, CompletionItem{
+			Label:  sym.Name,
+			Kind:   kind,
+			Detail: detail,
+		})
+	}
+
+	// Add globals/core if available (best-effort)
+	if entries, order := s.listBindings(s.ip.Global); len(order) > 0 {
+		for _, name := range order {
+			if seen[name] {
+				continue
 			}
-			if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-				return nil, err
+			seen[name] = true
+			v := entries[name]
+			kind := 6 // Variable
+			switch v.Tag {
+			case mindscript.VTFun:
+				kind = 3
+			case mindscript.VTType:
+				kind = 5
 			}
-			left = L("idx", left, idx)
+			items = append(items, CompletionItem{Label: name, Kind: kind})
+		}
+	}
+
+	// Language keywords
+	keywords := []string{
+		"and", "or", "not",
+		"let", "do", "end", "return", "break", "continue",
+		"if", "then", "elif", "else",
+		"function", "oracle",
+		"for", "in", "from", "while",
+		"typecons", "type", "enum",
+		"null", "true", "false",
+	}
+	for _, kw := range keywords {
+		if !seen[kw] {
+			seen[kw] = true
+			items = append(items, CompletionItem{
+				Label: kw,
+				Kind:  14, // Keyword
+			})
+		}
+	}
+
+	// Stable order
+	sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+	s.sendResponse(id, items, nil)
+}
+
+// Handle textDocument/semanticTokens/full
+func (s *server) onSemanticTokensFull(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params SemanticTokensParams
+	_ = json.Unmarshal(paramsRaw, &params)
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	out := SemanticTokens{Data: s.semanticTokensData(doc)}
+	s.sendResponse(id, out, nil)
+}
+
+// tokenAtOffset returns the token index and span whose lexeme covers [off].
+func tokenAtOffset(doc *docState, off int) (idx int, t mindscript.Token, start, end int, ok bool) {
+	for i, tk := range doc.tokens {
+		start, end = tokenSpan(doc, tk)
+		if off >= start && off < end {
+			return i, tk, start, end, true
+		}
+	}
+	return -1, mindscript.Token{}, 0, 0, false
+}
+
+func findSymbol(doc *docState, name string) (symbolDef, bool) {
+	for _, s := range doc.symbols {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return symbolDef{}, false
+}
+
+// listBindings asks the interpreter (best-effort) for visible bindings.
+// It tries calling a userland helper `getEnv` (if present). Falls back to empty.
+func (s *server) listBindings(env *mindscript.Env) (map[string]mindscript.Value, []string) {
+	ast := mindscript.S{"call", mindscript.S{"id", "getEnv"}}
+	v, err := s.ip.EvalAST(ast, env)
+	if err != nil || v.Tag != mindscript.VTMap {
+		return map[string]mindscript.Value{}, nil
+	}
+	mo := v.Data.(*mindscript.MapObject)
+	return mo.Entries, append([]string(nil), mo.Keys...)
+}
+
+func (s *server) onDocumentSymbols(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	s.mu.RLock()
+	doc := s.docs[params.TextDocument.URI]
+	s.mu.RUnlock()
+	if doc == nil {
+		s.sendResponse(id, []DocumentSymbol{}, nil)
+		return
+	}
+
+	out := make([]DocumentSymbol, 0, len(doc.symbols))
+	for _, sym := range doc.symbols {
+		kind := 13 // Variable
+		switch sym.Kind {
+		case "fun":
+			kind = 12 // Function
+		case "type":
+			kind = 5 // Class-ish for types
+		}
+		detail := sym.Kind
+		if sym.Kind == "fun" && sym.Sig != "" {
+			detail = sym.Sig
+		}
+		out = append(out, DocumentSymbol{
+			Name:           sym.Name,
+			Detail:         detail,
+			Kind:           kind,
+			Range:          sym.Range,
+			SelectionRange: sym.Range,
+		})
+	}
+	s.sendResponse(id, out, nil)
+}
+
+func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+		Context      struct {
+			IncludeDeclaration bool `json:"includeDeclaration"`
+		} `json:"context"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+	s.mu.RLock()
+	doc := s.docs[params.TextDocument.URI]
+	s.mu.RUnlock()
+	if doc == nil {
+		s.sendResponse(id, []Location{}, nil)
+		return
+	}
+	name, _ := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, []Location{}, nil)
+		return
+	}
+	locs := []Location{}
+	for _, t := range doc.tokens {
+		if t.Type == mindscript.ID && tokenName(t) == name {
+			start, end := tokenSpan(doc, t)
+			locs = append(locs, Location{URI: doc.uri, Range: makeRange(doc.lines, start, end, doc.text)})
+		}
+	}
+	s.sendResponse(id, locs, nil)
+}
+
+// --------------------------- Helpers -----------------------------------------
+
+// wordAt returns the identifier name and its range under the cursor using tokens.
+// It ignores occurrences inside strings/comments because it consults the lexer.
+// If token lookup misses, it falls back to a simple ASCII identifier scan.
+func wordAt(doc *docState, pos Position) (string, Range) {
+	off := posToOffset(doc.lines, pos, doc.text)
+	if off < 0 || off > len(doc.text) {
+		return "", Range{}
+	}
+
+	// 1) Token-based match (end exclusive)
+	for _, t := range doc.tokens {
+		if t.Type != mindscript.ID {
 			continue
-		case PERIOD:
-			p.i++
-			// obj.(EXPR) → idx(obj, EXPR)
-			if p.match(LROUND) || p.match(CLROUND) {
-				ex, err := p.expr(0)
-				if err != nil {
-					return nil, err
-				}
-				if _, err := p.need(RROUND, "expected ')' after computed property"); err != nil {
-					return nil, err
-				}
-				left = L("idx", left, ex)
-				continue
-			}
-			if p.match(INTEGER) { // obj.90 → idx(obj, 90)
-				left = L("idx", left, L("int", p.prev().Literal))
-				continue
-			}
-			if p.match(ID) || p.match(STRING) {
-				left = L("get", left, L("str", p.prev().Literal))
-				continue
-			}
-			g := p.peek()
-			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected property name, integer, or '(expr)' after '.'"}
 		}
-		break
-	}
-
-	// ---- infix ops ----
-	for {
-		op := p.peek()
-		bp, ok := lbp(op.Type)
-		if !ok || bp < minBP {
-			break
-		}
-		p.i++
-
-		nextBP := bp + 1
-		if op.Type == ASSIGN || op.Type == ARROW { // right-assoc
-			nextBP = bp
-		}
-
-		if op.Type == ASSIGN && !assignable(left) {
-			return nil, &ParseError{Line: op.Line, Col: op.Col, Msg: "invalid assignment target"}
-		}
-
-		if p.atEnd() && p.interactive {
-			return nil, &IncompleteError{Line: op.Line, Col: op.Col, Msg: "expected expression after operator"}
-		}
-		right, err := p.expr(nextBP)
-		if err != nil {
-			return nil, err
-		}
-		if op.Type == ASSIGN {
-			left = L("assign", left, right)
-		} else {
-			left = L("binop", op.Lexeme, left, right)
+		start, end := tokenSpan(doc, t)
+		if off >= start && off < end {
+			name := tokenName(t)
+			return name, makeRange(doc.lines, start, end, doc.text)
 		}
 	}
 
-	return left, nil
+	// 2) Fallback: naive ASCII identifier scan
+	isIdent := func(b byte) bool {
+		return b == '_' ||
+			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9')
+	}
+	i, j := off, off
+	for i > 0 && isIdent(doc.text[i-1]) {
+		i--
+	}
+	for j < len(doc.text) && isIdent(doc.text[j]) {
+		j++
+	}
+	if i < j {
+		return strings.TrimSpace(doc.text[i:j]), makeRange(doc.lines, i, j, doc.text)
+	}
+	return "", Range{}
 }
 
-// ---------- helpers ----------
-
-func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	// We’ve already consumed the opening '['
-	if p.match(RSQUARE) {
-		return L("array"), nil
-	}
-	var elems []any
-	for {
-		it, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		elems = append(elems, it)
-		if !p.match(COMMA) {
-			break
-		}
-	}
-	if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-		return nil, err
-	}
-	return L("array", elems...), nil
-}
-
-func (p *parser) params() (S, error) {
-	if _, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
-		return nil, err
-	}
-	if p.match(RROUND) {
-		return L("array"), nil
-	}
-	var ps []any
-	for {
-		idTok, err := p.need(ID, "expected parameter name")
-		if err != nil {
-			return nil, err
-		}
-		var t any = L("id", "Any")
-		if p.match(COLON) {
-			if p.atEnd() && p.interactive {
-				return nil, &IncompleteError{Line: idTok.Line, Col: idTok.Col, Msg: "expected type after ':'"}
-			}
-			e, err := p.expr(0) // parse type as expression
-			if err != nil {
-				return nil, err
-			}
-			t = e
-		}
-		ps = append(ps, L("pair", L("id", idTok.Literal), t))
-		if !p.match(COMMA) {
-			break
-		}
-	}
-	if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
-		return nil, err
-	}
-	return L("array", ps...), nil
-}
-
-// ifExpr builds: ("if", ("pair", cond1, thenBlk1), ("pair", cond2, thenBlk2), ..., [elseBlk?])
-// NOTE: The final element, if present, is a bare ("block", ...) for 'else', not wrapped in a tag.
-func (p *parser) ifExpr() (S, error) {
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(THEN, "expected 'then'"); err != nil {
-		return nil, err
-	}
-	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
-	if err != nil {
-		return nil, err
-	}
-	arms := []any{L("pair", cond, thenBlk)}
-	for p.match(ELIF) {
-		c, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := p.need(THEN, "expected 'then'"); err != nil {
-			return nil, err
-		}
-		b, err := p.blockUntil(END, ELIF, ELSE)
-		if err != nil {
-			return nil, err
-		}
-		arms = append(arms, L("pair", c, b))
-	}
-	var elseTail []any
-	if p.match(ELSE) {
-		b, err := p.blockUntil(END)
-		if err != nil {
-			return nil, err
-		}
-		elseTail = []any{b}
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return L("if", append(arms, elseTail...)...), nil
-}
-
-// Parse a block; if requireDo is true, assert a leading 'do'.
-// Always requires a trailing 'end'.
-func (p *parser) parseBlock(requireDo bool) (S, error) {
-	if requireDo {
-		if _, err := p.need(DO, "expected 'do'"); err != nil {
-			return nil, err
-		}
-	}
-	b, err := p.blockUntil(END)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-func (p *parser) blockUntil(stops ...TokenType) (S, error) {
-	stop := map[TokenType]bool{}
-	for _, s := range stops {
-		stop[s] = true
-	}
-	var items []any
-	for !p.atEnd() && !stop[p.peek().Type] {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, e)
-	}
-	return L("block", items...), nil
-}
-
-func (p *parser) forExpr() (S, error) {
-	// for <target> in <expr> do ... end
-	tgt, err := p.forTarget()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(IN, "expected 'in'"); err != nil {
-		return nil, err
-	}
-	iter, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	return L("for", tgt, iter, body), nil
-}
-
-func (p *parser) whileExpr() (S, error) {
-	// while COND do ... end
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	return L("while", cond, body), nil
-}
-
-func (p *parser) forTarget() (S, error) {
-	// Allow explicit `let <pattern>`
-	if p.match(LET) {
-		return p.declPattern()
-	}
-
-	// If the next token clearly starts a pattern, parse a *declaration* pattern
-	// (implicit binding) just like Python: `for [k, v] in ...` or `for {k:x} in ...`.
-	switch p.peek().Type {
-	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
-		save := p.i
-		pt, err := p.declPattern()
-		if err == nil {
-			return pt, nil // e.g., ("darr", ...), ("dobj", ...)
-		}
-		// In interactive mode, bubble up incompleteness instead of falling back
-		if p.interactive && IsIncomplete(err) {
-			return nil, err
-		}
-		p.i = save // fall back below if pattern parse fails
-	}
-
-	// Otherwise, parse a simple prim+postfix expression and require it's assignable
-	save := p.i
-	e, err := p.expr(90)
-	if err != nil {
-		return nil, err
-	}
-	if !assignable(e) {
-		p.i = save
-		g := p.peek()
-		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "invalid for-target (must be id/get/idx/decl/pattern)"}
-	}
-
-	// Bare id → implicit declaration, same as before
-	if e[0].(string) == "id" {
-		return L("decl", e[1].(string)), nil
-	}
-	return e, nil
-}
-
-func assignable(n S) bool {
-	if len(n) == 0 {
-		return false
-	}
-	switch n[0] {
-	case "id", "get", "idx", "decl", "darr", "dobj":
+func isKeyword(tt mindscript.TokenType) bool {
+	switch tt {
+	case mindscript.AND, mindscript.OR, mindscript.NOT,
+		mindscript.LET, mindscript.DO, mindscript.END, mindscript.RETURN, mindscript.BREAK, mindscript.CONTINUE,
+		mindscript.IF, mindscript.THEN, mindscript.ELIF, mindscript.ELSE,
+		mindscript.FUNCTION, mindscript.ORACLE,
+		mindscript.FOR, mindscript.IN, mindscript.FROM, mindscript.WHILE,
+		mindscript.TYPECONS, mindscript.TYPE, mindscript.ENUM,
+		mindscript.NULL:
 		return true
 	default:
 		return false
 	}
 }
 
-// ----- Declaration patterns (with annotation wrapper) -----
+// --------------------------- Semantic Tokens ---------------------------------
 
-func (p *parser) declPattern() (S, error) {
-	// Allow stacked line-leading annotations to wrap the next pattern
-	if p.match(ANNOTATION) {
-		txt := ""
-		if s, ok := p.prev().Literal.(string); ok {
-			txt = s
+func u16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r < 0x10000 {
+			n++
+		} else {
+			n += 2
 		}
-		sub, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		return L("annot", L("str", txt), sub), nil
 	}
-
-	if p.match(ID) {
-		return L("decl", p.prev().Literal), nil
-	}
-	if p.match(LSQUARE, CLSQUARE) {
-		return p.arrayDeclPattern()
-	}
-	if p.match(LCURLY) {
-		return p.objectDeclPattern()
-	}
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
-	}
-	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
+	return n
 }
 
-func (p *parser) arrayDeclPattern() (S, error) {
-	if p.match(RSQUARE) {
-		return L("darr"), nil
-	}
-	var parts []any
-	for {
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, err
+// tokenType index mapping (must match initialize legend)
+var semTypes = map[string]int{
+	"keyword":  0,
+	"function": 1,
+	"type":     2,
+	"variable": 3,
+	"property": 4,
+	"string":   5,
+	"number":   6,
+	"comment":  7,
+}
+
+// commentSpans returns byte ranges for all comment/annotation regions:
+//   - lines whose first non-space is "##" (line comments),
+//   - lines whose first non-space is "#"  (block annotation lines),
+//   - inline "#(" ... ")" (single line best-effort).
+func commentSpans(doc *docState) [][2]int {
+	text := doc.text
+	spans := [][2]int{}
+
+	// 1) Per-line scanning for "##" and "#" blocks
+	for li := 0; li < len(doc.lines); li++ {
+		lo := doc.lines[li]
+		hi := len(text)
+		if li+1 < len(doc.lines) {
+			hi = doc.lines[li+1]
 		}
-		parts = append(parts, pt)
-		if !p.match(COMMA) {
+		line := text[lo:hi]
+		trim := strings.TrimLeft(line, " \t")
+		if len(trim) == 0 {
+			continue
+		}
+		if strings.HasPrefix(trim, "##") {
+			// whole line is a comment
+			spans = append(spans, [2]int{lo, hi})
+			continue
+		}
+		if strings.HasPrefix(trim, "#") {
+			// annotation-style line; treat whole line as comment
+			spans = append(spans, [2]int{lo, hi})
+		}
+	}
+
+	// 2) Inline "#(" ... ")" (best effort, no nesting)
+	for start := 0; ; {
+		i := strings.Index(text[start:], "#(")
+		if i < 0 {
 			break
 		}
-	}
-	if _, err := p.need(RSQUARE, "expected ']' in array pattern"); err != nil {
-		return nil, err
-	}
-	return L("darr", parts...), nil
-}
-
-// read a key token and turn it into ("str", key)
-func (p *parser) readKeyString() (S, error) {
-	// Allow annotation(s) directly in front of the key.
-	if p.match(ANNOTATION) {
-		txt := ""
-		if s, ok := p.prev().Literal.(string); ok {
-			txt = s
-		}
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, err
-		}
-		return L("annot", L("str", txt), k), nil
-	}
-
-	// Quoted key.
-	if p.match(STRING) {
-		return L("str", p.prev().Literal), nil
-	}
-
-	// Any word-like token (identifier, built-in type, or keyword), plus true/false/null.
-	t := p.peek()
-	switch t.Type {
-	case ID, TYPE,
-		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
-		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
-		TYPECONS, ENUM,
-		BOOLEAN, NULL:
-		p.i++
-		name := t.Lexeme
-		if s, ok := t.Literal.(string); ok { // ID/TYPE carry string Literal
-			name = s
-		}
-		return L("str", name), nil
-	}
-
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected key"}
-	}
-	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key"}
-}
-
-func (p *parser) keyRequired() (key S, required bool, err error) {
-	k, err := p.readKeyString()
-	if err != nil {
-		return nil, false, err
-	}
-	req := p.match(BANG)
-	return k, req, nil
-}
-
-func (p *parser) objectDeclPattern() (S, error) {
-	if p.match(RCURLY) {
-		return L("dobj"), nil
-	}
-	var pairs []any
-	for {
-		key, err := p.readKeyString()
-		if err != nil {
-			return nil, err
-		}
-		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
-			return nil, err
-		}
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		pairs = append(pairs, L("pair", key, pt))
-		if !p.match(COMMA) {
+		i += start
+		j := strings.IndexByte(text[i+2:], ')')
+		if j < 0 {
+			// until end of file if unmatched
+			spans = append(spans, [2]int{i, len(text)})
 			break
 		}
+		j = i + 2 + j // inclusive ')'
+		spans = append(spans, [2]int{i, j + 1})
+		start = j + 1
 	}
-	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
-		return nil, err
-	}
-	return L("dobj", pairs...), nil
+
+	// (We do not rely on ANNOTATION tokens here to avoid lexeme-vs-# offset issues.)
+	return spans
 }
-=== END FILE: parser.go ===
+
+func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
+
+type semEntry struct {
+	line, ch, lenU16, typ int
+}
+
+// --------------------------- Semantic Tokens ---------------------------------
+
+func (s *server) semanticTokensData(doc *docState) []uint32 {
+	if doc == nil || len(doc.tokens) == 0 {
+		return nil
+	}
+
+	// Comment/annotation spans are used for exclusion only.
+	cspans := commentSpans(doc)
+	isInComment := func(sOff, eOff int) bool {
+		se := [2]int{sOff, eOff}
+		for _, c := range cspans {
+			if overlaps(se, c) {
+				return true
+			}
+		}
+		return false
+	}
+
+	type semEntry struct{ line, ch, lenU16, typ int }
+	entries := []semEntry{}
+
+	for i := 0; i < len(doc.tokens); i++ {
+		tk := doc.tokens[i]
+		if tk.Type == mindscript.ANNOTATION {
+			continue // skip entire annotation tokens
+		}
+		sOff, eOff := tokenSpan(doc, tk)
+		if eOff <= sOff || isInComment(sOff, eOff) {
+			continue
+		}
+
+		// classify
+		typIdx := -1
+		switch {
+		case isKeyword(tk.Type) || tk.Type == mindscript.BOOLEAN:
+			typIdx = semTypes["keyword"]
+		case tk.Type == mindscript.STRING:
+			typIdx = semTypes["string"]
+		case tk.Type == mindscript.INTEGER || tk.Type == mindscript.NUMBER:
+			typIdx = semTypes["number"]
+		case tk.Type == mindscript.ID:
+			name := tokenName(tk)
+			idx := -1
+			for ii, t := range doc.tokens {
+				if t == tk {
+					idx = ii
+					break
+				}
+			}
+			if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
+				typIdx = semTypes["property"]
+			} else {
+				kind := ""
+				for _, sy := range doc.symbols {
+					if sy.Name == name {
+						kind = sy.Kind
+						break
+					}
+				}
+				if kind == "fun" || (idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND) {
+					typIdx = semTypes["function"]
+				} else if kind == "type" {
+					typIdx = semTypes["type"]
+				} else {
+					typIdx = semTypes["variable"]
+				}
+			}
+		default:
+			continue
+		}
+
+		start := offsetToPos(doc.lines, sOff, doc.text)
+		entries = append(entries, semEntry{
+			line:   start.Line,
+			ch:     start.Character,
+			lenU16: u16Len(doc.text[sOff:eOff]),
+			typ:    typIdx,
+		})
+	}
+
+	// Sort then delta-encode to avoid split/partial coloring.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].line != entries[j].line {
+			return entries[i].line < entries[j].line
+		}
+		return entries[i].ch < entries[j].ch
+	})
+	data := make([]uint32, 0, len(entries)*5)
+	prevLine, prevCh := 0, 0
+	first := true
+	for _, e := range entries {
+		dl, dc := e.line, e.ch
+		if !first {
+			dl -= prevLine
+			if dl == 0 {
+				dc -= prevCh
+			}
+		}
+		first = false
+		prevLine, prevCh = e.line, e.ch
+		data = append(data, uint32(dl), uint32(dc), uint32(e.lenU16), uint32(e.typ), 0)
+	}
+	return data
+}
+
+// --------------------------- Builtin type docs -------------------------------
+
+var builtinTypeDocs = map[string]string{
+	"Any":  "Top type; any value.",
+	"Null": "Null value (absence).",
+	"Bool": "Boolean type (true/false).",
+	"Int":  "64-bit signed integer.",
+	"Num":  "64-bit IEEE-754 float.",
+	"Str":  "Unicode string.",
+	"Type": "Type descriptor value.",
+}
+
+// --------------------------- Main loop ---------------------------------------
+
+func main() {
+	s := newServer()
+	in := bufio.NewReader(os.Stdin)
+
+	for {
+		msgBytes, err := readMsg(in)
+		if err != nil {
+			if err != io.EOF {
+				// best-effort log to stderr
+				fmt.Fprintln(os.Stderr, "read error:", err)
+			}
+			return
+		}
+		var req Request
+		if err := json.Unmarshal(msgBytes, &req); err != nil {
+			continue
+		}
+
+		switch req.Method {
+		case "initialize":
+			s.onInitialize(req.ID, req.Params)
+		case "initialized":
+			// ignore
+		case "shutdown":
+			s.sendResponse(req.ID, nil, nil)
+		case "exit":
+			return
+
+		case "textDocument/didOpen":
+			s.onDidOpen(req.Params)
+		case "textDocument/didChange":
+			s.onDidChange(req.Params)
+		case "textDocument/hover":
+			s.onHover(req.ID, req.Params)
+		case "textDocument/definition":
+			s.onDefinition(req.ID, req.Params)
+		case "textDocument/completion":
+			s.onCompletion(req.ID, req.Params)
+		case "textDocument/documentSymbol":
+			s.onDocumentSymbols(req.ID, req.Params)
+		case "textDocument/references":
+			s.onReferences(req.ID, req.Params)
+		case "textDocument/semanticTokens/full":
+			s.onSemanticTokensFull(req.ID, req.Params)
+
+		default:
+			// Respond with MethodNotFound for requests that carry an id
+			if len(req.ID) > 0 {
+				s.sendResponse(req.ID, nil, &ResponseError{Code: -32601, Message: "method not found"})
+			}
+		}
+	}
+}
+=== END FILE: cmd/lsp/main.go ===
 

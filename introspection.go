@@ -231,6 +231,8 @@ func IxFromSourceInteractive(src string) (S, error) { return ParseSExprInteracti
 // pretty-printer from printer.go (FormatSExpr). Output is stable.
 func IxToSource(ast S) string { return FormatSExpr(ast) }
 
+//// END_OF_PUBLIC
+
 // ==============================
 // ========== PRIVATE ===========
 // ==============================

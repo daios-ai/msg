@@ -6,4 +6,5 @@ echo "Building the CLI"
 go build -o mindscript cmd/cli/main.go
 
 echo "Building the LSP"
-go build -o mindscript-lsp cmd/lsp/main.go
+go test ./cmd/lsp -v
+go build -o cmd/lsp/vscode/server/mindscript-lsp cmd/lsp/main.go

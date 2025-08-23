@@ -1,60 +1,33 @@
-import * as path from 'path';
 import * as vscode from 'vscode';
-import {
-  LanguageClient,
-  LanguageClientOptions,
-  ServerOptions,
-  TransportKind
-} from 'vscode-languageclient/node';
+import { LanguageClient, LanguageClientOptions, Executable } from 'vscode-languageclient/node';
+import * as path from 'path';
 
 let client: LanguageClient | undefined;
 
+function serverExecutablePath(ctx: vscode.ExtensionContext): string {
+  const exe = process.platform === 'win32' ? 'mindscript-lsp.exe' : 'mindscript-lsp';
+  // server/ sits at the extension root (same level as package.json)
+  const uri = vscode.Uri.joinPath(ctx.extensionUri, 'server', exe);
+  return uri.fsPath;
+}
+
 export async function activate(context: vscode.ExtensionContext) {
-  const cfg = vscode.workspace.getConfiguration('mindscript');
-  const serverPath = cfg.get<string>('serverPath') || '';
-
-  if (!serverPath) {
-    vscode.window.showWarningMessage(
-      'MindScript: set "mindscript.serverPath" to your LSP binary to enable language features.'
-    );
-    return;
-  }
-
-  const serverOptions: ServerOptions = {
-    run:   { command: serverPath, transport: TransportKind.stdio },
-    debug: { command: serverPath, transport: TransportKind.stdio }
-  };
-
-  const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ language: 'mindscript', scheme: 'file' }, { language: 'mindscript', scheme: 'untitled' }],
-    synchronize: {
-      fileEvents: vscode.workspace.createFileSystemWatcher('**/*.ms')
+  const command = serverExecutablePath(context); // absolute path inside the extension
+  const executable: Executable = {
+    command,
+    args: [],
+    options: {
+      cwd: vscode.Uri.joinPath(context.extensionUri).fsPath // extension root as CWD
     }
   };
 
-  client = new LanguageClient(
-    'mindscriptLanguageServer',
-    'MindScript Language Server',
-    serverOptions,
-    clientOptions
-  );
+  const clientOptions: LanguageClientOptions = {
+    documentSelector: [{ scheme: 'file', language: 'mindscript' }, { scheme: 'untitled', language: 'mindscript' }]
+  };
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand('mindscript.startServer', async () => {
-      if (client) {
-        // `start()` may return a Thenable in newer clients; `await` is fine.
-        await client.start();
-      } else {
-        vscode.window.showErrorMessage('MindScript LSP client is not initialized.');
-      }
-    })
-  );
-
+  client = new LanguageClient('mindscript', 'MindScript Language Server', executable, clientOptions);
+  client.outputChannel.show(true); // surface logs
   await client.start();
 }
 
-export function deactivate(): Promise<void> | undefined {
-  return client?.stop();
-}
-
-
+export async function deactivate() { await client?.stop(); }

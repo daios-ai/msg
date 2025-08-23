@@ -1,0 +1,57 @@
+{
+  "name": "MindScript",
+  "scopeName": "source.mindscript",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#annotations" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.number-sign.mindscript", "match": "##.*$" }
+      ]
+    },
+    "annotations": {
+      "patterns": [
+        { "name": "markup.quote.annotation.mindscript", "begin": "^[ \\t]*#(?!#)", "end": "$" },
+        { "name": "comment.block.annotation.mindscript", "begin": "#\\(", "end": "\\)" } 
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.double.mindscript", "begin": "\"", "end": "\"", "patterns": [{ "include": "#esc" }] },
+        { "name": "string.quoted.single.mindscript", "begin": "'",  "end": "'",  "patterns": [{ "include": "#esc" }] }
+      ]
+    },
+    "esc": { "patterns": [{ "name": "constant.character.escape.mindscript", "match": "\\\\(?:[\"'\\\\/bfnrt]|u[0-9A-Fa-f]{4})" }] },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.float.mindscript", "match": "(?<!\\w)(?:\\d+\\.\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?(?!\\w)" },
+        { "name": "constant.numeric.integer.mindscript", "match": "(?<!\\w)\\d+(?!\\w)" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.mindscript", "match": "\\b(if|then|elif|else|for|while|do|end|return|break|continue|from|in)\\b" },
+        { "name": "keyword.declaration.mindscript", "match": "\\b(let|fun|oracle|type|enum)\\b" },
+        { "name": "keyword.operator.word.mindscript", "match": "\\b(and|or|not)\\b" },
+        { "name": "keyword.operator.symbol.mindscript", "match": "(==|!=|<=|>=|->|[+\\-*/%<>=!?.,:\\[\\]\\(\\){}])" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        { "name": "support.type.primitive.mindscript", "match": "\\b(Any|Null|Bool|Int|Num|Str|Type)\\b" }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        { "name": "variable.other.mindscript", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" }
+      ]
+    }
+  }
+}

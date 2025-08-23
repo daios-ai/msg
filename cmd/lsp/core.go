@@ -296,7 +296,8 @@ type server struct {
 func newServer() *server {
 	return &server{
 		docs: make(map[string]*docState),
-		ip:   mindscript.NewInterpreter(),
+		// Hydrated runtime (builtins + prelude)
+		ip: mindscript.NewRuntime(),
 	}
 }
 
@@ -325,12 +326,25 @@ func (s *server) snapshotDoc(uri string) *docState {
 // Text & UTF-16 helpers
 ////////////////////////////////////////////////////////////////////////////////
 
+// CRLF-aware: treat "\r\n" as a single newline; store offsets at the byte *after* '\n'.
 func lineOffsets(text string) []int {
 	offs := []int{0}
-	for i, r := range text {
-		if r == '\n' {
-			offs = append(offs, i+1)
+	for i := 0; i < len(text); {
+		if text[i] == '\r' {
+			// skip lone \r (shouldn't happen often)
+			i++
+			continue
 		}
+		if text[i] == '\n' {
+			offs = append(offs, i+1)
+			i++
+			continue
+		}
+		_, sz := utf8.DecodeRuneInString(text[i:])
+		if sz <= 0 {
+			sz = 1
+		}
+		i += sz
 	}
 	return offs
 }
@@ -353,6 +367,10 @@ func posToOffset(lines []int, p Position, text string) int {
 	need := p.Character // in UTF-16 units
 	for i < len(text) && need > 0 {
 		r, sz := utf8.DecodeRuneInString(text[i:])
+		if r == '\r' { // ignore CR in column math
+			i += sz
+			continue
+		}
 		if r == '\n' {
 			break
 		}
@@ -381,6 +399,10 @@ func offsetToPos(lines []int, off int, text string) Position {
 	u16 := 0
 	for k := lines[i]; k < off && k < len(text); {
 		r, sz := utf8.DecodeRuneInString(text[k:])
+		if r == '\r' { // ignore CR
+			k += sz
+			continue
+		}
 		if r == '\n' {
 			break
 		}
@@ -689,6 +711,25 @@ func commentSpans(doc *docState) [][2]int {
 		}
 	}
 
+	// Build STRING spans once to avoid false-positive inline "#(" inside strings.
+	stringSpans := [][2]int{}
+	for _, tk := range doc.tokens {
+		if tk.Type == mindscript.STRING {
+			s, e := tokenSpan(doc, tk)
+			if e > s {
+				stringSpans = append(stringSpans, [2]int{s, e})
+			}
+		}
+	}
+	inString := func(off int) bool {
+		for _, sp := range stringSpans {
+			if off >= sp[0] && off < sp[1] {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Lines whose first non-space is '#' or '##'
 	for li := 0; li < len(doc.lines); li++ {
 		lo := doc.lines[li]
@@ -713,6 +754,11 @@ func commentSpans(doc *docState) [][2]int {
 			break
 		}
 		i += start
+		// Skip if inside a string literal
+		if inString(i) {
+			start = i + 2
+			continue
+		}
 		j := strings.IndexByte(text[i+2:], ')')
 		if j < 0 {
 			spans = append(spans, [2]int{i, len(text)})
@@ -827,10 +873,37 @@ func (s *server) analyze(doc *docState) {
 	ast, err := mindscript.ParseSExprInteractive(local.text)
 	if err != nil {
 		s.publishError(&local, err)
+
+		// If we don't have tokens (e.g., initial lex/parse dies early), try to lex the prefix up to error position
+		// so diagnostics, refs, and semTokens still have something to work with.
+		if len(local.tokens) == 0 {
+			line, col := 0, 0
+			switch e := err.(type) {
+			case *mindscript.ParseError:
+				line, col = e.Line, e.Col
+			case *mindscript.LexError:
+				line, col = e.Line, e.Col
+			case *mindscript.IncompleteError:
+				line, col = e.Line, e.Col
+			}
+			if line > 0 {
+				off := byteColToOffset(local.lines, line-1, col, local.text)
+				if off > 0 && off <= len(local.text) {
+					if lx := mindscript.NewLexer(local.text[:off]); lx != nil {
+						if toks, lexErr := lx.Scan(); lexErr == nil {
+							local.tokens = toks
+						}
+					}
+				}
+			}
+		}
 		// Store tokens so features still work during errors.
 		s.mu.Lock()
 		if live := s.docs[doc.uri]; live != nil {
-			live.tokens = local.tokens
+			if len(local.tokens) > 0 {
+				live.tokens = local.tokens
+			}
+			// keep existing live.symbols on error
 		}
 		s.mu.Unlock()
 		return

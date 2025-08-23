@@ -35,8 +35,10 @@ func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
 	result := InitializeResult{
 		Capabilities: ServerCapabilities{
 			TextDocumentSync: TextDocumentSyncOptions{
-				OpenClose: true,
-				Change:    2, // Incremental
+				OpenClose:         true,
+				Change:            2,
+				WillSave:          false,
+				WillSaveWaitUntil: true,
 			},
 			HoverProvider:      true,
 			DefinitionProvider: true,
@@ -46,8 +48,8 @@ func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
 			DocumentSymbolProvider:          true,
 			ReferencesProvider:              true,
 			WorkspaceSymbolProvider:         false,
-			DocumentFormattingProvider:      false,
-			DocumentRangeFormattingProvider: false,
+			DocumentFormattingProvider:      true,
+			DocumentRangeFormattingProvider: true,
 			SignatureHelpProvider: &struct {
 				TriggerCharacters   []string `json:"triggerCharacters"`
 				RetriggerCharacters []string `json:"retriggerCharacters"`
@@ -127,6 +129,35 @@ func (s *server) onDidChange(raw json.RawMessage) {
 		doc.lines = lineOffsets(doc.text)
 	}
 	s.analyze(doc)
+}
+
+// WillSaveWaitUntil: offer formatting edits right before save.
+func (s *server) onWillSaveWaitUntil(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Reason       int                    `json:"reason"` // unused
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+	out, err := mindscript.Standardize(doc.text)
+	if err != nil || out == doc.text {
+		// no edits (either failed to parse or already formatted)
+		if err != nil {
+			s.publishError(doc, err)
+		}
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+	edit := TextEdit{
+		Range:   makeRange(doc.lines, 0, len(doc.text), doc.text),
+		NewText: out,
+	}
+	s.sendResponse(id, []TextEdit{edit}, nil)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -231,6 +262,19 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
+	// Local param type from enclosing fun(s), using AST spans.
+	if tokOK && tk.Type == mindscript.ID && doc.ast != nil && doc.spans != nil {
+		sOff, eOff := tokenSpan(doc, tk)
+		path, node, ok := findSmallestCovering(doc.ast, doc.spans, sOff, eOff)
+		if ok && len(node) >= 2 && node[0] == "id" {
+			if tS, ok := findParamTypeInEnclosingFuns(doc.ast, path, name); ok && tS != nil {
+				label := fmt.Sprintf("**param** `%s: %s`", name, mindscript.FormatType(tS))
+				s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: label}, Range: &rng}, nil)
+				return
+			}
+		}
+	}
+
 	// Fallback classification for IDs
 	if tokOK && tk.Type == mindscript.ID {
 		kind := "identifier"
@@ -296,6 +340,38 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 	doc := s.snapshotDoc(params.TextDocument.URI)
 	if doc == nil {
 		s.sendResponse(id, []CompletionItem{}, nil)
+		return
+	}
+
+	// --- dot context: person. → suggest properties only ---
+	if ok, base := isDotContext(doc, params.Position); ok && doc.ast != nil {
+		seen := map[string]bool{}
+		props := []CompletionItem{}
+
+		// find the last top-level assignment to `base` that has a map literal
+		ast := doc.ast
+		for i := 1; i < len(ast); i++ {
+			n, _ := ast[i].([]any)
+			if len(n) >= 3 && n[0] == "assign" {
+				lhs, _ := n[1].([]any)
+				rhs := n[2]
+				if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
+					if nm, ok := lhs[1].(string); ok && nm == base {
+						for _, k := range mapKeysLiteral(rhs) {
+							if !seen[k] {
+								seen[k] = true
+								props = append(props, CompletionItem{
+									Label: k,
+									Kind:  10, // Property
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+		sort.Slice(props, func(i, j int) bool { return props[i].Label < props[j].Label })
+		s.sendResponse(id, props, nil)
 		return
 	}
 
@@ -374,6 +450,48 @@ func (s *server) listBindings(env *mindscript.Env) (map[string]mindscript.Value,
 	}
 	mo := v.Data.(*mindscript.MapObject)
 	return mo.Entries, append([]string(nil), mo.Keys...)
+}
+
+func isDotContext(doc *docState, pos Position) (bool, string) {
+	off := posToOffset(doc.lines, pos, doc.text)
+	idx, tk, _, _, ok := tokenAtOffset(doc, off-1) // look just before cursor
+	if !ok || tk.Type != mindscript.PERIOD {
+		return false, ""
+	}
+	// previous significant token should be an ID
+	if idx-1 >= 0 && doc.tokens[idx-1].Type == mindscript.ID {
+		return true, tokenName(doc.tokens[idx-1])
+	}
+	return false, ""
+}
+
+// extract keys from a ("map", ("pair"| "pair!", ("str",k), v) ...)
+func mapKeysLiteral(n any) []string {
+	s, ok := n.([]any)
+	if !ok || len(s) == 0 || s[0] != "map" {
+		return nil
+	}
+	out := []string{}
+	for i := 1; i < len(s); i++ {
+		p, _ := s[i].([]any)
+		if len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
+			// p[1] may be ("str", key) or wrapped by ("annot", ("str", text), ("str", key))
+			k := p[1]
+			for {
+				if a, ok := k.([]any); ok && len(a) >= 3 && a[0] == "annot" {
+					k = a[2]
+					continue
+				}
+				break
+			}
+			if ks, ok := k.([]any); ok && len(ks) >= 2 && ks[0] == "str" {
+				if name, ok := ks[1].(string); ok {
+					out = append(out, name)
+				}
+			}
+		}
+	}
+	return out
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -458,6 +576,78 @@ func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
 		})
 	}
 	s.sendResponse(id, locs, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Document formatting (full + range)
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onDocumentFormatting(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params DocumentFormattingParams
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+
+	out, err := mindscript.Standardize(doc.text)
+	if err != nil {
+		// surface as diagnostics and return no edits
+		s.publishError(doc, err)
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+	// Full replacement edit
+	full := TextEdit{
+		Range:   makeRange(doc.lines, 0, len(doc.text), doc.text),
+		NewText: out,
+	}
+	s.sendResponse(id, []TextEdit{full}, nil)
+}
+
+func (s *server) onDocumentRangeFormatting(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params DocumentRangeFormattingParams
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil || doc.spans == nil || doc.ast == nil {
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+
+	start := posToOffset(doc.lines, params.Range.Start, doc.text)
+	end := posToOffset(doc.lines, params.Range.End, doc.text)
+	if start < 0 {
+		start = 0
+	}
+	if end > len(doc.text) {
+		end = len(doc.text)
+	}
+	if start >= end {
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+
+	_, node, ok := findSmallestCovering(doc.ast, doc.spans, start, end)
+	if !ok {
+		// Fallback: format whole file minimally (or no edits)
+		s.sendResponse(id, []TextEdit{}, nil)
+		return
+	}
+
+	pretty := mindscript.FormatSExpr(node)
+
+	// Use the recorded span for the node to compute the replacement range
+	// Re-find the path to retrieve the exact span we’re replacing.
+	path, _, _ := findSmallestCovering(doc.ast, doc.spans, start, end) // same call; path reused
+	sp, _ := doc.spans.Get(path)
+	edit := TextEdit{
+		Range:   makeRange(doc.lines, sp.StartByte, sp.EndByte, doc.text),
+		NewText: pretty,
+	}
+	s.sendResponse(id, []TextEdit{edit}, nil)
 }
 
 ////////////////////////////////////////////////////////////////////////////////

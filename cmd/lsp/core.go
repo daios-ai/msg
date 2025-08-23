@@ -198,6 +198,23 @@ type ParameterInformation struct {
 	Documentation *MarkupContent `json:"documentation,omitempty"`
 }
 
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+type DocumentFormattingParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	// Options are ignored for now; we honor global printer settings instead.
+	Options map[string]any `json:"options"`
+}
+
+type DocumentRangeFormattingParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Range        Range                  `json:"range"`
+	Options      map[string]any         `json:"options"`
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Transport (stdio framing) + send/notify
 ////////////////////////////////////////////////////////////////////////////////
@@ -285,6 +302,8 @@ type docState struct {
 	lines   []int // line start offsets (byte indices)
 	symbols []symbolDef
 	tokens  []mindscript.Token
+	ast     mindscript.S
+	spans   *mindscript.SpanIndex
 }
 
 type server struct {
@@ -528,74 +547,32 @@ func tokenName(t mindscript.Token) string {
 }
 
 // tokenSpan returns [start,end) byte offsets of a token's lexeme in doc.text.
-// Robust to occasional column off-by-ones via small local search.
-func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
-	if t.Line < 1 || t.Line > len(doc.lines) {
-		return 0, 0
+func tokenSpan(_ *docState, t mindscript.Token) (start, end int) {
+	// Tokens carry precise byte offsets from the lexer.
+	if t.StartByte >= 0 && t.EndByte >= t.StartByte {
+		return t.StartByte, t.EndByte
 	}
-	lineStart := doc.lines[t.Line-1]
-	lineEnd := len(doc.text)
-	if t.Line < len(doc.lines) {
-		lineEnd = doc.lines[t.Line]
-	}
-	line := doc.text[lineStart:lineEnd]
-
-	cand := t.Col
-	if cand < 0 {
-		cand = 0
-	}
-	if cand > len(line) {
-		cand = len(line)
-	}
-	try := func(at int) (int, int, bool) {
-		if at < 0 {
-			at = 0
-		}
-		if at+len(t.Lexeme) > len(line) {
-			return 0, 0, false
-		}
-		if line[at:at+len(t.Lexeme)] == t.Lexeme {
-			s := lineStart + at
-			return s, s + len(t.Lexeme), true
-		}
-		return 0, 0, false
-	}
-	if s, e, ok := try(cand); ok {
-		return s, e
-	}
-	if s, e, ok := try(cand - 1); ok {
-		return s, e
-	}
-	const window = 8
-	from := cand - window
-	if from < 0 {
-		from = 0
-	}
-	if idx := strings.Index(line[from:], t.Lexeme); idx >= 0 {
-		s := lineStart + from + idx
-		return s, s + len(t.Lexeme)
-	}
-	s := lineStart + t.Col
-	e := s + len(t.Lexeme)
-	if s < 0 {
-		s = 0
-	}
-	if e > len(doc.text) {
-		e = len(doc.text)
-	}
-	if e < s {
-		e = s
-	}
-	return s, e
+	// Extremely defensive fallback (shouldn’t happen).
+	return 0, 0
 }
 
-// tokenAtOffset returns the token index and span whose lexeme covers [off].
+// tokenAtOffset returns the token index and span whose lexeme covers [off] using binary search.
 func tokenAtOffset(doc *docState, off int) (idx int, t mindscript.Token, start, end int, ok bool) {
-	for i, tk := range doc.tokens {
-		s, e := tokenSpan(doc, tk)
-		if off >= s && off < e {
-			return i, tk, s, e, true
+	// tokens are emitted in source order; StartByte is monotonic
+	lo, hi := 0, len(doc.tokens)-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		tk := doc.tokens[mid]
+		s, e := tk.StartByte, tk.EndByte
+		if off < s {
+			hi = mid - 1
+			continue
 		}
+		if off >= e {
+			lo = mid + 1
+			continue
+		}
+		return mid, tk, s, e, true
 	}
 	return -1, mindscript.Token{}, 0, 0, false
 }
@@ -653,6 +630,104 @@ func wordAt(doc *docState, pos Position) (string, Range) {
 	return "", Range{}
 }
 
+// walkPaths emits all NodePaths in pre-order (children included).
+func walkPaths(n mindscript.S, prefix mindscript.NodePath, visit func(path mindscript.NodePath, node mindscript.S)) {
+	visit(prefix, n)
+	for ci := 1; ci < len(n); ci++ {
+		if child, ok := n[ci].(mindscript.S); ok {
+			walkPaths(child, append(append(mindscript.NodePath(nil), prefix...), ci-1), visit)
+		}
+	}
+}
+
+// getNodeByPath indexes into an S-expression by NodePath.
+func getNodeByPath(n mindscript.S, p mindscript.NodePath) (mindscript.S, bool) {
+	cur := n
+	for _, k := range p {
+		if k+1 >= len(cur) {
+			return nil, false
+		}
+		c, ok := cur[k+1].(mindscript.S)
+		if !ok {
+			return nil, false
+		}
+		cur = c
+	}
+	return cur, true
+}
+
+// getAncestors returns all ancestor paths from nearest to root (excluding the node itself).
+func getAncestors(path mindscript.NodePath) []mindscript.NodePath {
+	out := []mindscript.NodePath{}
+	for i := len(path); i >= 0; i-- {
+		out = append(out, append(mindscript.NodePath(nil), path[:i]...))
+	}
+	return out
+}
+
+func findParamTypeInEnclosingFuns(ast mindscript.S, path mindscript.NodePath, name string) (mindscript.S, bool) {
+	anc := getAncestors(path)
+	for _, ap := range anc {
+		fn, ok := getNodeByPath(ast, ap)
+		if !ok || len(fn) == 0 || fn[0] != "fun" {
+			continue
+		}
+		// ("fun", paramsArray, ret, body)
+		if len(fn) >= 2 {
+			ps, _ := fn[1].([]any)
+			if len(ps) > 0 && ps[0] == "array" {
+				for i := 1; i < len(ps); i++ {
+					pair, _ := ps[i].([]any) // ("pair"| "pair!", ("id", n), typeS)
+					if len(pair) >= 3 && (pair[0] == "pair" || pair[0] == "pair!") {
+						idNode, _ := pair[1].([]any)
+						if len(idNode) >= 2 && idNode[0] == "id" {
+							if nm, ok := idNode[1].(string); ok && nm == name {
+								if tS, ok := pair[2].([]any); ok {
+									return tS, true
+								}
+								return mindscript.S{"id", "Any"}, true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Range formatting helpers.
+////////////////////////////////////////////////////////////////////////////////
+
+// findSmallestCovering finds the tightest node whose byte span fully covers [start,end).
+func findSmallestCovering(ast mindscript.S, spans *mindscript.SpanIndex, start, end int) (mindscript.NodePath, mindscript.S, bool) {
+	if spans == nil || ast == nil {
+		return nil, nil, false
+	}
+	bestPath := mindscript.NodePath(nil)
+	var bestNode mindscript.S
+	bestLen := 1 << 30
+
+	walkPaths(ast, nil, func(path mindscript.NodePath, node mindscript.S) {
+		sp, ok := spans.Get(path)
+		if !ok {
+			return
+		}
+		if sp.StartByte <= start && end <= sp.EndByte {
+			if l := sp.EndByte - sp.StartByte; l < bestLen {
+				bestLen = l
+				bestPath = append(mindscript.NodePath(nil), path...)
+				bestNode = node
+			}
+		}
+	})
+	if bestNode == nil {
+		return nil, nil, false
+	}
+	return bestPath, bestNode, true
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Shared keyword/type helpers (used by hover/completion/semTokens)
 ////////////////////////////////////////////////////////////////////////////////
@@ -701,7 +776,7 @@ func commentSpans(doc *docState) [][2]int {
 	text := doc.text
 	spans := [][2]int{}
 
-	// ANNOTATION tokens from the lexer
+	// 1) ANNOTATION tokens from the lexer (# block annotations)
 	for _, tk := range doc.tokens {
 		if tk.Type == mindscript.ANNOTATION {
 			s, e := tokenSpan(doc, tk)
@@ -711,7 +786,7 @@ func commentSpans(doc *docState) [][2]int {
 		}
 	}
 
-	// Build STRING spans once to avoid false-positive inline "#(" inside strings.
+	// 2) Build STRING spans once to avoid false positives inside strings.
 	stringSpans := [][2]int{}
 	for _, tk := range doc.tokens {
 		if tk.Type == mindscript.STRING {
@@ -730,7 +805,7 @@ func commentSpans(doc *docState) [][2]int {
 		return false
 	}
 
-	// Lines whose first non-space is '#' or '##'
+	// 3) Lines whose first non-space is '#' or '##' → whole line is comment.
 	for li := 0; li < len(doc.lines); li++ {
 		lo := doc.lines[li]
 		hi := len(text)
@@ -742,19 +817,44 @@ func commentSpans(doc *docState) [][2]int {
 		if len(trim) == 0 {
 			continue
 		}
-		if strings.HasPrefix(trim, "##") || strings.HasPrefix(trim, "#") {
+		if strings.HasPrefix(trim, "#") {
 			spans = append(spans, [2]int{lo, hi})
 		}
 	}
 
-	// Inline "#(" ... ")" (best effort; no nesting)
+	// 4) Inline "##(...)" blocks (no nesting), skip strings.
+	for start := 0; ; {
+		i := strings.Index(text[start:], "##(")
+		if i < 0 {
+			break
+		}
+		i += start
+		if inString(i) {
+			start = i + 3
+			continue
+		}
+		j := strings.IndexByte(text[i+3:], ')')
+		if j < 0 {
+			spans = append(spans, [2]int{i, len(text)})
+			break
+		}
+		j = i + 3 + j
+		spans = append(spans, [2]int{i, j + 1})
+		start = j + 1
+	}
+
+	// 5) Inline "#(...)" blocks (existing behavior), skip strings.
 	for start := 0; ; {
 		i := strings.Index(text[start:], "#(")
 		if i < 0 {
 			break
 		}
 		i += start
-		// Skip if inside a string literal
+		// avoid catching the "##(" case again
+		if i-1 >= 0 && text[i-1] == '#' {
+			start = i + 2
+			continue
+		}
 		if inString(i) {
 			start = i + 2
 			continue
@@ -764,10 +864,31 @@ func commentSpans(doc *docState) [][2]int {
 			spans = append(spans, [2]int{i, len(text)})
 			break
 		}
-		j = i + 2 + j // inclusive ')'
+		j = i + 2 + j
 		spans = append(spans, [2]int{i, j + 1})
 		start = j + 1
 	}
+
+	// 6) Inline "##" line comments anywhere on the line, stop at newline, skip strings.
+	for start := 0; ; {
+		i := strings.Index(text[start:], "##")
+		if i < 0 {
+			break
+		}
+		i += start
+		if inString(i) {
+			start = i + 2
+			continue
+		}
+		// span from '##' to end of line
+		end := i
+		for end < len(text) && text[end] != '\n' {
+			end++
+		}
+		spans = append(spans, [2]int{i, end})
+		start = end
+	}
+
 	return spans
 }
 
@@ -910,6 +1031,16 @@ func (s *server) analyze(doc *docState) {
 	}
 	s.clearDiagnostics(local.uri)
 
+	// Build spans for precise sub-tree formatting (second pass).
+	// We keep interactive error semantics (already passed), but we want spans.
+	var spans *mindscript.SpanIndex
+	{
+		if ast2, idx, err2 := mindscript.ParseSExprWithSpans(local.text); err2 == nil {
+			ast = ast2
+			spans = idx
+		}
+	}
+
 	// Build top-level symbols from the AST.
 	local.symbols = nil
 	appendSym := func(name, kind, docline, sig string) {
@@ -1026,6 +1157,8 @@ func (s *server) analyze(doc *docState) {
 	if live := s.docs[doc.uri]; live != nil {
 		live.tokens = local.tokens
 		live.symbols = local.symbols
+		live.ast = ast
+		live.spans = spans
 	}
 	s.mu.Unlock()
 }

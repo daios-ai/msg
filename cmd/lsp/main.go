@@ -62,6 +62,14 @@ func main() {
 		case "textDocument/foldingRange":
 			s.onFoldingRange(req.ID, req.Params)
 
+		// Formatting
+		case "textDocument/formatting":
+			s.onDocumentFormatting(req.ID, req.Params)
+		case "textDocument/rangeFormatting":
+			s.onDocumentRangeFormatting(req.ID, req.Params)
+		case "textDocument/willSaveWaitUntil":
+			s.onWillSaveWaitUntil(req.ID, req.Params)
+
 		// Semantic tokens
 		case "textDocument/semanticTokens/full":
 			s.onSemanticTokensFull(req.ID, req.Params)

@@ -311,3 +311,45 @@ func Test_Lexer_Interactive_Unterminated_String_IsIncomplete(t *testing.T) {
 		t.Fatalf("expected IncompleteError for unterminated string, got %v", err)
 	}
 }
+
+func Test_Lexer_BlockAnnotation_LeavesFinalNewline(t *testing.T) {
+	src := "" +
+		"# first line\n" +
+		"# second line\n" + // <- this newline must remain unconsumed by scanAnnotation
+		"let x = 1\n"
+
+	got := wantTypes(t, src, []TokenType{
+		ANNOTATION,
+		LET, ID, ASSIGN, INTEGER,
+	})
+
+	ann := got[0]
+	if ann.Type != ANNOTATION {
+		t.Fatalf("first token must be ANNOTATION, got %v", ann.Type)
+	}
+
+	// 1) The ANNOTATION's text (Literal) should have joined lines and trimmed trailing '\n'.
+	wantText := "first line\nsecond line"
+	if s, ok := ann.Literal.(string); !ok || s != wantText {
+		t.Fatalf("annotation text mismatch\nwant: %q\ngot:  %q (ok=%v)", wantText, ann.Literal, ok)
+	}
+
+	// 2) The lexer must NOT consume the final '\n' of the block annotation.
+	//    That means the token's EndByte should point at a '\n' in the original source.
+	if ann.EndByte >= len(src) {
+		t.Fatalf("annotation EndByte out of range: %d >= %d", ann.EndByte, len(src))
+	}
+	if src[ann.EndByte] != '\n' {
+		t.Fatalf("expected src[EndByte] to be '\\n' after annotation; got %q at pos %d", src[ann.EndByte], ann.EndByte)
+	}
+
+	// 3) Sanity: The next token should start on the following line and be 'let'.
+	letTok := got[1]
+	if letTok.Type != LET {
+		t.Fatalf("second token must be LET, got %v", letTok.Type)
+	}
+	// With two annotation lines, 'let' should start on line 3 (1-based).
+	if letTok.Line != 3 {
+		t.Fatalf("expected LET to start on line 3; got line %d", letTok.Line)
+	}
+}

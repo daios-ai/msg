@@ -534,7 +534,7 @@ func Test_Oracle_Examples_Passed_To_Backend(t *testing.T) {
 			[2, "two"]
 		]
 		let number2word = oracle(n: Int) -> Str from ex
-		number2word(5)   ## backend returns "ok" if examples arrived as [ [in,out], ... ]
+		number2word(5)
 	`)
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)

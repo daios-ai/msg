@@ -62,9 +62,7 @@
 //   - BOOLEAN — “true” or “false” (Literal: bool).
 //   - NULL    — “null” (Literal: nil).
 //
-// COMMENTS vs ANNOTATIONS (hash syntax)
-//   - Line comment:       "## ... <newline>"           → ignored
-//   - Inline comment:     "##( ... )" (no nesting)     → ignored
+// ANNOTATIONS (hash syntax)
 //   - Inline annotation:  "#( ... )"                   → emits ANNOTATION with text
 //   - Block annotations:  one or more consecutive lines where, after optional
 //     indentation, the first non-space is '#'. The leading '#' (and one optional
@@ -781,25 +779,60 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	return NUMBER, vf, nil
 }
 
-// ignoreUntilNewline eats until '\n' or EOF.
-func (l *Lexer) ignoreUntilNewline() {
-	for {
-		b, ok := l.peek()
-		if !ok || b == '\n' {
-			return
-		}
-		l.advance()
-	}
-}
-
 // scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
 // Terminates on blank line or a line that does not begin (after spaces) with '#'.
 func (l *Lexer) scanAnnotation() (string, error) {
 	var bldr strings.Builder
 
-	// Consume (indent* '#') with one optional post-# space/tab. Returns true if a line was consumed.
+	// helper: check if the *next* line (after current '\n') starts with '#'
+	nextLineStartsWithHash := func() bool {
+		// we are currently positioned at the '\n' (unconsumed)
+		probe := l.cur + 1
+		for probe < len(l.src) {
+			c := l.src[probe]
+			if c == ' ' || c == '\t' || c == '\r' {
+				probe++
+				continue
+			}
+			break
+		}
+		return probe < len(l.src) && l.src[probe] == '#'
+	}
+
+	// (unchanged) trim one optional space/tab after the first '#'
+	if b, ok := l.peek(); ok && (b == ' ' || b == '\t') {
+		l.advance()
+	}
+
+	// ----- capture first line, but DO NOT consume its trailing '\n' -----
+	for {
+		b, ok := l.peek()
+		if !ok || b == '\n' {
+			// do not l.advance() here; leave '\n' in the stream
+			bldr.WriteByte('\n')
+			break
+		}
+		bldr.WriteByte(b)
+		l.advance()
+	}
+
+	// If there is another annotation line, consume the '\n' now and continue.
+	if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+		l.advance() // consume newline to move to start of the next line
+	} else {
+		// single-line block; leave the '\n' unconsumed
+		s := bldr.String()
+		if len(s) == 0 {
+			return "", errors.New("incomplete annotation")
+		}
+		for len(s) > 0 && s[len(s)-1] == '\n' { // keep existing trailing-trim behavior
+			s = s[:len(s)-1]
+		}
+		return s, nil
+	}
+
+	// ----- capture subsequent '#'-prefixed lines -----
 	consumeHashOnLine := func() (bool, error) {
-		// skip leading spaces/tabs (not newline)
 		for {
 			b, ok := l.peek()
 			if !ok || b == '\n' {
@@ -815,35 +848,13 @@ func (l *Lexer) scanAnnotation() (string, error) {
 		if !ok || b != '#' {
 			return false, nil
 		}
-		l.advance() // consume '#'
-		// Optional single space/tab immediately after '#'
+		l.advance() // '#'
 		if b2, ok2 := l.peek(); ok2 && (b2 == ' ' || b2 == '\t') {
 			l.advance()
 		}
 		return true, nil
 	}
 
-	// We were called with current char being '#' already consumed by caller in scanToken.
-	// Trim one optional space/tab after this first '#'.
-	if b, ok := l.peek(); ok && (b == ' ' || b == '\t') {
-		l.advance()
-	}
-
-	// Capture the rest of the first line
-	for {
-		b, ok := l.peek()
-		if !ok || b == '\n' {
-			if ok {
-				l.advance() // consume newline
-			}
-			bldr.WriteByte('\n')
-			break
-		}
-		bldr.WriteByte(b)
-		l.advance()
-	}
-
-	// Capture subsequent lines that also start with '#'
 	for {
 		save := l.cur
 		cont, err := consumeHashOnLine()
@@ -854,18 +865,23 @@ func (l *Lexer) scanAnnotation() (string, error) {
 			l.cur = save
 			break
 		}
-		// read until newline
+
+		// read rest of line, but DO NOT consume trailing '\n'
 		for {
 			b, ok := l.peek()
 			if !ok || b == '\n' {
-				if ok {
-					l.advance()
-				}
 				bldr.WriteByte('\n')
 				break
 			}
 			bldr.WriteByte(b)
 			l.advance()
+		}
+
+		// If another '#'-line follows, eat this '\n' and continue; else stop (leave '\n').
+		if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+			l.advance() // consume newline to move to next line
+		} else {
+			break // leave final '\n' unconsumed
 		}
 	}
 
@@ -873,7 +889,7 @@ func (l *Lexer) scanAnnotation() (string, error) {
 	if len(s) == 0 {
 		return "", errors.New("incomplete annotation")
 	}
-	// Trim trailing newlines (at most what we added)
+	// keep trimming of trailing '\n' in the emitted annotation text
 	for len(s) > 0 && s[len(s)-1] == '\n' {
 		s = s[:len(s)-1]
 	}
@@ -910,30 +926,6 @@ func (l *Lexer) scanInlineParens() (string, error) {
 }
 
 // --- hash/comment helpers ---
-
-// handleDoubleHash processes '##' comments.
-// Returns (handled, err). When handled, the content is ignored and start is advanced.
-func (l *Lexer) handleDoubleHash() (bool, error) {
-	b1, ok := l.peek()
-	if !ok || b1 != '#' {
-		return false, nil
-	}
-	l.advance() // second '#'
-
-	// Inline comment: ##( ... ) → ignore entirely
-	if b2, ok2 := l.peek(); ok2 && b2 == '(' {
-		if _, err := l.scanInlineParens(); err != nil {
-			return true, err
-		}
-		l.start = l.cur
-		return true, nil
-	}
-
-	// Line comment: ## ... \n → ignore until newline
-	l.ignoreUntilNewline()
-	l.start = l.cur
-	return true, nil
-}
 
 // handleSingleHash processes '#' annotations (inline or multiline).
 // Returns (producedAnnotation, text, err).
@@ -1064,16 +1056,8 @@ func (l *Lexer) scanToken() (Token, error) {
 			return l.addToken(GREATER, ">"), nil
 		}
 
-		// Comments / Annotations
+		// Annotations
 		if ch == '#' {
-			// Try '##' comment forms first
-			if handled, err := l.handleDoubleHash(); handled || err != nil {
-				if err != nil {
-					return Token{}, err
-				}
-				continue
-			}
-			// Single '#': inline '#(...)' or multiline block
 			ok, text, err := l.handleSingleHash()
 			if err != nil {
 				return Token{}, err

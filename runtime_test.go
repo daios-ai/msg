@@ -123,7 +123,7 @@ func Test_RT_Channel_Close_RecvAfterClose(t *testing.T) {
 	v := evalWithIP(t, ip, `
 		let c = chan()
 		chanClose(c)
-		chanRecv(c)        ## should yield annotated null "channel closed"
+		chanRecv(c)
 	`)
 	wantAnnotatedContains(t, v, "channel closed")
 }

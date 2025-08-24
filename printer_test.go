@@ -321,14 +321,6 @@ x`
 x`
 	got := pretty(t, in)
 	eq(t, got, want)
-
-	// With an inline comment between return and newline, it still becomes null.
-	in2 := `return##(ignored inline comment)
-42`
-	want2 := `return(null)
-42`
-	got2 := pretty(t, in2)
-	eq(t, got2, want2)
 }
 
 func Test_Printer_ComputedDot_NormalizesToIndexing(t *testing.T) {
@@ -459,16 +451,12 @@ func Test_Standardize_Trailing_Newline_And_Idempotence(t *testing.T) {
 		t.Fatalf("not idempotent:\n---1---\n%q\n---2---\n%q", std1, std2)
 	}
 }
+
 func Test_Printer_Uses_Tabs(t *testing.T) {
 	got := pretty(t, `do x end`)
 	if strings.Contains(got, "  ") { // two spaces
 		t.Fatalf("expected tabs, found spaces:\n%s", got)
 	}
-}
-func Test_Printer_Control_Newline_With_CommentTrivia(t *testing.T) {
-	got := pretty(t, "return##(trivia)\n42")
-	want := "return(null)\n42"
-	eq(t, got, want)
 }
 
 func Test_Printer_Property_Name_Normalization(t *testing.T) {
@@ -495,6 +483,7 @@ func Test_Printer_Standardize_Trailing_Newline_And_Idempotence(t *testing.T) {
 		t.Fatalf("not idempotent:\n---1---\n%q\n---2---\n%q", std1, std2)
 	}
 }
+
 func Test_Printer_TabsOnly_Indentation(t *testing.T) {
 	got := pretty(t, `if a then x else y end`)
 	// Ensure no leading spaces are used for indentation on any line.
@@ -510,6 +499,7 @@ func Test_Printer_TabsOnly_Indentation(t *testing.T) {
 		}
 	}
 }
+
 func Test_Printer_RoundTrip_Samples(t *testing.T) {
 	samples := []string{
 		`f ( x )`,      // grouping vs call (space before '(')
@@ -519,8 +509,6 @@ func Test_Printer_RoundTrip_Samples(t *testing.T) {
 f(x)`,
 		`if a then x elif b then y else z end`,
 		`{ok:1,"bad key":2}`,
-		`return##(comment)
-42`,
 	}
 	for _, src := range samples {
 		p1 := pretty(t, src)

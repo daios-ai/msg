@@ -615,7 +615,7 @@ func Test_Interpreter_For_Map_Yields_Pairs_As_Array(t *testing.T) {
 let m = {a: 1, b: 2}
 let sum = 0
 for let p in m do
-  sum = sum + p.1  ## p = [key, value]; index 1 is value
+  sum = sum + p.1
 end
 sum
 `
@@ -730,7 +730,7 @@ let range = fun(start: Int, finish: Int) -> Null -> Int? do
   )
 end
 
-range(5, 8)  ## return the iterator
+range(5, 8)
 `
 
 	ip := NewInterpreter()
@@ -810,7 +810,7 @@ func Test_Interpreter_For_Iterator_AnnotatedNull_Propagates(t *testing.T) {
 	// Iterator returns an annotated null; for-loop should propagate it out.
 	src := `
 let bad = fun() -> Int? do
-  return #(oops) null ## causes annotated null
+  return #(oops) null
 end
 let sum = 0
 for let x in bad do
@@ -1004,7 +1004,7 @@ let { #(first) name: x, age: y } = { name: "Ana", age: 33 }
 func Test_Interpreter_ObjectDestructuring_AnnotatedKey_MissingValue(t *testing.T) {
 	src := `
 let { #(first) name: x, #(years) age: y } = { name: "Bob" }
-[y]  ## probe only 'y'
+[y]
 `
 	v := evalSrc(t, src)
 	if v.Tag != VTArray || len(v.Data.([]Value)) != 1 {

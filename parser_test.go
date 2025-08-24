@@ -531,7 +531,6 @@ func Test_Parser_Map_Required_Field_Bang(t *testing.T) {
 	if v1[1].(string) != "Str" {
 		t.Fatalf("want Str, got %s", dump(v1))
 	}
-
 	// second field: normal pair
 	f2 := kid(rec, 1)
 	if head(f2) != "pair" {

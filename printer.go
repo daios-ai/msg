@@ -347,6 +347,10 @@ func (p *pp) printProgram(n S) {
 
 func (p *pp) printStmt(n S) {
 	switch tag(n) {
+	case "noop":
+		// Intentionally print nothing. The caller (printProgram/printBlock)
+		// always adds one newline after each statement.
+		return
 	case "annot":
 		text := getStr(child(n, 0))
 		p.out.annot(text)

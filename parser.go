@@ -407,6 +407,9 @@ func (p *parser) expr(minBP int) (S, error) {
 	p.i++
 	var left S
 	switch t.Type {
+	case NOOP:
+		left = L("noop")
+
 	case ID, TYPE:
 		// Identifiers and capitalized built-in types behave the same in expressions.
 		left = L("id", tokString(t))

@@ -1448,6 +1448,8 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(Str(n[1].(string))))
 	case "bool":
 		e.emit(opConst, e.k(Bool(n[1].(bool))))
+	// case "noop":
+	// 	e.emit(opConst, e.k(Null))
 	case "null":
 		e.emit(opConst, e.k(Null))
 

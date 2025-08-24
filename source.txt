@@ -1,1188 +1,2275 @@
-=== BEGIN FILE: runtime_test.go ===
+=== BEGIN FILE: lexer.go ===
+// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
+// MindScript language. It converts a source string into a linear stream of
+// tokens with accurate source positions and rich literal decoding.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-LEVEL OVERVIEW
+//
+// The lexer scans left→right and emits Token values, always ending with EOF.
+// Each token carries:
+//   - Type    — a TokenType enum
+//   - Lexeme  — the exact source slice (verbatim characters from the input)
+//   - Literal — the decoded value for literal tokens (e.g., bool/int/float/string)
+//   - Line/Col— 1-based line and 0-based column of the token’s start
+//
+// The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
+// whether there is immediate whitespace before the delimiter:
+//
+//	'('  → LROUND  if there IS preceding whitespace
+//	      CLROUND if there is NO preceding whitespace
+//	'['  → LSQUARE if there IS preceding whitespace
+//	      CLSQUARE if there is NO preceding whitespace
+//
+// Consequences (user-facing syntax):
+//
+//   - Calls and parameter lists require NO space before '('.
+//     f(x)           // call: uses CLROUND
+//     fun(x: T)      // function params: uses CLROUND
+//     oracle(x: T)   // oracle params: uses CLROUND
+//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
+//     parameter list; the parser will error.
+//
+//   - Indexing requires NO space before '['.
+//     arr[i]         // indexing: uses CLSQUARE
+//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
+//
+//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
+//     CLROUND participates in call/juxtaposition chains.
+//
+// This lets the parser distinguish grouping/indexing from juxtaposition/call-like
+// forms without lookbehind in the parser.
+//
+// The '.' character is context-sensitive:
+//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
+//     produced.
+//   - Otherwise it is PERIOD (typically for property access).
+//
+// IDENTIFIERS & KEYWORDS
+//
+//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
+//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
+//	After a PERIOD, both identifiers *and* quoted strings are treated as
+//	property names and forced to ID (even if the text is a keyword). This allows:
+//	    obj."then"   // ID with Literal="then"
+//	    obj.then     // ID with Literal="then"
+//
+// LITERALS
+//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
+//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
+//     bytes in the lexeme are validated and decoded.
+//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
+//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
+//   - BOOLEAN — “true” or “false” (Literal: bool).
+//   - NULL    — “null” (Literal: nil).
+//
+// ANNOTATIONS (hash syntax)
+//   - Inline annotation:  "#( ... )"                   → emits ANNOTATION with text
+//   - Block annotations:  one or more consecutive lines where, after optional
+//     indentation, the first non-space is '#'. The leading '#' (and one optional
+//     following space/tab) are stripped; lines are joined with '\n', and a single
+//     ANNOTATION token is emitted. A blank/non-# line ends the block.
+//
+// ERRORS
+//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
+//     reported as *LexError* with precise location.
+//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
+//     strings or unterminated "#(...)" / "##(...)" inline blocks produce
+//     *IncompleteError* instead of LexError. Use IsIncomplete(err) to detect this
+//     and prompt for more input.
+//
+// OUTPUT
+//   - Scan returns the full token slice *including* the terminal EOF token.
+//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
+//     includes the quotes and escapes), while Literal carries the decoded value.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// FILE ORGANIZATION
+//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
+//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
+//
+// The PUBLIC API docs below are intentionally exhaustive so the behavior is
+// understandable without reading the implementation.
+//
+// ──────────────────────────────────────────────────────────────────────────────
 package mindscript
 
 import (
-	"net"
-	"os"
-	"path/filepath"
+	"errors"
+	"fmt"
+	"strconv"
 	"strings"
-	"testing"
-	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
-func newRT() *Interpreter { return NewRuntime() }
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
 
-// Pick an ephemeral loopback TCP address like "127.0.0.1:54321"
-func freeLocalAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("cannot pick free port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+// TokenType is the enumeration of all token kinds the lexer can emit.
+// Most names are self-explanatory; groups are listed for clarity.
+//
+// Special:
+//
+//	EOF     — end-of-file sentinel (always the final token)
+//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
+//
+// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
+//
+//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
+//	RROUND            — ')'
+//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
+//	RSQUARE           — ']'
+//	LCURLY, RCURLY    — '{', '}'
+//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
+//
+// Operators:
+//
+//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
+//	ASSIGN                      — '='
+//	EQ, NEQ                     — '==', '!='
+//	LESS, LESS_EQ               — '<',  '<='
+//	GREATER, GREATER_EQ         — '>',  '>='
+//	BANG                        — '!' (used by the language in object/type literals)
+//	ARROW                       — '->'
+//
+// Literals & identifiers:
+//
+//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
+//
+// Keywords (produced when the identifier text equals these words, except when
+// forced to an ID after PERIOD/property access):
+//
+//	AND, OR, NOT,
+//	LET, DO, END, RETURN, BREAK, CONTINUE,
+//	IF, THEN, ELIF, ELSE,
+//	FUNCTION, ORACLE,
+//	FOR, IN, FROM, WHILE,
+//	TYPECONS, TYPE, ENUM
+//
+// Annotation:
+//
+//	ANNOTATION — emitted for "#( … )" lines or multi-line blocks starting with '#'.
+type TokenType int
+
+const (
+	// Special
+	EOF TokenType = iota
+	ILLEGAL
+
+	// Punctuation
+	LROUND   // "(" when preceded by whitespace
+	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
+	RROUND   // ")"
+	LSQUARE  // "["
+	CLSQUARE // "[" when not preceded by whitespace (index-close)
+	RSQUARE  // "]"
+	LCURLY   // "{"
+	RCURLY   // "}"
+	COLON    // ":"
+	COMMA    // ","
+	PERIOD   // "."
+	QUESTION // "?"
+
+	// Operators
+	PLUS
+	MINUS
+	MULT
+	DIV
+	MOD
+	ASSIGN // "="
+	EQ     // "=="
+	NEQ    // "!="
+	LESS
+	LESS_EQ
+	GREATER
+	GREATER_EQ
+	BANG  // "!" (required-field marker in object/type literals)
+	ARROW // "->"
+
+	// Literals & identifiers
+	ID
+	STRING
+	INTEGER
+	NUMBER
+	BOOLEAN
+	NULL
+
+	// Keywords
+	AND
+	OR
+	NOT
+	LET
+	DO
+	END
+	RETURN
+	BREAK
+	CONTINUE
+	IF
+	THEN
+	ELIF
+	ELSE
+	FUNCTION
+	ORACLE
+	FOR
+	IN
+	FROM
+	WHILE
+	TYPECONS
+	TYPE
+	ENUM
+
+	// Annotation token (from lines starting with '#')
+	ANNOTATION
+)
+
+// Token is a single lexical unit produced by the lexer.
+//
+// Fields:
+//
+//	Type    — the TokenType kind.
+//	Lexeme  — the exact source slice comprising the token (verbatim, including
+//	          quotes for strings, escape sequences, etc.).
+//	Literal — a decoded value for literal tokens:
+//	          • STRING  → Go string with escapes and surrogate pairs resolved
+//	          • INTEGER → int64
+//	          • NUMBER  → float64
+//	          • BOOLEAN → bool
+//	          • NULL    → nil
+//	          Non-literal tokens usually carry nil or an unmodified string
+//	          (keywords may store their text; property IDs store the property name).
+//	Line    — 1-based line number at which this token starts.
+//	Col     — 0-based column index at which this token starts.
+type Token struct {
+	Type      TokenType
+	Lexeme    string
+	Literal   interface{}
+	Line      int
+	Col       int
+	StartByte int
+	EndByte   int
 }
 
-func entriesOf(t *testing.T, v Value) map[string]Value {
-	t.Helper()
-	mo, ok := v.Data.(*MapObject)
-	if !ok {
-		t.Fatalf("expected VTMap/*MapObject, got %#v", v)
-	}
-	return mo.Entries
+// LexError reports a lexical error detected during scanning (e.g., invalid
+// escape sequence, malformed number, unexpected character, invalid UTF-8).
+// In non-interactive mode, unterminated strings or inline "#(...)" / "##(...)"
+// also produce LexError.
+//
+// The error position (Line, Col) refers to the location where the lexer
+// detected the problem (generally close to the token’s start).
+type LexError struct {
+	Line int
+	Col  int
+	Msg  string
 }
 
-// Small helpers for reading MindScript map values in tests.
-func mustMap(t *testing.T, v Value) *MapObject {
-	t.Helper()
-	if v.Tag != VTMap {
-		t.Fatalf("expected map; got %v", v.Tag)
-	}
-	return v.Data.(*MapObject)
-}
-func mget(m *MapObject, k string) (Value, bool) { v, ok := m.Entries[k]; return v, ok }
-
-func Test_RT_Builtins_isType_And_typeOf(t *testing.T) {
-	ip := NewRuntime()
-
-	// isType with explicit Type value
-	v := evalWithIP(t, ip, `isType(42, type Int)`)
-	if v.Tag != VTBool || v.Data.(bool) != true {
-		t.Fatal("isType should return true")
-	}
-
-	// typeOf returns a Type value
-	tt := evalWithIP(t, ip, `typeOf([1, 2.0, "x"])`)
-	if tt.Tag != VTType {
-		t.Fatalf("typeOf should return VTType, got %#v", tt)
-	}
-
-	// Passing a bare identifier (not a Type value) yields "undefined variable"
-	bad := evalWithIP(t, ip, `isType(42, Int)`)
-	wantAnnotatedContains(t, bad, "undefined variable")
+func (e *LexError) Error() string {
+	return fmt.Sprintf("LEXICAL ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
 }
 
-func Test_RT_Builtins_import_FailurePath(t *testing.T) {
-	ip := NewRuntime()
-
-	// With no ModuleLoader configured, import should produce a clear annotated-null
-	v := evalWithIP(t, ip, `import("does-not-exist")`)
-	wantAnnotatedNullContains(t, v, "module not found")
+// IncompleteError signals that more input is required to complete a construct.
+// It is returned *only* by a lexer created with NewLexerInteractive when the
+// end of input is reached inside:
+//   - a string literal,
+//   - an inline annotation "#( ... )", or
+//   - an inline comment   "##( ... )".
+//
+// Use IsIncomplete(err) to detect this case in REPLs and prompt the user for
+// more lines instead of failing the parse.
+type IncompleteError struct {
+	Line int
+	Col  int
+	Msg  string
 }
 
-// ---------------- Concurrency ----------------
-
-func Test_RT_Spawn_Join_ClosureIsolation(t *testing.T) {
-	ip := newRT()
-
-	// capture a value into a zero-arg fun and spawn it
-	fn := evalWithIP(t, ip, `
-		let x = 41
-		# adds one
-		fun() do x + 1 end
-	`)
-	ip.Global.Define("f", fn)
-
-	// spawn + join entirely in MindScript (no unused Go var)
-	out := evalWithIP(t, ip, `
-		let p = procSpawn(f)
-		procJoin(p)
-	`)
-	if out.Tag != VTInt || out.Data.(int64) != 42 {
-		t.Fatalf("procSpawn/procJoin wrong result: %#v", out)
-	}
-
-	// cancel smoke test (no observable effect yet)
-	_ = evalWithIP(t, ip, `
-		let p = procSpawn(f)
-		procCancel(p)
-		procJoin(p)
-	`)
-
-	// Channel ping-pong
-	v := evalWithIP(t, ip, `
-let c = chan()
-let worker = fun() do
-  let m = chanRecv(c)
-  chanSend(c, m + " world")
-  "ok"
-end
-let p = procSpawn(worker)
-chanSend(c, "hello")
-let r = chanRecv(c)
-procJoin(p)
-r
-	`)
-	if v.Tag != VTStr || v.Data.(string) != "hello world" {
-		t.Fatalf("channel ping-pong failed: %#v", v)
-	}
+func (e *IncompleteError) Error() string {
+	return fmt.Sprintf("INCOMPLETE at %d:%d: %s", e.Line, e.Col, e.Msg)
 }
 
-func Test_RT_Channel_Close_RecvAfterClose(t *testing.T) {
-	ip := newRT()
-	v := evalWithIP(t, ip, `
-		let c = chan()
-		chanClose(c)
-		chanRecv(c)        ## should yield annotated null "channel closed"
-	`)
-	wantAnnotatedContains(t, v, "channel closed")
+// IsIncomplete reports whether err is an *IncompleteError. Helpful in REPLs
+// to distinguish “need more input” from real lexical errors.
+func IsIncomplete(err error) bool {
+	_, ok := err.(*IncompleteError)
+	return ok
 }
 
-// ---------------- Networking ----------------
+// Lexer is a streaming tokenizer for MindScript.
+//
+// Construction:
+//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
+//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
+//     produce IncompleteError.
+//
+// Semantics:
+//   - Scan() returns the full token slice including EOF. It never panics for
+//     malformed input; instead it returns (nil, error).
+//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
+//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
+//     either preceding whitespace *or* the previous token cannot be a left operand.
+//     Otherwise '.' is PERIOD used for property access.
+//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
+//     even if it matches a keyword.
+//
+// Positioning:
+//   - Line numbers are 1-based; column indices are 0-based.
+//   - A token’s position is captured at the start of scanning that token.
+type Lexer struct {
+	// public type with no exported fields; use constructors + Scan()
+	src    string
+	start  int // start index of current token
+	cur    int // current index
+	line   int // 1-based
+	col    int // 0-based column within line
+	tokens []Token
 
-func Test_RT_Net_Listen_Accept_Echo(t *testing.T) {
-	ip := newRT()
+	// precise token start position
+	tokStartLine int
+	tokStartCol  int
 
-	addr := freeLocalAddr(t)
-	ip.Global.Define("ADDR", Str(addr))
-
-	// Server and client both in MindScript, using primitives:
-	// netListen, netAccept, netConnect, readLine, write, flush, close.
-	v := evalWithIP(t, ip, `
-		let ln = netListen(ADDR)
-
-		let srv = fun() do
-		  let c = netAccept(ln)
-		  let s = readLine(c)
-		  write(c, s + "-ok\n")
-		  flush(c)
-		  close(c)
-		  close(ln)
-		  "done"
-		end
-
-		let p = procSpawn(srv)
-
-		let c = netConnect(ADDR)
-		write(c, "hi\n")
-		flush(c)
-		let r = readLine(c)
-		close(c)
-
-		procJoin(p)
-		r
-	`)
-	if v.Tag != VTStr || v.Data.(string) != "hi-ok" {
-		t.Fatalf("network echo failed: %#v", v)
-	}
+	// interactive mode: produce IncompleteError for unterminated constructs at EOF
+	interactive bool
 }
 
-// ---------------- I/O ----------------
-
-func Test_RT_IO_File_ReadWrite_ListDir(t *testing.T) {
-	ip := newRT()
-
-	dir := t.TempDir()
-	p := filepath.Join(dir, "a.txt")
-	q := filepath.Join(dir, "b.txt")
-
-	// writeFile + readFile
-	ip.Global.Define("pathA", Str(p))
-	ip.Global.Define("pathB", Str(q))
-
-	w := evalWithIP(t, ip, `writeFile(pathA, "line1\nline2")`)
-	if w.Tag != VTNull {
-		t.Fatalf("writeFile expected null, got %#v", w)
-	}
-	all := evalWithIP(t, ip, `readFile(pathA)`)
-	if all.Tag != VTStr || !strings.Contains(all.Data.(string), "line2") {
-		t.Fatalf("readFile wrong content: %#v", all)
-	}
-
-	// open/readLine/write/flush/close
-	v := evalWithIP(t, ip, `
-		let f = open(pathB, "w")
-		write(f, "A\nB\n")
-		flush(f)
-		close(f)
-		let r = open(pathB, "r")
-		let a = readLine(r)
-		let b = readLine(r)
-		let c = readLine(r)   # null at EOF
-		close(r)
-		{a:a, b:b, c:c}
-	`)
-	m := entriesOf(t, v)
-	if m["a"].Data.(string) != "A" || m["b"].Data.(string) != "B" || m["c"].Tag != VTNull {
-		t.Fatalf("readLine sequence unexpected: %#v", v)
-	}
-
-	// listDir
-	_ = os.WriteFile(filepath.Join(dir, "z.dat"), []byte("x"), 0o644)
-	ip.Global.Define("dir", Str(dir))
-	ls := evalWithIP(t, ip, `listDir(dir)`)
-	if ls.Tag != VTArray || len(ls.Data.([]Value)) < 2 {
-		t.Fatalf("listDir expected >=2 entries, got %#v", ls)
-	}
-}
-
-func Test_RT_IO_ReadN_ReadAll(t *testing.T) {
-	ip := newRT()
-	p := filepath.Join(t.TempDir(), "buf.txt")
-	_ = os.WriteFile(p, []byte("abcdef"), 0o644)
-	ip.Global.Define("p", Str(p))
-
-	v := evalWithIP(t, ip, `
-		let r = open(p, "r")
-		let x = readN(r, 3)
-		let y = readAll(r)
-		close(r)
-		{x:x, y:y}
-	`)
-	m := entriesOf(t, v)
-	if m["x"].Data.(string) != "abc" || m["y"].Data.(string) != "def" {
-		t.Fatalf("readN/readAll mismatch: %#v", v)
-	}
-}
-
-// ---------------- Introspection & Docs ----------------
-
-func Test_RT_Introspection_funInfo_funType_TypeUtils_Docs(t *testing.T) {
-	ip := newRT()
-
-	// Annotated function with param types & return type
-	fn := evalWithIP(t, ip, `
-# Adds one to an integer
-# This is a longer description.
-fun(x:Int) -> Int do x + 1 end
-`)
-	ip.Global.Define("f", fn)
-
-	info := evalWithIP(t, ip, `funInfo(f)`)
-	if info.Tag != VTMap {
-		t.Fatalf("funInfo should return map, got %#v", info)
-	}
-	// params[0].name == "x"
-	nm := evalWithIP(t, ip, `funInfo(f).params[0].name`)
-	if nm.Tag != VTStr || nm.Data.(string) != "x" {
-		t.Fatalf("funInfo param name wrong: %#v", nm)
-	}
-	// doc/docline
-	d1 := evalWithIP(t, ip, `doc(f)`)
-	if d1.Tag != VTStr || !strings.Contains(strings.ToLower(d1.Data.(string)), "adds one") {
-		t.Fatalf("doc first line wrong: %#v", d1)
-	}
-	help := evalWithIP(t, ip, `help(f)`)
-	if help.Tag != VTStr || !strings.Contains(help.Data.(string), "longer") {
-		t.Fatalf("help expected full docstring: %#v", help)
-	}
-
-	// funType roundtrip (A->B)
-	ft := evalWithIP(t, ip, `funType(f)`)
-	if ft.Tag != VTType {
-		t.Fatalf("funType should return Type, got %#v", ft)
-	}
-
-	// Type utils
-	tmap := evalWithIP(t, ip, `type {name!: Str, age: Int?}`)
-	ip.Global.Define("T", tmap)
-	fields := evalWithIP(t, ip, `typeFields(T)`)
-	if fields.Tag != VTArray || len(fields.Data.([]Value)) != 2 {
-		t.Fatalf("typeFields count wrong: %#v", fields)
-	}
-	isN := evalWithIP(t, ip, `isNullable(type Int?)`)
-	if isN.Tag != VTBool || !isN.Data.(bool) {
-		t.Fatalf("isNullable failed: %#v", isN)
-	}
-	eqBase := evalWithIP(t, ip, `typeEquals(baseType(type Int?), type Int)`)
-	if eqBase.Tag != VTBool || !eqBase.Data.(bool) {
-		t.Fatalf("baseType wrong: %#v", eqBase)
-	}
-	eqElem := evalWithIP(t, ip, `typeEquals(arrayElemType(type [Str]), type Str)`)
-	if eqElem.Tag != VTBool || !eqElem.Data.(bool) {
-		t.Fatalf("arrayElemType wrong: %#v", eqElem)
-	}
-	teq := evalWithIP(t, ip, `typeEquals(type Int, type Int)`)
-	if teq.Tag != VTBool || !teq.Data.(bool) {
-		t.Fatalf("typeEquals false negative: %#v", teq)
+// NewLexer creates a new lexer for the given source in normal mode.
+// Unterminated strings / "#(...)" / "##(...)" yield LexError.
+func NewLexer(src string) *Lexer {
+	return &Lexer{
+		src: src,
+		// very rough guess to reduce reslices on big files
+		tokens: make([]Token, 0, len(src)/4),
+		line:   1,
+		col:    0,
 	}
 }
 
-// ---------------- Utilities: time/rand/json ----------------
-
-func Test_RT_Utilities_Time_Rand_JSON(t *testing.T) {
-	ip := newRT()
-
-	// nowMillis & sleep: ensure time advances
-	t0 := evalWithIP(t, ip, `nowMillis()`)
-	time.Sleep(20 * time.Millisecond)
-	t1 := evalWithIP(t, ip, `nowMillis()`)
-	if !(t0.Tag == VTInt && t1.Tag == VTInt && t1.Data.(int64) >= t0.Data.(int64)) {
-		t.Fatalf("nowMillis non-monotonic: %#v, %#v", t0, t1)
-	}
-
-	// seeded randomness
-	v := evalWithIP(t, ip, `
-		seedRand(123)
-		{a: randInt(10), b: randFloat()}
-	`)
-	m := entriesOf(t, v)
-	if m["a"].Tag != VTInt || m["a"].Data.(int64) < 0 || m["a"].Data.(int64) >= 10 {
-		t.Fatalf("randInt out of range: %#v", m["a"])
-	}
-	if m["b"].Tag != VTNum || m["b"].Data.(float64) < 0.0 || m["b"].Data.(float64) >= 1.0 {
-		t.Fatalf("randFloat out of range: %#v", m["b"])
-	}
-
-	// JSON round-trip
-	j := evalWithIP(t, ip, `
-		let obj = {name:"Ada", age: 37, tags: ["a","b"], ok: true, misc: null}
-		let s = jsonStringify(obj)
-		let back = jsonParse(s)
-		back.name
-	`)
-	if j.Tag != VTStr || j.Data.(string) != "Ada" {
-		t.Fatalf("json roundtrip failed, got %#v", j)
+// NewLexerInteractive creates a lexer in interactive mode.
+// Unterminated strings or inline paren blocks return IncompleteError at EOF,
+// allowing REPLs to request more input.
+func NewLexerInteractive(src string) *Lexer {
+	return &Lexer{
+		src:         src,
+		tokens:      make([]Token, 0, len(src)/4),
+		line:        1,
+		col:         0,
+		interactive: true,
 	}
 }
 
-// ---------------- std_core: types & import/env/map ----------------
-
-// Variance: (Num->Int) <: (Int->Num) is actually TRUE
-func Test_RT_IsSubtype_Variance_And_Basics(t *testing.T) {
-	ip := newRT()
-
-	// (Num -> Int) <: (Int -> Num)  — params contravariant, returns covariant → true
-	v := evalWithIP(t, ip, `isSubtype(type (Num -> Int), type (Int -> Num))`)
-	if v.Tag != VTBool || v.Data.(bool) != true {
-		t.Fatalf("(Num->Int) <: (Int->Num) should be true, got %#v", v)
-	}
-
-	// A <: A is true
-	self := evalWithIP(t, ip, `isSubtype(type Int, type Int)`)
-	if self.Tag != VTBool || !self.Data.(bool) {
-		t.Fatalf("reflexivity failed: %#v", self)
-	}
-}
-
-// importCode: success + parse error + runtime error
-func Test_RT_ImportCode_Success_ParseError_RuntimeError(t *testing.T) {
-	ip := newRT()
-
-	// success: returns a Module with an exported binding
-	mod := evalWithIP(t, ip, `
-		importCode("mok", "
-			let inc = fun(x:Int) -> Int do x + 1 end
-		")
-	`)
-	if mod.Tag != VTModule {
-		t.Fatalf("importCode success should return Module, got %#v", mod)
-	}
-	// Call the exported function to be sure it compiled
-	ip.Global.Define("M", mod)
-	out := evalWithIP(t, ip, `M.inc(41)`)
-	if out.Tag != VTInt || out.Data.(int64) != 42 {
-		t.Fatalf("imported function wrong result: %#v", out)
-	}
-
-	// parse error: bad syntax inside the source string
-	perr := evalWithIP(t, ip, `importCode("bad", "fun x:Int -> Int do x end")`)
-	wantAnnotatedContains(t, perr, "parse error in mem:bad")
-
-	// runtime error: reference to undefined variable in module code
-	rterr := evalWithIP(t, ip, `importCode("boom", "y + 1")`)
-	wantAnnotatedContains(t, rterr, "runtime error in mem:boom")
-}
-
-func Test_RT_Import_TypeChecks_And_StringPath(t *testing.T) {
-	ip := newRT()
-
-	// wrong type for 'path'
-	v := evalWithIP(t, ip, `import(42)`)
-	wantAnnotatedContains(t, v, "type mismatch in parameter 'path'")
-
-	// ok path, but module not found should annotate clearly
-	v2 := evalWithIP(t, ip, `import("nope")`)
-	wantAnnotatedNullContains(t, v2, "module not found")
-}
-
-func Test_RT_GetEnv_Shadows_And_Order(t *testing.T) {
-	ip := newRT()
-	out := evalWithIP(t, ip, `
-      let x = "outer"
-      do
-        let x = "inner"
-        let y = 1
-        let m = getEnv()
-        {a: m["x"], b: m["y"]}
-      end
-    `)
-	m := entriesOf(t, out)
-	if m["a"].Tag != VTStr || m["a"].Data.(string) != "inner" {
-		t.Fatalf("getEnv shadowing failed: %#v", out)
-	}
-	if m["b"].Tag != VTInt || m["b"].Data.(int64) != 1 {
-		t.Fatalf("getEnv missing y: %#v", out)
-	}
-}
-
-func Test_RT_MapHas_And_MapDelete_Order_And_Ann(t *testing.T) {
-	ip := newRT()
-	v := evalWithIP(t, ip, `
-      let m = {#(first) a:1, b:2, c:3}
-      let _ = mapDelete(m, "b")
-      {h1: mapHas(m,"b"), h2: mapHas(m,"z"), pairs: __collect_for_elems(m)}
-	`)
-	// {h1:false, h2:false, pairs:[[k,v]...]} with keys in order a,c
-	m := entriesOf(t, v)
-	if m["h1"].Tag != VTBool || m["h1"].Data.(bool) != false {
-		t.Fatalf("expected h1 = false, got %#v", m["h1"])
-	}
-	if m["h2"].Tag != VTBool || m["h2"].Data.(bool) != false {
-		t.Fatalf("expected h2 = false, got %#v", m["h2"])
-	}
-	pairs := m["pairs"]
-	if pairs.Tag != VTArray {
-		t.Fatalf("pairs not array: %#v", pairs)
-	}
-	xs := pairs.Data.([]Value)
-	if len(xs) != 2 {
-		t.Fatalf("expected 2 pairs after delete, got %d", len(xs))
-	}
-	k0 := xs[0].Data.([]Value)[0] // first key
-	k1 := xs[1].Data.([]Value)[0] // second key
-	if k0.Tag != VTStr || k0.Data.(string) != "a" || k1.Tag != VTStr || k1.Data.(string) != "c" {
-		t.Fatalf("order not preserved a,c: %#v", pairs)
-	}
-	// key annotation on "a" should be present (doc on key shows up as Annot on the Str key)
-	if k0.Annot == "" {
-		t.Fatalf("expected annotation on key 'a'")
-	}
-}
-
-// ---------------- std_io_net: file/net edge cases ----------------
-
-func Test_RT_IO_Open_Modes_And_WriteCount(t *testing.T) {
-	ip := newRT()
-	path := filepath.Join(t.TempDir(), "w.txt")
-	ip.Global.Define("p", Str(path))
-
-	v := evalWithIP(t, ip, `
-      let f = open(p, "w")
-      let n = write(f, "A")
-      flush(f)
-      close(f)
-      n
-    `)
-	if v.Tag != VTInt || v.Data.(int64) != 1 {
-		t.Fatalf("write should return 1 byte, got %#v", v)
-	}
-}
-
-func Test_RT_IO_ReadWrite_Permissions_And_Errors(t *testing.T) {
-	ip := newRT()
-	path := filepath.Join(t.TempDir(), "g.txt")
-	ip.Global.Define("p", Str(path))
-
-	_ = evalWithIP(t, ip, `writeFile(p, "")`)
-
-	// Not writable: open "r" then write should annotate
-	v1 := evalWithIP(t, ip, `
-      let f = open(p, "r")
-      write(f, "x")
-    `)
-	wantAnnotatedContains(t, v1, "not writable")
-
-	// Not readable: open "w" then readLine should annotate
-	v2 := evalWithIP(t, ip, `
-      let f = open(p, "w")
-      readLine(f)
-    `)
-	wantAnnotatedContains(t, v2, "not readable")
-
-	// readN with n=0 → empty string
-	v3 := evalWithIP(t, ip, `
-      let f = open(p, "r")
-      let s = readN(f, 0)
-      close(f)
-      s
-    `)
-	if v3.Tag != VTStr || v3.Data.(string) != "" {
-		t.Fatalf("readN(0) should return empty string, got %#v", v3)
-	}
-
-	// Direct Go: unsupported handle for close()
-	uh := HandleVal("weird", nil)
-	ip.Global.Define("H", uh)
-	cv := evalWithIP(t, ip, `close(H)`)
-	wantAnnotatedContains(t, cv, "unsupported handle for close")
-}
-
-func Test_RT_Net_Error_Paths(t *testing.T) {
-	ip := newRT()
-	// Connect to an unused local port
-	addr := freeLocalAddr(t) // frees immediately; likely unused
-	ip.Global.Define("ADDR", Str(addr))
-	v := evalWithIP(t, ip, `netConnect(ADDR)`)
-	wantAnnotatedContains(t, v, "connect") // message contains "connect" or similar
-}
-
-// ---------------- std_sys: clone, cast, strings, math, date, cancel ----------------
-
-func Test_RT_Clone_DeepCopy_Arrays_And_Maps(t *testing.T) {
-	ip := newRT()
-	// Build a map with an annotated key and a small array; clone both and mutate originals
-	v := evalWithIP(t, ip, `
-      let m = {#(first) a:1, b:2}
-      let a = [10, 20]
-      let mc = clone(m)
-      let ac = clone(a)
-      m.a = 99
-      a[0] = 77
-      {mc: mc, ac: ac, mcPairs: __collect_for_elems(mc)}
-    `)
-
-	m := entriesOf(t, v)
-	// cloned array not affected by mutation of original
-	ac := m["ac"]
-	if ac.Tag != VTArray || len(ac.Data.([]Value)) != 2 || ac.Data.([]Value)[0].Data.(int64) != 10 {
-		t.Fatalf("array clone not independent: %#v", ac)
-	}
-
-	// cloned map still has a:1, b:2 and preserves order a,b; "a" key annotated
-	mc := m["mc"]
-	if mc.Tag != VTMap {
-		t.Fatalf("mc not a map: %#v", mc)
-	}
-	pairs := m["mcPairs"]
-	xs := pairs.Data.([]Value)
-	if len(xs) != 2 {
-		t.Fatalf("mcPairs wrong length: %#v", pairs)
-	}
-	k0 := xs[0].Data.([]Value)[0]
-	v0 := xs[0].Data.([]Value)[1]
-	k1 := xs[1].Data.([]Value)[0]
-	v1 := xs[1].Data.([]Value)[1]
-	if k0.Tag != VTStr || k0.Data.(string) != "a" || v0.Data.(int64) != 1 || k1.Data.(string) != "b" || v1.Data.(int64) != 2 {
-		t.Fatalf("map clone content/order wrong: %#v", pairs)
-	}
-	if k0.Annot == "" {
-		t.Fatalf("expected annotation on cloned key 'a'")
-	}
-}
-func Test_RT_Sleep_Increases_NowMillis(t *testing.T) {
-	ip := newRT()
-	v := evalWithIP(t, ip, `
-      let t0 = nowMillis()
-      sleep(5)
-      let t1 = nowMillis()
-      t1 - t0
-    `)
-	if v.Tag != VTInt || v.Data.(int64) < 0 {
-		t.Fatalf("sleep/nowMillis unexpected: %#v", v)
-	}
-}
-
-func Test_RT_Cast_Str_Int_Num_Bool(t *testing.T) {
-	ip := newRT()
-
-	// str on arrays/maps → JSON
-	s := evalWithIP(t, ip, `str({x:1, y:[2,3]})`)
-	if s.Tag != VTStr || !strings.Contains(s.Data.(string), `"x":`) {
-		t.Fatalf("str(map) should be JSON-ish, got %#v", s)
-	}
-
-	// int conversions
-	i1 := evalWithIP(t, ip, `int(3.9)`)
-	if i1.Tag != VTInt || i1.Data.(int64) != 3 {
-		t.Fatalf("int(3.9) truncation failed: %#v", i1)
-	}
-	i2 := evalWithIP(t, ip, `int("xyz")`)
-	if i2.Tag != VTNull {
-		t.Fatalf("int(\"xyz\") should be null, got %#v", i2)
-	}
-
-	// num conversions
-	n1 := evalWithIP(t, ip, `num(7)`)
-	if n1.Tag != VTNum || n1.Data.(float64) != 7.0 {
-		t.Fatalf("num(7) failed: %#v", n1)
-	}
-	n2 := evalWithIP(t, ip, `num("oops")`)
-	if n2.Tag != VTNull {
-		t.Fatalf("num(\"oops\") should be null, got %#v", n2)
-	}
-
-	// bool truthiness
-	b1 := evalWithIP(t, ip, `bool([])`)
-	if b1.Tag != VTBool || b1.Data.(bool) {
-		t.Fatalf("bool([]) should be false, got %#v", b1)
-	}
-	b2 := evalWithIP(t, ip, `bool({})`)
-	if b2.Tag != VTBool || b2.Data.(bool) {
-		t.Fatalf("bool({}) should be false, got %#v", b2)
-	}
-	b3 := evalWithIP(t, ip, `bool("hi")`)
-	if b3.Tag != VTBool || !b3.Data.(bool) {
-		t.Fatalf("bool(\"hi\") should be true, got %#v", b3)
-	}
-}
-
-func Test_RT_String_Utilities(t *testing.T) {
-	ip := newRT()
-	out := evalWithIP(t, ip, `
-      {
-        sub: substr("héllo", 1, 4),
-        lo:  toLower("HeLLo"),
-        up:  toUpper("HeLLo"),
-        st:  strip("  x  "),
-        ls:  lstrip("  x  "),
-        rs:  rstrip("x  "),
-        sp:  split("a,b,c", ","),
-        jn:  join(["a","b","c"], "-")
-      }
-    `)
-	m := entriesOf(t, out)
-	if m["sub"].Data.(string) != "éll" {
-		t.Fatalf("substr failed: %#v", m["sub"])
-	}
-	if m["lo"].Data.(string) != "hello" || m["up"].Data.(string) != "HELLO" {
-		t.Fatalf("case conversions failed: lo=%#v up=%#v", m["lo"], m["up"])
-	}
-	if m["st"].Data.(string) != "x" || m["ls"].Data.(string) != "x  " || m["rs"].Data.(string) != "x" {
-		t.Fatalf("strip/lstrip/rstrip failed: st=%#v ls=%#v rs=%#v", m["st"], m["ls"], m["rs"])
-	}
-	if sp := m["sp"]; sp.Tag != VTArray || len(sp.Data.([]Value)) != 3 {
-		t.Fatalf("split failed: %#v", sp)
-	}
-	if m["jn"].Data.(string) != "a-b-c" {
-		t.Fatalf("join failed: %#v", m["jn"])
-	}
-}
-
-func Test_RT_Math_And_Constants(t *testing.T) {
-	ip := newRT()
-	v := evalWithIP(t, ip, `
-      { s: sin(0.0), c: cos(0.0), e: exp(0.0), p: pow(2.0,3.0), pi: PI, ee: E }
-    `)
-	m := entriesOf(t, v)
-	if m["s"].Tag != VTNum || m["c"].Tag != VTNum || m["e"].Tag != VTNum || m["p"].Tag != VTNum {
-		t.Fatalf("math funcs types wrong: %#v", v)
-	}
-	if m["e"].Data.(float64) != 1.0 || m["p"].Data.(float64) != 8.0 {
-		t.Fatalf("exp/pow values wrong: %#v", v)
-	}
-	if m["pi"].Tag != VTNum || m["ee"].Tag != VTNum {
-		t.Fatalf("constants missing: %#v", v)
-	}
-}
-
-func Test_RT_DateNow_Structure(t *testing.T) {
-	ip := newRT()
-	v := evalWithIP(t, ip, `dateNow()`)
-	if v.Tag != VTMap {
-		t.Fatalf("dateNow should return map, got %#v", v)
-	}
-	m := v.Data.(*MapObject).Entries
-	for _, k := range []string{"year", "month", "day", "hour", "minute", "second", "millisecond"} {
-		if _, ok := m[k]; !ok {
-			t.Fatalf("dateNow missing key %q", k)
+// Scan tokenizes the entire source string and returns the resulting slice of
+// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
+//
+// Error behavior summary:
+//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
+//   - Interactive mode: returns *IncompleteError at EOF if a construct is
+//     unterminated; other issues still return *LexError.
+//
+// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
+// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
+func (l *Lexer) Scan() ([]Token, error) {
+	for {
+		tok, err := l.scanToken()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Type == EOF {
+			return l.tokens, nil
 		}
 	}
 }
 
-func Test_RT_ProcCancel_Smoke(t *testing.T) {
-	ip := newRT()
+//// END_OF_PUBLIC
 
-	fn := evalWithIP(t, ip, `fun() do 0 end`)
-	ip.Global.Define("f", fn)
+////////////////////////////////////////////////////////////////////////////////
+//                            PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
 
-	v := evalWithIP(t, ip, `
-      let p = procSpawn(f)
-      procCancel(p)
-      procJoin(p)
-    `)
-	if v.Tag != VTInt || v.Data.(int64) != 0 {
-		t.Fatalf("procCancel/procJoin smoke failed: %#v", v)
-	}
+// ---------------- keywords map (private) ----------------
+
+var keywords = map[string]TokenType{
+	"null":     NULL,
+	"false":    BOOLEAN,
+	"true":     BOOLEAN,
+	"and":      AND,
+	"or":       OR,
+	"not":      NOT,
+	"let":      LET,
+	"do":       DO,
+	"end":      END,
+	"return":   RETURN,
+	"break":    BREAK,
+	"continue": CONTINUE,
+	"if":       IF,
+	"then":     THEN,
+	"elif":     ELIF,
+	"else":     ELSE,
+	"fun":      FUNCTION,
+	"oracle":   ORACLE,
+	"for":      FOR,
+	"in":       IN,
+	"from":     FROM,
+	"while":    WHILE,
+	"type":     TYPECONS,
+	"Type":     TYPE,
+	"Null":     TYPE,
+	"Str":      TYPE,
+	"Int":      TYPE,
+	"Num":      TYPE,
+	"Bool":     TYPE,
+	"Any":      TYPE,
+	"Enum":     ENUM,
 }
 
-func Test_RT_IO_Open_RW_Mode_ReadAfterWrite(t *testing.T) {
-	ip := newRT()
-	path := filepath.Join(t.TempDir(), "rw.txt")
-	ip.Global.Define("p", Str(path))
+// ---------------- core scanning helpers ----------------
 
-	v := evalWithIP(t, ip, `
-      let f = open(p, "rw")
-      write(f, "XY")
-      flush(f)
-      let r = readN(f, 2)  # position is at end; readN should return ""
-      close(f)
-      r
-    `)
-	if v.Tag != VTStr || v.Data.(string) != "" {
-		t.Fatalf("expected empty because cursor at end after write; got %#v", v)
+func (l *Lexer) isAtEnd() bool { return l.cur >= len(l.src) }
+
+func (l *Lexer) peek() (byte, bool) {
+	if l.isAtEnd() {
+		return 0, false
 	}
+	return l.src[l.cur], true
 }
 
-// ---------- error(message) ----------
-
-func Test_RT_Error_Raises_RuntimeError(t *testing.T) {
-	ip := newRT()
-
-	v := evalWithIP(t, ip, `error("boom")`)
-	wantAnnotatedContains(t, v, "boom")
-
-	// Optional: null/empty message still raises a hard error (message can be empty)
-	v2 := evalWithIP(t, ip, `error(null)`)
-	if v2.Tag != VTNull || v2.Annot == "" {
-		t.Fatalf("error(null) should still be an annotated null, got %#v", v2)
+func (l *Lexer) peekN(n int) (byte, bool) {
+	idx := l.cur + n
+	if idx >= len(l.src) {
+		return 0, false
 	}
+	return l.src[idx], true
 }
 
-// ---------- sprintf / printf ----------
-
-func Test_RT_Sprintf_Basics_And_Literals(t *testing.T) {
-	ip := newRT()
-
-	// %s and %d basics; args passed as an array
-	v := evalWithIP(t, ip, `
-		let s = sprintf("hi %s %d", ["x", 3])
-		s
-	`)
-	if v.Tag != VTStr || v.Data.(string) != "hi x 3" {
-		t.Fatalf("sprintf basic failed, got %#v", v)
+func (l *Lexer) advance() (byte, bool) {
+	if l.isAtEnd() {
+		return 0, false
 	}
-
-	// literal %%
-	v2 := evalWithIP(t, ip, `
-		let s = sprintf("rate: 100%% ok", [])
-		s
-	`)
-	if v2.Tag != VTStr || v2.Data.(string) != "rate: 100% ok" {
-		t.Fatalf("sprintf %% literal failed, got %#v", v2)
+	ch := l.src[l.cur]
+	l.cur++
+	if ch == '\n' {
+		l.line++
+		l.col = 0
+	} else {
+		l.col++
 	}
+	return ch, true
 }
 
-func Test_RT_Printf_Returns_Printed_Value(t *testing.T) {
-	ip := newRT()
-
-	// Basic %s / %d formatting with array args
-	v := evalWithIP(t, ip, `printf("%s-%d", ["hi", 7])`)
-	if v.Tag != VTStr || v.Data.(string) != "hi-7" {
-		t.Fatalf("printf should return formatted string, got %#v", v)
-	}
-
-	// Float formatting (keeps it simple with %v to avoid precision surprises)
-	v2 := evalWithIP(t, ip, `printf("%v/%v", [3, 2.5])`)
-	if v2.Tag != VTStr || v2.Data.(string) != "3/2.5" {
-		t.Fatalf("printf formatting mismatch, got %#v", v2)
-	}
-}
-func Test_RT_Size_On_Arr_Map_Str_And_Other(t *testing.T) {
-	ip := newRT()
-
-	// array
-	vArr := evalWithIP(t, ip, `
-		let a = [1,2,3]
-		size(a)
-	`)
-	if vArr.Tag != VTInt || vArr.Data.(int64) != 3 {
-		t.Fatalf("size([..]) wrong, got %#v", vArr)
-	}
-
-	// map
-	vMap := evalWithIP(t, ip, `
-		let m = {"a":1, "b":2}
-		size(m)
-	`)
-	if vMap.Tag != VTInt || vMap.Data.(int64) != 2 {
-		t.Fatalf("size({..}) wrong, got %#v", vMap)
-	}
-
-	// string
-	vStr := evalWithIP(t, ip, `
-		size("test")
-	`)
-	if vStr.Tag != VTInt || vStr.Data.(int64) != 4 {
-		t.Fatalf(`size("test") wrong, got %#v`, vStr)
-	}
-
-	// other → null
-	vOther := evalWithIP(t, ip, `
-		size(123)
-	`)
-	if vOther.Tag != VTNull {
-		t.Fatalf("size(other) should be null, got %#v", vOther)
-	}
+func (l *Lexer) rewindToStart() {
+	// We rewind only within the bounds of the current token start; line/col are kept
+	// for error arrows (OK since we set tokStartLine/Col before scanning).
+	l.cur = l.start
 }
 
-func Test_RT_Regex_Match_And_Replace(t *testing.T) {
-	ip := newRT()
-
-	// match → [Str]
-	vm := evalWithIP(t, ip, `
-		match("[a-z]+", "a12bc3")
-	`)
-	if vm.Tag != VTArray {
-		t.Fatalf("match should return array, got %#v", vm)
+func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
+	lex := l.src[l.start:l.cur]
+	tok := Token{
+		Type:      tt,
+		Lexeme:    lex,
+		Literal:   lit,
+		Line:      l.tokStartLine,
+		Col:       l.tokStartCol,
+		StartByte: l.start,
+		EndByte:   l.cur,
 	}
-	xs := vm.Data.([]Value)
-	if len(xs) != 2 || xs[0].Tag != VTStr || xs[1].Tag != VTStr || xs[0].Data.(string) != "a" || xs[1].Data.(string) != "bc" {
-		t.Fatalf("match results wrong: %#v", vm)
-	}
-
-	// replace
-	vr := evalWithIP(t, ip, `
-		replace("[0-9]+", "#", "abc123def45")
-	`)
-	if vr.Tag != VTStr || vr.Data.(string) != "abc#def#" {
-		t.Fatalf("replace wrong, got %#v", vr)
-	}
+	l.tokens = append(l.tokens, tok)
+	l.start = l.cur
+	return tok
 }
 
-func Test_RT_Sprintf_Does_Not_Interfere_With_IO(t *testing.T) {
-	ip := newRT()
-
-	path := filepath.Join(t.TempDir(), "out.txt")
-	ip.Global.Define("p", Str(path))
-
-	v := evalWithIP(t, ip, `
-		let s = sprintf("X=%d", [5])
-		let f = open(p, "w")
-		write(f, s)
-		flush(f)
-		close(f)
-		readFile(p)
-	`)
-	if v.Tag != VTStr || strings.TrimSpace(v.Data.(string)) != "X=5" {
-		t.Fatalf("sprintf+IO failed, got %#v", v)
+func (l *Lexer) previousToken() *Token {
+	if len(l.tokens) == 0 {
+		return nil
 	}
-}
-func Test_RT_Import_Retry_After_Parse_Error(t *testing.T) {
-	ip := newRT()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "mod.ms")
-	ip.Global.Define("P", Str(path))
-
-	// 1) Write a parse-broken module, import should fail with annotated null
-	if err := os.WriteFile(path, []byte("let x = \n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	v1 := evalWithIP(t, ip, `
-		import(P)
-	`)
-	wantAnnotatedNullContains(t, v1, "parse")
-
-	// 2) Fix the file and re-import; should succeed (cache must NOT be poisoned)
-	if err := os.WriteFile(path, []byte("let answer = 42\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	v2 := evalWithIP(t, ip, `
-		import(P).answer
-	`)
-	if v2.Tag != VTInt || v2.Data.(int64) != 42 {
-		t.Fatalf("import retry (parse fix) failed, got %#v", v2)
-	}
+	return &l.tokens[len(l.tokens)-1]
 }
 
-func Test_RT_Import_Retry_After_Runtime_Error(t *testing.T) {
-	ip := newRT()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "mod.ms")
-	ip.Global.Define("P", Str(path))
-
-	// 1) Module parses but fails at runtime (division by zero)
-	if err := os.WriteFile(path, []byte("let bad = 1 / 0\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	v1 := evalWithIP(t, ip, `
-		import(P)
-	`)
-	// The exact wording may vary; "division by zero" is VM's message.
-	wantAnnotatedNullContains(t, v1, "division by zero")
-
-	// 2) Fix the module and re-import; should succeed
-	if err := os.WriteFile(path, []byte("let answer = 7\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	v2 := evalWithIP(t, ip, `
-		import(P).answer
-	`)
-	if v2.Tag != VTInt || v2.Data.(int64) != 7 {
-		t.Fatalf("import retry (runtime fix) failed, got %#v", v2)
-	}
-}
-
-// ---- Runtime smoke: builtins are wired and preserve key behaviors ----
-
-// Builtin: typeToJSONSchema — honors value-level and key-level descriptions + required
-func Test_RT_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
-	ip := NewRuntime()
-
-	src := `
-		let T = #(Type describing a person) type {
-			#(the name) name!: Str,
-			#(availability) avail: Enum["yes","no"]
+func (l *Lexer) skipWhitespace() {
+	for !l.isAtEnd() {
+		ch, _ := l.peek()
+		switch ch {
+		case ' ', '\r', '\n', '\t':
+			l.advance()
+			l.start = l.cur
+		default:
+			return
 		}
-		typeToJSONSchema(T)
-	`
-	out, err := ip.EvalSource(src)
+	}
+}
+
+// immediateWhitespaceBefore reports whether the byte immediately preceding the
+// current token start is ASCII whitespace. Called *after* skipWhitespace.
+func (l *Lexer) immediateWhitespaceBefore() bool {
+	if l.start == 0 {
+		return false
+	}
+	switch l.src[l.start-1] {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+// ---------------- small predicates ----------------
+
+func canBeLeftOperand(t TokenType) bool {
+	switch t {
+	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
+		TYPE, ENUM,
+		RROUND, RSQUARE, RCURLY,
+		QUESTION:
+		return true
+	default:
+		return false
+	}
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+func isHex(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+func isAlpha(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' }
+func isAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_'
+}
+
+func (l *Lexer) afterDotIsProperty() bool {
+	p := l.previousToken()
+	return p != nil && p.Type == PERIOD
+}
+
+// ---------------- error builders ----------------
+
+func (l *Lexer) err(msg string) error {
+	return &LexError{Line: l.line, Col: l.col, Msg: msg}
+}
+
+func (l *Lexer) errIncomplete(msg string) error {
+	return &IncompleteError{Line: l.line, Col: l.col, Msg: msg}
+}
+
+// ---------------- scanners ----------------
+
+// scanString parses a JSON-style string literal (single or double quotes).
+func (l *Lexer) scanString() (string, error) {
+	del := l.src[l.start]
+	if del != '"' && del != '\'' {
+		return "", l.err("internal: scanString without quote")
+	}
+	// consume the delimiter
+	l.advance()
+
+	var out []rune
+	for !l.isAtEnd() {
+		ch, _ := l.advance()
+		if ch == byte(del) {
+			return string(out), nil
+		}
+		if ch == '\\' {
+			if l.isAtEnd() {
+				if l.interactive {
+					return "", l.errIncomplete("unfinished escape sequence")
+				}
+				return "", l.err("unfinished escape sequence")
+			}
+			esc, _ := l.advance()
+			switch esc {
+			case '"':
+				out = append(out, '"')
+			case '\'':
+				out = append(out, '\'')
+			case '\\':
+				out = append(out, '\\')
+			case '/':
+				out = append(out, '/')
+			case 'b':
+				out = append(out, '\b')
+			case 'f':
+				out = append(out, '\f')
+			case 'n':
+				out = append(out, '\n')
+			case 'r':
+				out = append(out, '\r')
+			case 't':
+				out = append(out, '\t')
+			case 'u':
+				// expect 4 hex digits
+				toHex := func(b byte) int {
+					switch {
+					case b >= '0' && b <= '9':
+						return int(b - '0')
+					case b >= 'a' && b <= 'f':
+						return 10 + int(b-'a')
+					case b >= 'A' && b <= 'F':
+						return 10 + int(b-'A')
+					default:
+						return -1
+					}
+				}
+				val := 0
+				for i := 0; i < 4; i++ {
+					b, ok := l.peek()
+					if !ok {
+						if l.interactive {
+							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
+						}
+						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
+					}
+					d := toHex(b)
+					if d < 0 {
+						return "", l.err("invalid unicode escape")
+					}
+					val = (val << 4) | d
+					l.advance()
+				}
+				r := rune(val)
+
+				// handle surrogate pair \uD800-\uDBFF followed by \uDC00-\uDFFF
+				if 0xD800 <= r && r <= 0xDBFF {
+					saveCur := l.cur
+					saveLine, saveCol := l.line, l.col
+					if b1, ok := l.peek(); ok && b1 == '\\' {
+						l.advance()
+						if b2, ok := l.peek(); ok && b2 == 'u' {
+							l.advance()
+							val2 := 0
+							for i := 0; i < 4; i++ {
+								b, ok := l.peek()
+								if !ok {
+									if l.interactive {
+										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
+									}
+									return "", l.err("unicode surrogate pair low was not terminated")
+								}
+								d := toHex(b)
+								if d < 0 {
+									return "", l.err("invalid unicode surrogate pair low")
+								}
+								val2 = (val2 << 4) | d
+								l.advance()
+							}
+							r2 := rune(val2)
+							if 0xDC00 <= r2 && r2 <= 0xDFFF {
+								cp := utf16.DecodeRune(r, r2)
+								out = append(out, cp)
+								continue
+							}
+						}
+					}
+					// not a valid pair; rewind and just emit r
+					l.cur = saveCur
+					l.line, l.col = saveLine, saveCol
+				}
+				out = append(out, r)
+			default:
+				return "", l.err(fmt.Sprintf("invalid escape sequence: \\%c", esc))
+			}
+			continue
+		}
+		// normal char; ensure it’s valid UTF-8 boundary (source may be UTF-8)
+		if ch < utf8.RuneSelf {
+			out = append(out, rune(ch))
+			continue
+		}
+		// If we see a non-ASCII byte here, the source itself is UTF-8; back up one byte and decode rune.
+		l.cur-- // step back 1 byte to let utf8.DecodeRuneInString read from correct start
+		r, size := utf8.DecodeRuneInString(l.src[l.cur:])
+		if r == utf8.RuneError && size == 1 {
+			return "", l.err("invalid UTF-8 in source")
+		}
+		out = append(out, r)
+		l.cur += size
+		l.col += size - 1
+	}
+	if l.interactive {
+		return "", l.errIncomplete("string was not terminated")
+	}
+	return "", l.err("string was not terminated")
+}
+
+// scanIdentifier parses [A-Za-z_][A-Za-z0-9_]*
+func (l *Lexer) scanIdentifier() string {
+	for {
+		b, ok := l.peek()
+		if !ok || !isAlphaNum(b) {
+			break
+		}
+		l.advance()
+	}
+	return l.src[l.start:l.cur]
+}
+
+// scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
+// Precondition: current position is at l.start and the first rune is either a digit
+//
+//	or a '.' that has already been verified to start a number.
+func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
+	sawDigits := false
+	sawDot := false
+	sawExp := false
+
+	// integral part (optional for leading '.')
+	for {
+		b, ok := l.peek()
+		if !ok || !isDigit(b) {
+			break
+		}
+		l.advance()
+		sawDigits = true
+	}
+
+	// fractional part
+	if b, ok := l.peek(); ok && b == '.' {
+		// Always consume '.'; at least one of integral or fractional must have digits.
+		l.advance()
+		sawDot = true
+		for {
+			b2, ok2 := l.peek()
+			if !ok2 || !isDigit(b2) {
+				break
+			}
+			l.advance()
+			sawDigits = true
+		}
+	}
+
+	// exponent part: ([eE][+-]?digits)?
+	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
+		save := l.cur
+		l.advance() // consume e/E
+		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
+			l.advance()
+		}
+		if b3, ok := l.peek(); ok && isDigit(b3) {
+			sawExp = true
+			for {
+				b4, ok := l.peek()
+				if !ok || !isDigit(b4) {
+					break
+				}
+				l.advance()
+				// Having an exponent implies there were digits overall, but we leave
+				// sawDigits alone—it already tracked integral/fractional digits.
+			}
+		} else {
+			// No digits after e/E (and optional sign) → backtrack, no exponent.
+			l.cur = save
+		}
+	}
+
+	if !sawDigits {
+		return ILLEGAL, nil, l.err("malformed number")
+	}
+
+	lex := l.src[l.start:l.cur]
+	if !sawDot && !sawExp {
+		v, convErr := strconv.ParseInt(lex, 10, 64)
+		if convErr != nil {
+			return ILLEGAL, nil, l.err("invalid integer literal")
+		}
+		return INTEGER, v, nil
+	}
+	vf, convErr := strconv.ParseFloat(lex, 64)
+	if convErr != nil {
+		return ILLEGAL, nil, l.err("invalid float literal")
+	}
+	return NUMBER, vf, nil
+}
+
+// scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
+// Terminates on blank line or a line that does not begin (after spaces) with '#'.
+func (l *Lexer) scanAnnotation() (string, error) {
+	var bldr strings.Builder
+
+	// helper: check if the *next* line (after current '\n') starts with '#'
+	nextLineStartsWithHash := func() bool {
+		// we are currently positioned at the '\n' (unconsumed)
+		probe := l.cur + 1
+		for probe < len(l.src) {
+			c := l.src[probe]
+			if c == ' ' || c == '\t' || c == '\r' {
+				probe++
+				continue
+			}
+			break
+		}
+		return probe < len(l.src) && l.src[probe] == '#'
+	}
+
+	// (unchanged) trim one optional space/tab after the first '#'
+	if b, ok := l.peek(); ok && (b == ' ' || b == '\t') {
+		l.advance()
+	}
+
+	// ----- capture first line, but DO NOT consume its trailing '\n' -----
+	for {
+		b, ok := l.peek()
+		if !ok || b == '\n' {
+			// do not l.advance() here; leave '\n' in the stream
+			bldr.WriteByte('\n')
+			break
+		}
+		bldr.WriteByte(b)
+		l.advance()
+	}
+
+	// If there is another annotation line, consume the '\n' now and continue.
+	if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+		l.advance() // consume newline to move to start of the next line
+	} else {
+		// single-line block; leave the '\n' unconsumed
+		s := bldr.String()
+		if len(s) == 0 {
+			return "", errors.New("incomplete annotation")
+		}
+		for len(s) > 0 && s[len(s)-1] == '\n' { // keep existing trailing-trim behavior
+			s = s[:len(s)-1]
+		}
+		return s, nil
+	}
+
+	// ----- capture subsequent '#'-prefixed lines -----
+	consumeHashOnLine := func() (bool, error) {
+		for {
+			b, ok := l.peek()
+			if !ok || b == '\n' {
+				break
+			}
+			if b == ' ' || b == '\t' || b == '\r' {
+				l.advance()
+				continue
+			}
+			break
+		}
+		b, ok := l.peek()
+		if !ok || b != '#' {
+			return false, nil
+		}
+		l.advance() // '#'
+		if b2, ok2 := l.peek(); ok2 && (b2 == ' ' || b2 == '\t') {
+			l.advance()
+		}
+		return true, nil
+	}
+
+	for {
+		save := l.cur
+		cont, err := consumeHashOnLine()
+		if err != nil {
+			return "", err
+		}
+		if !cont {
+			l.cur = save
+			break
+		}
+
+		// read rest of line, but DO NOT consume trailing '\n'
+		for {
+			b, ok := l.peek()
+			if !ok || b == '\n' {
+				bldr.WriteByte('\n')
+				break
+			}
+			bldr.WriteByte(b)
+			l.advance()
+		}
+
+		// If another '#'-line follows, eat this '\n' and continue; else stop (leave '\n').
+		if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+			l.advance() // consume newline to move to next line
+		} else {
+			break // leave final '\n' unconsumed
+		}
+	}
+
+	s := bldr.String()
+	if len(s) == 0 {
+		return "", errors.New("incomplete annotation")
+	}
+	// keep trimming of trailing '\n' in the emitted annotation text
+	for len(s) > 0 && s[len(s)-1] == '\n' {
+		s = s[:len(s)-1]
+	}
+	return s, nil
+}
+
+// scanInlineParens reads everything between a '(' and the matching ')'.
+// Caller must ensure the next byte is '('.
+// No nesting supported; runs across newlines; errors if EOF before ')'.
+func (l *Lexer) scanInlineParens() (string, error) {
+	// consume '('
+	if b, ok := l.peek(); !ok || b != '(' {
+		return "", l.err("internal: expected '(' after inline opener")
+	}
+	l.advance()
+
+	var bldr strings.Builder
+	for {
+		b, ok := l.peek()
+		if !ok {
+			if l.interactive {
+				return "", l.errIncomplete("inline block was not terminated with ')'")
+			}
+			return "", l.err("inline block was not terminated with ')'")
+		}
+		if b == ')' {
+			l.advance() // consume ')'
+			break
+		}
+		bldr.WriteByte(b)
+		l.advance()
+	}
+	return bldr.String(), nil
+}
+
+// --- hash/comment helpers ---
+
+// handleSingleHash processes '#' annotations (inline or multiline).
+// Returns (producedAnnotation, text, err).
+func (l *Lexer) handleSingleHash() (bool, string, error) {
+	if b1, ok := l.peek(); ok && b1 == '(' {
+		text, err := l.scanInlineParens()
+		if err != nil {
+			return false, "", err
+		}
+		return true, text, nil
+	}
+	annot, err := l.scanAnnotation()
 	if err != nil {
-		t.Fatalf("Eval error: %v", err)
+		return false, "", l.err("incomplete annotation")
+	}
+	return true, annot, nil
+}
+
+// --- misc helpers ---
+
+func (l *Lexer) dotStartsNumber() bool {
+	b, ok := l.peek()
+	if !ok || !isDigit(b) {
+		return false
+	}
+	prev := l.previousToken()
+	if l.immediateWhitespaceBefore() || prev == nil || !canBeLeftOperand(prev.Type) {
+		return true
+	}
+	return false
+}
+
+// ---------------- main tokenization ----------------
+
+func (l *Lexer) scanToken() (Token, error) {
+	for {
+		l.skipWhitespace()
+		l.tokStartLine = l.line
+		l.tokStartCol = l.col
+		l.start = l.cur
+
+		if l.isAtEnd() {
+			return l.addToken(EOF, nil), nil
+		}
+
+		ch, _ := l.advance()
+
+		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
+		switch ch {
+		case '(':
+			if l.immediateWhitespaceBefore() {
+				return l.addToken(LROUND, "("), nil
+			}
+			return l.addToken(CLROUND, "("), nil
+		case ')':
+			return l.addToken(RROUND, ")"), nil
+		case '[':
+			if l.immediateWhitespaceBefore() {
+				return l.addToken(LSQUARE, "["), nil
+			}
+			return l.addToken(CLSQUARE, "["), nil
+		case ']':
+			return l.addToken(RSQUARE, "]"), nil
+		case '{':
+			return l.addToken(LCURLY, "{"), nil
+		case '}':
+			return l.addToken(RCURLY, "}"), nil
+		case '+':
+			return l.addToken(PLUS, "+"), nil
+		case '*':
+			return l.addToken(MULT, "*"), nil
+		case '/':
+			return l.addToken(DIV, "/"), nil
+		case '%':
+			return l.addToken(MOD, "%"), nil
+		case ':':
+			return l.addToken(COLON, ":"), nil
+		case ',':
+			return l.addToken(COMMA, ","), nil
+		case '?':
+			return l.addToken(QUESTION, "?"), nil
+		}
+
+		// '.' : either decimal-starting float or PERIOD
+		if ch == '.' {
+			if l.dotStartsNumber() {
+				l.rewindToStart()
+				tt, lit, err := l.scanNumber()
+				if err != nil {
+					return Token{}, err
+				}
+				return l.addToken(tt, lit), nil
+			}
+			return l.addToken(PERIOD, "."), nil
+		}
+
+		// Two-char operators and fallbacks
+		switch ch {
+		case '-':
+			if b, ok := l.peek(); ok && b == '>' {
+				l.advance()
+				return l.addToken(ARROW, "->"), nil
+			}
+			return l.addToken(MINUS, "-"), nil
+		case '=':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(EQ, "=="), nil
+			}
+			return l.addToken(ASSIGN, "="), nil
+		case '!':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(NEQ, "!="), nil
+			}
+			return l.addToken(BANG, "!"), nil
+		case '<':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(LESS_EQ, "<="), nil
+			}
+			return l.addToken(LESS, "<"), nil
+		case '>':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(GREATER_EQ, ">="), nil
+			}
+			return l.addToken(GREATER, ">"), nil
+		}
+
+		// Annotations
+		if ch == '#' {
+			ok, text, err := l.handleSingleHash()
+			if err != nil {
+				return Token{}, err
+			}
+			if ok {
+				return l.addToken(ANNOTATION, text), nil
+			}
+		}
+
+		// Strings
+		if ch == '"' || ch == '\'' {
+			l.rewindToStart()
+			text, err := l.scanString()
+			if err != nil {
+				return Token{}, err
+			}
+			// After '.' a quoted key becomes ID (property name)
+			if l.afterDotIsProperty() {
+				return l.addToken(ID, text), nil
+			}
+			return l.addToken(STRING, text), nil
+		}
+
+		// Numbers (starting with digit)
+		if isDigit(ch) {
+			l.rewindToStart()
+			tt, lit, err := l.scanNumber()
+			if err != nil {
+				return Token{}, err
+			}
+			return l.addToken(tt, lit), nil
+		}
+
+		// Identifiers / Keywords
+		if isAlpha(ch) {
+			l.rewindToStart()
+			lex := l.scanIdentifier()
+			// After '.', treat as property name (ID)
+			if l.afterDotIsProperty() {
+				return l.addToken(ID, lex), nil
+			}
+			if tt, ok := keywords[lex]; ok {
+				switch tt {
+				case NULL:
+					return l.addToken(NULL, nil), nil
+				case BOOLEAN:
+					if lex == "true" {
+						return l.addToken(BOOLEAN, true), nil
+					}
+					return l.addToken(BOOLEAN, false), nil
+				default:
+					return l.addToken(tt, nil), nil
+				}
+			}
+			return l.addToken(ID, lex), nil
+		}
+
+		return Token{}, l.err(fmt.Sprintf("unexpected character: %q", ch))
+	}
+}
+=== END FILE: lexer.go ===
+
+=== BEGIN FILE: parser.go ===
+// parser.go: Pratt parser for MindScript that produces Lisp-style S-expressions.
+//
+// OVERVIEW
+// --------
+// This file implements a newline-aware, interactive-ready Pratt parser for the
+// MindScript language. The parser consumes the token stream produced by the
+// lexer (see lexer.go) and returns a compact, Lisp-y S-expression (AST) where
+// each node is encoded as []any with a leading tag string, e.g.:
+//
+//	("binop", "+", ("int", 1), ("id", "x"))
+//
+// DEPENDENCIES
+// ------------
+// • lexer.go — provides:
+//   - Token / TokenType definitions and all token kinds used here
+//   - Lexer, NewLexer, NewLexerInteractive
+//   - IncompleteError and IsIncomplete(err)
+//
+// • standard library: fmt (for error messages)
+//
+// PARSING MODE & INTERACTIVITY
+// ----------------------------
+// Two entry points are provided:
+//
+//	ParseSExpr(src string)            — normal parsing (unterminated input is a ParseError)
+//	ParseSExprInteractive(src string) — REPL-friendly (unterminated input becomes IncompleteError)
+//
+// In interactive mode, reaching EOF inside a construct (e.g., missing ')', ']', '}', 'end',
+// or RHS after an operator/unary) yields IncompleteError with a precise position.
+//
+// OUTPUT SHAPE (AST)
+// ------------------
+// The result is always a top-level block:
+//
+//	("block", expr1, expr2, ...)
+//
+// Node forms (tags) the parser emits:
+//
+// Literals & identifiers:
+//
+//	("id",   name)           // identifiers and builtin TYPE tokens (e.g., "Int") used as names
+//	("int",  int64)
+//	("num",  float64)
+//	("str",  string)
+//	("bool", bool)
+//	("null")
+//
+// Unary/postfix:
+//
+//	("unop", "-",   expr)    // prefix minus
+//	("unop", "not", expr)    // logical not
+//	("unop", "?",   expr)    // postfix optional operator
+//
+// Calls / property / indexing:
+//
+//	("call", callee, arg1, arg2, ...)
+//	("idx",  object, indexExpr)                // obj[expr] or obj.<integer> or obj.(expr)
+//	("get",  object, ("str", propertyName))    // obj.<id> or obj."string"
+//
+// Arrays & maps:
+//
+//	("array", elements...)
+//	("map", ("pair",  keyStrExpr, valueExpr)*)
+//	("map", ("pair!", keyStrExpr, valueExpr)* ) // key marked required via '!' in literal (e.g., {name!: "x"})
+//
+// Enum sugar:
+//
+//	Enum[ e1, e2, ... ] → ("enum", e1, e2, ...)
+//
+// Functions & oracles:
+//
+//	fun (p1[: T], p2[: T], ...) [-> Ret] do ... end
+//	   → ("fun",   paramsArray, RetOr("id","Any"), bodyBlock)
+//	oracle (p1[: T], ...) [-> Out] [from SourceExpr]
+//	   → ("oracle", paramsArray, OutOr("id","Any"), SourceOr("array"))
+//
+// where paramsArray is ("array", ("pair", ("id", name), typeExpr), ...).
+//
+// Blocks and control:
+//
+//	do ... end                → ("block", ...)
+//	if cond then … elif … else … end
+//	   → ("if", ("pair", cond1, thenBlock1), ("pair", cond2, thenBlock2), [, elseBlock])
+//	for <target> in <iter> do ... end → ("for", target, iter, body)
+//	while cond do ... end             → ("while", cond, body)
+//
+// Return/break/continue (newline-sensitive):
+//
+//	If the next token is on the SAME line → take a following expression.
+//	Else (or at EOF)                      → implicit null.
+//	Examples:
+//	  return 1      → ("return", ("int", 1))
+//	  return\nx     → ("return", ("null"))
+//
+// Declaration patterns (used by `let` and `for` targets):
+//
+//	("decl", name)                        // let x
+//	("darr", p1, p2, ...)                 // let [a, b, ...]
+//	("dobj", ("pair", keyStrExpr, p), ...) // let {k: p, ...}
+//
+// Annotations may wrap the next pattern or expression:
+//
+//	("annot", ("str", text), node)
+//
+// Operators & precedence (higher binds tighter; '=' and '->' are right-assoc):
+//
+//	70: * / %
+//	60: + -
+//	50: < <= > >=
+//	40: == !=
+//	30: and
+//	20: or
+//	15: ->
+//	10: =
+//
+// '=' yields ("assign", target, value) and requires an assignable target: one of
+// "id", "get", "idx", "decl", "darr", "dobj".
+//
+// ERROR MODEL
+// -----------
+// • ParseError  — structural/grammar problems with location.
+// • IncompleteError (interactive mode) — source ended while a construct was incomplete.
+//
+// NOTE ON WHITESPACE RULE FOR CALLS/PARAM LISTS
+// -------------------------------------
+// The lexer classifies '(' and '[' based on *immediate* preceding whitespace:
+//
+//   - '('  → LROUND  if there IS preceding whitespace
+//     → CLROUND if there is NO preceding whitespace
+//   - '['  → LSQUARE if there IS preceding whitespace
+//     → CLSQUARE if there is NO preceding whitespace
+//
+// This distinction lets the parser treat juxtaposition forms as calls/indexing
+// without lookbehind, and treat spaced forms as grouping/array literals.
+//
+// Consequences (important user-facing syntax):
+//
+//   - Calls and parameter lists require NO space before '(':
+//     f(x)         // call: CLROUND
+//     fun(x: T)    // function params: CLROUND
+//     oracle(x: T) // oracle params: CLROUND
+//     Using a space changes the token to LROUND and will NOT be seen as a call.
+//     Example: "f (x)" parses as identifier 'f' followed by a grouped expression,
+//     not a function call.
+//
+//   - Indexing requires NO space before '[':
+//     arr[i]    // CLSQUARE (indexing)
+//     With a space ("arr [i]"), '[' becomes LSQUARE and is NOT treated as indexing.
+//
+//   - Plain grouping still works with both LROUND/CLROUND:
+//     (expr)   // grouping
+//     but only CLROUND participates in call/postfix chains.
+//
+// NOTE ON TOKENS & NEWLINES
+// -------------------------
+// The parser relies on token positions provided by the lexer. For newline-sensitive
+// behavior of return/break/continue, it checks whether the next token shares the same line.
+//
+// The complete behavior above is sufficient to consume this API without reading the
+// implementation details below.
+package mindscript
+
+import (
+	"fmt"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// S is the S-expression node representation used by the parser.
+// It is a []any whose first element is a string tag (e.g., "binop", "id", "array").
+// Subsequent elements are the node’s children or data.
+//
+// Common node forms (non-exhaustive):
+//
+//	("block", n1, n2, ...)
+//	("id",   name)            // string name
+//	("int",  int64)
+//	("num",  float64)
+//	("str",  string)
+//	("bool", bool)
+//	("null")
+//	("unop", op, rhs)         // op is string: "-", "not", "?"
+//	("binop", op, lhs, rhs)   // op is string: "+", "and", "==", ...
+//	("assign", target, value) // "="
+//	("call", callee, arg...)
+//	("get",  obj, ("str", name))
+//	("idx",  obj, indexExpr)
+//	("array", ...)
+//	("map", ("pair",  keyStrExpr, value)*)
+//	("map", ("pair!", keyStrExpr, value)*)
+//	("enum", ...)
+//	("fun", paramsArray, retTypeExprOrAny, bodyBlock)
+//	("oracle", paramsArray, outTypeExprOrAny, sourceExprOrEmptyArray)
+//	("if", ("pair", cond, thenBlock)* [, elseBlock])
+//	("while", cond, bodyBlock)
+//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//	("decl", name) | ("darr", ...) | ("dobj", ("pair", keyStrExpr, pat)*)
+//	("annot", ("str", text), wrappedNode)
+type S = []any
+
+// L is a small helper to build S-expression nodes. The first argument is the
+// string tag; the remaining arguments are appended as children.
+func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
+
+// ParseError reports a non-interactive parse failure with a location.
+// Typical causes: unexpected tokens, missing delimiters, invalid assignment target.
+type ParseError struct {
+	Line, Col int
+	Msg       string
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("PARSE ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
+}
+
+// ParseSExpr parses a MindScript source string into an S-expression AST.
+// It lexes the source using NewLexer (normal mode) and parses according to the
+// grammar summarized in the file header comments.
+//
+// Returns:
+//   - S  — a top-level ("block", ...) node.
+//   - error — *ParseError on grammar problems, or lexer errors propagated.
+//
+// Newline-sensitive control:
+//
+//	return/break/continue take an expression only if the next token is on the same line;
+//	otherwise they default to ("null").
+//
+// Property/index/call chaining:
+//   - Calls:           f(args...)             → ("call", f, args...)
+//   - Index:           a[b]                   → ("idx", a, b)
+//   - Computed dot:    a.(expr)               → ("idx", a, expr)
+//   - Numeric dot:     a.42                   → ("idx", a, ("int", 42))
+//   - Named property:  a.name / a."name"      → ("get", a, ("str", "name"))
+//
+// Operators:
+//
+//	Precedence and associativity are as listed in the header; "=" and "->" are right-assoc.
+//	"=" yields ("assign", target, value) and requires assignable targets.
+func ParseSExpr(src string) (S, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks}
+	return p.program()
+}
+
+// ParseSExprWithSpans parses `src` into an S-expression AST and also returns a
+// SpanIndex mapping each node (addressed by NodePath) to its source byte span.
+//
+// Behavior:
+//   - The AST is identical to ParseSExpr (stable contract).
+//   - Spans are recorded in post-order (children before parent).
+//   - Spans are half-open byte intervals [StartByte, EndByte) in `src`.
+//   - The top-level ("block", ...) is included.
+//
+// Errors mirror ParseSExpr; lexer errors and parse errors are propagated unchanged.
+func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, nil, err
+	}
+	p := &parser{toks: toks}
+	ast, err := p.program()
+	if err != nil {
+		return nil, nil, err
+	}
+	idx := BuildSpanIndexPostOrder(ast, p.post) // sidecar index (spans.go)
+	return ast, idx, nil
+}
+
+// ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
+// and returns *IncompleteError when the input ends mid-construct (e.g., missing
+// ')', ']', '}', 'end', or the RHS of an operator/unary).
+//
+// Use IsIncomplete(err) to detect this case in a REPL and request more input.
+func ParseSExprInteractive(src string) (S, error) {
+	lex := NewLexerInteractive(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, interactive: true}
+	return p.program()
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                           PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// Pratt parser state
+type parser struct {
+	toks        []Token
+	i           int
+	interactive bool
+	post        []Span
+}
+
+// tokString returns a stable string for tokens used as identifier-like or key names.
+// It prefers Literal when it is a string (e.g., STRING tokens after '.' keep decoded text),
+// otherwise falls back to the verbatim Lexeme.
+func tokString(t Token) string {
+	if s, ok := t.Literal.(string); ok {
+		return s
+	}
+	return t.Lexeme
+}
+
+func (p *parser) atEnd() bool { return p.peek().Type == EOF }
+func (p *parser) peek() Token {
+	if p.i >= len(p.toks) {
+		return p.toks[len(p.toks)-1]
+	}
+	return p.toks[p.i]
+}
+func (p *parser) prev() Token { return p.toks[p.i-1] }
+func (p *parser) match(tt ...TokenType) bool {
+	if p.atEnd() {
+		return false
+	}
+	for _, t := range tt {
+		if p.peek().Type == t {
+			p.i++
+			return true
+		}
+	}
+	return false
+}
+func (p *parser) need(t TokenType, msg string) (Token, error) {
+	if p.match(t) {
+		return p.prev(), nil
+	}
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return Token{}, &IncompleteError{Line: g.Line, Col: g.Col, Msg: msg}
+	}
+	return Token{}, &ParseError{Line: g.Line, Col: g.Col, Msg: msg}
+}
+
+func (p *parser) nextTokenIsOnSameLine(as Token) bool {
+	if p.atEnd() {
+		return false
+	}
+	return p.peek().Line == as.Line
+}
+
+// precedence (higher binds tighter)
+func lbp(t TokenType) (int, bool) {
+	switch t {
+	case ARROW:
+		return 15, true // low precedence, right-assoc
+	case MULT, DIV, MOD:
+		return 70, true
+	case PLUS, MINUS:
+		return 60, true
+	case LESS, LESS_EQ, GREATER, GREATER_EQ:
+		return 50, true
+	case EQ, NEQ:
+		return 40, true
+	case AND:
+		return 30, true
+	case OR:
+		return 20, true
+	case ASSIGN: // '=' right-assoc
+		return 10, true
+	}
+	return 0, false
+}
+
+func (p *parser) program() (S, error) {
+	var items []any
+	for !p.atEnd() {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, e)
+	}
+	root := L("block", items...)
+	// Append span for the top-level block: cover all non-EOF tokens.
+	// If there are no tokens besides EOF, leave span empty (Start=End=0).
+	startTok := 0
+	endTok := len(p.toks) - 2 // last non-EOF
+	if endTok >= startTok && len(p.toks) > 0 {
+		p.post = append(p.post, Span{
+			StartByte: p.toks[startTok].StartByte,
+			EndByte:   p.toks[endTok].EndByte,
+		})
+	} else {
+		p.post = append(p.post, Span{})
+	}
+	return root, nil
+}
+
+func (p *parser) expr(minBP int) (S, error) {
+	// Record the token index at which this expression starts.
+	nodeStartTok := p.i
+	// ---- prefix ----
+	t := p.peek()
+	p.i++
+	var left S
+	switch t.Type {
+	case ID, TYPE:
+		// Identifiers and capitalized built-in types behave the same in expressions.
+		left = L("id", tokString(t))
+
+	case ENUM:
+		// Enum[ ... ] sugar → ("enum", ...)
+		if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
+			p.i++
+			arr, err := p.arrayLiteralAfterOpen()
+			if err != nil {
+				return nil, err
+			}
+			it := make([]any, 0, len(arr)-1)
+			for i := 1; i < len(arr); i++ {
+				it = append(it, arr[i])
+			}
+			left = L("enum", it...)
+		} else {
+			left = L("id", tokString(t))
+		}
+
+	case INTEGER:
+		left = L("int", t.Literal)
+	case NUMBER:
+		left = L("num", t.Literal)
+	case STRING:
+		left = L("str", t.Literal)
+	case BOOLEAN:
+		left = L("bool", t.Literal)
+	case NULL:
+		left = L("null")
+
+	case MINUS, NOT:
+		// unary operators require a RHS expression
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after unary operator"}
+		}
+		r, err := p.expr(80)
+		if err != nil {
+			return nil, err
+		}
+		left = L("unop", t.Lexeme, r)
+
+	case LROUND, CLROUND:
+		inner, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.need(RROUND, "expected ')'"); err != nil {
+			return nil, err
+		}
+		left = inner
+
+	case LSQUARE, CLSQUARE:
+		a, err := p.arrayLiteralAfterOpen()
+		if err != nil {
+			return nil, err
+		}
+		left = a
+
+	case LCURLY:
+		// map literal {k: v, ...} where k is id or string; id may have trailing '!' for required
+		if p.match(RCURLY) {
+			left = L("map")
+		} else {
+			var pairs []any
+			for {
+				k, req, err := p.keyRequired()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+					return nil, err
+				}
+				v, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				tag := "pair"
+				if req {
+					tag = "pair!"
+				}
+				pairs = append(pairs, L(tag, k, v))
+				if !p.match(COMMA) {
+					break
+				}
+			}
+			if _, err := p.need(RCURLY, "expected '}'"); err != nil {
+				return nil, err
+			}
+			left = L("map", pairs...)
+		}
+
+	case FUNCTION:
+		params, err := p.params()
+		if err != nil {
+			return nil, err
+		}
+		var ret any = L("id", "Any")
+		if p.match(ARROW) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected return type after '->'"}
+			}
+			r, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			ret = r
+		}
+		body, err := p.parseBlock(true) // require 'do'
+		if err != nil {
+			return nil, err
+		}
+		left = L("fun", params, ret, body)
+
+	case ORACLE:
+		params, err := p.params()
+		if err != nil {
+			return nil, err
+		}
+		var out any = L("id", "Any")
+		if p.match(ARROW) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected output type after '->'"}
+			}
+			o, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			out = o
+		}
+		// accept any expression after `from`
+		var src any = L("array")
+		if p.match(FROM) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after 'from'"}
+			}
+			ex, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			src = ex
+		}
+		left = L("oracle", params, out, src)
+
+	case RETURN, BREAK, CONTINUE:
+		// Newline-sensitive behavior; see file header.
+		if !p.nextTokenIsOnSameLine(t) {
+			switch t.Type {
+			case RETURN:
+				left = L("return", L("null"))
+			case BREAK:
+				left = L("break", L("null"))
+			default:
+				left = L("continue", L("null"))
+			}
+		} else {
+			x, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			switch t.Type {
+			case RETURN:
+				left = L("return", x)
+			case BREAK:
+				left = L("break", x)
+			default:
+				left = L("continue", x)
+			}
+		}
+
+	case IF:
+		thenIf, err := p.ifExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = thenIf
+
+	case DO:
+		// do ... end
+		body, err := p.parseBlock(false) // 'do' already consumed
+		if err != nil {
+			return nil, err
+		}
+		left = body
+
+	case FOR:
+		f, err := p.forExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = f
+
+	case WHILE:
+		w, err := p.whileExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = w
+
+	case LET:
+		pat, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		left = pat
+		if tag, _ := pat[0].(string); tag == "darr" || tag == "dobj" {
+			if p.peek().Type != ASSIGN {
+				g := p.peek()
+				// If input ended, mark as incomplete
+				if p.interactive && g.Type == EOF {
+					return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
+				}
+				return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
+			}
+		}
+
+	case TYPECONS: // "type" <expr>
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected type expression after 'type'"}
+		}
+		x, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		left = L("type", x)
+
+	case ANNOTATION:
+		// wrap next expression
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
+		}
+		x, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		txt := ""
+		if s, ok := t.Literal.(string); ok {
+			txt = s
+		}
+		left = L("annot", L("str", txt), x)
+
+	default:
+		if t.Type == EOF && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "unexpected end of input"}
+		}
+		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme)}
 	}
 
-	root := mustMap(t, out)
-
-	// Root description from Value-level annotation
-	if desc := root.Entries["description"]; desc.Tag != VTStr || desc.Data.(string) != "Type describing a person" {
-		t.Fatalf("root description mismatch: %v", desc)
+	// ---- postfix chain: call (), index [], get . ----
+	for {
+		switch p.peek().Type {
+		case QUESTION:
+			p.i++
+			left = L("unop", "?", left)
+			continue
+		case CLROUND:
+			p.i++
+			var args []any
+			if !p.match(RROUND) {
+				for {
+					a, err := p.expr(0)
+					if err != nil {
+						return nil, err
+					}
+					args = append(args, a)
+					if !p.match(COMMA) {
+						break
+					}
+				}
+				if _, err := p.need(RROUND, "expected ')'"); err != nil {
+					return nil, err
+				}
+			}
+			left = L("call", append([]any{left}, args...)...)
+			continue
+		case CLSQUARE:
+			p.i++
+			idx, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
+				return nil, err
+			}
+			left = L("idx", left, idx)
+			continue
+		case PERIOD:
+			p.i++
+			// obj.(EXPR) → idx(obj, EXPR)
+			if p.match(LROUND) || p.match(CLROUND) {
+				ex, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.need(RROUND, "expected ')' after computed property"); err != nil {
+					return nil, err
+				}
+				left = L("idx", left, ex)
+				continue
+			}
+			if p.match(INTEGER) { // obj.90 → idx(obj, 90)
+				left = L("idx", left, L("int", p.prev().Literal))
+				continue
+			}
+			if p.match(ID) || p.match(STRING) {
+				left = L("get", left, L("str", tokString(p.prev())))
+				continue
+			}
+			g := p.peek()
+			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected property name, integer, or '(expr)' after '.'"}
+		}
+		break
 	}
 
-	propsV, ok := mget(root, "properties")
-	if !ok {
-		t.Fatalf("properties missing")
-	}
-	props := mustMap(t, propsV)
+	// ---- infix ops ----
+	for {
+		op := p.peek()
+		bp, ok := lbp(op.Type)
+		if !ok || bp < minBP {
+			break
+		}
+		p.i++
 
-	// name property
-	nameV, ok := mget(props, "name")
-	if !ok {
-		t.Fatalf("name property missing")
-	}
-	name := mustMap(t, nameV)
+		nextBP := bp + 1
+		if op.Type == ASSIGN || op.Type == ARROW { // right-assoc
+			nextBP = bp
+		}
 
-	if typ, ok := mget(name, "type"); !ok || typ.Tag != VTStr || typ.Data.(string) != "string" {
-		t.Fatalf("name.type mismatch: %v", typ)
-	}
-	if d, ok := mget(name, "description"); !ok || d.Tag != VTStr || d.Data.(string) != "the name" {
-		t.Fatalf("name.description mismatch: %v", d)
-	}
+		if op.Type == ASSIGN && !assignable(left) {
+			return nil, &ParseError{Line: op.Line, Col: op.Col, Msg: "invalid assignment target"}
+		}
 
-	// avail property
-	availV, ok := mget(props, "avail")
-	if !ok {
-		t.Fatalf("avail property missing")
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: op.Line, Col: op.Col, Msg: "expected expression after operator"}
+		}
+		right, err := p.expr(nextBP)
+		if err != nil {
+			return nil, err
+		}
+		if op.Type == ASSIGN {
+			left = L("assign", left, right)
+		} else {
+			left = L("binop", op.Lexeme, left, right)
+		}
 	}
-	avail := mustMap(t, availV)
-	if d, ok := mget(avail, "description"); !ok || d.Tag != VTStr || d.Data.(string) != "availability" {
-		t.Fatalf("avail.description mismatch: %v", d)
+	// On completion of this node, append its span (post-order).
+	// Use tokens[nodeStartTok ... p.i-1].
+	if p.i-1 >= nodeStartTok && nodeStartTok < len(p.toks) {
+		endTok := p.i - 1
+		// Guard against EOF being the only thing consumed (shouldn't happen).
+		if endTok >= 0 && endTok < len(p.toks) {
+			p.post = append(p.post, Span{
+				StartByte: p.toks[nodeStartTok].StartByte,
+				EndByte:   p.toks[endTok].EndByte,
+			})
+		} else {
+			p.post = append(p.post, Span{})
+		}
+	} else {
+		p.post = append(p.post, Span{})
 	}
-	if ev, ok := mget(avail, "enum"); !ok || ev.Tag != VTArray {
-		t.Fatalf("avail.enum missing or wrong type: %v", ev)
-	}
+	return left, nil
+}
 
-	// required contains "name"
-	reqV, ok := mget(root, "required")
-	if !ok || reqV.Tag != VTArray {
-		t.Fatalf("required missing or wrong type: %v", reqV)
+// ---------- helpers ----------
+
+func (p *parser) arrayLiteralAfterOpen() (S, error) {
+	// We’ve already consumed the opening '['
+	if p.match(RSQUARE) {
+		return L("array"), nil
 	}
-	found := false
-	for _, it := range reqV.Data.([]Value) {
-		if it.Tag == VTStr && it.Data.(string) == "name" {
-			found = true
+	var elems []any
+	for {
+		it, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, it)
+		if !p.match(COMMA) {
 			break
 		}
 	}
-	if !found {
-		t.Fatalf(`"name" not found in required: %v`, reqV)
+	if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
+		return nil, err
 	}
+	return L("array", elems...), nil
 }
 
-// Builtin: typeStringToJSONSchema — end-to-end parse→convert
-func Test_RT_TypeStringToJSONSchema_Convenience(t *testing.T) {
-	ip := NewRuntime()
-
-	src := `
-		typeStringToJSONSchema("# the doc\n{ name!: Str, age: Int? }")
-	`
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
+func (p *parser) params() (S, error) {
+	if _, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
+		return nil, err
 	}
-	root := mustMap(t, out)
-
-	// Root description preserved
-	if d, ok := mget(root, "description"); !ok || d.Tag != VTStr || d.Data.(string) != "the doc" {
-		t.Fatalf("root description mismatch: %v", d)
+	if p.match(RROUND) {
+		return L("array"), nil
 	}
-
-	props := mustMap(t, root.Entries["properties"])
-	// name is required string
-	name := mustMap(t, props.Entries["name"])
-	if typ := name.Entries["type"]; typ.Tag != VTStr || typ.Data.(string) != "string" {
-		t.Fatalf("name.type mismatch: %v", typ)
-	}
-	// age is nullable integer → allow either anyOf or ["integer","null"]
-	age := mustMap(t, props.Entries["age"])
-	if _, ok := age.Entries["anyOf"]; !ok {
-		if tv, ok2 := age.Entries["type"]; !(ok2 && tv.Tag == VTArray) {
-			t.Fatalf("age should be nullable pattern; got %v", age)
+	var ps []any
+	for {
+		idTok, err := p.need(ID, "expected parameter name")
+		if err != nil {
+			return nil, err
 		}
-	}
-}
-
-// Builtin: jsonSchemaStringToType — end-to-end parse→convert
-func Test_RT_JSONSchemaStringToType_Convenience(t *testing.T) {
-	ip := NewRuntime()
-	out, err := ip.EvalSource(`jsonSchemaStringToType("{\"type\":\"array\",\"items\":{\"type\":\"number\"}}")`)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
-	}
-	if out.Tag != VTType {
-		t.Fatalf("expected Type; got %v", out.Tag)
-	}
-	if got := strings.TrimSpace(FormatValue(out)); got != "[Num]" {
-		t.Fatalf("expected [Num]; got %q", got)
-	}
-}
-
-// Builtin: typeToJSONSchema — aliases produce $defs + $ref
-func Test_RT_TypeToJSONSchema_WithAliasAndDefs(t *testing.T) {
-	ip := NewRuntime()
-
-	// Person references itself via a nullable field, forcing $defs + $ref.
-	src := `
-		let Person = type {
-			name!: Str,
-			friend: Person?
-		}
-		typeToJSONSchema(Person)
-	`
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
-	}
-	root := mustMap(t, out)
-
-	// Expect $defs.Person and properties.friend referencing it with nullability
-	defsV, ok := mget(root, "$defs")
-	if !ok {
-		t.Fatalf("$defs missing")
-	}
-	defs := mustMap(t, defsV)
-	if _, ok := defs.Entries["Person"]; !ok {
-		t.Fatalf("$defs.Person missing")
-	}
-
-	props := mustMap(t, root.Entries["properties"])
-	friend := mustMap(t, props.Entries["friend"])
-
-	// Should be anyOf: [{$ref...}, {"type":"null"}]
-	anyOf, ok := friend.Entries["anyOf"]
-	if !ok || anyOf.Tag != VTArray {
-		t.Fatalf("friend should be nullable anyOf with $ref: %v", friend)
-	}
-	branches := anyOf.Data.([]Value)
-	if len(branches) != 2 {
-		t.Fatalf("expected two anyOf branches; got %d", len(branches))
-	}
-	refObj := mustMap(t, branches[0])
-	if ref, ok := refObj.Entries["$ref"]; !ok || ref.Tag != VTStr || ref.Data.(string) == "" {
-		t.Fatalf("missing $ref in first anyOf branch: %v", refObj)
-	}
-}
-
-// Roundtrip: JSON with $defs/$ref -> Type -> JSON, preserve $defs + description
-func Test_RT_Roundtrip_JSON_WithDefsAndRefs(t *testing.T) {
-	ip := NewRuntime()
-
-	src := `
-		let schema = {
-			description: "root doc",
-			type: "object",
-			properties: {
-				person: {
-					anyOf: [
-						{ "$ref": "#/$defs/Person" },
-						{ type: "null" }
-					]
-				}
-			},
-			"$defs": {
-				Person: {
-					type: "object",
-					properties: { name: { type: "string" } },
-					required: ["name"]
-				}
+		var t any = L("id", "Any")
+		if p.match(COLON) {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: idTok.Line, Col: idTok.Col, Msg: "expected type after ':'"}
 			}
+			e, err := p.expr(0) // parse type as expression
+			if err != nil {
+				return nil, err
+			}
+			t = e
 		}
-		let T = jsonSchemaToType(schema)
-		typeToJSONSchema(T)
-	`
-	out, err := ip.EvalSource(src)
+		ps = append(ps, L("pair", L("id", tokString(idTok)), t))
+		if !p.match(COMMA) {
+			break
+		}
+	}
+	if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
+		return nil, err
+	}
+	return L("array", ps...), nil
+}
+
+// ifExpr builds: ("if", ("pair", cond1, thenBlk1), ("pair", cond2, thenBlk2), ..., [elseBlk?])
+// NOTE: The final element, if present, is a bare ("block", ...) for 'else', not wrapped in a tag.
+func (p *parser) ifExpr() (S, error) {
+	cond, err := p.expr(0)
 	if err != nil {
-		t.Fatalf("Eval error: %v", err)
+		return nil, err
 	}
-	root := mustMap(t, out)
+	if _, err := p.need(THEN, "expected 'then'"); err != nil {
+		return nil, err
+	}
+	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
+	if err != nil {
+		return nil, err
+	}
+	arms := []any{L("pair", cond, thenBlk)}
+	for p.match(ELIF) {
+		c, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.need(THEN, "expected 'then'"); err != nil {
+			return nil, err
+		}
+		b, err := p.blockUntil(END, ELIF, ELSE)
+		if err != nil {
+			return nil, err
+		}
+		arms = append(arms, L("pair", c, b))
+	}
+	var elseTail []any
+	if p.match(ELSE) {
+		b, err := p.blockUntil(END)
+		if err != nil {
+			return nil, err
+		}
+		elseTail = []any{b}
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return L("if", append(arms, elseTail...)...), nil
+}
 
-	// root description should survive
-	if d, ok := mget(root, "description"); !ok || d.Tag != VTStr || d.Data.(string) != "root doc" {
-		t.Fatalf("root description mismatch: %v", d)
+// Parse a block; if requireDo is true, assert a leading 'do'.
+// Always requires a trailing 'end'.
+func (p *parser) parseBlock(requireDo bool) (S, error) {
+	if requireDo {
+		if _, err := p.need(DO, "expected 'do'"); err != nil {
+			return nil, err
+		}
+	}
+	b, err := p.blockUntil(END)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func (p *parser) blockUntil(stops ...TokenType) (S, error) {
+	stop := map[TokenType]bool{}
+	for _, s := range stops {
+		stop[s] = true
+	}
+	var items []any
+	for !p.atEnd() && !stop[p.peek().Type] {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, e)
+	}
+	return L("block", items...), nil
+}
+
+func (p *parser) forExpr() (S, error) {
+	// for <target> in <expr> do ... end
+	tgt, err := p.forTarget()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(IN, "expected 'in'"); err != nil {
+		return nil, err
+	}
+	iter, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	return L("for", tgt, iter, body), nil
+}
+
+func (p *parser) whileExpr() (S, error) {
+	// while COND do ... end
+	cond, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	return L("while", cond, body), nil
+}
+
+func (p *parser) forTarget() (S, error) {
+	// Allow explicit `let <pattern>`
+	if p.match(LET) {
+		return p.declPattern()
 	}
 
-	// $defs.Person present after roundtrip
-	defs, ok := mget(root, "$defs")
-	if !ok || defs.Tag != VTMap {
-		t.Fatalf("$defs missing after roundtrip")
+	// If the next token clearly starts a pattern, parse a *declaration* pattern
+	// (implicit binding) just like Python: `for [k, v] in ...` or `for {k:x} in ...`.
+	switch p.peek().Type {
+	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
+		save := p.i
+		pt, err := p.declPattern()
+		if err == nil {
+			return pt, nil // e.g., ("darr", ...), ("dobj", ...)
+		}
+		// In interactive mode, bubble up incompleteness instead of falling back
+		if p.interactive && IsIncomplete(err) {
+			return nil, err
+		}
+		p.i = save // fall back below if pattern parse fails
 	}
-	if _, ok := defs.Data.(*MapObject).Entries["Person"]; !ok {
-		t.Fatalf("$defs.Person missing after roundtrip")
+
+	// Otherwise, parse a simple prim+postfix expression and require it's assignable
+	save := p.i
+	e, err := p.expr(90)
+	if err != nil {
+		return nil, err
+	}
+	if !assignable(e) {
+		p.i = save
+		g := p.peek()
+		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "invalid for-target (must be id/get/idx/decl/pattern)"}
+	}
+
+	// Bare id → implicit declaration, same as before
+	if e[0].(string) == "id" {
+		return L("decl", e[1].(string)), nil
+	}
+	return e, nil
+}
+
+func assignable(n S) bool {
+	if len(n) == 0 {
+		return false
+	}
+	switch n[0] {
+	case "id", "get", "idx", "decl", "darr", "dobj":
+		return true
+	default:
+		return false
 	}
 }
 
-// Error paths: bad inputs handled by builtins
+// ----- Declaration patterns (with annotation wrapper) -----
 
-func Test_RT_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+func (p *parser) declPattern() (S, error) {
+	// Allow stacked line-leading annotations to wrap the next pattern.
+	if anns := p.consumeAnnotations(); len(anns) > 0 {
+		sub, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		return p.wrapWithAnnotations(anns, sub), nil
+	}
 
-	// Intentionally malformed type text (unterminated object)
-	src := `typeStringToJSONSchema("{ name!: Str, ")`
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
+	if p.match(ID) {
+		return L("decl", tokString(p.prev())), nil
 	}
-	if out.Tag != VTNull || out.Annot == "" {
-		t.Fatalf("expected annotated null error; got Tag=%v Annot=%q", out.Tag, out.Annot)
+	if p.match(LSQUARE, CLSQUARE) {
+		return p.arrayDeclPattern()
 	}
+	if p.match(LCURLY) {
+		return p.objectDeclPattern()
+	}
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
+	}
+	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
 }
 
-func Test_RT_JSONSchemaStringToType_BadJSON_YieldsAnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
-
-	src := `jsonSchemaStringToType("{ invalid json }")`
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
+func (p *parser) arrayDeclPattern() (S, error) {
+	if p.match(RSQUARE) {
+		return L("darr"), nil
 	}
-	if out.Tag != VTNull || out.Annot == "" {
-		t.Fatalf("expected annotated null error; got Tag=%v Annot=%q", out.Tag, out.Annot)
+	var parts []any
+	for {
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, pt)
+		if !p.match(COMMA) {
+			break
+		}
 	}
+	if _, err := p.need(RSQUARE, "expected ']' in array pattern"); err != nil {
+		return nil, err
+	}
+	return L("darr", parts...), nil
 }
 
-func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
-	ip := NewRuntime()
+// read a key token and turn it into ("str", key)
+func (p *parser) readKeyString() (S, error) {
+	// Allow stacked annotation(s) directly in front of the key.
+	if anns := p.consumeAnnotations(); len(anns) > 0 {
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		return p.wrapWithAnnotations(anns, k), nil
+	}
 
-	out, err := ip.EvalSource(`jsonSchemaToType("not an object")`)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
+	// Quoted key.
+	if p.match(STRING) {
+		return L("str", p.prev().Literal), nil
 	}
-	if out.Tag != VTType || strings.TrimSpace(FormatValue(out)) != "Any" {
-		t.Fatalf("expected Any; got %v", FormatValue(out))
+
+	// Any word-like token (identifier, builtin TYPE, keywords, true/false/null).
+	t := p.peek()
+	if isWordLike(t.Type) {
+		p.i++
+		name := t.Lexeme
+		if s, ok := t.Literal.(string); ok { // ID/TYPE/ENUM may carry string Literal
+			name = s
+		}
+		return L("str", name), nil
 	}
+
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected key"}
+	}
+	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected key"}
 }
 
-func Test_RT_BaseType_StripsNullable_AndResolvesAliases(t *testing.T) {
-	ip := NewRuntime()
-	src := `let T = type Int?
-	baseType(T)
-	`
-	// Define alias persistently
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("setup error: %v", err)
+// isWordLike reports tokens that can stand in for bare string keys.
+func isWordLike(tt TokenType) bool {
+	switch tt {
+	case ID, TYPE, ENUM, BOOLEAN, NULL,
+		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
+		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
+		TYPECONS:
+		return true
 	}
-
-	// baseType(T) -> Int
-	if out.Tag != VTType {
-		t.Fatalf("want VTType, got %#v", FormatValue(out))
-	}
-	tv := out.Data.(*TypeValue)
-	if !equalS(tv.Ast, typeS(t, ip, `Int`)) {
-		t.Fatalf("baseType failed, got %#v", tv.Ast)
-	}
+	return false
 }
-=== END FILE: runtime_test.go ===
+
+func (p *parser) keyRequired() (key S, required bool, err error) {
+	k, err := p.readKeyString()
+	if err != nil {
+		return nil, false, err
+	}
+	req := p.match(BANG)
+	return k, req, nil
+}
+
+func (p *parser) objectDeclPattern() (S, error) {
+	if p.match(RCURLY) {
+		return L("dobj"), nil
+	}
+	var pairs []any
+	for {
+		key, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
+			return nil, err
+		}
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, L("pair", key, pt))
+		if !p.match(COMMA) {
+			break
+		}
+	}
+	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
+		return nil, err
+	}
+	return L("dobj", pairs...), nil
+}
+
+// --- small helpers for annotations ---
+func (p *parser) consumeAnnotations() []string {
+	var texts []string
+	for p.match(ANNOTATION) {
+		txt := ""
+		if s, ok := p.prev().Literal.(string); ok {
+			txt = s
+		}
+		texts = append(texts, txt)
+	}
+	return texts
+}
+
+func (p *parser) wrapWithAnnotations(texts []string, node S) S {
+	// Outer to inner: the first annotation encountered should wrap outermost,
+	// so we apply in reverse to keep order intuitive for stacked blocks.
+	for i := len(texts) - 1; i >= 0; i-- {
+		node = L("annot", L("str", texts[i]), node)
+	}
+	return node
+}
+=== END FILE: parser.go ===
 

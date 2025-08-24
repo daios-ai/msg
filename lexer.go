@@ -222,6 +222,7 @@ const (
 
 	// Annotation token (from lines starting with '#')
 	ANNOTATION
+	NOOP
 )
 
 // Token is a single lexical unit produced by the lexer.
@@ -483,11 +484,11 @@ func (l *Lexer) previousToken() *Token {
 	return &l.tokens[len(l.tokens)-1]
 }
 
-func (l *Lexer) skipWhitespace() {
+func (l *Lexer) skipHorizontalWhitespace() {
 	for !l.isAtEnd() {
 		ch, _ := l.peek()
 		switch ch {
-		case ' ', '\r', '\n', '\t':
+		case ' ', '\t', '\r':
 			l.advance()
 			l.start = l.cur
 		default:
@@ -944,6 +945,56 @@ func (l *Lexer) handleSingleHash() (bool, string, error) {
 	return true, annot, nil
 }
 
+// scanNoopIfPresent emits a NOOP token if the source at the current position
+// matches: '\n' ( hws* '\n' )+  where hws ∈ {' ', '\r', '\t'}.
+// On success, it advances the cursor and returns (token, true).
+// On failure, it restores the cursor and returns (Token{}, false).
+func (l *Lexer) scanNoopIfPresent() (Token, bool) {
+	b, ok := l.peek()
+	if !ok || b != '\n' {
+		return Token{}, false
+	}
+
+	// Snapshot so we can roll back on non-match (i.e., if we don't see at least one repetition).
+	saveCur, saveLine, saveCol, saveStart := l.cur, l.line, l.col, l.start
+
+	// Token starts here.
+	l.tokStartLine = l.line
+	l.tokStartCol = l.col
+	l.start = l.cur
+
+	// Consume the initial newline.
+	l.advance()
+
+	matchedReps := 0
+	for {
+		// Consume zero or more horizontal whitespace chars.
+		for {
+			nb, ok := l.peek()
+			if !ok || (nb != ' ' && nb != '\t' && nb != '\r') {
+				break
+			}
+			l.advance()
+		}
+		// Require a newline to complete one (hws* '\n') repetition.
+		nb, ok := l.peek()
+		if ok && nb == '\n' {
+			l.advance()
+			matchedReps++
+			continue
+		}
+		break
+	}
+
+	if matchedReps >= 1 {
+		return l.addToken(NOOP, nil), true
+	}
+
+	// Not a full match: restore and report no-op not present.
+	l.cur, l.line, l.col, l.start = saveCur, saveLine, saveCol, saveStart
+	return Token{}, false
+}
+
 // --- misc helpers ---
 
 func (l *Lexer) dotStartsNumber() bool {
@@ -962,13 +1013,24 @@ func (l *Lexer) dotStartsNumber() bool {
 
 func (l *Lexer) scanToken() (Token, error) {
 	for {
-		l.skipWhitespace()
+		l.skipHorizontalWhitespace()
 		l.tokStartLine = l.line
 		l.tokStartCol = l.col
 		l.start = l.cur
 
 		if l.isAtEnd() {
 			return l.addToken(EOF, nil), nil
+		}
+
+		// No-op (blank lines)
+		if b, _ := l.peek(); b == '\n' {
+			if tok, ok := l.scanNoopIfPresent(); ok {
+				return tok, nil
+			}
+			// Lone newline (or newline followed by non-hws) → skip it as whitespace and loop.
+			l.advance()
+			l.start = l.cur
+			continue
 		}
 
 		ch, _ := l.advance()

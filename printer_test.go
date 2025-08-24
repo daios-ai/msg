@@ -288,6 +288,7 @@ func Test_Printer_Annotations_TwoSeparateBlocks(t *testing.T) {
 x`
 	// Two separate annotations should stay as two header lines.
 	want := `# a
+
 # b
 x`
 	got := pretty(t, in)

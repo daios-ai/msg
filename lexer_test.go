@@ -353,3 +353,59 @@ func Test_Lexer_BlockAnnotation_LeavesFinalNewline(t *testing.T) {
 		t.Fatalf("expected LET to start on line 3; got line %d", letTok.Line)
 	}
 }
+func Test_Lexer_NOOP_MultiBlankLines(t *testing.T) {
+	src := "let x=1\n   \n\t \nlet y=2"
+	got := wantTypes(t, src, []TokenType{
+		LET, ID, ASSIGN, INTEGER,
+		NOOP,
+		LET, ID, ASSIGN, INTEGER,
+	})
+
+	// Verify the NOOP lexeme exactly matches the whitespace run.
+	var noop *Token
+	for i := range got {
+		if got[i].Type == NOOP {
+			noop = &got[i]
+			break
+		}
+	}
+	if noop == nil {
+		t.Fatalf("expected a NOOP token, found none")
+	}
+	if noop.Lexeme != "\n   \n\t \n" {
+		t.Fatalf("NOOP lexeme mismatch:\nwant: %q\ngot:  %q", "\n   \n\t \n", noop.Lexeme)
+	}
+}
+
+func Test_Lexer_NOOP_SingleNewlineIgnored(t *testing.T) {
+	src := "let x=1\nlet y=2"
+	wantTypes(t, src, []TokenType{
+		LET, ID, ASSIGN, INTEGER,
+		LET, ID, ASSIGN, INTEGER,
+	})
+}
+
+func Test_Lexer_NOOP_AtStartAndEnd(t *testing.T) {
+	src := "\n\nlet x=1\n\n"
+	got := wantTypes(t, src, []TokenType{
+		NOOP,
+		LET, ID, ASSIGN, INTEGER,
+		NOOP,
+	})
+
+	// Expect exactly two NOOP tokens, each being "\n\n".
+	var noops []Token
+	for _, tk := range got {
+		if tk.Type == NOOP {
+			noops = append(noops, tk)
+		}
+	}
+	if len(noops) != 2 {
+		t.Fatalf("expected 2 NOOP tokens, got %d", len(noops))
+	}
+	for i, tk := range noops {
+		if tk.Lexeme != "\n\n" {
+			t.Fatalf("NOOP #%d lexeme mismatch: want %q, got %q", i+1, "\n\n", tk.Lexeme)
+		}
+	}
+}

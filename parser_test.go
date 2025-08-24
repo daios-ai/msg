@@ -1046,3 +1046,87 @@ func Test_Parser_ComputedDotIndex_Array(t *testing.T) {
 	wantTag(t, kid(lhs, 1), "binop") // ("+" ...)
 	wantTag(t, kid(assign, 1), "str")
 }
+
+func Test_Parser_Annotations_Noops_DoBlock(t *testing.T) {
+	src := `
+# annot 1
+# annot 2
+
+# annot 3
+do
+  let x
+  
+  # annot 4
+  # annot 5
+  lex y
+end
+`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+
+	// Top-level: two children:
+	// 1) ("annot", ("str","annot 1\nannot 2"), ("noop"))
+	// 2) ("annot", ("str","annot 3"), ("block", ...))
+	if len(root) != 1+2 {
+		t.Fatalf("want 2 top-level children, got %d\n%s", len(root)-1, dump(root))
+	}
+
+	// Child 0: annot 1+2 wrapping NOOP
+	ann12 := kid(root, 0)
+	wantTag(t, ann12, "annot")
+	ann12Text := kid(ann12, 0)
+	wantTag(t, ann12Text, "str")
+	if ann12Text[1].(string) != "annot 1\nannot 2" {
+		t.Fatalf("annot 1+2 text mismatch: %q", ann12Text[1])
+	}
+	no := kid(ann12, 1)
+	wantTag(t, no, "noop")
+
+	// Child 1: annot 3 wrapping the do-block
+	ann3 := kid(root, 1)
+	wantTag(t, ann3, "annot")
+	ann3Text := kid(ann3, 0)
+	wantTag(t, ann3Text, "str")
+	if ann3Text[1].(string) != "annot 3" {
+		t.Fatalf("annot 3 text mismatch: %q", ann3Text[1])
+	}
+	blk := kid(ann3, 1)
+	wantTag(t, blk, "block")
+
+	// Block must have 4 children:
+	//   0) ("decl","x")
+	//   1) ("noop")
+	//   2) ("annot", ("str","annot 4\nannot 5"), ("id","lex"))
+	//   3) ("id","y")
+	if len(blk) != 1+4 {
+		t.Fatalf("want 4 block children, got %d\n%s", len(blk)-1, dump(root))
+	}
+
+	declX := kid(blk, 0)
+	wantTag(t, declX, "decl")
+	if declX[1].(string) != "x" {
+		t.Fatalf("decl name mismatch: %q", declX[1])
+	}
+
+	no2 := kid(blk, 1)
+	wantTag(t, no2, "noop")
+
+	ann45 := kid(blk, 2)
+	wantTag(t, ann45, "annot")
+	ann45Text := kid(ann45, 0)
+	wantTag(t, ann45Text, "str")
+	if ann45Text[1].(string) != "annot 4\nannot 5" {
+		t.Fatalf("annot 4+5 text mismatch: %q", ann45Text[1])
+	}
+	wrappedLex := kid(ann45, 1)
+	wantTag(t, wrappedLex, "id")
+	if wrappedLex[1].(string) != "lex" {
+		t.Fatalf("wrapped id mismatch: %q", wrappedLex[1])
+	}
+
+	idY := kid(blk, 3)
+	wantTag(t, idY, "id")
+	if idY[1].(string) != "y" {
+		t.Fatalf("final id mismatch: %q", idY[1])
+	}
+}

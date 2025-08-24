@@ -159,7 +159,7 @@ const (
 	// Special
 	EOF TokenType = iota
 	ILLEGAL
-
+	TEST
 	// Punctuation
 	LROUND   // "(" when preceded by whitespace
 	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)

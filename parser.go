@@ -14,7 +14,6 @@ package mindscript
 
 import (
 	"fmt"
-	"strings"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -122,12 +121,6 @@ type parser struct {
 }
 
 // --- helpers for tokens / annotations classification ---
-
-// tokenIsInlineAnnotation reports whether this ANNOTATION token came from an inline "#(...)"
-// (as opposed to a multi-line block). The lexer leaves inline lexemes starting with "#(".
-func tokenIsInlineAnnotation(t Token) bool {
-	return strings.HasPrefix(t.Lexeme, "#(")
-}
 
 // tokenCanEndExpr is the "ENDER" predicate used for pre/post classification.
 // If the last same-line token before a '#' is one of these, the annotation is POST.
@@ -609,18 +602,6 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			left = L("annot", L("str", txt), left, false)
 
-			// Stacking ban for inline POST targeting the same left (no intervening non-annotation token).
-			// Do NOT rely on classifying the next annotation as POST (it may appear PRE by the rule),
-			// just ban a second inline annotation on the same line immediately after the first.
-			if !p.atEnd() {
-				next := p.peek()
-				if next.Type == ANNOTATION &&
-					tokenIsInlineAnnotation(a) &&
-					tokenIsInlineAnnotation(next) &&
-					next.Line == a.Line {
-					return nil, &ParseError{Line: next.Line, Col: next.Col, Msg: "multiple consecutive post-annotations"}
-				}
-			}
 			continue
 		}
 		break
@@ -918,8 +899,8 @@ func unwrapAnnots(n S) S {
 // ----- Declaration patterns (with pre-annotation wrapper) -----
 
 func (p *parser) declPattern() (S, error) {
-	// Allow stacked line-leading PRE annotations to wrap the next pattern,
-	// but disallow stacked *inline* "#(...)" that target the same pattern.
+	// Allow line-leading PRE annotations to wrap the next pattern;
+	// still disallow multiple consecutive PRE annotations.
 	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
 		return nil, err
 	} else if len(anns) > 0 {

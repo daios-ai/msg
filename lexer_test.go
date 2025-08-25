@@ -166,21 +166,6 @@ let x = 1
 	}
 }
 
-func Test_Lexer_Inline_Annotation_Paren(t *testing.T) {
-	src := `#(inline note) 1 + 2`
-	got := toks(t, src)
-	if len(got) < 4 {
-		t.Fatalf("too few tokens: %v", got)
-	}
-	if got[0].Type != ANNOTATION {
-		t.Fatalf("first token should be ANNOTATION, got %v", got[0].Type)
-	}
-	if strings.TrimSpace(got[0].Literal.(string)) != "inline note" {
-		t.Fatalf("wrong inline annotation text: %q", got[0].Literal)
-	}
-	// Next tokens should parse as 1 + 2: INTEGER PLUS INTEGER
-}
-
 func Test_Lexer_Strings_JSONEscapes_And_Unicode(t *testing.T) {
 	src := `"a\/b\n\u0041"  '# ok too'`
 	got := wantTypes(t, src, []TokenType{STRING, STRING})
@@ -268,19 +253,21 @@ func Test_Lexer_Object_Annotations_TokenFlow(t *testing.T) {
 	src := `{
 # the name
 name: "Raffaella",
-#(the age) age: 29,
-available: #(status) "yes"
+# the age
+age: 29,
+# status
+available: "yes"
 }`
 
 	ts := toks(t, src)
 	gotTypes := typesWithoutEOF(ts)
 
-	// Expected token *types* sequence (not positions of annotations)
+	// Expected token *types* sequence with line-leading (PRE) annotations
 	want := []TokenType{
 		LCURLY,
 		ANNOTATION, ID, COLON, STRING, COMMA,
 		ANNOTATION, ID, COLON, INTEGER, COMMA,
-		ID, COLON, ANNOTATION, STRING,
+		ANNOTATION, ID, COLON, STRING,
 		RCURLY,
 	}
 	if !reflect.DeepEqual(gotTypes, want) {
@@ -353,6 +340,7 @@ func Test_Lexer_BlockAnnotation_LeavesFinalNewline(t *testing.T) {
 		t.Fatalf("expected LET to start on line 3; got line %d", letTok.Line)
 	}
 }
+
 func Test_Lexer_NOOP_MultiBlankLines(t *testing.T) {
 	src := "let x=1\n   \n\t \nlet y=2"
 	got := wantTypes(t, src, []TokenType{

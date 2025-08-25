@@ -419,7 +419,10 @@ func Test_RT_GetEnv_Shadows_And_Order(t *testing.T) {
 func Test_RT_MapHas_And_MapDelete_Order_And_Ann(t *testing.T) {
 	ip := newRT()
 	v := evalWithIP(t, ip, `
-      let m = {#(first) a:1, b:2, c:3}
+      let m = {
+        # first
+        a:1, b:2, c:3
+      }
       let _ = mapDelete(m, "b")
       {h1: mapHas(m,"b"), h2: mapHas(m,"z"), pairs: __collect_for_elems(m)}
 	`)
@@ -523,7 +526,10 @@ func Test_RT_Clone_DeepCopy_Arrays_And_Maps(t *testing.T) {
 	ip := newRT()
 	// Build a map with an annotated key and a small array; clone both and mutate originals
 	v := evalWithIP(t, ip, `
-      let m = {#(first) a:1, b:2}
+      let m = {
+        # first
+        a:1, b:2
+      }
       let a = [10, 20]
       let mc = clone(m)
       let ac = clone(a)
@@ -912,9 +918,13 @@ func Test_RT_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
 	ip := NewRuntime()
 
 	src := `
-		let T = #(Type describing a person) type {
-			#(the name) name!: Str,
-			#(availability) avail: Enum["yes","no"]
+		let T = 
+		# Type describing a person
+		type {
+			# the name
+			name!: Str,
+			# availability
+			avail: Enum["yes","no"]
 		}
 		typeToJSONSchema(T)
 	`

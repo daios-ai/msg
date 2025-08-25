@@ -810,7 +810,10 @@ func Test_Interpreter_For_Iterator_AnnotatedNull_Propagates(t *testing.T) {
 	// Iterator returns an annotated null; for-loop should propagate it out.
 	src := `
 let bad = fun() -> Int? do
-  return #(oops) null
+  return(
+    # oops
+    null
+  )
 end
 let sum = 0
 for let x in bad do
@@ -863,16 +866,8 @@ func Test_Interpreter_Plus_Unsupported_Types_Annotated(t *testing.T) {
 }
 
 // ------------------------------------------------------------
-// Annotations: inline & stacking
+// Annotations: stacking (inline removed)
 // ------------------------------------------------------------
-
-func Test_Interpreter_Annotation_Inline_Parens(t *testing.T) {
-	v := evalSrc(t, `#(note:hi) 21`)
-	wantInt(t, v, 21)
-	if v.Annot == "" || !strings.Contains(strings.ToLower(v.Annot), "note:hi") {
-		t.Fatalf("missing inline annotation, got %q", v.Annot)
-	}
-}
 
 func Test_Interpreter_Annotation_Stacking_MultilineHashes(t *testing.T) {
 	v := evalSrc(t, `
@@ -959,7 +954,7 @@ let o = {if: 1, else: 2, for: 3, type: 4, Enum: 5, enum: 6, Int: 7, Str: 8, true
 	}
 }
 
-// Map with annotated keys (single-line and inline) + annotated value.
+// Map with annotated keys (single-line) + annotated value.
 // Key annotations should NOT affect runtime map (keys become plain strings).
 // Value annotation MUST be preserved on the stored value.
 func Test_Interpreter_Map_AnnotatedKeys_And_ValueAnnotation(t *testing.T) {
@@ -967,8 +962,11 @@ func Test_Interpreter_Map_AnnotatedKeys_And_ValueAnnotation(t *testing.T) {
 let o = {
 # the name
 name: "Mo",
-#(the age) age: 47,
-available: #(status) "yes"
+# the age
+age: 47,
+available:
+  # status
+  "yes"
 }
 [o["name"], o["age"], o["available"]]
 `
@@ -988,7 +986,10 @@ available: #(status) "yes"
 // Destructuring with annotated keys should bind correctly.
 func Test_Interpreter_ObjectDestructuring_With_AnnotatedKey(t *testing.T) {
 	src := `
-let { #(first) name: x, age: y } = { name: "Ana", age: 33 }
+let {
+  # first
+  name: x, age: y
+} = { name: "Ana", age: 33 }
 [x, y]
 `
 	v := evalSrc(t, src)
@@ -1003,7 +1004,12 @@ let { #(first) name: x, age: y } = { name: "Ana", age: 33 }
 // Destructuring with annotated keys — missing key should yield annotated null.
 func Test_Interpreter_ObjectDestructuring_AnnotatedKey_MissingValue(t *testing.T) {
 	src := `
-let { #(first) name: x, #(years) age: y } = { name: "Bob" }
+let {
+  # first
+  name: x,
+  # years
+  age: y
+} = { name: "Bob" }
 [y]
 `
 	v := evalSrc(t, src)
@@ -1025,8 +1031,11 @@ func Test_Interpreter_Map_AnnotatedKeys_MultiplePairs(t *testing.T) {
 let m = {
 # k1
 k1: 1,
-#(k2-inline) k2: 2,
-k3: #(val) "v"
+# k2-inline
+k2: 2,
+k3:
+  # val
+  "v"
 }
 [m["k1"], m["k2"], m["k3"]]
 `
@@ -1065,7 +1074,8 @@ func Test_Interpreter_Map_KeyAnnotations_On_Iter(t *testing.T) {
 let o = {
 # the name
 name: "Mo",
-#(the age) age: 47,
+# the age
+age: 47,
 plain: "ok"
 }
 let it = __to_iter(o)
@@ -1087,7 +1097,10 @@ let c = it(null)
 // Lookup ignores key annotation (storage by raw string).
 func Test_Interpreter_Map_Lookup_Ignores_Key_Annot(t *testing.T) {
 	src := `
-let o = { #(the name) name: "Mo" }
+let o = {
+# the name
+name: "Mo"
+}
 o["name"]
 `
 	wantStr(t, evalSrc(t, src), "Mo")
@@ -1103,8 +1116,16 @@ func Test_Interpreter_Map_DeepEqual_Ignores_KeyAnnots(t *testing.T) {
 			return Bool(ip2.deepEqual(ctx.MustArg("x"), ctx.MustArg("y")))
 		})
 
-	srcA := `let a = { #(the name) name: "Mo", x: 1 }`
-	srcB := `let b = { #(label)     name: "Mo", x: 1 }`
+	srcA := `
+let a = {
+# the name
+name: "Mo", x: 1
+}`
+	srcB := `
+let b = {
+# label
+name: "Mo", x: 1
+}`
 	v1, err := ip.EvalSource(srcA + "\n" + srcB + "\n__eq_maps(a, b)")
 	if err != nil {
 		t.Fatalf("eval error: %v", err)
@@ -1115,8 +1136,14 @@ func Test_Interpreter_Map_DeepEqual_Ignores_KeyAnnots(t *testing.T) {
 // Merge carries key annotations from RHS.
 func Test_Interpreter_Map_Plus_Merge_Carries_RHS_KeyAnnot(t *testing.T) {
 	src := `
-let a = { #(A) k: 1, x: 2 }
-let b = { #(B) k: 9, y: 3 }
+let a = {
+# A
+k: 1, x: 2
+}
+let b = {
+# B
+k: 9, y: 3
+}
 let m = a + b
 let it = __to_iter(m)
 let p = it(null)
@@ -1138,7 +1165,7 @@ arr
 func Test_Interpreter_Annot_On_Assign_Persists_In_Env(t *testing.T) {
 	ip := NewInterpreter()
 
-	// #(doc) let c = 1
+	// let c = 299792458 with annotation
 	mustEvalPersistent(t, ip, "# speed of light\nlet c = 299792458")
 
 	// c must carry the annotation
@@ -1154,7 +1181,7 @@ func Test_Interpreter_Annot_On_Assign_Persists_In_Env(t *testing.T) {
 func Test_Interpreter_Annot_On_Bare_Decl_Persists_As_AnnotatedNull(t *testing.T) {
 	ip := NewInterpreter()
 
-	// #(doc) let x
+	// annotated bare decl
 	mustEvalPersistent(t, ip, "# doc for x\nlet x")
 
 	v := mustEvalPersistent(t, ip, "x")
@@ -1170,7 +1197,7 @@ func Test_Interpreter_Annot_On_Reassign_Persists_On_Binding(t *testing.T) {
 	ip := NewInterpreter()
 
 	mustEvalPersistent(t, ip, "let x = 1")
-	// #(doc2) x = 2
+	// annotated reassignment
 	mustEvalPersistent(t, ip, "# newer doc\nx = 2")
 
 	v := mustEvalPersistent(t, ip, "x")
@@ -1187,7 +1214,7 @@ func Test_Interpreter_Annot_On_Expression_Does_NotMutate_Binding(t *testing.T) {
 
 	mustEvalPersistent(t, ip, "let z = 5")
 
-	// #(temp) z  — returns annotated copy, should NOT change z in env
+	// annotated expression result should NOT change z in env
 	r := mustEvalPersistent(t, ip, "# temp note\nz")
 	if r.Tag != VTInt || r.Data.(int64) != 5 {
 		t.Fatalf("expected annotated expression to evaluate to 5, got %#v", r)

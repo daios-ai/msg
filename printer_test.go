@@ -176,7 +176,15 @@ let {name: n, age: a} = {name: "Bob", age: 40}
 }
 
 func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
-	in := `let { name: #( username ) n, age: #( yearsOld ) a } = {name: "Bob", age: 40}`
+	// Rewritten to use PRE hash-line annotations instead of inline #( ... )
+	in := "let {\n" +
+		"\tname: \n" +
+		"\t# username\n" +
+		"\tn,\n" +
+		"\tage: \n" +
+		"\t# yearsOld\n" +
+		"\ta\n" +
+		"} = {name: \"Bob\", age: 40}"
 	want := "let {\n" +
 		"\tname: \n" +
 		"\t# username\n" +
@@ -295,13 +303,8 @@ x`
 	eq(t, got, want)
 }
 
-func Test_Printer_Annotations_InlineParens_NormalizesToHeader(t *testing.T) {
-	in := `#( note about y ) y`
-	want := `# note about y
-y`
-	got := pretty(t, in)
-	eq(t, got, want)
-}
+// NOTE: Removed Test_Printer_Annotations_InlineParens_NormalizesToHeader
+// because inline annotations #( ... ) are no longer supported.
 
 func Test_Printer_ReturnBreakContinue_SameLineVsNewline(t *testing.T) {
 	// Same-line expression → carry the expression.

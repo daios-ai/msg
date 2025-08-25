@@ -679,8 +679,9 @@ func Test_Parser_Map_KeyAndValue_Annotations(t *testing.T) {
 	src := `{
 # the name
 name: "Mo",
-#(the age) age: 47,
-available: #(status) "yes"
+# the age
+age: 47,
+available: "yes" # status
 }`
 	root := mustParse(t, src)
 	m := kid(root, 0)
@@ -708,7 +709,7 @@ available: #(status) "yes"
 		t.Fatalf("want value 'Mo', got %s", dump(v1))
 	}
 
-	// 2) "(the age)" annotates KEY "age"
+	// 2) "the age" annotates KEY "age"
 	p2 := kid(m, 1)
 	if head(p2) != "pair" {
 		t.Fatalf("field2 should be pair: %s", dump(p2))
@@ -727,7 +728,7 @@ available: #(status) "yes"
 		t.Fatalf("want 47, got %v", v2[1])
 	}
 
-	// 3) "(status)" annotates VALUE "yes"
+	// 3) "status" annotates VALUE "yes" (POST here)
 	p3 := kid(m, 2)
 	if head(p3) != "pair" {
 		t.Fatalf("field3 should be pair: %s", dump(p3))
@@ -918,8 +919,6 @@ func Test_Parser_For_BareId_ImplicitDecl(t *testing.T) {
 	wantTag(t, body, "block")
 }
 
-// --- NEW: control-keyword newline semantics --------------------------------
-
 func Test_Parser_Control_NewlineMeansNullAndNextExpr(t *testing.T) {
 	src := "return\n(1 + 2)"
 	root := mustParse(t, src)
@@ -971,8 +970,6 @@ func Test_Parser_Control_SameLine_ChainsAsSingleExpr(t *testing.T) {
 	wantTag(t, c[1].(S), "null")
 }
 
-// --- NEW: interactive-mode parser behavior ---------------------------------
-
 func Test_Interactive_Incomplete_Grouping_IsIncomplete(t *testing.T) {
 	mustIncomplete(t, "let x = (")
 }
@@ -986,10 +983,6 @@ func Test_Interactive_Incomplete_Params_IsIncomplete(t *testing.T) {
 	mustIncomplete(t, "fun(a: Str")
 }
 
-func Test_Interactive_InlineAnnotation_Unterminated_IsIncomplete(t *testing.T) {
-	mustIncomplete(t, "#(note")
-}
-
 func Test_Interactive_Completes_WhenClosed(t *testing.T) {
 	full := "let x = (\n  1 + 1\n)\n"
 	a := mustParseInteractive(t, full)
@@ -1000,8 +993,6 @@ func Test_Interactive_Completes_WhenClosed(t *testing.T) {
 		t.Fatalf("interactive vs normal AST differ:\n%s\n%s", string(ja), string(jb))
 	}
 }
-
-// --- NEW: sanity checks for equivalence of forms across whitespace ----------
 
 func Test_Parser_Control_Return_Forms_SameAST(t *testing.T) {
 	r1 := mustParse(t, `return 1`)
@@ -1171,7 +1162,7 @@ func Test_Parser_Annot_Pre_Multiline_Wraps_Let(t *testing.T) {
 
 // Trailing POST annotation attaches to the RHS literal `1`
 func Test_Parser_Annot_Post_Trailing_Attaches_RHSLiteral(t *testing.T) {
-	src := "do\nlet y = 1 #(3. post)\nend"
+	src := "do\nlet y = 1 # 3. post\nend"
 	root := mustParse(t, src)
 	blk := kid(root, 0)
 	asn := kid(blk, 0)
@@ -1191,7 +1182,7 @@ func Test_Parser_Annot_Post_Trailing_Attaches_RHSLiteral(t *testing.T) {
 
 // PRE annotation before a map: attaches to the map on the RHS
 func Test_Parser_Annot_Pre_Before_Map_RHS(t *testing.T) {
-	src := "let obj = #(4. pre map) { a: 1 }"
+	src := "let obj = \n# 4. pre map\n{ a: 1 }"
 	root := mustParse(t, src)
 	asn := kid(root, 0)
 	wantTag(t, asn, "assign")
@@ -1207,7 +1198,7 @@ func Test_Parser_Annot_Pre_Before_Map_RHS(t *testing.T) {
 
 // PRE annotation on a key inside a map
 func Test_Parser_Annot_Pre_On_Key(t *testing.T) {
-	src := "let obj = { #(5. pre key) name: 1 }"
+	src := "let obj = { \n# 5. pre key\nname: 1 \n}"
 	root := mustParse(t, src)
 	asn := kid(root, 0)
 	mp := kid(asn, 1)
@@ -1229,7 +1220,8 @@ func Test_Parser_Annot_Pre_On_Key(t *testing.T) {
 
 // POST annotation on an integer literal value
 func Test_Parser_Annot_Post_On_Int_Value(t *testing.T) {
-	src := `let m = { age: 17 #(7. post) }`
+	src := `let m = { age: 17 # 7. post 
+	}`
 	root := mustParse(t, src)
 	asn := kid(root, 0)
 	mp := kid(asn, 1)
@@ -1247,58 +1239,11 @@ func Test_Parser_Annot_Post_On_Int_Value(t *testing.T) {
 	}
 }
 
-func Test_Parser_Annotations_Inline_Stacking_Errors_8_to_11(t *testing.T) {
-	// 8–9: multiple inline PRE annotations targeting same following expr → parse error
-	src1 := `#(8. multiple inline pre-annotations) #(9. are a parse error) let a`
-	mustFailParseContains(t, src1, "multiple consecutive pre-annotations")
-
-	// 10–11: multiple inline POST annotations targeting same preceding expr → parse error
-	src2 := `let b #(10. multiple inline post-annotations) #(11. are a parse error)`
-	mustFailParseContains(t, src2, "multiple consecutive post-annotations")
-}
-
-func Test_Parser_Annotations_Assign_Targets_And_Destructuring(t *testing.T) {
-	// PRE annot directly on a destructuring pattern (outer) and inside it (inner)
-	src := `let #(outer) [ #(inner) a ] = [1]`
-	root := mustParse(t, src)
-	assign := kid(root, 0)
-	wantTag(t, assign, "assign")
-	lhs := kid(assign, 0)
-	// LHS should be PRE-annotated
-	wantTag(t, lhs, "annot")
-	if pre, ok := lhs[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot on LHS pattern, got: %v", lhs[3])
-	}
-	base := kid(lhs, 1)
-	wantTag(t, base, "darr")
-	elt0 := kid(base, 0)
-	// First element should be PRE-annotated decl a
-	wantTag(t, elt0, "annot")
-	if pre, ok := elt0[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot on inner pattern element, got: %v", elt0[3])
-	}
-	innerDecl := kid(elt0, 1)
-	wantTag(t, innerDecl, "decl")
-	if innerDecl[1].(string) != "a" {
-		t.Fatalf("want decl a, got %s", dump(innerDecl))
-	}
-
-	// POST annot right after a pattern before '=' should still be assignable
-	src2 := `let [a] #(post) = [1, 2]`
-	root2 := mustParse(t, src2)
-	assign2 := kid(root2, 0)
-	wantTag(t, assign2, "assign")
-	lhs2 := kid(assign2, 0)
-	wantTag(t, lhs2, "annot")
-	if pre, ok := lhs2[3].(bool); !ok || pre {
-		t.Fatalf("expected POST annot on LHS pattern, got: %v", lhs2[3])
-	}
-	unwrap := kid(lhs2, 1)
-	wantTag(t, unwrap, "darr") // assignable() must unwrap
-}
-
 func Test_Parser_Annotations_Keys_And_Required(t *testing.T) {
-	src := `{ #(key) name!: 1 }`
+	src := `{
+# key
+name!: 1
+}`
 	root := mustParse(t, src)
 	mp := kid(root, 0)
 	wantTag(t, mp, "map")
@@ -1325,7 +1270,7 @@ func Test_Parser_Annotations_Keys_And_Required(t *testing.T) {
 }
 
 func Test_Parser_Annotations_Postfix_Chain_With_Post(t *testing.T) {
-	src := `obj.name(1)[i] #(post) `
+	src := `obj.name(1)[i] # post `
 	root := mustParse(t, src)
 	e := kid(root, 0)
 	wantTag(t, e, "annot")
@@ -1344,8 +1289,8 @@ func Test_Parser_Annotations_Postfix_Chain_With_Post(t *testing.T) {
 }
 
 func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
-	// Same-line PRE annotation after 'return' → wraps following expr
-	src1 := `return #(pre) x`
+	// Same-line PRE annotation after 'return' → wraps following expr (value on next line)
+	src1 := "return # pre\nx"
 	r1 := mustParse(t, src1)
 	ret1 := kid(r1, 0)
 	wantTag(t, ret1, "return")
@@ -1359,7 +1304,7 @@ func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
 	}
 
 	// POST annotation on the returned expr
-	src2 := `return x #(post)`
+	src2 := `return x # post`
 	r2 := mustParse(t, src2)
 	ret2 := kid(r2, 0)
 	wantTag(t, ret2, "return")
@@ -1373,7 +1318,7 @@ func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
 	}
 
 	// Newline → return takes implicit null; annotated expr is separate stmt
-	src3 := "return\n#(pre) x"
+	src3 := "return\n# pre\nx"
 	r3 := mustParse(t, src3)
 	if len(r3) != 3 {
 		t.Fatalf("want 2 statements, got %d\n%s", len(r3)-1, dump(r3))

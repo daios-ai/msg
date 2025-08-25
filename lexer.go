@@ -62,9 +62,8 @@
 //   - BOOLEAN — “true” or “false” (Literal: bool).
 //   - NULL    — “null” (Literal: nil).
 //
-// ANNOTATIONS (hash syntax)
-//   - Inline annotation:  "#( ... )"                   → emits ANNOTATION with text
-//   - Block annotations:  one or more consecutive lines where, after optional
+// ANNOTATIONS
+//   - Hash-line annotations: one or more consecutive lines where, after optional
 //     indentation, the first non-space is '#'. The leading '#' (and one optional
 //     following space/tab) are stripped; lines are joined with '\n', and a single
 //     ANNOTATION token is emitted. A blank/non-# line ends the block.
@@ -73,9 +72,7 @@
 //   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
 //     reported as *LexError* with precise location.
 //   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings or unterminated "#(...)" inline blocks produce
-//     *IncompleteError* instead of LexError. Use IsIncomplete(err) to detect this
-//     and prompt for more input.
+//     strings produce *IncompleteError* instead of LexError.
 //
 // OUTPUT
 //   - Scan returns the full token slice *including* the terminal EOF token.
@@ -150,7 +147,7 @@ import (
 //
 // Annotation:
 //
-//	ANNOTATION — emitted for "#( … )" lines or multi-line blocks starting with '#'.
+//	ANNOTATION — emitted for multi-line blocks starting with '#'.
 type TokenType int
 
 const (
@@ -254,8 +251,7 @@ type Token struct {
 
 // LexError reports a lexical error detected during scanning (e.g., invalid
 // escape sequence, malformed number, unexpected character, invalid UTF-8).
-// In non-interactive mode, unterminated strings or inline "#(...)"
-// also produce LexError.
+// In non-interactive mode, unterminated strings also produce LexError.
 //
 // The error position (Line, Col) refers to the location where the lexer
 // detected the problem (generally close to the token’s start).
@@ -271,10 +267,7 @@ func (e *LexError) Error() string {
 
 // IncompleteError signals that more input is required to complete a construct.
 // It is returned *only* by a lexer created with NewLexerInteractive when the
-// end of input is reached inside:
-//   - a string literal,
-//   - an inline annotation "#( ... )".
-//
+// end of input is reached inside a string literal.
 // Use IsIncomplete(err) to detect this case in REPLs and prompt the user for
 // more lines instead of failing the parse.
 type IncompleteError struct {
@@ -332,7 +325,6 @@ type Lexer struct {
 }
 
 // NewLexer creates a new lexer for the given source in normal mode.
-// Unterminated strings / "#(...)" yield LexError.
 func NewLexer(src string) *Lexer {
 	return &Lexer{
 		src: src,
@@ -344,8 +336,7 @@ func NewLexer(src string) *Lexer {
 }
 
 // NewLexerInteractive creates a lexer in interactive mode.
-// Unterminated strings or inline paren blocks return IncompleteError at EOF,
-// allowing REPLs to request more input.
+// Unterminated strings return IncompleteError at EOF, allowing REPLs to request more input.
 func NewLexerInteractive(src string) *Lexer {
 	return &Lexer{
 		src:         src,
@@ -896,47 +887,11 @@ func (l *Lexer) scanAnnotation() (string, error) {
 	return s, nil
 }
 
-// scanInlineParens reads everything between a '(' and the matching ')'.
-// Caller must ensure the next byte is '('.
-// No nesting supported; runs across newlines; errors if EOF before ')'.
-func (l *Lexer) scanInlineParens() (string, error) {
-	// consume '('
-	if b, ok := l.peek(); !ok || b != '(' {
-		return "", l.err("internal: expected '(' after inline opener")
-	}
-	l.advance()
-
-	var bldr strings.Builder
-	for {
-		b, ok := l.peek()
-		if !ok {
-			if l.interactive {
-				return "", l.errIncomplete("inline block was not terminated with ')'")
-			}
-			return "", l.err("inline block was not terminated with ')'")
-		}
-		if b == ')' {
-			l.advance() // consume ')'
-			break
-		}
-		bldr.WriteByte(b)
-		l.advance()
-	}
-	return bldr.String(), nil
-}
-
 // --- hash/comment helpers ---
 
 // handleSingleHash processes '#' annotations (inline or multiline).
 // Returns (producedAnnotation, text, err).
 func (l *Lexer) handleSingleHash() (bool, string, error) {
-	if b1, ok := l.peek(); ok && b1 == '(' {
-		text, err := l.scanInlineParens()
-		if err != nil {
-			return false, "", err
-		}
-		return true, text, nil
-	}
 	annot, err := l.scanAnnotation()
 	if err != nil {
 		return false, "", l.err("incomplete annotation")

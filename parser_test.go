@@ -1250,11 +1250,11 @@ func Test_Parser_Annot_Post_On_Int_Value(t *testing.T) {
 func Test_Parser_Annotations_Inline_Stacking_Errors_8_to_11(t *testing.T) {
 	// 8–9: multiple inline PRE annotations targeting same following expr → parse error
 	src1 := `#(8. multiple inline pre-annotations) #(9. are a parse error) let a`
-	mustFailParseContains(t, src1, "multiple inline pre-annotations")
+	mustFailParseContains(t, src1, "multiple consecutive pre-annotations")
 
 	// 10–11: multiple inline POST annotations targeting same preceding expr → parse error
 	src2 := `let b #(10. multiple inline post-annotations) #(11. are a parse error)`
-	mustFailParseContains(t, src2, "multiple inline post-annotations")
+	mustFailParseContains(t, src2, "multiple consecutive post-annotations")
 }
 
 func Test_Parser_Annotations_Assign_Targets_And_Destructuring(t *testing.T) {

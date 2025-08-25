@@ -497,25 +497,22 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("type", x)
 
 	case ANNOTATION:
-		// Classify as PRE/POST by same-line ender rule.
 		pre := p.annotationIsPreAt(p.i - 1)
 		txt := ""
 		if s, ok := t.Literal.(string); ok {
 			txt = s
 		}
-		// Stacking ban for inline PRE targeting the same expression:
-		// if the next token is another inline PRE on the same line, it's ambiguous.
-		if pre && !p.atEnd() {
-			next := p.peek()
-			if next.Type == ANNOTATION &&
-				tokenIsInlineAnnotation(t) &&
-				tokenIsInlineAnnotation(next) &&
-				next.Line == t.Line &&
-				p.annotationIsPreAt(p.i) {
-				return nil, &ParseError{Line: next.Line, Col: next.Col, Msg: "multiple inline pre-annotations are a parse error"}
-			}
-		}
+
 		if pre {
+			// NEW: general consecutive-PRE ban (inline or block)
+			if !p.atEnd() && p.peek().Type == ANNOTATION && p.annotationIsPreAt(p.i) {
+				next := p.peek()
+				return nil, &ParseError{
+					Line: next.Line, Col: next.Col,
+					Msg: "multiple consecutive pre-annotations are not allowed; combine them",
+				}
+			}
+
 			if p.atEnd() && p.interactive {
 				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
 			}
@@ -525,9 +522,6 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			left = L("annot", L("str", txt), x, true)
 		} else {
-			// POST at a prefix position has no finished LHS to attach to.
-			// In practice, POST annotations should be consumed in the postfix loop below
-			// of the prior expression; reaching here indicates a structural issue.
 			return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: "post-annotation has no preceding expression to attach"}
 		}
 
@@ -624,7 +618,7 @@ func (p *parser) expr(minBP int) (S, error) {
 					tokenIsInlineAnnotation(a) &&
 					tokenIsInlineAnnotation(next) &&
 					next.Line == a.Line {
-					return nil, &ParseError{Line: next.Line, Col: next.Col, Msg: "multiple inline post-annotations are a parse error"}
+					return nil, &ParseError{Line: next.Line, Col: next.Col, Msg: "multiple consecutive post-annotations"}
 				}
 			}
 			continue
@@ -1060,27 +1054,24 @@ func (p *parser) objectDeclPattern() (S, error) {
 
 // --- small helpers for annotations ---
 
-// consumePreAnnotationsOrError collects consecutive PRE annotations and enforces the inline-stacking ban.
-// It does not consume POST annotations (those belong to the previous expression).
+// consumePreAnnotationsOrError collects at most one PRE annotation.
+// Any second consecutive PRE annotation is a hard parse error.
 func (p *parser) consumePreAnnotationsOrError() ([]string, error) {
 	var texts []string
 	for !p.atEnd() && p.peek().Type == ANNOTATION && p.annotationIsPreAt(p.i) {
 		tok := p.peek()
+		if len(texts) > 0 {
+			return nil, &ParseError{
+				Line: tok.Line, Col: tok.Col,
+				Msg: "multiple consecutive pre-annotations are not allowed",
+			}
+		}
 		p.i++
 		txt := ""
 		if s, ok := tok.Literal.(string); ok {
 			txt = s
 		}
 		texts = append(texts, txt)
-
-		// inline-stacking ban: immediate next ANNOTATION that's also inline PRE on the same line
-		if !p.atEnd() && p.peek().Type == ANNOTATION &&
-			tokenIsInlineAnnotation(tok) &&
-			tokenIsInlineAnnotation(p.peek()) &&
-			p.peek().Line == tok.Line &&
-			p.annotationIsPreAt(p.i) {
-			return nil, &ParseError{Line: p.peek().Line, Col: p.peek().Col, Msg: "multiple inline pre-annotations are a parse error"}
-		}
 	}
 	return texts, nil
 }

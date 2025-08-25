@@ -103,10 +103,6 @@ import (
 // This setting is read at call time and is safe to change between calls.
 var MaxInlineWidth = 80
 
-// IndentWithTabs controls whether pretty output uses tabs (like gofmt) for
-// indentation. When false, two spaces are used.
-var IndentWithTabs = true
-
 // Pretty parses a MindScript source string and returns a formatted version.
 //
 // Behavior:
@@ -391,6 +387,8 @@ func (p *pp) printStmt(n S) {
 			p.printExpr(out, 0)
 		}
 		srcs := child(n, 2)
+		// Empty ("array") node: “no from”.
+		// Otherwise, src is arbitrary expression that *evaluates* to an array.
 		if len(srcs) > 1 {
 			p.sp()
 			p.write("from ")
@@ -804,11 +802,10 @@ func prec(n S) int {
 }
 
 func unwrapKey(n S) (name string, annot string) {
-	for tag(n) == "annot" {
-		annot += getStr(child(n, 0))
-		n = child(n, 1)
+	if tag(n) == "annot" {
+		return getStr(child(n, 1)), getStr(child(n, 0))
 	}
-	return getStr(n), annot
+	return getStr(n), ""
 }
 
 func binopPrec(op string) int {

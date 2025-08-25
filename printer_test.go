@@ -528,3 +528,62 @@ f(x)`,
 		}
 	}
 }
+func Test_Printer_RoundTrip_Standardize(t *testing.T) {
+	cases := []string{
+		// Simple expressions and ops
+		`x=1+2*3`,
+
+		// Calls / idx / get
+		`f( a, b )[i].name(3)`,
+
+		// Array with pre-annotation on the next element (comma-before-comment form)
+		`arr = [1, # note about 2
+2]`,
+
+		// Map with a key annotation and multiple fields
+		`m = { a: 1, # key doc
+b: 2 }`,
+
+		// Function + control flow in a block
+		`do
+	x = 1 + 2 * 3
+	if x < 10 then
+		return(x)
+	elif x == 10 then
+		break(null)
+	else
+		continue(false)
+	end
+end`,
+
+		// Oracle with non-empty from expression (any expr that evaluates to an array)
+		`res = oracle(a: Int) -> Str from sources()`,
+
+		// Destructuring with annotated key in an object pattern
+		`let { # id of the user
+userId: id, profile: { name: n } } = obj`,
+	}
+
+	for i, in := range cases {
+		std1, err := Standardize(in)
+		if err != nil {
+			t.Fatalf("case %d: Standardize(in) error: %v\nin:\n%s", i, err, in)
+		}
+
+		ast1 := parse(t, std1)
+
+		std2, err := Standardize(std1)
+		if err != nil {
+			t.Fatalf("case %d: Standardize(std1) error: %v\nstd1:\n%s", i, err, std1)
+		}
+
+		// The standardized source should be idempotent.
+		eq(t, std2, std1)
+
+		// And the ASTs should be structurally equal.
+		ast2 := parse(t, std2)
+		if !reflect.DeepEqual(ast1, ast2) {
+			t.Fatalf("case %d: AST mismatch after second pass\n--- ast1 (from std1) ---\n%#v\n--- ast2 (from std2) ---\n%#v\nstd1:\n%s\nstd2:\n%s", i, ast1, ast2, std1, std2)
+		}
+	}
+}

@@ -11,7 +11,7 @@
 
 let _failNull = fun(msg: Str) do
   # {msg}
-null
+  null
 end
 
 # --- state -------------------------------------------------------------------
@@ -21,10 +21,10 @@ end
 # _:Null -> {backends:{}, cfg:{}, selected:Str?, system:Str?}
 let new = fun() do
   {
-    backends: {},        ## name -> execFun(prompt,inT,outT,ex,opts) -> Str|Null
-    cfg: {},             ## name -> {Str:Any}
-    selected: null,      ## active backend name
-    system: null         ## optional global system hint
+    backends: {},        # name -> execFun(prompt,inT,outT,ex,opts) -> Str|Null
+    cfg: {},             # name -> {Str:Any}
+    selected: null,      # active backend name
+    system: null         # optional global system hint
   }
 end
 
@@ -113,7 +113,7 @@ end
 # params: [{name:Str, type:Type}]
 # (params:Any, ret:Type, doc:Str?, examples:Any) -> Any
 let makeOracle = fun(params: Any, ret: Type, doc: Str?, examples: Any) -> Any do
-  let names = [] 
+  let names = []
   let types = []
   for let p in params do
     names = names + [p.name]

@@ -197,8 +197,8 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// Builtin types by ID
-	if tokOK && (tk.Type == mindscript.ID || tk.Type == mindscript.TYPE) {
+	// Builtin types by ID (NOT by TYPE keyword)
+	if tokOK && tk.Type == mindscript.ID {
 		if docTxt, ok := builtinTypeDocs[name]; ok {
 			content := fmt.Sprintf("**type** `%s`\n\n%s", name, docTxt)
 			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
@@ -234,7 +234,20 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 	// Fallback classification for IDs
 	if tokOK && tk.Type == mindscript.ID {
 		kind := "identifier"
-		idx := indexOfToken(doc.tokens, tk)
+		idx := -1
+		// we can find the idx cheaply via tokenAtOffset when on the token; otherwise scan once
+		if i, _, _, _, ok := tokenAtOffset(doc, off); ok {
+			idx = i
+		}
+		if idx == -1 {
+			for i := range doc.tokens {
+				if doc.tokens[i] == tk {
+					idx = i
+					break
+				}
+			}
+		}
+
 		if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
 			kind = "property"
 		} else if sy, ok := findSymbol(doc, name); ok && sy.Kind != "" {
@@ -492,8 +505,6 @@ type semEntry struct {
 
 // semanticTokensData builds LSP-encoded semantic token data.
 // If [selStart, selEnd) are >=0, only tokens overlapping that range are emitted.
-// semanticTokensData builds LSP-encoded semantic token data.
-// If [selStart, selEnd) are >=0, only tokens overlapping that range are emitted.
 func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint32 {
 	if doc == nil || len(doc.tokens) == 0 {
 		return nil
@@ -513,44 +524,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 
 	entries := []semEntry{}
 
-	// 1) Emit comment/annotation semantic tokens so they are visibly colored.
-	emitCommentSeg := func(sOff, eOff int) {
-		segStart := sOff
-		for cur := sOff; cur < eOff; cur++ {
-			if doc.text[cur] == '\r' {
-				continue
-			}
-			if doc.text[cur] == '\n' {
-				if segStart < cur {
-					st := offsetToPos(doc.lines, segStart, doc.text)
-					entries = append(entries, semEntry{
-						line:   st.Line,
-						ch:     st.Character,
-						lenU16: u16Len(doc.text[segStart:cur]),
-						typ:    semTypes["comment"],
-					})
-				}
-				segStart = cur + 1
-			}
-		}
-		if segStart < eOff {
-			st := offsetToPos(doc.lines, segStart, doc.text)
-			entries = append(entries, semEntry{
-				line:   st.Line,
-				ch:     st.Character,
-				lenU16: u16Len(doc.text[segStart:eOff]),
-				typ:    semTypes["comment"],
-			})
-		}
-	}
-	for _, sp := range cspans {
-		if selStart >= 0 && selEnd >= 0 && !(sp[1] > selStart && sp[0] < selEnd) {
-			continue
-		}
-		emitCommentSeg(sp[0], sp[1])
-	}
-
-	// 2) Emit code tokens, skipping anything inside comment spans.
+	// Emit code tokens, skipping anything inside comment spans.
 	// Track brace depth to classify map-literal keys (`id`/`"str"` before ':') as properties.
 	braceDepth := 0
 
@@ -598,8 +572,10 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 			typIdx = semTypes["keyword"]
 
 		case tk.Type == mindscript.STRING:
-			// Map key heuristic: inside {...} and followed by ':' → property
-			if braceDepth > 0 && i+1 < len(doc.tokens) && doc.tokens[i+1].Type == mindscript.COLON {
+			// Property after '.' OR map key before ':'
+			if i-1 >= 0 && doc.tokens[i-1].Type == mindscript.PERIOD {
+				typIdx = semTypes["property"]
+			} else if braceDepth > 0 && i+1 < len(doc.tokens) && doc.tokens[i+1].Type == mindscript.COLON {
 				typIdx = semTypes["property"]
 			} else {
 				typIdx = semTypes["string"]
@@ -610,7 +586,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 
 		case tk.Type == mindscript.ID:
 			name := tokenName(tk)
-			idx := indexOfToken(doc.tokens, tk)
+			idx := i // avoid O(n) indexOfToken
 			if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
 				typIdx = semTypes["property"]
 			} else if braceDepth > 0 && i+1 < len(doc.tokens) && doc.tokens[i+1].Type == mindscript.COLON {
@@ -631,9 +607,6 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 					typIdx = semTypes["variable"]
 				}
 			}
-
-		case tk.Type == mindscript.TYPE:
-			typIdx = semTypes["type"]
 
 		default:
 			// keep depth updated, even if we don't emit anything
@@ -863,55 +836,35 @@ func (s *server) onFoldingRange(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// Structured blocks: do/end, if/elif/else/end, while/end, for/end, fun…do…end, oracle…do…end
-	type opener struct {
-		typ  mindscript.TokenType
-		line int
-	}
-	stack := []opener{}
-
-	push := func(t mindscript.Token) {
-		stack = append(stack, opener{typ: t.Type, line: t.Line - 1})
-	}
-	pop := func(matches ...mindscript.TokenType) (op opener, ok bool) {
-		if len(stack) == 0 {
-			return opener{}, false
+	// AST-based folding using spans (starts at headers, ends at closing)
+	if doc.spans != nil && doc.ast != nil && len(doc.ast) > 0 {
+		foldable := map[string]bool{
+			"fun": true, "oracle": true, "if": true, "while": true, "for": true,
+			// Optional: fold big literals too
+			"array": true, "map": true,
 		}
-		top := stack[len(stack)-1]
-		for _, m := range matches {
-			if top.typ == m {
-				stack = stack[:len(stack)-1]
-				return top, true
+		var walk func(node []any, path mindscript.NodePath)
+		walk = func(node []any, path mindscript.NodePath) {
+			if len(node) == 0 {
+				return
 			}
-		}
-		return opener{}, false
-	}
-
-	for _, t := range doc.tokens {
-		switch t.Type {
-		case mindscript.LCURLY, mindscript.LSQUARE, mindscript.CLSQUARE, mindscript.LROUND, mindscript.CLROUND:
-			// Treat grouping opens as fold starters (LSQUARE also from spaced)
-			push(t)
-		case mindscript.DO, mindscript.IF, mindscript.WHILE, mindscript.FOR, mindscript.FUNCTION, mindscript.ORACLE:
-			push(t)
-		case mindscript.RCURLY:
-			if op, ok := pop(mindscript.LCURLY); ok && (t.Line-1) > op.line {
-				out = append(out, FoldingRange{StartLine: op.line, EndLine: t.Line - 1})
+			tag, _ := node[0].(string)
+			if foldable[tag] {
+				if sp, ok := doc.spans.Get(path); ok {
+					startL := offsetToPos(doc.lines, sp.StartByte, doc.text).Line
+					endL := offsetToPos(doc.lines, sp.EndByte, doc.text).Line
+					if endL > startL {
+						out = append(out, FoldingRange{StartLine: startL, EndLine: endL})
+					}
+				}
 			}
-		case mindscript.RSQUARE:
-			if op, ok := pop(mindscript.LSQUARE, mindscript.CLSQUARE); ok && (t.Line-1) > op.line {
-				out = append(out, FoldingRange{StartLine: op.line, EndLine: t.Line - 1})
-			}
-		case mindscript.RROUND:
-			if op, ok := pop(mindscript.LROUND, mindscript.CLROUND); ok && (t.Line-1) > op.line {
-				out = append(out, FoldingRange{StartLine: op.line, EndLine: t.Line - 1})
-			}
-		case mindscript.END:
-			// Close any of the block starters above
-			if op, ok := pop(mindscript.DO, mindscript.IF, mindscript.WHILE, mindscript.FOR, mindscript.FUNCTION, mindscript.ORACLE); ok && (t.Line-1) > op.line {
-				out = append(out, FoldingRange{StartLine: op.line, EndLine: t.Line - 1})
+			for i := 1; i < len(node); i++ {
+				if ch, ok := node[i].([]any); ok {
+					walk(ch, append(path, i-1))
+				}
 			}
 		}
+		walk(doc.ast, mindscript.NodePath{})
 	}
 
 	s.sendResponse(id, out, nil)

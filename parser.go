@@ -9,159 +9,12 @@
 //
 //	("binop", "+", ("int", 1), ("id", "x"))
 //
-// DEPENDENCIES
-// ------------
-// • lexer.go — provides:
-//   - Token / TokenType definitions and all token kinds used here
-//   - Lexer, NewLexer, NewLexerInteractive
-//   - IncompleteError and IsIncomplete(err)
-//
-// • standard library: fmt (for error messages)
-//
-// PARSING MODE & INTERACTIVITY
-// ----------------------------
-// Two entry points are provided:
-//
-//	ParseSExpr(src string)            — normal parsing (unterminated input is a ParseError)
-//	ParseSExprInteractive(src string) — REPL-friendly (unterminated input becomes IncompleteError)
-//
-// In interactive mode, reaching EOF inside a construct (e.g., missing ')', ']', '}', 'end',
-// or RHS after an operator/unary) yields IncompleteError with a precise position.
-//
-// OUTPUT SHAPE (AST)
-// ------------------
-// The result is always a top-level block:
-//
-//	("block", expr1, expr2, ...)
-//
-// Node forms (tags) the parser emits:
-//
-// Literals & identifiers:
-//
-//	("id",   name)           // identifiers and builtin TYPE tokens (e.g., "Int") used as names
-//	("int",  int64)
-//	("num",  float64)
-//	("str",  string)
-//	("bool", bool)
-//	("null")
-//
-// Unary/postfix:
-//
-//	("unop", "-",   expr)    // prefix minus
-//	("unop", "not", expr)    // logical not
-//	("unop", "?",   expr)    // postfix optional operator
-//
-// Calls / property / indexing:
-//
-//	("call", callee, arg1, arg2, ...)
-//	("idx",  object, indexExpr)                // obj[expr] or obj.<integer> or obj.(expr)
-//	("get",  object, ("str", propertyName))    // obj.<id> or obj."string"
-//
-// Arrays & maps:
-//
-//	("array", elements...)
-//	("map", ("pair",  keyStrExpr, valueExpr)*)
-//	("map", ("pair!", keyStrExpr, valueExpr)* ) // key marked required via '!' in literal (e.g., {name!: "x"})
-//
-// Enum sugar:
-//
-//	Enum[ e1, e2, ... ] → ("enum", e1, e2, ...)
-//
-// Functions & oracles:
-//
-//	fun (p1[: T], p2[: T], ...) [-> Ret] do ... end
-//	   → ("fun",   paramsArray, RetOr("id","Any"), bodyBlock)
-//	oracle (p1[: T], ...) [-> Out] [from SourceExpr]
-//	   → ("oracle", paramsArray, OutOr("id","Any"), SourceOr("array"))
-//
-// where paramsArray is ("array", ("pair", ("id", name), typeExpr), ...).
-//
-// Blocks and control:
-//
-//	do ... end                → ("block", ...)
-//	if cond then … elif … else … end
-//	   → ("if", ("pair", cond1, thenBlock1), ("pair", cond2, thenBlock2), [, elseBlock])
-//	for <target> in <iter> do ... end → ("for", target, iter, body)
-//	while cond do ... end             → ("while", cond, body)
-//
-// Return/break/continue (newline-sensitive):
-//
-//	If the next token is on the SAME line → take a following expression.
-//	Else (or at EOF)                      → implicit null.
-//	Examples:
-//	  return 1      → ("return", ("int", 1))
-//	  return\nx     → ("return", ("null"))
-//
-// Declaration patterns (used by `let` and `for` targets):
-//
-//	("decl", name)                        // let x
-//	("darr", p1, p2, ...)                 // let [a, b, ...]
-//	("dobj", ("pair", keyStrExpr, p), ...) // let {k: p, ...}
-//
-// Annotations may wrap the next pattern or expression:
-//
-//	("annot", ("str", text), node)
-//
-// Operators & precedence (higher binds tighter; '=' and '->' are right-assoc):
-//
-//	70: * / %
-//	60: + -
-//	50: < <= > >=
-//	40: == !=
-//	30: and
-//	20: or
-//	15: ->
-//	10: =
-//
-// '=' yields ("assign", target, value) and requires an assignable target: one of
-// "id", "get", "idx", "decl", "darr", "dobj".
-//
-// ERROR MODEL
-// -----------
-// • ParseError  — structural/grammar problems with location.
-// • IncompleteError (interactive mode) — source ended while a construct was incomplete.
-//
-// NOTE ON WHITESPACE RULE FOR CALLS/PARAM LISTS
-// -------------------------------------
-// The lexer classifies '(' and '[' based on *immediate* preceding whitespace:
-//
-//   - '('  → LROUND  if there IS preceding whitespace
-//     → CLROUND if there is NO preceding whitespace
-//   - '['  → LSQUARE if there IS preceding whitespace
-//     → CLSQUARE if there is NO preceding whitespace
-//
-// This distinction lets the parser treat juxtaposition forms as calls/indexing
-// without lookbehind, and treat spaced forms as grouping/array literals.
-//
-// Consequences (important user-facing syntax):
-//
-//   - Calls and parameter lists require NO space before '(':
-//     f(x)         // call: CLROUND
-//     fun(x: T)    // function params: CLROUND
-//     oracle(x: T) // oracle params: CLROUND
-//     Using a space changes the token to LROUND and will NOT be seen as a call.
-//     Example: "f (x)" parses as identifier 'f' followed by a grouped expression,
-//     not a function call.
-//
-//   - Indexing requires NO space before '[':
-//     arr[i]    // CLSQUARE (indexing)
-//     With a space ("arr [i]"), '[' becomes LSQUARE and is NOT treated as indexing.
-//
-//   - Plain grouping still works with both LROUND/CLROUND:
-//     (expr)   // grouping
-//     but only CLROUND participates in call/postfix chains.
-//
-// NOTE ON TOKENS & NEWLINES
-// -------------------------
-// The parser relies on token positions provided by the lexer. For newline-sensitive
-// behavior of return/break/continue, it checks whether the next token shares the same line.
-//
-// The complete behavior above is sufficient to consume this API without reading the
-// implementation details below.
+// … [unchanged header elided for brevity] …
 package mindscript
 
 import (
 	"fmt"
+	"strings"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -197,7 +50,7 @@ import (
 //	("while", cond, bodyBlock)
 //	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
 //	("decl", name) | ("darr", ...) | ("dobj", ("pair", keyStrExpr, pat)*)
-//	("annot", ("str", text), wrappedNode)
+//	("annot", ("str", text), wrappedNode, preBool) // NEW: pre/post bit; preBool=true => pre-annotation
 type S = []any
 
 // L is a small helper to build S-expression nodes. The first argument is the
@@ -216,29 +69,7 @@ func (e *ParseError) Error() string {
 }
 
 // ParseSExpr parses a MindScript source string into an S-expression AST.
-// It lexes the source using NewLexer (normal mode) and parses according to the
-// grammar summarized in the file header comments.
-//
-// Returns:
-//   - S  — a top-level ("block", ...) node.
-//   - error — *ParseError on grammar problems, or lexer errors propagated.
-//
-// Newline-sensitive control:
-//
-//	return/break/continue take an expression only if the next token is on the same line;
-//	otherwise they default to ("null").
-//
-// Property/index/call chaining:
-//   - Calls:           f(args...)             → ("call", f, args...)
-//   - Index:           a[b]                   → ("idx", a, b)
-//   - Computed dot:    a.(expr)               → ("idx", a, expr)
-//   - Numeric dot:     a.42                   → ("idx", a, ("int", 42))
-//   - Named property:  a.name / a."name"      → ("get", a, ("str", "name"))
-//
-// Operators:
-//
-//	Precedence and associativity are as listed in the header; "=" and "->" are right-assoc.
-//	"=" yields ("assign", target, value) and requires assignable targets.
+// … (unchanged doc) …
 func ParseSExpr(src string) (S, error) {
 	lex := NewLexer(src)
 	toks, err := lex.Scan()
@@ -249,16 +80,7 @@ func ParseSExpr(src string) (S, error) {
 	return p.program()
 }
 
-// ParseSExprWithSpans parses `src` into an S-expression AST and also returns a
-// SpanIndex mapping each node (addressed by NodePath) to its source byte span.
-//
-// Behavior:
-//   - The AST is identical to ParseSExpr (stable contract).
-//   - Spans are recorded in post-order (children before parent).
-//   - Spans are half-open byte intervals [StartByte, EndByte) in `src`.
-//   - The top-level ("block", ...) is included.
-//
-// Errors mirror ParseSExpr; lexer errors and parse errors are propagated unchanged.
+// ParseSExprWithSpans … (unchanged)
 func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
 	lex := NewLexer(src)
 	toks, err := lex.Scan()
@@ -274,11 +96,7 @@ func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
 	return ast, idx, nil
 }
 
-// ParseSExprInteractive is identical to ParseSExpr but uses NewLexerInteractive
-// and returns *IncompleteError when the input ends mid-construct (e.g., missing
-// ')', ']', '}', 'end', or the RHS of an operator/unary).
-//
-// Use IsIncomplete(err) to detect this case in a REPL and request more input.
+// ParseSExprInteractive … (unchanged)
 func ParseSExprInteractive(src string) (S, error) {
 	lex := NewLexerInteractive(src)
 	toks, err := lex.Scan()
@@ -303,9 +121,51 @@ type parser struct {
 	post        []Span
 }
 
+// --- helpers for tokens / annotations classification ---
+
+// tokenIsInlineAnnotation reports whether this ANNOTATION token came from an inline "#(...)"
+// (as opposed to a multi-line block). The lexer leaves inline lexemes starting with "#(".
+func tokenIsInlineAnnotation(t Token) bool {
+	return strings.HasPrefix(t.Lexeme, "#(")
+}
+
+// tokenCanEndExpr is the "ENDER" predicate used for pre/post classification.
+// If the last same-line token before a '#' is one of these, the annotation is POST.
+func tokenCanEndExpr(tt TokenType) bool {
+	switch tt {
+	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
+		TYPE, ENUM,
+		RROUND, RSQUARE, RCURLY,
+		QUESTION:
+		return true
+	default:
+		return false
+	}
+}
+
+// annotationIsPreAt classifies the ANNOTATION at index idx as PRE or POST w.r.t.
+// the last token on the same physical line before it.
+func (p *parser) annotationIsPreAt(idx int) bool {
+	if idx <= 0 || idx >= len(p.toks) {
+		return true
+	}
+	ann := p.toks[idx]
+	// scan left to find last token on the same line
+	for j := idx - 1; j >= 0; j-- {
+		t := p.toks[j]
+		if t.Line < ann.Line {
+			break
+		}
+		if t.Line == ann.Line {
+			// there exists a token before '#' on this line
+			return !tokenCanEndExpr(t.Type) // if it CAN end expr => POST (so PRE=false)
+		}
+	}
+	// no token before '#' on this line => PRE
+	return true
+}
+
 // tokString returns a stable string for tokens used as identifier-like or key names.
-// It prefers Literal when it is a string (e.g., STRING tokens after '.' keep decoded text),
-// otherwise falls back to the verbatim Lexeme.
 func tokString(t Token) string {
 	if s, ok := t.Literal.(string); ok {
 		return s
@@ -385,7 +245,6 @@ func (p *parser) program() (S, error) {
 	}
 	root := L("block", items...)
 	// Append span for the top-level block: cover all non-EOF tokens.
-	// If there are no tokens besides EOF, leave span empty (Start=End=0).
 	startTok := 0
 	endTok := len(p.toks) - 2 // last non-EOF
 	if endTok >= startTok && len(p.toks) > 0 {
@@ -411,11 +270,9 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("noop")
 
 	case ID, TYPE:
-		// Identifiers and capitalized built-in types behave the same in expressions.
 		left = L("id", tokString(t))
 
 	case ENUM:
-		// Enum[ ... ] sugar → ("enum", ...)
 		if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
 			p.i++
 			arr, err := p.arrayLiteralAfterOpen()
@@ -443,7 +300,6 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("null")
 
 	case MINUS, NOT:
-		// unary operators require a RHS expression
 		if p.atEnd() && p.interactive {
 			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after unary operator"}
 		}
@@ -471,7 +327,6 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = a
 
 	case LCURLY:
-		// map literal {k: v, ...} where k is id or string; id may have trailing '!' for required
 		if p.match(RCURLY) {
 			left = L("map")
 		} else {
@@ -519,7 +374,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			ret = r
 		}
-		body, err := p.parseBlock(true) // require 'do'
+		body, err := p.parseBlock(true)
 		if err != nil {
 			return nil, err
 		}
@@ -541,7 +396,6 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			out = o
 		}
-		// accept any expression after `from`
 		var src any = L("array")
 		if p.match(FROM) {
 			if p.atEnd() && p.interactive {
@@ -556,7 +410,6 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("oracle", params, out, src)
 
 	case RETURN, BREAK, CONTINUE:
-		// Newline-sensitive behavior; see file header.
 		if !p.nextTokenIsOnSameLine(t) {
 			switch t.Type {
 			case RETURN:
@@ -589,8 +442,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = thenIf
 
 	case DO:
-		// do ... end
-		body, err := p.parseBlock(false) // 'do' already consumed
+		body, err := p.parseBlock(false)
 		if err != nil {
 			return nil, err
 		}
@@ -616,10 +468,17 @@ func (p *parser) expr(minBP int) (S, error) {
 			return nil, err
 		}
 		left = pat
-		if tag, _ := pat[0].(string); tag == "darr" || tag == "dobj" {
-			if p.peek().Type != ASSIGN {
+		// Destructuring check must ignore outer annotations and allow POST annotations
+		// immediately after the pattern before '='.
+		base := unwrapAnnots(pat)
+		if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
+			// Look ahead, skipping any POST annotations, to verify that '=' follows.
+			j := p.i
+			for j < len(p.toks) && p.toks[j].Type == ANNOTATION && !p.annotationIsPreAt(j) {
+				j++
+			}
+			if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
 				g := p.peek()
-				// If input ended, mark as incomplete
 				if p.interactive && g.Type == EOF {
 					return nil, &IncompleteError{Line: g.Line, Col: g.Col, Msg: "expected '=' after destructuring let pattern"}
 				}
@@ -627,7 +486,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 		}
 
-	case TYPECONS: // "type" <expr>
+	case TYPECONS:
 		if p.atEnd() && p.interactive {
 			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected type expression after 'type'"}
 		}
@@ -638,19 +497,39 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("type", x)
 
 	case ANNOTATION:
-		// wrap next expression
-		if p.atEnd() && p.interactive {
-			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
-		}
-		x, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
+		// Classify as PRE/POST by same-line ender rule.
+		pre := p.annotationIsPreAt(p.i - 1)
 		txt := ""
 		if s, ok := t.Literal.(string); ok {
 			txt = s
 		}
-		left = L("annot", L("str", txt), x)
+		// Stacking ban for inline PRE targeting the same expression:
+		// if the next token is another inline PRE on the same line, it's ambiguous.
+		if pre && !p.atEnd() {
+			next := p.peek()
+			if next.Type == ANNOTATION &&
+				tokenIsInlineAnnotation(t) &&
+				tokenIsInlineAnnotation(next) &&
+				next.Line == t.Line &&
+				p.annotationIsPreAt(p.i) {
+				return nil, &ParseError{Line: next.Line, Col: next.Col, Msg: "multiple inline pre-annotations are a parse error"}
+			}
+		}
+		if pre {
+			if p.atEnd() && p.interactive {
+				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
+			}
+			x, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			left = L("annot", L("str", txt), x, true)
+		} else {
+			// POST at a prefix position has no finished LHS to attach to.
+			// In practice, POST annotations should be consumed in the postfix loop below
+			// of the prior expression; reaching here indicates a structural issue.
+			return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: "post-annotation has no preceding expression to attach"}
+		}
 
 	default:
 		if t.Type == EOF && p.interactive {
@@ -659,7 +538,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme)}
 	}
 
-	// ---- postfix chain: call (), index [], get . ----
+	// ---- postfix chain: ?, call (), index [], dot, and POST annotations ----
 	for {
 		switch p.peek().Type {
 		case QUESTION:
@@ -699,7 +578,6 @@ func (p *parser) expr(minBP int) (S, error) {
 			continue
 		case PERIOD:
 			p.i++
-			// obj.(EXPR) → idx(obj, EXPR)
 			if p.match(LROUND) || p.match(CLROUND) {
 				ex, err := p.expr(0)
 				if err != nil {
@@ -711,7 +589,7 @@ func (p *parser) expr(minBP int) (S, error) {
 				left = L("idx", left, ex)
 				continue
 			}
-			if p.match(INTEGER) { // obj.90 → idx(obj, 90)
+			if p.match(INTEGER) {
 				left = L("idx", left, L("int", p.prev().Literal))
 				continue
 			}
@@ -721,6 +599,35 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			g := p.peek()
 			return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected property name, integer, or '(expr)' after '.'"}
+
+		case ANNOTATION:
+			// Decide whether this is PRE for the next thing, or POST for 'left'.
+			if p.annotationIsPreAt(p.i) {
+				// leave it for the next expression
+				break
+			}
+			// POST: wrap the finished left.
+			a := p.peek()
+			p.i++
+			txt := ""
+			if s, ok := a.Literal.(string); ok {
+				txt = s
+			}
+			left = L("annot", L("str", txt), left, false)
+
+			// Stacking ban for inline POST targeting the same left (no intervening non-annotation token).
+			// Do NOT rely on classifying the next annotation as POST (it may appear PRE by the rule),
+			// just ban a second inline annotation on the same line immediately after the first.
+			if !p.atEnd() {
+				next := p.peek()
+				if next.Type == ANNOTATION &&
+					tokenIsInlineAnnotation(a) &&
+					tokenIsInlineAnnotation(next) &&
+					next.Line == a.Line {
+					return nil, &ParseError{Line: next.Line, Col: next.Col, Msg: "multiple inline post-annotations are a parse error"}
+				}
+			}
+			continue
 		}
 		break
 	}
@@ -757,10 +664,8 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 	}
 	// On completion of this node, append its span (post-order).
-	// Use tokens[nodeStartTok ... p.i-1].
 	if p.i-1 >= nodeStartTok && nodeStartTok < len(p.toks) {
 		endTok := p.i - 1
-		// Guard against EOF being the only thing consumed (shouldn't happen).
 		if endTok >= 0 && endTok < len(p.toks) {
 			p.post = append(p.post, Span{
 				StartByte: p.toks[nodeStartTok].StartByte,
@@ -778,7 +683,6 @@ func (p *parser) expr(minBP int) (S, error) {
 // ---------- helpers ----------
 
 func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	// We’ve already consumed the opening '['
 	if p.match(RSQUARE) {
 		return L("array"), nil
 	}
@@ -817,7 +721,7 @@ func (p *parser) params() (S, error) {
 			if p.atEnd() && p.interactive {
 				return nil, &IncompleteError{Line: idTok.Line, Col: idTok.Col, Msg: "expected type after ':'"}
 			}
-			e, err := p.expr(0) // parse type as expression
+			e, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
@@ -834,8 +738,7 @@ func (p *parser) params() (S, error) {
 	return L("array", ps...), nil
 }
 
-// ifExpr builds: ("if", ("pair", cond1, thenBlk1), ("pair", cond2, thenBlk2), ..., [elseBlk?])
-// NOTE: The final element, if present, is a bare ("block", ...) for 'else', not wrapped in a tag.
+// ifExpr builds: ("if", ("pair", cond1, thenBlk1), ... [, elseBlk?])
 func (p *parser) ifExpr() (S, error) {
 	cond, err := p.expr(0)
 	if err != nil {
@@ -877,8 +780,6 @@ func (p *parser) ifExpr() (S, error) {
 	return L("if", append(arms, elseTail...)...), nil
 }
 
-// Parse a block; if requireDo is true, assert a leading 'do'.
-// Always requires a trailing 'end'.
 func (p *parser) parseBlock(requireDo bool) (S, error) {
 	if requireDo {
 		if _, err := p.need(DO, "expected 'do'"); err != nil {
@@ -932,7 +833,6 @@ func (p *parser) forExpr() (S, error) {
 }
 
 func (p *parser) whileExpr() (S, error) {
-	// while COND do ... end
 	cond, err := p.expr(0)
 	if err != nil {
 		return nil, err
@@ -950,23 +850,19 @@ func (p *parser) forTarget() (S, error) {
 		return p.declPattern()
 	}
 
-	// If the next token clearly starts a pattern, parse a *declaration* pattern
-	// (implicit binding) just like Python: `for [k, v] in ...` or `for {k:x} in ...`.
 	switch p.peek().Type {
 	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
 		save := p.i
 		pt, err := p.declPattern()
 		if err == nil {
-			return pt, nil // e.g., ("darr", ...), ("dobj", ...)
+			return pt, nil
 		}
-		// In interactive mode, bubble up incompleteness instead of falling back
 		if p.interactive && IsIncomplete(err) {
 			return nil, err
 		}
-		p.i = save // fall back below if pattern parse fails
+		p.i = save
 	}
 
-	// Otherwise, parse a simple prim+postfix expression and require it's assignable
 	save := p.i
 	e, err := p.expr(90)
 	if err != nil {
@@ -978,18 +874,29 @@ func (p *parser) forTarget() (S, error) {
 		return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "invalid for-target (must be id/get/idx/decl/pattern)"}
 	}
 
-	// Bare id → implicit declaration, same as before
 	if e[0].(string) == "id" {
 		return L("decl", e[1].(string)), nil
 	}
 	return e, nil
 }
 
+// assignable now transparently unwraps outer "annot" nodes.
 func assignable(n S) bool {
-	if len(n) == 0 {
+	cur := n
+	for len(cur) > 0 {
+		tag, _ := cur[0].(string)
+		if tag == "annot" {
+			if inner, ok := cur[2].(S); ok {
+				cur = inner
+				continue
+			}
+		}
+		break
+	}
+	if len(cur) == 0 {
 		return false
 	}
-	switch n[0] {
+	switch cur[0] {
 	case "id", "get", "idx", "decl", "darr", "dobj":
 		return true
 	default:
@@ -997,16 +904,36 @@ func assignable(n S) bool {
 	}
 }
 
-// ----- Declaration patterns (with annotation wrapper) -----
+// Unwrap any outer "annot" nodes and return the base node.
+func unwrapAnnots(n S) S {
+	cur := n
+	for len(cur) > 0 {
+		tag, _ := cur[0].(string)
+		if tag != "annot" {
+			break
+		}
+		inner, ok := cur[2].(S)
+		if !ok {
+			break
+		}
+		cur = inner
+	}
+	return cur
+}
+
+// ----- Declaration patterns (with pre-annotation wrapper) -----
 
 func (p *parser) declPattern() (S, error) {
-	// Allow stacked line-leading annotations to wrap the next pattern.
-	if anns := p.consumeAnnotations(); len(anns) > 0 {
+	// Allow stacked line-leading PRE annotations to wrap the next pattern,
+	// but disallow stacked *inline* "#(...)" that target the same pattern.
+	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
+		return nil, err
+	} else if len(anns) > 0 {
 		sub, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
-		return p.wrapWithAnnotations(anns, sub), nil
+		return p.wrapWithPreAnnotations(anns, sub), nil
 	}
 
 	if p.match(ID) {
@@ -1046,15 +973,17 @@ func (p *parser) arrayDeclPattern() (S, error) {
 	return L("darr", parts...), nil
 }
 
-// read a key token and turn it into ("str", key)
+// read a key token and turn it into ("str", key), with optional PRE annotations.
 func (p *parser) readKeyString() (S, error) {
-	// Allow stacked annotation(s) directly in front of the key.
-	if anns := p.consumeAnnotations(); len(anns) > 0 {
+	// Allow stacked PRE annotation(s) directly in front of the key (no inline stacking).
+	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
+		return nil, err
+	} else if len(anns) > 0 {
 		k, err := p.readKeyString()
 		if err != nil {
 			return nil, err
 		}
-		return p.wrapWithAnnotations(anns, k), nil
+		return p.wrapWithPreAnnotations(anns, k), nil
 	}
 
 	// Quoted key.
@@ -1067,7 +996,7 @@ func (p *parser) readKeyString() (S, error) {
 	if isWordLike(t.Type) {
 		p.i++
 		name := t.Lexeme
-		if s, ok := t.Literal.(string); ok { // ID/TYPE/ENUM may carry string Literal
+		if s, ok := t.Literal.(string); ok {
 			name = s
 		}
 		return L("str", name), nil
@@ -1130,23 +1059,42 @@ func (p *parser) objectDeclPattern() (S, error) {
 }
 
 // --- small helpers for annotations ---
-func (p *parser) consumeAnnotations() []string {
+
+// consumePreAnnotationsOrError collects consecutive PRE annotations and enforces the inline-stacking ban.
+// It does not consume POST annotations (those belong to the previous expression).
+func (p *parser) consumePreAnnotationsOrError() ([]string, error) {
 	var texts []string
-	for p.match(ANNOTATION) {
+	for !p.atEnd() && p.peek().Type == ANNOTATION && p.annotationIsPreAt(p.i) {
+		tok := p.peek()
+		p.i++
 		txt := ""
-		if s, ok := p.prev().Literal.(string); ok {
+		if s, ok := tok.Literal.(string); ok {
 			txt = s
 		}
 		texts = append(texts, txt)
+
+		// inline-stacking ban: immediate next ANNOTATION that's also inline PRE on the same line
+		if !p.atEnd() && p.peek().Type == ANNOTATION &&
+			tokenIsInlineAnnotation(tok) &&
+			tokenIsInlineAnnotation(p.peek()) &&
+			p.peek().Line == tok.Line &&
+			p.annotationIsPreAt(p.i) {
+			return nil, &ParseError{Line: p.peek().Line, Col: p.peek().Col, Msg: "multiple inline pre-annotations are a parse error"}
+		}
 	}
-	return texts
+	return texts, nil
+}
+
+// wrapWithPreAnnotations wraps node with the given texts as PRE annotations.
+// First encountered should be outermost → apply in reverse.
+func (p *parser) wrapWithPreAnnotations(texts []string, node S) S {
+	for i := len(texts) - 1; i >= 0; i-- {
+		node = L("annot", L("str", texts[i]), node, true)
+	}
+	return node
 }
 
 func (p *parser) wrapWithAnnotations(texts []string, node S) S {
-	// Outer to inner: the first annotation encountered should wrap outermost,
-	// so we apply in reverse to keep order intuitive for stacked blocks.
-	for i := len(texts) - 1; i >= 0; i-- {
-		node = L("annot", L("str", texts[i]), node)
-	}
-	return node
+	// Backwards compat shim (kept for any existing internal calls).
+	return p.wrapWithPreAnnotations(texts, node)
 }

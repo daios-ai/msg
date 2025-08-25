@@ -73,7 +73,7 @@
 //   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
 //     reported as *LexError* with precise location.
 //   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings or unterminated "#(...)" / "##(...)" inline blocks produce
+//     strings or unterminated "#(...)" inline blocks produce
 //     *IncompleteError* instead of LexError. Use IsIncomplete(err) to detect this
 //     and prompt for more input.
 //
@@ -254,7 +254,7 @@ type Token struct {
 
 // LexError reports a lexical error detected during scanning (e.g., invalid
 // escape sequence, malformed number, unexpected character, invalid UTF-8).
-// In non-interactive mode, unterminated strings or inline "#(...)" / "##(...)"
+// In non-interactive mode, unterminated strings or inline "#(...)"
 // also produce LexError.
 //
 // The error position (Line, Col) refers to the location where the lexer
@@ -273,8 +273,7 @@ func (e *LexError) Error() string {
 // It is returned *only* by a lexer created with NewLexerInteractive when the
 // end of input is reached inside:
 //   - a string literal,
-//   - an inline annotation "#( ... )", or
-//   - an inline comment   "##( ... )".
+//   - an inline annotation "#( ... )".
 //
 // Use IsIncomplete(err) to detect this case in REPLs and prompt the user for
 // more lines instead of failing the parse.
@@ -333,7 +332,7 @@ type Lexer struct {
 }
 
 // NewLexer creates a new lexer for the given source in normal mode.
-// Unterminated strings / "#(...)" / "##(...)" yield LexError.
+// Unterminated strings / "#(...)" yield LexError.
 func NewLexer(src string) *Lexer {
 	return &Lexer{
 		src: src,

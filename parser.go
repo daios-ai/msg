@@ -1093,8 +1093,3 @@ func (p *parser) wrapWithPreAnnotations(texts []string, node S) S {
 	}
 	return node
 }
-
-func (p *parser) wrapWithAnnotations(texts []string, node S) S {
-	// Backwards compat shim (kept for any existing internal calls).
-	return p.wrapWithPreAnnotations(texts, node)
-}

@@ -6,7 +6,7 @@
 // kinds of data to human-readable, stable strings:
 //
 //  1. Parsed source ASTs (S-expressions) → MindScript source code.
-//     - Entry points: Pretty(src), FormatSExpr(ast).
+//     - Entry points: Pretty, Standardize, FormatSExpr.
 //     - Produces whitespace- and newline-stable output with minimal
 //     parentheses, based on operator precedence. It understands all
 //     statement and expression tags emitted by the parser (e.g. "fun",
@@ -24,26 +24,26 @@
 //     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
 //
 //  2. Type ASTs (S-expressions) → compact type strings.
-//     - Entry point: FormatType(t).
+//     - Entry point: FormatType.
 //     - Supported forms:
-//     • ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
-//     • ("unop","?", T)         → prints as `T?`
-//     • ("array", T)            → prints as `[T]`
-//     • ("map", ("pair"| "pair!", ("str",k), T) ...)
+//     ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
+//     ("unop","?", T)         → prints as `T?`
+//     ("array", T)            → prints as `[T]`
+//     ("map", ("pair"| "pair!", ("str",k), T) ...)
 //     Required fields print with a trailing `!` on the key.
 //     Key/value annotations (if wrapped in "annot") become `# ...` lines.
-//     • ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
+//     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
 //     may be scalars, arrays, or maps.
-//     • ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
+//     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
 //     right-associated chains.
 //     - Output is stable. Multi-line maps are rendered with sorted keys to
 //     avoid visual churn.
 //
 //  3. Runtime values (Value) → width-aware strings.
-//     - Entry point: FormatValue(v).
+//     - Entry point: FormatValue.
 //     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
 //     - Arrays and maps prefer a single-line rendering if it fits the
-//     `MaxInlineWidth` budget and no elements/keys force multi-line; else
+//     MaxInlineWidth budget and no elements/keys force multi-line; else
 //     they fall back to pretty, multi-line output with indentation.
 //     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
 //     - Per-value annotations (Value.Annot) and per-key annotations in maps
@@ -57,11 +57,11 @@
 // --------------------------
 // • parser.go
 //   - S = []any (AST payload shape)
-//   - ParseSExpr(string) (used by Pretty)
-//   - AST tags: "block", "fun", "oracle", "for", "while", "if", "then", "elif",
-//     "else", "type", "return", "break", "continue", "assign", "array", "map",
+//   - ParseSExpr(string) / ParseSExprInteractive (used by Pretty/Standardize)
+//   - AST tags: "block", "fun", "oracle", "for", "while", "if",
+//     "type", "return", "break", "continue", "assign", "array", "map",
 //     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
-//     "null", "unop", "binop", "decl", "darr", "dobj", "annot".
+//     "null", "unop", "binop", "decl", "darr", "dobj", "annot", "noop".
 //
 // • interpreter.go (runtime model)
 //   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
@@ -72,7 +72,7 @@
 //   - Module struct and prettySpec(string) (used for VTModule display).
 //
 // • errors.go (shared errors)
-//   - WrapErrorWithSource(err, src) (used by Pretty).
+//   - WrapErrorWithSource(err, src) (used by Pretty/Standardize).
 //
 // PUBLIC vs PRIVATE layout
 // ------------------------
@@ -80,7 +80,8 @@
 //  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
 //  2. PRIVATE: helper types and functions that implement the printers.
 //
-// Formatting policy highlights:
+// Formatting policy highlights
+// ----------------------------
 //   - Indentation uses **tabs** only (gofmt-style).
 //   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
 package mindscript
@@ -96,31 +97,21 @@ import (
 // ========== PUBLIC ============
 // ==============================
 
-// MaxInlineWidth controls when arrays/maps are rendered on a single line
-// by FormatValue. If the one-line candidate exceeds this many characters,
-// or if any element/key is annotated or multiline by nature, the value is
-// rendered across multiple lines with indentation.
-//
-// This setting is read at call time and is safe to change between calls.
+// MaxInlineWidth controls when arrays/maps are rendered on a single line by
+// FormatValue. If the one-line candidate exceeds this many characters, or if
+// any element/key is annotated or multiline by nature, the value is rendered
+// across multiple lines with indentation. This setting is read at call time
+// and may be changed between calls.
 var MaxInlineWidth = 80
 
 // Pretty parses a MindScript source string and returns a formatted version.
 //
 // Behavior:
-//   - Parses `src` via ParseSExpr (from parser.go). If parsing fails,
-//     the error is wrapped with source context via WrapErrorWithSource.
-//   - On success, it pretty-prints the resulting AST using FormatSExpr,
-//     producing stable, whitespace-normalized code.
-//   - Annotation nodes ("annot", ("str", text), X, preBool) print as `# text`
-//     lines either before (pre) or after (post) X.
-//   - Operators use minimal parentheses according to precedence/associativity:
-//   - "->" (lowest), "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
-//   - postfix call/index/get bind tightest; unary ("not", "-") binds tighter than
-//     binary arithmetic; assignment is the loosest among term operators.
-//   - Object/map keys are emitted unquoted if they match identifier syntax
-//     ([A-Za-z_][A-Za-z0-9_]*), else quoted with JSON-style escapes.
-//   - Destructuring declaration patterns ("decl"/"darr"/"dobj") and
-//     assignments print in a user-friendly layout.
+//   - Parses src via ParseSExpr. If parsing fails, the error is wrapped with
+//     source context via WrapErrorWithSource.
+//   - On success, pretty-prints the AST using FormatSExpr, producing stable,
+//     whitespace-normalized code with minimal parentheses.
+//   - Supports PRE/POST annotations: ("annot", ("str", text), X, preBool).
 //
 // Errors:
 //   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
@@ -132,10 +123,12 @@ func Pretty(src string) (string, error) {
 	return FormatSExpr(ast), nil
 }
 
-// Standardize returns the canonical source form ("standard_source_code"):
+// Standardize returns the canonical source form:
 //   - deterministic layout
 //   - indentation using tabs
 //   - exactly one trailing newline
+//
+// It is equivalent to Pretty(src), but ensures precisely one '\n' at the end.
 func Standardize(src string) (string, error) {
 	ast, err := ParseSExpr(src)
 	if err != nil {
@@ -145,7 +138,6 @@ func Standardize(src string) (string, error) {
 	if !strings.HasSuffix(out, "\n") {
 		out += "\n"
 	} else {
-		// ensure exactly one
 		out = strings.TrimRight(out, "\n") + "\n"
 	}
 	return out, nil
@@ -158,12 +150,11 @@ func Standardize(src string) (string, error) {
 //
 // Output policy:
 //   - Statements (fun/oracle/for/if/type/block/return/break/continue/assign)
-//     are rendered with keywords and indentation similar to Pretty.
-//   - Expressions are printed with minimal parentheses based on a fixed
-//     precedence table; property access vs calls/indexing binds tightly.
-//   - Arrays and maps are printed inline (AST form) without line-width heuristics;
-//     however, annotations on map keys are emitted as preceding `# ...` comment lines.
-//   - Annotation nodes wrap the printed construct with header comments.
+//     are rendered with keywords and indentation.
+//   - Expressions use minimal parentheses according to a fixed precedence table;
+//     property access vs calls/indexing binds tightly.
+//   - Arrays and maps are printed inline (AST form); map key annotations print
+//     as preceding `# ...` lines. Annotation nodes wrap the printed construct.
 //
 // This function does not parse; it strictly formats the provided AST.
 func FormatSExpr(n S) string {
@@ -180,16 +171,13 @@ func FormatSExpr(n S) string {
 //   - ("unop","?", T)           →  T?
 //   - ("array", T)              →  [T]
 //   - ("map", ("pair"| "pair!", ("str",k), T) ...)
-//   - Required fields print as `key!:`
-//   - Keys are quoted if not identifier-like
-//   - Key/value annotations (when wrapped in "annot") emit `# ...`
-//     lines above the field
-//   - ("enum", lit1, lit2, ...) →  Enum[lit1, lit2, ...] where literals may be
-//     scalars, arrays, or maps rendered in a type-literal form
-//   - ("binop","->", A, B)      →  (A) -> B ; right-assoc chains flatten
+//     Required fields print as `key!:`; keys are quoted if not identifier-like.
+//     Key/value annotations (when wrapped in "annot") emit `# ...` lines above.
+//   - ("enum", lit1, ...)       →  Enum[lit1, ...] ; members may be scalars,
+//     arrays, or maps rendered as type-literals.
+//   - ("binop","->", A, B)      →  (A) -> B ; right-assoc chains flatten.
 //
-// Output is stable; when multi-line, map fields are sorted by key name for
-// readability and determinism.
+// Output is stable; when multi-line, map fields are sorted by key for determinism.
 func FormatType(t S) string {
 	var b strings.Builder
 	o := out{b: &b}
@@ -200,27 +188,16 @@ func FormatType(t S) string {
 // FormatValue renders a runtime Value into a stable, readable string.
 //
 // Layout policy:
-//   - Scalars: `null`, booleans, ints, floats (guaranteed to show a decimal
-//     point for non-scientific output), and quoted strings (with JSON-style escapes).
-//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line
-//     and total length ≤ MaxInlineWidth; otherwise multi-line with one element per
-//     line, indented, and with trailing commas omitted.
-//   - Maps (MapObject):
-//   - Keys are emitted in sorted order for stability.
-//   - Single-line `{ k1: v1, k2: v2 }` is used when feasible under the
-//     MaxInlineWidth budget and when no key carries a header annotation.
-//   - Multi-line maps indent each entry; key/value annotations are emitted
-//     as `# ...` lines immediately above the field.
-//   - Keys are quoted when not identifier-like.
-//   - Functions: printed as `<fun: name1:T1 -> name2:T2 -> R>`
-//   - Zero-arg closures display `_:Null` for the single implicit unit.
-//   - Types (VTType): the embedded type AST is pretty-printed via FormatType.
-//   - Modules: printed as `<module: pretty-name>` if available.
-//   - Value.Annot (header annotation): if non-empty, prints as leading `# ...`
-//     lines above the value.
-//
-// Width sensitivity is only applied to runtime arrays/maps (not AST/type forms),
-// and is controlled by MaxInlineWidth.
+//   - Scalars: null, booleans, ints, floats (with a decimal point for
+//     non-scientific output), and quoted strings.
+//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line and
+//     total length ≤ MaxInlineWidth; otherwise multi-line with indentation.
+//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short
+//     and unannotated, else multi-line with indentation and key/value annotations
+//     emitted as `# ...` header lines.
+//   - Functions: `<fun: name1:T1 -> name2:T2 -> R>` (zero-arg uses `_:Null`).
+//   - Types (VTType): pretty-printed via FormatType.
+//   - Modules: `<module: pretty-name>` when available.
 func FormatValue(v Value) string {
 	var b strings.Builder
 	o := out{b: &b}
@@ -234,10 +211,8 @@ func FormatValue(v Value) string {
 // ========= PRIVATE =============
 // ===============================
 
-/* ---------- globals & tiny helpers ---------- */
+/* ---------- small globals & utilities ---------- */
 
-// isIdent tests ASCII identifiers compatible with the lexer rules:
-// first char [A-Za-z_], rest [A-Za-z0-9_].
 func isIdent(s string) bool {
 	if s == "" {
 		return false
@@ -283,8 +258,6 @@ func quoteString(s string) string {
 	return b.String()
 }
 
-/* ---------- small writer with indentation & annotations ---------- */
-
 type out struct {
 	b     *strings.Builder
 	depth int
@@ -297,198 +270,288 @@ func (o *out) pad() {
 		o.b.WriteByte('\t')
 	}
 }
-func (o *out) line(s string)        { o.pad(); o.b.WriteString(s) }
 func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
 func (o *out) annot(text string) {
 	if text == "" {
 		return
 	}
 	for _, ln := range strings.Split(text, "\n") {
-		o.line("# " + strings.TrimSpace(ln))
+		o.pad()
+		o.b.WriteString("# " + strings.TrimSpace(ln))
 		o.nl()
 	}
 }
 
-// unwraps the current VTType payload to its AST (supports legacy S as well).
+// unwrap VTType payload to its AST (supports legacy S too).
 func typeAst(data any) S {
 	switch tv := data.(type) {
 	case *TypeValue:
 		return tv.Ast
-	case S: // legacy fallback
+	case S:
 		return tv
 	default:
 		return S{}
 	}
 }
 
-/* ---------- source -> pretty (AST printer) ---------- */
+/* ---------- AST helpers: tags, shapes, precedence ---------- */
 
-type pp struct {
-	out out
+func tag(n S) string   { return n[0].(string) }
+func getId(n S) string { return n[1].(string) }
+func getStr(n S) string {
+	// Used for ("str", s), but safe for ("id", name) too (both carry string at [1]).
+	return n[1].(string)
 }
+
+// Shape helpers (safe indexing in one place)
+func asUnop(n S) (op string, rhs S)       { return n[1].(string), n[2].(S) }
+func asBinop(n S) (op string, lhs, rhs S) { return n[1].(string), n[2].(S), n[3].(S) }
+func asAssign(n S) (lhs, rhs S)           { return n[1].(S), n[2].(S) }
+func asCall(n S) (recv S, args []S)       { recv = n[1].(S); return recv, listS(n, 2) }
+func asIdx(n S) (recv, idx S)             { return n[1].(S), n[2].(S) }
+func asGet(n S) (recv S, name string)     { return n[1].(S), n[2].(S)[1].(string) }
+func asAnnot(n S) (text string, wrapped S, pre bool) {
+	text = n[1].(S)[1].(string)
+	wrapped = n[2].(S)
+	pre = true
+	if len(n) >= 4 {
+		if b, ok := n[3].(bool); ok {
+			pre = b
+		}
+	}
+	return
+}
+
+func listS(n S, from int) []S {
+	if len(n) <= from {
+		return nil
+	}
+	out := make([]S, 0, len(n)-from)
+	for i := from; i < len(n); i++ {
+		out = append(out, n[i].(S))
+	}
+	return out
+}
+
+func bracketed(o *out, open, close string, elems []S, emit func(S)) {
+	o.write(open)
+	for i, e := range elems {
+		if i > 0 {
+			o.write(", ")
+		}
+		emit(e)
+	}
+	o.write(close)
+}
+
+func keyOut(o *out, name string) {
+	if isIdent(name) {
+		o.write(name)
+	} else {
+		o.write(quoteString(name))
+	}
+}
+
+var binPrec = map[string]struct {
+	p     int
+	right bool
+}{
+	"->": {15, true},
+	"*":  {70, false}, "/": {70, false}, "%": {70, false},
+	"+": {60, false}, "-": {60, false},
+	"<": {50, false}, "<=": {50, false}, ">": {50, false}, ">=": {50, false},
+	"==": {40, false}, "!=": {40, false},
+	"and": {30, false},
+	"or":  {20, false},
+}
+
+func precOf(n S) int {
+	switch tag(n) {
+	case "assign":
+		return 10
+	case "binop":
+		if pr, ok := binPrec[n[1].(string)]; ok {
+			return pr.p
+		}
+		return 60
+	case "unop":
+		if n[1].(string) == "?" {
+			return 90
+		}
+		return 80
+	case "call", "idx", "get":
+		return 90
+	default:
+		return 100
+	}
+}
+
+/* ---------- source → pretty (AST printer) ---------- */
+
+type pp struct{ out out }
 
 func (p *pp) write(s string) { p.out.write(s) }
 func (p *pp) nl()            { p.out.nl() }
-func (p *pp) sp()            { p.out.write(" ") }
 func (p *pp) pad()           { p.out.pad() }
+func (p *pp) sp()            { p.write(" ") }
+
+func (p *pp) printMin(n S, need int) {
+	if precOf(n) < need {
+		p.write("(")
+		p.printExpr(n)
+		p.write(")")
+		return
+	}
+	p.printExpr(n)
+}
+func (p *pp) recv90(n S) { p.printMin(n, 90) }
+
+func (p *pp) bin(op string, l, r S) {
+	my := 60
+	if pr, ok := binPrec[op]; ok {
+		my = pr.p
+	}
+	p.printMin(l, my)
+	p.write(" " + op + " ")
+	p.printMin(r, my)
+}
 
 func (p *pp) printProgram(n S) {
 	if tag(n) != "block" {
 		p.printStmt(n)
 		return
 	}
-	kids := children(n)
-	for i, k := range kids {
-		p.printStmt(k.(S))
-		if i < len(kids)-1 {
+	for i, k := range listS(n, 1) {
+		p.printStmt(k)
+		if i < len(listS(n, 1))-1 {
 			p.nl()
 		}
+	}
+}
+
+func (p *pp) kwCall(name string, arg S) {
+	p.pad()
+	p.write(name)
+	p.write("(")
+	p.printExpr(arg)
+	p.write(")")
+}
+
+func (p *pp) kwBlock(header func(), body S) {
+	p.pad()
+	header()
+	p.sp()
+	p.write("do")
+	p.nl()
+	p.out.withIndent(func() { p.printBlock(body) })
+	if len(body) > 1 {
+		p.nl()
+	}
+	p.pad()
+	p.write("end")
+}
+
+func (p *pp) callableHeader(kind string, params, outT S) {
+	p.write(kind)
+	p.write("(")
+	p.printParams(params)
+	p.write(")")
+	if !(tag(outT) == "id" && getId(outT) == "Any") {
+		p.sp()
+		p.write("->")
+		p.sp()
+		p.printExpr(outT)
+	}
+}
+
+func isEmptyArray(n S) bool { return tag(n) == "array" && len(n) == 1 }
+
+func (p *pp) printAnnotStmt(n S) {
+	text, wrapped, pre := asAnnot(n)
+	if pre {
+		p.out.annot(text)
+		p.printStmt(wrapped)
+	} else {
+		p.printStmt(wrapped)
+		p.nl()
+		p.out.annot(text)
 	}
 }
 
 func (p *pp) printStmt(n S) {
 	switch tag(n) {
 	case "noop":
-		// Intentionally print nothing. The caller (printProgram/printBlock)
-		// always adds one newline after each statement.
 		return
 	case "annot":
-		text := getStr(child(n, 0))
-		wrapped := child(n, 1)
-		pre := true
-		if len(n) >= 4 {
-			if b, ok := n[3].(bool); ok {
-				pre = b
-			}
-		}
-		if pre {
-			p.out.annot(text)
-			p.printStmt(wrapped)
-		} else {
-			// POST: print the wrapped construct first, then the annotation lines
-			p.printStmt(wrapped)
-			p.nl()
-			p.out.annot(text)
-		}
+		p.printAnnotStmt(n)
 
 	case "fun":
-		p.pad()
-		p.write("fun(")
-		p.printParams(child(n, 0))
-		p.write(")")
-		ret := child(n, 1)
-		if !(tag(ret) == "id" && getId(ret) == "Any") {
-			p.sp()
-			p.write("->")
-			p.sp()
-			p.printExpr(ret, 0)
-		}
-		p.sp()
-		p.write("do")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(child(n, 2)) })
-		if len(child(n, 2)) > 1 {
-			p.nl()
-		}
-		p.pad()
-		p.write("end")
+		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
+		p.kwBlock(func() { p.callableHeader("fun", params, ret) }, body)
 
 	case "oracle":
+		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
 		p.pad()
-		p.write("oracle(")
-		p.printParams(child(n, 0))
-		p.write(")")
-		outT := child(n, 1)
-		if !(tag(outT) == "id" && getId(outT) == "Any") {
-			p.sp()
-			p.write("->")
-			p.sp()
-			p.printExpr(outT, 0)
-		}
-		src := child(n, 2)
-		// Print `from <expr>` for any non-empty source expression; omit for empty array
-		if !(tag(src) == "array" && len(src) == 1) {
+		p.callableHeader("oracle", params, outT)
+		if !isEmptyArray(src) {
 			p.sp()
 			p.write("from ")
-			p.printExpr(src, 0)
+			p.printExpr(src)
 		}
 
 	case "for":
-		p.pad()
-		p.write("for ")
-		tgt := child(n, 0)
-		// For targets that are declaration patterns, print them as patterns:
-		//  - ("decl", x)    → "let x"
-		//  - ("darr", ...)  → "[...]"  (no "let")
-		//  - ("dobj", ...)  → "{...}"  (no "let")
-		// Non-pattern assignables print as normal expressions.
-		if isDeclPattern(tgt) {
-			if tag(tgt) == "decl" {
-				p.write("let ")
-				p.printPattern(tgt) // prints just the name
+		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
+		p.kwBlock(func() {
+			p.write("for ")
+			if isDeclPattern(tgt) {
+				if tag(tgt) == "decl" {
+					p.write("let ")
+					p.printPattern(tgt)
+				} else {
+					p.printPattern(tgt)
+				}
 			} else {
-				p.printPattern(tgt)
+				p.printExpr(tgt)
 			}
-		} else {
-			p.printExpr(tgt, 0)
-		}
-		p.sp()
-		p.write("in ")
-		p.printExpr(child(n, 1), 0)
-		p.sp()
-		p.write("do")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(child(n, 2)) })
-		if len(child(n, 2)) > 1 {
-			p.nl()
-		}
-		p.pad()
-		p.write("end")
+			p.sp()
+			p.write("in ")
+			p.printExpr(iter)
+		}, body)
 
 	case "while":
-		p.pad()
-		p.write("while ")
-		p.printExpr(child(n, 0), 0)
-		p.sp()
-		p.write("do")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(child(n, 1)) })
-		if len(child(n, 1)) > 1 {
-			p.nl()
-		}
-		p.pad()
-		p.write("end")
+		cond, body := n[1].(S), n[2].(S)
+		p.kwBlock(func() { p.write("while "); p.printExpr(cond) }, body)
 
 	case "if":
-		arms := children(n)
-		first := arms[0].(S)
+		arms := listS(n, 1)
+		first := arms[0]
 		p.pad()
 		p.write("if ")
-		p.printExpr(child(first, 0), 0)
+		p.printExpr(first[1].(S))
 		p.sp()
 		p.write("then")
 		p.nl()
-		p.out.withIndent(func() { p.printBlock(child(first, 1)) })
-		if len(child(first, 1)) > 1 {
+		p.out.withIndent(func() { p.printBlock(first[2].(S)) })
+		if len(first[2].(S)) > 1 {
 			p.nl()
 		}
 		i := 1
-		for i < len(arms) && tag(arms[i].(S)) == "pair" {
-			arm := arms[i].(S)
+		for i < len(arms) && tag(arms[i]) == "pair" {
+			arm := arms[i]
 			p.pad()
 			p.write("elif ")
-			p.printExpr(child(arm, 0), 0)
+			p.printExpr(arm[1].(S))
 			p.sp()
 			p.write("then")
 			p.nl()
-			p.out.withIndent(func() { p.printBlock(child(arm, 1)) })
-			if len(child(arm, 1)) > 1 {
+			p.out.withIndent(func() { p.printBlock(arm[2].(S)) })
+			if len(arm[2].(S)) > 1 {
 				p.nl()
 			}
 			i++
 		}
 		if i < len(arms) {
-			elseBlk := arms[i].(S)
+			elseBlk := arms[i]
 			p.pad()
 			p.write("else")
 			p.nl()
@@ -503,28 +566,17 @@ func (p *pp) printStmt(n S) {
 	case "type":
 		p.pad()
 		p.write("type ")
-		p.printExpr(child(n, 0), 0)
+		p.printExpr(n[1].(S))
 
 	case "return":
-		p.pad()
-		p.write("return(")
-		p.printExpr(child(n, 0), 0)
-		p.write(")")
-
+		p.kwCall("return", n[1].(S))
 	case "break":
-		p.pad()
-		p.write("break(")
-		p.printExpr(child(n, 0), 0)
-		p.write(")")
-
+		p.kwCall("break", n[1].(S))
 	case "continue":
-		p.pad()
-		p.write("continue(")
-		p.printExpr(child(n, 0), 0)
-		p.write(")")
+		p.kwCall("continue", n[1].(S))
 
 	case "assign":
-		lhs, rhs := child(n, 0), child(n, 1)
+		lhs, rhs := asAssign(n)
 		p.pad()
 		if isDeclPattern(lhs) {
 			p.write("let ")
@@ -532,13 +584,13 @@ func (p *pp) printStmt(n S) {
 			p.sp()
 			p.write("=")
 			p.sp()
-			p.printExpr(rhs, 0)
+			p.printExpr(rhs)
 		} else {
-			p.printExpr(lhs, 0)
+			p.printExpr(lhs)
 			p.sp()
 			p.write("=")
 			p.sp()
-			p.printExpr(rhs, 0)
+			p.printExpr(rhs)
 		}
 
 	case "block":
@@ -554,7 +606,7 @@ func (p *pp) printStmt(n S) {
 
 	default:
 		p.pad()
-		p.printExpr(n, 0)
+		p.printExpr(n)
 	}
 }
 
@@ -563,9 +615,9 @@ func (p *pp) printBlock(n S) {
 		p.printStmt(n)
 		return
 	}
-	kids := children(n)
+	kids := listS(n, 1)
 	for i, k := range kids {
-		p.printStmt(k.(S))
+		p.printStmt(k)
 		if i < len(kids)-1 {
 			p.nl()
 		}
@@ -576,15 +628,13 @@ func (p *pp) printParams(arr S) {
 	if tag(arr) != "array" || len(arr) == 1 {
 		return
 	}
-	items := children(arr)
-	for i, it := range items {
-		pi := it.(S)
-		name := getId(child(pi, 0))
-		p.write(name)
-		ty := child(pi, 1)
+	items := listS(arr, 1)
+	for i, pi := range items {
+		p.write(getId(pi[1].(S)))
+		ty := pi[2].(S)
 		if !(tag(ty) == "id" && getId(ty) == "Any") {
 			p.write(": ")
-			p.printExpr(ty, 0)
+			p.printExpr(ty)
 		}
 		if i < len(items)-1 {
 			p.write(", ")
@@ -592,15 +642,23 @@ func (p *pp) printParams(arr S) {
 	}
 }
 
-func (p *pp) printExpr(n S, _ctx int) {
+func (p *pp) printCommaList(xs []S, emit func(S)) {
+	for i, a := range xs {
+		if i > 0 {
+			p.write(", ")
+		}
+		emit(a)
+	}
+}
+
+func (p *pp) printExpr(n S) {
 	switch tag(n) {
 	case "id":
 		p.write(getId(n))
 	case "int":
 		p.write(fmt.Sprint(n[1]))
 	case "num":
-		f := n[1].(float64)
-		s := strconv.FormatFloat(f, 'g', -1, 64)
+		s := strconv.FormatFloat(n[1].(float64), 'g', -1, 64)
 		if !strings.ContainsAny(s, ".eE") {
 			s += ".0"
 		}
@@ -615,17 +673,11 @@ func (p *pp) printExpr(n S, _ctx int) {
 		}
 	case "null":
 		p.write("null")
+
 	case "unop":
-		op := n[1].(string)
+		op, rhs := asUnop(n)
 		if op == "?" {
-			recv := n[2].(S)
-			if prec(recv) < 90 {
-				p.write("(")
-				p.printExpr(recv, 0)
-				p.write(")")
-			} else {
-				p.printExpr(recv, 90)
-			}
+			p.recv90(rhs)
 			p.write("?")
 			return
 		}
@@ -634,226 +686,102 @@ func (p *pp) printExpr(n S, _ctx int) {
 		} else {
 			p.write(op)
 		}
-		operand := n[2].(S)
-		if prec(operand) < 80 {
-			p.write("(")
-			p.printExpr(operand, 0)
-			p.write(")")
-		} else {
-			p.printExpr(operand, 80)
-		}
+		p.printMin(rhs, 80)
+
 	case "binop":
-		op := n[1].(string)
-		my := binopPrec(op)
-		l, r := n[2].(S), n[3].(S)
-		if prec(l) < my {
-			p.write("(")
-			p.printExpr(l, 0)
-			p.write(")")
-		} else {
-			p.printExpr(l, my)
-		}
-		p.write(" " + op + " ")
-		if prec(r) < my {
-			p.write("(")
-			p.printExpr(r, 0)
-			p.write(")")
-		} else {
-			p.printExpr(r, my)
-		}
+		op, l, r := asBinop(n)
+		p.bin(op, l, r)
+
 	case "assign":
-		l, r := child(n, 0), child(n, 1)
-		if prec(l) < 10 {
-			p.write("(")
-			p.printExpr(l, 0)
-			p.write(")")
-		} else {
-			p.printExpr(l, 10)
-		}
+		l, r := asAssign(n)
+		p.printMin(l, 10)
 		p.write(" = ")
-		if prec(r) < 10 {
-			p.write("(")
-			p.printExpr(r, 0)
-			p.write(")")
-		} else {
-			p.printExpr(r, 10)
-		}
+		p.printMin(r, 10)
+
 	case "call":
-		recv := child(n, 0)
-		if prec(recv) < 90 {
-			p.write("(")
-			p.printExpr(recv, 0)
-			p.write(")")
-		} else {
-			p.printExpr(recv, 90)
-		}
+		recv, args := asCall(n)
+		p.recv90(recv)
 		p.write("(")
-		for i := 2; i < len(n); i++ {
-			if i > 2 {
-				p.write(", ")
-			}
-			p.printExpr(n[i].(S), 0)
+		if len(args) > 0 {
+			p.printCommaList(args, func(s S) { p.printExpr(s) })
 		}
 		p.write(")")
+
 	case "idx":
-		recv := child(n, 0)
-		if prec(recv) < 90 {
-			p.write("(")
-			p.printExpr(recv, 0)
-			p.write(")")
-		} else {
-			p.printExpr(recv, 90)
-		}
+		recv, ix := asIdx(n)
+		p.recv90(recv)
 		p.write("[")
-		p.printExpr(child(n, 1), 0)
+		p.printExpr(ix)
 		p.write("]")
+
 	case "get":
-		recv := child(n, 0)
-		if prec(recv) < 90 {
-			p.write("(")
-			p.printExpr(recv, 0)
-			p.write(")")
-		} else {
-			p.printExpr(recv, 90)
-		}
-		name := getStr(child(n, 1))
+		recv, name := asGet(n)
+		p.recv90(recv)
 		if isIdent(name) {
 			p.write("." + name)
 		} else {
 			p.write("." + quoteString(name))
 		}
+
 	case "array":
-		p.printArray(n)
+		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
+
 	case "map":
-		p.printMap(n)
+		p.printMapAST(n)
 
 	case "enum":
-		// Type expression: Enum[ <lits...> ]
-		p.write("Enum[")
-		items := children(n)
-		for i, it := range items {
-			if i > 0 {
-				p.write(", ")
-			}
-			p.printExpr(it.(S), 0) // literals can be scalars, arrays, or maps
-		}
-		p.write("]")
+		bracketed(&p.out, "Enum[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
 
 	case "decl":
 		p.write("let " + getId(n))
+
 	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
 		p.printStmt(n)
+
 	default:
 		p.write("<" + tag(n) + ">")
 	}
 }
 
-func (p *pp) printArray(n S) {
-	p.write("[")
-	for i, it := range children(n) {
-		if i > 0 {
-			p.write(", ")
-		}
-		p.printExpr(it.(S), 0)
-	}
-	p.write("]")
-}
-
-func (p *pp) printMap(n S) {
+func (p *pp) printMapAST(n S) {
 	p.write("{")
-	items := children(n)
+	items := listS(n, 1)
 	for i, pr := range items {
 		if i > 0 {
 			p.write(", ")
 		}
-		pair := pr.(S)
-		keyNode := child(pair, 0)
+		keyNode := pr[1].(S)
 		key, keyAnn := unwrapKey(keyNode)
-
 		if keyAnn != "" {
-			// put the annotation as a line comment just before the field
 			p.nl()
-			p.out.withIndent(func() {
-				p.pad()
-				p.out.annot(keyAnn)
-			})
+			p.out.withIndent(func() { p.out.annot(keyAnn) })
 			p.pad()
 		}
-
-		if isIdent(key) {
-			p.write(key)
-		} else {
-			p.write(quoteString(key))
-		}
+		keyOut(&p.out, key)
 		p.write(": ")
-		p.printExpr(child(pair, 1), 0)
+		p.printExpr(pr[2].(S))
 	}
 	p.write("}")
 }
 
-/* ---------- tiny AST helpers ---------- */
-
-func tag(n S) string     { return n[0].(string) }
-func children(n S) []any { return n[1:] }
-func child(n S, i int) S { return n[i+1].(S) }
-func getId(n S) string   { return n[1].(string) }
-func getStr(n S) string  { return n[1].(string) }
-
-func prec(n S) int {
-	switch tag(n) {
-	case "assign":
-		return 10
-	case "binop":
-		return binopPrec(n[1].(string))
-	case "unop":
-		if n[1].(string) == "?" {
-			return 90
-		}
-		return 80
-	case "call", "idx", "get":
-		return 90
-	default:
-		return 100
-	}
-}
-
-func unwrapKey(n S) (name string, annot string) {
-	if tag(n) == "annot" {
-		return getStr(child(n, 1)), getStr(child(n, 0))
-	}
-	return getStr(n), ""
-}
-
-func binopPrec(op string) int {
-	switch op {
-	case "->":
-		return 15
-	case "*", "/", "%":
-		return 70
-	case "+", "-":
-		return 60
-	case "<", "<=", ">", ">=":
-		return 50
-	case "==", "!=":
-		return 40
-	case "and":
-		return 30
-	case "or":
-		return 20
-	default:
-		return 60
-	}
-}
+/* ---------- patterns ---------- */
 
 func isDeclPattern(n S) bool {
 	switch tag(n) {
 	case "decl", "darr", "dobj":
 		return true
 	case "annot":
-		return isDeclPattern(child(n, 1))
+		return isDeclPattern(n[2].(S))
 	default:
 		return false
 	}
+}
+
+func unwrapKey(n S) (name string, annot string) {
+	if tag(n) == "annot" {
+		return n[2].(S)[1].(string), n[1].(S)[1].(string)
+	}
+	return n[1].(string), ""
 }
 
 func (p *pp) printPattern(n S) {
@@ -861,41 +789,27 @@ func (p *pp) printPattern(n S) {
 	case "decl":
 		p.write(getId(n))
 	case "darr":
-		p.write("[")
-		for i := 1; i < len(n); i++ {
-			if i > 1 {
-				p.write(", ")
-			}
-			p.printPattern(n[i].(S))
-		}
-		p.write("]")
+		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printPattern(s) })
 	case "dobj":
-		items := children(n)
-		needsMultiline := false
+		items := listS(n, 1)
+		multi := false
 		for _, it := range items {
-			pr := it.(S)
-			keyNode := child(pr, 0)
-			_, keyAnn := unwrapKey(keyNode)
-			if keyAnn != "" || tag(pr[2].(S)) == "annot" {
-				needsMultiline = true
+			_, ann := unwrapKey(it[1].(S))
+			if ann != "" || tag(it[2].(S)) == "annot" {
+				multi = true
 				break
 			}
 		}
-		if !needsMultiline {
+		if !multi {
 			p.write("{")
 			for i, it := range items {
 				if i > 0 {
 					p.write(", ")
 				}
-				pr := it.(S)
-				key, _ := unwrapKey(child(pr, 0))
-				if isIdent(key) {
-					p.write(key)
-				} else {
-					p.write(quoteString(key))
-				}
+				key, _ := unwrapKey(it[1].(S))
+				keyOut(&p.out, key)
 				p.write(": ")
-				p.printPattern(child(pr, 1))
+				p.printPattern(it[2].(S))
 			}
 			p.write("}")
 			return
@@ -904,19 +818,14 @@ func (p *pp) printPattern(n S) {
 		p.nl()
 		p.out.withIndent(func() {
 			for i, it := range items {
-				pr := it.(S)
-				key, keyAnn := unwrapKey(child(pr, 0))
-				if keyAnn != "" {
-					p.out.annot(keyAnn)
+				key, ann := unwrapKey(it[1].(S))
+				if ann != "" {
+					p.out.annot(ann)
 				}
 				p.pad()
-				if isIdent(key) {
-					p.write(key)
-				} else {
-					p.write(quoteString(key))
-				}
+				keyOut(&p.out, key)
 				p.write(": ")
-				val := child(pr, 1)
+				val := it[2].(S)
 				if tag(val) == "annot" {
 					p.nl()
 					p.printPattern(val)
@@ -932,96 +841,73 @@ func (p *pp) printPattern(n S) {
 		p.pad()
 		p.write("}")
 	case "annot":
-		p.out.annot(getStr(child(n, 0)))
+		text, wrapped, _ := asAnnot(n)
+		p.out.annot(text)
 		p.pad()
-		p.printPattern(child(n, 1))
+		p.printPattern(wrapped)
 	default:
-		p.printExpr(n, 0)
+		p.printExpr(n)
 	}
 }
 
-/* ---------- Type pretty-printer (private helpers) ---------- */
+/* ---------- Type pretty-printer ---------- */
 
 func writeType(o *out, t S) {
-	tagOf := func(x S) string {
-		if len(x) == 0 {
-			return ""
-		}
-		return x[0].(string)
+	if len(t) == 0 {
+		o.write("<type>")
+		return
 	}
-
-	switch tagOf(t) {
+	switch tag(t) {
 	case "id":
-		o.write(t[1].(string))
-
+		o.write(getStr(t))
 	case "unop":
-		if len(t) >= 3 && t[1].(string) == "?" {
+		if t[1].(string) == "?" {
 			writeType(o, t[2].(S))
 			o.write("?")
-			return
+		} else {
+			o.write("<unop>")
 		}
-		o.write("<unop>")
-
 	case "array":
-		o.write("[")
 		elem := S{"id", "Any"}
 		if len(t) == 2 {
 			elem = t[1].(S)
 		}
-		writeType(o, elem)
-		o.write("]")
-
+		bracketed(o, "[", "]", []S{elem}, func(s S) { writeType(o, s) }) // prints [T]
 	case "enum":
-		o.write("Enum[")
-		for i := 1; i < len(t); i++ {
-			if i > 1 {
-				o.write(", ")
-			}
-			writeTypeLiteral(o, t[i].(S))
-		}
-		o.write("]")
-
+		bracketed(o, "Enum[", "]", listS(t, 1), func(s S) { writeTypeLiteral(o, s) })
 	case "map":
-		type field struct {
-			name     string
-			required bool
-			typ      S
-			keyAnnot string
-			valAnnot string
+		type fld struct {
+			name       string
+			req        bool
+			typ        S
+			kAnn, vAnn string
 		}
-		fs := make([]field, 0, len(t)-1)
-		for i := 1; i < len(t); i++ {
-			p := t[i].(S) // ("pair"|"pair!", keyNode, T or ("annot", ("str",doc), T))
-			req := p[0].(string) == "pair!"
-			keyNode := p[1].(S)
-			key, keyAnn := unwrapKey(keyNode)
-			ft := p[2].(S)
-			valAnn := ""
-			if len(ft) > 0 && ft[0].(string) == "annot" {
-				valAnn = ft[1].(S)[1].(string)
+		var fs []fld
+		for _, raw := range listS(t, 1) {
+			req := raw[0].(string) == "pair!"
+			k, kAnn := unwrapKey(raw[1].(S))
+			ft := raw[2].(S)
+			vAnn := ""
+			if len(ft) > 0 && tag(ft) == "annot" {
+				vAnn = ft[1].(S)[1].(string)
 				ft = ft[2].(S)
 			}
-			fs = append(fs, field{name: key, required: req, typ: ft, keyAnnot: keyAnn, valAnnot: valAnn})
+			fs = append(fs, fld{name: k, req: req, typ: ft, kAnn: kAnn, vAnn: vAnn})
 		}
 		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
-
 		o.write("{")
 		o.nl()
 		o.withIndent(func() {
 			for i, f := range fs {
-				if f.keyAnnot != "" {
-					o.annot(f.keyAnnot)
+				if f.kAnn != "" {
+					o.annot(f.kAnn)
 				}
-				if f.valAnnot != "" {
-					o.annot(f.valAnnot)
+				if f.vAnn != "" {
+					o.annot(f.vAnn)
 				}
 				o.pad()
-				if isIdent(f.name) {
-					o.write(f.name)
-				} else {
-					o.write(quoteString(f.name))
-				}
-				if f.required {
+				keyOut(o, f.name)
+				if f.req {
 					o.write("!")
 				}
 				o.write(": ")
@@ -1034,9 +920,8 @@ func writeType(o *out, t S) {
 		})
 		o.pad()
 		o.write("}")
-
 	case "binop":
-		if len(t) >= 4 && t[1].(string) == "->" {
+		if t[1].(string) == "->" && len(t) >= 4 {
 			params, ret := flattenArrow(t)
 			o.write("(")
 			for i := range params {
@@ -1047,21 +932,19 @@ func writeType(o *out, t S) {
 			}
 			o.write(") -> ")
 			writeType(o, ret)
-			return
+		} else {
+			o.write("<binop>")
 		}
-		o.write("<binop>")
-
 	case "annot":
 		o.annot(t[1].(S)[1].(string))
 		writeType(o, t[2].(S))
-
 	default:
 		o.write("<type>")
 	}
 }
 
 func writeTypeLiteral(o *out, lit S) {
-	switch lit[0].(string) {
+	switch tag(lit) {
 	case "null":
 		o.write("null")
 	case "bool":
@@ -1075,55 +958,37 @@ func writeTypeLiteral(o *out, lit S) {
 	case "num":
 		o.write(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
 	case "str":
-		o.write(quoteString(lit[1].(string)))
-
-	// Allow complex enum members (arrays/maps) for schema-like enums
+		o.write(quoteString(getStr(lit)))
 	case "array":
-		o.write("[")
-		for i := 1; i < len(lit); i++ {
-			if i > 1 {
-				o.write(", ")
-			}
-			writeTypeLiteral(o, lit[i].(S))
-		}
-		o.write("]")
+		bracketed(o, "[", "]", listS(lit, 1), func(s S) { writeTypeLiteral(o, s) })
 	case "map":
 		o.write("{")
-		items := children(lit)
+		items := listS(lit, 1)
 		for i, pr := range items {
 			if i > 0 {
 				o.write(", ")
 			}
-			pair := pr.(S)
-			k := getStr(child(pair, 0))
-			if isIdent(k) {
-				o.write(k)
-			} else {
-				o.write(quoteString(k))
-			}
+			k := pr[1].(S)[1].(string)
+			keyOut(o, k)
 			o.write(": ")
-			writeTypeLiteral(o, child(pair, 1))
+			writeTypeLiteral(o, pr[2].(S))
 		}
 		o.write("}")
-
 	default:
 		o.write("<lit>")
 	}
 }
 
 func flattenArrow(t S) (params []S, ret S) {
-	for {
-		if tag(t) == "binop" && t[1].(string) == "->" {
-			params = append(params, t[2].(S))
-			t = t[3].(S)
-			continue
-		}
-		ret = t
-		return
+	for tag(t) == "binop" && t[1].(string) == "->" && len(t) >= 4 {
+		params = append(params, t[2].(S))
+		t = t[3].(S)
 	}
+	ret = t
+	return
 }
 
-/* ---------- Runtime value pretty-printer (private helpers) ---------- */
+/* ---------- Runtime value pretty-printer ---------- */
 
 func mapOneLineMO(keys []string, mo *MapObject) string {
 	if len(keys) == 0 {
@@ -1132,7 +997,6 @@ func mapOneLineMO(keys []string, mo *MapObject) string {
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-			// any annotated key forces multiline
 			return ""
 		}
 		v := mo.Entries[k]
@@ -1152,37 +1016,29 @@ func mapOneLineMO(keys []string, mo *MapObject) string {
 }
 
 func writeValue(o *out, v Value) {
-	// Header annotation (once)
 	if v.Annot != "" {
 		o.annot(v.Annot)
 		o.pad()
 	}
-
 	switch v.Tag {
-
 	case VTNull:
 		o.write("null")
-
 	case VTBool:
 		if v.Data.(bool) {
 			o.write("true")
 		} else {
 			o.write("false")
 		}
-
 	case VTInt:
 		o.write(strconv.FormatInt(v.Data.(int64), 10))
-
 	case VTNum:
 		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
 		if !strings.ContainsAny(s, ".eE") {
 			s += ".0"
 		}
 		o.write(s)
-
 	case VTStr:
 		o.write(quoteString(v.Data.(string)))
-
 	case VTArray:
 		xs := v.Data.([]Value)
 		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
@@ -1194,9 +1050,9 @@ func writeValue(o *out, v Value) {
 		o.withIndent(func() {
 			for i, it := range xs {
 				if it.Annot == "" {
-					o.pad() // pad here only when no header annot
+					o.pad()
 				}
-				writeValue(o, it) // annotated values handle their own padding
+				writeValue(o, it)
 				if i < len(xs)-1 {
 					o.write(",")
 				}
@@ -1205,33 +1061,23 @@ func writeValue(o *out, v Value) {
 		})
 		o.pad()
 		o.write("]")
-
 	case VTMap:
 		mo := v.Data.(*MapObject)
-		// Build a sorted view of keys for stable output
 		keys := append([]string(nil), mo.Keys...)
 		sort.Strings(keys)
-
-		// One-line candidate (only if no key is annotated)
 		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
 			o.write(oneline)
 			return
 		}
-
-		// Multiline
 		o.write("{")
 		o.nl()
 		o.withIndent(func() {
 			for i, k := range keys {
 				if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-					o.annot(ann) // o.annot already pads correctly
+					o.annot(ann)
 				}
-				o.pad() // align with annotation line
-				if isIdent(k) {
-					o.write(k)
-				} else {
-					o.write(quoteString(k))
-				}
+				o.pad()
+				keyOut(o, k)
 				o.write(": ")
 				writeValue(o, mo.Entries[k])
 				if i < len(keys)-1 {
@@ -1242,10 +1088,7 @@ func writeValue(o *out, v Value) {
 		})
 		o.pad()
 		o.write("}")
-		return
-
 	case VTFun:
-		// Pretty-print as <fun: n1:T1 -> n2:T2 -> R> ; zero-arg as _:Null -> R
 		if f, ok := v.Data.(*Fun); ok && f != nil {
 			var sb strings.Builder
 			sb.WriteString("<fun: ")
@@ -1272,13 +1115,10 @@ func writeValue(o *out, v Value) {
 		} else {
 			o.write("<fun>")
 		}
-
 	case VTType:
-		ast := typeAst(v.Data)
-		typ := FormatType(ast)
+		typ := FormatType(typeAst(v.Data))
 		if strings.Contains(typ, "\n") {
-			lines := strings.Split(typ, "\n")
-			for i, ln := range lines {
+			for i, ln := range strings.Split(typ, "\n") {
 				if i == 0 {
 					o.write(ln)
 					continue
@@ -1290,7 +1130,6 @@ func writeValue(o *out, v Value) {
 			return
 		}
 		o.write(typ)
-
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
@@ -1301,7 +1140,6 @@ func writeValue(o *out, v Value) {
 			name = "<module: " + disp + ">"
 		}
 		o.write(name)
-
 	default:
 		s := "<unknown>"
 		if v.Tag == VTHandle {
@@ -1335,7 +1173,7 @@ func arrayOneLine(xs []Value) string {
 }
 
 func isValueMultiline(v Value) bool {
-	if v.Annot != "" { // header comments force multi-line
+	if v.Annot != "" {
 		return true
 	}
 	switch v.Tag {
@@ -1360,11 +1198,9 @@ func isValueMultiline(v Value) bool {
 		sort.Strings(keys)
 		line := mapOneLineMO(keys, mo)
 		return line == "" || len(line) > MaxInlineWidth
-
 	case VTType:
 		t := typeAst(v.Data)
-		return len(t) > 0 && t[0].(string) == "map" && len(t) > 1
-
+		return len(t) > 0 && tag(t) == "map" && len(t) > 1
 	default:
 		return false
 	}

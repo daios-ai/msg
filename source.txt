@@ -14,8 +14,10 @@
 //     "oracle", "for", "if/elif/else", "type", "block", "assign",
 //     "return/break/continue", arrays, maps, calls, indexing, properties,
 //     unary and binary operators).
-//     - Annotation nodes ("annot", ("str", text), <node>) become `# ...`
-//     line comments immediately above the printed construct.
+//     - Annotation nodes ("annot", ("str", text), <node>, preBool) are supported
+//     in both PRE and POST forms. PRE annotations print as `# ...` lines
+//     immediately above the construct; POST annotations print as `# ...` lines
+//     immediately after the construct.
 //     - Property names are emitted bare if they are identifier-like, otherwise
 //     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
 //     are rendered in a compact, readable form.
@@ -89,7 +91,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
 // ==============================
@@ -111,8 +112,8 @@ var MaxInlineWidth = 80
 //     the error is wrapped with source context via WrapErrorWithSource.
 //   - On success, it pretty-prints the resulting AST using FormatSExpr,
 //     producing stable, whitespace-normalized code.
-//   - Annotation nodes ("annot", ("str", text), X) print as `# text`
-//     lines directly above X.
+//   - Annotation nodes ("annot", ("str", text), X, preBool) print as `# text`
+//     lines either before (pre) or after (post) X.
 //   - Operators use minimal parentheses according to precedence/associativity:
 //   - "->" (lowest), "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
 //   - postfix call/index/get bind tightest; unary ("not", "-") binds tighter than
@@ -134,7 +135,7 @@ func Pretty(src string) (string, error) {
 
 // Standardize returns the canonical source form ("standard_source_code"):
 //   - deterministic layout
-//   - indentation using tabs (configurable via IndentWithTabs)
+//   - indentation using tabs
 //   - exactly one trailing newline
 func Standardize(src string) (string, error) {
 	ast, err := ParseSExpr(src)
@@ -236,16 +237,20 @@ func FormatValue(v Value) string {
 
 /* ---------- globals & tiny helpers ---------- */
 
+// isIdent tests ASCII identifiers compatible with the lexer rules:
+// first char [A-Za-z_], rest [A-Za-z0-9_].
 func isIdent(s string) bool {
 	if s == "" {
 		return false
 	}
-	rs := []rune(s)
-	if !(unicode.IsLetter(rs[0]) || rs[0] == '_') {
+	b := []byte(s)
+	c := b[0]
+	if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
 		return false
 	}
-	for _, r := range rs[1:] {
-		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+	for i := 1; i < len(b); i++ {
+		c = b[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
 			return false
 		}
 	}
@@ -350,8 +355,22 @@ func (p *pp) printStmt(n S) {
 		return
 	case "annot":
 		text := getStr(child(n, 0))
-		p.out.annot(text)
-		p.printStmt(child(n, 1))
+		wrapped := child(n, 1)
+		pre := true
+		if len(n) >= 4 {
+			if b, ok := n[3].(bool); ok {
+				pre = b
+			}
+		}
+		if pre {
+			p.out.annot(text)
+			p.printStmt(wrapped)
+		} else {
+			// POST: print the wrapped construct first, then the annotation lines
+			p.printStmt(wrapped)
+			p.nl()
+			p.out.annot(text)
+		}
 
 	case "fun":
 		p.pad()
@@ -380,20 +399,19 @@ func (p *pp) printStmt(n S) {
 		p.write("oracle(")
 		p.printParams(child(n, 0))
 		p.write(")")
-		out := child(n, 1)
-		if !(tag(out) == "id" && getId(out) == "Any") {
+		outT := child(n, 1)
+		if !(tag(outT) == "id" && getId(outT) == "Any") {
 			p.sp()
 			p.write("->")
 			p.sp()
-			p.printExpr(out, 0)
+			p.printExpr(outT, 0)
 		}
-		srcs := child(n, 2)
-		// Empty ("array") node: “no from”.
-		// Otherwise, src is arbitrary expression that *evaluates* to an array.
-		if len(srcs) > 1 {
+		src := child(n, 2)
+		// Print `from <expr>` for any non-empty source expression; omit for empty array
+		if !(tag(src) == "array" && len(src) == 1) {
 			p.sp()
 			p.write("from ")
-			p.printArray(srcs)
+			p.printExpr(src, 0)
 		}
 
 	case "for":
@@ -529,6 +547,9 @@ func (p *pp) printStmt(n S) {
 		p.write("do")
 		p.nl()
 		p.out.withIndent(func() { p.printBlock(n) })
+		if len(n) > 1 {
+			p.nl()
+		}
 		p.pad()
 		p.write("end")
 
@@ -767,11 +788,6 @@ func (p *pp) printMap(n S) {
 		}
 		p.write(": ")
 		p.printExpr(child(pair, 1), 0)
-
-		// if we emitted a leading annotation, keep items nicely lined up
-		if keyAnn != "" && i < len(items)-1 {
-			p.write(", ")
-		}
 	}
 	p.write("}")
 }
@@ -858,7 +874,10 @@ func (p *pp) printPattern(n S) {
 		items := children(n)
 		needsMultiline := false
 		for _, it := range items {
-			if tag(it.(S)[2].(S)) == "annot" {
+			pr := it.(S)
+			keyNode := child(pr, 0)
+			_, keyAnn := unwrapKey(keyNode)
+			if keyAnn != "" || tag(pr[2].(S)) == "annot" {
 				needsMultiline = true
 				break
 			}
@@ -870,7 +889,7 @@ func (p *pp) printPattern(n S) {
 					p.write(", ")
 				}
 				pr := it.(S)
-				key := getStr(child(pr, 0))
+				key, _ := unwrapKey(child(pr, 0))
 				if isIdent(key) {
 					p.write(key)
 				} else {
@@ -887,8 +906,11 @@ func (p *pp) printPattern(n S) {
 		p.out.withIndent(func() {
 			for i, it := range items {
 				pr := it.(S)
+				key, keyAnn := unwrapKey(child(pr, 0))
+				if keyAnn != "" {
+					p.out.annot(keyAnn)
+				}
 				p.pad()
-				key := getStr(child(pr, 0))
 				if isIdent(key) {
 					p.write(key)
 				} else {

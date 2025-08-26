@@ -3,16 +3,20 @@
 // Module system built on the stable engine surface, now exposing modules as a
 // map-like value with an attached lexical environment.
 //
-// • Resolves & fetches sources (FS/HTTP)
-// • Parses to S-exprs
-// • Evaluates in an isolated Env parented to Core
-// • Caches successes, detects cycles
-// • Returns VTModule whose Data is *Module { Name, Map: *MapObject, Env: *Env }
+// This refactor provides three focused entry points that reuse shared helpers:
 //
-// Design goal: VTModule should be *ergonomically* like VTMap. We realize this
-// by building the module’s public surface as a MapObject (ordered, key annots),
-// and keep Env for closures/types. All VTMap behaviors are reused by small,
-// central coercions VTModule→VTMap in interpreter.go (no duplicated branches).
+//   • importAST(name, ast)   — takes an AST, creates a module
+//   • importCode(name, src)  — takes source code, creates a module
+//   • importFile(spec, imp)  — resolves (FS/HTTP), parses, caches, detects cycles
+//
+// Internals are de-duplicated via:
+//   • parseSource(display, src)           — shared parsing + error wrapping
+//   • buildModuleFromAST(display, ast)    — shared eval + snapshotting into Module
+//
+// Design goal: VTModule should be ergonomically like VTMap. We realize this by
+// building the module’s public surface as a MapObject (ordered, key annots), and
+// keep Env for closures/types. All VTMap behaviors are reused by small, central
+// coercions VTModule→VTMap in interpreter.go (no duplicated branches).
 
 package mindscript
 
@@ -64,13 +68,31 @@ func (m *Module) get(key string) (Value, bool) {
 	return v, ok
 }
 
-// ---- Autoloader ------------------------------------------------------------
+// ---- Public-ish entry points (package-internal) ----------------------------
 
-const defaultModuleExt = ".ms" // adjust if you prefer a different extension
+// importAST creates a module from a READY AST, evaluating it in an Env parented to Core.
+// The produced module is NOT cached (no cycles involved).
+func (ip *Interpreter) importAST(name string, ast S) (Value, error) {
+	m, err := ip.buildModuleFromAST(name, ast)
+	if err != nil {
+		return Null, err
+	}
+	m.Name = name
+	return Value{Tag: VTModule, Data: m}, nil
+}
 
-// importModule resolves, parses, evaluates, caches, and returns a VTModule.
-// Evaluates in an Env parented to Core. Success is cached; failures are not.
-func (ip *Interpreter) importModule(spec string, importer string) (Value, error) {
+// importCode parses source then delegates to importAST. No cache/cycle handling here.
+func (ip *Interpreter) importCode(name string, src string) (Value, error) {
+	ast, err := parseSource(name, src)
+	if err != nil {
+		return Null, err
+	}
+	return ip.importAST(name, ast)
+}
+
+// importFile resolves (FS/HTTP), parses, evaluates, caches successes, and detects cycles.
+// This is the refactor of the old importModule.
+func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 	// Resolve + fetch → (src, display, canon)
 	src, display, canon, rerr := resolveAndFetch(spec, importer)
 	if rerr != nil {
@@ -87,34 +109,68 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 	defer func() { ip.loadStack = ip.loadStack[:len(ip.loadStack)-1] }()
 
 	// Cache check
-	if ip.modules != nil {
-		if rec, ok := ip.modules[canon]; ok {
-			if rec.state == modLoading {
-				return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
-			}
-			if rec.state == modLoaded && rec.mod != nil {
-				return Value{Tag: VTModule, Data: rec.mod}, nil
-			}
-		}
-	} else {
+	if ip.modules == nil {
 		ip.modules = map[string]*moduleRec{}
+	}
+	if rec, ok := ip.modules[canon]; ok {
+		if rec.state == modLoading {
+			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
+		}
+		if rec.state == modLoaded && rec.mod != nil {
+			return Value{Tag: VTModule, Data: rec.mod}, nil
+		}
 	}
 
 	// Mark loading
 	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
 
-	// Parse
+	// Parse (shared helper)
+	ast, perr := parseSource(display, src)
+	if perr != nil {
+		delete(ip.modules, canon) // do not cache failures
+		return Null, perr
+	}
+
+	// Build module from AST (shared helper)
+	m, err := ip.buildModuleFromAST(display, ast)
+	if err != nil {
+		delete(ip.modules, canon) // do not cache failures
+		return Null, err
+	}
+
+	// Commit success to cache with canonical identity
+	rec := ip.modules[canon]
+	rec.displayName = display
+	rec.src = src
+	rec.env = m.Env
+	m.Name = canon
+	rec.mod = m
+	rec.state = modLoaded
+	rec.err = nil
+
+	return Value{Tag: VTModule, Data: rec.mod}, nil
+}
+
+// ---- Shared helpers (no duplication) ---------------------------------------
+
+// parseSource parses src into an S-expr AST and wraps errors with source context.
+func parseSource(display string, src string) (S, error) {
 	ast, perr := ParseSExpr(src)
 	if perr != nil {
 		perr = WrapErrorWithSource(perr, src)
-		delete(ip.modules, canon) // do not cache failures
-		return Null, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
+		return nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
 	}
+	return ast, nil
+}
 
-	// Evaluate in isolated env parented to Core (convert rtErr panics to errors)
+// buildModuleFromAST evaluates ast in an Env parented to Core and snapshots the public surface.
+// Runtime annotated nulls and rtErr panics are converted to rich errors with display context.
+func (ip *Interpreter) buildModuleFromAST(display string, ast S) (*Module, error) {
+	// Evaluate in isolated env parented to Core; turn rtErr/annotNull into errors
 	modEnv := NewEnv(ip.Core)
 	var rterr error
 	var evalRes Value
+
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -127,36 +183,26 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 			}
 		}()
 		if len(ast) > 0 {
+			// Uncaught mode returns annotated nulls instead of errors; we surface them below.
 			evalRes = ip.EvalASTUncaught(ast, modEnv, true)
 		}
 	}()
 
-	// Treat VM-returned annotated null as a hard import failure too.
 	if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
 		rterr = fmt.Errorf("runtime error in %s: %s", display, evalRes.Annot)
 	}
 	if rterr != nil {
-		delete(ip.modules, canon) // do not cache failures
-		return Null, rterr
+		return nil, rterr
 	}
 
-	// Snapshot public surface as a MapObject (ordered + key annots).
+	// Snapshot public surface (ordered keys, key annotations, pin VTType envs)
 	mo := buildModuleMap(modEnv)
 
-	// Commit cache on success only
-	rec := ip.modules[canon]
-	rec.displayName = display
-	rec.src = src
-	rec.env = modEnv
-	rec.mod = &Module{
-		Name: canon, // keep canonical identity; prettySpec is for messages
-		Map:  mo,
-		Env:  modEnv,
-	}
-	rec.state = modLoaded
-	rec.err = nil
-
-	return Value{Tag: VTModule, Data: rec.mod}, nil
+	return &Module{
+		// Caller sets Name (canonical identity or a chosen name).
+		Map: mo,
+		Env: modEnv,
+	}, nil
 }
 
 // buildModuleMap snapshots modEnv.table into a MapObject:
@@ -197,6 +243,10 @@ func buildModuleMap(modEnv *Env) *MapObject {
 	return mo
 }
 
+// ---- Autoloader (resolution & fetching) ------------------------------------
+
+const defaultModuleExt = ".ms" // adjust if you prefer a different extension
+
 // resolveAndFetch returns (src, display, canonicalKey) for the given spec.
 //
 // Network:
@@ -207,7 +257,7 @@ func buildModuleMap(modEnv *Env) *MapObject {
 //   - Resolve relative specs against importer dir → CWD → MINDSCRIPT_PATH.
 //   - If spec has no extension, try spec+defaultModuleExt then spec.
 //   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
-func resolveAndFetch(spec string, importer string) (src string, display string, canon string, err error) {
+func resolveAndFetch(spec string, importer string) (string, string, string, error) {
 	// Network?
 	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
 		u, perr := url.Parse(spec)
@@ -217,7 +267,7 @@ func resolveAndFetch(spec string, importer string) (src string, display string, 
 		if path.Ext(u.Path) == "" && defaultModuleExt != "" {
 			u.Path = strings.TrimSuffix(u.Path, "/") + defaultModuleExt
 		}
-		canon = u.String()
+		canon := u.String()
 		src, display, err := httpFetch(canon)
 		return src, display, canon, err
 	}

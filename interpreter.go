@@ -432,6 +432,14 @@ func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, im
 	}))
 }
 
+// AsMapValue returns a VTMap view for VTMap/VTModule (same MapObject), else the input.
+func AsMapValue(v Value) Value {
+	if v.Tag == VTModule {
+		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
+	}
+	return v
+}
+
 //// END_OF_PUBLIC
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -474,14 +482,6 @@ func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
 		env = fallback
 	}
 	return ip.resolveType(tv.Ast, env)
-}
-
-// asMapValue returns a VTMap view for VTMap/VTModule (same MapObject), else the input.
-func asMapValue(v Value) Value {
-	if v.Tag == VTModule {
-		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
-	}
-	return v
 }
 
 // syncModuleEnv keeps a module's Env consistent after a write to its map.
@@ -753,8 +753,8 @@ func (ip *Interpreter) initCore() {
 	ip.reg("__plus",
 		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			a := asMapValue(ctx.MustArg("a"))
-			b := asMapValue(ctx.MustArg("b"))
+			a := AsMapValue(ctx.MustArg("a"))
+			b := AsMapValue(ctx.MustArg("b"))
 			if isNumber(a) && isNumber(b) {
 				if a.Tag == VTInt && b.Tag == VTInt {
 					return Int(a.Data.(int64) + b.Data.(int64))
@@ -873,7 +873,7 @@ func (ip *Interpreter) initCore() {
 	ip.reg("__len",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
 		func(ctx CallCtx) Value {
-			x := asMapValue(ctx.MustArg("x"))
+			x := AsMapValue(ctx.MustArg("x"))
 			switch x.Tag {
 			case VTArray:
 				return Int(int64(len(x.Data.([]Value))))
@@ -966,7 +966,7 @@ func (ip *Interpreter) initCore() {
 	ip.RegisterNative("__to_iter",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			x := asMapValue(ctx.MustArg("x"))
+			x := AsMapValue(ctx.MustArg("x"))
 
 			// Already an iterator?
 			if x.Tag == VTFun {
@@ -1162,7 +1162,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 			keyStr = k.Data.(string)
 		}
-		mv := asMapValue(obj)
+		mv := AsMapValue(obj)
 		if mv.Tag == VTMap {
 			mo := mv.Data.(*MapObject)
 			if _, exists := mo.Entries[keyStr]; !exists {
@@ -1196,7 +1196,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			xs[i] = value
 			return
 		}
-		mv := asMapValue(obj)
+		mv := AsMapValue(obj)
 		if mv.Tag == VTMap && idx.Tag == VTStr {
 			mo := mv.Data.(*MapObject)
 			k := idx.Data.(string)
@@ -1224,7 +1224,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 		}
 	case "dobj":
-		vmap := asMapValue(value)
+		vmap := AsMapValue(value)
 		if vmap.Tag != VTMap {
 			for i := 1; i < len(target); i++ {
 				p := target[i].(S) // ("pair", key, pattern)
@@ -1310,7 +1310,7 @@ func (ip *Interpreter) evalFull(n S, env *Env) Value {
 // -------- iterator expansion --------
 
 func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
-	iter = asMapValue(iter)
+	iter = AsMapValue(iter)
 	switch iter.Tag {
 	case VTArray:
 		return append([]Value(nil), iter.Data.([]Value)...)

@@ -1067,7 +1067,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			x := asMapValue(ctx.MustArg("x"))
+			x := AsMapValue(ctx.MustArg("x"))
 			switch x.Tag {
 			case VTArray:
 				return Int(int64(len(x.Data.([]Value))))

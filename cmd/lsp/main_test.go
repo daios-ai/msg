@@ -22,6 +22,27 @@ func mustDoc(t *testing.T, uri, src string) *docState {
 	return doc
 }
 
+// wireNotif is a minimal envelope for LSP notifications we care about.
+type wireNotif struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// readAllMsgs decodes all framed messages currently in buf into a slice of raw bodies.
+func readAllMsgs(buf *bytes.Buffer) (bodies [][]byte, _ error) {
+	r := bufio.NewReader(bytes.NewReader(buf.Bytes()))
+	for {
+		body, err := readMsg(r)
+		if err != nil {
+			// readMsg returns io.EOF when buffer is exhausted
+			break
+		}
+		bodies = append(bodies, body)
+	}
+	return bodies, nil
+}
+
 // --- tests -----------------------------------------------------------------
 
 func TestUTF16Positioning(t *testing.T) {
@@ -762,5 +783,179 @@ y = f(1)
 	}
 	if !strings.Contains(strings.ToLower(hv.Contents.Value), "adds one") {
 		t.Fatalf("hover missing doc line, got: %q", hv.Contents.Value)
+	}
+}
+
+// gatherDiagnostics pulls all publishDiagnostics notifications from a buffer.
+func gatherDiagnostics(buf *bytes.Buffer) ([]PublishDiagnosticsParams, error) {
+	bodies, _ := readAllMsgs(buf)
+	out := []PublishDiagnosticsParams{}
+	for _, b := range bodies {
+		var n wireNotif
+		if err := json.Unmarshal(b, &n); err != nil {
+			continue
+		}
+		if n.Method != "textDocument/publishDiagnostics" {
+			continue
+		}
+		var pd PublishDiagnosticsParams
+		if err := json.Unmarshal(n.Params, &pd); err != nil {
+			continue
+		}
+		out = append(out, pd)
+	}
+	return out, nil
+}
+
+/* ------------------------------ tests ------------------------------ */
+
+func TestDiagnostics_OnDidOpen_LexError_Publishes(t *testing.T) {
+	s := newServer()
+	var buf bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &buf
+	defer func() { stdoutSink = old }()
+
+	// A single '$' should be a hard lexical error.
+	openParams := struct {
+		TextDocument TextDocumentItem `json:"textDocument"`
+	}{TextDocument: TextDocumentItem{
+		URI:        "file:///lexerr.ms",
+		LanguageID: "mindscript",
+		Version:    1,
+		Text:       "$",
+	}}
+	raw, _ := json.Marshal(openParams)
+	s.onDidOpen(raw)
+
+	diags, _ := gatherDiagnostics(&buf)
+	if len(diags) == 0 {
+		t.Fatal("expected a diagnostics notification for lex error")
+	}
+	last := diags[len(diags)-1]
+	if got := len(last.Diagnostics); got != 1 {
+		t.Fatalf("expected 1 diagnostic, got %d", got)
+	}
+	d := last.Diagnostics[0]
+	if d.Code != "LEX" {
+		t.Fatalf("expected Code=LEX, got %q", d.Code)
+	}
+	if d.Severity != 1 {
+		t.Fatalf("expected Severity=1 (Error), got %d", d.Severity)
+	}
+	// Range should be non-empty.
+	if d.Range.Start.Line == d.Range.End.Line && d.Range.Start.Character == d.Range.End.Character {
+		t.Fatalf("expected non-empty range, got %#v", d.Range)
+	}
+}
+
+func TestDiagnostics_OnDidOpen_ParseError_Publishes(t *testing.T) {
+	s := newServer()
+	var buf bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &buf
+	defer func() { stdoutSink = old }()
+
+	// "end" alone is lex-valid but parse-invalid → ParseError
+	openParams := struct {
+		TextDocument TextDocumentItem `json:"textDocument"`
+	}{TextDocument: TextDocumentItem{
+		URI:        "file:///parseerr.ms",
+		LanguageID: "mindscript",
+		Version:    1,
+		Text:       "end\n",
+	}}
+	raw, _ := json.Marshal(openParams)
+	s.onDidOpen(raw)
+
+	diags, _ := gatherDiagnostics(&buf)
+	if len(diags) == 0 {
+		t.Fatal("expected a diagnostics notification for parse error")
+	}
+	last := diags[len(diags)-1]
+	if len(last.Diagnostics) != 1 {
+		t.Fatalf("expected 1 diagnostic, got %d", len(last.Diagnostics))
+	}
+	if last.Diagnostics[0].Code != "PARSE" {
+		t.Fatalf("expected Code=PARSE, got %q", last.Diagnostics[0].Code)
+	}
+}
+
+func TestDiagnostics_Incomplete_Clears(t *testing.T) {
+	s := newServer()
+	var buf bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &buf
+	defer func() { stdoutSink = old }()
+
+	// Unterminated string in interactive mode → IncompleteError → clear diagnostics
+	openParams := struct {
+		TextDocument TextDocumentItem `json:"textDocument"`
+	}{TextDocument: TextDocumentItem{
+		URI:        "file:///incomplete.ms",
+		LanguageID: "mindscript",
+		Version:    1,
+		Text:       "\"unterminated",
+	}}
+	raw, _ := json.Marshal(openParams)
+	s.onDidOpen(raw)
+
+	diags, _ := gatherDiagnostics(&buf)
+	if len(diags) == 0 {
+		t.Fatal("expected at least one diagnostics publish (clear)")
+	}
+	last := diags[len(diags)-1]
+	if len(last.Diagnostics) != 0 {
+		t.Fatalf("expected diagnostics to be CLEARED for incomplete; got %d entries", len(last.Diagnostics))
+	}
+}
+
+func TestDiagnostics_ClearAfterFix_OnDidChange(t *testing.T) {
+	s := newServer()
+	var buf bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &buf
+	defer func() { stdoutSink = old }()
+
+	// 1) Open with a lex error to produce an error diagnostic.
+	openParams := struct {
+		TextDocument TextDocumentItem `json:"textDocument"`
+	}{TextDocument: TextDocumentItem{
+		URI:        "file:///fix.ms",
+		LanguageID: "mindscript",
+		Version:    1,
+		Text:       "$",
+	}}
+	rawOpen, _ := json.Marshal(openParams)
+	s.onDidOpen(rawOpen)
+
+	// 2) Send a full-replace change with valid code; should publish CLEAR.
+	changeParams := struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+		ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"`
+	}{
+		TextDocument: struct {
+			URI string `json:"uri"`
+		}{URI: "file:///fix.ms"},
+		ContentChanges: []TextDocumentContentChangeEvent{
+			{Text: "let x = 1\n"}, // Range=nil => full replace
+		},
+	}
+	rawCh, _ := json.Marshal(changeParams)
+	s.onDidChange(rawCh)
+
+	diags, _ := gatherDiagnostics(&buf)
+	if len(diags) == 0 {
+		t.Fatal("expected diagnostics traffic")
+	}
+	last := diags[len(diags)-1]
+	if len(last.Diagnostics) != 0 {
+		t.Fatalf("expected diagnostics cleared after fix; got %d entries", len(last.Diagnostics))
+	}
+	// sanity: ensure the URI matches
+	if !strings.HasSuffix(last.URI, "/fix.ms") {
+		t.Fatalf("unexpected URI in diagnostics clear: %q", last.URI)
 	}
 }

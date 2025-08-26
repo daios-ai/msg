@@ -25,7 +25,7 @@ let new = fun() do
     cfg: {},             # name -> {Str:Any}
     selected: null,      # active backend name
     system: null         # optional global system hint
-  }
+  } 
 end
 
 # Returns a function with the exact engine-required signature:

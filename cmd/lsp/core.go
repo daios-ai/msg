@@ -479,11 +479,15 @@ func (s *server) publishError(doc *docState, err error) {
 		return
 	}
 	line, col := 0, 0
+	code := ""
+
 	switch e := err.(type) {
 	case *mindscript.ParseError:
 		line, col = e.Line, e.Col
+		code = "PARSE"
 	case *mindscript.LexError:
 		line, col = e.Line, e.Col
+		code = "LEX"
 	default:
 	}
 	if line > 0 {
@@ -504,11 +508,22 @@ func (s *server) publishError(doc *docState, err error) {
 		}
 	}
 	if end <= start {
-		_, sz := utf8.DecodeRuneInString(doc.text[start:])
-		if sz <= 0 {
-			sz = 1
+		if start < len(doc.text) {
+			// Highlight the next rune when inside the buffer.
+			_, sz := utf8.DecodeRuneInString(doc.text[start:])
+			if sz <= 0 {
+				sz = 1
+			}
+			end = start + sz
+		} else if start > 0 {
+			// At end-of-buffer: highlight the previous rune.
+			_, sz := utf8.DecodeLastRuneInString(doc.text[:start])
+			if sz <= 0 {
+				sz = 1
+			}
+			start = start - sz
+			end = start + sz
 		}
-		end = start + sz
 	}
 
 	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
@@ -516,6 +531,7 @@ func (s *server) publishError(doc *docState, err error) {
 		Diagnostics: []Diagnostic{{
 			Range:    makeRange(doc.lines, start, end, doc.text),
 			Severity: 1,
+			Code:     code,
 			Source:   "mindscript",
 			Message:  err.Error(),
 		}},
@@ -889,11 +905,32 @@ func (s *server) analyze(doc *docState) {
 	lx := mindscript.NewLexerInteractive(doc.text)
 	toks, err := lx.Scan()
 	if err != nil {
-		// Keep previous tokens if any, but tests expect we at least try.
-		// On lex error we still clear symbols so completions/symbols don't lie.
-		doc.tokens = nil
+		// Try to salvage tokens up to the error position so semantic tokens
+		// still color the prefix.
+		if le, ok := err.(*mindscript.LexError); ok {
+			// Convert (1-based line, 0-based byte col) to absolute byte offset.
+			off := byteColToOffset(doc.lines, le.Line-1, le.Col, doc.text)
+			if off < 0 {
+				off = 0
+			}
+			if off > len(doc.text) {
+				off = len(doc.text)
+			}
+			// Re-lex the prefix only; this should succeed.
+			px := mindscript.NewLexerInteractive(doc.text[:off])
+			ptoks, pErr := px.Scan()
+			if pErr == nil {
+				if n := len(ptoks); n > 0 && ptoks[n-1].Type == mindscript.EOF {
+					ptoks = ptoks[:n-1]
+				}
+				doc.tokens = ptoks
+			} else {
+				// If even the prefix fails, leave tokens as-is (keep previous coloring).
+			}
+		}
 		doc.symbols = nil
 		doc.ast = nil
+		s.publishError(doc, err)
 		return
 	}
 	// Drop the terminal EOF token for downstream convenience.
@@ -902,18 +939,24 @@ func (s *server) analyze(doc *docState) {
 	}
 	doc.tokens = toks
 
-	// 2) Parse AST (no spans needed for these tests)
-	ast, err := mindscript.ParseSExpr(doc.text)
+	// 2) Parse AST in interactive mode so we can distinguish "incomplete"
+	// from true errors for on-type diagnostics.
+	ast, err := mindscript.ParseSExprInteractive(doc.text)
 	if err != nil {
 		// Parsing failed (or incomplete) — keep tokens, but clear AST/symbols.
 		doc.ast = nil
 		doc.symbols = nil
+		// Publish diagnostics for parse/lex errors; Incomplete clears.
+		s.publishError(doc, err)
 		return
 	}
 	doc.ast = ast
 
 	// 3) Rebuild top-level symbols (alpha/beta/etc.). This does NOT execute user code.
 	doc.symbols = collectTopLevelSymbols(doc)
+
+	// 4) Success: clear any previous diagnostics.
+	s.clearDiagnostics(doc.uri)
 }
 
 // collectTopLevelSymbols walks the AST (root-level only) and extracts symbols:

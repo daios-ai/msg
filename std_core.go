@@ -206,80 +206,80 @@ Params:
 
 Returns: Module (as a value with exported bindings)`)
 
-	// importCode(name: Str, src: Str) -> Module
-	ip.RegisterNative(
-		"importCode",
-		[]ParamSpec{
-			{Name: "name", Type: S{"id", "Str"}},
-			{Name: "src", Type: S{"id", "Str"}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			nv := ctx.MustArg("name")
-			sv := ctx.MustArg("src")
-			if nv.Tag != VTStr || sv.Tag != VTStr {
-				return annotNull("importCode expects (name: Str, src: Str)")
-			}
-			name := nv.Data.(string)
-			src := sv.Data.(string)
+	// 	// importCode(name: Str, src: Str) -> Module
+	// 	ip.RegisterNative(
+	// 		"importCode",
+	// 		[]ParamSpec{
+	// 			{Name: "name", Type: S{"id", "Str"}},
+	// 			{Name: "src", Type: S{"id", "Str"}},
+	// 		},
+	// 		S{"id", "Any"},
+	// 		func(ip *Interpreter, ctx CallCtx) Value {
+	// 			nv := ctx.MustArg("name")
+	// 			sv := ctx.MustArg("src")
+	// 			if nv.Tag != VTStr || sv.Tag != VTStr {
+	// 				return annotNull("importCode expects (name: Str, src: Str)")
+	// 			}
+	// 			name := nv.Data.(string)
+	// 			src := sv.Data.(string)
 
-			// Parse
-			ast, perr := ParseSExpr(src)
-			if perr != nil {
-				perr = WrapErrorWithSource(perr, src)
-				return annotNull(fmt.Sprintf("parse error in mem:%s:\n%s", name, perr.Error()))
-			}
+	// 			// Parse
+	// 			ast, perr := ParseSExpr(src)
+	// 			if perr != nil {
+	// 				perr = WrapErrorWithSource(perr, src)
+	// 				return annotNull(fmt.Sprintf("parse error in mem:%s:\n%s", name, perr.Error()))
+	// 			}
 
-			// Evaluate in isolated env parented to Core (uncaught to treat rtErr as failure)
-			modEnv := NewEnv(ip.Core)
-			var rterr error
-			var evalRes Value
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						switch sig := r.(type) {
-						case rtErr:
-							rterr = fmt.Errorf("runtime error in mem:%s: %s", name, sig.msg)
-						default:
-							rterr = fmt.Errorf("runtime panic in mem:%s: %v", name, r)
-						}
-					}
-				}()
-				if len(ast) > 0 {
-					evalRes = ip.EvalASTUncaught(ast, modEnv, true)
-				}
-			}()
-			if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
-				rterr = fmt.Errorf("runtime error in mem:%s: %s", name, evalRes.Annot)
-			}
-			if rterr != nil {
-				fail(rterr.Error())
-			}
+	// 			// Evaluate in isolated env parented to Core (uncaught to treat rtErr as failure)
+	// 			modEnv := NewEnv(ip.Core)
+	// 			var rterr error
+	// 			var evalRes Value
+	// 			func() {
+	// 				defer func() {
+	// 					if r := recover(); r != nil {
+	// 						switch sig := r.(type) {
+	// 						case rtErr:
+	// 							rterr = fmt.Errorf("runtime error in mem:%s: %s", name, sig.msg)
+	// 						default:
+	// 							rterr = fmt.Errorf("runtime panic in mem:%s: %v", name, r)
+	// 						}
+	// 					}
+	// 				}()
+	// 				if len(ast) > 0 {
+	// 					evalRes = ip.EvalASTUncaught(ast, modEnv, true)
+	// 				}
+	// 			}()
+	// 			if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
+	// 				rterr = fmt.Errorf("runtime error in mem:%s: %s", name, evalRes.Annot)
+	// 			}
+	// 			if rterr != nil {
+	// 				fail(rterr.Error())
+	// 			}
 
-			exports := make(map[string]Value, len(modEnv.table))
-			for k, v := range modEnv.table {
-				if v.Tag == VTType {
-					tv := v.Data.(*TypeValue)
-					if tv.Env == nil {
-						exports[k] = TypeValIn(tv.Ast, modEnv)
-						continue
-					}
-				}
-				exports[k] = v
-			}
-			return Value{Tag: VTModule, Data: &Module{Name: "mem:" + name, Exports: exports}}
-		},
-	)
-	setBuiltinDoc(ip, "importCode", `Evaluate a source string as a module.
+	// 			exports := make(map[string]Value, len(modEnv.table))
+	// 			for k, v := range modEnv.table {
+	// 				if v.Tag == VTType {
+	// 					tv := v.Data.(*TypeValue)
+	// 					if tv.Env == nil {
+	// 						exports[k] = TypeValIn(tv.Ast, modEnv)
+	// 						continue
+	// 					}
+	// 				}
+	// 				exports[k] = v
+	// 			}
+	// 			return Value{Tag: VTModule, Data: &Module{Name: "mem:" + name, Exports: exports}}
+	// 		},
+	// 	)
+	// 	setBuiltinDoc(ip, "importCode", `Evaluate a source string as a module.
 
-The code is executed in an isolated environment parented to Core.
-This does **not** populate the module cache; a later import(name) won’t find it.
+	// The code is executed in an isolated environment parented to Core.
+	// This does **not** populate the module cache; a later import(name) won’t find it.
 
-Params:
-  name: Str — logical module name (for diagnostics)
-  src:  Str — MindScript source code
+	// Params:
+	//   name: Str — logical module name (for diagnostics)
+	//   src:  Str — MindScript source code
 
-Returns: Module`)
+	// Returns: Module`)
 }
 
 // --- Introspection & docs ----------------------------------------------------

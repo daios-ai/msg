@@ -56,7 +56,7 @@ let _extractOpenAI = fun(obj: Any) -> Str? do
     obj.output_text
   else
     # Try choices[0].message.content (may be Str or array of {type:"text", text:"..."})
-    if mapHas(obj, "choices") and size(obj.choices) > 0 then
+    if mapHas(obj, "choices") and len(obj.choices) > 0 then
       let m = obj.choices[0].message
       if m == null then
         null
@@ -64,7 +64,7 @@ let _extractOpenAI = fun(obj: Any) -> Str? do
         let c = m.content
         if c == null then null
         elif __is_fun(c) then null 
-        elif size(c) >= 1 and mapHas(c[0], "text") then c[0].text 
+        elif len(c) >= 1 and mapHas(c[0], "text") then c[0].text 
         else c 
         end
       end
@@ -78,7 +78,7 @@ end
 # obj:{} -> Str?
 let _extractAnthropic = fun(obj: Any) -> Str? do
   # { content: [{type:"text", text:"..."}] }
-  if mapHas(obj, "content") and size(obj.content) >= 1 then
+  if mapHas(obj, "content") and len(obj.content) >= 1 then
     let it = obj.content[0]
     if mapHas(it, "text") then it.text else null end
   else

@@ -1,11 +1,18 @@
 // modules.go
 //
-// Module system built on the stable engine surface:
-// - Resolves and fetches sources (FS/HTTP).
-// - Parses to S-exprs.
-// - Evaluates via ip.EvalASTUncaught (so runtime failures abort import).
-// - Caches modules and detects cycles.
-// - Exposes modules as VTModule values with Exports map.
+// Module system built on the stable engine surface, now exposing modules as a
+// map-like value with an attached lexical environment.
+//
+// • Resolves & fetches sources (FS/HTTP)
+// • Parses to S-exprs
+// • Evaluates in an isolated Env parented to Core
+// • Caches successes, detects cycles
+// • Returns VTModule whose Data is *Module { Name, Map: *MapObject, Env: *Env }
+//
+// Design goal: VTModule should be *ergonomically* like VTMap. We realize this
+// by building the module’s public surface as a MapObject (ordered, key annots),
+// and keep Env for closures/types. All VTMap behaviors are reused by small,
+// central coercions VTModule→VTMap in interpreter.go (no duplicated branches).
 
 package mindscript
 
@@ -17,6 +24,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -36,19 +44,23 @@ type moduleRec struct {
 	displayName string
 	src         string
 	env         *Env
-	exports     map[string]Value
+	mod         *Module
 	state       moduleState
 	err         error
 }
 
-// Module value backing store for VTModule.
+// Module is the public payload for VTModule.
+// Map holds the exported bindings (ordered, with per-key annotations).
+// Env is the lexical environment where the module executed (for closures/types).
 type Module struct {
-	Name    string
-	Exports map[string]Value
+	Name string
+	Map  *MapObject
+	Env  *Env
 }
 
+// get returns an exported binding by key. The VM can use this for property/index reads.
 func (m *Module) get(key string) (Value, bool) {
-	v, ok := m.Exports[key]
+	v, ok := m.Map.Entries[key]
 	return v, ok
 }
 
@@ -56,50 +68,50 @@ func (m *Module) get(key string) (Value, bool) {
 
 const defaultModuleExt = ".ms" // adjust if you prefer a different extension
 
-// importModule resolves, parses, and evaluates a module in an isolated env whose
-// parent is the interpreter's Core env. It detects import cycles and reuses a cache.
+// importModule resolves, parses, evaluates, caches, and returns a VTModule.
+// Evaluates in an Env parented to Core. Success is cached; failures are not.
 func (ip *Interpreter) importModule(spec string, importer string) (Value, error) {
-	// Resolve + fetch → (src, display, canonKey)
+	// Resolve + fetch → (src, display, canon)
 	src, display, canon, rerr := resolveAndFetch(spec, importer)
 	if rerr != nil {
 		return Null, rerr
 	}
 
-	// --- cycle detection on canonical key ---
+	// Cycle detection against canonical key
 	for _, s := range ip.loadStack {
 		if s == canon {
-			path := joinCyclePath(ip.loadStack, canon)
-			return Null, fmt.Errorf("import cycle detected: %s", path)
+			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
 		}
 	}
 	ip.loadStack = append(ip.loadStack, canon)
 	defer func() { ip.loadStack = ip.loadStack[:len(ip.loadStack)-1] }()
 
-	// --- cached? ---
-	if rec, ok := ip.modules[canon]; ok {
-		// We no longer cache failures, so only hit for true successes or in-flight loads.
-		if rec.state == modLoading {
-			path := joinCyclePath(ip.loadStack, canon)
-			return Null, fmt.Errorf("import cycle detected: %s", path)
+	// Cache check
+	if ip.modules != nil {
+		if rec, ok := ip.modules[canon]; ok {
+			if rec.state == modLoading {
+				return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
+			}
+			if rec.state == modLoaded && rec.mod != nil {
+				return Value{Tag: VTModule, Data: rec.mod}, nil
+			}
 		}
-		if rec.state == modLoaded {
-			return Value{Tag: VTModule, Data: &Module{Name: rec.spec, Exports: rec.exports}}, nil
-		}
+	} else {
+		ip.modules = map[string]*moduleRec{}
 	}
 
-	// --- mark loading ---
+	// Mark loading
 	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
 
-	// --- parse ---
+	// Parse
 	ast, perr := ParseSExpr(src)
 	if perr != nil {
 		perr = WrapErrorWithSource(perr, src)
-		// DO NOT cache failures; allow retry on next import
-		delete(ip.modules, canon)
+		delete(ip.modules, canon) // do not cache failures
 		return Null, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
 	}
 
-	// --- evaluate in isolated env parented to Core ---
+	// Evaluate in isolated env parented to Core (convert rtErr panics to errors)
 	modEnv := NewEnv(ip.Core)
 	var rterr error
 	var evalRes Value
@@ -124,34 +136,65 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 		rterr = fmt.Errorf("runtime error in %s: %s", display, evalRes.Annot)
 	}
 	if rterr != nil {
-		// DO NOT cache failures; allow retry on next import
-		delete(ip.modules, canon)
+		delete(ip.modules, canon) // do not cache failures
 		return Null, rterr
 	}
 
-	// --- snapshot exports ---
-	exports := make(map[string]Value, len(modEnv.table))
-	for k, v := range modEnv.table {
-		if v.Tag == VTType {
-			tv := v.Data.(*TypeValue)
-			if tv.Env == nil {
-				exports[k] = TypeValIn(tv.Ast, modEnv)
-				continue
-			}
-		}
-		exports[k] = v
-	}
+	// Snapshot public surface as a MapObject (ordered + key annots).
+	mo := buildModuleMap(modEnv)
 
-	// --- commit cache on success only ---
+	// Commit cache on success only
 	rec := ip.modules[canon]
 	rec.displayName = display
 	rec.src = src
 	rec.env = modEnv
-	rec.exports = exports
+	rec.mod = &Module{
+		Name: canon, // keep canonical identity; prettySpec is for messages
+		Map:  mo,
+		Env:  modEnv,
+	}
 	rec.state = modLoaded
 	rec.err = nil
 
-	return Value{Tag: VTModule, Data: &Module{Name: rec.spec, Exports: rec.exports}}, nil
+	return Value{Tag: VTModule, Data: rec.mod}, nil
+}
+
+// buildModuleMap snapshots modEnv.table into a MapObject:
+// • Keys are sorted for determinism (Env.table is a Go map).
+// • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
+// • If a value carries Annot, we mirror it into KeyAnn for that key.
+func buildModuleMap(modEnv *Env) *MapObject {
+	keys := make([]string, 0, len(modEnv.table))
+	for k := range modEnv.table {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic order
+
+	mo := &MapObject{
+		Entries: make(map[string]Value, len(keys)),
+		KeyAnn:  make(map[string]string, len(keys)),
+		Keys:    make([]string, 0, len(keys)),
+	}
+	for _, k := range keys {
+		v := modEnv.table[k]
+
+		// Pin exported types to the module env if needed
+		if v.Tag == VTType {
+			tv := v.Data.(*TypeValue)
+			if tv.Env == nil {
+				nv := TypeValIn(tv.Ast, modEnv)
+				nv.Annot = v.Annot // preserve docs on the value
+				v = nv
+			}
+		}
+
+		mo.Entries[k] = v
+		mo.Keys = append(mo.Keys, k)
+		if ann := v.Annot; ann != "" {
+			mo.KeyAnn[k] = ann
+		}
+	}
+	return mo
 }
 
 // resolveAndFetch returns (src, display, canonicalKey) for the given spec.
@@ -161,7 +204,7 @@ func (ip *Interpreter) importModule(spec string, importer string) (Value, error)
 //   - If the URL path has no extension, defaultModuleExt is appended.
 //
 // Filesystem:
-//   - Resolve relative specs against importer dir → CWD → MINDSCRIPT\_PATH.
+//   - Resolve relative specs against importer dir → CWD → MINDSCRIPT_PATH.
 //   - If spec has no extension, try spec+defaultModuleExt then spec.
 //   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
 func resolveAndFetch(spec string, importer string) (src string, display string, canon string, err error) {
@@ -189,7 +232,6 @@ func resolveAndFetch(spec string, importer string) (src string, display string, 
 		return "", "", "", fmt.Errorf("module not found: %s", spec)
 	}
 	return string(b), canon, canon, nil
-
 }
 
 func resolveFS(spec string, importer string) (string, error) {
@@ -244,7 +286,6 @@ func resolveFS(spec string, importer string) (string, error) {
 	}
 
 	return "", fmt.Errorf("module not found: %s", spec)
-
 }
 
 func httpFetch(canonURL string) (src string, display string, err error) {
@@ -265,9 +306,9 @@ func httpFetch(canonURL string) (src string, display string, err error) {
 }
 
 // prettySpec returns a short display name for a canonical spec:
-//   - file path  -> basename without extension ("/x/A.ms" -> "A")
-//   - http(s) URL -> last segment without extension ("[https://.../A.ms](https://.../A.ms)" -> "A")
-//   - fallback: the original string if parsing fails.
+//   - file path   -> basename without extension
+//   - http(s) URL -> last segment without extension
+//   - fallback: original string if parsing fails
 func prettySpec(s string) string {
 	// Try URL first
 	if u, err := url.Parse(s); err == nil && u.Scheme != "" {

@@ -774,41 +774,41 @@ func Test_RT_Printf_Returns_Printed_Value(t *testing.T) {
 		t.Fatalf("printf formatting mismatch, got %#v", v2)
 	}
 }
-func Test_RT_Size_On_Arr_Map_Str_And_Other(t *testing.T) {
+func Test_RT_len_On_Arr_Map_Str_And_Other(t *testing.T) {
 	ip := newRT()
 
 	// array
 	vArr := evalWithIP(t, ip, `
 		let a = [1,2,3]
-		size(a)
+		len(a)
 	`)
 	if vArr.Tag != VTInt || vArr.Data.(int64) != 3 {
-		t.Fatalf("size([..]) wrong, got %#v", vArr)
+		t.Fatalf("len([..]) wrong, got %#v", vArr)
 	}
 
 	// map
 	vMap := evalWithIP(t, ip, `
 		let m = {"a":1, "b":2}
-		size(m)
+		len(m)
 	`)
 	if vMap.Tag != VTInt || vMap.Data.(int64) != 2 {
-		t.Fatalf("size({..}) wrong, got %#v", vMap)
+		t.Fatalf("len({..}) wrong, got %#v", vMap)
 	}
 
 	// string
 	vStr := evalWithIP(t, ip, `
-		size("test")
+		len("test")
 	`)
 	if vStr.Tag != VTInt || vStr.Data.(int64) != 4 {
-		t.Fatalf(`size("test") wrong, got %#v`, vStr)
+		t.Fatalf(`len("test") wrong, got %#v`, vStr)
 	}
 
 	// other → null
 	vOther := evalWithIP(t, ip, `
-		size(123)
+		len(123)
 	`)
 	if vOther.Tag != VTNull {
-		t.Fatalf("size(other) should be null, got %#v", vOther)
+		t.Fatalf("len(other) should be null, got %#v", vOther)
 	}
 }
 

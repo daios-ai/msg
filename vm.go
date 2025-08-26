@@ -338,7 +338,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 		case opMakeArr:
 			n := int(imm)
 			if n < 0 || n > m.sp {
-				return m.fail("bad array size")
+				return m.fail("bad array length")
 			}
 			start := m.sp - n
 			elems := make([]Value, n)

@@ -294,6 +294,7 @@ func NewInterpreter() *Interpreter {
 	ip := &Interpreter{}
 	ip.Core = NewEnv(nil)
 	ip.Global = NewEnv(ip.Core) // built-ins visible from user programs
+	ip.modules = map[string]*moduleRec{}
 	ip.initCore()
 	return ip
 }
@@ -473,6 +474,26 @@ func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
 		env = fallback
 	}
 	return ip.resolveType(tv.Ast, env)
+}
+
+// asMapValue returns a VTMap view for VTMap/VTModule (same MapObject), else the input.
+func asMapValue(v Value) Value {
+	if v.Tag == VTModule {
+		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
+	}
+	return v
+}
+
+// syncModuleEnv keeps a module's Env consistent after a write to its map.
+func syncModuleEnv(obj Value, key string, val Value) {
+	if obj.Tag == VTModule {
+		m := obj.Data.(*Module)
+		if _, ok := m.Env.table[key]; ok {
+			m.Env.table[key] = val
+		} else {
+			m.Env.Define(key, val)
+		}
+	}
 }
 
 // -------- Callable & CallCtx adapters --------
@@ -732,7 +753,8 @@ func (ip *Interpreter) initCore() {
 	ip.reg("__plus",
 		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			a, b := ctx.MustArg("a"), ctx.MustArg("b")
+			a := asMapValue(ctx.MustArg("a"))
+			b := asMapValue(ctx.MustArg("b"))
 			if isNumber(a) && isNumber(b) {
 				if a.Tag == VTInt && b.Tag == VTInt {
 					return Int(a.Data.(int64) + b.Data.(int64))
@@ -851,7 +873,7 @@ func (ip *Interpreter) initCore() {
 	ip.reg("__len",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
 		func(ctx CallCtx) Value {
-			x := ctx.MustArg("x")
+			x := asMapValue(ctx.MustArg("x"))
 			switch x.Tag {
 			case VTArray:
 				return Int(int64(len(x.Data.([]Value))))
@@ -944,7 +966,7 @@ func (ip *Interpreter) initCore() {
 	ip.RegisterNative("__to_iter",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
+			x := asMapValue(ctx.MustArg("x"))
 
 			// Already an iterator?
 			if x.Tag == VTFun {
@@ -1044,6 +1066,12 @@ func (ip *Interpreter) initCore() {
 // -------- deep equality (Value) --------
 
 func (ip *Interpreter) deepEqual(a, b Value) bool {
+	if a.Tag == VTModule {
+		a = Value{Tag: VTMap, Data: a.Data.(*Module).Map}
+	}
+	if b.Tag == VTModule {
+		b = Value{Tag: VTMap, Data: b.Data.(*Module).Map}
+	}
 	if isNumber(a) && isNumber(b) {
 		return toFloat(a) == toFloat(b)
 	}
@@ -1123,7 +1151,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 		env.Define(target[1].(string), value)
 	case "get":
 		obj := ip.evalFull(target[1].(S), env)
-		// key may be literal or computed
+		// resolve key string (literal or computed)
 		var keyStr string
 		if ks := target[2].(S); len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
 			keyStr = ks[1].(string)
@@ -1134,16 +1162,21 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 			keyStr = k.Data.(string)
 		}
-		if obj.Tag == VTMap {
-			mo := obj.Data.(*MapObject)
+		mv := asMapValue(obj)
+		if mv.Tag == VTMap {
+			mo := mv.Data.(*MapObject)
 			if _, exists := mo.Entries[keyStr]; !exists {
 				mo.Keys = append(mo.Keys, keyStr)
 			}
 			mo.Entries[keyStr] = value
+			syncModuleEnv(obj, keyStr, value) // no-op for plain maps
 			return
 		}
 		if obj.Tag == VTModule {
-			fail("cannot assign to module exports")
+			fail("object assignment requires map and string key") // unreachable, safety
+		}
+		if obj.Tag == VTArray {
+			fail("object assignment requires map and string key")
 		}
 		fail("object assignment requires map and string key")
 	case "idx":
@@ -1163,13 +1196,15 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			xs[i] = value
 			return
 		}
-		if obj.Tag == VTMap && idx.Tag == VTStr {
-			mo := obj.Data.(*MapObject)
+		mv := asMapValue(obj)
+		if mv.Tag == VTMap && idx.Tag == VTStr {
+			mo := mv.Data.(*MapObject)
 			k := idx.Data.(string)
 			if _, exists := mo.Entries[k]; !exists {
 				mo.Keys = append(mo.Keys, k)
 			}
 			mo.Entries[k] = value
+			syncModuleEnv(obj, k, value)
 			return
 		}
 		fail("index assignment requires array[int] or map[string]")
@@ -1189,14 +1224,15 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 		}
 	case "dobj":
-		if value.Tag != VTMap {
+		vmap := asMapValue(value)
+		if vmap.Tag != VTMap {
 			for i := 1; i < len(target); i++ {
 				p := target[i].(S) // ("pair", key, pattern)
 				ip.assignTo(p[2].(S), annotNull("object pattern: RHS is not a map"), env, true)
 			}
 			return
 		}
-		mo := value.Data.(*MapObject)
+		mo := vmap.Data.(*MapObject)
 		m := mo.Entries
 		for i := 1; i < len(target); i++ {
 			p := target[i].(S)
@@ -1274,6 +1310,7 @@ func (ip *Interpreter) evalFull(n S, env *Env) Value {
 // -------- iterator expansion --------
 
 func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
+	iter = asMapValue(iter)
 	switch iter.Tag {
 	case VTArray:
 		return append([]Value(nil), iter.Data.([]Value)...)

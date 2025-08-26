@@ -3,8 +3,8 @@
 ## Notes:
 ## • Relies on: printf/sprintf, error, nowMillis, dateNow, clone, exit,
 ##   jsonStringify/jsonParse, randFloat, typeOf/isType/isSubtype, funInfo/funType,
-##   mapHas/mapDelete, http, import/importCode, substr/split/join/strip/size, try.
-## • We avoid shadowing native helpers (e.g., size).
+##   mapHas/mapDelete, http, import/importCode, substr/split/join/strip/len, try.
+## • We avoid shadowing native helpers (e.g., len).
 
 # Print a value and return it.
 # Useful for debugging or piping: insert `| print` in a chain.
@@ -109,7 +109,7 @@ let iter = fun(v: Any) -> (Null -> Any?) do
     let xs = v
     let i = 0
     fun(_: Null) -> Any? do
-      if i < size(xs) then
+      if i < len(xs) then
         let y = xs[i]
         i = i + 1
         y
@@ -199,7 +199,7 @@ end
 # Return the last element, or null if empty.
 # array:[Any] -> Any
 let pop = fun(xs: [Any]) -> Any do
-  let n = size(xs)
+  let n = len(xs)
   if n == 0 then null else xs[n - 1] end
 end
 
@@ -215,7 +215,7 @@ end
 # Return the first element, or null if empty.
 # array:[Any] -> Any
 let unshift = fun(xs: [Any]) -> Any do
-  if size(xs) == 0 then null else xs[0] end
+  if len(xs) == 0 then null else xs[0] end
 end
 
 ## -----------------------------
@@ -390,7 +390,7 @@ let uid = fun(value: Any) -> Int do
   let h = 5381
   for ch in split(s, "") do
     ## crude: use string length as a surrogate for codepoint weight (no ord())
-    h = ((h * 33) + size(ch))
+    h = ((h * 33) + len(ch))
   end
   h
 end

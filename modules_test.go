@@ -154,24 +154,104 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 	wantAnnotatedNullContains(t, r, "division by zero")
 }
 
-// Module exports are readable but read-only.
-func Test_FileImport_ReadOnly_Exports(t *testing.T) {
+// --- NEW behavior: modules are map-like & writable --------------------------
+
+// Writable module fields, and NO namespace collision with caller globals.
+func Test_Module_MapLike_Writable_NoNamespaceCollision(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()
 	defer chdir(t, dir)()
 
-	_ = write(t, dir, "m.ms", `let name = "Bob"`)
+	_ = write(t, dir, "m.ms", `
+let x = 2
+`)
+
+	ip := NewRuntime()
+	// Use block-form if/then/else with 'end', per grammar.
+	v := evalWithIP(t, ip, `
+let x = 1
+let m = import("m")
+let before = m.x
+m.x = 3
+let after = m.x
+if (x == 1) and (before == 2) and (after == 3) then
+  1
+else
+  0
+end
+`)
+	wantInt(t, v, 1)
+}
+
+// Patching a module variable is visible to closures defined inside the module.
+func Test_Module_Patch_Visible_To_Module_Closures(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	_ = write(t, dir, "m.ms", `
+let x = 5
+let get = fun() -> Int do return(x) end
+`)
+
+	ip := NewRuntime()
+	// Expect a*10 + b == 57 where a=get() before patch (5) and b after patch (7).
+	v := evalWithIP(t, ip, `
+let m = import("m")
+let a = m.get()
+m.x = 7
+let b = m.get()
+a * 10 + b
+`)
+	wantInt(t, v, 57)
+}
+
+// Destructuring and len() work because modules behave like maps.
+func Test_Module_Destructure_And_Len(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	_ = write(t, dir, "m.ms", `
+let x = 41
+let inc = fun(n: Int) -> Int do return(n + 1) end
+`)
+
+	ip := NewRuntime()
+
+	// Object pattern requires "key : pattern" entries (no shorthand).
+	v := evalWithIP(t, ip, `
+let {x: x, inc: inc} = import("m")
+inc(x)`)
+	wantInt(t, v, 42)
+
+	// len(m) == 2 (x and inc)
+	v2 := evalWithIP(t, ip, `
+let m = import("m")
+len(m)`)
+	wantInt(t, v2, 2)
+}
+
+// Iteration over module exports (order not asserted here; just sums values).
+func Test_Module_Iterate(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	_ = write(t, dir, "m.ms", `
+let a = 1
+let b = 2
+`)
 
 	ip := NewRuntime()
 	v := evalWithIP(t, ip, `
 let m = import("m")
-m.name`)
-	wantStr(t, v, "Bob")
-
-	v2 := evalWithIP(t, ip, `
-let m = import("m")
-m.name = "Alice"`)
-	wantAnnotatedNullContains(t, v2, "cannot assign to module exports")
+let total = 0
+for [k, v] in m do
+  total = total + v
+end
+total`)
+	wantInt(t, v, 3)
 }
 
 // Builtins are visible inside module env (Core is parent).
@@ -227,8 +307,7 @@ let m = import("`+srv.URL+`/m1.ms")
 m.x`)
 	wantInt(t, v1, 5)
 
-	// Without extension — our autoloader appends defaultModuleExt for http(s)
-	// (server serves /m2.ms; spec without ext becomes /m2.ms)
+	// Without extension — the autoloader appends defaultModuleExt for http(s)
 	v2 := evalWithIP(t, ip, `
 let m = import("`+srv.URL+`/m2")
 m.x`)

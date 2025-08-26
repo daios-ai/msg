@@ -1063,17 +1063,17 @@ Returns:
   Bool`)
 
 	ip.RegisterNative(
-		"size",
+		"len",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
+			x := asMapValue(ctx.MustArg("x"))
 			switch x.Tag {
 			case VTArray:
 				return Int(int64(len(x.Data.([]Value))))
 			case VTMap:
 				mo := x.Data.(*MapObject)
-				// Use ordered keys length to reflect object “size”
+				// Use ordered keys length to reflect object “length”
 				return Int(int64(len(mo.Keys)))
 			case VTStr:
 				// Unicode-aware length to match substr’s rune semantics

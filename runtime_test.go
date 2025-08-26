@@ -101,7 +101,7 @@ func Test_RT_Spawn_Join_ClosureIsolation(t *testing.T) {
 
 	// Channel ping-pong
 	v := evalWithIP(t, ip, `
-let c = chan()
+let c = chanOpen()
 let worker = fun() do
   let m = chanRecv(c)
   chanSend(c, m + " world")
@@ -121,7 +121,7 @@ r
 func Test_RT_Channel_Close_RecvAfterClose(t *testing.T) {
 	ip := newRT()
 	v := evalWithIP(t, ip, `
-		let c = chan()
+		let c = chanOpen()
 		chanClose(c)
 		chanRecv(c)
 	`)
@@ -169,7 +169,7 @@ func Test_RT_Net_Listen_Accept_Echo(t *testing.T) {
 
 // ---------------- I/O ----------------
 
-func Test_RT_IO_File_ReadWrite_ListDir(t *testing.T) {
+func Test_RT_IO_File_ReadWrite_DirList(t *testing.T) {
 	ip := newRT()
 
 	dir := t.TempDir()
@@ -207,12 +207,12 @@ func Test_RT_IO_File_ReadWrite_ListDir(t *testing.T) {
 		t.Fatalf("readLine sequence unexpected: %#v", v)
 	}
 
-	// listDir
+	// dirList
 	_ = os.WriteFile(filepath.Join(dir, "z.dat"), []byte("x"), 0o644)
 	ip.Global.Define("dir", Str(dir))
-	ls := evalWithIP(t, ip, `listDir(dir)`)
+	ls := evalWithIP(t, ip, `dirList(dir)`)
 	if ls.Tag != VTArray || len(ls.Data.([]Value)) < 2 {
-		t.Fatalf("listDir expected >=2 entries, got %#v", ls)
+		t.Fatalf("dirList expected >=2 entries, got %#v", ls)
 	}
 }
 
@@ -725,13 +725,13 @@ func Test_RT_IO_Open_RW_Mode_ReadAfterWrite(t *testing.T) {
 func Test_RT_Error_Raises_RuntimeError(t *testing.T) {
 	ip := newRT()
 
-	v := evalWithIP(t, ip, `error("boom")`)
+	v := evalWithIP(t, ip, `fail("boom")`)
 	wantAnnotatedContains(t, v, "boom")
 
 	// Optional: null/empty message still raises a hard error (message can be empty)
-	v2 := evalWithIP(t, ip, `error(null)`)
+	v2 := evalWithIP(t, ip, `fail(null)`)
 	if v2.Tag != VTNull || v2.Annot == "" {
-		t.Fatalf("error(null) should still be an annotated null, got %#v", v2)
+		t.Fatalf("fail(null) should still be an annotated null, got %#v", v2)
 	}
 }
 
@@ -1191,5 +1191,65 @@ func Test_RT_BaseType_StripsNullable_AndResolvesAliases(t *testing.T) {
 	tv := out.Data.(*TypeValue)
 	if !equalS(tv.Ast, typeS(t, ip, `Int`)) {
 		t.Fatalf("baseType failed, got %#v", tv.Ast)
+	}
+}
+
+// --------- Prelude loading ---------------------
+
+func Test_RT_LoadPrelude_BindsToCore(t *testing.T) {
+	ip := NewRuntime()
+
+	// Create a temporary prelude that defines a simple builtin.
+	td := t.TempDir()
+	const preludeSrc = `
+		# prelude: adds one
+		let inc = fun(x: Int) -> Int do x + 1 end
+	`
+	if err := os.WriteFile(filepath.Join(td, "prelude"), []byte(preludeSrc), 0o644); err != nil {
+		t.Fatalf("write prelude: %v", err)
+	}
+	t.Setenv(MindScriptPath, td)
+
+	// Before loading, calling inc should fail with "undefined variable".
+	v0 := evalWithIP(t, ip, `inc(41)`)
+	wantAnnotatedContains(t, v0, "undefined variable")
+
+	// Load the prelude: it must bind into Core (builtins), not Global.
+	if err := ip.LoadPrelude("prelude", ""); err != nil {
+		t.Fatalf("LoadPrelude failed: %v", err)
+	}
+
+	// After loading, inc works and returns 42.
+	v := evalWithIP(t, ip, `inc(41)`)
+	if v.Tag != VTInt || v.Data.(int64) != 42 {
+		t.Fatalf("inc(41) => want 42, got %#v", v)
+	}
+
+	// Ensure binding lives in Core, not in Global.
+	if _, ok := ip.Core.table["inc"]; !ok {
+		t.Fatalf("inc should be defined in Core")
+	}
+	if _, ok := ip.Global.table["inc"]; ok {
+		t.Fatalf("inc should NOT be defined in Global")
+	}
+}
+
+func Test_RT_LoadPrelude_FailurePath(t *testing.T) {
+	ip := NewRuntime()
+
+	// Prelude with a runtime failure (unsupported '+' operands) must surface as error.
+	td := t.TempDir()
+	const badSrc = `1 + []`
+	if err := os.WriteFile(filepath.Join(td, "bad"), []byte(badSrc), 0o644); err != nil {
+		t.Fatalf("write bad prelude: %v", err)
+	}
+	t.Setenv(MindScriptPath, td)
+
+	err := ip.LoadPrelude("bad", "")
+	if err == nil {
+		t.Fatalf("LoadPrelude should have failed")
+	}
+	if !strings.Contains(err.Error(), "unsupported operands for '+'") {
+		t.Fatalf("LoadPrelude error should mention cause, got: %v", err)
 	}
 }

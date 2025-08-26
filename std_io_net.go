@@ -320,7 +320,7 @@ Returns: Str`)
 Creates the file if necessary with mode 0644.`)
 
 	ip.RegisterNative(
-		"listDir",
+		"dirList",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"array", S{"id", "Str"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
@@ -336,7 +336,7 @@ Creates the file if necessary with mode 0644.`)
 			return Arr(out)
 		},
 	)
-	setBuiltinDoc(ip, "listDir", `List directory entries as an array of names.
+	setBuiltinDoc(ip, "dirList", `List directory entries as an array of names.
 
 Params:
   path: Str

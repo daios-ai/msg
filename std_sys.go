@@ -186,10 +186,10 @@ Returns:
   Null`)
 
 	// Channels (untyped)
-	ip.RegisterNative("chan", nil, S{"id", "Any"}, func(ip *Interpreter, ctx CallCtx) Value {
+	ip.RegisterNative("chanOpen", nil, S{"id", "Any"}, func(ip *Interpreter, ctx CallCtx) Value {
 		return HandleVal("chan", &chanBox{ch: make(chan Value)})
 	})
-	setBuiltinDoc(ip, "chan", `Create a new unbuffered channel.
+	setBuiltinDoc(ip, "chanOpen", `Create a new unbuffered channel.
 
 Channels transport arbitrary values between concurrent processes.
 

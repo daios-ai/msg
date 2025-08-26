@@ -1,399 +1,651 @@
-=== BEGIN FILE: modules.go ===
-// modules.go
-//
-// Module system built on the stable engine surface, now exposing modules as a
-// map-like value with an attached lexical environment.
-//
-// This refactor provides three focused entry points that reuse shared helpers:
-//
-//   • importAST(name, ast)   — takes an AST, creates a module
-//   • importCode(name, src)  — takes source code, creates a module
-//   • importFile(spec, imp)  — resolves (FS/HTTP), parses, caches, detects cycles
-//
-// Internals are de-duplicated via:
-//   • parseSource(display, src)           — shared parsing + error wrapping
-//   • buildModuleFromAST(display, ast)    — shared eval + snapshotting into Module
-//
-// Design goal: VTModule should be ergonomically like VTMap. We realize this by
-// building the module’s public surface as a MapObject (ordered, key annots), and
-// keep Env for closures/types. All VTMap behaviors are reused by small, central
-// coercions VTModule→VTMap in interpreter.go (no duplicated branches).
+=== BEGIN FILE: lib/std.ms ===
+## stdlib.ms
+## Minimal standard library implemented in MindScript on top of builtins.
+## Notes:
+## • Relies on: printf/sprintf, error, nowMillis, dateNow, clone, exit,
+##   jsonStringify/jsonParse, randFloat, typeOf/isType/isSubtype, funInfo/funType,
+##   mapHas/mapDelete, http, import/importCode, substr/split/join/strip/len, try.
+## • We avoid shadowing native helpers (e.g., len).
 
-package mindscript
+# Return an error.
+let error = fun(msg: Str) -> Null do
+  __annotate(msg, null)
+end
 
-import (
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
-	"path"
-	"path/filepath"
-	"sort"
-	"strings"
-	"time"
-)
+# Print a value and return it.
+# Useful for debugging or piping: insert `| print` in a chain.
+# value:Any -> Any
+let print = fun(x: Any) -> Any do
+  printf("%v\n", x)
+end
 
-// ---- Module runtime structs ------------------------------------------------
+# Assert that a condition is true.
+# Returns true if it holds, otherwise throws an error.
+# condition:Bool -> Bool
+let assert = fun(cond: Bool) -> Bool do
+  if cond then
+    true
+  else
+    error("assertion failed")
+  end
+end
 
-type moduleState int
+# Current timestamp in milliseconds since the Unix epoch.
+# _:Null -> Int
+let tsNow = fun(_: Null) -> Int do nowMillis() end
 
-const (
-	modUnloaded moduleState = iota
-	modLoading
-	modLoaded
-)
+# Random float uniformly in [0, 1).
+# _:Null -> Num
+let random = fun(_: Null) -> Num do randFloat() end
 
-type moduleRec struct {
-	spec        string
-	displayName string
-	src         string
-	env         *Env
-	mod         *Module
-	state       moduleState
-	err         error
+## -----------------------------
+## Tiny internal helpers
+## -----------------------------
+
+# Build a JSON array incrementally (string-backed buffer).
+# _:Null -> {push:(Any -> Null), build:(Null -> [Any])}
+let _arrayBuilder = fun() -> {push:(Any -> Null), build:(Null -> [Any])} do
+  let buf = "["
+  let first = true
+  let push = fun(x: Any) -> Null do
+    if first then
+      buf = buf + jsonStringify(x)
+      first = false
+      null
+    else
+      buf = buf + "," + jsonStringify(x)
+      null
+    end
+  end
+  let build = fun(_: Null) -> [Any] do
+    jsonParse(buf + "]")
+  end
+  {push: push, build: build}
+end
+
+## -----------------------------
+## Iterators
+## -----------------------------
+
+# Infinite iterator: 0, 1, 2, 3, ...
+# _:Null -> (Null -> Int)
+let natural0 = fun(_: Null) -> (Null -> Int) do
+  let i = 0
+  fun(_: Null) -> Int do
+    let v = i
+    i = i + 1
+    v
+  end
+end
+
+# Infinite iterator: 1, 2, 3, 4, ...
+# _:Null -> (Null -> Int)
+let natural = fun(_: Null) -> (Null -> Int) do
+  let i = 1
+  fun(_: Null) -> Int do
+    let v = i
+    i = i + 1
+    v
+  end
+end
+
+# Integer range iterator (stop exclusive; infinite if stop is null).
+# start:Int -> stop:Int? -> (Null -> Int?)
+let range = fun(start: Int, stop: Int?) -> (Null -> Int?) do
+  let i = start
+  fun(_: Null) -> Int? do
+    if stop == null then
+      let v = i
+      i = i + 1
+      v
+    elif i >= stop then
+      null
+    else
+      let v = i
+      i = i + 1
+      v
+    end
+  end
+end
+
+# Turn arrays into (Null -> Any?) iterators; pass iterators through unchanged.
+# value:Any -> (Null -> Any?)
+let iter = fun(v: Any) -> (Null -> Any?) do
+  if isType(v, type [Any]) then
+    let xs = v
+    let i = 0
+    fun(_: Null) -> Any? do
+      if i < len(xs) then
+        let y = xs[i]
+        i = i + 1
+        y
+      else
+        null
+      end
+    end
+  else
+    v  ## assume it’s already an iterator (Null -> Any?)
+  end
+end
+
+# Collect an iterator into an array.
+# iterator:(Null -> Any?) -> [Any]
+let list = fun(it: (Null -> Any?)) -> [Any] do
+  let b = _arrayBuilder()
+  for _ in natural0(null) do
+    let x = it(null)
+    if x == null then break(null) end
+    b.push(x)
+  end
+  b.build(null)
+end
+
+# Map over an iterator (lazy transform).
+# f:(Any -> Any) -> it:(Null -> Any?) -> (Null -> Any?)
+let map = fun(f: (Any -> Any), it: (Null -> Any?)) -> (Null -> Any?) do
+  fun(_: Null) -> Any? do
+    let x = it(null)
+    if x == null then null else f(x) end
+  end
+end
+
+# Filter an iterator (lazy predicate).
+# cond:(Any -> Bool) -> it:(Null -> Any?) -> (Null -> Any?)
+let filter = fun(cond: (Any -> Bool), it: (Null -> Any?)) -> (Null -> Any?) do
+  fun(_: Null) -> Any? do
+    for _ in natural0(null) do
+      let x = it(null)
+      if x == null then break(null) end
+      if cond(x) then return(x) end
+    end
+    null
+  end
+end
+
+# Fold an iterator with a binary function.
+# f:(Any -> Any -> Any) -> it:(Null -> Any?) -> Any
+let reduce = fun(f: (Any -> Any -> Any), it: (Null -> Any?)) -> Any do
+  let first = it(null)
+  if first == null then
+    null
+  else
+    let acc = first
+    for _ in natural0(null) do
+      let x = it(null)
+      if x == null then break(null) end
+      acc = f(acc, x)
+    end
+    acc
+  end
+end
+
+## -----------------------------
+## Arrays
+## -----------------------------
+
+# Slice a subarray [s, e) (end exclusive).
+# array:[Any] -> s:Int -> e:Int -> [Any]
+let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
+  let b = _arrayBuilder()
+  for i in range(s, e) do
+    b.push(xs[i])
+  end
+  b.build(null)
+end
+
+# Return a new array with value appended (non-mutating).
+# array:[Any] -> value:Any -> [Any]
+let push = fun(xs: [Any], v: Any) -> [Any] do
+  let b = _arrayBuilder()
+  for x in iter(xs) do b.push(x) end
+  b.push(v)
+  b.build(null)
+end
+
+# Return the last element, or null if empty.
+# array:[Any] -> Any
+let pop = fun(xs: [Any]) -> Any do
+  let n = len(xs)
+  if n == 0 then null else xs[n - 1] end
+end
+
+# Return a new array with value inserted at the front (non-mutating).
+# array:[Any] -> value:Any -> [Any]
+let shift = fun(xs: [Any], v: Any) -> [Any] do
+  let b = _arrayBuilder()
+  b.push(v)
+  for x in iter(xs) do b.push(x) end
+  b.build(null)
+end
+
+# Return the first element, or null if empty.
+# array:[Any] -> Any
+let unshift = fun(xs: [Any]) -> Any do
+  if len(xs) == 0 then null else xs[0] end
+end
+
+## -----------------------------
+## Objects (maps)
+## -----------------------------
+
+# Delete a property (in place) and return the same object.
+# obj:{} -> prop:Str -> {}
+let delete = fun(obj: {}, prop: Str) -> {} do
+  mapDelete(obj, prop)
+end
+
+# Check whether a key exists in an object.
+# obj:{} -> key:Str -> Bool
+let exists = fun(obj: {}, key: Str) -> Bool do
+  mapHas(obj, key)
+end
+
+# Dynamic property get.
+# obj:{} -> key:Str -> Any
+let get = fun(obj: {}, key: Str) -> Any do
+  obj[key]
+end
+
+# Dynamic property set (returns the assigned value).
+# obj:{} -> key:Str -> value:Any -> Any
+let set = fun(obj: {}, key: Str, value: Any) -> Any do
+  obj[key] = value
+  value
+end
+
+# Iterator over object keys (in insertion order).
+# obj:{} -> (Null -> Str?)
+let keys = fun(obj: {}) -> (Null -> Str?) do
+  let it = iter(obj)
+  fun(_: Null) -> Str? do
+    let pair = it(null)
+    if pair == null then
+      null
+    else
+      pair[0]
+    end
+  end
+end
+
+# Iterator over object values (in insertion order).
+# obj:{} -> (Null -> Any?)
+let values = fun(obj: {}) -> (Null -> Any?) do
+  let it = iter(obj)
+  fun(_: Null) -> Any? do
+    let pair = it(null)
+    if pair == null then
+      null
+    else
+      pair[1]
+    end
+  end
+end
+
+# List public attributes of an object (and modules, if supported).
+# Filters out names that start with "_" (treated as private).
+# obj:{}|Module -> [Str]
+let dir = fun(x: Any) -> [Str] do
+  ## Map/object path
+  if isType(x, type {}) then
+    let out = []
+    for let [k, _] in x do
+      if not (substr(k, 0, 1) == "_") then
+        out = out + [k]
+      end
+    end
+    out
+  else
+    ## Optional module support if a native `moduleKeys(mod) -> [Str]` exists.
+    let probe = try(fun() do moduleKeys(x) end)
+    if probe.ok then
+      let out = []
+      for name in iter(probe.value) do
+        if not (substr(name, 0, 1) == "_") then
+          out = out + [name]
+        end
+      end
+      out
+    else
+      []
+    end
+  end
+end
+
+# Placeholder for method discovery on objects.
+# Not implemented in pure MindScript; needs a native predicate for functions.
+# obj:{} -> [Str]
+let dirFun = fun(_obj: {}) -> [Str] do
+  error("dirFun is not implemented in stdlib; requires native function detection")
+end
+
+## -----------------------------
+## Importing / Modules
+## -----------------------------
+
+# Curried wrapper over importCode(name, src) for convenience.
+# code:Str -> name:Str -> {}
+let codeImport = fun(code: Str) -> (Str -> {}) do
+  fun(name: Str) -> {} do
+    importCode(name, code)
+  end
+end
+
+# Import a module from a URL or path (delegates to native import()).
+# url:Str -> {}
+let netImport = fun(url: Str) -> {} do
+  import(url)
+end
+
+## -----------------------------
+## Networking
+## -----------------------------
+
+# GET a URL; return body on HTTP 200, otherwise null.
+# url:Str -> Str?
+let www = fun(url: Str) -> Str? do
+  let r = http({ url: url, method: "GET" })
+  if r.status == 200 then r.body else null end
+end
+
+## -----------------------------
+## Schemas / Grammars (placeholders)
+## -----------------------------
+
+# Render a JSON Schema from a Type (not implemented here).
+# t:Type -> Str
+let schema = fun(_t: Type) -> Str do
+  error("schema(Type) not implemented in stdlib; provide a native bridge")
+end
+
+# Render a BNF-like grammar from a Type (not implemented here).
+# t:Type -> Str
+let bnf = fun(_t: Type) -> Str do
+  error("bnf(Type) not implemented in stdlib; provide a native bridge")
+end
+
+## -----------------------------
+## Annotations
+## -----------------------------
+
+# Get a value’s full docstring (if any).
+# x:Any -> Str?
+let getNote = fun(x: Any) -> Str? do
+  help(x)
+end
+
+# Attach/replace a value’s docstring (not implemented here).
+# x:Any -> note:Str? -> Any
+let setNote = fun(_x: Any, _ann: Str?) -> Any do
+  error("setNote requires native support to attach annotations at runtime")
+end
+
+## -----------------------------
+## Misc
+## -----------------------------
+
+# Bind a value as the implicit first argument of a function.
+# value:Any -> func:(Any -> Any) -> (Any -> Any)
+let bindMethod = fun(value: Any, f: (Any -> Any)) -> (Any -> Any) do
+  fun(x: Any) -> Any do f(value, x) end
+end
+
+# Best-effort stable hash of a value’s printable form (may collide).
+# value:Any -> Int
+let uid = fun(value: Any) -> Int do
+  let s = str(value)
+  let h = 5381
+  for ch in split(s, "") do
+    ## crude: use string length as a surrogate for codepoint weight (no ord())
+    h = ((h * 33) + len(ch))
+  end
+  h
+end
+
+# Swallow any value and return null.
+# _:Any -> Null
+let mute = fun(_: Any) -> Null do null end
+
+
+## -----------------------------
+## Oracle prelude shim (default backend: Ollama)
+##
+## Provides a working default backend + a single delegate hook that a module can replace.
+## -----------------------------
+
+# prelude_oracle.ms — tiny bootstrap in the global environment
+
+# The oracle hook symbol.
+let __oracle_execute = fun(_prompt: Str, _inT: Type, _outT: Type, _examples: Any) do
+  error("oracle backend not configured; load oracle.ms")
+end
+
+# Try to import the backend manager module.
+let _imp = try(fun() do import("backends") end)
+
+if _imp.ok == true then
+  let _mod = _imp.value
+  # Pull the namespaced API into a convenient global binding.
+  let Oracle = _mod.Oracle
+
+  # Choose a default backend & model.
+  if osEnv("OPENAI_API_KEY") != null then
+    Oracle.use_backend("openai")
+    Oracle.use_model(Oracle.state.cfg.openai.default_model)
+  else
+    Oracle.use_backend("ollama")
+    Oracle.use_model(Oracle.state.cfg.ollama.default_model)
+  end
+
+  __oracle_execute = Oracle.execute
+end
+=== END FILE: lib/std.ms ===
+
+=== BEGIN FILE: lib/backends.ms ===
+## backends.ms — provider executors
+##
+## Each maker returns an executor with signature:
+##   exec(prompt: Str, inType: Type, outType: Type, examples: [Any], opts: { backend:Str, config:{Str:Any}, system:Str? }) -> Str | Null
+# oracle.ms — minimal, ergonomic oracle backend manager
+
+# Annotated error helper (use error(...) per your semantics)
+let bad = fun(msg: Str) do error(msg) end
+
+# Compact boxed schema: {"output": <schema(outT)>}
+let boxedSchemaFor = fun(outT: Type) do
+  {
+    "type": "object",
+    "properties": { "output": typeToJSONSchema(outT) },
+    "required": ["output"]
+  }
+end
+
+# Safe HTTP wrapper that converts hard faults to annotated errors
+let httpSafe = fun(req) do
+  let r = try(fun() do http(req) end)
+  if r.ok == true then
+    r.value
+  else
+    bad("http: " + (r.error + "request failed"))
+  end
+end
+
+# -------------------- OpenAI adapter --------------------
+
+let OpenAI = {
+  name: "openai",
+  supports_schema: true,
+  execute: fun(prompt: Str, inT: Type, outT: Type, examples, cfg, model: Str) do
+    # Resolve auth
+    let key = cfg.api_key
+    if key == null then
+      key = osEnv("OPENAI_API_KEY")
+      if key == null then
+        return bad("openai: missing api_key (set OPENAI_API_KEY or Oracle.configure)")
+      end
+    end
+
+    let base = cfg.base_url
+    if base == null then base = "https://api.openai.com/v1" end
+
+    # Request body
+    let body = {
+      "model": model,
+      "messages": [{"role": "user", "content": prompt}],
+      "temperature": 0
+    }
+
+    if cfg.use_schema == true then
+      body.response_format = {
+        "type": "json_schema",
+        "json_schema": { "name": "OracleOutput", "schema": boxedSchemaFor(outT) }
+      }
+    else
+      body.response_format = { "type": "json_object" }
+    end
+
+    # HTTP
+    let resp = httpSafe({
+      "url": base + "/chat/completions",
+      "method": "POST",
+      "headers": {
+        "Authorization": "Bearer " + key,
+        "Content-Type": "application/json"
+      },
+      "body": jsonStringify(body)
+    })
+
+    if resp.status != 200 then
+      return bad("openai: HTTP " + str(resp.status))
+    end
+
+    let j = jsonParse(resp.body)
+    if j == null then return bad("openai: bad JSON response") end
+
+    let c0 = j.choices[0]
+    if c0 == null then return bad("openai: missing choices[0]") end
+
+    let content = c0.message.content
+    if content == null then return bad("openai: missing message.content") end
+    content
+  end
 }
 
-// Module is the public payload for VTModule.
-// Map holds the exported bindings (ordered, with per-key annotations).
-// Env is the lexical environment where the module executed (for closures/types).
-type Module struct {
-	Name string
-	Map  *MapObject
-	Env  *Env
+# -------------------- Ollama adapter --------------------
+
+let Ollama = {
+  name: "ollama",
+  supports_schema: false,
+  execute: fun(prompt: Str, _inT: Type, _outT: Type, _examples, cfg, model: Str) do
+    let base = cfg.base_url
+    if base == null then base = "http://localhost:11434" end
+
+    let body = {
+      "model": model,
+      "prompt": prompt,
+      "options": {"temperature": 0},
+      "format": "json",
+      "stream": false
+    }
+
+    let resp = httpSafe({
+      "url": base + "/api/generate",
+      "method": "POST",
+      "headers": {"Content-Type": "application/json"},
+      "body": jsonStringify(body)
+    })
+
+    if resp.status != 200 then
+      return bad("ollama: HTTP " + str(resp.status))
+    end
+
+    let j = jsonParse(resp.body)
+    if j == null then return bad("ollama: bad JSON response") end
+
+    let out = j.response
+    if out == null then return bad("ollama: missing response text") end
+    out
+  end
 }
 
-// get returns an exported binding by key. The VM can use this for property/index reads.
-func (m *Module) get(key string) (Value, bool) {
-	v, ok := m.Map.Entries[key]
-	return v, ok
+# -------------------- Oracle manager (namespace) --------------------
+
+let Oracle = {
+  state: {
+    backends: { "openai": OpenAI, "ollama": Ollama },
+    backend_names: ["openai", "ollama"],
+    selected_backend: null,
+    selected_model: null,
+    cfg: {
+      "openai": {
+        "api_key": null,
+        "base_url": "https://api.openai.com/v1",
+        "use_schema": true,
+        "default_model": "gpt-4o-mini"
+      },
+      "ollama": {
+        "base_url": "http://localhost:11434",
+        "default_model": "llama3:latest"
+      }
+    }
+  },
+  list_backends: fun() do Oracle.state.backend_names end,
+  use_backend: fun(name: Str) do
+    if mapHas(Oracle.state.backends, name) != true then
+      return bad("unknown backend: " + name)
+    end
+    Oracle.state.selected_backend = name
+    if Oracle.state.selected_model == null then
+      Oracle.state.selected_model = Oracle.state.cfg.(name).default_model
+    end
+    null
+  end,
+  use_model: fun(model: Str) do
+    if Oracle.state.selected_backend == null then
+      return bad("no backend selected")
+    end
+    Oracle.state.selected_model = model
+    null
+  end,
+  configure: fun(name: Str, opts) do
+    if mapHas(Oracle.state.backends, name) != true then
+      return bad("unknown backend: " + name)
+    end
+    # fetch (or create) the cfg map for this backend
+    let C = Oracle.state.cfg.(name)
+    if C == null then
+      Oracle.state.cfg.(name) = {}
+    end
+
+    if mapHas(opts, "api_key") == true then Oracle.state.cfg.(name).api_key = opts.api_key end
+    if mapHas(opts, "base_url") == true then Oracle.state.cfg.(name).base_url = opts.base_url end
+    if mapHas(opts, "use_schema") == true then Oracle.state.cfg.(name).use_schema = opts.use_schema end
+    if mapHas(opts, "default_model") == true then Oracle.state.cfg.(name).default_model = opts.default_model end
+    null
+  end,
+  current: fun() do
+    {
+      "backend": Oracle.state.selected_backend,
+      "model": Oracle.state.selected_model,
+      "cfg": Oracle.state.cfg.(Oracle.state.selected_backend)
+    }
+  end,
+  # Hook consumed by oracles.go
+  execute: fun(prompt: Str, inT: Type, outT: Type, examples) do
+    let name = Oracle.state.selected_backend
+    if name == null then return bad("oracle backend not configured") end
+
+    let b = Oracle.state.backends.(name)
+    if b == null then return bad("oracle backend missing: " + name) end
+
+    let model = Oracle.state.selected_model
+    if model == null then model = Oracle.state.cfg.(name).default_model end
+
+    b.execute(prompt, inT, outT, examples, Oracle.state.cfg.(name), model)
+  end
 }
 
-// ---- Public-ish entry points (package-internal) ----------------------------
-
-// importAST creates a module from a READY AST, evaluating it in an Env parented to Core.
-// The produced module is NOT cached (no cycles involved).
-func (ip *Interpreter) importAST(name string, ast S) (Value, error) {
-	m, err := ip.buildModuleFromAST(name, ast)
-	if err != nil {
-		return Null, err
-	}
-	m.Name = name
-	return Value{Tag: VTModule, Data: m}, nil
-}
-
-// importCode parses source then delegates to importAST. No cache/cycle handling here.
-func (ip *Interpreter) importCode(name string, src string) (Value, error) {
-	ast, err := parseSource(name, src)
-	if err != nil {
-		return Null, err
-	}
-	return ip.importAST(name, ast)
-}
-
-// importFile resolves (FS/HTTP), parses, evaluates, caches successes, and detects cycles.
-// This is the refactor of the old importModule.
-func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
-	// Resolve + fetch → (src, display, canon)
-	src, display, canon, rerr := resolveAndFetch(spec, importer)
-	if rerr != nil {
-		return Null, rerr
-	}
-
-	// Cycle detection against canonical key
-	for _, s := range ip.loadStack {
-		if s == canon {
-			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
-		}
-	}
-	ip.loadStack = append(ip.loadStack, canon)
-	defer func() { ip.loadStack = ip.loadStack[:len(ip.loadStack)-1] }()
-
-	// Cache check
-	if ip.modules == nil {
-		ip.modules = map[string]*moduleRec{}
-	}
-	if rec, ok := ip.modules[canon]; ok {
-		if rec.state == modLoading {
-			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
-		}
-		if rec.state == modLoaded && rec.mod != nil {
-			return Value{Tag: VTModule, Data: rec.mod}, nil
-		}
-	}
-
-	// Mark loading
-	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
-
-	// Parse (shared helper)
-	ast, perr := parseSource(display, src)
-	if perr != nil {
-		delete(ip.modules, canon) // do not cache failures
-		return Null, perr
-	}
-
-	// Build module from AST (shared helper)
-	m, err := ip.buildModuleFromAST(display, ast)
-	if err != nil {
-		delete(ip.modules, canon) // do not cache failures
-		return Null, err
-	}
-
-	// Commit success to cache with canonical identity
-	rec := ip.modules[canon]
-	rec.displayName = display
-	rec.src = src
-	rec.env = m.Env
-	m.Name = canon
-	rec.mod = m
-	rec.state = modLoaded
-	rec.err = nil
-
-	return Value{Tag: VTModule, Data: rec.mod}, nil
-}
-
-// ---- Shared helpers (no duplication) ---------------------------------------
-
-// parseSource parses src into an S-expr AST and wraps errors with source context.
-func parseSource(display string, src string) (S, error) {
-	ast, perr := ParseSExpr(src)
-	if perr != nil {
-		perr = WrapErrorWithSource(perr, src)
-		return nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
-	}
-	return ast, nil
-}
-
-// buildModuleFromAST evaluates ast in an Env parented to Core and snapshots the public surface.
-// Runtime annotated nulls and rtErr panics are converted to rich errors with display context.
-func (ip *Interpreter) buildModuleFromAST(display string, ast S) (*Module, error) {
-	// Evaluate in isolated env parented to Core; turn rtErr/annotNull into errors
-	modEnv := NewEnv(ip.Core)
-	var rterr error
-	var evalRes Value
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				switch sig := r.(type) {
-				case rtErr:
-					rterr = fmt.Errorf("runtime error in %s: %s", display, sig.msg)
-				default:
-					rterr = fmt.Errorf("runtime panic in %s: %v", display, r)
-				}
-			}
-		}()
-		if len(ast) > 0 {
-			// Uncaught mode returns annotated nulls instead of errors; we surface them below.
-			evalRes = ip.EvalASTUncaught(ast, modEnv, true)
-		}
-	}()
-
-	if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
-		rterr = fmt.Errorf("runtime error in %s: %s", display, evalRes.Annot)
-	}
-	if rterr != nil {
-		return nil, rterr
-	}
-
-	// Snapshot public surface (ordered keys, key annotations, pin VTType envs)
-	mo := buildModuleMap(modEnv)
-
-	return &Module{
-		// Caller sets Name (canonical identity or a chosen name).
-		Map: mo,
-		Env: modEnv,
-	}, nil
-}
-
-// buildModuleMap snapshots modEnv.table into a MapObject:
-// • Keys are sorted for determinism (Env.table is a Go map).
-// • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
-// • If a value carries Annot, we mirror it into KeyAnn for that key.
-func buildModuleMap(modEnv *Env) *MapObject {
-	keys := make([]string, 0, len(modEnv.table))
-	for k := range modEnv.table {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys) // deterministic order
-
-	mo := &MapObject{
-		Entries: make(map[string]Value, len(keys)),
-		KeyAnn:  make(map[string]string, len(keys)),
-		Keys:    make([]string, 0, len(keys)),
-	}
-	for _, k := range keys {
-		v := modEnv.table[k]
-
-		// Pin exported types to the module env if needed
-		if v.Tag == VTType {
-			tv := v.Data.(*TypeValue)
-			if tv.Env == nil {
-				nv := TypeValIn(tv.Ast, modEnv)
-				nv.Annot = v.Annot // preserve docs on the value
-				v = nv
-			}
-		}
-
-		mo.Entries[k] = v
-		mo.Keys = append(mo.Keys, k)
-		if ann := v.Annot; ann != "" {
-			mo.KeyAnn[k] = ann
-		}
-	}
-	return mo
-}
-
-// ---- Autoloader (resolution & fetching) ------------------------------------
-
-const defaultModuleExt = ".ms" // adjust if you prefer a different extension
-
-// resolveAndFetch returns (src, display, canonicalKey) for the given spec.
-//
-// Network:
-//   - Absolute http(s) URLs are fetched via GET with a timeout.
-//   - If the URL path has no extension, defaultModuleExt is appended.
-//
-// Filesystem:
-//   - Resolve relative specs against importer dir → CWD → MINDSCRIPT_PATH.
-//   - If spec has no extension, try spec+defaultModuleExt then spec.
-//   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
-func resolveAndFetch(spec string, importer string) (string, string, string, error) {
-	// Network?
-	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
-		u, perr := url.Parse(spec)
-		if perr != nil {
-			return "", "", "", fmt.Errorf("invalid import url: %w", perr)
-		}
-		if path.Ext(u.Path) == "" && defaultModuleExt != "" {
-			u.Path = strings.TrimSuffix(u.Path, "/") + defaultModuleExt
-		}
-		canon := u.String()
-		src, display, err := httpFetch(canon)
-		return src, display, canon, err
-	}
-
-	// Filesystem
-	canon, ferr := resolveFS(spec, importer)
-	if ferr != nil {
-		return "", "", "", ferr
-	}
-	b, rerr := os.ReadFile(canon)
-	if rerr != nil {
-		return "", "", "", fmt.Errorf("module not found: %s", spec)
-	}
-	return string(b), canon, canon, nil
-}
-
-func resolveFS(spec string, importer string) (string, error) {
-	var bases []string
-	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
-		bases = append(bases, filepath.Dir(importer))
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		bases = append(bases, cwd)
-	}
-
-	try := func(base, s string) (string, bool) {
-		cands := []string{}
-		if filepath.Ext(s) != "" {
-			cands = append(cands, filepath.Join(base, s))
-		} else {
-			cands = append(cands, filepath.Join(base, s)+defaultModuleExt, filepath.Join(base, s))
-		}
-		for _, c := range cands {
-			if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
-				abs, _ := filepath.Abs(c)
-				return filepath.Clean(abs), true
-			}
-		}
-		return "", false
-	}
-
-	// Absolute path?
-	if filepath.IsAbs(spec) {
-		if p, ok := try("", spec); ok {
-			return p, nil
-		}
-		// fallthrough to MINDSCRIPT_PATH for completeness
-	} else {
-		for _, b := range bases {
-			if p, ok := try(b, spec); ok {
-				return p, nil
-			}
-		}
-	}
-
-	// MINDSCRIPT_PATH
-	if sp := os.Getenv("MINDSCRIPT_PATH"); sp != "" {
-		for _, root := range filepath.SplitList(sp) {
-			if root == "" {
-				continue
-			}
-			if p, ok := try(root, spec); ok {
-				return p, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("module not found: %s", spec)
-}
-
-func httpFetch(canonURL string) (src string, display string, err error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(canonURL)
-	if err != nil {
-		return "", canonURL, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", canonURL, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", canonURL, err
-	}
-	return string(b), canonURL, nil
-}
-
-// prettySpec returns a short display name for a canonical spec:
-//   - file path   -> basename without extension
-//   - http(s) URL -> last segment without extension
-//   - fallback: original string if parsing fails
-func prettySpec(s string) string {
-	// Try URL first
-	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
-		base := path.Base(u.Path)
-		name := strings.TrimSuffix(base, path.Ext(base))
-		if name != "" {
-			return name
-		}
-		return base
-	}
-	// Filesystem path
-	base := filepath.Base(s)
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	if name != "" {
-		return name
-	}
-	return base
-}
-
-// "A -> B -> C -> A" using pretty names instead of full canonical specs.
-func joinCyclePath(stack []string, again string) string {
-	i := 0
-	for idx, s := range stack {
-		if s == again {
-			i = idx
-			break
-		}
-	}
-	chain := append(stack[i:], again)
-	out := make([]string, len(chain))
-	for k, s := range chain {
-		out[k] = prettySpec(s)
-	}
-	return strings.Join(out, " -> ")
-}
-=== END FILE: modules.go ===
+# Export namespace (module-scoped)
+# (Importers access as: let Oracle = import("oracle.ms").Oracle)
+let Oracle = Oracle
+=== END FILE: lib/backends.ms ===
 

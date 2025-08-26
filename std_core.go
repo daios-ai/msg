@@ -9,7 +9,7 @@ import (
 
 func registerStandardBuiltins(ip *Interpreter) {
 	ip.RegisterNative(
-		"error",
+		"fail",
 		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
@@ -22,7 +22,7 @@ func registerStandardBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "error", `Throw a runtime error (hard fault).
+	setBuiltinDoc(ip, "fail", `Fail: throw a runtime error (hard fault).
 
 Params:
   message: Str? — optional message (default "error")

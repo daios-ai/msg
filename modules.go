@@ -46,7 +46,7 @@
 //     extension, `.ms` is appended. The canonical cache key is the full URL.
 //     • Filesystem — resolve `spec` relative to the *importer’s directory*
 //     (when importer is a file path), then the current working directory,
-//     then each root in `MINDSCRIPT_PATH`. If `spec` lacks an extension,
+//     then each root in `MindScriptPath`. If `spec` lacks an extension,
 //     try `spec + ".ms"` and then `spec`. The canonical key is the cleaned,
 //     absolute path of the resolved file.
 //  2. Cycle detection
@@ -114,6 +114,9 @@ import (
 ////////////////////////////////////////////////////////////////////////////////
 //                                   PUBLIC API
 ////////////////////////////////////////////////////////////////////////////////
+
+// MindScript Library Path
+const MindScriptPath = "MSGPATH"
 
 // Module is the payload carried by a VTModule value.
 //
@@ -395,7 +398,7 @@ const defaultModuleExt = ".ms" // adjust if you prefer a different extension
 //   - If the URL path has no extension, defaultModuleExt is appended.
 //
 // Filesystem:
-//   - Resolve relative specs against importer dir → CWD → MINDSCRIPT_PATH.
+//   - Resolve relative specs against importer dir → CWD → MindScriptPath.
 //   - If spec has no extension, try spec+defaultModuleExt then spec.
 //   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
 func resolveAndFetch(spec string, importer string) (string, string, string, error) {
@@ -455,7 +458,7 @@ func resolveFS(spec string, importer string) (string, error) {
 		if p, ok := try("", spec); ok {
 			return p, nil
 		}
-		// fallthrough to MINDSCRIPT_PATH for completeness
+		// fallthrough to MindScriptPath for completeness
 	} else {
 		for _, b := range bases {
 			if p, ok := try(b, spec); ok {
@@ -464,8 +467,8 @@ func resolveFS(spec string, importer string) (string, error) {
 		}
 	}
 
-	// MINDSCRIPT_PATH
-	if sp := os.Getenv("MINDSCRIPT_PATH"); sp != "" {
+	// MindScriptPath
+	if sp := os.Getenv(MindScriptPath); sp != "" {
 		for _, root := range filepath.SplitList(sp) {
 			if root == "" {
 				continue

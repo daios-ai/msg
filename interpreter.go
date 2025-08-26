@@ -1926,6 +1926,6 @@ func (e *emitter) emitExpr(n S) {
 		e.callBuiltin("__annotate", S{"str", text}, subj)
 
 	default:
-		e.emit(opConst, e.k(errNull("unknown AST tag")))
+		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
 	}
 }

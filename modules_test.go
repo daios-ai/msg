@@ -106,10 +106,10 @@ func Test_FileImport_Search_MINDSCRIPT_PATH(t *testing.T) {
 
 	_ = write(t, lib, "util.ms", `let name = "Bob"`)
 
-	// Empty CWD, rely on MINDSCRIPT_PATH
-	old := os.Getenv("MINDSCRIPT_PATH")
-	_ = os.Setenv("MINDSCRIPT_PATH", lib)
-	defer os.Setenv("MINDSCRIPT_PATH", old)
+	// Empty CWD, rely on `MindScriptPath`
+	old := os.Getenv(MindScriptPath)
+	_ = os.Setenv(MindScriptPath, lib)
+	defer os.Setenv(MindScriptPath, old)
 
 	ip := NewRuntime()
 	v := evalWithIP(t, ip, `

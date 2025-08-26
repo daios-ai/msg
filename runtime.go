@@ -8,12 +8,7 @@
 
 package mindscript
 
-import (
-	"io/fs"
-	"os"
-	"path/filepath"
-	"strings"
-)
+import "fmt"
 
 // --- Opaque, universal handle (Lua-like userdata) + concrete boxed types ---
 
@@ -77,25 +72,51 @@ func NewRuntime() *Interpreter {
 	registerOsBuiltins(ip)
 
 	// standard library
-	loadPreludeIntoMain(ip, "std.ms")
+	ip.LoadPrelude("std", "")
 
 	return ip
 }
 
-func loadPreludeIntoMain(ip *Interpreter, filename string) error {
-	paths := strings.Split(os.Getenv("MINDSCRIPT_PATH"), string(os.PathListSeparator))
-	for _, dir := range paths {
-		if dir == "" {
-			continue
-		}
-		p := filepath.Join(dir, filename)
-		if data, err := os.ReadFile(p); err == nil {
-			// Evaluate directly in main env so top-level lets become globals
-			if _, err := ip.EvalPersistentSource(string(data)); err != nil {
-				return err
-			}
-			return nil
-		}
+// LoadPrelude resolves `spec` (filesystem or absolute http(s) URL), parses it,
+// and executes the prelude directly in the interpreter's Core environment.
+// On success it returns nil. On failure it returns a descriptive error,
+// mirroring the module loader's error semantics (parse/runtime/cycle messages).
+func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
+	// 1) Resolve + fetch (supports CWD, importer dir, MINDSCRIPT_PATH, http(s))
+	src, display, _, err := resolveAndFetch(spec, importer)
+	if err != nil {
+		return err
 	}
-	return fs.ErrNotExist
+
+	// 2) Parse with source-wrapped diagnostics
+	ast, perr := parseSource(display, src)
+	if perr != nil {
+		return perr
+	}
+
+	// 3) Evaluate in Core, surfacing failures like modules do
+	var rterr error
+	var res Value
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				switch sig := r.(type) {
+				case rtErr:
+					rterr = fmt.Errorf("runtime error in %s: %s", display, sig.msg)
+				default:
+					rterr = fmt.Errorf("runtime panic in %s: %v", display, r)
+				}
+			}
+		}()
+		if len(ast) > 0 {
+			// Uncaught mode -> annotated nulls instead of errors; we convert below.
+			res = ip.EvalASTUncaught(ast, ip.Core, true)
+		}
+	}()
+
+	// Annotated-null means a user/runtime failure; upgrade to error.
+	if rterr == nil && res.Tag == VTNull && res.Annot != "" {
+		rterr = fmt.Errorf("runtime error in %s: %s", display, res.Annot)
+	}
+	return rterr
 }

@@ -10,7 +10,14 @@
 # Useful for debugging or piping: insert `| print` in a chain.
 # value:Any -> Any
 let print = fun(x: Any) -> Any do
-  printf("%v\n", x)
+  printf("%s", [str(x)])
+end
+
+# Print a value and a newline and return it.
+# Useful for debugging or piping: insert `| print` in a chain.
+# value:Any -> Any
+let println = fun(x: Any) -> Any do
+  printf("%s\n", [str(x)])
 end
 
 # Assert that a condition is true.
@@ -404,4 +411,78 @@ let mute = fun(_: Any) -> Null do null end
 ## Oracle bootstrap (default backend: Ollama)
 ## -----------------------------
 
-let __oracle_execute  ## GLOBAL HOOK
+# Minimal + robust Ollama executor (auto-boxes, uses boxed schema if supported)
+
+let __oracle_execute = fun(prompt: Str, _inT: Type, _outT: Type, _examples: Any) -> Str do
+  let base = osEnv("OLLAMA_BASE_URL")
+  if base == null then base = "http://localhost:11434" end
+
+  let model = osEnv("OLLAMA_MODEL")
+  if model == null then model = "Phi3" end
+
+  # Build a boxed JSON Schema: {"output": schema(outT)}
+  let boxed = {
+    "type": "object",
+    "properties": { "output": typeToJSONSchema(_outT) },
+    "required": ["output"]
+  }
+
+  let req = {
+    "url": base + "/api/generate",
+    "method": "POST",
+    "headers": {"Content-Type": "application/json"},
+    "body": jsonStringify({
+      "model": model,
+      "prompt": prompt,
+      # If your Ollama supports schema-in-format, this aligns with the prompt’s schema.
+      # If not, Ollama will ignore and still try to emit JSON due to the prompt text.
+      "format": boxed,
+      "stream": false,
+      "options": {"temperature": 0.5}
+    })
+  }
+
+  let r = try(fun() do http(req) end)
+  if r.ok != true then
+    let msg = r.error
+    if msg == null then msg = "request failed" end
+    return __annotate("ollama: " + msg)(null)
+  end
+
+  let resp = r.value
+  if resp.status != 200 then
+    return __annotate("ollama: HTTP " + str(resp.status))(null)
+  end
+
+  let env = jsonParse(resp.body)
+  if env == null then return __annotate("ollama: bad JSON from server")(null) end
+
+  let text = env.response
+  if text == null then return __annotate("ollama: missing response")(null) end
+
+  # Normalize:
+  # - If text is JSON of an object with "output": return canonical JSON
+  # - If text is JSON of something else (number/array/string/map w/o "output"), box it
+  # - If text isn't JSON at all, return as-is (execOracle will annotate accordingly)
+  let p1 = try(fun() do jsonParse(text) end)
+  if p1.ok == true then
+    let v1 = p1.value
+
+    # object with "output"
+    let hasOut = try(fun() do mapHas(v1, "output") end)
+    if hasOut.ok == true then
+      return jsonStringify(v1)
+    end
+
+    # anything else → box
+    return jsonStringify({"output": v1})
+  end
+
+  # Fallback: return raw text (should already be {"output": ...})
+  text
+end
+
+let examples = [[1, "one"], [12, "twelve"], [7, "seven"]]
+
+# Say the number
+let number = oracle(n: Int) -> Str from examples

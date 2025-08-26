@@ -454,37 +454,74 @@ Returns:
   Str`)
 }
 
+// goJSONToValue converts a decoded JSON value into a MindScript Value.
+// Handles json.Number (preferred when Decoder.UseNumber() is set) and fallbacks.
 func goJSONToValue(x any) Value {
 	switch v := x.(type) {
 	case nil:
 		return Null
+
 	case bool:
 		return Bool(v)
+
+	case json.Number:
+		// Distinguish Int vs Num using the textual form.
+		s := v.String()
+		if !strings.ContainsAny(s, ".eE") {
+			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return Int(i)
+			}
+			// fall through to float if it doesn't fit in int64
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return annotNull("json number out of range")
+			}
+			return Num(f)
+		}
+		return annotNull("json number parse error")
+
 	case float64:
-		// JSON numbers are float64; cast to Int if integral
-		if math.Trunc(v) == v {
+		// Path when UseNumber() wasn't used.
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return annotNull("json number out of range")
+		}
+		if v == math.Trunc(v) {
 			return Int(int64(v))
 		}
 		return Num(v)
+
 	case string:
 		return Str(v)
+
 	case []any:
 		out := make([]Value, len(v))
 		for i := range v {
 			out[i] = goJSONToValue(v[i])
 		}
 		return Arr(out)
+
 	case map[string]any:
-		m := make(map[string]Value, len(v))
+		entries := make(map[string]Value, len(v))
+		keys := make([]string, 0, len(v))
 		for k, vv := range v {
-			m[k] = goJSONToValue(vv)
+			entries[k] = goJSONToValue(vv)
+			keys = append(keys, k)
 		}
-		return Map(m)
+		mo := &MapObject{
+			Entries: entries,
+			KeyAnn:  map[string]string{},
+			Keys:    keys, // insertion order from range is unspecified; fine for open-world maps
+		}
+		return Value{Tag: VTMap, Data: mo}
+
 	default:
+		// Shouldn’t happen with encoding/json, but keep a clear failure mode.
 		return annotNull("unsupported JSON value")
 	}
 }
 
+// valueToGoJSON converts a MindScript Value into a Go JSON-able value.
 func valueToGoJSON(v Value) any {
 	switch v.Tag {
 	case VTNull:
@@ -507,12 +544,16 @@ func valueToGoJSON(v Value) any {
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		out := make(map[string]any, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			out[k] = valueToGoJSON(vv)
+		// Note: Go's json encoder doesn't preserve map insertion order.
+		// We still iterate Keys for determinism if you ever serialize manually.
+		for _, k := range mo.Keys {
+			out[k] = valueToGoJSON(mo.Entries[k])
 		}
 		return out
 	default:
-		return fmt.Sprintf("<%v>", v.Tag)
+		// For non-JSON-serializable values (functions, types, handles, modules),
+		// return null rather than a debug string to keep valid JSON shape.
+		return nil
 	}
 }
 

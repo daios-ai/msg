@@ -1,23 +1,101 @@
-// modules.go
+// modules.go — MindScript module system (public API + private implementation)
 //
-// Module system built on the stable engine surface, now exposing modules as a
-// map-like value with an attached lexical environment.
+// OVERVIEW
+// --------
+// MindScript modules are ordinary MindScript programs whose *exported bindings*
+// are snapshotted into a map-like value and paired with the lexical environment
+// where the program executed.
 //
-// This refactor provides three focused entry points that reuse shared helpers:
+// At runtime, a module is represented as a `VTModule` value whose payload is:
 //
-//   • importAST(name, ast)   — takes an AST, creates a module
-//   • importCode(name, src)  — takes source code, creates a module
-//   • importFile(spec, imp)  — resolves (FS/HTTP), parses, caches, detects cycles
+//	type Module struct {
+//	  Name string     // canonical identity (path/URL) or caller-provided name
+//	  Map  *MapObject // ordered export surface with per-key annotations
+//	  Env  *Env       // lexical environment where the module executed
+//	}
 //
-// Internals are de-duplicated via:
-//   • parseSource(display, src)           — shared parsing + error wrapping
-//   • buildModuleFromAST(display, ast)    — shared eval + snapshotting into Module
+// Design goal: a module should behave ergonomically like a map. The interpreter
+// exposes a small coercion (`AsMapValue`, defined in interpreter.go) that lets
+// module values participate in all `VTMap` operations (length, overlay with '+',
+// iteration, property/index reads, etc.) without duplicating map logic.
 //
-// Design goal: VTModule should be ergonomically like VTMap. We realize this by
-// building the module’s public surface as a MapObject (ordered, key annots), and
-// keep Env for closures/types. All VTMap behaviors are reused by small, central
-// coercions VTModule→VTMap in interpreter.go (no duplicated branches).
-
+// PUBLIC API (this file)
+// ----------------------
+// The public surface is deliberately minimal and stable:
+//
+//   - (*Interpreter).ImportAST(name string, ast S) (Value, error)
+//     Evaluate a *ready AST* as a module and return a `VTModule`. No cache.
+//     Evaluation happens in a fresh env parented to the interpreter's Core.
+//
+//   - (*Interpreter).ImportCode(name, src string) (Value, error)
+//     Parse `src` into an AST (with rich source-wrapped errors) and delegate
+//     to ImportAST. No cache.
+//
+//   - (*Interpreter).ImportFile(spec, importer string) (Value, error)
+//     Resolve + fetch + parse + evaluate with cycle detection and caching.
+//     Resolution rules support both filesystem and absolute http(s) URLs.
+//     Successful loads are cached by their *canonical* identity.
+//
+//   - (*Module).Get(key string) (Value, bool)
+//     Return an exported binding and a presence flag. This mirrors the private
+//     `get` method used by the VM for property/index reads.
+//
+// What ImportFile does, precisely:
+//  1. Resolution & Fetching
+//     • HTTP(S) — only absolute URLs are accepted. If the path lacks an
+//     extension, `.ms` is appended. The canonical cache key is the full URL.
+//     • Filesystem — resolve `spec` relative to the *importer’s directory*
+//     (when importer is a file path), then the current working directory,
+//     then each root in `MINDSCRIPT_PATH`. If `spec` lacks an extension,
+//     try `spec + ".ms"` and then `spec`. The canonical key is the cleaned,
+//     absolute path of the resolved file.
+//  2. Cycle detection
+//     A per-import call stack (`ip.loadStack`) plus an in-progress state guard
+//     detects cycles and produces a friendly `A -> B -> … -> A` chain.
+//  3. Parse + Evaluate
+//     Parsing wraps syntax errors with the *original source* for good diagnostics.
+//     Evaluation runs in an isolated child env of Core. Both runtime annotated
+//     nulls and internal `rtErr` panics are converted into rich errors that
+//     include a display name for the module being loaded.
+//  4. Snapshot
+//     The module’s public surface is captured into a `MapObject`:
+//     • Exported keys are sorted lexicographically (deterministic order).
+//     • Exported `VTType` values that lack a pinned env are rewritten via
+//     `TypeValIn(..., modEnv)` so they resolve under the module’s env.
+//     • If an exported value carries `Annot`, it is mirrored to `KeyAnn[key]`.
+//
+// Error semantics:
+//   - Parse errors are reported as `parse error in <display>:\n<wrapped error>`.
+//   - Runtime failures during module init are reported as
+//     `runtime error in <display>: <message>`.
+//   - Cycles are reported as `import cycle detected: A -> B -> … -> A`.
+//
+// Caching:
+//   - Only successful loads are cached under the canonical identity.
+//   - Failures are never cached.
+//   - This cache is in-memory and persistent for the lifetime of the Interpreter.
+//
+// Concurrency:
+//   - The module cache and import stack are not synchronized; callers should
+//     avoid concurrent ImportFile calls on the same Interpreter.
+//
+// DEPENDENCIES (other files)
+// -------------------------
+//   - lexer.go / parser.go
+//   - ParseSExpr(src string) (S, error) — building ASTs.
+//   - interpreter.go
+//   - types: Value, Env, MapObject, TypeValue, TypeValIn, Null
+//   - methods: EvalASTUncaught, AsMapValue (for module/map coercion)
+//   - struct: Interpreter (fields Core, modules, loadStack)
+//   - errors.go
+//   - WrapErrorWithSource(err, src string) error — enrich parse errors.
+//   - vm.go
+//   - The VM performs property/index reads via (*Module).get (private here).
+//
+// The remainder of this file is intentionally split into:
+//  1. PUBLIC API — small, heavily documented wrappers that define behavior.
+//  2. PRIVATE    — detailed implementation (resolution, fetching, parsing,
+//     evaluation, snapshotting, caching, and cycle detection).
 package mindscript
 
 import (
@@ -33,7 +111,79 @@ import (
 	"time"
 )
 
-// ---- Module runtime structs ------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+//                                   PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// Module is the payload carried by a VTModule value.
+//
+// A Module’s public *map-like* surface is stored in Map (ordered exports with
+// per-key annotations), while Env retains the lexical environment used during
+// evaluation (closures/types capture from here). Name is the canonical identity
+// (absolute path or full URL) when loaded from ImportFile, or the caller’s
+// chosen label for ImportAST/ImportCode. See `AsMapValue` in interpreter.go for
+// VTModule→VTMap coercion when consuming a module as a map.
+type Module struct {
+	Name string
+	Map  *MapObject
+	Env  *Env
+}
+
+// Get returns the exported binding named key and whether it exists.
+// It mirrors the private `get` used by the VM for fast property/index reads.
+func (m *Module) Get(key string) (Value, bool) { return m.get(key) }
+
+// ImportAST evaluates a ready AST as a module.
+//
+// Behavior:
+//   - Evaluates `ast` in a fresh environment parented to `ip.Core`.
+//   - On success, returns a VTModule whose Module.Name = `name`.
+//   - No cache and no cycle detection are involved.
+//
+// Errors:
+//   - Runtime failures during evaluation (including annotated nulls) are
+//     converted into rich errors whose messages include `name`.
+func (ip *Interpreter) ImportAST(name string, ast S) (Value, error) {
+	return ip.importAST(name, ast)
+}
+
+// ImportCode parses source and evaluates it as a module.
+//
+// Behavior:
+//   - Parses `src` into an AST with source-wrapped diagnostics.
+//   - Delegates to ImportAST using the same `name`.
+//   - No cache and no cycle detection are involved.
+//
+// Errors:
+//   - Syntax errors are wrapped with source and labeled with `name`.
+//   - Runtime failures during evaluation are reported like ImportAST.
+func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
+	return ip.importCode(name, src)
+}
+
+// ImportFile resolves, fetches, parses, evaluates, caches, and detects cycles.
+//
+// Behavior:
+//   - Resolution & fetching follow the rules described in this file header.
+//   - Cycles are detected using a per-call import stack and an in-progress state.
+//   - Successful loads are cached by canonical identity and returned from cache
+//     on subsequent calls.
+//   - On success, returns a VTModule whose Module.Name is the canonical identity.
+//
+// Errors:
+//   - Parse/runtime errors are enriched with display context.
+//   - Cycles are reported using a compact `A -> B -> … -> A` chain.
+func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
+	return ip.importFile(spec, importer)
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// ---- Module runtime structs & VM hook --------------------------------------
 
 type moduleState int
 
@@ -43,6 +193,7 @@ const (
 	modLoaded
 )
 
+// moduleRec tracks cached module state by canonical identity.
 type moduleRec struct {
 	spec        string
 	displayName string
@@ -53,22 +204,13 @@ type moduleRec struct {
 	err         error
 }
 
-// Module is the public payload for VTModule.
-// Map holds the exported bindings (ordered, with per-key annotations).
-// Env is the lexical environment where the module executed (for closures/types).
-type Module struct {
-	Name string
-	Map  *MapObject
-	Env  *Env
-}
-
-// get returns an exported binding by key. The VM can use this for property/index reads.
+// get returns an exported binding by key. The VM uses this for property/index reads.
 func (m *Module) get(key string) (Value, bool) {
 	v, ok := m.Map.Entries[key]
 	return v, ok
 }
 
-// ---- Public-ish entry points (package-internal) ----------------------------
+// ---- Public-ish entry points (backing the exported wrappers) ---------------
 
 // importAST creates a module from a READY AST, evaluating it in an Env parented to Core.
 // The produced module is NOT cached (no cycles involved).
@@ -91,7 +233,6 @@ func (ip *Interpreter) importCode(name string, src string) (Value, error) {
 }
 
 // importFile resolves (FS/HTTP), parses, evaluates, caches successes, and detects cycles.
-// This is the refactor of the old importModule.
 func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 	// Resolve + fetch → (src, display, canon)
 	src, display, canon, rerr := resolveAndFetch(spec, importer)
@@ -99,7 +240,7 @@ func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 		return Null, rerr
 	}
 
-	// Cycle detection against canonical key
+	// Detect cycles against canonical key
 	for _, s := range ip.loadStack {
 		if s == canon {
 			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
@@ -108,7 +249,7 @@ func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 	ip.loadStack = append(ip.loadStack, canon)
 	defer func() { ip.loadStack = ip.loadStack[:len(ip.loadStack)-1] }()
 
-	// Cache check
+	// Cache lookup
 	if ip.modules == nil {
 		ip.modules = map[string]*moduleRec{}
 	}
@@ -138,7 +279,7 @@ func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 		return Null, err
 	}
 
-	// Commit success to cache with canonical identity
+	// Commit success to cache
 	rec := ip.modules[canon]
 	rec.displayName = display
 	rec.src = src
@@ -151,7 +292,7 @@ func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 	return Value{Tag: VTModule, Data: rec.mod}, nil
 }
 
-// ---- Shared helpers (no duplication) ---------------------------------------
+// ---- Shared helpers ---------------------------------------------------------
 
 // parseSource parses src into an S-expr AST and wraps errors with source context.
 func parseSource(display string, src string) (S, error) {
@@ -208,7 +349,7 @@ func (ip *Interpreter) buildModuleFromAST(display string, ast S) (*Module, error
 // buildModuleMap snapshots modEnv.table into a MapObject:
 // • Keys are sorted for determinism (Env.table is a Go map).
 // • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
-// • If a value carries Annot, we mirror it into KeyAnn for that key.
+// • If a value carries Annot, mirror it into KeyAnn for that key.
 func buildModuleMap(modEnv *Env) *MapObject {
 	keys := make([]string, 0, len(modEnv.table))
 	for k := range modEnv.table {

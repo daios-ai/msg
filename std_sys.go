@@ -1,3 +1,4 @@
+// === FILE: std_sys.go ===
 package mindscript
 
 import (
@@ -48,13 +49,13 @@ func snapshotEnv(e *Env) *Env {
 
 func registerConcurrencyBuiltins(ip *Interpreter) {
 	// spawn(f: Any->Any) -> Any (proc handle)
-	// spawn(f: Any->Any) -> Any (proc handle)
 	ip.RegisterNative(
 		"procSpawn",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.MustArg("f")
+			// Contractual: must be a function (hard error)
 			if fv.Tag != VTFun {
 				fail("procSpawn expects a function")
 			}
@@ -88,8 +89,10 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 						case returnSig:
 							pr.result = sig.v
 						case rtErr:
+							// Runtime failures inside the spawned proc become soft errors.
 							pr.result = errNull(sig.msg)
 						default:
+							// Unknown panic → soft error result
 							pr.result = errNull(fmt.Sprintf("runtime panic: %v", r))
 						}
 					}
@@ -97,7 +100,7 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 				}()
 
 				// Use the public API (no internal executor calls).
-				pr.result = ip.Call0(execVal)
+				pr.result = ip.Call0(execVal) // arity/type mismatches surface as hard errors
 			}()
 
 			return HandleVal("proc", pr)
@@ -146,7 +149,7 @@ Notes:
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("p")
-			pr := asHandle(pv, "proc").Data.(*procState)
+			pr := asHandle(pv, "proc").Data.(*procState) // wrong kind → hard error via asHandle
 			<-pr.done
 			return pr.result
 		},
@@ -165,7 +168,7 @@ Returns:
 		S{"id", "Null"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("p")
-			pr := asHandle(pv, "proc").Data.(*procState)
+			pr := asHandle(pv, "proc").Data.(*procState) // wrong kind → hard error via asHandle
 			select {
 			case <-pr.cancel:
 			default:
@@ -204,8 +207,9 @@ See also:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Null"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox) // wrong kind → hard error
 			x := ctx.MustArg("x")
+			// Sending to a closed channel is a misuse → hard error (propagates as panic).
 			cb.ch <- x
 			return Null
 		},
@@ -226,9 +230,10 @@ Returns:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox) // wrong kind → hard error
 			v, ok := <-cb.ch
 			if !ok {
+				// Soft error: channel has been closed.
 				return annotNull("channel closed")
 			}
 			return v
@@ -250,7 +255,8 @@ Returns:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"id", "Null"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox) // wrong kind → hard error
+			// Double-close is misuse in Go and will panic → hard error.
 			close(cb.ch)
 			return Null
 		},
@@ -381,8 +387,12 @@ Returns:
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Int"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n")
-			return Int(int64(rng.Intn(int(n.Data.(int64)))))
+			n := ctx.MustArg("n").Data.(int64)
+			// Contractual: n must be > 0 (hard error)
+			if n <= 0 {
+				fail("randInt: n must be > 0")
+			}
+			return Int(int64(rng.Intn(int(n))))
 		},
 	)
 	setBuiltinDoc(ip, "randInt", `Uniform random integer in [0, n).
@@ -410,7 +420,8 @@ Returns:
 			sv := ctx.MustArg("s")
 			var x any
 			if err := json.Unmarshal([]byte(sv.Data.(string)), &x); err != nil {
-				fail(err.Error())
+				// Soft error: invalid JSON text
+				return annotNull("invalid JSON: " + err.Error())
 			}
 			return goJSONToValue(x)
 		},
@@ -437,7 +448,8 @@ Returns:
 			xv := ctx.MustArg("x")
 			b, err := json.Marshal(valueToGoJSON(xv))
 			if err != nil {
-				fail(err.Error())
+				// Soft error: value cannot be represented in JSON (e.g., NaN/Inf)
+				return annotNull("json stringify: " + err.Error())
 			}
 			return Str(string(b))
 		},
@@ -588,6 +600,7 @@ Returns:
 			raw := valueToGoJSON(ctx.MustArg("schema"))
 			doc, ok := raw.(map[string]any)
 			if !ok {
+				// Not a JSON object: widen gracefully (soft behavior rather than hard failure)
 				return TypeVal(S{"id", "Any"})
 			}
 
@@ -636,6 +649,7 @@ Returns:
 			src := ctx.MustArg("src").Data.(string)
 			s, err := TypeStringToS(src)
 			if err != nil {
+				// Soft error: parse failure
 				return annotNull(err.Error())
 			}
 			// Convert **value-centrically** to ensure annotations propagate.
@@ -660,6 +674,7 @@ Returns:
 			src := ctx.MustArg("src").Data.(string)
 			doc, err := JSONSchemaStringToObject(src)
 			if err != nil {
+				// Soft error: invalid JSON schema text
 				return annotNull(err.Error())
 			}
 
@@ -881,7 +896,8 @@ func registerRegexBuiltins(ip *Interpreter) {
 			s := ctx.MustArg("string").Data.(string)
 			re, err := regexp.Compile(pat)
 			if err != nil {
-				fail(err.Error())
+				// Soft error: invalid regex
+				return annotNull("invalid regex: " + err.Error())
 			}
 			ms := re.FindAllString(s, -1)
 			out := make([]Value, len(ms))
@@ -911,7 +927,8 @@ Returns:
 			s := ctx.MustArg("string").Data.(string)
 			re, err := regexp.Compile(pat)
 			if err != nil {
-				fail(err.Error())
+				// Soft error: invalid regex
+				return annotNull("invalid regex: " + err.Error())
 			}
 			return Str(re.ReplaceAllString(s, rep))
 		},
@@ -953,7 +970,11 @@ func registerCastBuiltins(ip *Interpreter) {
 			case VTNum:
 				return Str(strconv.FormatFloat(v.Data.(float64), 'g', -1, 64))
 			case VTArray, VTMap:
-				b, _ := json.Marshal(valueToGoJSON(v))
+				b, err := json.Marshal(valueToGoJSON(v))
+				if err != nil {
+					// Soft error: cannot encode as JSON text (e.g., NaN/Inf)
+					return annotNull("stringify: " + err.Error())
+				}
 				return Str(string(b))
 			default:
 				// functions/modules/handles/types: fall back to Value.String()

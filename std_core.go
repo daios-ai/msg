@@ -38,7 +38,7 @@ Returns:
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.MustArg("f")
 			if fv.Tag != VTFun {
-				fail("try expects a function")
+				fail("try expects a function") // contractual → hard error
 			}
 
 			out := Map(map[string]Value{
@@ -71,7 +71,7 @@ Returns:
 				return out
 			}
 
-			// treat annotated-null as failure-with-message
+			// treat annotated-null as failure-with-message (soft)
 			if res.Tag == VTNull && res.Annot != "" {
 				out.Data.(*MapObject).Entries["ok"] = Bool(false)
 				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
@@ -127,7 +127,7 @@ Returns: Type`)
 			x := ctx.MustArg("x")
 			Tv := ctx.MustArg("T")
 			if Tv.Tag != VTType {
-				fail("isType expects a Type as second argument")
+				fail("isType expects a Type as second argument") // contractual → hard
 			}
 			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
 		},
@@ -152,7 +152,7 @@ Returns: Bool`)
 			Av := ctx.MustArg("A")
 			Bv := ctx.MustArg("B")
 			if Av.Tag != VTType || Bv.Tag != VTType {
-				fail("isSubtype expects Types as both arguments")
+				fail("isSubtype expects Types as both arguments") // contractual → hard
 			}
 			A := ip.resolveTypeValue(Av, ctx.Env())
 			B := ip.resolveTypeValue(Bv, ctx.Env())
@@ -179,8 +179,9 @@ Returns: Bool`)
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("path")
+			// Contractual (ParamSpec enforces Str already). Keep hard error if ever violated.
 			if pv.Tag != VTStr {
-				return annotNull("import expects a string path")
+				fail("import expects a string path")
 			}
 			importer := ""
 			if n := len(ip.loadStack); n > 0 {
@@ -188,23 +189,20 @@ Returns: Bool`)
 			}
 			mod, err := ip.importFile(pv.Data.(string), importer)
 			if err != nil {
-				return annotNull(err.Error())
+				// NEW POLICY:
+				// - Parse errors → HARD (Go error via fail)
+				// - Everything else (I/O, not found, runtime during init) → SOFT (annotated null)
+				msg := err.Error()
+				// Be robust to wording; modules.go formats as "parse error in <display>:\n..."
+				if strings.HasPrefix(strings.ToLower(msg), "parse error in ") ||
+					strings.Contains(strings.ToLower(msg), "parse error") {
+					fail(msg) // hard
+				}
+				return annotNull(msg) // soft
 			}
 			return mod
 		},
 	)
-	setBuiltinDoc(ip, "import", `Load a module by URL or file path.
-
-File search order:
-  1) Directory of the importing module
-  2) Current working directory
-  3) MINDSCRIPT_PATH (if set)
-A default extension may be added if omitted.
-
-Params:
-  path: Str — file path or URL
-
-Returns: Module (as a value with exported bindings)`)
 
 	// importCode(name: Str, src: Str) -> Module
 	ip.RegisterNative(
@@ -217,35 +215,30 @@ Returns: Module (as a value with exported bindings)`)
 		func(ip *Interpreter, ctx CallCtx) Value {
 			nv := ctx.MustArg("name")
 			sv := ctx.MustArg("src")
-			// Type system already checks, but keep a defensive guard:
+			// Contract violations → HARD.
 			if nv.Tag != VTStr || sv.Tag != VTStr {
-				return annotNull("importCode expects (name: Str, src: Str)")
+				fail("importCode expects (name: Str, src: Str)")
 			}
 
 			name := nv.Data.(string)
 			src := sv.Data.(string)
 
-			// Reuse the refactored entry point. This returns a VTModule Value.
 			modVal, err := ip.importCode("mem:"+name, src)
 			if err != nil {
-				// Mirror existing UX: return annotated-null with the formatted error
-				return annotNull(err.Error())
+				// NEW POLICY:
+				// - Parse errors → HARD
+				// - Runtime during module init → SOFT (annotated null)
+				msg := err.Error()
+				lc := strings.ToLower(msg)
+				if strings.HasPrefix(lc, "parse error in ") || strings.Contains(lc, "parse error") {
+					fail(msg) // hard
+				}
+				return annotNull(msg) // soft
 			}
-			// Name was already set by importCode via importAST → buildModuleFromAST.
 			return modVal
 		},
 	)
 
-	setBuiltinDoc(ip, "importCode", `Evaluate a source string as a module.
-
-	The code is executed in an isolated environment parented to Core.
-	This does **not** populate the module cache; a later import(name) won’t find it.
-
-	Params:
-	  name: Str — logical module name (for diagnostics)
-	  src:  Str — MindScript source code
-
-	Returns: Module`)
 }
 
 // --- Introspection & docs ----------------------------------------------------
@@ -301,7 +294,7 @@ Returns: {Str: Any}`)
 			fv := ctx.MustArg("f")
 			callable, ok := ip.FunMeta(fv)
 			if !ok {
-				fail("funInfo expects a function")
+				fail("funInfo expects a function") // contractual → hard
 			}
 			ps := callable.ParamSpecs()
 			params := make([]Value, 0, len(ps))
@@ -325,7 +318,7 @@ Returns: {Str: Any}`)
 	setBuiltinDoc(ip, "funInfo", `Return metadata for a function.
 
 The "params" array lists each parameter (in order), with its name and Type.
-The "return" field is the declared return Type of the function body.
+The "return" field is the declared return Type of the function's body.
 Use funType to obtain the full A -> B -> C arrow chain.
 
 Params:
@@ -390,7 +383,7 @@ Returns: Bool`)
 			tv := ctx.MustArg("t")
 			t := ip.resolveTypeValue(tv, ctx.Env())
 			if len(t) == 0 || t[0].(string) != "map" {
-				return Arr(nil)
+				return Arr(nil) // not a contract violation; return empty list
 			}
 			fs := mapTypeFields(t)
 			out := make([]Value, 0, len(fs))
@@ -545,7 +538,7 @@ func registerMapBuiltins(ip *Interpreter) {
 			v := ctx.MustArg("obj")
 			k := ctx.MustArg("key").Data.(string)
 			if v.Tag != VTMap {
-				fail("mapHas expects a map")
+				fail("mapHas expects a map") // contractual → hard
 			}
 			mo := v.Data.(*MapObject)
 			_, ok := mo.Entries[k]
@@ -569,7 +562,7 @@ Returns: Bool`)
 			v := ctx.MustArg("obj")
 			k := ctx.MustArg("key").Data.(string)
 			if v.Tag != VTMap {
-				fail("mapDelete expects a map")
+				fail("mapDelete expects a map") // contractual → hard
 			}
 			mo := v.Data.(*MapObject)
 			if _, ok := mo.Entries[k]; !ok {

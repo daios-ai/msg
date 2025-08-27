@@ -660,20 +660,20 @@ func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
 
 // -------- Calls / currying (scoped engine) --------
 
-func (ip *Interpreter) applyArgsScoped(fnVal Value, args []Value, callSite *Env) Value {
-	if fnVal.Tag != VTFun {
+func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	if fn.Tag != VTFun {
 		fail("not a function")
 	}
-	f := fnVal.Data.(*Fun)
+	f := fn.Data.(*Fun)
 
-	// Zero-arg application
+	// Zero-arg application (unchanged)
 	if len(args) == 0 {
 		switch len(f.Params) {
 		case 0:
-			return ip.execFunBodyScoped(fnVal, callSite)
+			return ip.execFunBodyScoped(fn, callSite)
 		case 1:
 			if ip.isType(Null, f.ParamTypes[0], f.Env) {
-				return ip.applyOneScoped(fnVal, Null, callSite)
+				return ip.applyOneScoped(fn, Null, callSite)
 			}
 			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
 		default:
@@ -681,9 +681,14 @@ func (ip *Interpreter) applyArgsScoped(fnVal Value, args []Value, callSite *Env)
 		}
 	}
 
-	cur := fnVal
+	cur := fn
 	for i := 0; i < len(args); i++ {
+		// Apply one argument
 		cur = ip.applyOneScoped(cur, args[i], callSite)
+		// Still arguments left => "too many arguments" contractual mistake.
+		if i < len(args)-1 && cur.Tag != VTFun {
+			fail("too many arguments")
+		}
 	}
 	return cur
 }
@@ -1068,31 +1073,20 @@ func (ip *Interpreter) initCore() {
 				return annotNull("for expects array, map, or iterator function (Null -> Any?)")
 			}
 
-			// Array → iterator
-			if x.Tag == VTArray {
-				env := NewEnv(ctx.Env())
-				env.Define("$arr", x)
+			// Helpers to reduce duplication
+			newIter := func(parent *Env, lenTarget S, thenBlock S) Value {
+				env := NewEnv(parent)
 				env.Define("$i", Int(0))
-
 				body := S{"if",
 					S{"pair",
 						S{"binop", "<",
 							S{"id", "$i"},
-							S{"call", S{"id", "__len"}, S{"id", "$arr"}},
+							S{"call", S{"id", "__len"}, lenTarget},
 						},
-						S{"block",
-							S{"assign", S{"id", "$i"},
-								S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
-							},
-							S{"idx",
-								S{"id", "$arr"},
-								S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
-							},
-						},
+						S{"block", thenBlock},
 					},
 					S{"block", S{"null"}},
 				}
-
 				return FunVal(&Fun{
 					Params:     []string{"_"},
 					ParamTypes: []S{S{"id", "Null"}},
@@ -1102,13 +1096,31 @@ func (ip *Interpreter) initCore() {
 					Src:        ip.currentSrc,
 				})
 			}
+			inc := func() S {
+				return S{"assign", S{"id", "$i"},
+					S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
+				}
+			}
+
+			// Array → iterator
+			if x.Tag == VTArray {
+				envInit := NewEnv(ctx.Env())
+				envInit.Define("$arr", x)
+				then := S{"block",
+					inc(),
+					S{"idx",
+						S{"id", "$arr"},
+						S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
+					},
+				}
+				return newIter(envInit, S{"id", "$arr"}, then)
+			}
 
 			// Map → iterator (yields [key, value]) preserving insertion order + key annotations
 			if x.Tag == VTMap {
 				mo := x.Data.(*MapObject)
-
-				env := NewEnv(ctx.Env())
-				env.Define("$map", x)
+				envInit := NewEnv(ctx.Env())
+				envInit.Define("$map", x)
 				keyVals := make([]Value, 0, len(mo.Keys))
 				for _, k := range mo.Keys {
 					s := Str(k)
@@ -1117,39 +1129,19 @@ func (ip *Interpreter) initCore() {
 					}
 					keyVals = append(keyVals, s)
 				}
-				env.Define("$keys", Arr(keyVals))
-				env.Define("$i", Int(0))
+				envInit.Define("$keys", Arr(keyVals))
 
-				body := S{"if",
-					S{"pair",
-						S{"binop", "<",
-							S{"id", "$i"},
-							S{"call", S{"id", "__len"}, S{"id", "$keys"}},
-						},
-						S{"block",
-							S{"assign", S{"decl", "$k"},
-								S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
-							},
-							S{"assign", S{"id", "$i"},
-								S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
-							},
-							S{"array",
-								S{"id", "$k"},
-								S{"idx", S{"id", "$map"}, S{"id", "$k"}},
-							},
-						},
+				then := S{"block",
+					S{"assign", S{"decl", "$k"},
+						S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
 					},
-					S{"block", S{"null"}},
+					inc(),
+					S{"array",
+						S{"id", "$k"},
+						S{"idx", S{"id", "$map"}, S{"id", "$k"}},
+					},
 				}
-
-				return FunVal(&Fun{
-					Params:     []string{"_"},
-					ParamTypes: []S{S{"id", "Null"}},
-					ReturnType: S{"unop", "?", S{"id", "Any"}},
-					Body:       body,
-					Env:        env,
-					Src:        ip.currentSrc,
-				})
+				return newIter(envInit, S{"id", "$keys"}, then)
 			}
 
 			return annotNull("for expects array, map, or iterator function (Null -> Any?)")
@@ -1400,49 +1392,43 @@ func (ip *Interpreter) evalFull(n S, env *Env) Value {
 	return Null
 }
 
-// -------- iterator expansion --------
+// -------- iterator expansion (unified) --------
 
 func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 	iter = AsMapValue(iter)
-	switch iter.Tag {
-	case VTArray:
-		return append([]Value(nil), iter.Data.([]Value)...)
-	case VTMap:
-		mo := iter.Data.(*MapObject)
-		out := make([]Value, 0, len(mo.Keys))
-		for _, k := range mo.Keys {
-			keyV := Str(k)
-			if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-				keyV = withAnnot(keyV, ann)
-			}
-			out = append(out, Arr([]Value{keyV, mo.Entries[k]}))
+
+	// Normalize to iterator function via Core's __to_iter when needed.
+	if iter.Tag != VTFun {
+		toIter, err := ip.Core.Get("__to_iter")
+		if err != nil {
+			fail("for expects array, map, or iterator function (Null -> Any)")
 		}
-		return out
-	case VTFun:
-		f := iter.Data.(*Fun)
-		if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
-			name := "_"
-			if len(f.Params) > 0 {
-				name = f.Params[0]
-			}
-			fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
-		}
-		out := []Value{}
-		for {
-			next := ip.applyArgsScoped(iter, []Value{Null}, scope)
-			if next.Tag == VTNull {
-				if next.Annot != "" {
-					fail(next.Annot)
-				}
-				break
-			}
-			out = append(out, next)
-		}
-		return out
-	default:
-		fail("for expects array, map, or iterator function (Null -> Any)")
-		return nil
+		iter = ip.applyArgsScoped(toIter, []Value{iter}, scope)
 	}
+
+	f := iter.Data.(*Fun)
+	if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
+		name := "_"
+		if len(f.Params) > 0 {
+			name = f.Params[0]
+		}
+		fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
+	}
+
+	stopFn, err := ip.Core.Get("__iter_should_stop")
+	if err != nil {
+		fail("missing __iter_should_stop")
+	}
+
+	out := []Value{}
+	for {
+		next := ip.applyArgsScoped(iter, []Value{Null}, scope)
+		if ip.applyArgsScoped(stopFn, []Value{next}, scope).Data.(bool) {
+			break
+		}
+		out = append(out, next)
+	}
+	return out
 }
 
 // -------- JIT: AST → bytecode emitter (with PC marks) --------
@@ -1574,6 +1560,51 @@ func unwrapKeyStr(k S) string {
 	return ""
 }
 
+// ---- DEDUP HELPERS (emitter): binary ops & fun/oracle ----
+
+func (e *emitter) emitBinaryOpAB(a, b S, op opcode) {
+	e.withChild(1, func() { e.emitExpr(a) })
+	e.withChild(2, func() { e.emitExpr(b) })
+	e.emit(op, 0)
+}
+func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {
+	e.emit(opLoadGlobal, e.ks(name))
+	e.withChild(1, func() { e.emitExpr(a) })
+	e.withChild(2, func() { e.emitExpr(b) })
+	e.emit(opCall, 2)
+}
+
+func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S) {
+	namesArr := make([]Value, 0, max(0, len(params)-1))
+	typesArr := make([]Value, 0, max(0, len(params)-1))
+	for i := 1; i < len(params); i++ {
+		p := params[i].(S)
+		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+		t := p[2].(S)
+		if len(t) == 0 {
+			t = S{"id", "Any"}
+		}
+		typesArr = append(typesArr, TypeVal(t))
+	}
+	if len(retT) == 0 {
+		retT = S{"id", "Any"}
+	}
+	e.emit(opLoadGlobal, e.ks("__make_fun"))
+	for _, v := range namesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(namesArr)))
+	for _, v := range typesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(typesArr)))
+	e.emit(opConst, e.k(TypeVal(retT)))
+	e.emit(opConst, e.k(TypeVal(bodyCarrier)))
+	e.emit(opConst, e.k(Bool(isOracle)))
+	e.emitExpr(examples)
+	e.emit(opCall, 6)
+}
+
 // Entry: emit whole function body and return.
 func (e *emitter) emitFunBody(body S) {
 	e.path = e.path[:0] // root
@@ -1690,51 +1721,27 @@ func (e *emitter) emitExpr(n S) {
 		a, b := n[2].(S), n[3].(S)
 		switch op {
 		case "==":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opEq, 0)
+			e.emitBinaryOpAB(a, b, opEq)
 		case "!=":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opNe, 0)
+			e.emitBinaryOpAB(a, b, opNe)
 		case "+":
-			// builtin plus; preserve child mapping
-			e.emit(opLoadGlobal, e.ks("__plus"))
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opCall, 2)
+			e.emitBinaryBuiltinAB("__plus", a, b)
 		case "-":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opSub, 0)
+			e.emitBinaryOpAB(a, b, opSub)
 		case "*":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opMul, 0)
+			e.emitBinaryOpAB(a, b, opMul)
 		case "/":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opDiv, 0)
+			e.emitBinaryOpAB(a, b, opDiv)
 		case "%":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opMod, 0)
+			e.emitBinaryOpAB(a, b, opMod)
 		case "<":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opLt, 0)
+			e.emitBinaryOpAB(a, b, opLt)
 		case "<=":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opLe, 0)
+			e.emitBinaryOpAB(a, b, opLe)
 		case ">":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opGt, 0)
+			e.emitBinaryOpAB(a, b, opGt)
 		case ">=":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emit(opGe, 0)
+			e.emitBinaryOpAB(a, b, opGe)
 		default:
 			e.emit(opConst, e.k(errNull("unsupported operator")))
 		}
@@ -1795,70 +1802,21 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opCall, uint32(len(n)-2))
 
 	case "fun":
-		params := n[1].(S)
-		namesArr := make([]Value, 0, len(params)-1)
-		typesArr := make([]Value, 0, len(params)-1)
-		for i := 1; i < len(params); i++ {
-			p := params[i].(S)
-			namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
-			t := p[2].(S)
-			if len(t) == 0 {
-				t = S{"id", "Any"}
-			}
-			typesArr = append(typesArr, TypeVal(t))
-		}
-		retT := n[2].(S)
-		if len(retT) == 0 {
-			retT = S{"id", "Any"}
-		}
-
-		e.emit(opLoadGlobal, e.ks("__make_fun"))
-		for _, v := range namesArr {
-			e.emit(opConst, e.k(v))
-		}
-		e.emit(opMakeArr, uint32(len(namesArr)))
-		for _, v := range typesArr {
-			e.emit(opConst, e.k(v))
-		}
-		e.emit(opMakeArr, uint32(len(typesArr)))
-		e.emit(opConst, e.k(TypeVal(retT)))
-		e.emit(opConst, e.k(TypeVal(n[3].(S))))
-		e.emit(opConst, e.k(Bool(false)))
-		e.emit(opConst, e.k(Null))
-		e.emit(opCall, 6)
-
+		e.emitMakeFun(
+			n[1].(S),  // params
+			n[2].(S),  // ret (may be empty)
+			n[3].(S),  // body carrier (type AST)
+			false,     // isOracle
+			S{"null"}, // examples
+		)
 	case "oracle":
-		params := n[1].(S)
-		namesArr := make([]Value, 0, len(params)-1)
-		typesArr := make([]Value, 0, len(params)-1)
-		for i := 1; i < len(params); i++ {
-			p := params[i].(S)
-			namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
-			t := p[2].(S)
-			if len(t) == 0 {
-				t = S{"id", "Any"}
-			}
-			typesArr = append(typesArr, TypeVal(t))
-		}
-		retT := n[2].(S)
-		if len(retT) == 0 {
-			retT = S{"id", "Any"}
-		}
-
-		e.emit(opLoadGlobal, e.ks("__make_fun"))
-		for _, v := range namesArr {
-			e.emit(opConst, e.k(v))
-		}
-		e.emit(opMakeArr, uint32(len(namesArr)))
-		for _, v := range typesArr {
-			e.emit(opConst, e.k(v))
-		}
-		e.emit(opMakeArr, uint32(len(typesArr)))
-		e.emit(opConst, e.k(TypeVal(retT)))
-		e.emit(opConst, e.k(TypeVal(S{"oracle"})))
-		e.emit(opConst, e.k(Bool(true)))
-		e.emitExpr(n[3].(S))
-		e.emit(opCall, 6)
+		e.emitMakeFun(
+			n[1].(S),    // params
+			n[2].(S),    // ret (may be empty)
+			S{"oracle"}, // body carrier marker for oracle
+			true,        // isOracle
+			n[3].(S),    // source expression
+		)
 
 	case "return":
 		e.emitExpr(n[1].(S))

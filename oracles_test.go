@@ -429,6 +429,21 @@ func registerExamplesAssertingOracle(ip *Interpreter, wantLen int) {
 	}
 }
 
+func wantHardErrorContains(t *testing.T, err error, substr string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected hard error containing %q, got nil error", substr)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, substr) {
+		t.Fatalf("hard error mismatch: want msg to contain %q, got: %s", substr, msg)
+	}
+	// Optional: assert caret header is present when runtimeErrorsAsGoError=true
+	if !strings.Contains(msg, "RUNTIME ERROR") {
+		t.Fatalf("expected caret-style RUNTIME ERROR, got: %s", msg)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // New tests
 // -----------------------------------------------------------------------------
@@ -438,15 +453,12 @@ func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
 	// Backend won't be reached if params fail type-checking (engine enforces)
 	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
 
-	// Wrong type for first parameter (expects Int)
-	v, err := ip.EvalSource(`
+	// Wrong type for first parameter (expects Int) → CONTRACT VIOLATION ⇒ HARD ERROR
+	_, err := ip.EvalSource(`
 		let f = oracle(a: Int, b: Str) -> Str
 		f("not-int", "ok")
 	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "type mismatch") // enforced before backend
+	wantHardErrorContains(t, err, "type mismatch")
 }
 
 func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {

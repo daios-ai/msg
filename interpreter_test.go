@@ -100,6 +100,36 @@ func wantStrWithAnnot(t *testing.T, v Value, s, ann string) {
 	}
 }
 
+// New helpers for error-expecting paths (runtimeErrorsAsGoError=true).
+func evalSrcExpectError(t *testing.T, src string) error {
+	t.Helper()
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil\nsource:\n%s", src)
+	}
+	return err
+}
+
+func evalPersistentExpectError(t *testing.T, ip *Interpreter, src string) error {
+	t.Helper()
+	_, err := ip.EvalPersistentSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil\nsource:\n%s", src)
+	}
+	return err
+}
+
+func wantErrContains(t *testing.T, err error, substr string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error containing %q, got nil", substr)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(substr)) {
+		t.Fatalf("want error containing %q, got: %v", substr, err)
+	}
+}
+
 // --- tests -----------------------------------------------------------------
 
 func Test_Interpreter_Literals(t *testing.T) {
@@ -294,19 +324,19 @@ func Test_Interpreter_ShortCircuit_And_Or(t *testing.T) {
 
 // --- annotated-null runtime error cases ------------------------------------
 
-func Test_Interpreter_DivisionByZero_Returns_AnnotatedNull(t *testing.T) {
-	v := evalSrc(t, `1 / 0`)
-	wantAnnotatedNullContains(t, v, "division by zero")
+func Test_Interpreter_DivisionByZero_Returns_Error(t *testing.T) {
+	err := evalSrcExpectError(t, `1 / 0`)
+	wantErrContains(t, err, "division by zero")
 }
 
-func Test_Interpreter_NotAFunction_Returns_AnnotatedNull(t *testing.T) {
-	v := evalSrc(t, `42(1)`)
-	wantAnnotatedNullContains(t, v, "not a function")
+func Test_Interpreter_NotAFunction_Returns_Error(t *testing.T) {
+	err := evalSrcExpectError(t, `42(1)`)
+	wantErrContains(t, err, "not a function")
 }
 
-func Test_Interpreter_UnknownProperty_Returns_AnnotatedNull(t *testing.T) {
-	v := evalSrc(t, `{a: 1}.b`)
-	wantAnnotatedNullContains(t, v, "unknown")
+func Test_Interpreter_UnknownProperty_Returns_Error(t *testing.T) {
+	err := evalSrcExpectError(t, `{a: 1}.b`)
+	wantErrContains(t, err, "unknown")
 }
 
 func Test_Interpreter_Let_Simple_Assign(t *testing.T) {
@@ -598,16 +628,14 @@ n
 }
 
 func Test_Interpreter_While_Condition_MustBeBool(t *testing.T) {
-	v := evalSrc(t, `
+	err := evalSrcExpectError(t, `
 let n = 0
 while 1 do
   n = 1
 end
 n
 `)
-	// loop never runs because condition is invalid → annotated null when evaluated
-	// Top-level value should be annotated null (from condition type check).
-	wantAnnotatedNullContains(t, v, "boolean")
+	wantErrContains(t, err, "boolean")
 }
 
 func Test_Interpreter_For_Map_Yields_Pairs_As_Array(t *testing.T) {
@@ -703,14 +731,9 @@ func Test_Interpreter_For_Iterator_Function_Rejects_NonNullParam(t *testing.T) {
 	end
 	sum
 	`
-	ip := NewInterpreter()
-	v, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("eval error: %v", err)
-	}
-	if !isAnnotatedNull(v) {
-		t.Fatalf("want annotated null from invalid iterator, got %v (annot=%q)", v, v.Annot)
-	}
+	err := evalSrcExpectError(t, src)
+	// Contract error raised when attempting to call a non-function:
+	wantErrContains(t, err, "not a function")
 }
 
 func Test_Interpreter_Debug_Range_ReturnsIteratorFunction(t *testing.T) {
@@ -806,7 +829,7 @@ end
 // Iterator protocol & annotated-null propagation
 // ------------------------------------------------------------
 
-func Test_Interpreter_For_Iterator_AnnotatedNull_Propagates(t *testing.T) {
+func Test_Interpreter_For_Iterator_AnnotatedNull_Propagates_As_Error(t *testing.T) {
 	// Iterator returns an annotated null; for-loop should propagate it out.
 	src := `
 let bad = fun() -> Int? do
@@ -821,8 +844,8 @@ for let x in bad do
 end
 sum
 `
-	v := evalSrc(t, src)
-	wantAnnotatedNullContains(t, v, "oops")
+	err := evalSrcExpectError(t, src)
+	wantErrContains(t, err, "oops")
 }
 
 func Test_Interpreter_For_ZeroArgIterator_Works(t *testing.T) {
@@ -852,8 +875,8 @@ sum
 // ------------------------------------------------------------
 
 func Test_Interpreter_Index_EmptyArray_Annotated(t *testing.T) {
-	v := evalSrc(t, `([])[-1]`)
-	wantAnnotatedNullContains(t, v, "empty array")
+	err := evalSrcExpectError(t, `([])[-1]`)
+	wantErrContains(t, err, "empty array")
 }
 
 // ------------------------------------------------------------
@@ -886,22 +909,22 @@ func Test_Interpreter_Annotation_Stacking_MultilineHashes(t *testing.T) {
 // Type system via runtime checks
 // ------------------------------------------------------------
 
-func Test_Interpreter_Function_ReturnType_Mismatch_Annotated(t *testing.T) {
-	v := evalSrc(t, `
+func Test_Interpreter_Function_ReturnType_Mismatch_Returns_Error(t *testing.T) {
+	err := evalSrcExpectError(t, `
 let f = fun()->Int do
   "nope"
 end
 f()
 `)
-	wantAnnotatedNullContains(t, v, "return type mismatch")
+	wantErrContains(t, err, "return type mismatch")
 }
 
-func Test_Interpreter_Function_ParamType_Mismatch_Annotated(t *testing.T) {
-	v := evalSrc(t, `
+func Test_Interpreter_Function_ParamType_Mismatch_Returns_Error(t *testing.T) {
+	err := evalSrcExpectError(t, `
 let f = fun(x:Int)->Int do x end
 f("str")
 `)
-	wantAnnotatedNullContains(t, v, "type mismatch in parameter")
+	wantErrContains(t, err, "type mismatch in parameter")
 }
 
 func Test_Interpreter_Function_Return_AnyOptional_Top(t *testing.T) {
@@ -1326,8 +1349,8 @@ func Test_Interpreter_Assign_Map_With_Computed_Index(t *testing.T) {
 	wantStr(t, mustEvalPersistent(t, ip, `obj.name`), "Maria")
 
 	// Failure path (int index on map) — expect generic engine message
-	v := mustEvalPersistent(t, ip, `obj.(0 + 1) = "X"`)
-	wantAnnotatedNullContains(t, v, "index assignment requires array[int] or map[string]")
+	err := evalPersistentExpectError(t, ip, `obj.(0 + 1) = "X"`)
+	wantErrContains(t, err, "index assignment requires array[int] or map[string]")
 }
 
 func Test_Interpreter_Assign_Array_With_Computed_Index(t *testing.T) {
@@ -1347,8 +1370,8 @@ func Test_Interpreter_Assign_Array_With_Computed_Index(t *testing.T) {
 	wantStr(t, mustEvalPersistent(t, ip, `arr[1]`), "Tail")
 
 	// Failure: string index on array
-	v := mustEvalPersistent(t, ip, `arr.("1") = "X"`)
-	wantAnnotatedNullContains(t, v, "index assignment requires array[int] or map[string]")
+	err := evalPersistentExpectError(t, ip, `arr.("1") = "X"`)
+	wantErrContains(t, err, "index assignment requires array[int] or map[string]")
 }
 
 func Test_Interpreter_Assign_Through_Nested_Computed_Keys(t *testing.T) {

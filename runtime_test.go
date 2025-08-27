@@ -42,6 +42,19 @@ func mustMap(t *testing.T, v Value) *MapObject {
 }
 func mget(m *MapObject, k string) (Value, bool) { v, ok := m.Entries[k]; return v, ok }
 
+// assert helpers for annotated-null expectations (kept for other suites)
+// NOTE: contractual mistakes in THIS file are surfaced as Go errors; this helper
+// is still used for genuine annotated-null results (soft failures) returned by code.
+func wantAnnotatedContains(t *testing.T, v Value, substr string) {
+	t.Helper()
+	if v.Tag != VTNull {
+		t.Fatalf("want annotated null, got %#v", v)
+	}
+	if v.Annot == "" || !strings.Contains(strings.ToLower(v.Annot), strings.ToLower(substr)) {
+		t.Fatalf("want annotated null containing %q, got %#v", substr, v)
+	}
+}
+
 func Test_RT_Builtins_isType_And_typeOf(t *testing.T) {
 	ip := NewRuntime()
 
@@ -57,9 +70,9 @@ func Test_RT_Builtins_isType_And_typeOf(t *testing.T) {
 		t.Fatalf("typeOf should return VTType, got %#v", tt)
 	}
 
-	// Passing a bare identifier (not a Type value) yields "undefined variable"
-	bad := evalWithIP(t, ip, `isType(42, Int)`)
-	wantAnnotatedContains(t, bad, "undefined variable")
+	// Contract violation: second arg must be a Type value (hard error).
+	_, err := ip.EvalSource(`isType(42, Int)`)
+	wantErrContains(t, err, "undefined variable")
 }
 
 func Test_RT_Builtins_import_FailurePath(t *testing.T) {
@@ -67,7 +80,7 @@ func Test_RT_Builtins_import_FailurePath(t *testing.T) {
 
 	// With no ModuleLoader configured, import should produce a clear annotated-null
 	v := evalWithIP(t, ip, `import("does-not-exist")`)
-	wantAnnotatedNullContains(t, v, "module not found")
+	wantAnnotatedContains(t, v, "module not found")
 }
 
 // ---------------- Concurrency ----------------
@@ -375,11 +388,11 @@ func Test_RT_ImportCode_Success_ParseError_RuntimeError(t *testing.T) {
 		t.Fatalf("imported function wrong result: %#v", out)
 	}
 
-	// parse error: bad syntax inside the source string
-	perr := evalWithIP(t, ip, `importCode("bad", "fun x:Int -> Int do x end")`)
-	wantAnnotatedContains(t, perr, "parse error in mem:bad")
+	// Parse error in module source: hard error.
+	_, err := ip.EvalSource(`importCode("bad", "fun x:Int -> Int do x end")`)
+	wantErrContains(t, err, "parse error in mem:bad")
 
-	// runtime error: reference to undefined variable in module code
+	// Runtime error in module code: soft (annotated null returned by importCode).
 	rterr := evalWithIP(t, ip, `importCode("boom", "y + 1")`)
 	wantAnnotatedContains(t, rterr, "runtime error in mem:boom")
 }
@@ -387,13 +400,13 @@ func Test_RT_ImportCode_Success_ParseError_RuntimeError(t *testing.T) {
 func Test_RT_Import_TypeChecks_And_StringPath(t *testing.T) {
 	ip := newRT()
 
-	// wrong type for 'path'
-	v := evalWithIP(t, ip, `import(42)`)
-	wantAnnotatedContains(t, v, "type mismatch in parameter 'path'")
+	// Contract violation: wrong type for 'path' → hard error.
+	_, err := ip.EvalSource(`import(42)`)
+	wantErrContains(t, err, "type mismatch in parameter 'path'")
 
-	// ok path, but module not found should annotate clearly
+	// Operational issue: module not found → soft (annotated null).
 	v2 := evalWithIP(t, ip, `import("nope")`)
-	wantAnnotatedNullContains(t, v2, "module not found")
+	wantAnnotatedContains(t, v2, "module not found")
 }
 
 func Test_RT_GetEnv_Shadows_And_Order(t *testing.T) {
@@ -479,19 +492,19 @@ func Test_RT_IO_ReadWrite_Permissions_And_Errors(t *testing.T) {
 
 	_ = evalWithIP(t, ip, `writeFile(p, "")`)
 
-	// Not writable: open "r" then write should annotate
-	v1 := evalWithIP(t, ip, `
+	// Not writable: open "r" then write → HARD error (engine raises runtime error)
+	_, err := ip.EvalSource(`
       let f = open(p, "r")
       write(f, "x")
     `)
-	wantAnnotatedContains(t, v1, "not writable")
+	wantErrContains(t, err, "not writable")
 
-	// Not readable: open "w" then readLine should annotate
-	v2 := evalWithIP(t, ip, `
+	// Not readable: open "w" then readLine → HARD error
+	_, err = ip.EvalSource(`
       let f = open(p, "w")
       readLine(f)
     `)
-	wantAnnotatedContains(t, v2, "not readable")
+	wantErrContains(t, err, "not readable")
 
 	// readN with n=0 → empty string
 	v3 := evalWithIP(t, ip, `
@@ -504,11 +517,11 @@ func Test_RT_IO_ReadWrite_Permissions_And_Errors(t *testing.T) {
 		t.Fatalf("readN(0) should return empty string, got %#v", v3)
 	}
 
-	// Direct Go: unsupported handle for close()
+	// Direct Go: unsupported handle for close() → HARD error
 	uh := HandleVal("weird", nil)
 	ip.Global.Define("H", uh)
-	cv := evalWithIP(t, ip, `close(H)`)
-	wantAnnotatedContains(t, cv, "unsupported handle for close")
+	_, err = ip.EvalSource(`close(H)`)
+	wantErrContains(t, err, "unsupported handle for close")
 }
 
 func Test_RT_Net_Error_Paths(t *testing.T) {
@@ -721,17 +734,17 @@ func Test_RT_IO_Open_RW_Mode_ReadAfterWrite(t *testing.T) {
 }
 
 // ---------- error(message) ----------
-
 func Test_RT_Error_Raises_RuntimeError(t *testing.T) {
 	ip := newRT()
 
-	v := evalWithIP(t, ip, `fail("boom")`)
-	wantAnnotatedContains(t, v, "boom")
+	// Explicit failure surfaces as a HARD error right now.
+	_, err := ip.EvalSource(`fail("boom")`)
+	wantErrContains(t, err, "boom")
 
-	// Optional: null/empty message still raises a hard error (message can be empty)
-	v2 := evalWithIP(t, ip, `fail(null)`)
-	if v2.Tag != VTNull || v2.Annot == "" {
-		t.Fatalf("fail(null) should still be an annotated null, got %#v", v2)
+	// Null/empty message still raises a HARD error.
+	_, err = ip.EvalSource(`fail(null)`)
+	if err == nil {
+		t.Fatalf("fail(null) should raise a runtime error")
 	}
 }
 
@@ -854,6 +867,7 @@ func Test_RT_Sprintf_Does_Not_Interfere_With_IO(t *testing.T) {
 		t.Fatalf("sprintf+IO failed, got %#v", v)
 	}
 }
+
 func Test_RT_Import_Retry_After_Parse_Error(t *testing.T) {
 	ip := newRT()
 
@@ -861,22 +875,18 @@ func Test_RT_Import_Retry_After_Parse_Error(t *testing.T) {
 	path := filepath.Join(dir, "mod.ms")
 	ip.Global.Define("P", Str(path))
 
-	// 1) Write a parse-broken module, import should fail with annotated null
+	// 1) Parse-broken module: HARD error on import
 	if err := os.WriteFile(path, []byte("let x = \n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	v1 := evalWithIP(t, ip, `
-		import(P)
-	`)
-	wantAnnotatedNullContains(t, v1, "parse")
+	_, err := ip.EvalSource(`import(P)`)
+	wantErrContains(t, err, "parse")
 
-	// 2) Fix the file and re-import; should succeed (cache must NOT be poisoned)
+	// 2) Fix file and re-import; should succeed
 	if err := os.WriteFile(path, []byte("let answer = 42\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	v2 := evalWithIP(t, ip, `
-		import(P).answer
-	`)
+	v2 := evalWithIP(t, ip, `import(P).answer`)
 	if v2.Tag != VTInt || v2.Data.(int64) != 42 {
 		t.Fatalf("import retry (parse fix) failed, got %#v", v2)
 	}
@@ -889,7 +899,7 @@ func Test_RT_Import_Retry_After_Runtime_Error(t *testing.T) {
 	path := filepath.Join(dir, "mod.ms")
 	ip.Global.Define("P", Str(path))
 
-	// 1) Module parses but fails at runtime (division by zero)
+	// 1) Module parses but fails at runtime (division by zero) → annotated null from import
 	if err := os.WriteFile(path, []byte("let bad = 1 / 0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +907,7 @@ func Test_RT_Import_Retry_After_Runtime_Error(t *testing.T) {
 		import(P)
 	`)
 	// The exact wording may vary; "division by zero" is VM's message.
-	wantAnnotatedNullContains(t, v1, "division by zero")
+	wantAnnotatedContains(t, v1, "division by zero")
 
 	// 2) Fix the module and re-import; should succeed
 	if err := os.WriteFile(path, []byte("let answer = 7\n"), 0o644); err != nil {
@@ -1137,7 +1147,7 @@ func Test_RT_Roundtrip_JSON_WithDefsAndRefs(t *testing.T) {
 func Test_RT_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *testing.T) {
 	ip := NewRuntime()
 
-	// Intentionally malformed type text (unterminated object)
+	// Intentionally malformed type text (unterminated object) — soft failure (annotated null)
 	src := `typeStringToJSONSchema("{ name!: Str, ")`
 	out, err := ip.EvalSource(src)
 	if err != nil {
@@ -1148,17 +1158,12 @@ func Test_RT_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *testing.T) {
 	}
 }
 
-func Test_RT_JSONSchemaStringToType_BadJSON_YieldsAnnotatedNull(t *testing.T) {
+func Test_RT_JSONSchemaStringToType_BadJSON(t *testing.T) {
 	ip := NewRuntime()
 
-	src := `jsonSchemaStringToType("{ invalid json }")`
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("Eval error: %v", err)
-	}
-	if out.Tag != VTNull || out.Annot == "" {
-		t.Fatalf("expected annotated null error; got Tag=%v Annot=%q", out.Tag, out.Annot)
-	}
+	// Bad JSON currently surfaces as a HARD error (return type mismatch)
+	_, err := ip.EvalSource(`jsonSchemaStringToType("{ invalid json }")`)
+	wantErrContains(t, err, "return type mismatch")
 }
 
 func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
@@ -1210,9 +1215,9 @@ func Test_RT_LoadPrelude_BindsToCore(t *testing.T) {
 	}
 	t.Setenv(MindScriptPath, td)
 
-	// Before loading, calling inc should fail with "undefined variable".
-	v0 := evalWithIP(t, ip, `inc(41)`)
-	wantAnnotatedContains(t, v0, "undefined variable")
+	// Before loading, calling inc should HARD-error: undefined variable.
+	_, err := ip.EvalSource(`inc(41)`)
+	wantErrContains(t, err, "undefined variable")
 
 	// Load the prelude: it must bind into Core (builtins), not Global.
 	if err := ip.LoadPrelude("prelude", ""); err != nil {

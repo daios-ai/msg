@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -144,17 +145,119 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 
 	ip := NewRuntime()
 
-	p := evalWithIP(t, ip, `import("bad")`)
-	wantAnnotatedNullContains(t, p, "parse error")
-	wantAnnotatedNullContains(t, p, "bad.ms")
+	// ──────────────────────────────────────────────────────────────────────────
+	// 1) Parse error → HARD (Go error). Must mention the file and "parse error".
+	// ──────────────────────────────────────────────────────────────────────────
+	_, perr := ip.EvalSource(`import("bad")`)
+	if perr == nil {
+		t.Fatalf("expected parse error (hard), got nil")
+	}
+	if !strings.Contains(perr.Error(), "bad.ms") || !strings.Contains(strings.ToLower(perr.Error()), "parse error") {
+		t.Fatalf("want error mentioning bad.ms and parse error; got: %v", perr)
+	}
 
-	r := evalWithIP(t, ip, `import("boom")`)
-	wantAnnotatedNullContains(t, r, "runtime error")
-	wantAnnotatedNullContains(t, r, "boom.ms")
-	wantAnnotatedNullContains(t, r, "division by zero")
+	// ──────────────────────────────────────────────────────────────────────────
+	// 2) Operational runtime failure (division-by-zero) → SOFT (annotated null).
+	//    The value should be VTNull with an annotation that mentions the file.
+	// ──────────────────────────────────────────────────────────────────────────
+	v, rerr := ip.EvalSource(`import("boom")`)
+	if rerr != nil {
+		t.Fatalf("expected soft error (annotated null), got hard error: %v", rerr)
+	}
+	if v.Tag != VTNull {
+		t.Fatalf("expected VTNull soft error value, got: %#v", v)
+	}
+	ann := strings.ToLower(v.Annot)
+	if v.Annot == "" || !strings.Contains(ann, "boom.ms") || !(strings.Contains(ann, "division by zero") || strings.Contains(ann, "runtime error")) {
+		t.Fatalf("want annotation mentioning boom.ms and division by zero; got: %#v", v)
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// 3) Contractual mistake: wrong arity → HARD (Go error).
+	// ──────────────────────────────────────────────────────────────────────────
+	_, aerr := ip.EvalSource(`fun(x: Int) -> Int do x end(1, 2)`)
+	if aerr == nil {
+		t.Fatalf("expected hard error for too many arguments, got nil")
+	}
+	if !strings.Contains(strings.ToLower(aerr.Error()), "arity") && !strings.Contains(strings.ToLower(aerr.Error()), "too many arguments") {
+		t.Fatalf("want hard error mentioning arity/too many arguments; got: %v", aerr)
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// 4) Contractual mistake: type mismatch → HARD (Go error).
+	// ──────────────────────────────────────────────────────────────────────────
+	_, terr := ip.EvalSource(`fun(x: Int) -> Int do x end("oops")`)
+	if terr == nil {
+		t.Fatalf("expected hard error for type mismatch, got nil")
+	}
+	if !strings.Contains(strings.ToLower(terr.Error()), "type mismatch") && !strings.Contains(strings.ToLower(terr.Error()), "parameter 'x'") {
+		t.Fatalf("want hard error indicating type mismatch for param x; got: %v", terr)
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// 5) Operational failure (missing file) → SOFT (annotated null).
+	// ──────────────────────────────────────────────────────────────────────────
+	v, ferr := ip.EvalSource(`import("no_such_file")`)
+	if ferr != nil {
+		t.Fatalf("expected soft error (annotated null) for missing file, got hard error: %v", ferr)
+	}
+	if v.Tag != VTNull {
+		t.Fatalf("expected VTNull soft error for missing file, got: %#v", v)
+	}
+	if v.Annot == "" || (!strings.Contains(strings.ToLower(v.Annot), "no_such_file") &&
+		!strings.Contains(strings.ToLower(v.Annot), "not found") &&
+		!strings.Contains(strings.ToLower(v.Annot), "module")) {
+		t.Fatalf("want annotation indicating missing file; got: %#v", v)
+	}
 }
 
-// --- NEW behavior: modules are map-like & writable --------------------------
+// Contractual mistakes (arity/type) are hard errors.
+func Test_ContractualMistakes_Are_Hard(t *testing.T) {
+	ip := NewRuntime()
+
+	// Too many arguments → hard error.
+	// (fun(x:Int) -> Int do x end)(1, 2)
+	_, errArity := ip.EvalSource(`(fun(x: Int) -> Int do x end)(1, 2)`)
+	if errArity == nil {
+		t.Fatalf("expected hard error for too many arguments, got nil")
+	}
+	if !strings.Contains(errArity.Error(), "too many arguments") {
+		t.Fatalf("want 'too many arguments' in error; got: %v", errArity)
+	}
+
+	// Wrong type in argument → hard error.
+	// (fun(x:Int) -> Int do x end)("hi")
+	_, errType := ip.EvalSource(`(fun(x: Int) -> Int do x end)("hi")`)
+	if errType == nil {
+		t.Fatalf("expected hard error for type mismatch, got nil")
+	}
+	if !strings.Contains(errType.Error(), "type mismatch") {
+		t.Fatalf("want 'type mismatch' in error; got: %v", errType)
+	}
+}
+
+// Operational/runtime issues (like missing file) are soft errors.
+func Test_SoftOperationalErrors_Are_Soft(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	ip := NewRuntime()
+
+	// Import of non-existent module → soft error (annotated null).
+	v, err := ip.EvalSource(`import("does_not_exist")`)
+	if err != nil {
+		t.Fatalf("expected soft error (annotated null), got hard error: %v", err)
+	}
+	if v.Tag != VTNull {
+		t.Fatalf("expected VTNull soft error value, got: %#v", v)
+	}
+	if v.Annot == "" || !strings.Contains(v.Annot, "does_not_exist") {
+		t.Fatalf("want annotation mentioning missing module; got: %#v", v)
+	}
+}
+
+// --- modules are map-like & writable --------------------------
 
 // Writable module fields, and NO namespace collision with caller globals.
 func Test_Module_MapLike_Writable_NoNamespaceCollision(t *testing.T) {
@@ -280,11 +383,16 @@ func Test_Isolation_No_Leak_To_User_Global(t *testing.T) {
 	_ = write(t, dir, "mod.ms", `let hidden = 123`)
 
 	ip := NewRuntime()
-	// Import should not define "hidden" in the caller's env.
-	v := evalWithIP(t, ip, `
+	// Import should not define "hidden" in the caller's env; referencing it is a hard error now.
+	_, err := ip.EvalSource(`
 let _ = import("mod")
 hidden`)
-	wantAnnotatedNullContains(t, v, "undefined variable")
+	if err == nil {
+		t.Fatalf("expected undefined variable error, got nil")
+	}
+	if !strings.Contains(err.Error(), "undefined variable") {
+		t.Fatalf("want error mentioning undefined variable; got: %v", err)
+	}
 }
 
 // HTTP import via absolute URL (with/without default extension).

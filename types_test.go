@@ -19,6 +19,19 @@ func evalWithIP(t *testing.T, ip *Interpreter, src string) Value {
 	return v
 }
 
+// When a contractual mistake occurs (e.g., type/arity mismatch), EvalSource should return a Go error.
+// This helper asserts that and checks the error message contains `substr` (case-insensitive).
+func evalExpectError(t *testing.T, ip *Interpreter, src string, substr string) {
+	t.Helper()
+	v, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected error containing %q, got value: %#v\nsource:\n%s", substr, v, src)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(substr)) {
+		t.Fatalf("expected error to contain %q, got: %v", substr, err)
+	}
+}
+
 // parse `type <expr>` and return the underlying type S (the AST stored in VTType)
 func typeS(t *testing.T, ip *Interpreter, src string) S {
 	t.Helper()
@@ -31,17 +44,6 @@ func typeS(t *testing.T, ip *Interpreter, src string) S {
 		t.Fatalf("VTType payload was %T (want *TypeValue)", v.Data)
 	}
 	return tv.Ast
-}
-
-// assert helpers for annotated-null expectations
-func wantAnnotatedContains(t *testing.T, v Value, substr string) {
-	t.Helper()
-	if v.Tag != VTNull {
-		t.Fatalf("want annotated null, got %#v", v)
-	}
-	if v.Annot == "" || !strings.Contains(strings.ToLower(v.Annot), strings.ToLower(substr)) {
-		t.Fatalf("want annotated null containing %q, got %#v", substr, v)
-	}
 }
 
 // --- isType (runtime checking) ----------------------------------------------
@@ -156,20 +158,20 @@ func Test_Types_Unify_Objects_Fieldwise(t *testing.T) {
 
 // --- Runtime enforcement at call sites (param and return) -------------------
 
-func Test_Types_Runtime_Param_Mismatch_AnnotatedNull(t *testing.T) {
+// Was: ...AnnotatedNull; now contractual type mismatch → Go error.
+func Test_Types_Runtime_Param_Mismatch_GoError(t *testing.T) {
 	ip := newIP()
 	// (fun(x:Int)->Int do x end)("str")
 	src := `(fun(x: Int) -> Int do x end)("str")`
-	v := evalWithIP(t, ip, src)
-	wantAnnotatedContains(t, v, "type mismatch")
+	evalExpectError(t, ip, src, "type mismatch")
 }
 
-func Test_Types_Runtime_Return_Mismatch_AnnotatedNull(t *testing.T) {
+// Was: ...AnnotatedNull; now return type mismatch → Go error.
+func Test_Types_Runtime_Return_Mismatch_GoError(t *testing.T) {
 	ip := newIP()
-	// fun()->Int returns "nope" (Str) → annotated null
+	// fun()->Int returns "nope" (Str) → Go error
 	src := `(fun() -> Int do "nope" end)()`
-	v := evalWithIP(t, ip, src)
-	wantAnnotatedContains(t, v, "return type mismatch")
+	evalExpectError(t, ip, src, "return type mismatch")
 }
 
 func Test_Types_Alias_Resolution_And_CycleGuard(t *testing.T) {
@@ -317,8 +319,7 @@ func Test_Types_ArrayShape_Robustness(t *testing.T) {
 func Test_Types_Runtime_Param_AliasMismatch(t *testing.T) {
 	ip := newIP()
 	evalWithIP(t, ip, `let Age = type Int`)
-	v := evalWithIP(t, ip, `(fun(x: Age) -> Int do x end)("nope")`)
-	wantAnnotatedContains(t, v, "type mismatch")
+	evalExpectError(t, ip, `(fun(x: Age) -> Int do x end)("nope")`, "type mismatch")
 }
 
 // --- Enums -------------------------------------------------------------------
@@ -419,8 +420,7 @@ func Test_Types_Runtime_Param_Enum_Ok_And_Mismatch(t *testing.T) {
 		t.Fatalf("enum param should accept matching literal, got %#v", ok)
 	}
 
-	bad := evalWithIP(t, ip, `(fun(x: Enum["small","large"]) -> Str do "ok" end)("medium")`)
-	wantAnnotatedContains(t, bad, "type mismatch")
+	evalExpectError(t, ip, `(fun(x: Enum["small","large"]) -> Str do "ok" end)("medium")`, "type mismatch")
 }
 
 // --- Aliases to enums --------------------------------------------------------
@@ -437,8 +437,7 @@ func Test_Types_Alias_To_Enum(t *testing.T) {
 		t.Fatalf("alias to enum should work, got %#v", v)
 	}
 
-	bad := evalWithIP(t, ip, `(fun(x: Color) -> Str do "ok" end)("green")`)
-	wantAnnotatedContains(t, bad, "type mismatch")
+	evalExpectError(t, ip, `(fun(x: Color) -> Str do "ok" end)("green")`, "type mismatch")
 }
 
 // --- Arrays, nullables, and inference ---------------------------------------
@@ -533,6 +532,7 @@ func Test_Types_FunctionValue_Against_EnumParamType(t *testing.T) {
 		t.Fatalf("function value should satisfy Enum[...] -> Str via param contravariance")
 	}
 }
+
 func Test_Types_Alias_State_With_Enum(t *testing.T) {
 	ip := newIP()
 
@@ -565,7 +565,6 @@ func Test_Types_Alias_State_With_Enum(t *testing.T) {
 		t.Fatalf(`expected function to return "terminated", got %#v`, okCall)
 	}
 
-	// 5) Using State in a function parameter (enum mismatch → annotated null)
-	badCall := evalWithIP(t, ip, `(fun(s: State) -> Str do s.status end)({status: "paused"})`)
-	wantAnnotatedContains(t, badCall, "type mismatch")
+	// 5) Using State in a function parameter (enum mismatch → Go error)
+	evalExpectError(t, ip, `(fun(s: State) -> Str do s.status end)({status: "paused"})`, "type mismatch")
 }

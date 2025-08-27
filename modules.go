@@ -310,40 +310,29 @@ func parseSource(display string, src string) (S, error) {
 // buildModuleFromAST evaluates ast in an Env parented to Core and snapshots the public surface.
 // Runtime annotated nulls and rtErr panics are converted to rich errors with display context.
 func (ip *Interpreter) buildModuleFromAST(display string, ast S) (*Module, error) {
-	// Evaluate in isolated env parented to Core; turn rtErr/annotNull into errors
 	modEnv := NewEnv(ip.Core)
-	var rterr error
-	var evalRes Value
 
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				switch sig := r.(type) {
-				case rtErr:
-					rterr = fmt.Errorf("runtime error in %s: %s", display, sig.msg)
-				default:
-					rterr = fmt.Errorf("runtime panic in %s: %v", display, r)
-				}
-			}
-		}()
-		if len(ast) > 0 {
-			// Uncaught mode returns annotated nulls instead of errors; we surface them below.
-			evalRes = ip.EvalASTUncaught(ast, modEnv, true)
-		}
-	}()
+	// Prefer direct evaluation that returns (Value, error).
+	// This respects runtimeErrorsAsGoError=true and doesn't drop errors.
+	var v Value
+	var err error
 
-	if rterr == nil && evalRes.Tag == VTNull && evalRes.Annot != "" {
-		rterr = fmt.Errorf("runtime error in %s: %s", display, evalRes.Annot)
+	if len(ast) > 0 {
+		v, err = ip.runTopWithSource(ast, modEnv, false, nil)
 	}
-	if rterr != nil {
-		return nil, rterr
+
+	// Convert failures into the conventional module error wording.
+	if err != nil {
+		return nil, fmt.Errorf("runtime error in %s: %s", display, err.Error())
+	}
+	if v.Tag == VTNull && v.Annot != "" {
+		return nil, fmt.Errorf("runtime error in %s: %s", display, v.Annot)
 	}
 
 	// Snapshot public surface (ordered keys, key annotations, pin VTType envs)
 	mo := buildModuleMap(modEnv)
 
 	return &Module{
-		// Caller sets Name (canonical identity or a chosen name).
 		Map: mo,
 		Env: modEnv,
 	}, nil

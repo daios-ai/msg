@@ -15,7 +15,9 @@
 //     Interpreter.Apply semantics via a private helper (applyArgsScoped). That
 //     preserves currying, native dispatch, type checks, and call-site scoping.
 //   - Runtime errors inside the VM are reported as annotated null Values and
-//     surfaced via a vmRuntimeError status to the interpreter.
+//     surfaced via a vmRuntimeError status to the interpreter. The vmResult also
+//     carries the instruction PC where the error occurred so the interpreter can
+//     map it back to a source (line, col) using Chunk.Marks and SourceRef.
 //
 // Instruction encoding (private)
 //   - 32-bit instruction: [ opcode:8 | imm:24 ].
@@ -62,6 +64,19 @@ import (
 //                                   PUBLIC API
 ////////////////////////////////////////////////////////////////////////////////
 
+// SourceRef attaches source text and an optional SpanIndex to bytecode.
+type SourceRef struct {
+	Name  string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
+	Src   string     // full text
+	Spans *SpanIndex // may be nil when unknown
+}
+
+// PCMark associates an instruction index with an AST node path.
+type PCMark struct {
+	PC   int
+	Path NodePath
+}
+
 // Chunk is an immutable bytecode container executed by the VM.
 //
 // Layout:
@@ -71,6 +86,8 @@ import (
 //	         immediate (operand). The encoding details are private to the VM.
 //	Consts — constant pool referenced by instructions (e.g., opConst pushes
 //	         Consts[k], opLoadGlobal/opGetProp carry string names as VTStr).
+//	Src    — optional source reference (used for caret-runtime errors).
+//	Marks  — PC→AST path marks for mapping instructions back to source spans.
 //
 // Producer & consumer:
 //   - Produced by the internal emitter (see interpreter.go) from an S-expr AST.
@@ -83,6 +100,8 @@ import (
 type Chunk struct {
 	Code   []uint32
 	Consts []Value
+	Src    *SourceRef
+	Marks  []PCMark
 }
 
 //// END_OF_PUBLIC
@@ -91,7 +110,7 @@ type Chunk struct {
 //                             PRIVATE IMPLEMENTATION
 ////////////////////////////////////////////////////////////////////////////////
 
-// ---------- Instruction encoding (private) ----------
+/************* Instruction encoding (private) *************/
 
 type opcode uint8
 
@@ -146,7 +165,7 @@ func asMap(v Value) *MapObject {
 	return v.Data.(*MapObject)
 }
 
-// ---------- VM status/result (private) ----------
+/************* VM status/result (private) *************/
 
 type vmStatus int
 
@@ -159,9 +178,10 @@ const (
 type vmResult struct {
 	status vmStatus
 	value  Value
+	pc     int // instruction index where the status was produced (best-effort)
 }
 
-// ---------- VM state & helpers (private) ----------
+/************* VM state & helpers (private) *************/
 
 type vm struct {
 	ip    *Interpreter
@@ -201,8 +221,10 @@ func (m *vm) top() Value {
 	return m.stack[m.sp-1]
 }
 
+// fail returns a vmRuntimeError with the PC set to the currently executing
+// instruction (iptr-1, since iptr has advanced past the fetched instruction).
 func (m *vm) fail(msg string) vmResult {
-	return vmResult{status: vmRuntimeError, value: errNull(msg)}
+	return vmResult{status: vmRuntimeError, value: errNull(msg), pc: m.iptr - 1}
 }
 
 // Numeric helpers (mirror interpreter semantics)
@@ -278,16 +300,17 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 			return Bool(as >= bs), nil
 		}
 	}
-	return Value{}, &vmResult{status: vmRuntimeError, value: errNull("bad numeric operator")}
+	res := m.fail("bad numeric operator")
+	return Value{}, &res
 }
 
-// ---------- VM entry point (private) ----------
+/************* VM entry point (private) *************/
 
 // runChunk executes a bytecode Chunk in the provided environment.
 // It implements the full instruction set and returns:
-//   - vmOK          with the top-of-stack (or Null) if the program fell through,
-//   - vmReturn      with the explicit return value,
-//   - vmRuntimeError with an annotated-null explaining the error.
+//   - vmOK           with the top-of-stack (or Null) if the program fell through,
+//   - vmReturn       with the explicit return value,
+//   - vmRuntimeError with an annotated-null explaining the error, plus a PC.
 //
 // Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
 // currying, native dispatch, type checks, and call-site scoping.
@@ -483,7 +506,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 			if m.sp > 0 {
 				v = m.pop()
 			}
-			return vmResult{status: vmReturn, value: v}
+			return vmResult{status: vmReturn, value: v, pc: m.iptr - 1}
 
 		// ---- calls ----
 		case opCall:
@@ -517,7 +540,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 	}
 
 	if m.sp == 0 {
-		return vmResult{status: vmOK, value: Null}
+		return vmResult{status: vmOK, value: Null, pc: m.iptr - 1}
 	}
-	return vmResult{status: vmOK, value: m.top()}
+	return vmResult{status: vmOK, value: m.top(), pc: m.iptr - 1}
 }

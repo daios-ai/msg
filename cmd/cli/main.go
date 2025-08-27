@@ -154,11 +154,15 @@ func runREPL() int {
 		// Evaluate (persistent session)
 		v, err := ip.EvalPersistentSource(code)
 		if err != nil {
+			// Now includes RUNTIME ERROR snippets (thanks to errors.go change).
 			fmt.Fprintln(os.Stderr, red(err.Error()))
 			continue
 		}
-		val := mindscript.FormatValue(v)
-		fmt.Println(colorizeValue(val))
+		if v.Tag == mindscript.VTNull && v.Annot != "" {
+			fmt.Fprintln(os.Stderr, red(v.Annot))
+			continue
+		}
+		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
 
 		// Save to history
 		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))

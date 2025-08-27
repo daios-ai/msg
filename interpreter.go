@@ -12,14 +12,27 @@
 //   - Runtime value model: Value/ValueTag and helpers (Bool, Int, Num, Str, Arr, Map).
 //   - Environments: Env with lexical scoping (Define/Set/Get).
 //   - Functions/closures: Fun and FunVal, plus Callable/CallCtx introspection.
-//   - The Interpreter: construction (NewInterpreter), evaluation entry points
-//     (Eval*/Eval*Persistent/EvalAST), native registration (RegisterNative),
-//     call helpers (Apply/Call0), and type helpers (ResolveType/IsType/…).
+//   - The Interpreter: construction (NewInterpreter / NewInterpreterWithOptions),
+//     evaluation entry points (Eval*/Eval*Persistent/EvalAST), native registration
+//     (RegisterNative), call helpers (Apply/Call0), and type helpers
+//     (ResolveType/IsType/…).
+//
+// NEW (RUNTIME ERROR REPORTING)
+// -----------------------------
+// When enabled via Options.RuntimeErrorsAsGoError, failures that reach runTop
+// (VM runtime errors or panic(rtErr)) are surfaced as **Go errors** rendered by
+// WrapErrorWithSource using **RUNTIME ERROR** headers and caret snippets.
+// This is implemented by carrying a SourceRef on compiled chunks and recording
+// PC→AST NodePath marks in the emitter. On failure, runTop resolves PC→Span→(line,col)
+// and returns a wrapped *RuntimeError. Legacy behavior (annotated VTNull “soft
+// errors”) remains available when the option is disabled.
 //
 // INTERNALS (PRIVATE SECTION BELOW)
 // ---------------------------------
 //   - A JIT emitter compiles S-expr nodes to bytecode (Chunk).
-//   - A VM entry (runTop) runs chunks and converts panics/signals into results.
+//   - A VM entry (runTopWithSource) runs chunks and converts failures into either
+//     caret-style runtime errors (new) or annotated-null Values (legacy), based
+//     on options.
 //   - Unified “scoped” call engine supports currying and native calls.
 //   - Core natives (__assign_set/def, __plus, __len, __map_from, __to_iter, …)
 //     are registered in initCore().
@@ -28,13 +41,13 @@
 // DEPENDENCIES ON OTHER FILES
 // ---------------------------
 // • lexer.go / parser.go
-//   - ParseSExpr / ParseSExprInteractive to build S-expr AST (type S = []any).
+//   - ParseSExpr / ParseSExprInteractive / ParseSExprWithSpans to build S-expr AST.
 //   - Tokenization rules and source positions used for error reporting upstream.
 //
 // • vm.go (bytecode & virtual machine)
-//   - Chunk { Code []uint32, Consts []Value }
+//   - Chunk { Code []uint32, Consts []Value, Src *SourceRef, Marks []PCMark }
 //   - opcode packing/unpacking and enum (opConst, opLoadGlobal, opCall, …)
-//   - runChunk(*Chunk, *Env, gas) -> { status vmOK|vmReturn|vmRuntimeError, value Value }
+//   - runChunk(*Chunk, *Env, gas) -> { status vmOK|vmReturn|vmRuntimeError, value Value, pc int }
 //
 // • types.go (type system)
 //   - (ip *Interpreter) resolveType / isType / isSubtype / unifyTypes / valueToTypeS
@@ -42,7 +55,8 @@
 //   - equalS(a, b S) bool                         (structural type equality)
 //
 // • errors.go (error reporting)
-//   - WrapErrorWithSource(err, src string) error  (enrich lexer/parser errors)
+//   - WrapErrorWithSource(err, src string) error  (enrich lexer/parser/runtime errors)
+//   - type RuntimeError { Line, Col int; Msg string } (rendered as caret snippet)
 //
 // • oracles.go (oracle implementation)
 //   - (ip *Interpreter) execOracle(funVal Value, callSite *Env) Value
@@ -182,6 +196,8 @@ func TypeValIn(expr S, env *Env) Value {
 //
 //	IsOracle    — marks oracle functions (different return-type semantics)
 //	Examples    — optional example pairs for tooling (opaque to runtime)
+//
+//	Src         — source metadata for caret-runtime-errors (optional)
 type Fun struct {
 	Params     []string
 	Body       S
@@ -195,6 +211,8 @@ type Fun struct {
 
 	IsOracle bool    // oracle marker
 	Examples []Value // optional examples
+
+	Src *SourceRef // where this function's body came from (may be nil)
 }
 
 // FunVal wraps *Fun into a Value.
@@ -270,8 +288,29 @@ type CallCtx interface {
 // It must return a Value of the declared return type; the engine enforces types.
 type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
 
+// Options configures interpreter behavior.
+type Options struct {
+	// If true, runtime failures at the top level are reported as Go errors
+	// using caret snippets (RUNTIME ERROR). If false (default), the legacy
+	// annotated-null “soft errors” are returned.
+	RuntimeErrorsAsGoError bool
+}
+
+// RuntimeError represents an execution-time failure with a source location.
+// Line/Col are 1-based.
+type RuntimeError struct {
+	Line int
+	Col  int
+	Msg  string
+}
+
+func (e *RuntimeError) Error() string {
+	return fmt.Sprintf("RUNTIME ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
+}
+
 // Interpreter owns global/core environments, registered natives, and module state.
-// Construct with NewInterpreter. Most users interact via Eval*/Apply/Call0, etc.
+// Construct with NewInterpreter or NewInterpreterWithOptions. Most users interact
+// via Eval*/Apply/Call0, etc.
 //
 // Fields for consumers:
 //
@@ -286,54 +325,63 @@ type Interpreter struct {
 
 	// Oracle observability (reserved for tooling)
 	oracleLastPrompt string
+
+	// Options / current source
+	runtimeErrorsAsGoError bool
+	currentSrc             *SourceRef // set while running a chunk; visible to natives
 }
 
-// NewInterpreter constructs an engine with a fresh Core and Global environment
-// and registers core runtime natives (operators, assignment, map/array helpers, etc.).
+// NewInterpreter constructs an engine with defaults.
 func NewInterpreter() *Interpreter {
-	ip := &Interpreter{}
+	return NewInterpreterWithOptions(Options{})
+}
+
+// NewInterpreterWithOptions constructs an engine with options and core natives.
+func NewInterpreterWithOptions(o Options) *Interpreter {
+	ip := &Interpreter{runtimeErrorsAsGoError: o.RuntimeErrorsAsGoError}
 	ip.Core = NewEnv(nil)
 	ip.Global = NewEnv(ip.Core) // built-ins visible from user programs
 	ip.modules = map[string]*moduleRec{}
+	ip.runtimeErrorsAsGoError = true
 	ip.initCore()
 	return ip
 }
 
-// EvalSource parses (via ParseSExpr) and evaluates source in a fresh child
+// EvalSource parses (via ParseSExprWithSpans) and evaluates source in a fresh child
 // of Global. The result does not mutate Global scope.
 func (ip *Interpreter) EvalSource(src string) (Value, error) {
-	ast, err := ParseSExpr(src)
+	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
 		return Value{}, WrapErrorWithSource(err, src)
 	}
-	return ip.Eval(ast)
+	return ip.runTopWithSource(ast, NewEnv(ip.Global), false, &SourceRef{Name: "main", Src: src, Spans: spans})
 }
 
 // Eval evaluates an AST in a fresh child of Global. Global is not mutated by
 // top-level bindings (they go into the fresh child), unless the program itself
 // mutates Global via explicit assignment.
 func (ip *Interpreter) Eval(root S) (Value, error) {
-	return ip.runTop(root, NewEnv(ip.Global), false)
+	return ip.runTopWithSource(root, NewEnv(ip.Global), false, nil)
 }
 
 // EvalPersistentSource parses and evaluates source **in Global**.
 // This is intended for REPLs or scripts that add to the global scope.
 func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
-	ast, err := ParseSExpr(src)
+	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
 		return Value{}, WrapErrorWithSource(err, src)
 	}
-	return ip.EvalPersistent(ast)
+	return ip.runTopWithSource(ast, ip.Global, false, &SourceRef{Name: "main", Src: src, Spans: spans})
 }
 
 // EvalPersistent evaluates an AST **in Global**.
 func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
-	return ip.runTop(root, ip.Global, false)
+	return ip.runTopWithSource(root, ip.Global, false, nil)
 }
 
 // EvalAST evaluates an AST in the provided environment.
 func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
-	return ip.runTop(ast, env, false)
+	return ip.runTopWithSource(ast, env, false, nil)
 }
 
 // EvalASTUncaught evaluates an AST and **never returns an error**.
@@ -341,7 +389,7 @@ func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
 // behavior in some integrations. The topBlockToSameEnv flag is kept for API
 // compatibility and is ignored.
 func (ip *Interpreter) EvalASTUncaught(ast S, env *Env, topBlockToSameEnv bool) Value {
-	v, _ := ip.runTop(ast, env, true)
+	v, _ := ip.runTopWithSource(ast, env, true, nil)
 	return v
 }
 
@@ -530,9 +578,9 @@ func (c *callCtx) MustArg(name string) Value {
 }
 func (c *callCtx) Env() *Env { return c.scope }
 
-// -------- VM entry/exit plumbing --------
+// -------- VM entry/exit plumbing (with runtime error surfacing) --------
 
-func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err error) {
+func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
 	if !uncaught {
 		defer func() {
 			if r := recover(); r != nil {
@@ -540,22 +588,46 @@ func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err er
 				case returnSig:
 					out, err = sig.v, nil
 				case rtErr:
-					out, err = errNull(sig.msg), nil
+					if ip.runtimeErrorsAsGoError {
+						line, col := ip.sourcePosFromChunk(nil, sr, 0)
+						err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: sig.msg}, ip.fallbackSrc(sr, ast))
+						out = Value{}
+					} else {
+						out, err = errNull(sig.msg), nil
+					}
 				case error:
 					out, err = Null, sig
 				default:
-					out, err = errNull(fmt.Sprintf("runtime panic: %v", r)), nil
+					if ip.runtimeErrorsAsGoError {
+						line, col := ip.sourcePosFromChunk(nil, sr, 0)
+						err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: fmt.Sprintf("runtime panic: %v", r)}, ip.fallbackSrc(sr, ast))
+						out = Value{}
+					} else {
+						out, err = errNull(fmt.Sprintf("runtime panic: %v", r)), nil
+					}
 				}
 			}
 		}()
 	}
 
-	ch := ip.jitTop(ast)
+	ch := ip.jitTop(ast, sr)
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
 	res := ip.runChunk(ch, env, 0)
+	ip.currentSrc = prev
+
 	switch res.status {
 	case vmOK, vmReturn:
 		return res.value, nil
 	case vmRuntimeError:
+		if ip.runtimeErrorsAsGoError {
+			line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+			msg := res.value.Annot
+			if msg == "" {
+				msg = "runtime error"
+			}
+			return Value{}, WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: msg}, ip.fallbackSrc(ch.Src, ast))
+		}
 		return res.value, nil
 	default:
 		return errNull("unknown VM status"), nil
@@ -563,22 +635,27 @@ func (ip *Interpreter) runTop(ast S, env *Env, uncaught bool) (out Value, err er
 }
 
 // Build a one-off top-level function body and ensure it is compiled.
-func (ip *Interpreter) jitTop(ast S) *Chunk {
+func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
 	f := &Fun{
 		ReturnType: S{"id", "Any"},
 		Body:       ast,
+		Src:        sr,
 	}
-	ip.ensureChunk(f)
+	ip.ensureChunkWithSource(f, sr)
 	return f.Chunk
 }
 
-func (ip *Interpreter) ensureChunk(f *Fun) {
+func (ip *Interpreter) ensureChunk(f *Fun) { ip.ensureChunkWithSource(f, f.Src) }
+
+func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
 	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
 		return
 	}
-	em := newEmitter(ip)
+	em := newEmitter(ip, sr)
 	em.emitFunBody(f.Body)
-	f.Chunk = em.chunk()
+	ch := em.chunk()
+	ch.Src = sr
+	f.Chunk = ch
 }
 
 // -------- Calls / currying (scoped engine) --------
@@ -654,6 +731,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 			HiddenNull: f.HiddenNull,
 			Chunk:      f.Chunk,
 			NativeName: f.NativeName,
+			Src:        f.Src,
 		})
 	}
 
@@ -669,6 +747,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		IsOracle:   f.IsOracle,
 		Examples:   f.Examples,
 		HiddenNull: f.HiddenNull,
+		Src:        f.Src,
 	}
 	execVal := FunVal(execFun)
 	execVal.Annot = fnVal.Annot // keep doc
@@ -687,7 +766,12 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 			fail(fmt.Sprintf("unknown native %q", f.NativeName))
 		}
 		scope := withScope(f.Env, callSite) // where side effects land
+		prev := ip.currentSrc
+		if f.Src != nil {
+			ip.currentSrc = f.Src
+		}
 		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
+		ip.currentSrc = prev
 		if !ip.isType(res, f.ReturnType, f.Env) {
 			fail("return type mismatch")
 		}
@@ -699,8 +783,14 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 	}
 
 	// User-defined function
-	ip.ensureChunk(f)
+	ip.ensureChunkWithSource(f, f.Src)
+	prev := ip.currentSrc
+	if f.Src != nil {
+		ip.currentSrc = f.Src
+	}
 	res := ip.runChunk(f.Chunk, f.Env, 0)
+	ip.currentSrc = prev
+
 	switch res.status {
 	case vmOK, vmReturn:
 		if !ip.isType(res.value, f.ReturnType, f.Env) {
@@ -885,7 +975,7 @@ func (ip *Interpreter) initCore() {
 		})
 
 	// __make_fun(params:[Str], types:[Type], ret:Type, body:Type, isOracle:Bool, examples:Any) -> Fun
-	ip.reg("__make_fun",
+	ip.RegisterNative("__make_fun",
 		[]ParamSpec{
 			{"params", S{"array", S{"id", "Str"}}},
 			{"types", S{"array", S{"id", "Type"}}},
@@ -895,7 +985,7 @@ func (ip *Interpreter) initCore() {
 			{"examples", S{"id", "Any"}},
 		},
 		S{"id", "Any"},
-		func(ctx CallCtx) Value {
+		func(ip *Interpreter, ctx CallCtx) Value {
 			namesV := ctx.MustArg("params").Data.([]Value)
 			typesV := ctx.MustArg("types").Data.([]Value)
 
@@ -940,6 +1030,7 @@ func (ip *Interpreter) initCore() {
 				HiddenNull: hidden,
 				IsOracle:   isOr,
 				Examples:   exVals,
+				Src:        ip.currentSrc, // inherit source of the running chunk
 			})
 		})
 
@@ -1008,6 +1099,7 @@ func (ip *Interpreter) initCore() {
 					ReturnType: S{"unop", "?", S{"id", "Any"}},
 					Body:       body,
 					Env:        env,
+					Src:        ip.currentSrc,
 				})
 			}
 
@@ -1056,6 +1148,7 @@ func (ip *Interpreter) initCore() {
 					ReturnType: S{"unop", "?", S{"id", "Any"}},
 					Body:       body,
 					Env:        env,
+					Src:        ip.currentSrc,
 				})
 			}
 
@@ -1285,7 +1378,7 @@ func (ip *Interpreter) evalSimple(n S, env *Env) Value {
 // evalFull compiles and runs a single expression in env.
 // Annotated null is turned into a runtime failure (panic(rtErr)) to align with assignment.
 func (ip *Interpreter) evalFull(n S, env *Env) Value {
-	em := newEmitter(ip)
+	em := newEmitter(ip, ip.currentSrc)
 	em.emitExpr(n)
 	em.emit(opReturn, 0)
 	ch := em.chunk()
@@ -1352,13 +1445,18 @@ func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 	}
 }
 
-// -------- JIT: AST → bytecode emitter --------
+// -------- JIT: AST → bytecode emitter (with PC marks) --------
 
 type emitter struct {
 	ip        *Interpreter
 	code      []uint32
 	consts    []Value
 	ctrlStack []ctrlCtx // generic block/loop control stack
+
+	// Source mapping
+	src   *SourceRef
+	marks []PCMark
+	path  NodePath
 }
 
 // Control-jump bookkeeping for blocks/loops (break/continue implemented via jumps).
@@ -1426,7 +1524,7 @@ func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
 	e.emit(opPop, 0)
 }
 
-func newEmitter(ip *Interpreter) *emitter { return &emitter{ip: ip} }
+func newEmitter(ip *Interpreter, src *SourceRef) *emitter { return &emitter{ip: ip, src: src} }
 
 func (e *emitter) k(v Value) uint32 {
 	for i := range e.consts {
@@ -1441,7 +1539,19 @@ func (e *emitter) ks(s string) uint32         { return e.k(Str(s)) }
 func (e *emitter) emit(op opcode, imm uint32) { e.code = append(e.code, pack(op, imm)) }
 func (e *emitter) patch(at int, to int)       { e.code[at] = pack(uop(e.code[at]), uint32(to)) }
 func (e *emitter) here() int                  { return len(e.code) }
-func (e *emitter) chunk() *Chunk              { return &Chunk{Code: e.code, Consts: e.consts} }
+func (e *emitter) chunk() *Chunk {
+	return &Chunk{Code: e.code, Consts: e.consts, Marks: e.marks, Src: e.src}
+}
+
+// path helpers for source mapping
+func (e *emitter) mark() {
+	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), e.path...)})
+}
+func (e *emitter) withChild(childIdx int, f func()) {
+	e.path = append(e.path, childIdx)
+	f()
+	e.path = e.path[:len(e.path)-1]
+}
 
 func (e *emitter) callBuiltin(name string, args ...S) {
 	e.emit(opLoadGlobal, e.ks(name))
@@ -1466,12 +1576,14 @@ func unwrapKeyStr(k S) string {
 
 // Entry: emit whole function body and return.
 func (e *emitter) emitFunBody(body S) {
+	e.path = e.path[:0] // root
 	e.emitExpr(body)
 	e.emit(opReturn, 0)
 }
 
 // Emit an expression node.
 func (e *emitter) emitExpr(n S) {
+	e.mark() // record PC → current AST node
 	if len(n) == 0 {
 		e.emit(opConst, e.k(Null))
 		return
@@ -1500,7 +1612,8 @@ func (e *emitter) emitExpr(n S) {
 			e.emit(opConst, e.k(Null))
 		} else {
 			for i := 1; i <= nItems; i++ {
-				e.emitExpr(n[i].(S))
+				j := i - 1
+				e.withChild(j, func() { e.emitExpr(n[i].(S)) })
 				if i < nItems {
 					e.emit(opPop, 0)
 				}
@@ -1535,7 +1648,7 @@ func (e *emitter) emitExpr(n S) {
 			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
 			return
 		}
-		e.emitExpr(n[2].(S))
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		switch op {
 		case "not":
 			e.emit(opNot, 0)
@@ -1548,11 +1661,11 @@ func (e *emitter) emitExpr(n S) {
 	case "binop":
 		op := n[1].(string)
 		if op == "and" || op == "or" {
-			e.emitExpr(n[2].(S))
+			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 			if op == "and" {
 				jf := e.here()
 				e.emit(opJumpIfFalse, 0)
-				e.emitExpr(n[3].(S))
+				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
 				jend := e.here()
 				e.emit(opJump, 0)
 				lfalse := e.here()
@@ -1568,7 +1681,7 @@ func (e *emitter) emitExpr(n S) {
 				e.emit(opJump, 0)
 				lrhs := e.here()
 				e.patch(jf, lrhs)
-				e.emitExpr(n[3].(S))
+				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
 				lend := e.here()
 				e.patch(jend, lend)
 			}
@@ -1577,46 +1690,50 @@ func (e *emitter) emitExpr(n S) {
 		a, b := n[2].(S), n[3].(S)
 		switch op {
 		case "==":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opEq, 0)
 		case "!=":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opNe, 0)
 		case "+":
-			e.callBuiltin("__plus", a, b)
+			// builtin plus; preserve child mapping
+			e.emit(opLoadGlobal, e.ks("__plus"))
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emit(opCall, 2)
 		case "-":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opSub, 0)
 		case "*":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opMul, 0)
 		case "/":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opDiv, 0)
 		case "%":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opMod, 0)
 		case "<":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opLt, 0)
 		case "<=":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opLe, 0)
 		case ">":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opGt, 0)
 		case ">=":
-			e.emitExpr(a)
-			e.emitExpr(b)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
 			e.emit(opGe, 0)
 		default:
 			e.emit(opConst, e.k(errNull("unsupported operator")))
@@ -1639,7 +1756,7 @@ func (e *emitter) emitExpr(n S) {
 
 	case "array":
 		for i := 1; i < len(n); i++ {
-			e.emitExpr(n[i].(S))
+			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
 		}
 		e.emit(opMakeArr, uint32(len(n)-1))
 
@@ -1663,17 +1780,17 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opCall, 2)
 
 	case "get":
-		e.emitExpr(n[1].(S))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.emit(opGetProp, e.ks(n[2].(S)[1].(string)))
 	case "idx":
-		e.emitExpr(n[1].(S))
-		e.emitExpr(n[2].(S))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		e.emit(opGetIdx, 0)
 
 	case "call":
-		e.emitExpr(n[1].(S))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		for i := 2; i < len(n); i++ {
-			e.emitExpr(n[i].(S))
+			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
 		}
 		e.emit(opCall, uint32(len(n)-2))
 
@@ -1762,17 +1879,19 @@ func (e *emitter) emitExpr(n S) {
 		}
 		for i := 0; i < limit; i++ {
 			p := arms[i].(S)
-			e.emitExpr(p[1].(S))
+			e.withChild(i, func() {
+				e.withChild(0, func() { e.emitExpr(p[1].(S)) }) // cond
+			})
 			jf := e.here()
 			e.emit(opJumpIfFalse, 0)
-			e.emitExpr(p[2].(S))
+			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) }) // then
 			jend := e.here()
 			e.emit(opJump, 0)
 			jends = append(jends, jend)
 			e.patch(jf, e.here())
 		}
 		if hasElse {
-			e.emitExpr(arms[len(arms)-1].(S))
+			e.withChild(len(arms)-1, func() { e.emitExpr(arms[len(arms)-1].(S)) })
 		} else {
 			e.emit(opConst, e.k(Null))
 		}
@@ -1789,14 +1908,14 @@ func (e *emitter) emitExpr(n S) {
 		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
 
 		head := e.here()
-		e.emitExpr(cond)
+		e.withChild(0, func() { e.emitExpr(cond) })
 		jf := e.here()
 		e.emit(opJumpIfFalse, 0)
 
 		e.preloadAssignToLast(lastName)
 
 		e.pushLoopCtx()
-		e.emitExpr(body)
+		e.withChild(1, func() { e.emitExpr(body) })
 		loopCtx := e.popCtx()
 
 		e.saveLastAndJumpHead(head)
@@ -1862,7 +1981,7 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opPop, 0)
 
 		e.pushLoopCtx()
-		e.emitExpr(body)
+		e.withChild(2, func() { e.emitExpr(body) })
 		loopCtx := e.popCtx()
 
 		e.saveLastAndJumpHead(head)
@@ -1928,4 +2047,63 @@ func (e *emitter) emitExpr(n S) {
 	default:
 		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
 	}
+}
+
+// -------- source mapping helpers (PC → (line,col)) --------
+
+// sourcePosFromChunk finds a best-effort (line,col) from PC marks + spans.
+func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
+	src := ""
+	if sr != nil {
+		src = sr.Src
+	}
+	// Unknown → 1:1
+	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
+		return 1, 1
+	}
+	// last mark with mark.PC <= pc
+	i := -1
+	for j := range ch.Marks {
+		if ch.Marks[j].PC <= pc {
+			i = j
+		} else {
+			break
+		}
+	}
+	if i < 0 {
+		return 1, 1
+	}
+	if span, ok := sr.Spans.Get(ch.Marks[i].Path); ok {
+		return offsetToLineCol(src, span.StartByte)
+	}
+	return 1, 1
+}
+
+// fallbackSrc chooses source text to render a snippet, even if spans are missing.
+func (ip *Interpreter) fallbackSrc(sr *SourceRef, ast S) string {
+	if sr != nil && sr.Src != "" {
+		return sr.Src
+	}
+	// As a last resort, pretty-print the AST (line:col will be coarse).
+	return FormatSExpr(ast)
+}
+
+// offsetToLineCol converts a byte offset into 1-based (line, col).
+func offsetToLineCol(src string, off int) (int, int) {
+	if off < 0 {
+		return 1, 1
+	}
+	line, col := 1, 1
+	i := 0
+	for i < len(src) && i < off {
+		if src[i] == '\n' {
+			line++
+			col = 1
+			i++
+			continue
+		}
+		col++
+		i++
+	}
+	return line, col
 }

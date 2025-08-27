@@ -80,6 +80,8 @@ func WrapErrorWithSource(err error, src string) error {
 		return fmt.Errorf("%s", prettyErrorString(src, "LEXICAL ERROR", e.Line, e.Col, e.Msg))
 	case *ParseError:
 		return fmt.Errorf("%s", prettyErrorString(src, "PARSE ERROR", e.Line, e.Col, e.Msg))
+	case *RuntimeError:
+		return fmt.Errorf("%s", prettyErrorString(src, "RUNTIME ERROR", e.Line, e.Col, e.Msg))
 	default:
 		return err
 	}

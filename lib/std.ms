@@ -20,6 +20,11 @@ let println = fun(x: Any) -> Any do
   printf("%s\n", [str(x)])
 end
 
+# Return an error (a null value annotated with an error message)
+let error = fun(msg: Str) -> Null do
+  __annotate(msg, null)
+end
+
 # Assert that a condition is true.
 # Returns true if it holds, otherwise throws an error.
 # condition:Bool -> Bool
@@ -27,7 +32,7 @@ let assert = fun(cond: Bool) -> Bool do
   if cond then
     true
   else
-    error("assertion failed")
+    fail("assertion failed")
   end
 end
 

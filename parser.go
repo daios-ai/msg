@@ -14,9 +14,24 @@
 //   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
 //   - '.' is PERIOD unless it started a number in the lexer.
 //   - multi-line '#' annotations become ANNOTATION tokens.
-//   - blank lines may be emitted as NOOP tokens.
+//   - blank-line runs may be emitted as NOOP tokens.
 //   - Support an "interactive" mode that surfaces *IncompleteError* at EOF
 //     instead of hard parse errors, suitable for REPLs.
+//
+// NEW IN THIS VERSION (liberal spacing inside delimiters)
+// ------------------------------------------------------
+// The parser **skips NOOP tokens inside delimited constructs** so that blank
+// lines are treated like whitespace within:
+//   - array literals:            [ … ]
+//   - map/object literals:       { … }
+//   - call argument lists:       f( … )
+//   - parameter lists:           fun(x: T, …)
+//   - bracket indices:           a[ … ]
+//   - computed properties:       obj.( … )
+//   - grouping parentheses:      ( … )
+//
+// The semantics of NOOP at the top level and inside blocks are unchanged: a
+// NOOP still parses as ("noop") outside the above delimited contexts.
 //
 // What the parser returns
 // -----------------------
@@ -108,16 +123,11 @@
 //     the annotation is POST (attaches to the left); otherwise it is PRE.
 //
 //   - General rule: multiple *consecutive PRE* annotations are disallowed
-//     (parser error; suggest combining). Exceptions apply inside key parsing
-//     where PRE annotations can recursively wrap a key.
+//     (parser error; suggest combining). Inside key parsing, recursion allows
+//     stacked PRE annotations in front of a key.
 //
 //   - POST annotations are attached in the postfix chain; PRE wrap the node
 //     that follows. The AST encodes this as ("annot", ("str", text), node, isPre).
-//
-//   - Newlines with control statements:
-//
-//   - `return`, `break`, `continue` consume a value only if the next token
-//     appears on the *same physical line*. Otherwise they default to ("null").
 //
 // Grammar sketch (informal)
 // -------------------------
@@ -244,6 +254,10 @@ func (e *ParseError) Error() string {
 //   - Return/break/continue consume a value only if the next token is on the same
 //     line; otherwise they default to ("null").
 //
+// Liberal spacing (this version):
+//   - Inside (), [], {}, call/parameter lists, bracket indices, and obj.(…),
+//     blank-line NOOP tokens are ignored.
+//
 // Errors:
 //   - Does not return *IncompleteError*; unterminated constructs are hard errors.
 //   - Never panics on malformed input.
@@ -317,6 +331,14 @@ type parser struct {
 	i           int
 	interactive bool
 	post        []Span
+}
+
+// skipNoops consumes any number of NOOP tokens (blank-line groups). This is
+// used inside delimited contexts so that blank lines behave like whitespace.
+func (p *parser) skipNoops() {
+	for !p.atEnd() && p.peek().Type == NOOP {
+		p.i++
+	}
 }
 
 // tokenCanEndExpr is used to classify same-line annotations as POST.
@@ -495,10 +517,12 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = L("unop", t.Lexeme, r)
 
 	case LROUND, CLROUND:
+		p.skipNoops()
 		inner, err := p.expr(0)
 		if err != nil {
 			return nil, err
 		}
+		p.skipNoops()
 		if _, err := p.need(RROUND, "expected ')'"); err != nil {
 			return nil, err
 		}
@@ -512,18 +536,22 @@ func (p *parser) expr(minBP int) (S, error) {
 		left = a
 
 	case LCURLY:
+		p.skipNoops()
 		if p.match(RCURLY) {
 			left = L("map")
 		} else {
 			var pairs []any
 			for {
+				p.skipNoops()
 				k, req, err := p.keyRequired()
 				if err != nil {
 					return nil, err
 				}
+				p.skipNoops()
 				if _, err := p.need(COLON, "expected ':' after key"); err != nil {
 					return nil, err
 				}
+				p.skipNoops()
 				v, err := p.expr(0)
 				if err != nil {
 					return nil, err
@@ -533,10 +561,12 @@ func (p *parser) expr(minBP int) (S, error) {
 					tag = "pair!"
 				}
 				pairs = append(pairs, L(tag, k, v))
+				p.skipNoops()
 				if !p.match(COMMA) {
 					break
 				}
 			}
+			p.skipNoops()
 			if _, err := p.need(RCURLY, "expected '}'"); err != nil {
 				return nil, err
 			}
@@ -725,17 +755,21 @@ func (p *parser) expr(minBP int) (S, error) {
 		case CLROUND:
 			p.i++
 			var args []any
+			p.skipNoops()
 			if !p.match(RROUND) {
 				for {
+					p.skipNoops()
 					a, err := p.expr(0)
 					if err != nil {
 						return nil, err
 					}
 					args = append(args, a)
+					p.skipNoops()
 					if !p.match(COMMA) {
 						break
 					}
 				}
+				p.skipNoops()
 				if _, err := p.need(RROUND, "expected ')'"); err != nil {
 					return nil, err
 				}
@@ -744,10 +778,12 @@ func (p *parser) expr(minBP int) (S, error) {
 			continue
 		case CLSQUARE:
 			p.i++
+			p.skipNoops()
 			idx, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
+			p.skipNoops()
 			if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
 				return nil, err
 			}
@@ -756,10 +792,12 @@ func (p *parser) expr(minBP int) (S, error) {
 		case PERIOD:
 			p.i++
 			if p.match(LROUND) || p.match(CLROUND) {
+				p.skipNoops()
 				ex, err := p.expr(0)
 				if err != nil {
 					return nil, err
 				}
+				p.skipNoops()
 				if _, err := p.need(RROUND, "expected ')' after computed property"); err != nil {
 					return nil, err
 				}
@@ -844,20 +882,24 @@ func (p *parser) expr(minBP int) (S, error) {
 }
 
 func (p *parser) arrayLiteralAfterOpen() (S, error) {
+	p.skipNoops()
 	if p.match(RSQUARE) {
 		return L("array"), nil
 	}
 	var elems []any
 	for {
+		p.skipNoops()
 		it, err := p.expr(0)
 		if err != nil {
 			return nil, err
 		}
 		elems = append(elems, it)
+		p.skipNoops()
 		if !p.match(COMMA) {
 			break
 		}
 	}
+	p.skipNoops()
 	if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
 		return nil, err
 	}
@@ -868,20 +910,24 @@ func (p *parser) params() (S, error) {
 	if _, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
 		return nil, err
 	}
+	p.skipNoops()
 	if p.match(RROUND) {
 		return L("array"), nil
 	}
 	var ps []any
 	for {
+		p.skipNoops()
 		idTok, err := p.need(ID, "expected parameter name")
 		if err != nil {
 			return nil, err
 		}
 		var t any = L("id", "Any")
+		p.skipNoops()
 		if p.match(COLON) {
 			if p.atEnd() && p.interactive {
 				return nil, &IncompleteError{Line: idTok.Line, Col: idTok.Col, Msg: "expected type after ':'"}
 			}
+			p.skipNoops()
 			e, err := p.expr(0)
 			if err != nil {
 				return nil, err
@@ -889,16 +935,19 @@ func (p *parser) params() (S, error) {
 			t = e
 		}
 		ps = append(ps, L("pair", L("id", tokString(idTok)), t))
+		p.skipNoops()
 		if !p.match(COMMA) {
 			break
 		}
 	}
+	p.skipNoops()
 	if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
 		return nil, err
 	}
 	return L("array", ps...), nil
 }
 
+// ifExpr builds: ("if", ("pair", cond1, thenBlk1), ... [, elseBlk?])
 func (p *parser) ifExpr() (S, error) {
 	cond, err := p.expr(0)
 	if err != nil {
@@ -1085,7 +1134,8 @@ func unwrapAnnots(n S) S {
 // ----- Declaration patterns (with optional PRE-annotation wrapper) -----
 
 func (p *parser) declPattern() (S, error) {
-	// Allow a single PRE annotation to wrap the pattern; stacking is disallowed here.
+	// Allow line-leading PRE annotations to wrap the next pattern;
+	// still disallow multiple consecutive PRE annotations at a single point.
 	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
 		return nil, err
 	} else if len(anns) > 0 {
@@ -1113,29 +1163,34 @@ func (p *parser) declPattern() (S, error) {
 }
 
 func (p *parser) arrayDeclPattern() (S, error) {
+	p.skipNoops()
 	if p.match(RSQUARE) {
 		return L("darr"), nil
 	}
 	var parts []any
 	for {
+		p.skipNoops()
 		pt, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, pt)
+		p.skipNoops()
 		if !p.match(COMMA) {
 			break
 		}
 	}
+	p.skipNoops()
 	if _, err := p.need(RSQUARE, "expected ']' in array pattern"); err != nil {
 		return nil, err
 	}
 	return L("darr", parts...), nil
 }
 
-// readKeyString parses a key for object patterns/maps, allowing PRE-annotation wrapping.
+// readKeyString parses a key for object patterns/maps, allowing stacked PRE-annotation
+// wrapping via recursion (each level allows at most one PRE, but recursion stacks).
 func (p *parser) readKeyString() (S, error) {
-	// Allow a single PRE annotation directly in front of the key.
+	// Allow stacked PRE annotation(s) directly in front of the key.
 	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
 		return nil, err
 	} else if len(anns) > 0 {
@@ -1188,27 +1243,33 @@ func (p *parser) keyRequired() (key S, required bool, err error) {
 }
 
 func (p *parser) objectDeclPattern() (S, error) {
+	p.skipNoops()
 	if p.match(RCURLY) {
 		return L("dobj"), nil
 	}
 	var pairs []any
 	for {
+		p.skipNoops()
 		key, err := p.readKeyString()
 		if err != nil {
 			return nil, err
 		}
+		p.skipNoops()
 		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
 			return nil, err
 		}
+		p.skipNoops()
 		pt, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
 		pairs = append(pairs, L("pair", key, pt))
+		p.skipNoops()
 		if !p.match(COMMA) {
 			break
 		}
 	}
+	p.skipNoops()
 	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
 		return nil, err
 	}

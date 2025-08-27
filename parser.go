@@ -562,7 +562,13 @@ func (p *parser) expr(minBP int) (S, error) {
 				}
 				pairs = append(pairs, L(tag, k, v))
 				p.skipNoops()
+
 				if !p.match(COMMA) {
+					break
+				}
+				// Trailing comma before '}'
+				p.skipNoops()
+				if p.peek().Type == RCURLY {
 					break
 				}
 			}
@@ -765,7 +771,13 @@ func (p *parser) expr(minBP int) (S, error) {
 					}
 					args = append(args, a)
 					p.skipNoops()
+
 					if !p.match(COMMA) {
+						break
+					}
+					// Trailing comma before ')'
+					p.skipNoops()
+					if p.peek().Type == RROUND {
 						break
 					}
 				}
@@ -895,7 +907,15 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 		}
 		elems = append(elems, it)
 		p.skipNoops()
+
+		// If there is no comma, list ends.
 		if !p.match(COMMA) {
+			break
+		}
+
+		// Trailing comma: allow COMMA followed by the closing ']'.
+		p.skipNoops()
+		if p.peek().Type == RSQUARE {
 			break
 		}
 	}
@@ -936,7 +956,13 @@ func (p *parser) params() (S, error) {
 		}
 		ps = append(ps, L("pair", L("id", tokString(idTok)), t))
 		p.skipNoops()
+
 		if !p.match(COMMA) {
+			break
+		}
+		// Trailing comma before ')'
+		p.skipNoops()
+		if p.peek().Type == RROUND {
 			break
 		}
 	}
@@ -1162,6 +1188,7 @@ func (p *parser) declPattern() (S, error) {
 	return nil, &ParseError{Line: g.Line, Col: g.Col, Msg: "expected let pattern (id, [], or {})"}
 }
 
+// --- array destructuring pattern: [p1, p2,] ---
 func (p *parser) arrayDeclPattern() (S, error) {
 	p.skipNoops()
 	if p.match(RSQUARE) {
@@ -1176,7 +1203,13 @@ func (p *parser) arrayDeclPattern() (S, error) {
 		}
 		parts = append(parts, pt)
 		p.skipNoops()
+
 		if !p.match(COMMA) {
+			break
+		}
+		// Trailing comma before ']'
+		p.skipNoops()
+		if p.peek().Type == RSQUARE {
 			break
 		}
 	}
@@ -1185,6 +1218,47 @@ func (p *parser) arrayDeclPattern() (S, error) {
 		return nil, err
 	}
 	return L("darr", parts...), nil
+}
+
+// --- object destructuring pattern: {k: p, ... ,} ---
+func (p *parser) objectDeclPattern() (S, error) {
+	p.skipNoops()
+	if p.match(RCURLY) {
+		return L("dobj"), nil
+	}
+	var pairs []any
+	for {
+		p.skipNoops()
+		key, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		p.skipNoops()
+		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
+			return nil, err
+		}
+		p.skipNoops()
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, L("pair", key, pt))
+		p.skipNoops()
+
+		if !p.match(COMMA) {
+			break
+		}
+		// Trailing comma before '}'
+		p.skipNoops()
+		if p.peek().Type == RCURLY {
+			break
+		}
+	}
+	p.skipNoops()
+	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
+		return nil, err
+	}
+	return L("dobj", pairs...), nil
 }
 
 // readKeyString parses a key for object patterns/maps, allowing stacked PRE-annotation
@@ -1240,40 +1314,6 @@ func (p *parser) keyRequired() (key S, required bool, err error) {
 	}
 	req := p.match(BANG)
 	return k, req, nil
-}
-
-func (p *parser) objectDeclPattern() (S, error) {
-	p.skipNoops()
-	if p.match(RCURLY) {
-		return L("dobj"), nil
-	}
-	var pairs []any
-	for {
-		p.skipNoops()
-		key, err := p.readKeyString()
-		if err != nil {
-			return nil, err
-		}
-		p.skipNoops()
-		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
-			return nil, err
-		}
-		p.skipNoops()
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		pairs = append(pairs, L("pair", key, pt))
-		p.skipNoops()
-		if !p.match(COMMA) {
-			break
-		}
-	}
-	p.skipNoops()
-	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
-		return nil, err
-	}
-	return L("dobj", pairs...), nil
 }
 
 // --- small helpers for annotations ---

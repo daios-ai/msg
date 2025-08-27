@@ -1337,3 +1337,308 @@ func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
 		t.Fatalf("unexpected annotated stmt: %s", dump(annStmt))
 	}
 }
+
+func Test_SkipNoop_And_TrailingComma_InArray(t *testing.T) {
+	src := `[
+		
+		1,
+		
+		2,
+	]`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+	arr := kid(root, 0)
+	wantTag(t, arr, "array")
+	if len(arr) != 1+2 {
+		t.Fatalf("want 2 elements, got %d\n%s", len(arr)-1, dump(root))
+	}
+	wantTag(t, kid(arr, 0), "int")
+	wantTag(t, kid(arr, 1), "int")
+}
+
+func Test_SkipNoop_And_TrailingComma_InMap(t *testing.T) {
+	src := `{
+		
+		name: "John",
+		
+		age: 17,
+	}`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+	m := kid(root, 0)
+	wantTag(t, m, "map")
+	if len(m) != 1+2 {
+		t.Fatalf("want 2 pairs, got %d\n%s", len(m)-1, dump(root))
+	}
+	// pair 0
+	p0 := kid(m, 0)
+	wantTag(t, p0, "pair")
+	k0 := kid(p0, 0)
+	v0 := kid(p0, 1)
+	wantTag(t, k0, "str")
+	wantTag(t, v0, "str")
+	if k0[1].(string) != "name" || v0[1].(string) != "John" {
+		t.Fatalf("bad first pair: %s", dump(p0))
+	}
+	// pair 1
+	p1 := kid(m, 1)
+	wantTag(t, p1, "pair")
+	k1 := kid(p1, 0)
+	v1 := kid(p1, 1)
+	wantTag(t, k1, "str")
+	wantTag(t, v1, "int")
+	if k1[1].(string) != "age" || v1[1].(int64) != 17 {
+		t.Fatalf("bad second pair: %s", dump(p1))
+	}
+}
+
+func Test_TrailingComma_CallArgs(t *testing.T) {
+	src := `f(1,
+	     2,)`
+	root := mustParse(t, src)
+	call := kid(root, 0)
+	wantTag(t, call, "call")
+	callee := kid(call, 0)
+	wantTag(t, callee, "id")
+	if callee[1].(string) != "f" {
+		t.Fatalf("callee not 'f': %s", dump(call))
+	}
+	if len(call) != 1+1+2 { // tag + callee + args(2)
+		t.Fatalf("want 2 args, got %d\n%s", len(call)-2, dump(root))
+	}
+	wantTag(t, call[2].(S), "int")
+	wantTag(t, call[3].(S), "int")
+}
+
+func Test_TrailingComma_FunctionParams(t *testing.T) {
+	src := `fun(x: Int, 
+	      y: Str,) do end`
+	root := mustParse(t, src)
+	fun := kid(root, 0)
+	wantTag(t, fun, "fun")
+	params := kid(fun, 0)
+	ret := kid(fun, 1)
+	body := kid(fun, 2)
+	wantTag(t, params, "array")
+	wantTag(t, ret, "id")
+	wantTag(t, body, "block")
+	if ret[1].(string) != "Any" {
+		t.Fatalf("default return type not Any: %s", dump(fun))
+	}
+	if len(params) != 1+2 {
+		t.Fatalf("want 2 params, got %d\n%s", len(params)-1, dump(fun))
+	}
+	p0 := kid(params, 0)
+	p1 := kid(params, 1)
+	wantTag(t, p0, "pair")
+	wantTag(t, p1, "pair")
+	if head(kid(p0, 0)) != "id" || kid(p0, 0)[1].(string) != "x" {
+		t.Fatalf("bad first param: %s", dump(p0))
+	}
+	if head(kid(p1, 0)) != "id" || kid(p1, 0)[1].(string) != "y" {
+		t.Fatalf("bad second param: %s", dump(p1))
+	}
+}
+
+func Test_TrailingComma_InPatterns(t *testing.T) {
+	src := `let [a, 
+	         b,] = [1, 2]`
+	root := mustParse(t, src)
+	asn := kid(root, 0)
+	wantTag(t, asn, "assign")
+	lhs := asn[1].(S)
+	rhs := asn[2].(S)
+	wantTag(t, lhs, "darr")
+	wantTag(t, rhs, "array")
+	if len(lhs) != 1+2 || len(rhs) != 1+2 {
+		t.Fatalf("bad sizes: lhs %d rhs %d\n%s", len(lhs)-1, len(rhs)-1, dump(root))
+	}
+	if head(kid(lhs, 0)) != "decl" || kid(lhs, 0)[1].(string) != "a" {
+		t.Fatalf("first pattern element: %s", dump(lhs))
+	}
+	if head(kid(lhs, 1)) != "decl" || kid(lhs, 1)[1].(string) != "b" {
+		t.Fatalf("second pattern element: %s", dump(lhs))
+	}
+}
+
+func Test_SkipNoop_InIndex_And_ComputedProperty(t *testing.T) {
+	srcIdx := "arr[\n  0 \n]"
+	root := mustParse(t, srcIdx)
+	idx := kid(root, 0)
+	wantTag(t, idx, "idx")
+	wantTag(t, kid(idx, 0), "id")
+	wantTag(t, kid(idx, 1), "int")
+
+	srcComp := "obj.(\n x + 1\n)"
+	root = mustParse(t, srcComp)
+	idx = kid(root, 0)
+	wantTag(t, idx, "idx")
+	obj := kid(idx, 0)
+	ex := kid(idx, 1)
+	wantTag(t, obj, "id")
+	wantTag(t, ex, "binop")
+	if obj[1].(string) != "obj" {
+		t.Fatalf("object name mismatch: %s", dump(obj))
+	}
+	// binop "+"
+	if ex[1].(string) != "+" {
+		t.Fatalf("expected '+', got %q\n%s", ex[1], dump(ex))
+	}
+}
+
+func Test_Dot_Zero_Name_Chain(t *testing.T) {
+	// Requires the lexer fix that keeps '.' after property numeric index,
+	// so token stream is: ID(arr) PERIOD INTEGER(0) PERIOD ID(name)
+	src := `arr.0.name`
+	root := mustParse(t, src)
+	get := kid(root, 0)
+	wantTag(t, get, "get")
+	if head(kid(get, 1)) != "str" || kid(get, 1)[1].(string) != "name" {
+		t.Fatalf("bad property tail: %s", dump(get))
+	}
+	idx := kid(get, 0)
+	wantTag(t, idx, "idx")
+	base := kid(idx, 0)
+	num := kid(idx, 1)
+	wantTag(t, base, "id")
+	wantTag(t, num, "int")
+	if base[1].(string) != "arr" || num[1].(int64) != 0 {
+		t.Fatalf("bad base or index: %s", dump(get))
+	}
+}
+
+func Test_CallVsGrouping_And_IndexVsArray(t *testing.T) {
+	// call: CLROUND (no space)
+	srcCall := `f( x )`
+	root := mustParse(t, srcCall)
+	call := kid(root, 0)
+	wantTag(t, call, "call")
+	wantTag(t, kid(call, 0), "id")
+	wantTag(t, kid(call, 1), "id")
+
+	// grouping (space forces LROUND) → two top-level exprs: "f" and "x"
+	srcGroup := `f (x)`
+	root = mustParse(t, srcGroup)
+	wantTag(t, root, "block")
+	if len(root) != 1+2 {
+		t.Fatalf("want two top-level nodes, got %d\n%s", len(root)-1, dump(root))
+	}
+	wantTag(t, kid(root, 0), "id")
+	wantTag(t, kid(root, 1), "id")
+
+	// indexing: CLSQUARE (no space)
+	srcIdx := `arr[i]`
+	root = mustParse(t, srcIdx)
+	idx := kid(root, 0)
+	wantTag(t, idx, "idx")
+
+	// array literal due to LSQUARE (space)
+	srcArr := `arr [i]`
+	root = mustParse(t, srcArr)
+	if len(root) != 1+2 {
+		t.Fatalf("want two top-level nodes, got %d\n%s", len(root)-1, dump(root))
+	}
+	wantTag(t, kid(root, 0), "id")
+	wantTag(t, kid(root, 1), "array")
+}
+
+func Test_Interactive_Incomplete_WithTrailingComma(t *testing.T) {
+	// Interactive mode should report incomplete if the closing delimiter is missing,
+	// even with a trailing comma and intervening blank line.
+	src := "[\n  1,\n"
+	mustIncomplete(t, src)
+
+	src = "{\n  a: 1,\n"
+	mustIncomplete(t, src)
+
+	src = "f(\n  1,\n"
+	mustIncomplete(t, src)
+
+	src = "fun(x: Int,\n"
+	mustIncomplete(t, src)
+}
+
+// Trailing comma in OBJECT destructuring pattern (lhs) and in object literal (rhs).
+func Test_TrailingComma_InObjectPattern(t *testing.T) {
+	src := `let {a: x, 
+	           b: y,} = {a: 1, b: 2,}`
+	root := mustParse(t, src)
+	asn := kid(root, 0)
+	wantTag(t, asn, "assign")
+
+	lhs := kid(asn, 0)
+	rhs := kid(asn, 1)
+	wantTag(t, lhs, "dobj")
+	wantTag(t, rhs, "map")
+
+	// LHS: two pairs a: x, b: y
+	if len(lhs) != 1+2 {
+		t.Fatalf("lhs object pattern size: want 2, got %d\n%s", len(lhs)-1, dump(lhs))
+	}
+	p0 := kid(lhs, 0)
+	p1 := kid(lhs, 1)
+	wantTag(t, p0, "pair")
+	wantTag(t, p1, "pair")
+	if k := kid(p0, 0)[1].(string); k != "a" {
+		t.Fatalf("lhs first key != 'a': %q", k)
+	}
+	if head(kid(p0, 1)) != "decl" || kid(p0, 1)[1].(string) != "x" {
+		t.Fatalf("lhs first val != decl x: %s", dump(kid(p0, 1)))
+	}
+	if k := kid(p1, 0)[1].(string); k != "b" {
+		t.Fatalf("lhs second key != 'b': %q", k)
+	}
+	if head(kid(p1, 1)) != "decl" || kid(p1, 1)[1].(string) != "y" {
+		t.Fatalf("lhs second val != decl y: %s", dump(kid(p1, 1)))
+	}
+
+	// RHS map: a:1, b:2 (with trailing comma)
+	if len(rhs) != 1+2 {
+		t.Fatalf("rhs map size: want 2, got %d\n%s", len(rhs)-1, dump(rhs))
+	}
+	q0 := kid(rhs, 0)
+	q1 := kid(rhs, 1)
+	wantTag(t, q0, "pair")
+	wantTag(t, q1, "pair")
+	if kid(q0, 0)[1].(string) != "a" || kid(q0, 1)[1].(int64) != 1 {
+		t.Fatalf("rhs first pair mismatch: %s", dump(q0))
+	}
+	if kid(q1, 0)[1].(string) != "b" || kid(q1, 1)[1].(int64) != 2 {
+		t.Fatalf("rhs second pair mismatch: %s", dump(q1))
+	}
+}
+
+// Blank lines (NOOP) inside call argument lists are ignored like whitespace.
+func Test_SkipNoop_Inside_CallArgs(t *testing.T) {
+	src := "f(\n\n  1,\n  \n  2\n)"
+	root := mustParse(t, src)
+	call := kid(root, 0)
+	wantTag(t, call, "call")
+	if len(call) != 1+1+2 { // tag + callee + 2 args
+		t.Fatalf("want 2 args, got %d\n%s", len(call)-2, dump(call))
+	}
+	wantTag(t, call[2].(S), "int")
+	wantTag(t, call[3].(S), "int")
+}
+
+// Blank lines (NOOP) inside function parameter lists are ignored like whitespace.
+func Test_SkipNoop_Inside_Params(t *testing.T) {
+	src := "fun(\n\n  x: Int,\n  \n  y: Str\n) do end"
+	root := mustParse(t, src)
+	fn := kid(root, 0)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+	if len(params) != 1+2 {
+		t.Fatalf("want 2 params, got %d\n%s", len(params)-1, dump(params))
+	}
+	// names x, y
+	p0 := kid(params, 0)
+	p1 := kid(params, 1)
+	if head(kid(p0, 0)) != "id" || kid(p0, 0)[1].(string) != "x" {
+		t.Fatalf("first param not x: %s", dump(p0))
+	}
+	if head(kid(p1, 0)) != "id" || kid(p1, 0)[1].(string) != "y" {
+		t.Fatalf("second param not y: %s", dump(p1))
+	}
+}

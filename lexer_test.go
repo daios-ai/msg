@@ -397,3 +397,223 @@ func Test_Lexer_NOOP_AtStartAndEnd(t *testing.T) {
 		}
 	}
 }
+
+func Test_Lexer_PropertyChain_IntegerAfterDot(t *testing.T) {
+	src := `arr.0.name`
+	got := wantTypes(t, src, []TokenType{
+		ID, PERIOD, INTEGER, PERIOD, ID,
+	})
+	if got[2].Literal.(int64) != 0 {
+		t.Fatalf("expected INTEGER literal 0, got %v", got[2].Literal)
+	}
+	if got[4].Lexeme != "name" || got[4].Type != ID {
+		t.Fatalf("expected ID 'name' after second dot, got %v (%v)", got[4].Lexeme, got[4].Type)
+	}
+}
+
+func Test_Lexer_DotStartsNumber_ContextSensitivity(t *testing.T) {
+	// 1..2 should be rejected at lex time as a malformed number.
+	{
+		l := NewLexer(`1..2`)
+		_, err := l.Scan()
+		if err == nil {
+			t.Fatalf("expected LexError for malformed number, got nil")
+		}
+		if _, ok := err.(*LexError); !ok {
+			t.Fatalf("expected *LexError, got %T (%v)", err, err)
+		}
+		if !strings.Contains(err.Error(), "malformed number") &&
+			!strings.Contains(err.Error(), "invalid") {
+			t.Fatalf("error should mention malformed number, got: %v", err)
+		}
+	}
+
+	// x .5  → ID, NUMBER  (whitespace lets '.' start a number)
+	{
+		src := `x .5`
+		got := wantTypes(t, src, []TokenType{ID, NUMBER})
+		if got[1].Literal.(float64) != 0.5 {
+			t.Fatalf("expected NUMBER 0.5, got %v", got[1].Literal)
+		}
+	}
+
+	// x.5   → ID, PERIOD, INTEGER (property numeric index)
+	{
+		src := `x.5`
+		got := wantTypes(t, src, []TokenType{ID, PERIOD, INTEGER})
+		if got[2].Literal.(int64) != 5 {
+			t.Fatalf("expected INTEGER 5, got %v", got[2].Literal)
+		}
+	}
+}
+func Test_Lexer_WhitespaceSensitive_Delimiters(t *testing.T) {
+	// Calls: only CLROUND is for calls (no space before '(')
+	wantTypes(t, `f(x)`, []TokenType{ID, CLROUND, ID, RROUND})
+	wantTypes(t, `f (x)`, []TokenType{ID, LROUND, ID, RROUND})
+
+	// Indexing: only CLSQUARE is for indexing (no space before '[')
+	wantTypes(t, `arr[i]`, []TokenType{ID, CLSQUARE, ID, RSQUARE})
+	wantTypes(t, `arr [i]`, []TokenType{ID, LSQUARE, ID, RSQUARE})
+}
+
+func Test_Lexer_AfterDot_ForcesID_ForKeywordAndString(t *testing.T) {
+	// Keyword after '.' must be forced to ID (not THEN)
+	src := `obj.then`
+	got := wantTypes(t, src, []TokenType{ID, PERIOD, ID})
+	if got[2].Lexeme != "then" || got[2].Type != ID {
+		t.Fatalf("expected ID 'then' after '.', got %v (%v)", got[2].Lexeme, got[2].Type)
+	}
+
+	// Quoted string after '.' also becomes ID with Literal holding the name
+	src = `obj."then"`
+	got = wantTypes(t, src, []TokenType{ID, PERIOD, ID})
+	lit, ok := got[2].Literal.(string)
+	if !ok || lit != "then" {
+		t.Fatalf("expected ID literal 'then' after '.', got %T %v", got[2].Literal, got[2].Literal)
+	}
+}
+
+func Test_Lexer_Annotations_BlockJoin(t *testing.T) {
+	// Keep indentation after '#': only one optional space is stripped.
+	src := "# a\n#   b\n   #c\nx"
+	toks := toks(t, src)
+
+	// Expect a single ANNOTATION token then ID 'x'
+	if toks[0].Type != ANNOTATION {
+		t.Fatalf("expected first token ANNOTATION, got %v", toks[0].Type)
+	}
+	text, ok := toks[0].Literal.(string)
+	if !ok {
+		t.Fatalf("annotation Literal not string: %T", toks[0].Literal)
+	}
+	// Indentation before '#' is ignored; spaces after '#' are preserved
+	// except for at most one optional space.
+	if text != "a\n  b\nc" {
+		t.Fatalf("annotation text mismatch: want %q, got %q", "a\n  b\nc", text)
+	}
+	if toks[1].Type != ID || toks[1].Lexeme != "x" {
+		t.Fatalf("expected ID 'x' after annotation, got %v %q", toks[1].Type, toks[1].Lexeme)
+	}
+}
+
+func Test_Lexer_NOOP_BlankLines(t *testing.T) {
+	// Single newline is skipped (no NOOP)
+	wantTypes(t, "a\nb", []TokenType{ID, ID})
+
+	// A run matching '\n' (hws* '\n')+ becomes a NOOP token
+	got := wantTypes(t, "a\n\nb", []TokenType{ID, NOOP, ID})
+	if got[1].Type != NOOP {
+		t.Fatalf("expected NOOP as second token, got %v", got[1].Type)
+	}
+
+	// Newlines with spaces/tabs also count
+	got = wantTypes(t, "a\n   \n\t\nb", []TokenType{ID, NOOP, ID})
+	if got[1].Type != NOOP {
+		t.Fatalf("expected NOOP with spaced blank lines, got %v", got[1].Type)
+	}
+}
+
+func Test_Lexer_String_UnicodeSurrogatePair(t *testing.T) {
+	src := `"\uD83D\uDE03"` // 😀 (U+1F603)
+	toks := toks(t, src)
+	if toks[0].Type != STRING {
+		t.Fatalf("expected STRING, got %v", toks[0].Type)
+	}
+	val, ok := toks[0].Literal.(string)
+	if !ok {
+		t.Fatalf("STRING literal not string type: %T", toks[0].Literal)
+	}
+	if val != "😃" {
+		t.Fatalf("expected decoded surrogate pair '😃', got %q", val)
+	}
+}
+
+func Test_Lexer_Keywords_And_Types(t *testing.T) {
+	// 'type' (constructor keyword) vs 'Type' (builtin type) vs 'Enum' (keyword)
+	wantTypes(t, `type Type Enum`, []TokenType{TYPECONS, TYPE, ENUM})
+}
+
+func Test_Lexer_Boolean_And_Null_Literals(t *testing.T) {
+	src := `true false null`
+	toks := wantTypes(t, src, []TokenType{BOOLEAN, BOOLEAN, NULL})
+	if toks[0].Literal != true || toks[1].Literal != false || toks[2].Literal != nil {
+		t.Fatalf("boolean/null literals mismatch: %v, %v, %v", toks[0].Literal, toks[1].Literal, toks[2].Literal)
+	}
+}
+
+// --- error-mode tests (direct Scan calls, not using wantTypes) ---
+
+func Test_Lexer_UnterminatedString_NonInteractive_IsLexError(t *testing.T) {
+	l := NewLexer(`"abc`)
+	_, err := l.Scan()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if _, ok := err.(*LexError); !ok {
+		t.Fatalf("expected *LexError for non-interactive unterminated string, got %T (%v)", err, err)
+	}
+}
+
+func Test_Lexer_UnterminatedString_Interactive_IsIncomplete(t *testing.T) {
+	l := NewLexerInteractive(`"abc`)
+	_, err := l.Scan()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !IsIncomplete(err) {
+		t.Fatalf("expected IncompleteError in interactive mode, got %T (%v)", err, err)
+	}
+}
+
+func Test_Lexer_Annotation_Alone_IsOk(t *testing.T) {
+	// A line that is just '#' (after optional spaces) is allowed
+	// and produces an empty annotation.
+	l := NewLexer("#")
+	toks, err := l.Scan()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(toks) < 1 || toks[0].Type != ANNOTATION {
+		t.Fatalf("expected leading ANNOTATION token, got %v", toks)
+	}
+	if s, _ := toks[0].Literal.(string); s != "" {
+		t.Fatalf("expected empty annotation text, got %q", s)
+	}
+}
+
+// Guard: PERIOD vs NUMBER when ambiguity exists around trailing dot
+func Test_Lexer_Number_With_TrailingDot_OutsideProperty(t *testing.T) {
+	// Outside property context, "1." is a NUMBER
+	got := wantTypes(t, `1.`, []TokenType{NUMBER})
+	if got[0].Literal.(float64) != 1.0 {
+		t.Fatalf("expected NUMBER 1.0, got %v", got[0].Literal)
+	}
+}
+
+func Test_Lexer_AfterDot_Integer_DoesNotFormFloat(t *testing.T) {
+	// Specifically guard the regression we fixed: after '.', a digit should not
+	// consume the following '.' into NUMBER("0.") when chaining.
+	wantTypes(t, `arr.0.name`, []TokenType{ID, PERIOD, INTEGER, PERIOD, ID})
+}
+
+// Ensure we strip AT MOST ONE ASCII space after '#' and DO NOT strip a tab.
+func Test_Lexer_Annotation_StripAtMostOneSpace_NotTab(t *testing.T) {
+	src := "" +
+		"#  two-space -> keep one\n" + // two spaces after '#': expect the first stripped, one remains
+		"# \tnext starts with tab\n" + // one space + tab: strip the one space, preserve the '\t'
+		"#\tleading tab preserved\n" + // tab immediately after '#': preserve
+		"x\n"
+
+	ts := toks(t, src)
+	if len(ts) < 2 || ts[0].Type != ANNOTATION || ts[1].Type != ID {
+		t.Fatalf("unexpected token sequence: %v", typesWithoutEOF(ts))
+	}
+	text, ok := ts[0].Literal.(string)
+	if !ok {
+		t.Fatalf("annotation Literal not string: %T", ts[0].Literal)
+	}
+	want := " two-space -> keep one\n\tnext starts with tab\n\tleading tab preserved"
+	if text != want {
+		t.Fatalf("annotation text mismatch:\nwant: %q\ngot:  %q", want, text)
+	}
+}

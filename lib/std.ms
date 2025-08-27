@@ -491,3 +491,335 @@ let examples = [[1, "one"], [12, "twelve"], [7, "seven"]]
 
 # Say the number
 let number = oracle(n: Int) -> Str from examples
+
+
+## =========================================
+## LLM Backend Manager (prelude / core env)
+## =========================================
+
+# ----------------
+# Mutable state
+# ----------------
+let __llm_state = {
+  "current": null,                 # "ollama" | "openai"
+  "model": { "ollama": null, "openai": null },
+  "options": {
+    "ollama": { "temperature": 0.5, "base_url": null },
+    "openai": { "temperature": 0.0, "base_url": null }
+  },
+  "creds": { "openai": { "api_key": null } }
+}
+
+# Pick default backend once at boot.
+do
+  let k = osEnv("OPENAI_API_KEY")
+  if k != null then
+    __llm_state.current = "openai"
+    __llm_state.creds.openai.api_key = k
+  else
+    __llm_state.current = "ollama"
+  end
+end
+
+# ----------------
+# Public helpers
+# ----------------
+
+let llm_backends = fun() -> [Str] do
+  ["ollama", "openai"]
+end
+
+# Always succeeds; returns a status object (typed as Any).
+let llm_status = fun() -> {} do
+  let b = __llm_state.current
+  let authed = if b == "openai" then __llm_has_openai_key() else true end
+  {
+    "backend": b,
+    "model": __llm_state.model[b],
+    "authed": authed,
+    "options": __llm_state.options[b]
+  }
+end
+
+# Might error → Str?
+# Returns the backend name on success.
+let llm_use_backend = fun(name: Str) -> Str? do
+  if not (name == "ollama" or name == "openai") then
+    return __annotate("llm: unknown backend '" + name + "'")(null)
+  end
+  __llm_state.current = name
+  name
+end
+
+# Might error (if no backend selected in some setups) → Str?
+let llm_use_model = fun(name: Str) -> Str? do
+  let b = __llm_state.current
+  if b == null then return __annotate("llm: no backend selected")(null) end
+  __llm_state.model[b] = name
+  name
+end
+
+# Might error (network, auth, etc.) → [Str]?
+let llm_models = fun() -> [Str]? do
+  let b = __llm_state.current
+  if b == null then return __annotate("llm: no backend selected")(null) end
+  if b == "ollama" then __ollama_list_models() else __openai_list_models() end
+end
+
+# Might error → Any?
+# Returns the effective options object.
+let llm_set = fun(opts: Any) -> Any? do
+  let b = __llm_state.current
+  if b == null then return __annotate("llm: no backend selected")(null) end
+  let cur = __llm_state.options[b]
+  let t = opts["temperature"]
+  if t != null then cur["temperature"] = t end
+  let u = opts["base_url"]
+  if u != null then cur["base_url"] = u end
+  __llm_state.options[b] = cur
+  cur
+end
+
+# Might error → Any?
+# Returns {"backend": "...", "authed": Bool} on success.
+let llm_auth = fun(creds: Any) -> Any? do
+  let b = __llm_state.current
+  if b == null then return __annotate("llm: no backend selected")(null) end
+  if b == "openai" then
+    let v = creds["api_key"]
+    if v == null then
+      return __annotate("llm: openai expects {api_key: Str}")(null)
+    end
+    __llm_state.creds.openai.api_key = v
+    { "backend": "openai", "authed": true }
+  else
+    { "backend": "ollama", "authed": true }
+  end
+end
+
+# -------------------------------------------------
+# __oracle_execute — called by the interpreter
+# -------------------------------------------------
+# Contract: returns Str on success, annotated null on error.
+# Oracles contract allows Null on error → Str?
+let __oracle_execute = fun(prompt: Str, _inT: Type, _outT: Type, _examples: Any) -> Str? do
+  let b = __llm_state.current
+  if b == null then return __annotate("llm: no backend selected")(null) end
+  if b == "ollama" then __ollama_exec(prompt, _outT) else __openai_exec(prompt, _outT) end
+end
+
+# -----------
+# OLLAMA
+# -----------
+
+let __ollama_base = fun() -> Str do
+  let v = __llm_state.options["ollama"]["base_url"]
+  if v != null then return v end
+  let e = osEnv("OLLAMA_BASE_URL")
+  if e != null then return e end
+  "http://localhost:11434"
+end
+
+let __ollama_model = fun() -> Str do
+  let m = __llm_state.model["ollama"]
+  if m != null then return m end
+  let env = osEnv("OLLAMA_MODEL")
+  if env != null then return env end
+  "Phi3"
+end
+
+# Backend helpers can fail → [Str]? / Str?
+let __openai_list_models = fun() -> [Str]? do
+  if __llm_has_openai_key() != true then
+    return __annotate("openai: missing API key")(null)
+  end
+  let url = __openai_base() + "/models"
+  let r = try(fun() do http({ "url": url, "method": "GET", "headers": __openai_auth_header(), "body": null }) end)
+  if r.ok != true then return __annotate("openai: request failed")(null) end
+  let resp = r.value
+  if resp.status != 200 then return __annotate("openai: HTTP " + str(resp.status))(null) end
+  let body = jsonParse(resp.body)
+  if body == null then return __annotate("openai: bad JSON from server")(null) end
+  let ds = body["data"]
+  if ds == null then return __annotate("openai: missing data")(null) end
+  let out = []
+  for i in range(0, len(ds)) do
+    let id = ds[i]["id"]
+    if id != null then out = append(out, id) end
+  end
+  out
+end
+
+# Executor: returns raw JSON string (boxed if needed) or annotated null.
+
+let __ollama_exec = fun(prompt: Str, _outT: Type) -> Str? do
+  let base = __ollama_base()
+  let model = __ollama_model()
+  let temp = __llm_state.options["ollama"]["temperature"]
+  if temp == null then temp = 0.5 end
+  let boxed = __llm_boxed_schema(_outT)
+
+  let r = try(fun() do http({
+    "url": base + "/api/generate",
+    "method": "POST",
+    "headers": { "Content-Type": "application/json" },
+    "body": jsonStringify({
+      "model": model,
+      "prompt": prompt,
+      "format": boxed,
+      "stream": false,
+      "options": { "temperature": temp }
+    })
+  }) end)
+  if r.ok != true then
+    let msg = r.error
+    if msg == null then msg = "request failed" end
+    return __annotate("ollama: " + msg)(null)
+  end
+
+  let resp = r.value
+  if resp.status != 200 then return __annotate("ollama: HTTP " + str(resp.status))(null) end
+  let env = jsonParse(resp.body)
+  if env == null then return __annotate("ollama: bad JSON from server")(null) end
+  let text = env["response"]
+  if text == null then return __annotate("ollama: missing response")(null) end
+  __llm_normalize_model_text(text)
+end
+
+# -----------
+# OPENAI
+# -----------
+
+let __openai_base = fun() -> Str do
+  let v = __llm_state.options["openai"]["base_url"]
+  if v != null then return v end
+  let e = osEnv("OPENAI_BASE_URL")
+  if e != null then return e end
+  "https://api.openai.com/v1"
+end
+
+let __openai_model = fun() -> Str do
+  let m = __llm_state.model["openai"]
+  if m != null then return m end
+  let e = osEnv("OPENAI_MODEL")
+  if e != null then return e end
+  "gpt-4o-mini"
+end
+
+let __llm_has_openai_key = fun() -> Bool do
+  if __llm_state.creds.openai.api_key != null then return true end
+  if osEnv("OPENAI_API_KEY") != null then return true end
+  false
+end
+
+let __openai_auth_header = fun() -> Map do
+  let key = __llm_state.creds.openai.api_key
+  if key == null then
+    let e = osEnv("OPENAI_API_KEY")
+    if e != null then { "Authorization": "Bearer " + e } else {} end
+  else
+    { "Authorization": "Bearer " + key }
+  end
+end
+
+let __openai_list_models = fun() -> [Str] do
+  if __llm_has_openai_key() != true then
+    return __annotate("openai: missing API key")(null)
+  end
+  let url = __openai_base() + "/models"
+  let r = try(fun() do http({ "url": url, "method": "GET", "headers": __openai_auth_header(), "body": null }) end)
+  if r.ok != true then return __annotate("openai: request failed")(null) end
+  let resp = r.value
+  if resp.status != 200 then return __annotate("openai: HTTP " + str(resp.status))(null) end
+  let body = jsonParse(resp.body)
+  if body == null then return __annotate("openai: bad JSON from server")(null) end
+  let ds = body["data"]
+  if ds == null then return __annotate("openai: missing data")(null) end
+  let out = []
+  for i in range(0, len(ds)) do
+    let id = ds[i]["id"]
+    if id != null then out = append(out, id) end
+  end
+  out
+end
+
+let __openai_exec = fun(prompt: Str, _outT: Type) -> Str? do
+  if __llm_has_openai_key() != true then
+    return __annotate("openai: missing API key")(null)
+  end
+  let base = __openai_base()
+  let model = __openai_model()
+  let temp = __llm_state.options["openai"]["temperature"]
+  if temp == null then temp = 0.0 end
+  let boxed = __llm_boxed_schema(_outT)
+
+  let headers = __openai_auth_header()
+  headers["Content-Type"] = "application/json"
+
+  let body = {
+    "model": model,
+    "messages": [
+      { "role": "system", "content": "Return only valid JSON. No code fences." },
+      { "role": "user", "content": prompt }
+    ],
+    "temperature": temp,
+    "response_format": { "type": "json_schema", "json_schema": boxed }
+  }
+
+  let r = try(fun() do http({
+    "url": base + "/chat/completions",
+    "method": "POST",
+    "headers": headers,
+    "body": jsonStringify(body)
+  }) end)
+  if r.ok != true then
+    let msg = r.error
+    if msg == null then msg = "request failed" end
+    return __annotate("openai: " + msg)(null)
+  end
+
+  let resp = r.value
+  if resp.status != 200 then
+    let m = jsonParse(resp.body)
+    let reason = if m != null then (m["error"]["message"]) else null end
+    if reason != null then return __annotate("openai: HTTP " + str(resp.status) + " — " + reason)(null) end
+    return __annotate("openai: HTTP " + str(resp.status))(null)
+  end
+
+  let parsed = jsonParse(resp.body)
+  if parsed == null then return __annotate("openai: bad JSON from server")(null) end
+  let choices = parsed["choices"]
+  if choices == null or len(choices) < 1 then return __annotate("openai: missing choices")(null) end
+  let content = choices[0]["message"]["content"]
+  if content == null then return __annotate("openai: missing message content")(null) end
+  __llm_normalize_model_text(content)
+end
+
+# ---------------------
+# Shared helpers
+# ---------------------
+
+# Boxed schema for oracle outputs: {"output": schema(outT)}
+let __llm_boxed_schema = fun(_outT: Type) -> Map do
+  {
+    "type": "object",
+    "properties": { "output": typeToJSONSchema(_outT) },
+    "required": ["output"]
+  }
+end
+
+# Normalize backend text into a raw JSON string for oracles.go
+let __llm_normalize_model_text = fun(text: Str) -> Str do
+  let p = try(fun() do jsonParse(text) end)
+  if p.ok == true then
+    let v = p.value
+    let has = try(fun() do mapHas(v, "output") end)
+    if has.ok == true then
+      jsonStringify(v)
+    else
+      jsonStringify({ "output": v })
+    end
+  else
+    text
+  end
+end

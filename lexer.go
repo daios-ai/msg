@@ -64,9 +64,9 @@
 //
 // ANNOTATIONS
 //   - Hash-line annotations: one or more consecutive lines where, after optional
-//     indentation, the first non-space is '#'. The leading '#' (and one optional
-//     following space/tab) are stripped; lines are joined with '\n', and a single
-//     ANNOTATION token is emitted. A blank/non-# line ends the block.
+//     indentation, the first non-space is '#'. The leading '#' (and at most one
+//     optional following space) are stripped; lines are joined with '\n', and a
+//     single ANNOTATION token is emitted. A blank/non-# line ends the block.
 //
 // ERRORS
 //   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
@@ -695,8 +695,7 @@ func (l *Lexer) scanIdentifier() string {
 
 // scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
 // Precondition: current position is at l.start and the first rune is either a digit
-//
-//	or a '.' that has already been verified to start a number.
+// or a '.' that has already been verified to start a number.
 func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	sawDigits := false
 	sawDot := false
@@ -714,16 +713,21 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 
 	// fractional part
 	if b, ok := l.peek(); ok && b == '.' {
-		// Always consume '.'; at least one of integral or fractional must have digits.
-		l.advance()
-		sawDot = true
-		for {
-			b2, ok2 := l.peek()
-			if !ok2 || !isDigit(b2) {
-				break
+		// Do NOT consume '.' if we're after a property PERIOD (obj.<digits>)
+		// OR if the next char is also '.' (e.g. "1..2").
+		if !(l.afterDotIsProperty()) {
+			if b2, ok2 := l.peekN(1); !(ok2 && b2 == '.') {
+				l.advance() // consume '.'
+				sawDot = true
+				for {
+					b2, ok2 := l.peek()
+					if !ok2 || !isDigit(b2) {
+						break
+					}
+					l.advance()
+					sawDigits = true
+				}
 			}
-			l.advance()
-			sawDigits = true
 		}
 	}
 
@@ -742,12 +746,9 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 					break
 				}
 				l.advance()
-				// Having an exponent implies there were digits overall, but we leave
-				// sawDigits alone—it already tracked integral/fractional digits.
 			}
 		} else {
-			// No digits after e/E (and optional sign) → backtrack, no exponent.
-			l.cur = save
+			l.cur = save // no exponent
 		}
 	}
 
@@ -790,8 +791,9 @@ func (l *Lexer) scanAnnotation() (string, error) {
 		return probe < len(l.src) && l.src[probe] == '#'
 	}
 
-	// (unchanged) trim one optional space/tab after the first '#'
-	if b, ok := l.peek(); ok && (b == ' ' || b == '\t') {
+	// Trim at most one ASCII space (NOT tab) after the first '#'.
+	// This preserves tabs and multi-space indentation in docstrings.
+	if b, ok := l.peek(); ok && b == ' ' {
 		l.advance()
 	}
 
@@ -840,7 +842,8 @@ func (l *Lexer) scanAnnotation() (string, error) {
 			return false, nil
 		}
 		l.advance() // '#'
-		if b2, ok2 := l.peek(); ok2 && (b2 == ' ' || b2 == '\t') {
+		// Trim at most one ASCII space (NOT tab) after '#'
+		if b2, ok2 := l.peek(); ok2 && b2 == ' ' {
 			l.advance()
 		}
 		return true, nil

@@ -43,17 +43,6 @@ func setBuiltinDoc(ip *Interpreter, name, doc string) {
 func NewRuntime() *Interpreter {
 	ip := NewInterpreter()
 
-	// Recreate Core/Global for a clean runtime env.
-	ip.Core = NewEnv(nil)
-	ip.Global = NewEnv(ip.Core)
-
-	// registries
-	ip.native = map[string]NativeImpl{}
-	ip.modules = map[string]*moduleRec{}
-
-	// engine helpers
-	ip.initCore()
-
 	// standard native builtins
 	registerStandardBuiltins(ip)
 	registerConcurrencyBuiltins(ip)

@@ -393,29 +393,14 @@ end
 # For modules: returns exported names (not starting with "_"), or [] if unavailable.
 # Args: x: Any
 # Returns: [Str]
-let dir = fun(x: Any) -> [Str] do
-	if isType(x, type {}) then
-		let out = []
-		for let [k, _] in x do
-			if not (substr(k, 0, 1) == "_") then
-				out = out + [k]
-			end
-		end
-		out
-	else
-		let probe = try(fun() do moduleKeys(x) end)
-		if probe.ok then
-			let out = []
-			for name in iter(probe.value) do
-				if not (substr(name, 0, 1) == "_") then
-					out = out + [name]
-				end
-			end
-			out
-		else
-			[]
+let dir = fun(x: {}) -> [Str] do
+	let out = []
+	for let [k, _] in x do
+		if not (substr(k, 0, 1) == "_") then
+			out = out + [k]
 		end
 	end
+	out
 end
 
 # List function names of an object (if supported).

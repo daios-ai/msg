@@ -148,6 +148,13 @@ import (
 // Annotation:
 //
 //	ANNOTATION — emitted for multi-line blocks starting with '#'.
+//
+// NOOP tokens:
+//
+// The lexer may surface blank-line runs as NOOP. Inside delimiters they’re ignored
+// by the parser; elsewhere they become the AST node ("noop"). Runtime handling is
+// in interpreter.go.
+
 type TokenType int
 
 const (

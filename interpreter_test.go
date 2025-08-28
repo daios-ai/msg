@@ -1391,3 +1391,47 @@ func Test_Interpreter_Assign_Through_Nested_Computed_Keys(t *testing.T) {
 	mustEvalPersistent(t, ip, `arr.(idx) = 99`)
 	wantInt(t, mustEvalPersistent(t, ip, `arr[1]`), 99)
 }
+
+func Test_Noops_Semantics_BlockAndTopLevel(t *testing.T) {
+	t.Run("Block_skips_noops_and_yields_last_value", func(t *testing.T) {
+		wantInt(t, evalSrc(t, "do 1\n\n2\n\nend"), 2)
+	})
+	t.Run("TopLevel_trailing_blank_lines_preserve_result", func(t *testing.T) {
+		wantInt(t, evalSrc(t, "42\n\n"), 42)
+	})
+	t.Run("Only_blank_lines_at_top_level_yield_plain_null", func(t *testing.T) {
+		v := evalSrc(t, "\n\n")
+		wantNull(t, v)
+		if isAnnotatedNull(v) {
+			t.Fatalf("want plain null (no annotation), got %#v", v)
+		}
+	})
+	t.Run("Lone_annotation_is_noop_plain_null", func(t *testing.T) {
+		v := evalSrc(t, "# a note\n\n")
+		wantNull(t, v)
+		if isAnnotatedNull(v) {
+			t.Fatalf("want plain null (no annotation), got %#v", v)
+		}
+	})
+	t.Run("Empty_block_is_plain_null", func(t *testing.T) {
+		v := evalSrc(t, "do\n\nend")
+		wantNull(t, v)
+		if isAnnotatedNull(v) {
+			t.Fatalf("want plain null (no annotation), got %#v", v)
+		}
+	})
+}
+
+func Test_Noops_DoNotClobber_LoopLastValue(t *testing.T) {
+	src := `
+let i
+i = 0
+while i < 2 do
+  i = i + 1
+
+  # trailing blank line that should be a noop
+
+end
+`
+	wantInt(t, evalSrc(t, src), 2)
+}

@@ -1,1281 +1,1210 @@
-=== BEGIN FILE: std_sys.go ===
+=== BEGIN FILE: printer.go ===
+// printer.go: pretty-printers for MindScript ASTs, types, and runtime values.
+//
+// What this file does
+// -------------------
+// This module provides the formatting layer for MindScript. It renders three
+// kinds of data to human-readable, stable strings:
+//
+//  1. Parsed source ASTs (S-expressions) → MindScript source code.
+//     - Entry points: Pretty, Standardize, FormatSExpr.
+//     - Produces whitespace- and newline-stable output with minimal
+//     parentheses, based on operator precedence. It understands all
+//     statement and expression tags emitted by the parser (e.g. "fun",
+//     "oracle", "for", "if/elif/else", "type", "block", "assign",
+//     "return/break/continue", arrays, maps, calls, indexing, properties,
+//     unary and binary operators).
+//     - Annotation nodes ("annot", ("str", text), <node>, preBool) are supported
+//     in both PRE and POST forms. PRE annotations print as `# ...` lines
+//     immediately above the construct; POST annotations print as `# ...` lines
+//     immediately after the construct.
+//     - Property names are emitted bare if they are identifier-like, otherwise
+//     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
+//     are rendered in a compact, readable form.
+//     - Formatting emits no space before '(' for calls and for 'fun(...)'
+//     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
+//
+//  2. Type ASTs (S-expressions) → compact type strings.
+//     - Entry point: FormatType.
+//     - Supported forms:
+//     ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
+//     ("unop","?", T)         → prints as `T?`
+//     ("array", T)            → prints as `[T]`
+//     ("map", ("pair"| "pair!", ("str",k), T) ...)
+//     Required fields print with a trailing `!` on the key.
+//     Key/value annotations (if wrapped in "annot") become `# ...` lines.
+//     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
+//     may be scalars, arrays, or maps.
+//     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
+//     right-associated chains.
+//     - Output is stable. Multi-line maps are rendered with sorted keys to
+//     avoid visual churn.
+//
+//  3. Runtime values (Value) → width-aware strings.
+//     - Entry point: FormatValue.
+//     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
+//     - Arrays and maps prefer a single-line rendering if it fits the
+//     MaxInlineWidth budget and no elements/keys force multi-line; else
+//     they fall back to pretty, multi-line output with indentation.
+//     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
+//     - Per-value annotations (Value.Annot) and per-key annotations in maps
+//     (MapObject.KeyAnn[name]) are printed as `# ...` header lines.
+//     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
+//     - Types (VTType) are printed by extracting the embedded type AST and
+//     delegating to FormatType.
+//     - Modules print as `<module: <pretty name>>` when available.
+//
+// Dependencies (other files)
+// --------------------------
+// • parser.go
+//   - S = []any (AST payload shape)
+//   - ParseSExpr(string) / ParseSExprInteractive (used by Pretty/Standardize)
+//   - AST tags: "block", "fun", "oracle", "for", "while", "if",
+//     "type", "return", "break", "continue", "assign", "array", "map",
+//     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
+//     "null", "unop", "binop", "decl", "darr", "dobj", "annot", "noop".
+//
+// • interpreter.go (runtime model)
+//   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
+//     VTFun, VTType, VTModule, VTHandle)
+//   - Fun, TypeValue, MapObject (Entries/KeyAnn/Keys).
+//
+// • modules.go (module loader)
+//   - Module struct and prettySpec(string) (used for VTModule display).
+//
+// • errors.go (shared errors)
+//   - WrapErrorWithSource(err, src) (used by Pretty/Standardize).
+//
+// PUBLIC vs PRIVATE layout
+// ------------------------
+// This file is organized in two blocks:
+//  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
+//  2. PRIVATE: helper types and functions that implement the printers.
+//
+// Formatting policy highlights
+// ----------------------------
+//   - Indentation uses **tabs** only (gofmt-style).
+//   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
 package mindscript
 
 import (
-	"encoding/json"
 	"fmt"
-	"math"
-	"math/rand"
-	"os"
-	"regexp"
+	"sort"
 	"strconv"
 	"strings"
-	"time"
-	"unicode"
-	"unicode/utf8"
 )
 
-// --- Concurrency primitives -------------------------------------------------
+// ==============================
+// ========== PUBLIC ============
+// ==============================
 
-type procState struct {
-	done   chan struct{}
-	result Value
-	cancel chan struct{} // cooperative
+// MaxInlineWidth controls when arrays/maps are rendered on a single line by
+// FormatValue. If the one-line candidate exceeds this many characters, or if
+// any element/key is annotated or multiline by nature, the value is rendered
+// across multiple lines with indentation. This setting is read at call time
+// and may be changed between calls.
+var MaxInlineWidth = 80
+
+// Pretty parses a MindScript source string and returns a formatted version.
+//
+// Behavior:
+//   - Parses src via ParseSExpr. If parsing fails, the error is wrapped with
+//     source context via WrapErrorWithSource.
+//   - On success, pretty-prints the AST using FormatSExpr, producing stable,
+//     whitespace-normalized code with minimal parentheses.
+//   - Supports PRE/POST annotations: ("annot", ("str", text), X, preBool).
+//
+// Errors:
+//   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
+func Pretty(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return "", WrapErrorWithSource(err, src)
+	}
+	return FormatSExpr(ast), nil
 }
 
-// Channel box (shared by all channel builtins)
-type chanBox struct {
-	ch chan Value
+// Standardize returns the canonical source form:
+//   - deterministic layout
+//   - indentation using tabs
+//   - exactly one trailing newline
+//
+// It is equivalent to Pretty(src), but ensures precisely one '\n' at the end.
+func Standardize(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		return "", WrapErrorWithSource(err, src)
+	}
+	out := FormatSExpr(ast)
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	} else {
+		out = strings.TrimRight(out, "\n") + "\n"
+	}
+	return out, nil
 }
 
-// --- Deep copy & snapshot for isolated worlds --------------------------------
+// FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
+//
+// Inputs:
+//   - n: an AST produced by parser.go (e.g., the result of ParseSExpr).
+//
+// Output policy:
+//   - Statements (fun/oracle/for/if/type/block/return/break/continue/assign)
+//     are rendered with keywords and indentation.
+//   - Expressions use minimal parentheses according to a fixed precedence table;
+//     property access vs calls/indexing binds tightly.
+//   - Arrays and maps are printed inline (AST form); map key annotations print
+//     as preceding `# ...` lines. Annotation nodes wrap the printed construct.
+//
+// This function does not parse; it strictly formats the provided AST.
+func FormatSExpr(n S) string {
+	var b strings.Builder
+	p := pp{out: out{b: &b}}
+	p.printProgram(n)
+	return strings.TrimRight(b.String(), "\n")
+}
 
-func snapshotEnv(e *Env) *Env {
-	// Flatten chain into one level (shadowing by nearer scopes wins).
-	flat := map[string]Value{}
-	for cur := e; cur != nil; cur = cur.parent {
-		for k, v := range cur.table {
-			if _, exists := flat[k]; !exists {
-				flat[k] = cloneValue(v)
-			}
+// FormatType renders a type S-expression into a compact, human-readable string.
+//
+// Supported forms (see types.go for the type system):
+//   - ("id", name)              →  name
+//   - ("unop","?", T)           →  T?
+//   - ("array", T)              →  [T]
+//   - ("map", ("pair"| "pair!", ("str",k), T) ...)
+//     Required fields print as `key!:`; keys are quoted if not identifier-like.
+//     Key/value annotations (when wrapped in "annot") emit `# ...` lines above.
+//   - ("enum", lit1, ...)       →  Enum[lit1, ...] ; members may be scalars,
+//     arrays, or maps rendered as type-literals.
+//   - ("binop","->", A, B)      →  (A) -> B ; right-assoc chains flatten.
+//
+// Output is stable; when multi-line, map fields are sorted by key for determinism.
+func FormatType(t S) string {
+	var b strings.Builder
+	o := out{b: &b}
+	writeType(&o, t)
+	return b.String()
+}
+
+// FormatValue renders a runtime Value into a stable, readable string.
+//
+// Layout policy:
+//   - Scalars: null, booleans, ints, floats (with a decimal point for
+//     non-scientific output), and quoted strings.
+//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line and
+//     total length ≤ MaxInlineWidth; otherwise multi-line with indentation.
+//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short
+//     and unannotated, else multi-line with indentation and key/value annotations
+//     emitted as `# ...` header lines.
+//   - Functions: `<fun: name1:T1 -> name2:T2 -> R>` (zero-arg uses `_:Null`).
+//   - Types (VTType): pretty-printed via FormatType.
+//   - Modules: `<module: pretty-name>` when available.
+func FormatValue(v Value) string {
+	var b strings.Builder
+	o := out{b: &b}
+	writeValue(&o, v)
+	return b.String()
+}
+
+//// END_OF_PUBLIC
+
+// ===============================
+// ========= PRIVATE =============
+// ===============================
+
+/* ---------- small globals & utilities ---------- */
+
+func isIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	b := []byte(s)
+	c := b[0]
+	if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+		return false
+	}
+	for i := 1; i < len(b); i++ {
+		c = b[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
 		}
 	}
-	cp := NewEnv(nil)
-	for k, v := range flat {
-		cp.Define(k, v)
+	return true
+}
+
+func quoteString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			b.WriteRune(r)
+		}
 	}
-	return cp
+	b.WriteByte('"')
+	return b.String()
 }
 
-func registerConcurrencyBuiltins(ip *Interpreter) {
-	// spawn(f: Any->Any) -> Any (proc handle)
-	// spawn(f: Any->Any) -> Any (proc handle)
-	ip.RegisterNative(
-		"procSpawn",
-		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
-			if fv.Tag != VTFun {
-				fail("procSpawn expects a function")
-			}
-			orig := fv.Data.(*Fun)
-
-			// Snapshot the closure env to isolate the spawned task.
-			snap := snapshotEnv(orig.Env)
-
-			// Clone the function to run in the snapshot.
-			work := &Fun{
-				Params:     append([]string{}, orig.Params...),
-				ParamTypes: append([]S{}, orig.ParamTypes...),
-				ReturnType: orig.ReturnType,
-				Body:       orig.Body,
-				Env:        snap,
-				HiddenNull: orig.HiddenNull,
-				Chunk:      orig.Chunk,      // ok to reuse compiled chunk
-				NativeName: orig.NativeName, // in case someone passes a native
-				IsOracle:   orig.IsOracle,
-				Examples:   append([]Value(nil), orig.Examples...),
-			}
-			// Wrap as a Value and preserve the original annotation (#-doc).
-			execVal := FunVal(work)
-			execVal.Annot = fv.Annot
-
-			pr := &procState{done: make(chan struct{}), cancel: make(chan struct{})}
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						switch sig := r.(type) {
-						case returnSig:
-							pr.result = sig.v
-						case rtErr:
-							pr.result = errNull(sig.msg)
-						default:
-							pr.result = errNull(fmt.Sprintf("runtime panic: %v", r))
-						}
-					}
-					close(pr.done)
-				}()
-
-				// Use the public API (no internal executor calls).
-				pr.result = ip.Call0(execVal)
-			}()
-
-			return HandleVal("proc", pr)
-		},
-	)
-	setBuiltinDoc(ip, "procSpawn", `Run a function in a new lightweight process.
-
-The function runs concurrently in an isolated snapshot of its closure
-environment (variables are deep-copied where applicable). Pass a fully-applied
-function (no missing parameters). If the function returns an annotated null,
-joining the process yields that error annotation.
-
-Params:
-  f: Any — a function to execute (must be zero-arity after partial application)
-
-Returns:
-  Opaque process handle (use with procJoin/procCancel)
-
-Examples:
-  # Simple worker
-  let worker = fun() do
-    40 + 2
-  end
-  let p = procSpawn(worker)
-  procJoin(p)           ## => 42
-
-  ## Partial application first, then spawn
-  let add = fun(a: Int, b: Int) -> Int do a + b end
-  let add1 = add(1)     # now zero-arity
-  let p2 = procSpawn(add1)
-  procJoin(p2)          ## => 1 + b (b must be bound inside add1's closure)
-
-  ## Propagate failure as annotated null via join
-  let boom = fun() do error("boom") end
-  let p3 = procSpawn(boom)
-  procJoin(p3)          ## => null annotated with "boom"
-
-Notes:
-  • Use procJoin(proc) to retrieve the result (or annotated error).
-  • Use procCancel(proc) to request cooperative cancellation (best effort).
-  • The spawned function sees a snapshot of its original closure env.`)
-
-	ip.RegisterNative(
-		"procJoin",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("p")
-			pr := asHandle(pv, "proc").Data.(*procState)
-			<-pr.done
-			return pr.result
-		},
-	)
-	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.
-
-Params:
-  p: proc — a handle returned by procSpawn
-
-Returns:
-  Any — the function's result, or an annotated null if the process failed.`)
-
-	ip.RegisterNative(
-		"procCancel",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("p")
-			pr := asHandle(pv, "proc").Data.(*procState)
-			select {
-			case <-pr.cancel:
-			default:
-				close(pr.cancel)
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process.
-
-Cancellation is best-effort: user code/libraries may choose to observe the
-request and stop early.
-
-Params:
-  p: proc — a handle returned by procSpawn
-
-Returns:
-  Null`)
-
-	// Channels (untyped)
-	ip.RegisterNative("chanOpen", nil, S{"id", "Any"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return HandleVal("chan", &chanBox{ch: make(chan Value)})
-	})
-	setBuiltinDoc(ip, "chanOpen", `Create a new unbuffered channel.
-
-Channels transport arbitrary values between concurrent processes.
-
-Returns:
-  chan handle (opaque)
-
-See also:
-  chanSend, chanRecv, chanClose`)
-
-	ip.RegisterNative(
-		"chanSend",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			x := ctx.MustArg("x")
-			cb.ch <- x
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "chanSend", `Send a value on a channel.
-
-Blocks until a receiver is ready (unbuffered semantics).
-
-Params:
-  c: chan — channel handle
-  x: Any  — value to send
-
-Returns:
-  Null`)
-
-	ip.RegisterNative(
-		"chanRecv",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			v, ok := <-cb.ch
-			if !ok {
-				return annotNull("channel closed")
-			}
-			return v
-		},
-	)
-	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel.
-
-Blocks until a sender is ready. After chanClose(c), further receives return an
-annotated null with the message "channel closed".
-
-Params:
-  c: chan — channel handle
-
-Returns:
-  Any — the received value, or annotated null after close`)
-
-	ip.RegisterNative(
-		"chanClose",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			close(cb.ch)
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "chanClose", `Close a channel.
-
-After closing:
-  • chanRecv returns an annotated null ("channel closed")
-  • Sending on a closed channel is an error
-
-Params:
-  c: chan — channel handle
-
-Returns:
-  Null`)
+type out struct {
+	b     *strings.Builder
+	depth int
 }
 
-// --- Utilities: time, rand, json --------------------------------------------
+func (o *out) write(s string) { o.b.WriteString(s) }
+func (o *out) nl()            { o.b.WriteByte('\n') }
+func (o *out) pad() {
+	for i := 0; i < o.depth; i++ {
+		o.b.WriteByte('\t')
+	}
+}
+func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
+func (o *out) annot(text string) {
+	if text == "" {
+		return
+	}
+	for _, ln := range strings.Split(text, "\n") {
+		o.pad()
+		o.b.WriteString("# " + strings.TrimSpace(ln))
+		o.nl()
+	}
+}
 
-func cloneValue(v Value) Value {
-	switch v.Tag {
-	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
-		return v
-	case VTArray:
-		xs := v.Data.([]Value)
-		cp := make([]Value, len(xs))
-		for i := range xs {
-			cp[i] = cloneValue(xs[i])
-		}
-		return Arr(cp)
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		// Deep-copy entries
-		entries := make(map[string]Value, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			entries[k] = cloneValue(vv)
-		}
-		// Preserve insertion order and per-key annotations
-		keys := make([]string, len(mo.Keys))
-		copy(keys, mo.Keys)
-		keyAnn := make(map[string]string, len(mo.KeyAnn))
-		for k, ann := range mo.KeyAnn {
-			keyAnn[k] = ann
-		}
-		return Value{
-			Tag: VTMap,
-			Data: &MapObject{
-				Entries: entries,
-				KeyAnn:  keyAnn,
-				Keys:    keys,
-			},
-		}
+// unwrap VTType payload to its AST (supports legacy S too).
+func typeAst(data any) S {
+	switch tv := data.(type) {
+	case *TypeValue:
+		return tv.Ast
+	case S:
+		return tv
 	default:
-		// Userdata/modules are NOT copied; processes should not capture them.
-		return v
+		return S{}
 	}
 }
 
-func registerUtilityBuiltins(ip *Interpreter) {
-	ip.RegisterNative("nowMillis", nil, S{"id", "Int"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return Int(time.Now().UnixMilli())
-	})
-	setBuiltinDoc(ip, "nowMillis", `Current wall-clock time in milliseconds since the Unix epoch.
+/* ---------- AST helpers: tags, shapes, precedence ---------- */
 
-Returns:
-  Int`)
-
-	ip.RegisterNative(
-		"clone",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return cloneValue(ctx.MustArg("x"))
-		},
-	)
-	setBuiltinDoc(ip, "clone", `Deep-copy arrays and maps.
-
-For maps, preserves key order and per-key annotations. Primitive values are
-returned as-is. Functions, modules, and handles are not duplicated (identity
-is preserved).
-
-Params:
-  x: Any
-
-Returns:
-  Any — a structurally independent copy for arrays/maps`)
-
-	ip.RegisterNative(
-		"sleep",
-		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms")
-			time.Sleep(time.Duration(ms.Data.(int64)) * time.Millisecond)
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "sleep", `Pause execution for a number of milliseconds.
-
-Params:
-  ms: Int — milliseconds to sleep
-
-Returns:
-  Null`)
-
-	var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
-	ip.RegisterNative(
-		"seedRand",
-		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n")
-			rng.Seed(n.Data.(int64))
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "seedRand", `Seed the pseudo-random number generator.
-
-Use a fixed seed for reproducible sequences.
-
-Params:
-  n: Int — seed value
-
-Returns:
-  Null`)
-
-	ip.RegisterNative("randInt",
-		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Int"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n")
-			return Int(int64(rng.Intn(int(n.Data.(int64)))))
-		},
-	)
-	setBuiltinDoc(ip, "randInt", `Uniform random integer in [0, n).
-
-Params:
-  n: Int — upper bound (must be > 0)
-
-Returns:
-  Int`)
-
-	ip.RegisterNative("randFloat", nil, S{"id", "Num"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return Num(rng.Float64())
-	})
-	setBuiltinDoc(ip, "randFloat", `Uniform random number in [0.0, 1.0).
-
-Returns:
-  Num`)
-
-	// JSON
-	ip.RegisterNative(
-		"jsonParse",
-		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			sv := ctx.MustArg("s")
-			var x any
-			if err := json.Unmarshal([]byte(sv.Data.(string)), &x); err != nil {
-				fail(err.Error())
-			}
-			return goJSONToValue(x)
-		},
-	)
-	setBuiltinDoc(ip, "jsonParse", `Parse a JSON string into MindScript values.
-
-Mapping rules:
-  • null/bool/number/string map to Null/Bool/Int|Num/Str
-  • arrays map to [Any]
-  • objects map to {Str: Any}
-  • integral JSON numbers become Int; other numbers become Num
-
-Params:
-  s: Str — JSON text
-
-Returns:
-  Any`)
-
-	ip.RegisterNative(
-		"jsonStringify",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Str"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			xv := ctx.MustArg("x")
-			b, err := json.Marshal(valueToGoJSON(xv))
-			if err != nil {
-				fail(err.Error())
-			}
-			return Str(string(b))
-		},
-	)
-	setBuiltinDoc(ip, "jsonStringify", `Serialize a value to a compact JSON string.
-
-Arrays and maps are emitted as JSON arrays/objects. Object key order is not
-guaranteed.
-
-Params:
-  x: Any
-
-Returns:
-  Str`)
+func tag(n S) string   { return n[0].(string) }
+func getId(n S) string { return n[1].(string) }
+func getStr(n S) string {
+	// Used for ("str", s), but safe for ("id", name) too (both carry string at [1]).
+	return n[1].(string)
 }
 
-// goJSONToValue converts a decoded JSON value into a MindScript Value.
-// Handles json.Number (preferred when Decoder.UseNumber() is set) and fallbacks.
-func goJSONToValue(x any) Value {
-	switch v := x.(type) {
-	case nil:
-		return Null
+// Shape helpers (safe indexing in one place)
+func asUnop(n S) (op string, rhs S)       { return n[1].(string), n[2].(S) }
+func asBinop(n S) (op string, lhs, rhs S) { return n[1].(string), n[2].(S), n[3].(S) }
+func asAssign(n S) (lhs, rhs S)           { return n[1].(S), n[2].(S) }
+func asCall(n S) (recv S, args []S)       { recv = n[1].(S); return recv, listS(n, 2) }
+func asIdx(n S) (recv, idx S)             { return n[1].(S), n[2].(S) }
+func asGet(n S) (recv S, name string)     { return n[1].(S), n[2].(S)[1].(string) }
+func asAnnot(n S) (text string, wrapped S, pre bool) {
+	text = n[1].(S)[1].(string)
+	wrapped = n[2].(S)
+	pre = true
+	if len(n) >= 4 {
+		if b, ok := n[3].(bool); ok {
+			pre = b
+		}
+	}
+	return
+}
 
-	case bool:
-		return Bool(v)
+func listS(n S, from int) []S {
+	if len(n) <= from {
+		return nil
+	}
+	out := make([]S, 0, len(n)-from)
+	for i := from; i < len(n); i++ {
+		out = append(out, n[i].(S))
+	}
+	return out
+}
 
-	case json.Number:
-		// Distinguish Int vs Num using the textual form.
-		s := v.String()
+func bracketed(o *out, open, close string, elems []S, emit func(S)) {
+	o.write(open)
+	for i, e := range elems {
+		if i > 0 {
+			o.write(", ")
+		}
+		emit(e)
+	}
+	o.write(close)
+}
+
+func keyOut(o *out, name string) {
+	if isIdent(name) {
+		o.write(name)
+	} else {
+		o.write(quoteString(name))
+	}
+}
+
+var binPrec = map[string]struct {
+	p     int
+	right bool
+}{
+	"->": {15, true},
+	"*":  {70, false}, "/": {70, false}, "%": {70, false},
+	"+": {60, false}, "-": {60, false},
+	"<": {50, false}, "<=": {50, false}, ">": {50, false}, ">=": {50, false},
+	"==": {40, false}, "!=": {40, false},
+	"and": {30, false},
+	"or":  {20, false},
+}
+
+func precOf(n S) int {
+	switch tag(n) {
+	case "assign":
+		return 10
+	case "binop":
+		if pr, ok := binPrec[n[1].(string)]; ok {
+			return pr.p
+		}
+		return 60
+	case "unop":
+		if n[1].(string) == "?" {
+			return 90
+		}
+		return 80
+	case "call", "idx", "get":
+		return 90
+	default:
+		return 100
+	}
+}
+
+/* ---------- source → pretty (AST printer) ---------- */
+
+type pp struct{ out out }
+
+func (p *pp) write(s string) { p.out.write(s) }
+func (p *pp) nl()            { p.out.nl() }
+func (p *pp) pad()           { p.out.pad() }
+func (p *pp) sp()            { p.write(" ") }
+
+func (p *pp) printMin(n S, need int) {
+	if precOf(n) < need {
+		p.write("(")
+		p.printExpr(n)
+		p.write(")")
+		return
+	}
+	p.printExpr(n)
+}
+func (p *pp) recv90(n S) { p.printMin(n, 90) }
+
+func (p *pp) bin(op string, l, r S) {
+	my := 60
+	if pr, ok := binPrec[op]; ok {
+		my = pr.p
+	}
+	p.printMin(l, my)
+	p.write(" " + op + " ")
+	p.printMin(r, my)
+}
+
+func (p *pp) printProgram(n S) {
+	if tag(n) != "block" {
+		p.printStmt(n)
+		return
+	}
+	for i, k := range listS(n, 1) {
+		p.printStmt(k)
+		if i < len(listS(n, 1))-1 {
+			p.nl()
+		}
+	}
+}
+
+func (p *pp) kwCall(name string, arg S) {
+	p.pad()
+	p.write(name)
+	p.write("(")
+	p.printExpr(arg)
+	p.write(")")
+}
+
+func (p *pp) kwBlock(header func(), body S) {
+	p.pad()
+	header()
+	p.sp()
+	p.write("do")
+	p.nl()
+	p.out.withIndent(func() { p.printBlock(body) })
+	if len(body) > 1 {
+		p.nl()
+	}
+	p.pad()
+	p.write("end")
+}
+
+func (p *pp) callableHeader(kind string, params, outT S) {
+	p.write(kind)
+	p.write("(")
+	p.printParams(params)
+	p.write(")")
+	if !(tag(outT) == "id" && getId(outT) == "Any") {
+		p.sp()
+		p.write("->")
+		p.sp()
+		p.printExpr(outT)
+	}
+}
+
+func isEmptyArray(n S) bool { return tag(n) == "array" && len(n) == 1 }
+
+func (p *pp) printAnnotStmt(n S) {
+	text, wrapped, pre := asAnnot(n)
+	if pre {
+		p.out.annot(text)
+		p.printStmt(wrapped)
+	} else {
+		p.printStmt(wrapped)
+		p.nl()
+		p.out.annot(text)
+	}
+}
+
+func (p *pp) printStmt(n S) {
+	switch tag(n) {
+	case "noop":
+		return
+	case "annot":
+		p.printAnnotStmt(n)
+
+	case "fun":
+		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
+		p.kwBlock(func() { p.callableHeader("fun", params, ret) }, body)
+
+	case "oracle":
+		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
+		p.pad()
+		p.callableHeader("oracle", params, outT)
+		if !isEmptyArray(src) {
+			p.sp()
+			p.write("from ")
+			p.printExpr(src)
+		}
+
+	case "for":
+		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
+		p.kwBlock(func() {
+			p.write("for ")
+			if isDeclPattern(tgt) {
+				if tag(tgt) == "decl" {
+					p.write("let ")
+					p.printPattern(tgt)
+				} else {
+					p.printPattern(tgt)
+				}
+			} else {
+				p.printExpr(tgt)
+			}
+			p.sp()
+			p.write("in ")
+			p.printExpr(iter)
+		}, body)
+
+	case "while":
+		cond, body := n[1].(S), n[2].(S)
+		p.kwBlock(func() { p.write("while "); p.printExpr(cond) }, body)
+
+	case "if":
+		arms := listS(n, 1)
+		first := arms[0]
+		p.pad()
+		p.write("if ")
+		p.printExpr(first[1].(S))
+		p.sp()
+		p.write("then")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(first[2].(S)) })
+		if len(first[2].(S)) > 1 {
+			p.nl()
+		}
+		i := 1
+		for i < len(arms) && tag(arms[i]) == "pair" {
+			arm := arms[i]
+			p.pad()
+			p.write("elif ")
+			p.printExpr(arm[1].(S))
+			p.sp()
+			p.write("then")
+			p.nl()
+			p.out.withIndent(func() { p.printBlock(arm[2].(S)) })
+			if len(arm[2].(S)) > 1 {
+				p.nl()
+			}
+			i++
+		}
+		if i < len(arms) {
+			elseBlk := arms[i]
+			p.pad()
+			p.write("else")
+			p.nl()
+			p.out.withIndent(func() { p.printBlock(elseBlk) })
+			if len(elseBlk) > 1 {
+				p.nl()
+			}
+		}
+		p.pad()
+		p.write("end")
+
+	case "type":
+		p.pad()
+		p.write("type ")
+		p.printExpr(n[1].(S))
+
+	case "return":
+		p.kwCall("return", n[1].(S))
+	case "break":
+		p.kwCall("break", n[1].(S))
+	case "continue":
+		p.kwCall("continue", n[1].(S))
+
+	case "assign":
+		lhs, rhs := asAssign(n)
+		p.pad()
+		if isDeclPattern(lhs) {
+			p.write("let ")
+			p.printPattern(lhs)
+			p.sp()
+			p.write("=")
+			p.sp()
+			p.printExpr(rhs)
+		} else {
+			p.printExpr(lhs)
+			p.sp()
+			p.write("=")
+			p.sp()
+			p.printExpr(rhs)
+		}
+
+	case "block":
+		p.pad()
+		p.write("do")
+		p.nl()
+		p.out.withIndent(func() { p.printBlock(n) })
+		if len(n) > 1 {
+			p.nl()
+		}
+		p.pad()
+		p.write("end")
+
+	default:
+		p.pad()
+		p.printExpr(n)
+	}
+}
+
+func (p *pp) printBlock(n S) {
+	if tag(n) != "block" {
+		p.printStmt(n)
+		return
+	}
+	kids := listS(n, 1)
+	for i, k := range kids {
+		p.printStmt(k)
+		if i < len(kids)-1 {
+			p.nl()
+		}
+	}
+}
+
+func (p *pp) printParams(arr S) {
+	if tag(arr) != "array" || len(arr) == 1 {
+		return
+	}
+	items := listS(arr, 1)
+	for i, pi := range items {
+		p.write(getId(pi[1].(S)))
+		ty := pi[2].(S)
+		if !(tag(ty) == "id" && getId(ty) == "Any") {
+			p.write(": ")
+			p.printExpr(ty)
+		}
+		if i < len(items)-1 {
+			p.write(", ")
+		}
+	}
+}
+
+func (p *pp) printCommaList(xs []S, emit func(S)) {
+	for i, a := range xs {
+		if i > 0 {
+			p.write(", ")
+		}
+		emit(a)
+	}
+}
+
+func (p *pp) printExpr(n S) {
+	switch tag(n) {
+	case "id":
+		p.write(getId(n))
+	case "int":
+		p.write(fmt.Sprint(n[1]))
+	case "num":
+		s := strconv.FormatFloat(n[1].(float64), 'g', -1, 64)
 		if !strings.ContainsAny(s, ".eE") {
-			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-				return Int(i)
-			}
-			// fall through to float if it doesn't fit in int64
+			s += ".0"
 		}
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			if math.IsNaN(f) || math.IsInf(f, 0) {
-				return annotNull("json number out of range")
-			}
-			return Num(f)
+		p.write(s)
+	case "str":
+		p.write(quoteString(getStr(n)))
+	case "bool":
+		if n[1].(bool) {
+			p.write("true")
+		} else {
+			p.write("false")
 		}
-		return annotNull("json number parse error")
+	case "null":
+		p.write("null")
 
-	case float64:
-		// Path when UseNumber() wasn't used.
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return annotNull("json number out of range")
+	case "unop":
+		op, rhs := asUnop(n)
+		if op == "?" {
+			p.recv90(rhs)
+			p.write("?")
+			return
 		}
-		if v == math.Trunc(v) {
-			return Int(int64(v))
+		if op == "not" {
+			p.write("not ")
+		} else {
+			p.write(op)
 		}
-		return Num(v)
+		p.printMin(rhs, 80)
 
-	case string:
-		return Str(v)
+	case "binop":
+		op, l, r := asBinop(n)
+		p.bin(op, l, r)
 
-	case []any:
-		out := make([]Value, len(v))
-		for i := range v {
-			out[i] = goJSONToValue(v[i])
-		}
-		return Arr(out)
+	case "assign":
+		l, r := asAssign(n)
+		p.printMin(l, 10)
+		p.write(" = ")
+		p.printMin(r, 10)
 
-	case map[string]any:
-		entries := make(map[string]Value, len(v))
-		keys := make([]string, 0, len(v))
-		for k, vv := range v {
-			entries[k] = goJSONToValue(vv)
-			keys = append(keys, k)
+	case "call":
+		recv, args := asCall(n)
+		p.recv90(recv)
+		p.write("(")
+		if len(args) > 0 {
+			p.printCommaList(args, func(s S) { p.printExpr(s) })
 		}
-		mo := &MapObject{
-			Entries: entries,
-			KeyAnn:  map[string]string{},
-			Keys:    keys, // insertion order from range is unspecified; fine for open-world maps
+		p.write(")")
+
+	case "idx":
+		recv, ix := asIdx(n)
+		p.recv90(recv)
+		p.write("[")
+		p.printExpr(ix)
+		p.write("]")
+
+	case "get":
+		recv, name := asGet(n)
+		p.recv90(recv)
+		if isIdent(name) {
+			p.write("." + name)
+		} else {
+			p.write("." + quoteString(name))
 		}
-		return Value{Tag: VTMap, Data: mo}
+
+	case "array":
+		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
+
+	case "map":
+		p.printMapAST(n)
+
+	case "enum":
+		bracketed(&p.out, "Enum[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
+
+	case "decl":
+		p.write("let " + getId(n))
+
+	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
+		p.printStmt(n)
 
 	default:
-		// Shouldn’t happen with encoding/json, but keep a clear failure mode.
-		return annotNull("unsupported JSON value")
+		p.write("<" + tag(n) + ">")
 	}
 }
 
-// valueToGoJSON converts a MindScript Value into a Go JSON-able value.
-func valueToGoJSON(v Value) any {
+func (p *pp) printMapAST(n S) {
+	p.write("{")
+	items := listS(n, 1)
+	for i, pr := range items {
+		if i > 0 {
+			p.write(", ")
+		}
+		keyNode := pr[1].(S)
+		key, keyAnn := unwrapKey(keyNode)
+		if keyAnn != "" {
+			p.nl()
+			p.out.withIndent(func() { p.out.annot(keyAnn) })
+			p.pad()
+		}
+		keyOut(&p.out, key)
+		p.write(": ")
+		p.printExpr(pr[2].(S))
+	}
+	p.write("}")
+}
+
+/* ---------- patterns ---------- */
+
+func isDeclPattern(n S) bool {
+	switch tag(n) {
+	case "decl", "darr", "dobj":
+		return true
+	case "annot":
+		return isDeclPattern(n[2].(S))
+	default:
+		return false
+	}
+}
+
+func unwrapKey(n S) (name string, annot string) {
+	if tag(n) == "annot" {
+		return n[2].(S)[1].(string), n[1].(S)[1].(string)
+	}
+	return n[1].(string), ""
+}
+
+func (p *pp) printPattern(n S) {
+	switch tag(n) {
+	case "decl":
+		p.write(getId(n))
+	case "darr":
+		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printPattern(s) })
+	case "dobj":
+		items := listS(n, 1)
+		multi := false
+		for _, it := range items {
+			_, ann := unwrapKey(it[1].(S))
+			if ann != "" || tag(it[2].(S)) == "annot" {
+				multi = true
+				break
+			}
+		}
+		if !multi {
+			p.write("{")
+			for i, it := range items {
+				if i > 0 {
+					p.write(", ")
+				}
+				key, _ := unwrapKey(it[1].(S))
+				keyOut(&p.out, key)
+				p.write(": ")
+				p.printPattern(it[2].(S))
+			}
+			p.write("}")
+			return
+		}
+		p.write("{")
+		p.nl()
+		p.out.withIndent(func() {
+			for i, it := range items {
+				key, ann := unwrapKey(it[1].(S))
+				if ann != "" {
+					p.out.annot(ann)
+				}
+				p.pad()
+				keyOut(&p.out, key)
+				p.write(": ")
+				val := it[2].(S)
+				if tag(val) == "annot" {
+					p.nl()
+					p.printPattern(val)
+				} else {
+					p.printPattern(val)
+				}
+				if i < len(items)-1 {
+					p.write(",")
+				}
+				p.nl()
+			}
+		})
+		p.pad()
+		p.write("}")
+	case "annot":
+		text, wrapped, _ := asAnnot(n)
+		p.out.annot(text)
+		p.pad()
+		p.printPattern(wrapped)
+	default:
+		p.printExpr(n)
+	}
+}
+
+/* ---------- Type pretty-printer ---------- */
+
+func writeType(o *out, t S) {
+	if len(t) == 0 {
+		o.write("<type>")
+		return
+	}
+	switch tag(t) {
+	case "id":
+		o.write(getStr(t))
+	case "unop":
+		if t[1].(string) == "?" {
+			writeType(o, t[2].(S))
+			o.write("?")
+		} else {
+			o.write("<unop>")
+		}
+	case "array":
+		elem := S{"id", "Any"}
+		if len(t) == 2 {
+			elem = t[1].(S)
+		}
+		bracketed(o, "[", "]", []S{elem}, func(s S) { writeType(o, s) }) // prints [T]
+	case "enum":
+		bracketed(o, "Enum[", "]", listS(t, 1), func(s S) { writeTypeLiteral(o, s) })
+	case "map":
+		type fld struct {
+			name       string
+			req        bool
+			typ        S
+			kAnn, vAnn string
+		}
+		var fs []fld
+		for _, raw := range listS(t, 1) {
+			req := raw[0].(string) == "pair!"
+			k, kAnn := unwrapKey(raw[1].(S))
+			ft := raw[2].(S)
+			vAnn := ""
+			if len(ft) > 0 && tag(ft) == "annot" {
+				vAnn = ft[1].(S)[1].(string)
+				ft = ft[2].(S)
+			}
+			fs = append(fs, fld{name: k, req: req, typ: ft, kAnn: kAnn, vAnn: vAnn})
+		}
+		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
+		o.write("{")
+		o.nl()
+		o.withIndent(func() {
+			for i, f := range fs {
+				if f.kAnn != "" {
+					o.annot(f.kAnn)
+				}
+				if f.vAnn != "" {
+					o.annot(f.vAnn)
+				}
+				o.pad()
+				keyOut(o, f.name)
+				if f.req {
+					o.write("!")
+				}
+				o.write(": ")
+				writeType(o, f.typ)
+				if i < len(fs)-1 {
+					o.write(",")
+				}
+				o.nl()
+			}
+		})
+		o.pad()
+		o.write("}")
+	case "binop":
+		if t[1].(string) == "->" && len(t) >= 4 {
+			params, ret := flattenArrow(t)
+			o.write("(")
+			for i := range params {
+				if i > 0 {
+					o.write(", ")
+				}
+				writeType(o, params[i])
+			}
+			o.write(") -> ")
+			writeType(o, ret)
+		} else {
+			o.write("<binop>")
+		}
+	case "annot":
+		o.annot(t[1].(S)[1].(string))
+		writeType(o, t[2].(S))
+	default:
+		o.write("<type>")
+	}
+}
+
+func writeTypeLiteral(o *out, lit S) {
+	switch tag(lit) {
+	case "null":
+		o.write("null")
+	case "bool":
+		if lit[1].(bool) {
+			o.write("true")
+		} else {
+			o.write("false")
+		}
+	case "int":
+		o.write(fmt.Sprint(lit[1]))
+	case "num":
+		o.write(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
+	case "str":
+		o.write(quoteString(getStr(lit)))
+	case "array":
+		bracketed(o, "[", "]", listS(lit, 1), func(s S) { writeTypeLiteral(o, s) })
+	case "map":
+		o.write("{")
+		items := listS(lit, 1)
+		for i, pr := range items {
+			if i > 0 {
+				o.write(", ")
+			}
+			k := pr[1].(S)[1].(string)
+			keyOut(o, k)
+			o.write(": ")
+			writeTypeLiteral(o, pr[2].(S))
+		}
+		o.write("}")
+	default:
+		o.write("<lit>")
+	}
+}
+
+func flattenArrow(t S) (params []S, ret S) {
+	for tag(t) == "binop" && t[1].(string) == "->" && len(t) >= 4 {
+		params = append(params, t[2].(S))
+		t = t[3].(S)
+	}
+	ret = t
+	return
+}
+
+/* ---------- Runtime value pretty-printer ---------- */
+
+func mapOneLineMO(keys []string, mo *MapObject) string {
+	if len(keys) == 0 {
+		return "{}"
+	}
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+			return ""
+		}
+		v := mo.Entries[k]
+		if isValueMultiline(v) {
+			return ""
+		}
+		key := k
+		if !isIdent(key) {
+			key = quoteString(key)
+		}
+		var b strings.Builder
+		o := out{b: &b}
+		writeValue(&o, v)
+		parts = append(parts, key+": "+b.String())
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
+}
+
+func writeValue(o *out, v Value) {
+	if v.Annot != "" {
+		o.annot(v.Annot)
+		o.pad()
+	}
 	switch v.Tag {
 	case VTNull:
-		return nil
+		o.write("null")
 	case VTBool:
-		return v.Data.(bool)
+		if v.Data.(bool) {
+			o.write("true")
+		} else {
+			o.write("false")
+		}
 	case VTInt:
-		return v.Data.(int64)
+		o.write(strconv.FormatInt(v.Data.(int64), 10))
 	case VTNum:
-		return v.Data.(float64)
+		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		o.write(s)
 	case VTStr:
-		return v.Data.(string)
+		o.write(quoteString(v.Data.(string)))
 	case VTArray:
 		xs := v.Data.([]Value)
-		out := make([]any, len(xs))
-		for i := range xs {
-			out[i] = valueToGoJSON(xs[i])
+		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
+			o.write(oneline)
+			return
 		}
-		return out
+		o.write("[")
+		o.nl()
+		o.withIndent(func() {
+			for i, it := range xs {
+				if it.Annot == "" {
+					o.pad()
+				}
+				writeValue(o, it)
+				if i < len(xs)-1 {
+					o.write(",")
+				}
+				o.nl()
+			}
+		})
+		o.pad()
+		o.write("]")
 	case VTMap:
 		mo := v.Data.(*MapObject)
-		out := make(map[string]any, len(mo.Entries))
-		// Note: Go's json encoder doesn't preserve map insertion order.
-		// We still iterate Keys for determinism if you ever serialize manually.
-		for _, k := range mo.Keys {
-			out[k] = valueToGoJSON(mo.Entries[k])
+		keys := append([]string(nil), mo.Keys...)
+		sort.Strings(keys)
+		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
+			o.write(oneline)
+			return
 		}
-		return out
+		o.write("{")
+		o.nl()
+		o.withIndent(func() {
+			for i, k := range keys {
+				if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+					o.annot(ann)
+				}
+				o.pad()
+				keyOut(o, k)
+				o.write(": ")
+				writeValue(o, mo.Entries[k])
+				if i < len(keys)-1 {
+					o.write(",")
+				}
+				o.nl()
+			}
+		})
+		o.pad()
+		o.write("}")
+	case VTFun:
+		if f, ok := v.Data.(*Fun); ok && f != nil {
+			var sb strings.Builder
+			sb.WriteString("<fun: ")
+			if len(f.ParamTypes) == 0 {
+				sb.WriteString("_:Null")
+			} else {
+				for i := range f.ParamTypes {
+					if i > 0 {
+						sb.WriteString(" -> ")
+					}
+					name := "_"
+					if i < len(f.Params) && f.Params[i] != "" {
+						name = f.Params[i]
+					}
+					sb.WriteString(name)
+					sb.WriteString(":")
+					sb.WriteString(FormatType(f.ParamTypes[i]))
+				}
+			}
+			sb.WriteString(" -> ")
+			sb.WriteString(FormatType(f.ReturnType))
+			sb.WriteString(">")
+			o.write(sb.String())
+		} else {
+			o.write("<fun>")
+		}
+	case VTType:
+		typ := FormatType(typeAst(v.Data))
+		if strings.Contains(typ, "\n") {
+			for i, ln := range strings.Split(typ, "\n") {
+				if i == 0 {
+					o.write(ln)
+					continue
+				}
+				o.nl()
+				o.pad()
+				o.write(ln)
+			}
+			return
+		}
+		o.write(typ)
+	case VTModule:
+		name := "<module>"
+		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
+			disp := prettySpec(m.Name)
+			if disp == "" {
+				disp = m.Name
+			}
+			name = "<module: " + disp + ">"
+		}
+		o.write(name)
 	default:
-		// For non-JSON-serializable values (functions, types, handles, modules),
-		// return null rather than a debug string to keep valid JSON shape.
-		return nil
-	}
-}
-
-// --- Schema ↔ Type bridge ----------------------------------------------------
-
-func registerSchemaBuiltins(ip *Interpreter) {
-	// typeToJSONSchema(t: Type) -> Any
-	ip.RegisterNative(
-		"typeToJSONSchema",
-		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t") // VTType value
-			js := ip.TypeValueToJSONSchema(tv, ctx.Env())
-			return goJSONToValue(js)
-		},
-	)
-	setBuiltinDoc(ip, "typeToJSONSchema", `Convert a MindScript Type to a JSON Schema object.
-
-Params:
-  t: Type
-
-Returns:
-  Any — JSON Schema as a map/array structure (use jsonStringify to serialize)`)
-
-	// jsonSchemaToType(schema: Any) -> Type
-	ip.RegisterNative(
-		"jsonSchemaToType",
-		[]ParamSpec{{Name: "schema", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			raw := valueToGoJSON(ctx.MustArg("schema"))
-			doc, ok := raw.(map[string]any)
-			if !ok {
-				return TypeVal(S{"id", "Any"})
+		s := "<unknown>"
+		if v.Tag == VTHandle {
+			if h, ok := v.Data.(*Handle); ok {
+				s = "<handle:" + h.Kind + ">"
+			} else {
+				s = "<handle>"
 			}
-
-			// Convert the root to a **Type value** (keeps top-level description in Annot).
-			tv := ip.JSONSchemaToTypeValue(doc)
-
-			// Import $defs/definitions into the current environment as aliases.
-			importDefs := func(defs map[string]any) {
-				for name, defRaw := range defs {
-					if defObj, ok := defRaw.(map[string]any); ok {
-						// Convert def using the whole document as root for local $ref resolution.
-						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
-						ctx.Env().Define(name, TypeVal(s))
-					}
-				}
-			}
-			if dm, ok := doc["$defs"].(map[string]any); ok {
-				importDefs(dm)
-			}
-			if dm, ok := doc["definitions"].(map[string]any); ok {
-				importDefs(dm)
-			}
-
-			return tv
-		},
-	)
-	setBuiltinDoc(ip, "jsonSchemaToType", `Convert a JSON Schema object to a MindScript Type.
-
-Notes:
-  • Same-document $ref and common keywords are handled.
-  • Unsupported constructs widen to Any.
-  • "$defs"/"definitions" are imported into the current scope as type aliases.
-
-Params:
-  schema: Any — JSON object (e.g., from jsonParse)
-
-Returns:
-  Type`)
-
-	// typeStringToJSONSchema(src: Str) -> Any
-	ip.RegisterNative(
-		"typeStringToJSONSchema",
-		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			src := ctx.MustArg("src").Data.(string)
-			s, err := TypeStringToS(src)
-			if err != nil {
-				return annotNull(err.Error())
-			}
-			// Convert **value-centrically** to ensure annotations propagate.
-			js := ip.TypeValueToJSONSchema(TypeVal(s), ctx.Env())
-			return goJSONToValue(js)
-		},
-	)
-	setBuiltinDoc(ip, "typeStringToJSONSchema", `Parse a MindScript type string and convert it to JSON Schema.
-
-Params:
-  src: Str — a single type expression (annotations map to "description")
-
-Returns:
-  Any — JSON Schema object`)
-
-	// jsonSchemaStringToType(src: Str) -> Type
-	ip.RegisterNative(
-		"jsonSchemaStringToType",
-		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			src := ctx.MustArg("src").Data.(string)
-			doc, err := JSONSchemaStringToObject(src)
-			if err != nil {
-				return annotNull(err.Error())
-			}
-
-			// Convert to a **Type value**.
-			tv := ip.JSONSchemaToTypeValue(doc)
-
-			// Import $defs/definitions into env (same logic as above).
-			importDefs := func(defs map[string]any) {
-				for name, defRaw := range defs {
-					if defObj, ok := defRaw.(map[string]any); ok {
-						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
-						ctx.Env().Define(name, TypeVal(s))
-					}
-				}
-			}
-			if dm, ok := doc["$defs"].(map[string]any); ok {
-				importDefs(dm)
-			}
-			if dm, ok := doc["definitions"].(map[string]any); ok {
-				importDefs(dm)
-			}
-
-			return tv
-		},
-	)
-	setBuiltinDoc(ip, "jsonSchemaStringToType", `Parse a JSON Schema string and convert it to a MindScript Type.
-
-Params:
-  src: Str — JSON text
-
-Returns:
-  Type`)
-}
-
-// --- String Utilities --------------------------------------------
-
-func registerStringBuiltins(ip *Interpreter) {
-	// substr(s, i, j)
-	ip.RegisterNative(
-		"substr",
-		[]ParamSpec{{"s", S{"id", "Str"}}, {"i", S{"id", "Int"}}, {"j", S{"id", "Int"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
-			i := int(ctx.MustArg("i").Data.(int64))
-			j := int(ctx.MustArg("j").Data.(int64))
-			r := []rune(s)
-			if i < 0 {
-				i = 0
-			}
-			if j < i {
-				j = i
-			}
-			if i > len(r) {
-				i = len(r)
-			}
-			if j > len(r) {
-				j = len(r)
-			}
-			return Str(string(r[i:j]))
-		},
-	)
-	setBuiltinDoc(ip, "substr", `Unicode-safe substring by rune index.
-
-Takes the half-open slice [i, j). Indices are clamped to bounds and negative
-values are treated as 0.
-
-Params:
-  s: Str — source string
-  i: Int — start index (inclusive)
-  j: Int — end index (exclusive)
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"toLower",
-		[]ParamSpec{{"s", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.MustArg("s").Data.(string))) },
-	)
-	setBuiltinDoc(ip, "toLower", `Lowercase conversion (Unicode aware).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"toUpper",
-		[]ParamSpec{{"s", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.MustArg("s").Data.(string))) },
-	)
-	setBuiltinDoc(ip, "toUpper", `Uppercase conversion (Unicode aware).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	trimFunc := func(left, right bool) func(string) string {
-		return func(s string) string {
-			if left && right {
-				return strings.TrimSpace(s)
-			}
-			if left {
-				return strings.TrimLeftFunc(s, unicode.IsSpace)
-			}
-			return strings.TrimRightFunc(s, unicode.IsSpace)
 		}
+		o.write(s)
 	}
-
-	ip.RegisterNative("strip",
-		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(true, true)(ctx.MustArg("s").Data.(string)))
-		},
-	)
-	setBuiltinDoc(ip, "strip", `Remove leading and trailing whitespace (Unicode).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative("lstrip",
-		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(true, false)(ctx.MustArg("s").Data.(string)))
-		},
-	)
-	setBuiltinDoc(ip, "lstrip", `Remove leading whitespace (Unicode).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative("rstrip",
-		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(false, true)(ctx.MustArg("s").Data.(string)))
-		},
-	)
-	setBuiltinDoc(ip, "rstrip", `Remove trailing whitespace (Unicode).
-
-Params:
-  s: Str
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"split",
-		[]ParamSpec{{"s", S{"id", "Str"}}, {"sep", S{"id", "Str"}}},
-		S{"array", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
-			sep := ctx.MustArg("sep").Data.(string)
-			parts := strings.Split(s, sep)
-			out := make([]Value, len(parts))
-			for i := range parts {
-				out[i] = Str(parts[i])
-			}
-			return Arr(out)
-		},
-	)
-	setBuiltinDoc(ip, "split", `Split a string on a separator (no regex).
-
-If sep is empty (""), splits between UTF-8 code points.
-
-Params:
-  s: Str   — source string
-  sep: Str — separator
-
-Returns:
-  [Str]`)
-
-	ip.RegisterNative(
-		"join",
-		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			xs := ctx.MustArg("xs").Data.([]Value)
-			sep := ctx.MustArg("sep").Data.(string)
-			strs := make([]string, len(xs))
-			for i := range xs {
-				strs[i] = xs[i].Data.(string)
-			}
-			return Str(strings.Join(strs, sep))
-		},
-	)
-	setBuiltinDoc(ip, "join", `Join strings with a separator.
-
-Params:
-  xs: [Str] — pieces to join
-  sep: Str  — separator
-
-Returns:
-  Str`)
-
 }
 
-// ---- Regex: match, replace --------------------------------------------------
+/* ---------- single-line candidates ---------- */
 
-func registerRegexBuiltins(ip *Interpreter) {
-	// match(pattern: Str, s: Str) -> [Str]
-	ip.RegisterNative(
-		"match",
-		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
-		S{"array", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			pat := ctx.MustArg("pattern").Data.(string)
-			s := ctx.MustArg("string").Data.(string)
-			re, err := regexp.Compile(pat)
-			if err != nil {
-				fail(err.Error())
-			}
-			ms := re.FindAllString(s, -1)
-			out := make([]Value, len(ms))
-			for i := range ms {
-				out[i] = Str(ms[i])
-			}
-			return Arr(out)
-		},
-	)
-	setBuiltinDoc(ip, "match", `Find all non-overlapping matches of a regex.
-
-Params:
-  pattern: Str — RE2-compatible regular expression
-  string:  Str — input
-
-Returns:
-  [Str] — matched substrings (no capture groups)`)
-
-	// replace(pattern: Str, repl: Str, s: Str) -> Str
-	ip.RegisterNative(
-		"replace",
-		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"replace", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			pat := ctx.MustArg("pattern").Data.(string)
-			rep := ctx.MustArg("replace").Data.(string)
-			s := ctx.MustArg("string").Data.(string)
-			re, err := regexp.Compile(pat)
-			if err != nil {
-				fail(err.Error())
-			}
-			return Str(re.ReplaceAllString(s, rep))
-		},
-	)
-	setBuiltinDoc(ip, "replace", `Replace all non-overlapping regex matches.
-
-Params:
-  pattern: Str — RE2-compatible regular expression
-  replace: Str — replacement (no backrefs)
-  string:  Str — input
-
-Returns:
-  Str`)
-}
-
-// --- Casting Utilities --------------------------------------------
-
-func registerCastBuiltins(ip *Interpreter) {
-
-	// str(x) -> Str (JSON-ish for arrays/maps; quotes preserved for strings)
-	ip.RegisterNative(
-		"str",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTStr:
-				return v
-			case VTNull:
-				return Str("null")
-			case VTBool:
-				if v.Data.(bool) {
-					return Str("true")
-				}
-				return Str("false")
-			case VTInt:
-				return Str(strconv.FormatInt(v.Data.(int64), 10))
-			case VTNum:
-				return Str(strconv.FormatFloat(v.Data.(float64), 'g', -1, 64))
-			case VTArray, VTMap:
-				b, _ := json.Marshal(valueToGoJSON(v))
-				return Str(string(b))
-			default:
-				// functions/modules/handles/types: fall back to Value.String()
-				return Str(v.String())
-			}
-		},
-	)
-	setBuiltinDoc(ip, "str", `Stringify a value.
-
-Rules:
-  • Str stays as-is
-  • Null → "null"
-  • Bool → "true"/"false"
-  • Int/Num → decimal representation
-  • Arrays/Maps → JSON text
-  • Functions/Modules/Handles/Types → readable debug form
-
-Params:
-  x: Any
-
-Returns:
-  Str`)
-
-	ip.RegisterNative(
-		"int",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Int"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTInt:
-				return v
-			case VTNum:
-				return Int(int64(v.Data.(float64)))
-			case VTBool:
-				if v.Data.(bool) {
-					return Int(1)
-				}
-				return Int(0)
-			case VTStr:
-				if n, err := strconv.ParseInt(v.Data.(string), 10, 64); err == nil {
-					return Int(n)
-				}
-				return Null
-			default:
-				return Null
-			}
-		},
-	)
-	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise return null.
-
-Rules:
-  • Int → Int
-  • Num → truncated toward zero
-  • Bool → 1/0
-  • Str → parsed base-10 integer, or null on failure
-  • Others → null
-
-Params:
-  x: Any
-
-Returns:
-  Int?`)
-
-	ip.RegisterNative(
-		"num",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Num"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTNum:
-				return v
-			case VTInt:
-				return Num(float64(v.Data.(int64)))
-			case VTBool:
-				if v.Data.(bool) {
-					return Num(1)
-				}
-				return Num(0)
-			case VTStr:
-				if f, err := strconv.ParseFloat(v.Data.(string), 64); err == nil {
-					return Num(f)
-				}
-				return Null
-			default:
-				return Null
-			}
-		},
-	)
-	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise return null.
-
-Rules:
-  • Num → Num
-  • Int → floating-point value
-  • Bool → 1.0/0.0
-  • Str → parsed as float64, or null on failure
-  • Others → null
-
-Params:
-  x: Any
-
-Returns:
-  Num?`)
-
-	ip.RegisterNative(
-		"bool",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Bool"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTBool:
-				return v
-			case VTNull:
-				return Bool(false)
-			case VTInt:
-				return Bool(v.Data.(int64) != 0)
-			case VTNum:
-				return Bool(v.Data.(float64) != 0)
-			case VTStr:
-				return Bool(v.Data.(string) != "")
-			case VTArray:
-				return Bool(len(v.Data.([]Value)) > 0)
-			case VTMap:
-				return Bool(len(v.Data.(*MapObject).Entries) > 0)
-			default:
-				return Bool(true) // functions, modules, handles, types → truthy
-			}
-		},
-	)
-	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules.
-
-Falsey:
-  • null
-  • 0, 0.0
-  • "" (empty string)
-  • [] (empty array)
-  • {} (empty map)
-
-Truthy:
-  • everything else (including functions, modules, handles, types)
-
-Params:
-  x: Any
-
-Returns:
-  Bool`)
-
-	ip.RegisterNative(
-		"len",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Int"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.MustArg("x"))
-			switch x.Tag {
-			case VTArray:
-				return Int(int64(len(x.Data.([]Value))))
-			case VTMap:
-				mo := x.Data.(*MapObject)
-				// Use ordered keys length to reflect object “length”
-				return Int(int64(len(mo.Keys)))
-			case VTStr:
-				// Unicode-aware length to match substr’s rune semantics
-				return Int(int64(utf8.RuneCountInString(x.Data.(string))))
-			default:
-				return Null
-			}
-		},
-	)
-}
-
-// --- Math Utilities --------------------------------------------
-
-func registerMathBuiltins(ip *Interpreter) {
-	// Constants
-	ip.Core.Define("PI", Num(math.Pi))
-	ip.Core.Define("E", Num(math.E))
-	setBuiltinDoc(ip, "PI", `Mathematical constant π.
-
-Returns:
-  Num`)
-	setBuiltinDoc(ip, "E", `Euler's number e.
-
-Returns:
-  Num`)
-
-	// Unary math helpers
-	un1 := func(name string, f func(float64) float64, doc string) {
-		ip.RegisterNative(
-			name,
-			[]ParamSpec{{"x", S{"id", "Num"}}},
-			S{"id", "Num"},
-			func(_ *Interpreter, ctx CallCtx) Value { return Num(f(ctx.MustArg("x").Data.(float64))) },
-		)
-		setBuiltinDoc(ip, name, doc)
+func arrayOneLine(xs []Value) string {
+	if len(xs) == 0 {
+		return "[]"
 	}
-	un1("sin", math.Sin, `Sine of an angle in radians.
-
-Params:
-  x: Num — radians
-
-Returns:
-  Num`)
-	un1("cos", math.Cos, `Cosine of an angle in radians.
-
-Params:
-  x: Num — radians
-
-Returns:
-  Num`)
-	un1("tan", math.Tan, `Tangent of an angle in radians.
-
-Params:
-  x: Num — radians
-
-Returns:
-  Num`)
-	un1("sqrt", math.Sqrt, `Square root.
-
-Params:
-  x: Num — non-negative
-
-Returns:
-  Num`)
-	un1("log", math.Log, `Natural logarithm (base e).
-
-Params:
-  x: Num — positive
-
-Returns:
-  Num`)
-	un1("exp", math.Exp, `Exponential function e^x.
-
-Params:
-  x: Num
-
-Returns:
-  Num`)
-
-	ip.RegisterNative(
-		"pow",
-		[]ParamSpec{{"base", S{"id", "Num"}}, {"exp", S{"id", "Num"}}},
-		S{"id", "Num"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Num(math.Pow(ctx.MustArg("base").Data.(float64), ctx.MustArg("exp").Data.(float64)))
-		},
-	)
-	setBuiltinDoc(ip, "pow", `Power: base^exp.
-
-Params:
-  base: Num
-  exp:  Num
-
-Returns:
-  Num`)
+	parts := make([]string, 0, len(xs))
+	for _, it := range xs {
+		if isValueMultiline(it) {
+			return ""
+		}
+		var b strings.Builder
+		o := out{b: &b}
+		writeValue(&o, it)
+		parts = append(parts, b.String())
+	}
+	return "[ " + strings.Join(parts, ", ") + " ]"
 }
 
-// Date
-func registerTimeExtras(ip *Interpreter) {
-	// dateNow() -> {year, month, day, hour, min, sec, ms}
-	ip.RegisterNative(
-		"dateNow",
-		nil,
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			now := time.Now()
-			mo := &MapObject{
-				Entries: map[string]Value{
-					"year":        Int(int64(now.Year())),
-					"month":       Int(int64(int(now.Month()))),
-					"day":         Int(int64(now.Day())),
-					"hour":        Int(int64(now.Hour())),
-					"minute":      Int(int64(now.Minute())),
-					"second":      Int(int64(now.Second())),
-					"millisecond": Int(int64(now.Nanosecond() / 1e6)),
-				},
-				KeyAnn: map[string]string{},
-				Keys:   []string{"year", "month", "day", "hour", "minute", "second", "millisecond"},
+func isValueMultiline(v Value) bool {
+	if v.Annot != "" {
+		return true
+	}
+	switch v.Tag {
+	case VTArray:
+		xs := v.Data.([]Value)
+		if len(xs) == 0 {
+			return false
+		}
+		for _, it := range xs {
+			if isValueMultiline(it) {
+				return true
 			}
-			return Value{Tag: VTMap, Data: mo}
-		},
-	)
-	setBuiltinDoc(ip, "dateNow", `Current local date/time components.
-
-Fields:
-  year, month(1–12), day(1–31),
-  hour(0–23), minute(0–59), second(0–59),
-  millisecond(0–999)
-
-Returns:
-  {Str: Any} — a map with the fields above`)
+		}
+		line := arrayOneLine(xs)
+		return line == "" || len(line) > MaxInlineWidth
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		if len(mo.Keys) == 0 {
+			return false
+		}
+		keys := append([]string(nil), mo.Keys...)
+		sort.Strings(keys)
+		line := mapOneLineMO(keys, mo)
+		return line == "" || len(line) > MaxInlineWidth
+	case VTType:
+		t := typeAst(v.Data)
+		return len(t) > 0 && tag(t) == "map" && len(t) > 1
+	default:
+		return false
+	}
 }
-
-// --- Process Utilities --------------------------------------------
-
-func registerProcessBuiltins(ip *Interpreter) {
-	// exit(code:Int?) -> Null (terminates the host process)
-	ip.RegisterNative(
-		"exit",
-		[]ParamSpec{{"code", S{"unop", "?", S{"id", "Int"}}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			codeV := ctx.MustArg("code")
-			code := 0
-			if codeV.Tag == VTInt {
-				code = int(codeV.Data.(int64))
-			}
-			os.Exit(code)
-			return Null // unreachable
-		},
-	)
-	setBuiltinDoc(ip, "exit", `Terminate the current process with an optional status code.
-
-By convention, 0 indicates success; non-zero indicates an error.
-
-Params:
-  code: Int? — exit status (default 0)
-
-Returns:
-  Null (never returns; process exits)`)
-}
-=== END FILE: std_sys.go ===
+=== END FILE: printer.go ===
 

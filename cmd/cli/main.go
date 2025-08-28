@@ -158,10 +158,6 @@ func runREPL() int {
 			fmt.Fprintln(os.Stderr, red(err.Error()))
 			continue
 		}
-		if v.Tag == mindscript.VTNull && v.Annot != "" {
-			fmt.Fprintln(os.Stderr, red(v.Annot))
-			continue
-		}
 		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
 
 		// Save to history

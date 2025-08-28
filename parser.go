@@ -129,6 +129,13 @@
 //   - POST annotations are attached in the postfix chain; PRE wrap the node
 //     that follows. The AST encodes this as ("annot", ("str", text), node, isPre).
 //
+//   - NOOP (blank lines):
+//     Inside delimiters (() [] {} args/params/indices/grouping): skipped like
+//     whitespace. Elsewhere (top level, block bodies): parsed as ("noop").
+//     Lone PRE annotation followed by a blank line:
+//     ("annot", ("str", text), ("noop"), true),
+//     the interpreter treats these as true no-ops; see interpreter.go.
+//
 // Grammar sketch (informal)
 // -------------------------
 //

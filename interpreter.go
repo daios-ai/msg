@@ -17,7 +17,7 @@
 //     (RegisterNative), call helpers (Apply/Call0), and type helpers
 //     (ResolveType/IsType/…).
 //
-// NEW (RUNTIME ERROR REPORTING)
+// RUNTIME ERROR REPORTING
 // -----------------------------
 // When enabled via Options.RuntimeErrorsAsGoError, failures that reach runTop
 // (VM runtime errors or panic(rtErr)) are surfaced as **Go errors** rendered by
@@ -517,6 +517,29 @@ func toFloat(v Value) float64 {
 		return float64(v.Data.(int64))
 	}
 	return v.Data.(float64)
+}
+
+// Noop detection: ("noop") and ("annot", ..., ("noop"), ...) are “noopish” and
+// generate no code inside blocks.
+func isNoopish(n S) bool {
+	if len(n) == 0 {
+		return false
+	}
+	switch n[0].(string) {
+	case "noop":
+		// Defensive: treat a stray ("noop") in expression position as plain Null.
+		return true
+	case "annot":
+		// n[2] is the subject node; treat annot(noop) as noop
+		if len(n) >= 3 {
+			if sub, ok := n[2].(S); ok {
+				return isNoopish(sub)
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // Given a VTType, resolve its AST using its own env if present; otherwise use fallback.
@@ -1628,8 +1651,8 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(Str(n[1].(string))))
 	case "bool":
 		e.emit(opConst, e.k(Bool(n[1].(bool))))
-	// case "noop":
-	// 	e.emit(opConst, e.k(Null))
+	case "noop":
+		e.emit(opConst, e.k(Null))
 	case "null":
 		e.emit(opConst, e.k(Null))
 
@@ -1638,18 +1661,30 @@ func (e *emitter) emitExpr(n S) {
 
 	case "block":
 		e.pushBlockCtx()
-		nItems := len(n) - 1
-		if nItems <= 0 {
-			e.emit(opConst, e.k(Null))
-		} else {
-			for i := 1; i <= nItems; i++ {
-				j := i - 1
-				e.withChild(j, func() { e.emitExpr(n[i].(S)) })
-				if i < nItems {
-					e.emit(opPop, 0)
-				}
+
+		// Skip noopish children entirely. Leave the last non-noop value on the stack;
+		// if all children are noopish, push plain Null. Guarantees callers always get
+		// a value.
+		emitted := 0
+		nAll := len(n) - 1
+		for i := 1; i <= nAll; i++ {
+			child := n[i].(S)
+			if isNoopish(child) {
+				continue // skip blank lines (and annot-wrapped blank lines)
 			}
+			// Pop the previous non-noop result before emitting the next one.
+			if emitted > 0 {
+				e.emit(opPop, 0)
+			}
+			idx := i - 1 // preserve original child index for source marks
+			e.withChild(idx, func() { e.emitExpr(child) })
+			emitted++
 		}
+		if emitted == 0 {
+			// Entire block was blank → produce Null as the block value.
+			e.emit(opConst, e.k(Null))
+		}
+
 		exit := e.here()
 		ctx := e.popCtx()
 		for _, at := range ctx.breakJumps {
@@ -1966,17 +2001,21 @@ func (e *emitter) emitExpr(n S) {
 		text := n[1].(S)[1].(string)
 		subj := n[2].(S)
 
+		// Lone PRE annotation over a blank line is a no-op: produce Null, no side effects.
+		if isNoopish(subj) {
+			e.emit(opConst, e.k(Null))
+			return
+		}
+
 		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
 		if len(subj) > 0 && subj[0].(string) == "assign" {
 			lhs := subj[1].(S)
 			rhs := subj[2].(S)
-
 			opName := "__assign_set"
 			switch lhs[0].(string) {
 			case "decl", "darr", "dobj", "annot":
 				opName = "__assign_def"
 			}
-
 			e.emit(opLoadGlobal, e.ks(opName))
 			e.emit(opConst, e.k(TypeVal(lhs)))
 			e.emit(opLoadGlobal, e.ks("__annotate"))

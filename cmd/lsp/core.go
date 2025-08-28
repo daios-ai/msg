@@ -296,11 +296,12 @@ type server struct {
 }
 
 func newServer() *server {
+	// Use NewRuntime to get a fully-populated interpreter
+	// instead of NewInterpreter().
+	ip, _ := mindscript.NewRuntime()
 	return &server{
 		docs: make(map[string]*docState),
-		// Use NewRuntime to get a fully-populated interpreter
-		// instead of NewInterpreter().
-		ip: mindscript.NewRuntime(),
+		ip:   ip,
 	}
 }
 

@@ -167,7 +167,7 @@ func wantNullAnnotContains(t *testing.T, v Value, substr string) {
 // --- tests -------------------------------------------------------------------
 
 func Test_Oracle_StrSuccess(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
 
@@ -183,7 +183,7 @@ func Test_Oracle_StrSuccess(t *testing.T) {
 }
 
 func Test_Oracle_JSONSuccess_Object(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"name":"Marie Curie"}}`)
 
@@ -199,7 +199,7 @@ func Test_Oracle_JSONSuccess_Object(t *testing.T) {
 }
 
 func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `not-json`)
 
@@ -214,7 +214,7 @@ func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
 }
 
 func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"ok":true}`)
 
@@ -229,7 +229,7 @@ func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
 }
 
 func Test_Oracle_PromptUsesNonNullSuccessType(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerBuildPromptEchoOutType(ip)
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"name":"X"}}`)
@@ -258,7 +258,7 @@ func Test_Oracle_PromptUsesNonNullSuccessType(t *testing.T) {
 }
 
 func Test_Oracle_ExecutorReceivesNullableOutType(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerAssertingFakeOracle(ip)
 
@@ -289,7 +289,7 @@ func Test_Oracle_ExecutorReceivesNullableOutType(t *testing.T) {
 }
 
 func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"wrong":42}}`)
 
@@ -304,7 +304,7 @@ func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"foo":123}}`)
 
@@ -319,7 +319,7 @@ func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
 }
 
 func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```json\n{\"output\":{\"name\":\"Rosalind Franklin\"}}\n```")
 
@@ -334,7 +334,7 @@ func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
 }
 
 func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	// Simulate transport failure: executor returns annotated null
 	ip.RegisterNative(
 		"__oracle_execute",
@@ -362,7 +362,7 @@ func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_OutType_Passed_Is_Nullable_For_NonAny(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerAssertingFakeOracle(ip) // asserts outType is nullable when not Any
 
@@ -379,7 +379,7 @@ func Test_Oracle_OutType_Passed_Is_Nullable_For_NonAny(t *testing.T) {
 }
 
 func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	// Fake checks Any is not wrapped; if fine, returns BOXED {"output":{"ok":true}}
 	registerAssertingFakeOracle(ip)
@@ -449,7 +449,7 @@ func wantHardErrorContains(t *testing.T, err error, substr string) {
 // -----------------------------------------------------------------------------
 
 func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	// Backend won't be reached if params fail type-checking (engine enforces)
 	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
 
@@ -462,7 +462,7 @@ func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
 }
 
 func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
 
@@ -477,7 +477,7 @@ func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
 }
 
 func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
 
@@ -492,7 +492,7 @@ func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
 }
 
 func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerFakeOracle(ip, "null") // executor returns the literal string "null"
 
 	v, err := ip.EvalSource(`
@@ -506,7 +506,7 @@ func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "this is not json at all")
 
@@ -521,7 +521,7 @@ func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerFakeOracle(ip, "null")
 
 	v, err := ip.EvalSource(`
@@ -535,7 +535,7 @@ func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_Examples_Passed_To_Backend(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerExamplesAssertingOracle(ip, 3)
 
@@ -555,7 +555,7 @@ func Test_Oracle_Examples_Passed_To_Backend(t *testing.T) {
 }
 
 func Test_Oracle_Examples_From_Variable_Expr(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerExamplesAssertingOracle(ip, 3)
 
@@ -575,7 +575,7 @@ func Test_Oracle_Examples_From_Variable_Expr(t *testing.T) {
 }
 
 func Test_Oracle_Examples_From_Expression(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerJSONParse(ip)
 	registerExamplesAssertingOracle(ip, 2)
 
@@ -593,7 +593,7 @@ func Test_Oracle_Examples_From_Expression(t *testing.T) {
 
 // Already had a transport error test; add one more variant: backend returns empty -> annotated null
 func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
 
 	v, err := ip.EvalSource(`
@@ -607,7 +607,7 @@ func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	// We don't care about the result here; we only want the prompt.
 	// Returning "null" avoids needing jsonParse in this test.
 	registerFakeOracle(ip, "null")

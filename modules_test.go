@@ -49,7 +49,7 @@ func chdir(t *testing.T, dir string) func() {
 
 // importCode(name, src) builds an isolated module (no cache registration).
 func Test_ImportCode_Simple(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	v := evalWithIP(t, ip, `
 let m = importCode("mem.calc", "
@@ -72,7 +72,7 @@ func Test_FileImport_Simple_And_DefaultExt(t *testing.T) {
 let inc = fun(n: Int) -> Int do return(n + 1) end
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// import("m1") should find m1.ms via default extension
 	v := evalWithIP(t, ip, `
@@ -93,15 +93,15 @@ let b = import("b")
 let y = b.x + 2
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
 let a = import("a")
 a.y`)
 	wantInt(t, v, 12)
 }
 
-// Search via MINDSCRIPT_PATH when not found in importer dir or CWD.
-func Test_FileImport_Search_MINDSCRIPT_PATH(t *testing.T) {
+// Search via MindScriptPath when not found in importer dir or CWD.
+func Test_FileImport_Search_MindScriptPath(t *testing.T) {
 	lib, done := withTempDir(t)
 	defer done()
 
@@ -112,7 +112,12 @@ func Test_FileImport_Search_MINDSCRIPT_PATH(t *testing.T) {
 	_ = os.Setenv(MindScriptPath, lib)
 	defer os.Setenv(MindScriptPath, old)
 
-	ip := NewRuntime()
+	_ = write(t, lib, "std.ms", ``) // or a tiny valid program like: `# std prelude\n`
+	ip, err := NewRuntime()
+	if err != nil {
+		t.Fatalf("NewRuntime failed: %v", err)
+	}
+
 	v := evalWithIP(t, ip, `
 let u = import("util")
 u.name`)
@@ -128,7 +133,7 @@ func Test_FileImport_Cycle_TwoModules(t *testing.T) {
 	_ = write(t, dir, "A.ms", `let b = import("B")`)
 	_ = write(t, dir, "B.ms", `let a = import("A")`)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `import("A")`)
 	wantAnnotatedNullContains(t, v, "import cycle")
 	wantAnnotatedNullContains(t, v, "A -> B -> A")
@@ -143,7 +148,7 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 	_ = write(t, dir, "bad.ms", `let x = (1 +`)
 	_ = write(t, dir, "boom.ms", `1 / 0`)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// 1) Parse error → HARD (Go error). Must mention the file and "parse error".
@@ -213,7 +218,7 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 
 // Contractual mistakes (arity/type) are hard errors.
 func Test_ContractualMistakes_Are_Hard(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Too many arguments → hard error.
 	// (fun(x:Int) -> Int do x end)(1, 2)
@@ -242,7 +247,7 @@ func Test_SoftOperationalErrors_Are_Soft(t *testing.T) {
 	defer done()
 	defer chdir(t, dir)()
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Import of non-existent module → soft error (annotated null).
 	v, err := ip.EvalSource(`import("does_not_exist")`)
@@ -269,7 +274,7 @@ func Test_Module_MapLike_Writable_NoNamespaceCollision(t *testing.T) {
 let x = 2
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	// Use block-form if/then/else with 'end', per grammar.
 	v := evalWithIP(t, ip, `
 let x = 1
@@ -297,7 +302,7 @@ let x = 5
 let get = fun() -> Int do return(x) end
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	// Expect a*10 + b == 57 where a=get() before patch (5) and b after patch (7).
 	v := evalWithIP(t, ip, `
 let m = import("m")
@@ -320,7 +325,7 @@ let x = 41
 let inc = fun(n: Int) -> Int do return(n + 1) end
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Object pattern requires "key : pattern" entries (no shorthand).
 	v := evalWithIP(t, ip, `
@@ -346,7 +351,7 @@ let a = 1
 let b = 2
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
 let m = import("m")
 let total = 0
@@ -367,7 +372,7 @@ func Test_FileImport_Builtins_Accessible(t *testing.T) {
 let js = jsonStringify({a: 1})
 `)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
 let u = import("util")
 u.js`)
@@ -382,7 +387,7 @@ func Test_Isolation_No_Leak_To_User_Global(t *testing.T) {
 
 	_ = write(t, dir, "mod.ms", `let hidden = 123`)
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	// Import should not define "hidden" in the caller's env; referencing it is a hard error now.
 	_, err := ip.EvalSource(`
 let _ = import("mod")
@@ -407,7 +412,7 @@ func Test_HTTP_Import_Simple(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Explicit .ms
 	v1 := evalWithIP(t, ip, `

@@ -87,7 +87,12 @@ func runFile(path string) int {
 		return 1
 	}
 
-	ip := mindscript.NewRuntime()
+	ip, err := mindscript.NewRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
 	v, err := ip.EvalSource(string(src))
 	if err != nil {
 		// Parse/Lex errors are already pretty-printed by the library.
@@ -100,7 +105,7 @@ func runFile(path string) int {
 
 func runEvalString(code string) int {
 	// -e mode: keep colors OFF (library default).
-	ip := mindscript.NewRuntime()
+	ip, _ := mindscript.NewRuntime()
 	v, err := ip.EvalSource(code)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
@@ -128,7 +133,11 @@ func runREPL() int {
 		_ = f.Close()
 	}
 
-	ip := mindscript.NewRuntime()
+	ip, err := mindscript.NewRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, red(err.Error()))
+		os.Exit(1)
+	}
 
 	for {
 		// Accumulate possibly-multiline input until parser says it's complete.
@@ -154,7 +163,6 @@ func runREPL() int {
 		// Evaluate (persistent session)
 		v, err := ip.EvalPersistentSource(code)
 		if err != nil {
-			// Now includes RUNTIME ERROR snippets (thanks to errors.go change).
 			fmt.Fprintln(os.Stderr, red(err.Error()))
 			continue
 		}
@@ -190,8 +198,13 @@ func handleReplCommand(ip *mindscript.Interpreter, ln *liner.State, line string)
 		return true
 
 	case ":reset":
-		// fresh runtime (built-ins only)
-		*ip = *mindscript.NewRuntime()
+		newIP, err := mindscript.NewRuntime()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, red(err.Error()))
+			fmt.Fprintln(os.Stderr, "reset aborted; keeping current interpreter.")
+			break
+		}
+		*ip = *newIP
 		fmt.Println("interpreter reset.")
 
 	case ":load":

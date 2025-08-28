@@ -307,12 +307,6 @@ func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
 	return ip._exec.evalAST(ast, env)
 }
 
-// EvalASTUncaught evaluates an AST and **never returns an error**.
-// Runtime failures are returned as annotated null Values (legacy behavior).
-func (ip *Interpreter) EvalASTUncaught(ast S, env *Env, topBlockToSameEnv bool) Value {
-	return ip._exec.evalASTUncaught(ast, env, topBlockToSameEnv)
-}
-
 // Apply applies a function Value to a list of arguments with correct scoping,
 // type-checking, and currying semantics.
 func (ip *Interpreter) Apply(fn Value, args []Value) Value {

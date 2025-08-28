@@ -40,7 +40,7 @@ func setBuiltinDoc(ip *Interpreter, name, doc string) {
 }
 
 // NewRuntime returns a fully-initialized interpreter with std builtins.
-func NewRuntime() *Interpreter {
+func NewRuntime() (*Interpreter, error) {
 	ip := NewInterpreter()
 
 	// standard native builtins
@@ -60,52 +60,47 @@ func NewRuntime() *Interpreter {
 	registerProcessBuiltins(ip)
 	registerOsBuiltins(ip)
 
-	// standard library
-	ip.LoadPrelude("std", "")
+	if err := ip.LoadPrelude("std.ms", ""); err != nil {
+		return nil, err
+	}
 
-	return ip
+	return ip, nil
 }
 
 // LoadPrelude resolves `spec` (filesystem or absolute http(s) URL), parses it,
 // and executes the prelude directly in the interpreter's Core environment.
-// On success it returns nil. On failure it returns a descriptive error,
-// mirroring the module loader's error semantics (parse/runtime/cycle messages).
+// On success it returns nil. On failure it returns a descriptive error
+// (LEXICAL/PARSE/RUNTIME with caret snippets where available).
 func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
-	// 1) Resolve + fetch (supports CWD, importer dir, MINDSCRIPT_PATH, http(s))
+	// 1) Resolve + fetch
 	src, display, _, err := resolveAndFetch(spec, importer)
 	if err != nil {
 		return err
 	}
 
-	// 2) Parse with source-wrapped diagnostics
-	ast, perr := parseSource(display, src)
+	// 2) Parse with spans for caret diagnostics
+	ast, spans, perr := ParseSExprWithSpans(src)
 	if perr != nil {
-		return perr
+		return WrapErrorWithSource(perr, src) // LEXICAL/PARSE with caret
 	}
 
-	// 3) Evaluate in Core, surfacing failures like modules do
-	var rterr error
-	var res Value
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				switch sig := r.(type) {
-				case rtErr:
-					rterr = fmt.Errorf("runtime error in %s: %s", display, sig.msg)
-				default:
-					rterr = fmt.Errorf("runtime panic in %s: %v", display, r)
-				}
-			}
-		}()
-		if len(ast) > 0 {
-			// Uncaught mode -> annotated nulls instead of errors; we convert below.
-			res = ip.EvalASTUncaught(ast, ip.Core, true)
-		}
-	}()
-
-	// Annotated-null means a user/runtime failure; upgrade to error.
-	if rterr == nil && res.Tag == VTNull && res.Annot != "" {
-		rterr = fmt.Errorf("runtime error in %s: %s", display, res.Annot)
+	// 3) Evaluate in Core. We want real errors for VM runtime failures,
+	//    *and* we also want to treat annotated-null as an error.
+	v, rterr := ip.runTopWithSource(ast, ip.Core /*uncaught=*/, false, &SourceRef{
+		Name:  display,
+		Src:   src,
+		Spans: spans,
+	})
+	if rterr != nil {
+		return rterr // already a caret RUNTIME ERROR
 	}
-	return rterr
+
+	// Top-level returned an annotated null → promote to runtime error.
+	if v.Tag == VTNull && v.Annot != "" {
+		// We can’t map a PC here (it wasn’t a VM runtime error), so keep the
+		// existing module-like message shape:
+		return fmt.Errorf("runtime error in %s: %s", display, v.Annot)
+	}
+
+	return nil
 }

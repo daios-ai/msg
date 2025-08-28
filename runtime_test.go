@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-func newRT() *Interpreter { return NewRuntime() }
-
 // Pick an ephemeral loopback TCP address like "127.0.0.1:54321"
 func freeLocalAddr(t *testing.T) string {
 	t.Helper()
@@ -56,7 +54,7 @@ func wantAnnotatedContains(t *testing.T, v Value, substr string) {
 }
 
 func Test_RT_Builtins_isType_And_typeOf(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// isType with explicit Type value
 	v := evalWithIP(t, ip, `isType(42, type Int)`)
@@ -76,7 +74,7 @@ func Test_RT_Builtins_isType_And_typeOf(t *testing.T) {
 }
 
 func Test_RT_Builtins_import_FailurePath(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// With no ModuleLoader configured, import should produce a clear annotated-null
 	v := evalWithIP(t, ip, `import("does-not-exist")`)
@@ -86,7 +84,7 @@ func Test_RT_Builtins_import_FailurePath(t *testing.T) {
 // ---------------- Concurrency ----------------
 
 func Test_RT_Spawn_Join_ClosureIsolation(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// capture a value into a zero-arg fun and spawn it
 	fn := evalWithIP(t, ip, `
@@ -132,7 +130,7 @@ r
 }
 
 func Test_RT_Channel_Close_RecvAfterClose(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
 		let c = chanOpen()
 		chanClose(c)
@@ -144,7 +142,7 @@ func Test_RT_Channel_Close_RecvAfterClose(t *testing.T) {
 // ---------------- Networking ----------------
 
 func Test_RT_Net_Listen_Accept_Echo(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	addr := freeLocalAddr(t)
 	ip.Global.Define("ADDR", Str(addr))
@@ -183,7 +181,7 @@ func Test_RT_Net_Listen_Accept_Echo(t *testing.T) {
 // ---------------- I/O ----------------
 
 func Test_RT_IO_File_ReadWrite_DirList(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	dir := t.TempDir()
 	p := filepath.Join(dir, "a.txt")
@@ -230,7 +228,7 @@ func Test_RT_IO_File_ReadWrite_DirList(t *testing.T) {
 }
 
 func Test_RT_IO_ReadN_ReadAll(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	p := filepath.Join(t.TempDir(), "buf.txt")
 	_ = os.WriteFile(p, []byte("abcdef"), 0o644)
 	ip.Global.Define("p", Str(p))
@@ -251,7 +249,7 @@ func Test_RT_IO_ReadN_ReadAll(t *testing.T) {
 // ---------------- Introspection & Docs ----------------
 
 func Test_RT_Introspection_funInfo_funType_TypeUtils_Docs(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// Annotated function with param types & return type
 	fn := evalWithIP(t, ip, `
@@ -314,7 +312,7 @@ fun(x:Int) -> Int do x + 1 end
 // ---------------- Utilities: time/rand/json ----------------
 
 func Test_RT_Utilities_Time_Rand_JSON(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// nowMillis & sleep: ensure time advances
 	t0 := evalWithIP(t, ip, `nowMillis()`)
@@ -353,7 +351,7 @@ func Test_RT_Utilities_Time_Rand_JSON(t *testing.T) {
 
 // Variance: (Num->Int) <: (Int->Num) is actually TRUE
 func Test_RT_IsSubtype_Variance_And_Basics(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// (Num -> Int) <: (Int -> Num)  — params contravariant, returns covariant → true
 	v := evalWithIP(t, ip, `isSubtype(type (Num -> Int), type (Int -> Num))`)
@@ -370,7 +368,7 @@ func Test_RT_IsSubtype_Variance_And_Basics(t *testing.T) {
 
 // importCode: success + parse error + runtime error
 func Test_RT_ImportCode_Success_ParseError_RuntimeError(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// success: returns a Module with an exported binding
 	mod := evalWithIP(t, ip, `
@@ -398,7 +396,7 @@ func Test_RT_ImportCode_Success_ParseError_RuntimeError(t *testing.T) {
 }
 
 func Test_RT_Import_TypeChecks_And_StringPath(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// Contract violation: wrong type for 'path' → hard error.
 	_, err := ip.EvalSource(`import(42)`)
@@ -410,7 +408,7 @@ func Test_RT_Import_TypeChecks_And_StringPath(t *testing.T) {
 }
 
 func Test_RT_GetEnv_Shadows_And_Order(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	out := evalWithIP(t, ip, `
       let x = "outer"
       do
@@ -430,7 +428,7 @@ func Test_RT_GetEnv_Shadows_And_Order(t *testing.T) {
 }
 
 func Test_RT_MapHas_And_MapDelete_Order_And_Ann(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
       let m = {
         # first
@@ -469,7 +467,7 @@ func Test_RT_MapHas_And_MapDelete_Order_And_Ann(t *testing.T) {
 // ---------------- std_io_net: file/net edge cases ----------------
 
 func Test_RT_IO_Open_Modes_And_WriteCount(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	path := filepath.Join(t.TempDir(), "w.txt")
 	ip.Global.Define("p", Str(path))
 
@@ -486,7 +484,7 @@ func Test_RT_IO_Open_Modes_And_WriteCount(t *testing.T) {
 }
 
 func Test_RT_IO_ReadWrite_Permissions_And_Errors(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	path := filepath.Join(t.TempDir(), "g.txt")
 	ip.Global.Define("p", Str(path))
 
@@ -525,7 +523,7 @@ func Test_RT_IO_ReadWrite_Permissions_And_Errors(t *testing.T) {
 }
 
 func Test_RT_Net_Error_Paths(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	// Connect to an unused local port
 	addr := freeLocalAddr(t) // frees immediately; likely unused
 	ip.Global.Define("ADDR", Str(addr))
@@ -536,7 +534,7 @@ func Test_RT_Net_Error_Paths(t *testing.T) {
 // ---------------- std_sys: clone, cast, strings, math, date, cancel ----------------
 
 func Test_RT_Clone_DeepCopy_Arrays_And_Maps(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	// Build a map with an annotated key and a small array; clone both and mutate originals
 	v := evalWithIP(t, ip, `
       let m = {
@@ -580,7 +578,7 @@ func Test_RT_Clone_DeepCopy_Arrays_And_Maps(t *testing.T) {
 	}
 }
 func Test_RT_Sleep_Increases_NowMillis(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
       let t0 = nowMillis()
       sleep(5)
@@ -593,7 +591,7 @@ func Test_RT_Sleep_Increases_NowMillis(t *testing.T) {
 }
 
 func Test_RT_Cast_Str_Int_Num_Bool(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// str on arrays/maps → JSON
 	s := evalWithIP(t, ip, `str({x:1, y:[2,3]})`)
@@ -637,7 +635,7 @@ func Test_RT_Cast_Str_Int_Num_Bool(t *testing.T) {
 }
 
 func Test_RT_String_Utilities(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	out := evalWithIP(t, ip, `
       {
         sub: substr("héllo", 1, 4),
@@ -669,7 +667,7 @@ func Test_RT_String_Utilities(t *testing.T) {
 }
 
 func Test_RT_Math_And_Constants(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `
       { s: sin(0.0), c: cos(0.0), e: exp(0.0), p: pow(2.0,3.0), pi: PI, ee: E }
     `)
@@ -686,7 +684,7 @@ func Test_RT_Math_And_Constants(t *testing.T) {
 }
 
 func Test_RT_DateNow_Structure(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `dateNow()`)
 	if v.Tag != VTMap {
 		t.Fatalf("dateNow should return map, got %#v", v)
@@ -700,7 +698,7 @@ func Test_RT_DateNow_Structure(t *testing.T) {
 }
 
 func Test_RT_ProcCancel_Smoke(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	fn := evalWithIP(t, ip, `fun() do 0 end`)
 	ip.Global.Define("f", fn)
@@ -716,7 +714,7 @@ func Test_RT_ProcCancel_Smoke(t *testing.T) {
 }
 
 func Test_RT_IO_Open_RW_Mode_ReadAfterWrite(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 	path := filepath.Join(t.TempDir(), "rw.txt")
 	ip.Global.Define("p", Str(path))
 
@@ -735,7 +733,7 @@ func Test_RT_IO_Open_RW_Mode_ReadAfterWrite(t *testing.T) {
 
 // ---------- error(message) ----------
 func Test_RT_Error_Raises_RuntimeError(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// Explicit failure surfaces as a HARD error right now.
 	_, err := ip.EvalSource(`fail("boom")`)
@@ -751,7 +749,7 @@ func Test_RT_Error_Raises_RuntimeError(t *testing.T) {
 // ---------- sprintf / printf ----------
 
 func Test_RT_Sprintf_Basics_And_Literals(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// %s and %d basics; args passed as an array
 	v := evalWithIP(t, ip, `
@@ -773,7 +771,7 @@ func Test_RT_Sprintf_Basics_And_Literals(t *testing.T) {
 }
 
 func Test_RT_Printf_Returns_Printed_Value(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// Basic %s / %d formatting with array args
 	v := evalWithIP(t, ip, `printf("%s-%d", ["hi", 7])`)
@@ -788,7 +786,7 @@ func Test_RT_Printf_Returns_Printed_Value(t *testing.T) {
 	}
 }
 func Test_RT_len_On_Arr_Map_Str_And_Other(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// array
 	vArr := evalWithIP(t, ip, `
@@ -826,7 +824,7 @@ func Test_RT_len_On_Arr_Map_Str_And_Other(t *testing.T) {
 }
 
 func Test_RT_Regex_Match_And_Replace(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	// match → [Str]
 	vm := evalWithIP(t, ip, `
@@ -850,7 +848,7 @@ func Test_RT_Regex_Match_And_Replace(t *testing.T) {
 }
 
 func Test_RT_Sprintf_Does_Not_Interfere_With_IO(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	path := filepath.Join(t.TempDir(), "out.txt")
 	ip.Global.Define("p", Str(path))
@@ -869,7 +867,7 @@ func Test_RT_Sprintf_Does_Not_Interfere_With_IO(t *testing.T) {
 }
 
 func Test_RT_Import_Retry_After_Parse_Error(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mod.ms")
@@ -893,7 +891,7 @@ func Test_RT_Import_Retry_After_Parse_Error(t *testing.T) {
 }
 
 func Test_RT_Import_Retry_After_Runtime_Error(t *testing.T) {
-	ip := newRT()
+	ip, _ := NewRuntime()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mod.ms")
@@ -925,7 +923,7 @@ func Test_RT_Import_Retry_After_Runtime_Error(t *testing.T) {
 
 // Builtin: typeToJSONSchema — honors value-level and key-level descriptions + required
 func Test_RT_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	src := `
 		let T = 
@@ -1002,7 +1000,7 @@ func Test_RT_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
 
 // Builtin: typeStringToJSONSchema — end-to-end parse→convert
 func Test_RT_TypeStringToJSONSchema_Convenience(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	src := `
 		typeStringToJSONSchema("# the doc\n{ name!: Str, age: Int? }")
@@ -1035,7 +1033,7 @@ func Test_RT_TypeStringToJSONSchema_Convenience(t *testing.T) {
 
 // Builtin: jsonSchemaStringToType — end-to-end parse→convert
 func Test_RT_JSONSchemaStringToType_Convenience(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	out, err := ip.EvalSource(`jsonSchemaStringToType("{\"type\":\"array\",\"items\":{\"type\":\"number\"}}")`)
 	if err != nil {
 		t.Fatalf("Eval error: %v", err)
@@ -1050,7 +1048,7 @@ func Test_RT_JSONSchemaStringToType_Convenience(t *testing.T) {
 
 // Builtin: typeToJSONSchema — aliases produce $defs + $ref
 func Test_RT_TypeToJSONSchema_WithAliasAndDefs(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Person references itself via a nullable field, forcing $defs + $ref.
 	src := `
@@ -1096,7 +1094,7 @@ func Test_RT_TypeToJSONSchema_WithAliasAndDefs(t *testing.T) {
 
 // Roundtrip: JSON with $defs/$ref -> Type -> JSON, preserve $defs + description
 func Test_RT_Roundtrip_JSON_WithDefsAndRefs(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	src := `
 		let schema = {
@@ -1145,7 +1143,7 @@ func Test_RT_Roundtrip_JSON_WithDefsAndRefs(t *testing.T) {
 // Error paths: bad inputs handled by builtins
 
 func Test_RT_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Intentionally malformed type text (unterminated object) — soft failure (annotated null)
 	src := `typeStringToJSONSchema("{ name!: Str, ")`
@@ -1159,7 +1157,7 @@ func Test_RT_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *testing.T) {
 }
 
 func Test_RT_JSONSchemaStringToType_BadJSON(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Bad JSON currently surfaces as a HARD error (return type mismatch)
 	_, err := ip.EvalSource(`jsonSchemaStringToType("{ invalid json }")`)
@@ -1167,7 +1165,7 @@ func Test_RT_JSONSchemaStringToType_BadJSON(t *testing.T) {
 }
 
 func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	out, err := ip.EvalSource(`jsonSchemaToType("not an object")`)
 	if err != nil {
@@ -1179,7 +1177,7 @@ func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
 }
 
 func Test_RT_BaseType_StripsNullable_AndResolvesAliases(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 	src := `let T = type Int?
 	baseType(T)
 	`
@@ -1202,7 +1200,7 @@ func Test_RT_BaseType_StripsNullable_AndResolvesAliases(t *testing.T) {
 // --------- Prelude loading ---------------------
 
 func Test_RT_LoadPrelude_BindsToCore(t *testing.T) {
-	ip := NewRuntime()
+	ip, _ := NewRuntime()
 
 	// Create a temporary prelude that defines a simple builtin.
 	td := t.TempDir()
@@ -1240,7 +1238,8 @@ func Test_RT_LoadPrelude_BindsToCore(t *testing.T) {
 }
 
 func Test_RT_LoadPrelude_FailurePath(t *testing.T) {
-	ip := NewRuntime()
+	// Start from a bare interpreter so this test controls what gets loaded.
+	ip := NewInterpreter()
 
 	// Prelude with a runtime failure (unsupported '+' operands) must surface as error.
 	td := t.TempDir()

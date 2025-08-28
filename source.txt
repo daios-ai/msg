@@ -1,1210 +1,864 @@
-=== BEGIN FILE: printer.go ===
-// printer.go: pretty-printers for MindScript ASTs, types, and runtime values.
+=== BEGIN FILE: types.go ===
+// types.go: runtime type & schema system for MindScript.
 //
-// What this file does
-// -------------------
-// This module provides the formatting layer for MindScript. It renders three
-// kinds of data to human-readable, stable strings:
+// IMPLEMENTATION-ONLY FILE
+// ------------------------
+// This file contains the *private implementation* of the type engine used by
+// the public methods on *Interpreter* that live in interpreter.go:
 //
-//  1. Parsed source ASTs (S-expressions) → MindScript source code.
-//     - Entry points: Pretty, Standardize, FormatSExpr.
-//     - Produces whitespace- and newline-stable output with minimal
-//     parentheses, based on operator precedence. It understands all
-//     statement and expression tags emitted by the parser (e.g. "fun",
-//     "oracle", "for", "if/elif/else", "type", "block", "assign",
-//     "return/break/continue", arrays, maps, calls, indexing, properties,
-//     unary and binary operators).
-//     - Annotation nodes ("annot", ("str", text), <node>, preBool) are supported
-//     in both PRE and POST forms. PRE annotations print as `# ...` lines
-//     immediately above the construct; POST annotations print as `# ...` lines
-//     immediately after the construct.
-//     - Property names are emitted bare if they are identifier-like, otherwise
-//     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
-//     are rendered in a compact, readable form.
-//     - Formatting emits no space before '(' for calls and for 'fun(...)'
-//     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
+//	ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
 //
-//  2. Type ASTs (S-expressions) → compact type strings.
-//     - Entry point: FormatType.
-//     - Supported forms:
-//     ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
-//     ("unop","?", T)         → prints as `T?`
-//     ("array", T)            → prints as `[T]`
-//     ("map", ("pair"| "pair!", ("str",k), T) ...)
-//     Required fields print with a trailing `!` on the key.
-//     Key/value annotations (if wrapped in "annot") become `# ...` lines.
-//     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
-//     may be scalars, arrays, or maps.
-//     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
-//     right-associated chains.
-//     - Output is stable. Multi-line maps are rendered with sorted keys to
-//     avoid visual churn.
+// Those exported methods are thin wrappers that delegate to the lower-case
+// functions defined here: resolveType, isType, isSubtype, unifyTypes,
+// valueToTypeS (plus helpers like litToValue/equalS).
 //
-//  3. Runtime values (Value) → width-aware strings.
-//     - Entry point: FormatValue.
-//     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
-//     - Arrays and maps prefer a single-line rendering if it fits the
-//     MaxInlineWidth budget and no elements/keys force multi-line; else
-//     they fall back to pretty, multi-line output with indentation.
-//     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
-//     - Per-value annotations (Value.Annot) and per-key annotations in maps
-//     (MapObject.KeyAnn[name]) are printed as `# ...` header lines.
-//     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
-//     - Types (VTType) are printed by extracting the embedded type AST and
-//     delegating to FormatType.
-//     - Modules print as `<module: <pretty name>>` when available.
+// Goals / design (practical, JSON-friendly, duck-typed):
 //
-// Dependencies (other files)
+// OVERVIEW
+// --------
+// This file implements MindScript’s *runtime* type system. Types are represented
+// as S-expressions (the same light-weight shape the parser produces) and remain
+// entirely structural. The system is designed for practical, JSON-friendly
+// validation and inference:
+//
+//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
+//     {name:"Pedro"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
+//     Arrays unify element types conservatively; objects are “open-world”.
+//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
+//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
+//   - Arrays are covariant in element type.
+//   - Objects require that all *required* fields of `B` exist, with compatible
+//     types, and *requiredness cannot be relaxed*.
+//   - Extra fields on values are allowed (open-world).
+//   - Functions use parameter contravariance and return covariance.
+//   - `Int <: Num`, and `T?` means nullable.
+//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
+//     inference (e.g., arrays with mixed contents).
+//   - `ResolveType(T, env)` resolves identifiers bound to `VTType` in `env`,
+//     with cycle protection and resolution using the alias’s own environment.
+//   - Enums are finite sets of *literal* values (null/bool/int/num/str/array/map).
+//     Their typing, subtyping, and unification follow intuitive set semantics.
+//
+// TYPE SYNTAX (as S)
+// ------------------
+//
+//	("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
+//	("unop","?", T)                                // nullable T?
+//	("array", T)                                   // homogeneous arrays
+//	("map", ("pair" | "pair!", ("str",k), T) ...)  // object schema; "pair!" = required
+//	("enum", literalS, ...)                        // finite set of literal values
+//	("binop","->", A, B)                           // function A -> B (right-assoc)
+//
+// DEPENDENCIES (other files)
 // --------------------------
 // • parser.go
-//   - S = []any (AST payload shape)
-//   - ParseSExpr(string) / ParseSExprInteractive (used by Pretty/Standardize)
-//   - AST tags: "block", "fun", "oracle", "for", "while", "if",
-//     "type", "return", "break", "continue", "assign", "array", "map",
-//     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
-//     "null", "unop", "binop", "decl", "darr", "dobj", "annot", "noop".
+//   - `type S = []any`  (S-expression node type)
 //
-// • interpreter.go (runtime model)
-//   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
-//     VTFun, VTType, VTModule, VTHandle)
-//   - Fun, TypeValue, MapObject (Entries/KeyAnn/Keys).
+// • interpreter.go
+//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
+//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
+//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
+//   - Environments: `Env` with `Get/Set/Define`
+//   - `type Interpreter` (receiver for public API methods)
 //
-// • modules.go (module loader)
-//   - Module struct and prettySpec(string) (used for VTModule display).
+// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
 //
-// • errors.go (shared errors)
-//   - WrapErrorWithSource(err, src) (used by Pretty/Standardize).
+// PUBLIC VS PRIVATE
+// -----------------
+// PUBLIC  : Nothing.
 //
-// PUBLIC vs PRIVATE layout
-// ------------------------
-// This file is organized in two blocks:
-//  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
-//  2. PRIVATE: helper types and functions that implement the printers.
+// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
 //
-// Formatting policy highlights
-// ----------------------------
-//   - Indentation uses **tabs** only (gofmt-style).
-//   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
+//	isSubtype, unifyTypes, valueToTypeS, literal conversion,
+//	structural S-equality, and field extraction.
 package mindscript
-
-import (
-	"fmt"
-	"sort"
-	"strconv"
-	"strings"
-)
-
-// ==============================
-// ========== PUBLIC ============
-// ==============================
-
-// MaxInlineWidth controls when arrays/maps are rendered on a single line by
-// FormatValue. If the one-line candidate exceeds this many characters, or if
-// any element/key is annotated or multiline by nature, the value is rendered
-// across multiple lines with indentation. This setting is read at call time
-// and may be changed between calls.
-var MaxInlineWidth = 80
-
-// Pretty parses a MindScript source string and returns a formatted version.
-//
-// Behavior:
-//   - Parses src via ParseSExpr. If parsing fails, the error is wrapped with
-//     source context via WrapErrorWithSource.
-//   - On success, pretty-prints the AST using FormatSExpr, producing stable,
-//     whitespace-normalized code with minimal parentheses.
-//   - Supports PRE/POST annotations: ("annot", ("str", text), X, preBool).
-//
-// Errors:
-//   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
-func Pretty(src string) (string, error) {
-	ast, err := ParseSExpr(src)
-	if err != nil {
-		return "", WrapErrorWithSource(err, src)
-	}
-	return FormatSExpr(ast), nil
-}
-
-// Standardize returns the canonical source form:
-//   - deterministic layout
-//   - indentation using tabs
-//   - exactly one trailing newline
-//
-// It is equivalent to Pretty(src), but ensures precisely one '\n' at the end.
-func Standardize(src string) (string, error) {
-	ast, err := ParseSExpr(src)
-	if err != nil {
-		return "", WrapErrorWithSource(err, src)
-	}
-	out := FormatSExpr(ast)
-	if !strings.HasSuffix(out, "\n") {
-		out += "\n"
-	} else {
-		out = strings.TrimRight(out, "\n") + "\n"
-	}
-	return out, nil
-}
-
-// FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
-//
-// Inputs:
-//   - n: an AST produced by parser.go (e.g., the result of ParseSExpr).
-//
-// Output policy:
-//   - Statements (fun/oracle/for/if/type/block/return/break/continue/assign)
-//     are rendered with keywords and indentation.
-//   - Expressions use minimal parentheses according to a fixed precedence table;
-//     property access vs calls/indexing binds tightly.
-//   - Arrays and maps are printed inline (AST form); map key annotations print
-//     as preceding `# ...` lines. Annotation nodes wrap the printed construct.
-//
-// This function does not parse; it strictly formats the provided AST.
-func FormatSExpr(n S) string {
-	var b strings.Builder
-	p := pp{out: out{b: &b}}
-	p.printProgram(n)
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// FormatType renders a type S-expression into a compact, human-readable string.
-//
-// Supported forms (see types.go for the type system):
-//   - ("id", name)              →  name
-//   - ("unop","?", T)           →  T?
-//   - ("array", T)              →  [T]
-//   - ("map", ("pair"| "pair!", ("str",k), T) ...)
-//     Required fields print as `key!:`; keys are quoted if not identifier-like.
-//     Key/value annotations (when wrapped in "annot") emit `# ...` lines above.
-//   - ("enum", lit1, ...)       →  Enum[lit1, ...] ; members may be scalars,
-//     arrays, or maps rendered as type-literals.
-//   - ("binop","->", A, B)      →  (A) -> B ; right-assoc chains flatten.
-//
-// Output is stable; when multi-line, map fields are sorted by key for determinism.
-func FormatType(t S) string {
-	var b strings.Builder
-	o := out{b: &b}
-	writeType(&o, t)
-	return b.String()
-}
-
-// FormatValue renders a runtime Value into a stable, readable string.
-//
-// Layout policy:
-//   - Scalars: null, booleans, ints, floats (with a decimal point for
-//     non-scientific output), and quoted strings.
-//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line and
-//     total length ≤ MaxInlineWidth; otherwise multi-line with indentation.
-//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short
-//     and unannotated, else multi-line with indentation and key/value annotations
-//     emitted as `# ...` header lines.
-//   - Functions: `<fun: name1:T1 -> name2:T2 -> R>` (zero-arg uses `_:Null`).
-//   - Types (VTType): pretty-printed via FormatType.
-//   - Modules: `<module: pretty-name>` when available.
-func FormatValue(v Value) string {
-	var b strings.Builder
-	o := out{b: &b}
-	writeValue(&o, v)
-	return b.String()
-}
 
 //// END_OF_PUBLIC
 
-// ===============================
-// ========= PRIVATE =============
-// ===============================
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
 
-/* ---------- small globals & utilities ---------- */
+// -----------------------------
+// Helpers
+// -----------------------------
 
-func isIdent(s string) bool {
-	if s == "" {
+func isBuiltinTypeName(name string) bool {
+	switch name {
+	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
+		return true
+	default:
 		return false
 	}
-	b := []byte(s)
-	c := b[0]
-	if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+}
+
+func isId(t S, name string) bool {
+	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+}
+
+// ("map", ("pair"| "pair!", ("str",k), T)...)
+type objField struct {
+	required bool
+	typ      S
+}
+
+func mapTypeFields(t S) map[string]objField {
+	fs := map[string]objField{}
+	for i := 1; i < len(t); i++ {
+		p := t[i].(S)
+		if len(p) < 3 {
+			continue
+		}
+		ptag := p[0].(string) // "pair" or "pair!"
+		keyNode := p[1].(S)   // ("str", k)
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			continue
+		}
+		k := keyNode[1].(string)
+		required := ptag == "pair!"
+		fs[k] = objField{required: required, typ: p[2].(S)}
+	}
+	return fs
+}
+
+// Structural equality for S-exprs (no fmt, no allocs).
+func equalS(a, b S) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	for i := 1; i < len(b); i++ {
-		c = b[i]
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+	if len(a) == 0 {
+		return true
+	}
+
+	ta, ok := a[0].(string)
+	if !ok {
+		return false
+	}
+	tb, ok := b[0].(string)
+	if !ok || ta != tb {
+		return false
+	}
+
+	// Order-insensitive equality for maps: compare by field name/required/type.
+	if ta == "map" {
+		fa := mapTypeFields(a)
+		fb := mapTypeFields(b)
+		if len(fa) != len(fb) {
+			return false
+		}
+		for k, va := range fa {
+			vb, ok := fb[k]
+			if !ok || va.required != vb.required || !equalS(va.typ, vb.typ) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Order-insensitive equality for enums: set comparison on literal S-exprs.
+	if ta == "enum" {
+		if len(a) != len(b) { // quick length check
+			return false
+		}
+	outer:
+		for i := 1; i < len(a); i++ {
+			for j := 1; j < len(b); j++ {
+				if equalS(a[i].(S), b[j].(S)) {
+					continue outer
+				}
+			}
+			return false
+		}
+		return true
+	}
+
+	for i := 1; i < len(a); i++ {
+		if !equalNode(a[i], b[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-func quoteString(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '\\':
-			b.WriteString(`\\`)
-		case '"':
-			b.WriteString(`\"`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		default:
-			b.WriteRune(r)
+// Compares two S nodes or scalars used inside S.
+func equalNode(x, y any) bool {
+	switch xv := x.(type) {
+	case []any: // covers S too
+		yv, ok := y.([]any)
+		if !ok {
+			return false
 		}
-	}
-	b.WriteByte('"')
-	return b.String()
-}
-
-type out struct {
-	b     *strings.Builder
-	depth int
-}
-
-func (o *out) write(s string) { o.b.WriteString(s) }
-func (o *out) nl()            { o.b.WriteByte('\n') }
-func (o *out) pad() {
-	for i := 0; i < o.depth; i++ {
-		o.b.WriteByte('\t')
-	}
-}
-func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
-func (o *out) annot(text string) {
-	if text == "" {
-		return
-	}
-	for _, ln := range strings.Split(text, "\n") {
-		o.pad()
-		o.b.WriteString("# " + strings.TrimSpace(ln))
-		o.nl()
-	}
-}
-
-// unwrap VTType payload to its AST (supports legacy S too).
-func typeAst(data any) S {
-	switch tv := data.(type) {
-	case *TypeValue:
-		return tv.Ast
-	case S:
-		return tv
+		return equalS(xv, yv)
+	case string:
+		ys, ok := y.(string)
+		return ok && xv == ys
+	case int64:
+		yi, ok := y.(int64)
+		return ok && xv == yi
+	case float64:
+		yf, ok := y.(float64)
+		return ok && xv == yf
+	case bool:
+		yb, ok := y.(bool)
+		return ok && xv == yb
 	default:
-		return S{}
+		return x == y
 	}
 }
 
-/* ---------- AST helpers: tags, shapes, precedence ---------- */
-
-func tag(n S) string   { return n[0].(string) }
-func getId(n S) string { return n[1].(string) }
-func getStr(n S) string {
-	// Used for ("str", s), but safe for ("id", name) too (both carry string at [1]).
-	return n[1].(string)
-}
-
-// Shape helpers (safe indexing in one place)
-func asUnop(n S) (op string, rhs S)       { return n[1].(string), n[2].(S) }
-func asBinop(n S) (op string, lhs, rhs S) { return n[1].(string), n[2].(S), n[3].(S) }
-func asAssign(n S) (lhs, rhs S)           { return n[1].(S), n[2].(S) }
-func asCall(n S) (recv S, args []S)       { recv = n[1].(S); return recv, listS(n, 2) }
-func asIdx(n S) (recv, idx S)             { return n[1].(S), n[2].(S) }
-func asGet(n S) (recv S, name string)     { return n[1].(S), n[2].(S)[1].(string) }
-func asAnnot(n S) (text string, wrapped S, pre bool) {
-	text = n[1].(S)[1].(string)
-	wrapped = n[2].(S)
-	pre = true
-	if len(n) >= 4 {
-		if b, ok := n[3].(bool); ok {
-			pre = b
-		}
+// Deep equality on Values for the literal space used by enums
+// (null/bool/int/num/str/array/map). Named *Lit* to avoid confusion with
+// (*Interpreter).deepEqual used elsewhere.
+func deepEqualLit(a, b Value) bool {
+	if a.Tag != b.Tag {
+		return false
 	}
-	return
-}
-
-func listS(n S, from int) []S {
-	if len(n) <= from {
-		return nil
-	}
-	out := make([]S, 0, len(n)-from)
-	for i := from; i < len(n); i++ {
-		out = append(out, n[i].(S))
-	}
-	return out
-}
-
-func bracketed(o *out, open, close string, elems []S, emit func(S)) {
-	o.write(open)
-	for i, e := range elems {
-		if i > 0 {
-			o.write(", ")
-		}
-		emit(e)
-	}
-	o.write(close)
-}
-
-func keyOut(o *out, name string) {
-	if isIdent(name) {
-		o.write(name)
-	} else {
-		o.write(quoteString(name))
-	}
-}
-
-var binPrec = map[string]struct {
-	p     int
-	right bool
-}{
-	"->": {15, true},
-	"*":  {70, false}, "/": {70, false}, "%": {70, false},
-	"+": {60, false}, "-": {60, false},
-	"<": {50, false}, "<=": {50, false}, ">": {50, false}, ">=": {50, false},
-	"==": {40, false}, "!=": {40, false},
-	"and": {30, false},
-	"or":  {20, false},
-}
-
-func precOf(n S) int {
-	switch tag(n) {
-	case "assign":
-		return 10
-	case "binop":
-		if pr, ok := binPrec[n[1].(string)]; ok {
-			return pr.p
-		}
-		return 60
-	case "unop":
-		if n[1].(string) == "?" {
-			return 90
-		}
-		return 80
-	case "call", "idx", "get":
-		return 90
-	default:
-		return 100
-	}
-}
-
-/* ---------- source → pretty (AST printer) ---------- */
-
-type pp struct{ out out }
-
-func (p *pp) write(s string) { p.out.write(s) }
-func (p *pp) nl()            { p.out.nl() }
-func (p *pp) pad()           { p.out.pad() }
-func (p *pp) sp()            { p.write(" ") }
-
-func (p *pp) printMin(n S, need int) {
-	if precOf(n) < need {
-		p.write("(")
-		p.printExpr(n)
-		p.write(")")
-		return
-	}
-	p.printExpr(n)
-}
-func (p *pp) recv90(n S) { p.printMin(n, 90) }
-
-func (p *pp) bin(op string, l, r S) {
-	my := 60
-	if pr, ok := binPrec[op]; ok {
-		my = pr.p
-	}
-	p.printMin(l, my)
-	p.write(" " + op + " ")
-	p.printMin(r, my)
-}
-
-func (p *pp) printProgram(n S) {
-	if tag(n) != "block" {
-		p.printStmt(n)
-		return
-	}
-	for i, k := range listS(n, 1) {
-		p.printStmt(k)
-		if i < len(listS(n, 1))-1 {
-			p.nl()
-		}
-	}
-}
-
-func (p *pp) kwCall(name string, arg S) {
-	p.pad()
-	p.write(name)
-	p.write("(")
-	p.printExpr(arg)
-	p.write(")")
-}
-
-func (p *pp) kwBlock(header func(), body S) {
-	p.pad()
-	header()
-	p.sp()
-	p.write("do")
-	p.nl()
-	p.out.withIndent(func() { p.printBlock(body) })
-	if len(body) > 1 {
-		p.nl()
-	}
-	p.pad()
-	p.write("end")
-}
-
-func (p *pp) callableHeader(kind string, params, outT S) {
-	p.write(kind)
-	p.write("(")
-	p.printParams(params)
-	p.write(")")
-	if !(tag(outT) == "id" && getId(outT) == "Any") {
-		p.sp()
-		p.write("->")
-		p.sp()
-		p.printExpr(outT)
-	}
-}
-
-func isEmptyArray(n S) bool { return tag(n) == "array" && len(n) == 1 }
-
-func (p *pp) printAnnotStmt(n S) {
-	text, wrapped, pre := asAnnot(n)
-	if pre {
-		p.out.annot(text)
-		p.printStmt(wrapped)
-	} else {
-		p.printStmt(wrapped)
-		p.nl()
-		p.out.annot(text)
-	}
-}
-
-func (p *pp) printStmt(n S) {
-	switch tag(n) {
-	case "noop":
-		return
-	case "annot":
-		p.printAnnotStmt(n)
-
-	case "fun":
-		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
-		p.kwBlock(func() { p.callableHeader("fun", params, ret) }, body)
-
-	case "oracle":
-		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
-		p.pad()
-		p.callableHeader("oracle", params, outT)
-		if !isEmptyArray(src) {
-			p.sp()
-			p.write("from ")
-			p.printExpr(src)
-		}
-
-	case "for":
-		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
-		p.kwBlock(func() {
-			p.write("for ")
-			if isDeclPattern(tgt) {
-				if tag(tgt) == "decl" {
-					p.write("let ")
-					p.printPattern(tgt)
-				} else {
-					p.printPattern(tgt)
-				}
-			} else {
-				p.printExpr(tgt)
-			}
-			p.sp()
-			p.write("in ")
-			p.printExpr(iter)
-		}, body)
-
-	case "while":
-		cond, body := n[1].(S), n[2].(S)
-		p.kwBlock(func() { p.write("while "); p.printExpr(cond) }, body)
-
-	case "if":
-		arms := listS(n, 1)
-		first := arms[0]
-		p.pad()
-		p.write("if ")
-		p.printExpr(first[1].(S))
-		p.sp()
-		p.write("then")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(first[2].(S)) })
-		if len(first[2].(S)) > 1 {
-			p.nl()
-		}
-		i := 1
-		for i < len(arms) && tag(arms[i]) == "pair" {
-			arm := arms[i]
-			p.pad()
-			p.write("elif ")
-			p.printExpr(arm[1].(S))
-			p.sp()
-			p.write("then")
-			p.nl()
-			p.out.withIndent(func() { p.printBlock(arm[2].(S)) })
-			if len(arm[2].(S)) > 1 {
-				p.nl()
-			}
-			i++
-		}
-		if i < len(arms) {
-			elseBlk := arms[i]
-			p.pad()
-			p.write("else")
-			p.nl()
-			p.out.withIndent(func() { p.printBlock(elseBlk) })
-			if len(elseBlk) > 1 {
-				p.nl()
-			}
-		}
-		p.pad()
-		p.write("end")
-
-	case "type":
-		p.pad()
-		p.write("type ")
-		p.printExpr(n[1].(S))
-
-	case "return":
-		p.kwCall("return", n[1].(S))
-	case "break":
-		p.kwCall("break", n[1].(S))
-	case "continue":
-		p.kwCall("continue", n[1].(S))
-
-	case "assign":
-		lhs, rhs := asAssign(n)
-		p.pad()
-		if isDeclPattern(lhs) {
-			p.write("let ")
-			p.printPattern(lhs)
-			p.sp()
-			p.write("=")
-			p.sp()
-			p.printExpr(rhs)
-		} else {
-			p.printExpr(lhs)
-			p.sp()
-			p.write("=")
-			p.sp()
-			p.printExpr(rhs)
-		}
-
-	case "block":
-		p.pad()
-		p.write("do")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(n) })
-		if len(n) > 1 {
-			p.nl()
-		}
-		p.pad()
-		p.write("end")
-
-	default:
-		p.pad()
-		p.printExpr(n)
-	}
-}
-
-func (p *pp) printBlock(n S) {
-	if tag(n) != "block" {
-		p.printStmt(n)
-		return
-	}
-	kids := listS(n, 1)
-	for i, k := range kids {
-		p.printStmt(k)
-		if i < len(kids)-1 {
-			p.nl()
-		}
-	}
-}
-
-func (p *pp) printParams(arr S) {
-	if tag(arr) != "array" || len(arr) == 1 {
-		return
-	}
-	items := listS(arr, 1)
-	for i, pi := range items {
-		p.write(getId(pi[1].(S)))
-		ty := pi[2].(S)
-		if !(tag(ty) == "id" && getId(ty) == "Any") {
-			p.write(": ")
-			p.printExpr(ty)
-		}
-		if i < len(items)-1 {
-			p.write(", ")
-		}
-	}
-}
-
-func (p *pp) printCommaList(xs []S, emit func(S)) {
-	for i, a := range xs {
-		if i > 0 {
-			p.write(", ")
-		}
-		emit(a)
-	}
-}
-
-func (p *pp) printExpr(n S) {
-	switch tag(n) {
-	case "id":
-		p.write(getId(n))
-	case "int":
-		p.write(fmt.Sprint(n[1]))
-	case "num":
-		s := strconv.FormatFloat(n[1].(float64), 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		p.write(s)
-	case "str":
-		p.write(quoteString(getStr(n)))
-	case "bool":
-		if n[1].(bool) {
-			p.write("true")
-		} else {
-			p.write("false")
-		}
-	case "null":
-		p.write("null")
-
-	case "unop":
-		op, rhs := asUnop(n)
-		if op == "?" {
-			p.recv90(rhs)
-			p.write("?")
-			return
-		}
-		if op == "not" {
-			p.write("not ")
-		} else {
-			p.write(op)
-		}
-		p.printMin(rhs, 80)
-
-	case "binop":
-		op, l, r := asBinop(n)
-		p.bin(op, l, r)
-
-	case "assign":
-		l, r := asAssign(n)
-		p.printMin(l, 10)
-		p.write(" = ")
-		p.printMin(r, 10)
-
-	case "call":
-		recv, args := asCall(n)
-		p.recv90(recv)
-		p.write("(")
-		if len(args) > 0 {
-			p.printCommaList(args, func(s S) { p.printExpr(s) })
-		}
-		p.write(")")
-
-	case "idx":
-		recv, ix := asIdx(n)
-		p.recv90(recv)
-		p.write("[")
-		p.printExpr(ix)
-		p.write("]")
-
-	case "get":
-		recv, name := asGet(n)
-		p.recv90(recv)
-		if isIdent(name) {
-			p.write("." + name)
-		} else {
-			p.write("." + quoteString(name))
-		}
-
-	case "array":
-		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
-
-	case "map":
-		p.printMapAST(n)
-
-	case "enum":
-		bracketed(&p.out, "Enum[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
-
-	case "decl":
-		p.write("let " + getId(n))
-
-	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
-		p.printStmt(n)
-
-	default:
-		p.write("<" + tag(n) + ">")
-	}
-}
-
-func (p *pp) printMapAST(n S) {
-	p.write("{")
-	items := listS(n, 1)
-	for i, pr := range items {
-		if i > 0 {
-			p.write(", ")
-		}
-		keyNode := pr[1].(S)
-		key, keyAnn := unwrapKey(keyNode)
-		if keyAnn != "" {
-			p.nl()
-			p.out.withIndent(func() { p.out.annot(keyAnn) })
-			p.pad()
-		}
-		keyOut(&p.out, key)
-		p.write(": ")
-		p.printExpr(pr[2].(S))
-	}
-	p.write("}")
-}
-
-/* ---------- patterns ---------- */
-
-func isDeclPattern(n S) bool {
-	switch tag(n) {
-	case "decl", "darr", "dobj":
+	switch a.Tag {
+	case VTNull:
 		return true
-	case "annot":
-		return isDeclPattern(n[2].(S))
+	case VTBool:
+		return a.Data.(bool) == b.Data.(bool)
+	case VTInt:
+		return a.Data.(int64) == b.Data.(int64)
+	case VTNum:
+		return a.Data.(float64) == b.Data.(float64)
+	case VTStr:
+		return a.Data.(string) == b.Data.(string)
+	case VTArray:
+		ax := a.Data.([]Value)
+		bx := b.Data.([]Value)
+		if len(ax) != len(bx) {
+			return false
+		}
+		for i := range ax {
+			if !deepEqualLit(ax[i], bx[i]) {
+				return false
+			}
+		}
+		return true
+	case VTMap:
+		am := a.Data.(*MapObject)
+		bm := b.Data.(*MapObject)
+		if len(am.Entries) != len(bm.Entries) {
+			return false
+		}
+		for k, av := range am.Entries {
+			bv, ok := bm.Entries[k]
+			if !ok || !deepEqualLit(av, bv) {
+				return false
+			}
+		}
+		return true
 	default:
+		// Not expected for enum literals
 		return false
 	}
 }
 
-func unwrapKey(n S) (name string, annot string) {
-	if tag(n) == "annot" {
-		return n[2].(S)[1].(string), n[1].(S)[1].(string)
+// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
+// Allowed forms: null/bool/int/num/str/array/map with literal children.
+// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
+func (ip *Interpreter) litToValue(lit S) (Value, bool) {
+	if len(lit) == 0 {
+		return Null, false
 	}
-	return n[1].(string), ""
-}
-
-func (p *pp) printPattern(n S) {
-	switch tag(n) {
-	case "decl":
-		p.write(getId(n))
-	case "darr":
-		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printPattern(s) })
-	case "dobj":
-		items := listS(n, 1)
-		multi := false
-		for _, it := range items {
-			_, ann := unwrapKey(it[1].(S))
-			if ann != "" || tag(it[2].(S)) == "annot" {
-				multi = true
-				break
-			}
-		}
-		if !multi {
-			p.write("{")
-			for i, it := range items {
-				if i > 0 {
-					p.write(", ")
-				}
-				key, _ := unwrapKey(it[1].(S))
-				keyOut(&p.out, key)
-				p.write(": ")
-				p.printPattern(it[2].(S))
-			}
-			p.write("}")
-			return
-		}
-		p.write("{")
-		p.nl()
-		p.out.withIndent(func() {
-			for i, it := range items {
-				key, ann := unwrapKey(it[1].(S))
-				if ann != "" {
-					p.out.annot(ann)
-				}
-				p.pad()
-				keyOut(&p.out, key)
-				p.write(": ")
-				val := it[2].(S)
-				if tag(val) == "annot" {
-					p.nl()
-					p.printPattern(val)
-				} else {
-					p.printPattern(val)
-				}
-				if i < len(items)-1 {
-					p.write(",")
-				}
-				p.nl()
-			}
-		})
-		p.pad()
-		p.write("}")
-	case "annot":
-		text, wrapped, _ := asAnnot(n)
-		p.out.annot(text)
-		p.pad()
-		p.printPattern(wrapped)
-	default:
-		p.printExpr(n)
-	}
-}
-
-/* ---------- Type pretty-printer ---------- */
-
-func writeType(o *out, t S) {
-	if len(t) == 0 {
-		o.write("<type>")
-		return
-	}
-	switch tag(t) {
-	case "id":
-		o.write(getStr(t))
-	case "unop":
-		if t[1].(string) == "?" {
-			writeType(o, t[2].(S))
-			o.write("?")
-		} else {
-			o.write("<unop>")
-		}
-	case "array":
-		elem := S{"id", "Any"}
-		if len(t) == 2 {
-			elem = t[1].(S)
-		}
-		bracketed(o, "[", "]", []S{elem}, func(s S) { writeType(o, s) }) // prints [T]
-	case "enum":
-		bracketed(o, "Enum[", "]", listS(t, 1), func(s S) { writeTypeLiteral(o, s) })
-	case "map":
-		type fld struct {
-			name       string
-			req        bool
-			typ        S
-			kAnn, vAnn string
-		}
-		var fs []fld
-		for _, raw := range listS(t, 1) {
-			req := raw[0].(string) == "pair!"
-			k, kAnn := unwrapKey(raw[1].(S))
-			ft := raw[2].(S)
-			vAnn := ""
-			if len(ft) > 0 && tag(ft) == "annot" {
-				vAnn = ft[1].(S)[1].(string)
-				ft = ft[2].(S)
-			}
-			fs = append(fs, fld{name: k, req: req, typ: ft, kAnn: kAnn, vAnn: vAnn})
-		}
-		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
-		o.write("{")
-		o.nl()
-		o.withIndent(func() {
-			for i, f := range fs {
-				if f.kAnn != "" {
-					o.annot(f.kAnn)
-				}
-				if f.vAnn != "" {
-					o.annot(f.vAnn)
-				}
-				o.pad()
-				keyOut(o, f.name)
-				if f.req {
-					o.write("!")
-				}
-				o.write(": ")
-				writeType(o, f.typ)
-				if i < len(fs)-1 {
-					o.write(",")
-				}
-				o.nl()
-			}
-		})
-		o.pad()
-		o.write("}")
-	case "binop":
-		if t[1].(string) == "->" && len(t) >= 4 {
-			params, ret := flattenArrow(t)
-			o.write("(")
-			for i := range params {
-				if i > 0 {
-					o.write(", ")
-				}
-				writeType(o, params[i])
-			}
-			o.write(") -> ")
-			writeType(o, ret)
-		} else {
-			o.write("<binop>")
-		}
-	case "annot":
-		o.annot(t[1].(S)[1].(string))
-		writeType(o, t[2].(S))
-	default:
-		o.write("<type>")
-	}
-}
-
-func writeTypeLiteral(o *out, lit S) {
-	switch tag(lit) {
+	switch lit[0].(string) {
 	case "null":
-		o.write("null")
+		return Null, true
 	case "bool":
-		if lit[1].(bool) {
-			o.write("true")
-		} else {
-			o.write("false")
-		}
+		return Bool(lit[1].(bool)), true
 	case "int":
-		o.write(fmt.Sprint(lit[1]))
+		return Int(lit[1].(int64)), true
 	case "num":
-		o.write(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
+		return Num(lit[1].(float64)), true
 	case "str":
-		o.write(quoteString(getStr(lit)))
+		return Str(lit[1].(string)), true
 	case "array":
-		bracketed(o, "[", "]", listS(lit, 1), func(s S) { writeTypeLiteral(o, s) })
-	case "map":
-		o.write("{")
-		items := listS(lit, 1)
-		for i, pr := range items {
-			if i > 0 {
-				o.write(", ")
+		out := make([]Value, 0, len(lit)-1)
+		for i := 1; i < len(lit); i++ {
+			v, ok := ip.litToValue(lit[i].(S))
+			if !ok {
+				return Null, false
 			}
-			k := pr[1].(S)[1].(string)
-			keyOut(o, k)
-			o.write(": ")
-			writeTypeLiteral(o, pr[2].(S))
+			out = append(out, v)
 		}
-		o.write("}")
+		return Arr(out), true
+	case "map":
+		m := make(map[string]Value, len(lit)-1)
+		for i := 1; i < len(lit); i++ {
+			p := lit[i].(S)
+			if len(p) < 3 {
+				return Null, false
+			}
+			keyNode := p[1].(S)
+			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+				return Null, false
+			}
+			k := keyNode[1].(string)
+			v, ok := ip.litToValue(p[2].(S))
+			if !ok {
+				return Null, false
+			}
+			m[k] = v
+		}
+		return Map(m), true
 	default:
-		o.write("<lit>")
+		return Null, false
 	}
 }
 
-func flattenArrow(t S) (params []S, ret S) {
-	for tag(t) == "binop" && t[1].(string) == "->" && len(t) >= 4 {
-		params = append(params, t[2].(S))
-		t = t[3].(S)
-	}
-	ret = t
-	return
-}
+// -----------------------------
+// Value → Type inference (typeOf-like behavior)
+// -----------------------------
 
-/* ---------- Runtime value pretty-printer ---------- */
-
-func mapOneLineMO(keys []string, mo *MapObject) string {
-	if len(keys) == 0 {
-		return "{}"
-	}
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-			return ""
-		}
-		v := mo.Entries[k]
-		if isValueMultiline(v) {
-			return ""
-		}
-		key := k
-		if !isIdent(key) {
-			key = quoteString(key)
-		}
-		var b strings.Builder
-		o := out{b: &b}
-		writeValue(&o, v)
-		parts = append(parts, key+": "+b.String())
-	}
-	return "{ " + strings.Join(parts, ", ") + " }"
-}
-
-func writeValue(o *out, v Value) {
-	if v.Annot != "" {
-		o.annot(v.Annot)
-		o.pad()
-	}
+func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 	switch v.Tag {
 	case VTNull:
-		o.write("null")
+		return S{"id", "Null"}
 	case VTBool:
-		if v.Data.(bool) {
-			o.write("true")
-		} else {
-			o.write("false")
-		}
+		return S{"id", "Bool"}
 	case VTInt:
-		o.write(strconv.FormatInt(v.Data.(int64), 10))
+		return S{"id", "Int"}
 	case VTNum:
-		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		o.write(s)
+		return S{"id", "Num"}
 	case VTStr:
-		o.write(quoteString(v.Data.(string)))
-	case VTArray:
-		xs := v.Data.([]Value)
-		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
-			o.write(oneline)
-			return
-		}
-		o.write("[")
-		o.nl()
-		o.withIndent(func() {
-			for i, it := range xs {
-				if it.Annot == "" {
-					o.pad()
-				}
-				writeValue(o, it)
-				if i < len(xs)-1 {
-					o.write(",")
-				}
-				o.nl()
-			}
-		})
-		o.pad()
-		o.write("]")
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		keys := append([]string(nil), mo.Keys...)
-		sort.Strings(keys)
-		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
-			o.write(oneline)
-			return
-		}
-		o.write("{")
-		o.nl()
-		o.withIndent(func() {
-			for i, k := range keys {
-				if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-					o.annot(ann)
-				}
-				o.pad()
-				keyOut(o, k)
-				o.write(": ")
-				writeValue(o, mo.Entries[k])
-				if i < len(keys)-1 {
-					o.write(",")
-				}
-				o.nl()
-			}
-		})
-		o.pad()
-		o.write("}")
-	case VTFun:
-		if f, ok := v.Data.(*Fun); ok && f != nil {
-			var sb strings.Builder
-			sb.WriteString("<fun: ")
-			if len(f.ParamTypes) == 0 {
-				sb.WriteString("_:Null")
-			} else {
-				for i := range f.ParamTypes {
-					if i > 0 {
-						sb.WriteString(" -> ")
-					}
-					name := "_"
-					if i < len(f.Params) && f.Params[i] != "" {
-						name = f.Params[i]
-					}
-					sb.WriteString(name)
-					sb.WriteString(":")
-					sb.WriteString(FormatType(f.ParamTypes[i]))
-				}
-			}
-			sb.WriteString(" -> ")
-			sb.WriteString(FormatType(f.ReturnType))
-			sb.WriteString(">")
-			o.write(sb.String())
-		} else {
-			o.write("<fun>")
-		}
-	case VTType:
-		typ := FormatType(typeAst(v.Data))
-		if strings.Contains(typ, "\n") {
-			for i, ln := range strings.Split(typ, "\n") {
-				if i == 0 {
-					o.write(ln)
-					continue
-				}
-				o.nl()
-				o.pad()
-				o.write(ln)
-			}
-			return
-		}
-		o.write(typ)
-	case VTModule:
-		name := "<module>"
-		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
-			disp := prettySpec(m.Name)
-			if disp == "" {
-				disp = m.Name
-			}
-			name = "<module: " + disp + ">"
-		}
-		o.write(name)
-	default:
-		s := "<unknown>"
-		if v.Tag == VTHandle {
-			if h, ok := v.Data.(*Handle); ok {
-				s = "<handle:" + h.Kind + ">"
-			} else {
-				s = "<handle>"
-			}
-		}
-		o.write(s)
-	}
-}
+		return S{"id", "Str"}
 
-/* ---------- single-line candidates ---------- */
-
-func arrayOneLine(xs []Value) string {
-	if len(xs) == 0 {
-		return "[]"
-	}
-	parts := make([]string, 0, len(xs))
-	for _, it := range xs {
-		if isValueMultiline(it) {
-			return ""
-		}
-		var b strings.Builder
-		o := out{b: &b}
-		writeValue(&o, it)
-		parts = append(parts, b.String())
-	}
-	return "[ " + strings.Join(parts, ", ") + " ]"
-}
-
-func isValueMultiline(v Value) bool {
-	if v.Annot != "" {
-		return true
-	}
-	switch v.Tag {
 	case VTArray:
 		xs := v.Data.([]Value)
 		if len(xs) == 0 {
+			return S{"array", S{"id", "Any"}}
+		}
+		elem := ip.valueToTypeS(xs[0], env)
+		for i := 1; i < len(xs); i++ {
+			elem = ip.unifyTypes(elem, ip.valueToTypeS(xs[i], env), env)
+		}
+		return S{"array", elem}
+
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		out := S{"map"}
+		// For a single observed map, infer optional fields (no required).
+		for k, vv := range mo.Entries {
+			out = append(out, S{"pair", S{"str", k}, ip.valueToTypeS(vv, env)})
+		}
+		return out
+
+	case VTFun:
+		f := v.Data.(*Fun)
+		t := f.ReturnType
+		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+			t = S{"binop", "->", f.ParamTypes[i], t}
+		}
+		return t
+
+	case VTType:
+		return S{"id", "Type"}
+
+	default:
+		return S{"id", "Any"}
+	}
+}
+
+// -----------------------------
+// Alias resolution for types
+// -----------------------------
+
+func (ip *Interpreter) resolveType(t S, env *Env) S {
+	seen := map[string]bool{}
+	var go1 func(S, *Env) S
+	go1 = func(x S, e *Env) S {
+		if len(x) == 0 {
+			return x
+		}
+		switch x[0].(string) {
+		case "id":
+			name := x[1].(string)
+			if isBuiltinTypeName(name) {
+				return x
+			}
+			if seen[name] {
+				return x // guard cycles
+			}
+			if e != nil {
+				if v, err := e.Get(name); err == nil && v.Tag == VTType {
+					tv := v.Data.(*TypeValue)
+					seen[name] = true
+					defer func() { delete(seen, name) }()
+					// recurse with the alias's own env (not the caller's env)
+					return go1(tv.Ast, tv.Env)
+				}
+			}
+			return x
+		case "unop":
+			if len(x) >= 3 && x[1].(string) == "?" {
+				return S{"unop", "?", go1(x[2].(S), e)}
+			}
+			return x
+		case "array":
+			if len(x) == 2 {
+				return S{"array", go1(x[1].(S), e)}
+			}
+			out := S{"array"}
+			for i := 1; i < len(x); i++ {
+				out = append(out, go1(x[i].(S), e))
+			}
+			return out
+		case "map":
+			out := S{"map"}
+			for i := 1; i < len(x); i++ {
+				p := x[i].(S)
+				ttag := p[0].(string)
+				key := p[1].(S)
+				typ := go1(p[2].(S), e)
+				out = append(out, S{ttag, key, typ})
+			}
+			return out
+		case "enum":
+			return x
+		case "binop":
+			if len(x) >= 4 && x[1].(string) == "->" {
+				return S{"binop", "->", go1(x[2].(S), e), go1(x[3].(S), e)}
+			}
+			return x
+		default:
+			return x
+		}
+	}
+	return go1(t, env)
+}
+
+// -----------------------------
+// Runtime type checking
+// -----------------------------
+
+func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
+	t = ip.resolveType(t, env)
+	if len(t) == 0 {
+		return false
+	}
+
+	switch t[0].(string) {
+	case "id":
+		switch t[1].(string) {
+		case "Any":
+			return true
+		case "Null":
+			return v.Tag == VTNull
+		case "Bool":
+			return v.Tag == VTBool
+		case "Int":
+			return v.Tag == VTInt
+		case "Num":
+			return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
+		case "Str":
+			return v.Tag == VTStr
+		case "Type":
+			return v.Tag == VTType
+		default:
 			return false
 		}
-		for _, it := range xs {
-			if isValueMultiline(it) {
+
+	case "unop":
+		if t[1].(string) != "?" {
+			return false
+		}
+		if v.Tag == VTNull {
+			return true
+		}
+		return ip.isType(v, t[2].(S), env)
+
+	case "array":
+		if v.Tag != VTArray {
+			return false
+		}
+		// If no element type provided, treat as [Any]
+		elemT := S{"id", "Any"}
+		if len(t) == 2 {
+			elemT = t[1].(S)
+		}
+		for _, elem := range v.Data.([]Value) {
+			if !ip.isType(elem, elemT, env) {
+				return false
+			}
+		}
+		return true
+
+	case "map":
+		if v.Tag != VTMap {
+			return false
+		}
+		fs := mapTypeFields(t)
+		mo := v.Data.(*MapObject)
+		for name, f := range fs {
+			val, ok := mo.Entries[name]
+			if !ok {
+				if f.required {
+					return false
+				}
+				continue
+			}
+			if !ip.isType(val, f.typ, env) {
+				return false
+			}
+		}
+		return true
+
+	case "enum":
+		// Deeply equal to one of the literal values
+		for i := 1; i < len(t); i++ {
+			lv, ok := ip.litToValue(t[i].(S))
+			if !ok {
+				continue
+			}
+			if deepEqualLit(lv, v) {
 				return true
 			}
 		}
-		line := arrayOneLine(xs)
-		return line == "" || len(line) > MaxInlineWidth
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		if len(mo.Keys) == 0 {
+		return false
+
+	case "binop":
+		if t[1].(string) != "->" || v.Tag != VTFun {
 			return false
 		}
-		keys := append([]string(nil), mo.Keys...)
-		sort.Strings(keys)
-		line := mapOneLineMO(keys, mo)
-		return line == "" || len(line) > MaxInlineWidth
-	case VTType:
-		t := typeAst(v.Data)
-		return len(t) > 0 && tag(t) == "map" && len(t) > 1
-	default:
-		return false
+		// value's function type
+		f := v.Data.(*Fun)
+		ft := f.ReturnType
+		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+			ft = S{"binop", "->", f.ParamTypes[i], ft}
+		}
+		return ip.isSubtype(ft, t, env)
 	}
+
+	return false
 }
-=== END FILE: printer.go ===
+
+// -----------------------------
+// Structural subtyping  t1 <: t2
+// -----------------------------
+
+func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
+	a = ip.resolveType(a, env)
+	b = ip.resolveType(b, env)
+
+	if equalS(a, b) {
+		return true
+	}
+
+	isOpt := func(t S) bool { return len(t) >= 2 && t[0].(string) == "unop" && t[1].(string) == "?" }
+	unwrapOpt := func(t S) S { return t[2].(S) }
+
+	// Top
+	if b[0].(string) == "id" && b[1].(string) == "Any" {
+		return true
+	}
+	// Optional RHS
+	if isOpt(b) {
+		inner := unwrapOpt(b)
+		if ip.isSubtype(a, inner, env) {
+			return true
+		}
+		if a[0].(string) == "id" && a[1].(string) == "Null" {
+			return true
+		}
+	}
+	// Int <: Num
+	if a[0].(string) == "id" && a[1].(string) == "Int" &&
+		b[0].(string) == "id" && b[1].(string) == "Num" {
+		return true
+	}
+	// A? <: B?  iff  A <: B
+	if isOpt(a) && isOpt(b) {
+		return ip.isSubtype(unwrapOpt(a), unwrapOpt(b), env)
+	}
+	// Identical primitive IDs
+	if a[0].(string) == "id" && b[0].(string) == "id" {
+		return a[1].(string) == b[1].(string)
+	}
+
+	// Arrays: elementwise covariance
+	if a[0].(string) == "array" && b[0].(string) == "array" {
+		elemA := S{"id", "Any"}
+		if len(a) == 2 {
+			elemA = a[1].(S)
+		}
+		elemB := S{"id", "Any"}
+		if len(b) == 2 {
+			elemB = b[1].(S)
+		}
+		return ip.isSubtype(elemA, elemB, env)
+	}
+
+	// Maps: must provide all required fields of b with compatible types,
+	// and cannot relax requiredness.
+	if a[0].(string) == "map" && b[0].(string) == "map" {
+		reqB := mapTypeFields(b)
+		haveA := mapTypeFields(a)
+		for name, fb := range reqB {
+			fa, ok := haveA[name]
+			if !ok {
+				if fb.required {
+					return false
+				}
+				continue
+			}
+			if fb.required && !fa.required {
+				return false
+			}
+			if !ip.isSubtype(fa.typ, fb.typ, env) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Enums:
+	// 1) Enum ⊆ Enum by literal inclusion (structural equality on literal S)
+	if a[0].(string) == "enum" && b[0].(string) == "enum" {
+		for i := 1; i < len(a); i++ {
+			found := false
+			for j := 1; j < len(b); j++ {
+				if equalS(a[i].(S), b[j].(S)) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	// 2) Enum <: T if every member conforms to T
+	if a[0].(string) == "enum" {
+		for i := 1; i < len(a); i++ {
+			lv, ok := ip.litToValue(a[i].(S))
+			if !ok || !ip.isType(lv, b, env) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Functions: param contravariant, return covariant (right-assoc)
+	if a[0].(string) == "binop" && a[1].(string) == "->" &&
+		b[0].(string) == "binop" && b[1].(string) == "->" {
+		aParam, aRest := a[2].(S), a[3].(S)
+		bParam, bRest := b[2].(S), b[3].(S)
+		if !ip.isSubtype(bParam, aParam, env) { // contra
+			return false
+		}
+		return ip.isSubtype(aRest, bRest, env) // co (right)
+	}
+
+	return false
+}
+
+// -----------------------------
+// Unification (least common supertype)
+// -----------------------------
+
+func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
+	t1 = ip.resolveType(t1, env)
+	t2 = ip.resolveType(t2, env)
+
+	// Any absorbs
+	if isId(t1, "Any") {
+		return t1
+	}
+	if isId(t2, "Any") {
+		return t2
+	}
+
+	// ---- Null / Nullable ----
+	if isId(t1, "Null") && isId(t2, "Null") {
+		return t1
+	}
+	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
+		return t2
+	}
+	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
+		return t1
+	}
+	if isId(t1, "Null") {
+		return S{"unop", "?", t2}
+	}
+	if isId(t2, "Null") {
+		return S{"unop", "?", t1}
+	}
+
+	// Nullable normalization
+	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
+	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
+	if isOpt1 && isOpt2 {
+		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+	if isOpt1 {
+		u := ip.unifyTypes(t1[2].(S), t2, env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+	if isOpt2 {
+		u := ip.unifyTypes(t1, t2[2].(S), env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+
+	// ---- Primitives (incl. Int ⊔ Num = Num) ----
+	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
+		n1 := t1[1].(string)
+		n2 := t2[1].(string)
+		if n1 == n2 {
+			return t1
+		}
+		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
+			return S{"id", "Num"}
+		}
+		return S{"id", "Any"}
+	}
+
+	// ---- Arrays ----
+	if t1[0].(string) == "array" && t2[0].(string) == "array" {
+		e1 := S{"id", "Any"}
+		e2 := S{"id", "Any"}
+		if len(t1) == 2 {
+			e1 = t1[1].(S)
+		}
+		if len(t2) == 2 {
+			e2 = t2[1].(S)
+		}
+		elem := ip.unifyTypes(e1, e2, env)
+		return S{"array", elem}
+	}
+	if t1[0].(string) == "array" || t2[0].(string) == "array" {
+		return S{"id", "Any"}
+	}
+
+	// ---- Maps: fieldwise unify; required OR ----
+	if t1[0].(string) == "map" && t2[0].(string) == "map" {
+		f1 := mapTypeFields(t1)
+		f2 := mapTypeFields(t2)
+		keys := map[string]struct{}{}
+		for k := range f1 {
+			keys[k] = struct{}{}
+		}
+		for k := range f2 {
+			keys[k] = struct{}{}
+		}
+		out := S{"map"}
+		for k := range keys {
+			s1, ok1 := f1[k]
+			s2, ok2 := f2[k]
+			switch {
+			case ok1 && ok2:
+				ut := ip.unifyTypes(s1.typ, s2.typ, env)
+				req := s1.required || s2.required
+				tag := "pair"
+				if req {
+					tag = "pair!"
+				}
+				out = append(out, S{tag, S{"str", k}, ut})
+			case ok1 && !ok2:
+				out = append(out, S{"pair", S{"str", k}, s1.typ})
+			case !ok1 && ok2:
+				out = append(out, S{"pair", S{"str", k}, s2.typ})
+			}
+		}
+		return out
+	}
+	if t1[0].(string) == "map" || t2[0].(string) == "map" {
+		return S{"id", "Any"}
+	}
+
+	// ---- Enums ----
+	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
+		union := S{"enum"}
+		seen := func(x S) bool {
+			for i := 1; i < len(union); i++ {
+				if equalS(union[i].(S), x) {
+					return true
+				}
+			}
+			return false
+		}
+		for i := 1; i < len(t1); i++ {
+			x := t1[i].(S)
+			if !seen(x) {
+				union = append(union, x)
+			}
+		}
+		for i := 1; i < len(t2); i++ {
+			x := t2[i].(S)
+			if !seen(x) {
+				union = append(union, x)
+			}
+		}
+		return union
+	}
+	// enum ⊔ Type → Type if all members fit; else Any
+	if t1[0].(string) == "enum" {
+		all := true
+		for i := 1; i < len(t1); i++ {
+			lv, ok := ip.litToValue(t1[i].(S))
+			if !ok || !ip.isType(lv, t2, env) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return t2
+		}
+		return S{"id", "Any"}
+	}
+	if t2[0].(string) == "enum" {
+		all := true
+		for i := 1; i < len(t2); i++ {
+			lv, ok := ip.litToValue(t2[i].(S))
+			if !ok || !ip.isType(lv, t1, env) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return t1
+		}
+		return S{"id", "Any"}
+	}
+
+	// ---- Functions: pointwise ----
+	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
+		// f1 = A1 -> B1, f2 = A2 -> B2
+		a1, b1 := t1[2].(S), t1[3].(S)
+		a2, b2 := t2[2].(S), t2[3].(S)
+
+		// Param GLB (contravariant):
+		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
+		var param S
+		if ip.isSubtype(a1, a2, env) {
+			param = a1
+		} else if ip.isSubtype(a2, a1, env) {
+			param = a2
+		} else {
+			return S{"id", "Any"}
+		}
+
+		// Return LUB (covariant):
+		ret := ip.unifyTypes(b1, b2, env)
+		return S{"binop", "->", param, ret}
+	}
+	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
+		return S{"id", "Any"}
+	}
+
+	return S{"id", "Any"}
+}
+=== END FILE: types.go ===
 

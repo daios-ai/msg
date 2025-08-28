@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/peterh/liner"
 
@@ -61,6 +63,12 @@ REPL commands:
 // ---- main ------------------------------------------------------------------
 
 func main() {
+	// Compute an exit code, but call os.Exit only once, after all defers ran.
+	code := 0
+	defer func() {
+		os.Exit(code)
+	}()
+
 	var evalStr string
 	flag.StringVar(&evalStr, "e", "", "Evaluate the given MindScript snippet and exit")
 	flag.Parse()
@@ -69,11 +77,11 @@ func main() {
 
 	switch {
 	case evalStr != "":
-		os.Exit(runEvalString(evalStr))
+		code = runEvalString(evalStr)
 	case len(args) > 0:
-		os.Exit(runFile(args[0]))
+		code = runFile(args[0])
 	default:
-		os.Exit(runREPL())
+		code = runREPL()
 	}
 }
 
@@ -117,7 +125,11 @@ func runEvalString(code string) int {
 
 // ---- REPL ------------------------------------------------------------------
 
-func runREPL() int {
+// exitCoder is a loose interface to catch a runtime "exit" sentinel panic.
+type exitCoder interface{ ExitCode() int }
+type codeGetter interface{ Code() int }
+
+func runREPL() (ret int) {
 	fmt.Println(banner)
 
 	home, _ := os.UserHomeDir()
@@ -126,6 +138,44 @@ func runREPL() int {
 	ln := liner.NewLiner()
 	defer ln.Close()
 	ln.SetCtrlCAborts(true)
+
+	// Persist history on any return/panic.
+	defer func() {
+		if f, err := os.Create(histPath); err == nil {
+			_, _ = ln.WriteHistory(f)
+			_ = f.Close()
+		}
+	}()
+
+	// Trap common termination signals and restore TTY before exiting.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigc)
+	go func() {
+		s := <-sigc
+		_ = s
+		// Best-effort: close liner to restore terminal settings,
+		// then exit with a conventional code (130 for SIGINT).
+		ln.Close()
+		os.Exit(130)
+	}()
+
+	// Catch a potential "exit sentinel" panic so we can exit with a code
+	// *after* ln.Close() runs.
+	defer func() {
+		if r := recover(); r != nil {
+			switch x := r.(type) {
+			case exitCoder:
+				ret = x.ExitCode()
+			case codeGetter:
+				ret = x.Code()
+			case int:
+				ret = x
+			default:
+				panic(r) // not an exit sentinel → rethrow
+			}
+		}
+	}()
 
 	// Load history (best-effort)
 	if f, err := os.Open(histPath); err == nil {
@@ -136,7 +186,7 @@ func runREPL() int {
 	ip, err := mindscript.NewRuntime()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, red(err.Error()))
-		os.Exit(1)
+		return 1
 	}
 
 	for {
@@ -172,11 +222,6 @@ func runREPL() int {
 		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
 	}
 
-	// Persist history (best-effort)
-	if f, err := os.Create(histPath); err == nil {
-		_, _ = ln.WriteHistory(f)
-		_ = f.Close()
-	}
 	return 0
 }
 

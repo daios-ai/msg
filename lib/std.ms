@@ -608,7 +608,7 @@ oracleInstall(llm.exec)
 # Runs the full oracle path: prompt build → backend exec → JSON boxing → type-check.
 # Args: name: Str
 # Returns: Str
-let oracleHello = oracle(name: Str) -> Str from [
+let _hello = oracle(name: Str) -> Str from [
 	["Ada", "Surprise, Ada — you just unlocked bonus sunshine today! ☀️"],
 	["Sam", "Plot twist, Sam: today you’re the main character! 🎬"]
 ]
@@ -619,15 +619,15 @@ let oracleHello = oracle(name: Str) -> Str from [
 # On failure, returns an annotated null describing the problem.
 # Args: name: Str
 # Returns: { ok: Bool, backend: Str, model: Str?, ms: Int, value: Str }?
-let oracleHelloCheck = fun(name: Str) -> {}? do
+let oracleCheck = fun(name: Str) -> {}? do
 	let st = llm.status(null)
 	let t0 = tsNow(null)
-	let r = try(fun() do oracleHello(name) end)
+	let r = try(fun() do _hello(name) end)
 	let t1 = tsNow(null)
 
 	if r.ok then
 		{ ok: true, backend: st.backend, model: st.model, ms: t1 - t0, value: r.value }
 	else
-		error("oracleHello failed: " + str(r.error))
+		error("Oracle failed: " + str(r.error))
 	end
 end

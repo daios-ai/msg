@@ -38,41 +38,45 @@
 // The AST is a tree of S-expressions: []any whose first element is a string tag.
 // Examples (non-exhaustive):
 //
-//	("block", n1, n2, ...)
-//	("id",   name)               // string
-//	("int",  int64)              // from INTEGER
-//	("num",  float64)            // from NUMBER
-//	("str",  string)             // decoded literal
-//	("bool", bool)               // from BOOLEAN
-//	("null")                     // from NULL
+//		("block", n1, n2, ...)
+//		("id",   name)               // string
+//		("int",  int64)              // from INTEGER
+//		("num",  float64)            // from NUMBER
+//		("str",  string)             // decoded literal
+//		("bool", bool)               // from BOOLEAN
+//		("null")                     // from NULL
 //
-//	("unop", op, rhs)            // prefix "-" or "not"; postfix "?"  (op is string)
-//	("binop", op, lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
-//	("assign", target, value)    // "=" (right-assoc)
+//		("unop", op, rhs)            // prefix "-" or "not"; postfix "?"  (op is string)
+//		("binop", op, lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
+//		("assign", target, value)    // "=" (right-assoc)
 //
-//	("call", callee, arg1, arg2, ...)
-//	("get",  obj, ("str", name))                  // property: obj.name or obj."name"
-//	("idx",  obj, indexExpr)                      // obj[expr] or obj.(expr) or obj.12
+//		("call", callee, arg1, arg2, ...)
+//		("get",  obj, ("str", name))                  // property: obj.name or obj."name"
+//		("idx",  obj, indexExpr)                      // obj[expr] or obj.(expr) or obj.12
 //
-//	("array", e1, e2, ...)
-//	("map",   ("pair",  keyStrExpr, value)*)
-//	("map",   ("pair!", keyStrExpr, value)*)      // required-field (key! : value)
-//	("enum",  item1, item2, ...)                  // from Enum[ ... ]
+//		("array", e1, e2, ...)
+//		("map",   ("pair",  keyStrExpr, value)*)
+//		("map",   ("pair!", keyStrExpr, value)*)      // required-field (key! : value)
+//		("enum",  item1, item2, ...)                  // from Enum[ ... ]
 //
-//	("fun",    paramsArray, retTypeExprOrAny, bodyBlock)
-//	("oracle", paramsArray, outTypeExprOrAny, sourceExpr)  // optional 'from' expression
+//		("fun",    paramsArray, retTypeExprOrAny, bodyBlock)
+//		("oracle", paramsArray, outTypeExprOrAny, sourceExpr)  // optional 'from' expression
 //
-//	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)       // if/elif/else
-//	("while", cond, bodyBlock)
-//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//		("if", ("pair", cond1, thenBlk1), ..., elseBlk?)       // if/elif/else
+//		("while", cond, bodyBlock)
+//		("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
 //
-//	// Declaration patterns (used by 'let' and 'for' targets):
-//	("decl", name)
-//	("darr", p1, p2, ...)                               // array destructure
-//	("dobj", ("pair", keyStrExpr, subPattern), ...)     // object destructure
+//		// Declaration patterns (used by 'let' and 'for' targets):
+//		("decl", name)
+//		("darr", p1, p2, ...)                               // array destructure
+//		("dobj", ("pair", keyStrExpr, subPattern), ...)     // object destructure
 //
-//	// Annotations (from '#'-blocks). The final boolean indicates PRE vs POST.
-//	("annot", ("str", text), wrappedNode, true|false)
+//		// Annotations (from '#'-blocks). POST is encoded by a leading "<" in text.
+//		("annot", ("str", textOr<text>), wrappedNode)
+//
+//	 Annotation encoding:
+//	   - PRE annotations are stored as-is:        ("annot", ("str", "note"), expr)
+//	   - POST annotations are prefixed with "<":  ("annot", ("str", "<note"), expr)
 //
 // Node spans
 // ----------
@@ -127,7 +131,8 @@
 //     stacked PRE annotations in front of a key.
 //
 //   - POST annotations are attached in the postfix chain; PRE wrap the node
-//     that follows. The AST encodes this as ("annot", ("str", text), node, isPre).
+//     that follows. In the AST, POST is represented by a leading "<" in the
+//     stored text (see encoding above).
 //
 //   - NOOP (blank lines):
 //     Inside delimiters (() [] {} args/params/indices/grouping): skipped like
@@ -746,7 +751,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			if err != nil {
 				return nil, err
 			}
-			left = L("annot", L("str", txt), x, true)
+			left = L("annot", L("str", txt), x)
 		} else {
 			return nil, &ParseError{Line: t.Line, Col: t.Col, Msg: "post-annotation has no preceding expression to attach"}
 		}
@@ -845,7 +850,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			if s, ok := a.Literal.(string); ok {
 				txt = s
 			}
-			left = L("annot", L("str", txt), left, false)
+			left = L("annot", L("str", "<"+txt), left)
 			continue
 		}
 		break
@@ -1349,7 +1354,7 @@ func (p *parser) consumePreAnnotationsOrError() ([]string, error) {
 // wrapWithPreAnnotations wraps node with the given texts as PRE annotations.
 func (p *parser) wrapWithPreAnnotations(texts []string, node S) S {
 	for i := len(texts) - 1; i >= 0; i-- {
-		node = L("annot", L("str", texts[i]), node, true)
+		node = L("annot", L("str", texts[i]), node)
 	}
 	return node
 }

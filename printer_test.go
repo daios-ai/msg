@@ -176,7 +176,7 @@ let {name: n, age: a} = {name: "Bob", age: 40}
 }
 
 func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
-	// Rewritten to use PRE hash-line annotations instead of inline #( ... )
+	// Uses PRE hash-line annotations for value positions in an object pattern.
 	in := "let {\n" +
 		"\tname: \n" +
 		"\t# username\n" +
@@ -188,10 +188,10 @@ func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
 	want := "let {\n" +
 		"\tname: \n" +
 		"\t# username\n" +
-		"\tn,\n" +
+		"\tname: n,\n" +
 		"\tage: \n" +
 		"\t# yearsOld\n" +
-		"\ta\n" +
+		"\tage: a\n" +
 		"} = {name: \"Bob\", age: 40}"
 	got := pretty(t, in)
 	eq(t, got, want)

@@ -13,10 +13,12 @@
 //     "oracle", "for", "if/elif/else", "type", "block", "assign",
 //     "return/break/continue", arrays, maps, calls, indexing, properties,
 //     unary and binary operators).
-//     - Annotation nodes ("annot", ("str", text), <node>, preBool) are supported
-//     in both PRE and POST forms. PRE annotations print as `# ...` lines
-//     immediately above the construct; POST annotations print as `# ...` lines
-//     immediately after the construct.
+//     - Annotation nodes use the simplified 3-ary form:
+//     ("annot", ("str", textOr<text>), wrappedNode)
+//     PRE annotations are stored as-is (text); POST annotations are encoded
+//     by a leading "<" in the stored text. PRE annotations print as `# ...`
+//     lines immediately above the construct; POST annotations print as a
+//     trailing `# ...` inline comment on the same line as the construct.
 //     - Property names are emitted bare if they are identifier-like, otherwise
 //     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
 //     are rendered in a compact, readable form.
@@ -31,7 +33,8 @@
 //     ("array", T)            → prints as `[T]`
 //     ("map", ("pair"| "pair!", ("str",k), T) ...)
 //     Required fields print with a trailing `!` on the key.
-//     Key/value annotations (if wrapped in "annot") become `# ...` lines.
+//     Key/value annotations (if wrapped in "annot") are respected:
+//     PRE as header lines; POST as trailing inline comments.
 //     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
 //     may be scalars, arrays, or maps.
 //     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
@@ -43,11 +46,14 @@
 //     - Entry point: FormatValue.
 //     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
 //     - Arrays and maps prefer a single-line rendering if it fits the
-//     MaxInlineWidth budget and no elements/keys force multi-line; else
+//     MaxInlineWidth budget and no PRE annotations force multi-line; else
 //     they fall back to pretty, multi-line output with indentation.
 //     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
-//     - Per-value annotations (Value.Annot) and per-key annotations in maps
-//     (MapObject.KeyAnn[name]) are printed as `# ...` header lines.
+//     - Annotations distinguish PRE vs POST using the same `<` convention:
+//     • PRE (no '<' prefix): printed as `# ...` lines before the value.
+//     • POST (with '<' prefix): printed as an inline trailing comment
+//     on the same line as the value.
+//     This applies to Value.Annot (per-value) and MapObject.KeyAnn[k] (per-key).
 //     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
 //     - Types (VTType) are printed by extracting the embedded type AST and
 //     delegating to FormatType.
@@ -99,7 +105,7 @@ import (
 
 // MaxInlineWidth controls when arrays/maps are rendered on a single line by
 // FormatValue. If the one-line candidate exceeds this many characters, or if
-// any element/key is annotated or multiline by nature, the value is rendered
+// any element/key has a PRE annotation (non '<' prefixed), the value is rendered
 // across multiple lines with indentation. This setting is read at call time
 // and may be changed between calls.
 var MaxInlineWidth = 80
@@ -111,7 +117,9 @@ var MaxInlineWidth = 80
 //     source context via WrapErrorWithSource.
 //   - On success, pretty-prints the AST using FormatSExpr, producing stable,
 //     whitespace-normalized code with minimal parentheses.
-//   - Supports PRE/POST annotations: ("annot", ("str", text), X, preBool).
+//   - Supports annotations using the 3-ary form:
+//     ("annot", ("str", textOr<text>), X)
+//     PRE prints as `# ...` above; POST prints as trailing `# ...` on the line.
 //
 // Errors:
 //   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
@@ -154,7 +162,8 @@ func Standardize(src string) (string, error) {
 //   - Expressions use minimal parentheses according to a fixed precedence table;
 //     property access vs calls/indexing binds tightly.
 //   - Arrays and maps are printed inline (AST form); map key annotations print
-//     as preceding `# ...` lines. Annotation nodes wrap the printed construct.
+//     as preceding `# ...` lines (PRE) or trailing inline comments (POST).
+//   - Annotation nodes wrap the printed construct; POST becomes trailing inline.
 //
 // This function does not parse; it strictly formats the provided AST.
 func FormatSExpr(n S) string {
@@ -165,19 +174,8 @@ func FormatSExpr(n S) string {
 }
 
 // FormatType renders a type S-expression into a compact, human-readable string.
-//
-// Supported forms (see types.go for the type system):
-//   - ("id", name)              →  name
-//   - ("unop","?", T)           →  T?
-//   - ("array", T)              →  [T]
-//   - ("map", ("pair"| "pair!", ("str",k), T) ...)
-//     Required fields print as `key!:`; keys are quoted if not identifier-like.
-//     Key/value annotations (when wrapped in "annot") emit `# ...` lines above.
-//   - ("enum", lit1, ...)       →  Enum[lit1, ...] ; members may be scalars,
-//     arrays, or maps rendered as type-literals.
-//   - ("binop","->", A, B)      →  (A) -> B ; right-assoc chains flatten.
-//
-// Output is stable; when multi-line, map fields are sorted by key for determinism.
+// It respects PRE (header lines) vs POST (trailing inline) annotations in the
+// same way as the AST/code printer.
 func FormatType(t S) string {
 	var b strings.Builder
 	o := out{b: &b}
@@ -190,11 +188,12 @@ func FormatType(t S) string {
 // Layout policy:
 //   - Scalars: null, booleans, ints, floats (with a decimal point for
 //     non-scientific output), and quoted strings.
-//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line and
-//     total length ≤ MaxInlineWidth; otherwise multi-line with indentation.
-//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short
-//     and unannotated, else multi-line with indentation and key/value annotations
-//     emitted as `# ...` header lines.
+//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line,
+//     have no PRE annotations, and total length ≤ MaxInlineWidth; otherwise
+//     multi-line with indentation. POST annotations render inline trailing.
+//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short,
+//     with no PRE key/value annotations; else multi-line with indentation,
+//     where PRE annotations print as header lines, POST as inline trailing.
 //   - Functions: `<fun: name1:T1 -> name2:T2 -> R>` (zero-arg uses `_:Null`).
 //   - Types (VTType): pretty-printed via FormatType.
 //   - Modules: `<module: pretty-name>` when available.
@@ -271,6 +270,8 @@ func (o *out) pad() {
 	}
 }
 func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
+
+// PRE annotations (block/head) — prints as lines above current position.
 func (o *out) annot(text string) {
 	if text == "" {
 		return
@@ -280,6 +281,23 @@ func (o *out) annot(text string) {
 		o.b.WriteString("# " + strings.TrimSpace(ln))
 		o.nl()
 	}
+}
+
+// POST annotations (inline/trailing) — prints on the same line.
+func (o *out) annotInline(text string) {
+	if text == "" {
+		return
+	}
+	trim := oneLine(text)
+	if trim == "" {
+		return
+	}
+	o.write(" # " + trim)
+}
+
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.TrimSpace(s)
 }
 
 // unwrap VTType payload to its AST (supports legacy S too).
@@ -292,6 +310,17 @@ func typeAst(data any) S {
 	default:
 		return S{}
 	}
+}
+
+// Split annotation text into PRE vs POST according to leading "<".
+func splitAnnotText(s string) (pre, post string) {
+	if s == "" {
+		return "", ""
+	}
+	if strings.HasPrefix(s, "<") {
+		return "", strings.TrimPrefix(s, "<")
+	}
+	return s, ""
 }
 
 /* ---------- AST helpers: tags, shapes, precedence ---------- */
@@ -310,16 +339,15 @@ func asAssign(n S) (lhs, rhs S)           { return n[1].(S), n[2].(S) }
 func asCall(n S) (recv S, args []S)       { recv = n[1].(S); return recv, listS(n, 2) }
 func asIdx(n S) (recv, idx S)             { return n[1].(S), n[2].(S) }
 func asGet(n S) (recv S, name string)     { return n[1].(S), n[2].(S)[1].(string) }
+
+// New: decode 3-ary ("annot", ("str", textOr<text>), wrapped) to (text, wrapped, pre?)
 func asAnnot(n S) (text string, wrapped S, pre bool) {
-	text = n[1].(S)[1].(string)
-	wrapped = n[2].(S)
-	pre = true
-	if len(n) >= 4 {
-		if b, ok := n[3].(bool); ok {
-			pre = b
-		}
+	raw := n[1].(S)[1].(string)
+	preText, postText := splitAnnotText(raw)
+	if preText != "" {
+		return preText, n[2].(S), true
 	}
-	return
+	return postText, n[2].(S), false
 }
 
 func listS(n S, from int) []S {
@@ -421,9 +449,10 @@ func (p *pp) printProgram(n S) {
 		p.printStmt(n)
 		return
 	}
-	for i, k := range listS(n, 1) {
+	kids := listS(n, 1)
+	for i, k := range kids {
 		p.printStmt(k)
-		if i < len(listS(n, 1))-1 {
+		if i < len(kids)-1 {
 			p.nl()
 		}
 	}
@@ -471,11 +500,11 @@ func (p *pp) printAnnotStmt(n S) {
 	if pre {
 		p.out.annot(text)
 		p.printStmt(wrapped)
-	} else {
-		p.printStmt(wrapped)
-		p.nl()
-		p.out.annot(text)
+		return
 	}
+	// POST: print wrapped, then trailing inline comment (no newline here).
+	p.printStmt(wrapped)
+	p.out.annotInline(text)
 }
 
 func (p *pp) printStmt(n S) {
@@ -751,15 +780,47 @@ func (p *pp) printMapAST(n S) {
 			p.write(", ")
 		}
 		keyNode := pr[1].(S)
+		valNode := pr[2].(S)
+
+		// Unwrap key annotation (keys are PRE-only in the grammar).
 		key, keyAnn := unwrapKey(keyNode)
-		if keyAnn != "" {
-			p.nl()
-			p.out.withIndent(func() { p.out.annot(keyAnn) })
+		keyPre, keyPost := splitAnnotText(keyAnn)
+
+		// Unwrap value annotation if present.
+		valPre, valPost := "", ""
+		if tag(valNode) == "annot" {
+			txt, wrapped, pre := asAnnot(valNode)
+			if pre {
+				valPre = txt
+			} else {
+				valPost = txt
+			}
+			valNode = wrapped
+		}
+
+		// PRE annotations before the entry.
+		if keyPre != "" {
+			p.out.annot(keyPre)
 			p.pad()
 		}
+		if valPre != "" {
+			p.out.annot(valPre)
+			p.pad()
+		}
+
+		// key: value
+		p.pad()
 		keyOut(&p.out, key)
 		p.write(": ")
-		p.printExpr(pr[2].(S))
+		p.printExpr(valNode)
+
+		// POST annotations after value, inline.
+		if valPost != "" {
+			p.out.annotInline(valPost)
+		}
+		if keyPost != "" {
+			p.out.annotInline(keyPost)
+		}
 	}
 	p.write("}")
 }
@@ -777,6 +838,9 @@ func isDeclPattern(n S) bool {
 	}
 }
 
+// unwrapKey returns the bare key name and its (possibly empty) annotation text.
+// The annotation, if present, is assumed to be PRE in parsed keys, but we still
+// return the raw text to let the printers decide (POST would be treated inline).
 func unwrapKey(n S) (name string, annot string) {
 	if tag(n) == "annot" {
 		return n[2].(S)[1].(string), n[1].(S)[1].(string)
@@ -819,18 +883,32 @@ func (p *pp) printPattern(n S) {
 		p.out.withIndent(func() {
 			for i, it := range items {
 				key, ann := unwrapKey(it[1].(S))
-				if ann != "" {
-					p.out.annot(ann)
+				keyPre, keyPost := splitAnnotText(ann)
+				if keyPre != "" {
+					p.out.annot(keyPre)
 				}
 				p.pad()
 				keyOut(&p.out, key)
 				p.write(": ")
 				val := it[2].(S)
 				if tag(val) == "annot" {
-					p.nl()
-					p.printPattern(val)
+					txt, wrapped, pre := asAnnot(val)
+					if pre {
+						p.nl()
+						p.out.annot(txt)
+						p.pad()
+						keyOut(&p.out, key)
+						p.write(": ")
+						p.printPattern(wrapped)
+					} else {
+						p.printPattern(wrapped)
+						p.out.annotInline(txt)
+					}
 				} else {
 					p.printPattern(val)
+				}
+				if keyPost != "" {
+					p.out.annotInline(keyPost)
 				}
 				if i < len(items)-1 {
 					p.write(",")
@@ -841,10 +919,16 @@ func (p *pp) printPattern(n S) {
 		p.pad()
 		p.write("}")
 	case "annot":
-		text, wrapped, _ := asAnnot(n)
-		p.out.annot(text)
-		p.pad()
-		p.printPattern(wrapped)
+		text, wrapped, pre := asAnnot(n)
+		if pre {
+			p.out.annot(text)
+			p.pad()
+			p.printPattern(wrapped)
+		} else {
+			p.pad()
+			p.printPattern(wrapped)
+			p.out.annotInline(text)
+		}
 	default:
 		p.printExpr(n)
 	}
@@ -877,33 +961,46 @@ func writeType(o *out, t S) {
 		bracketed(o, "Enum[", "]", listS(t, 1), func(s S) { writeTypeLiteral(o, s) })
 	case "map":
 		type fld struct {
-			name       string
-			req        bool
-			typ        S
-			kAnn, vAnn string
+			name     string
+			req      bool
+			typ      S
+			kAnnPre  string
+			kAnnPost string
+			vAnnPre  string
+			vAnnPost string
 		}
 		var fs []fld
 		for _, raw := range listS(t, 1) {
 			req := raw[0].(string) == "pair!"
 			k, kAnn := unwrapKey(raw[1].(S))
+			kPre, kPost := splitAnnotText(kAnn)
 			ft := raw[2].(S)
-			vAnn := ""
+			vPre, vPost := "", ""
 			if len(ft) > 0 && tag(ft) == "annot" {
-				vAnn = ft[1].(S)[1].(string)
-				ft = ft[2].(S)
+				txt, inner, pre := asAnnot(ft)
+				if pre {
+					vPre = txt
+				} else {
+					vPost = txt
+				}
+				ft = inner
 			}
-			fs = append(fs, fld{name: k, req: req, typ: ft, kAnn: kAnn, vAnn: vAnn})
+			fs = append(fs, fld{
+				name: k, req: req, typ: ft,
+				kAnnPre: kPre, kAnnPost: kPost,
+				vAnnPre: vPre, vAnnPost: vPost,
+			})
 		}
 		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
 		o.write("{")
 		o.nl()
 		o.withIndent(func() {
 			for i, f := range fs {
-				if f.kAnn != "" {
-					o.annot(f.kAnn)
+				if f.kAnnPre != "" {
+					o.annot(f.kAnnPre)
 				}
-				if f.vAnn != "" {
-					o.annot(f.vAnn)
+				if f.vAnnPre != "" {
+					o.annot(f.vAnnPre)
 				}
 				o.pad()
 				keyOut(o, f.name)
@@ -912,6 +1009,12 @@ func writeType(o *out, t S) {
 				}
 				o.write(": ")
 				writeType(o, f.typ)
+				if f.vAnnPost != "" {
+					o.annotInline(f.vAnnPost)
+				}
+				if f.kAnnPost != "" {
+					o.annotInline(f.kAnnPost)
+				}
 				if i < len(fs)-1 {
 					o.write(",")
 				}
@@ -936,8 +1039,14 @@ func writeType(o *out, t S) {
 			o.write("<binop>")
 		}
 	case "annot":
-		o.annot(t[1].(S)[1].(string))
-		writeType(o, t[2].(S))
+		txt, wrapped, pre := asAnnot(t)
+		if pre {
+			o.annot(txt)
+			writeType(o, wrapped)
+		} else {
+			writeType(o, wrapped)
+			o.annotInline(txt)
+		}
 	default:
 		o.write("<type>")
 	}
@@ -990,17 +1099,25 @@ func flattenArrow(t S) (params []S, ret S) {
 
 /* ---------- Runtime value pretty-printer ---------- */
 
+// Single-line candidate for a map. Respects PRE/POST:
+// - PRE in key or value → force multi-line (return "").
+// - POST allowed inline (appended after value).
 func mapOneLineMO(keys []string, mo *MapObject) string {
 	if len(keys) == 0 {
 		return "{}"
 	}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+		kAnn := ""
+		if ann, ok := mo.KeyAnn[k]; ok {
+			kAnn = ann
+		}
+		kPre, kPost := splitAnnotText(kAnn)
+		if kPre != "" {
 			return ""
 		}
 		v := mo.Entries[k]
-		if isValueMultiline(v) {
+		if isValueMultiline(v) { // honors PRE as multiline, POST ok
 			return ""
 		}
 		key := k
@@ -1009,17 +1126,35 @@ func mapOneLineMO(keys []string, mo *MapObject) string {
 		}
 		var b strings.Builder
 		o := out{b: &b}
-		writeValue(&o, v)
-		parts = append(parts, key+": "+b.String())
+		// Render value without its PRE/POST annotations here;
+		// attach POST inline after the value if present.
+		vPre, vPost := splitAnnotText(v.Annot)
+		if vPre != "" {
+			return ""
+		}
+		vNoAnn := v
+		vNoAnn.Annot = ""
+		writeValue(&o, vNoAnn)
+		valStr := b.String()
+		if vPost != "" {
+			valStr += " # " + oneLine(vPost)
+		}
+		if kPost != "" {
+			valStr += " # " + oneLine(kPost)
+		}
+		parts = append(parts, key+": "+valStr)
 	}
 	return "{ " + strings.Join(parts, ", ") + " }"
 }
 
 func writeValue(o *out, v Value) {
-	if v.Annot != "" {
-		o.annot(v.Annot)
+	// PRE vs POST for the value itself.
+	pre, post := splitAnnotText(v.Annot)
+	if pre != "" {
+		o.annot(pre)
 		o.pad()
 	}
+
 	switch v.Tag {
 	case VTNull:
 		o.write("null")
@@ -1043,16 +1178,26 @@ func writeValue(o *out, v Value) {
 		xs := v.Data.([]Value)
 		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
 			o.write(oneline)
+			if post != "" {
+				o.annotInline(post)
+			}
 			return
 		}
 		o.write("[")
 		o.nl()
 		o.withIndent(func() {
 			for i, it := range xs {
-				if it.Annot == "" {
-					o.pad()
+				itPre, itPost := splitAnnotText(it.Annot)
+				if itPre != "" {
+					o.annot(itPre)
 				}
-				writeValue(o, it)
+				o.pad()
+				itNoAnn := it
+				itNoAnn.Annot = ""
+				writeValue(o, itNoAnn)
+				if itPost != "" {
+					o.annotInline(itPost)
+				}
 				if i < len(xs)-1 {
 					o.write(",")
 				}
@@ -1067,19 +1212,48 @@ func writeValue(o *out, v Value) {
 		sort.Strings(keys)
 		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
 			o.write(oneline)
+			if post != "" {
+				o.annotInline(post)
+			}
 			return
 		}
 		o.write("{")
 		o.nl()
 		o.withIndent(func() {
 			for i, k := range keys {
-				if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-					o.annot(ann)
+				kAnn := ""
+				if ann, ok := mo.KeyAnn[k]; ok {
+					kAnn = ann
 				}
+				kPre, kPost := splitAnnotText(kAnn)
+				vv := mo.Entries[k]
+				vPre, vPost := splitAnnotText(vv.Annot)
+
+				// PRE annotations before entry.
+				if kPre != "" {
+					o.annot(kPre)
+				}
+				if vPre != "" {
+					o.annot(vPre)
+				}
+
 				o.pad()
 				keyOut(o, k)
 				o.write(": ")
-				writeValue(o, mo.Entries[k])
+
+				// Print value without its own annotations (handled above/below).
+				vNoAnn := vv
+				vNoAnn.Annot = ""
+				writeValue(o, vNoAnn)
+
+				// Append POST (value, then key) inline.
+				if vPost != "" {
+					o.annotInline(vPost)
+				}
+				if kPost != "" {
+					o.annotInline(kPost)
+				}
+
 				if i < len(keys)-1 {
 					o.write(",")
 				}
@@ -1127,9 +1301,9 @@ func writeValue(o *out, v Value) {
 				o.pad()
 				o.write(ln)
 			}
-			return
+		} else {
+			o.write(typ)
 		}
-		o.write(typ)
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
@@ -1151,6 +1325,11 @@ func writeValue(o *out, v Value) {
 		}
 		o.write(s)
 	}
+
+	// POST (inline) for the value itself.
+	if post != "" {
+		o.annotInline(post)
+	}
 }
 
 /* ---------- single-line candidates ---------- */
@@ -1161,19 +1340,30 @@ func arrayOneLine(xs []Value) string {
 	}
 	parts := make([]string, 0, len(xs))
 	for _, it := range xs {
-		if isValueMultiline(it) {
+		// PRE annotation in any element forces multiline.
+		pre, post := splitAnnotText(it.Annot)
+		if pre != "" || isValueMultiline(it) {
 			return ""
 		}
+		// Render element without ANN and append inline POST if present.
 		var b strings.Builder
 		o := out{b: &b}
-		writeValue(&o, it)
-		parts = append(parts, b.String())
+		itNoAnn := it
+		itNoAnn.Annot = ""
+		writeValue(&o, itNoAnn)
+		elem := b.String()
+		if post != "" {
+			elem += " # " + oneLine(post)
+		}
+		parts = append(parts, elem)
 	}
 	return "[ " + strings.Join(parts, ", ") + " ]"
 }
 
 func isValueMultiline(v Value) bool {
-	if v.Annot != "" {
+	// PRE annotation on the value itself forces multiline.
+	pre, _ := splitAnnotText(v.Annot)
+	if pre != "" {
 		return true
 	}
 	switch v.Tag {
@@ -1183,7 +1373,9 @@ func isValueMultiline(v Value) bool {
 			return false
 		}
 		for _, it := range xs {
-			if isValueMultiline(it) {
+			// Any PRE in nested items forces multiline.
+			ipre, _ := splitAnnotText(it.Annot)
+			if ipre != "" || isValueMultiline(it) {
 				return true
 			}
 		}

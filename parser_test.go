@@ -690,7 +690,7 @@ available: "yes" # status
 		t.Fatalf("unexpected map arity: %s", dump(m))
 	}
 
-	// 1) "the name" annotates KEY "name"
+	// 1) "the name" annotates KEY "name" (PRE)
 	p1 := kid(m, 0)
 	if head(p1) != "pair" {
 		t.Fatalf("field1 should be pair: %s", dump(p1))
@@ -709,7 +709,7 @@ available: "yes" # status
 		t.Fatalf("want value 'Mo', got %s", dump(v1))
 	}
 
-	// 2) "the age" annotates KEY "age"
+	// 2) "the age" annotates KEY "age" (PRE)
 	p2 := kid(m, 1)
 	if head(p2) != "pair" {
 		t.Fatalf("field2 should be pair: %s", dump(p2))
@@ -728,7 +728,7 @@ available: "yes" # status
 		t.Fatalf("want 47, got %v", v2[1])
 	}
 
-	// 3) "status" annotates VALUE "yes" (POST here)
+	// 3) "status" annotates VALUE "yes" (POST → encoded as "<status")
 	p3 := kid(m, 2)
 	if head(p3) != "pair" {
 		t.Fatalf("field3 should be pair: %s", dump(p3))
@@ -740,8 +740,8 @@ available: "yes" # status
 	}
 	v3 := p3[2].(S)
 	wantTag(t, v3, "annot")
-	if s := v3[1].(S); head(s) != "str" || s[1].(string) != "status" {
-		t.Fatalf("bad value annotation payload: %s", dump(v3))
+	if s := v3[1].(S); head(s) != "str" || s[1].(string) != "<status" {
+		t.Fatalf("bad value annotation payload (expect '<status'): %s", dump(v3))
 	}
 	if inner := v3[2].(S); head(inner) != "str" || inner[1].(string) != "yes" {
 		t.Fatalf("annot did not wrap value 'yes': %s", dump(v3))
@@ -1142,12 +1142,18 @@ func Test_Parser_Annot_Pre_Multiline_Wraps_Let(t *testing.T) {
 
 	e1 := kid(blk, 0)
 	wantTag(t, e1, "annot")
-	if pre, ok := e1[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot (true), got: %v", e1[3])
+
+	// PRE annotations are stored as-is (no leading "<"), with lines joined by '\n'.
+	txt := e1[1].(S)
+	wantTag(t, txt, "str")
+	if got := txt[1].(string); got != "1. line\n2. line" {
+		t.Fatalf("expected PRE annot text %q, got %q", "1. line\n2. line", got)
 	}
 
+	// Wrapped node is still the 2nd child (index 1 via kid).
 	asn := kid(e1, 1)
 	wantTag(t, asn, "assign")
+
 	lhs := kid(asn, 0)
 	rhs := kid(asn, 1)
 	wantTag(t, lhs, "decl")
@@ -1170,8 +1176,10 @@ func Test_Parser_Annot_Post_Trailing_Attaches_RHSLiteral(t *testing.T) {
 
 	rhs := kid(asn, 1)
 	wantTag(t, rhs, "annot")
-	if pre, ok := rhs[3].(bool); !ok || pre {
-		t.Fatalf("expected POST annot (false), got: %v", rhs[3])
+	txt := rhs[1].(S)
+	wantTag(t, txt, "str")
+	if s := txt[1].(string); s != "<3. post" {
+		t.Fatalf("expected POST annot text %q, got %q", "<3. post", s)
 	}
 	inner := kid(rhs, 1)
 	wantTag(t, inner, "int")
@@ -1189,8 +1197,10 @@ func Test_Parser_Annot_Pre_Before_Map_RHS(t *testing.T) {
 
 	val := kid(asn, 1)
 	wantTag(t, val, "annot")
-	if pre, ok := val[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot on map, got: %v", val[3])
+	txt := val[1].(S)
+	wantTag(t, txt, "str")
+	if s := txt[1].(string); s != "4. pre map" {
+		t.Fatalf("expected PRE annot on map, got %q", s)
 	}
 	mp := kid(val, 1)
 	wantTag(t, mp, "map")
@@ -1208,8 +1218,10 @@ func Test_Parser_Annot_Pre_On_Key(t *testing.T) {
 	wantTag(t, p, "pair")
 	k := kid(p, 0)
 	wantTag(t, k, "annot")
-	if pre, ok := k[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot on key, got: %v", k[3])
+	kt := k[1].(S)
+	wantTag(t, kt, "str")
+	if s := kt[1].(string); s != "5. pre key" {
+		t.Fatalf("expected PRE annot text %q, got %q", "5. pre key", s)
 	}
 	kstr := kid(k, 1)
 	wantTag(t, kstr, "str")
@@ -1229,8 +1241,11 @@ func Test_Parser_Annot_Post_On_Int_Value(t *testing.T) {
 	val := kid(p, 1)
 
 	wantTag(t, val, "annot")
-	if pre, ok := val[3].(bool); !ok || pre {
-		t.Fatalf("expected POST annot on int, got: %v", val[3])
+	vt := val[1].(S)
+	wantTag(t, vt, "str")
+	// Source has trailing space after "post ", so accept prefix.
+	if s := vt[1].(string); !strings.HasPrefix(s, "<7. post") {
+		t.Fatalf("expected POST annot starting with %q, got %q", "<7. post", s)
 	}
 	inner := kid(val, 1)
 	wantTag(t, inner, "int")
@@ -1254,8 +1269,10 @@ name!: 1
 	wantTag(t, p, "pair!")
 	k := kid(p, 0)
 	wantTag(t, k, "annot")
-	if pre, ok := k[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot on key, got: %v", k[3])
+	kt := k[1].(S)
+	wantTag(t, kt, "str")
+	if s := kt[1].(string); s != "key" {
+		t.Fatalf("expected PRE annot text %q, got %q", "key", s)
 	}
 	kstr := kid(k, 1)
 	wantTag(t, kstr, "str")
@@ -1274,9 +1291,14 @@ func Test_Parser_Annotations_Postfix_Chain_With_Post(t *testing.T) {
 	root := mustParse(t, src)
 	e := kid(root, 0)
 	wantTag(t, e, "annot")
-	if pre, ok := e[3].(bool); !ok || pre {
-		t.Fatalf("expected POST annot (bool=false), got: %v", e[3])
+
+	txt := e[1].(S)
+	wantTag(t, txt, "str")
+	// There’s a trailing space after "post " in the source; accept prefix.
+	if s := txt[1].(string); !strings.HasPrefix(s, "<post") {
+		t.Fatalf("expected POST annot starting with %q, got %q", "<post", s)
 	}
+
 	inner := kid(e, 1)
 	// The inner should be the whole chain; last op is index => "idx"
 	wantTag(t, inner, "idx")
@@ -1296,8 +1318,10 @@ func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
 	wantTag(t, ret1, "return")
 	arg1 := kid(ret1, 0)
 	wantTag(t, arg1, "annot")
-	if pre, ok := arg1[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot in return value, got: %v", arg1[3])
+	t1 := arg1[1].(S)
+	wantTag(t, t1, "str")
+	if s := t1[1].(string); s != "pre" {
+		t.Fatalf("expected PRE annot text %q, got %q", "pre", s)
 	}
 	if head(kid(arg1, 1)) != "id" || kid(arg1, 1)[1].(string) != "x" {
 		t.Fatalf("unexpected return payload: %s", dump(arg1))
@@ -1310,8 +1334,10 @@ func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
 	wantTag(t, ret2, "return")
 	arg2 := kid(ret2, 0)
 	wantTag(t, arg2, "annot")
-	if pre, ok := arg2[3].(bool); !ok || pre {
-		t.Fatalf("expected POST annot in return value, got: %v", arg2[3])
+	t2 := arg2[1].(S)
+	wantTag(t, t2, "str")
+	if s := t2[1].(string); s != "<post" {
+		t.Fatalf("expected POST annot text %q, got %q", "<post", s)
 	}
 	if head(kid(arg2, 1)) != "id" || kid(arg2, 1)[1].(string) != "x" {
 		t.Fatalf("unexpected return payload: %s", dump(arg2))
@@ -1330,8 +1356,10 @@ func Test_Parser_Annotations_Return_Newline_Sensitivity(t *testing.T) {
 	}
 	annStmt := kid(r3, 1)
 	wantTag(t, annStmt, "annot")
-	if pre, ok := annStmt[3].(bool); !ok || !pre {
-		t.Fatalf("expected PRE annot on next-line expr, got: %v", annStmt[3])
+	t3 := annStmt[1].(S)
+	wantTag(t, t3, "str")
+	if s := t3[1].(string); s != "pre" {
+		t.Fatalf("expected PRE annot text %q, got %q", "pre", s)
 	}
 	if head(kid(annStmt, 1)) != "id" || kid(annStmt, 1)[1].(string) != "x" {
 		t.Fatalf("unexpected annotated stmt: %s", dump(annStmt))

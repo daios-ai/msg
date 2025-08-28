@@ -1,864 +1,356 @@
-=== BEGIN FILE: types.go ===
-// types.go: runtime type & schema system for MindScript.
-//
-// IMPLEMENTATION-ONLY FILE
-// ------------------------
-// This file contains the *private implementation* of the type engine used by
-// the public methods on *Interpreter* that live in interpreter.go:
-//
-//	ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
-//
-// Those exported methods are thin wrappers that delegate to the lower-case
-// functions defined here: resolveType, isType, isSubtype, unifyTypes,
-// valueToTypeS (plus helpers like litToValue/equalS).
-//
-// Goals / design (practical, JSON-friendly, duck-typed):
-//
-// OVERVIEW
-// --------
-// This file implements MindScript’s *runtime* type system. Types are represented
-// as S-expressions (the same light-weight shape the parser produces) and remain
-// entirely structural. The system is designed for practical, JSON-friendly
-// validation and inference:
-//
-//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
-//     {name:"Pedro"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
-//     Arrays unify element types conservatively; objects are “open-world”.
-//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
-//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
-//   - Arrays are covariant in element type.
-//   - Objects require that all *required* fields of `B` exist, with compatible
-//     types, and *requiredness cannot be relaxed*.
-//   - Extra fields on values are allowed (open-world).
-//   - Functions use parameter contravariance and return covariance.
-//   - `Int <: Num`, and `T?` means nullable.
-//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
-//     inference (e.g., arrays with mixed contents).
-//   - `ResolveType(T, env)` resolves identifiers bound to `VTType` in `env`,
-//     with cycle protection and resolution using the alias’s own environment.
-//   - Enums are finite sets of *literal* values (null/bool/int/num/str/array/map).
-//     Their typing, subtyping, and unification follow intuitive set semantics.
-//
-// TYPE SYNTAX (as S)
-// ------------------
-//
-//	("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
-//	("unop","?", T)                                // nullable T?
-//	("array", T)                                   // homogeneous arrays
-//	("map", ("pair" | "pair!", ("str",k), T) ...)  // object schema; "pair!" = required
-//	("enum", literalS, ...)                        // finite set of literal values
-//	("binop","->", A, B)                           // function A -> B (right-assoc)
-//
-// DEPENDENCIES (other files)
-// --------------------------
-// • parser.go
-//   - `type S = []any`  (S-expression node type)
-//
-// • interpreter.go
-//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
-//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
-//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
-//   - Environments: `Env` with `Get/Set/Define`
-//   - `type Interpreter` (receiver for public API methods)
-//
-// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
-//
-// PUBLIC VS PRIVATE
-// -----------------
-// PUBLIC  : Nothing.
-//
-// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
-//
-//	isSubtype, unifyTypes, valueToTypeS, literal conversion,
-//	structural S-equality, and field extraction.
-package mindscript
+=== BEGIN FILE: cmd/cli/main.go ===
+// cmd/cli/main.go
+package main
 
-//// END_OF_PUBLIC
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
 
-////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
+	"github.com/peterh/liner"
 
-// -----------------------------
-// Helpers
-// -----------------------------
+	// Adjust this to your actual module path
+	mindscript "github.com/DAIOS-AI/msg"
+)
 
-func isBuiltinTypeName(name string) bool {
-	switch name {
-	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
-		return true
+const (
+	colorReset = "\x1b[0m"
+	colorRed   = "\x1b[31m"
+	colorGreen = "\x1b[32m"
+	colorBlue  = "\x1b[34m"
+)
+
+func red(s string) string   { return colorRed + s + colorReset }
+func green(s string) string { return colorGreen + s + colorReset }
+func blue(s string) string  { return colorBlue + s + colorReset }
+
+// Colorize a formatted value: annotation lines (trim-left starts with "#") → green,
+// everything else → blue.
+func colorizeValue(val string) string {
+	lines := strings.Split(val, "\n")
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+			lines[i] = green(ln)
+		} else if ln != "" {
+			lines[i] = blue(ln)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+const (
+	appName     = "mindscript"
+	historyFile = ".mindscript_history"
+	promptMain  = "==> "
+	promptCont  = "... "
+	banner      = "MindScript REPL — Ctrl+C to cancel input, Ctrl+D to exit. Type :help for commands."
+	helpText    = `
+REPL commands:
+  :help            Show this help
+  :quit / :exit    Exit the REPL
+  :load <file>     Load & execute a file into the current session
+  :fmt [code]      Pretty-print code (multiline if no code provided)
+  :pretty [code]   Alias for :fmt
+  :reset           Reset the interpreter (new empty global scope)
+`
+)
+
+// ---- main ------------------------------------------------------------------
+
+func main() {
+	// Compute an exit code, but call os.Exit only once, after all defers ran.
+	code := 0
+	defer func() {
+		os.Exit(code)
+	}()
+
+	var evalStr string
+	flag.StringVar(&evalStr, "e", "", "Evaluate the given MindScript snippet and exit")
+	flag.Parse()
+
+	args := flag.Args()
+
+	switch {
+	case evalStr != "":
+		code = runEvalString(evalStr)
+	case len(args) > 0:
+		code = runFile(args[0])
 	default:
-		return false
+		code = runREPL()
 	}
 }
 
-func isId(t S, name string) bool {
-	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+// ---- file & string modes ---------------------------------------------------
+
+func runFile(path string) int {
+	// File mode: keep colors OFF (library default).
+	src, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: cannot read %s: %v\n", appName, path, err)
+		return 1
+	}
+
+	ip, err := mindscript.NewRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	v, err := ip.EvalSource(string(src))
+	if err != nil {
+		// Parse/Lex errors are already pretty-printed by the library.
+		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
+		return 1
+	}
+	fmt.Println(mindscript.FormatValue(v))
+	return 0
 }
 
-// ("map", ("pair"| "pair!", ("str",k), T)...)
-type objField struct {
-	required bool
-	typ      S
+func runEvalString(code string) int {
+	// -e mode: keep colors OFF (library default).
+	ip, _ := mindscript.NewRuntime()
+	v, err := ip.EvalSource(code)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
+		return 1
+	}
+	fmt.Println(mindscript.FormatValue(v))
+	return 0
 }
 
-func mapTypeFields(t S) map[string]objField {
-	fs := map[string]objField{}
-	for i := 1; i < len(t); i++ {
-		p := t[i].(S)
-		if len(p) < 3 {
-			continue
-		}
-		ptag := p[0].(string) // "pair" or "pair!"
-		keyNode := p[1].(S)   // ("str", k)
-		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-			continue
-		}
-		k := keyNode[1].(string)
-		required := ptag == "pair!"
-		fs[k] = objField{required: required, typ: p[2].(S)}
-	}
-	return fs
-}
+// ---- REPL ------------------------------------------------------------------
 
-// Structural equality for S-exprs (no fmt, no allocs).
-func equalS(a, b S) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	if len(a) == 0 {
-		return true
-	}
+// exitCoder is a loose interface to catch a runtime "exit" sentinel panic.
+type exitCoder interface{ ExitCode() int }
+type codeGetter interface{ Code() int }
 
-	ta, ok := a[0].(string)
-	if !ok {
-		return false
-	}
-	tb, ok := b[0].(string)
-	if !ok || ta != tb {
-		return false
-	}
+func runREPL() (ret int) {
+	fmt.Println(banner)
 
-	// Order-insensitive equality for maps: compare by field name/required/type.
-	if ta == "map" {
-		fa := mapTypeFields(a)
-		fb := mapTypeFields(b)
-		if len(fa) != len(fb) {
-			return false
+	home, _ := os.UserHomeDir()
+	histPath := filepath.Join(home, historyFile)
+
+	ln := liner.NewLiner()
+	defer ln.Close()
+	ln.SetCtrlCAborts(true)
+
+	// Persist history on any return/panic.
+	defer func() {
+		if f, err := os.Create(histPath); err == nil {
+			_, _ = ln.WriteHistory(f)
+			_ = f.Close()
 		}
-		for k, va := range fa {
-			vb, ok := fb[k]
-			if !ok || va.required != vb.required || !equalS(va.typ, vb.typ) {
-				return false
+	}()
+
+	// Trap common termination signals and restore TTY before exiting.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigc)
+	go func() {
+		s := <-sigc
+		_ = s
+		// Best-effort: close liner to restore terminal settings,
+		// then exit with a conventional code (130 for SIGINT).
+		ln.Close()
+		os.Exit(130)
+	}()
+
+	// Catch a potential "exit sentinel" panic so we can exit with a code
+	// *after* ln.Close() runs.
+	defer func() {
+		if r := recover(); r != nil {
+			switch x := r.(type) {
+			case exitCoder:
+				ret = x.ExitCode()
+			case codeGetter:
+				ret = x.Code()
+			case int:
+				ret = x
+			default:
+				panic(r) // not an exit sentinel → rethrow
 			}
 		}
-		return true
+	}()
+
+	// Load history (best-effort)
+	if f, err := os.Open(histPath); err == nil {
+		_, _ = ln.ReadHistory(f)
+		_ = f.Close()
 	}
 
-	// Order-insensitive equality for enums: set comparison on literal S-exprs.
-	if ta == "enum" {
-		if len(a) != len(b) { // quick length check
-			return false
-		}
-	outer:
-		for i := 1; i < len(a); i++ {
-			for j := 1; j < len(b); j++ {
-				if equalS(a[i].(S), b[j].(S)) {
-					continue outer
-				}
-			}
-			return false
-		}
-		return true
+	ip, err := mindscript.NewRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, red(err.Error()))
+		return 1
 	}
 
-	for i := 1; i < len(a); i++ {
-		if !equalNode(a[i], b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// Compares two S nodes or scalars used inside S.
-func equalNode(x, y any) bool {
-	switch xv := x.(type) {
-	case []any: // covers S too
-		yv, ok := y.([]any)
-		if !ok {
-			return false
-		}
-		return equalS(xv, yv)
-	case string:
-		ys, ok := y.(string)
-		return ok && xv == ys
-	case int64:
-		yi, ok := y.(int64)
-		return ok && xv == yi
-	case float64:
-		yf, ok := y.(float64)
-		return ok && xv == yf
-	case bool:
-		yb, ok := y.(bool)
-		return ok && xv == yb
-	default:
-		return x == y
-	}
-}
-
-// Deep equality on Values for the literal space used by enums
-// (null/bool/int/num/str/array/map). Named *Lit* to avoid confusion with
-// (*Interpreter).deepEqual used elsewhere.
-func deepEqualLit(a, b Value) bool {
-	if a.Tag != b.Tag {
-		return false
-	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray:
-		ax := a.Data.([]Value)
-		bx := b.Data.([]Value)
-		if len(ax) != len(bx) {
-			return false
-		}
-		for i := range ax {
-			if !deepEqualLit(ax[i], bx[i]) {
-				return false
-			}
-		}
-		return true
-	case VTMap:
-		am := a.Data.(*MapObject)
-		bm := b.Data.(*MapObject)
-		if len(am.Entries) != len(bm.Entries) {
-			return false
-		}
-		for k, av := range am.Entries {
-			bv, ok := bm.Entries[k]
-			if !ok || !deepEqualLit(av, bv) {
-				return false
-			}
-		}
-		return true
-	default:
-		// Not expected for enum literals
-		return false
-	}
-}
-
-// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
-// Allowed forms: null/bool/int/num/str/array/map with literal children.
-// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
-func (ip *Interpreter) litToValue(lit S) (Value, bool) {
-	if len(lit) == 0 {
-		return Null, false
-	}
-	switch lit[0].(string) {
-	case "null":
-		return Null, true
-	case "bool":
-		return Bool(lit[1].(bool)), true
-	case "int":
-		return Int(lit[1].(int64)), true
-	case "num":
-		return Num(lit[1].(float64)), true
-	case "str":
-		return Str(lit[1].(string)), true
-	case "array":
-		out := make([]Value, 0, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			v, ok := ip.litToValue(lit[i].(S))
-			if !ok {
-				return Null, false
-			}
-			out = append(out, v)
-		}
-		return Arr(out), true
-	case "map":
-		m := make(map[string]Value, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			p := lit[i].(S)
-			if len(p) < 3 {
-				return Null, false
-			}
-			keyNode := p[1].(S)
-			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-				return Null, false
-			}
-			k := keyNode[1].(string)
-			v, ok := ip.litToValue(p[2].(S))
-			if !ok {
-				return Null, false
-			}
-			m[k] = v
-		}
-		return Map(m), true
-	default:
-		return Null, false
-	}
-}
-
-// -----------------------------
-// Value → Type inference (typeOf-like behavior)
-// -----------------------------
-
-func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
-	switch v.Tag {
-	case VTNull:
-		return S{"id", "Null"}
-	case VTBool:
-		return S{"id", "Bool"}
-	case VTInt:
-		return S{"id", "Int"}
-	case VTNum:
-		return S{"id", "Num"}
-	case VTStr:
-		return S{"id", "Str"}
-
-	case VTArray:
-		xs := v.Data.([]Value)
-		if len(xs) == 0 {
-			return S{"array", S{"id", "Any"}}
-		}
-		elem := ip.valueToTypeS(xs[0], env)
-		for i := 1; i < len(xs); i++ {
-			elem = ip.unifyTypes(elem, ip.valueToTypeS(xs[i], env), env)
-		}
-		return S{"array", elem}
-
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		out := S{"map"}
-		// For a single observed map, infer optional fields (no required).
-		for k, vv := range mo.Entries {
-			out = append(out, S{"pair", S{"str", k}, ip.valueToTypeS(vv, env)})
-		}
-		return out
-
-	case VTFun:
-		f := v.Data.(*Fun)
-		t := f.ReturnType
-		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-			t = S{"binop", "->", f.ParamTypes[i], t}
-		}
-		return t
-
-	case VTType:
-		return S{"id", "Type"}
-
-	default:
-		return S{"id", "Any"}
-	}
-}
-
-// -----------------------------
-// Alias resolution for types
-// -----------------------------
-
-func (ip *Interpreter) resolveType(t S, env *Env) S {
-	seen := map[string]bool{}
-	var go1 func(S, *Env) S
-	go1 = func(x S, e *Env) S {
-		if len(x) == 0 {
-			return x
-		}
-		switch x[0].(string) {
-		case "id":
-			name := x[1].(string)
-			if isBuiltinTypeName(name) {
-				return x
-			}
-			if seen[name] {
-				return x // guard cycles
-			}
-			if e != nil {
-				if v, err := e.Get(name); err == nil && v.Tag == VTType {
-					tv := v.Data.(*TypeValue)
-					seen[name] = true
-					defer func() { delete(seen, name) }()
-					// recurse with the alias's own env (not the caller's env)
-					return go1(tv.Ast, tv.Env)
-				}
-			}
-			return x
-		case "unop":
-			if len(x) >= 3 && x[1].(string) == "?" {
-				return S{"unop", "?", go1(x[2].(S), e)}
-			}
-			return x
-		case "array":
-			if len(x) == 2 {
-				return S{"array", go1(x[1].(S), e)}
-			}
-			out := S{"array"}
-			for i := 1; i < len(x); i++ {
-				out = append(out, go1(x[i].(S), e))
-			}
-			return out
-		case "map":
-			out := S{"map"}
-			for i := 1; i < len(x); i++ {
-				p := x[i].(S)
-				ttag := p[0].(string)
-				key := p[1].(S)
-				typ := go1(p[2].(S), e)
-				out = append(out, S{ttag, key, typ})
-			}
-			return out
-		case "enum":
-			return x
-		case "binop":
-			if len(x) >= 4 && x[1].(string) == "->" {
-				return S{"binop", "->", go1(x[2].(S), e), go1(x[3].(S), e)}
-			}
-			return x
-		default:
-			return x
-		}
-	}
-	return go1(t, env)
-}
-
-// -----------------------------
-// Runtime type checking
-// -----------------------------
-
-func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	t = ip.resolveType(t, env)
-	if len(t) == 0 {
-		return false
-	}
-
-	switch t[0].(string) {
-	case "id":
-		switch t[1].(string) {
-		case "Any":
-			return true
-		case "Null":
-			return v.Tag == VTNull
-		case "Bool":
-			return v.Tag == VTBool
-		case "Int":
-			return v.Tag == VTInt
-		case "Num":
-			return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
-		case "Str":
-			return v.Tag == VTStr
-		case "Type":
-			return v.Tag == VTType
-		default:
-			return false
+	for {
+		// Accumulate possibly-multiline input until parser says it's complete.
+		code, ok := readByParseProbe(ln, promptMain, promptCont)
+		if !ok { // user pressed Ctrl+D or EOF
+			fmt.Println()
+			break
 		}
 
-	case "unop":
-		if t[1].(string) != "?" {
-			return false
-		}
-		if v.Tag == VTNull {
-			return true
-		}
-		return ip.isType(v, t[2].(S), env)
-
-	case "array":
-		if v.Tag != VTArray {
-			return false
-		}
-		// If no element type provided, treat as [Any]
-		elemT := S{"id", "Any"}
-		if len(t) == 2 {
-			elemT = t[1].(S)
-		}
-		for _, elem := range v.Data.([]Value) {
-			if !ip.isType(elem, elemT, env) {
-				return false
-			}
-		}
-		return true
-
-	case "map":
-		if v.Tag != VTMap {
-			return false
-		}
-		fs := mapTypeFields(t)
-		mo := v.Data.(*MapObject)
-		for name, f := range fs {
-			val, ok := mo.Entries[name]
-			if !ok {
-				if f.required {
-					return false
-				}
-				continue
-			}
-			if !ip.isType(val, f.typ, env) {
-				return false
-			}
-		}
-		return true
-
-	case "enum":
-		// Deeply equal to one of the literal values
-		for i := 1; i < len(t); i++ {
-			lv, ok := ip.litToValue(t[i].(S))
-			if !ok {
-				continue
-			}
-			if deepEqualLit(lv, v) {
-				return true
-			}
-		}
-		return false
-
-	case "binop":
-		if t[1].(string) != "->" || v.Tag != VTFun {
-			return false
-		}
-		// value's function type
-		f := v.Data.(*Fun)
-		ft := f.ReturnType
-		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-			ft = S{"binop", "->", f.ParamTypes[i], ft}
-		}
-		return ip.isSubtype(ft, t, env)
-	}
-
-	return false
-}
-
-// -----------------------------
-// Structural subtyping  t1 <: t2
-// -----------------------------
-
-func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
-	a = ip.resolveType(a, env)
-	b = ip.resolveType(b, env)
-
-	if equalS(a, b) {
-		return true
-	}
-
-	isOpt := func(t S) bool { return len(t) >= 2 && t[0].(string) == "unop" && t[1].(string) == "?" }
-	unwrapOpt := func(t S) S { return t[2].(S) }
-
-	// Top
-	if b[0].(string) == "id" && b[1].(string) == "Any" {
-		return true
-	}
-	// Optional RHS
-	if isOpt(b) {
-		inner := unwrapOpt(b)
-		if ip.isSubtype(a, inner, env) {
-			return true
-		}
-		if a[0].(string) == "id" && a[1].(string) == "Null" {
-			return true
-		}
-	}
-	// Int <: Num
-	if a[0].(string) == "id" && a[1].(string) == "Int" &&
-		b[0].(string) == "id" && b[1].(string) == "Num" {
-		return true
-	}
-	// A? <: B?  iff  A <: B
-	if isOpt(a) && isOpt(b) {
-		return ip.isSubtype(unwrapOpt(a), unwrapOpt(b), env)
-	}
-	// Identical primitive IDs
-	if a[0].(string) == "id" && b[0].(string) == "id" {
-		return a[1].(string) == b[1].(string)
-	}
-
-	// Arrays: elementwise covariance
-	if a[0].(string) == "array" && b[0].(string) == "array" {
-		elemA := S{"id", "Any"}
-		if len(a) == 2 {
-			elemA = a[1].(S)
-		}
-		elemB := S{"id", "Any"}
-		if len(b) == 2 {
-			elemB = b[1].(S)
-		}
-		return ip.isSubtype(elemA, elemB, env)
-	}
-
-	// Maps: must provide all required fields of b with compatible types,
-	// and cannot relax requiredness.
-	if a[0].(string) == "map" && b[0].(string) == "map" {
-		reqB := mapTypeFields(b)
-		haveA := mapTypeFields(a)
-		for name, fb := range reqB {
-			fa, ok := haveA[name]
-			if !ok {
-				if fb.required {
-					return false
-				}
-				continue
-			}
-			if fb.required && !fa.required {
-				return false
-			}
-			if !ip.isSubtype(fa.typ, fb.typ, env) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Enums:
-	// 1) Enum ⊆ Enum by literal inclusion (structural equality on literal S)
-	if a[0].(string) == "enum" && b[0].(string) == "enum" {
-		for i := 1; i < len(a); i++ {
-			found := false
-			for j := 1; j < len(b); j++ {
-				if equalS(a[i].(S), b[j].(S)) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	}
-	// 2) Enum <: T if every member conforms to T
-	if a[0].(string) == "enum" {
-		for i := 1; i < len(a); i++ {
-			lv, ok := ip.litToValue(a[i].(S))
-			if !ok || !ip.isType(lv, b, env) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Functions: param contravariant, return covariant (right-assoc)
-	if a[0].(string) == "binop" && a[1].(string) == "->" &&
-		b[0].(string) == "binop" && b[1].(string) == "->" {
-		aParam, aRest := a[2].(S), a[3].(S)
-		bParam, bRest := b[2].(S), b[3].(S)
-		if !ip.isSubtype(bParam, aParam, env) { // contra
-			return false
-		}
-		return ip.isSubtype(aRest, bRest, env) // co (right)
-	}
-
-	return false
-}
-
-// -----------------------------
-// Unification (least common supertype)
-// -----------------------------
-
-func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
-	t1 = ip.resolveType(t1, env)
-	t2 = ip.resolveType(t2, env)
-
-	// Any absorbs
-	if isId(t1, "Any") {
-		return t1
-	}
-	if isId(t2, "Any") {
-		return t2
-	}
-
-	// ---- Null / Nullable ----
-	if isId(t1, "Null") && isId(t2, "Null") {
-		return t1
-	}
-	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
-		return t2
-	}
-	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
-		return t1
-	}
-	if isId(t1, "Null") {
-		return S{"unop", "?", t2}
-	}
-	if isId(t2, "Null") {
-		return S{"unop", "?", t1}
-	}
-
-	// Nullable normalization
-	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
-	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
-	if isOpt1 && isOpt2 {
-		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt1 {
-		u := ip.unifyTypes(t1[2].(S), t2, env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt2 {
-		u := ip.unifyTypes(t1, t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-
-	// ---- Primitives (incl. Int ⊔ Num = Num) ----
-	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
-		n1 := t1[1].(string)
-		n2 := t2[1].(string)
-		if n1 == n2 {
-			return t1
-		}
-		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
-			return S{"id", "Num"}
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Arrays ----
-	if t1[0].(string) == "array" && t2[0].(string) == "array" {
-		e1 := S{"id", "Any"}
-		e2 := S{"id", "Any"}
-		if len(t1) == 2 {
-			e1 = t1[1].(S)
-		}
-		if len(t2) == 2 {
-			e2 = t2[1].(S)
-		}
-		elem := ip.unifyTypes(e1, e2, env)
-		return S{"array", elem}
-	}
-	if t1[0].(string) == "array" || t2[0].(string) == "array" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Maps: fieldwise unify; required OR ----
-	if t1[0].(string) == "map" && t2[0].(string) == "map" {
-		f1 := mapTypeFields(t1)
-		f2 := mapTypeFields(t2)
-		keys := map[string]struct{}{}
-		for k := range f1 {
-			keys[k] = struct{}{}
-		}
-		for k := range f2 {
-			keys[k] = struct{}{}
-		}
-		out := S{"map"}
-		for k := range keys {
-			s1, ok1 := f1[k]
-			s2, ok2 := f2[k]
-			switch {
-			case ok1 && ok2:
-				ut := ip.unifyTypes(s1.typ, s2.typ, env)
-				req := s1.required || s2.required
-				tag := "pair"
-				if req {
-					tag = "pair!"
-				}
-				out = append(out, S{tag, S{"str", k}, ut})
-			case ok1 && !ok2:
-				out = append(out, S{"pair", S{"str", k}, s1.typ})
-			case !ok1 && ok2:
-				out = append(out, S{"pair", S{"str", k}, s2.typ})
-			}
-		}
-		return out
-	}
-	if t1[0].(string) == "map" || t2[0].(string) == "map" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Enums ----
-	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
-		union := S{"enum"}
-		seen := func(x S) bool {
-			for i := 1; i < len(union); i++ {
-				if equalS(union[i].(S), x) {
-					return true
-				}
-			}
-			return false
-		}
-		for i := 1; i < len(t1); i++ {
-			x := t1[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		for i := 1; i < len(t2); i++ {
-			x := t2[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		return union
-	}
-	// enum ⊔ Type → Type if all members fit; else Any
-	if t1[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t1); i++ {
-			lv, ok := ip.litToValue(t1[i].(S))
-			if !ok || !ip.isType(lv, t2, env) {
-				all = false
+		// REPL commands (prefixed with ':')
+		if strings.HasPrefix(strings.TrimSpace(code), ":") {
+			if done := handleReplCommand(ip, ln, code); done {
 				break
 			}
+			continue
 		}
-		if all {
-			return t2
+
+		// Skip blank
+		if strings.TrimSpace(code) == "" {
+			continue
 		}
-		return S{"id", "Any"}
-	}
-	if t2[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t2); i++ {
-			lv, ok := ip.litToValue(t2[i].(S))
-			if !ok || !ip.isType(lv, t1, env) {
-				all = false
-				break
-			}
+
+		// Evaluate (persistent session)
+		v, err := ip.EvalPersistentSource(code)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, red(err.Error()))
+			continue
 		}
-		if all {
-			return t1
-		}
-		return S{"id", "Any"}
+		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
+
+		// Save to history
+		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
 	}
 
-	// ---- Functions: pointwise ----
-	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
-		// f1 = A1 -> B1, f2 = A2 -> B2
-		a1, b1 := t1[2].(S), t1[3].(S)
-		a2, b2 := t2[2].(S), t2[3].(S)
+	return 0
+}
 
-		// Param GLB (contravariant):
-		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
-		var param S
-		if ip.isSubtype(a1, a2, env) {
-			param = a1
-		} else if ip.isSubtype(a2, a1, env) {
-			param = a2
+// ---- REPL helpers ----------------------------------------------------------
+
+// handleReplCommand handles :help, :quit, :load, :type, :reset, :fmt
+func handleReplCommand(ip *mindscript.Interpreter, ln *liner.State, line string) (exit bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := strings.ToLower(fields[0])
+
+	switch cmd {
+	case ":help":
+		fmt.Print(helpText)
+
+	case ":quit", ":exit":
+		return true
+
+	case ":reset":
+		newIP, err := mindscript.NewRuntime()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, red(err.Error()))
+			fmt.Fprintln(os.Stderr, "reset aborted; keeping current interpreter.")
+			break
+		}
+		*ip = *newIP
+		fmt.Println("interpreter reset.")
+
+	case ":load":
+		if len(fields) < 2 {
+			fmt.Println("usage: :load <file>")
+			return false
+		}
+		path := fields[1]
+		src, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", red(fmt.Sprintf("cannot read %s: %v", path, err)))
+			return false
+		}
+		if v, err := ip.EvalPersistentSource(string(src)); err != nil {
+			fmt.Fprintln(os.Stderr, red(err.Error()))
 		} else {
-			return S{"id", "Any"}
+			// Print last value
+			fmt.Println(mindscript.FormatValue(v))
+			ln.AppendHistory(fmt.Sprintf(":load %s", path))
 		}
 
-		// Return LUB (covariant):
-		ret := ip.unifyTypes(b1, b2, env)
-		return S{"binop", "->", param, ret}
-	}
-	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
-		return S{"id", "Any"}
-	}
+	case ":fmt", ":pretty":
+		// Inline snippet?
+		inline := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+		if inline != "" {
+			runFormat(inline)
+			return false
+		}
+		// Otherwise, capture multiline snippet
+		code, ok := readByParseProbe(ln, "fmt> ", "... ")
+		if !ok {
+			fmt.Println() // Ctrl+D
+			return false
+		}
+		if strings.TrimSpace(code) == "" {
+			return false
+		}
+		runFormat(code)
 
-	return S{"id", "Any"}
+	default:
+		fmt.Printf("unknown command. Type :help for help.\n")
+	}
+	return false
 }
-=== END FILE: types.go ===
+
+// readByParseProbe reads one or more lines until the parser
+// accepts the current buffer as a complete program, or returns early
+// if the parser reports a non-recoverable error.
+func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
+	var b strings.Builder
+
+	for {
+		var line string
+		var err error
+		if b.Len() == 0 {
+			line, err = ln.Prompt(prompt)
+		} else {
+			line, err = ln.Prompt(cont)
+		}
+		if errors.Is(err, io.EOF) {
+			return "", false
+		}
+		if err != nil {
+			// Ctrl+C aborts the current input; let user start again.
+			return "", true
+		}
+
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+
+		src := b.String()
+		// Use the interactive parser: it reports need-more-input cases via IncompleteError.
+		_, perr := mindscript.ParseSExprInteractive(src)
+		if perr == nil {
+			// Complete and valid.
+			return src, true
+		}
+		// Keep reading only when the parser/lexer signalled an interactive incompleteness.
+		if mindscript.IsIncomplete(perr) {
+			continue
+		}
+		// Real error → return current buffer so the caller can print it.
+		return src, true
+	}
+}
+
+// stripStrings is retained only for endsWithOpenAnnotation helper if you keep it;
+// otherwise you can delete it from the CLI (we no longer use bracket heuristics).
+
+// ---- pretty printing -------------------------------------------------------
+
+func runFormat(src string) {
+	formatted, err := mindscript.Pretty(src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, red(err.Error()))
+		return
+	}
+	fmt.Println(formatted)
+}
+=== END FILE: cmd/cli/main.go ===
 

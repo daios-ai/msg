@@ -21,7 +21,7 @@
 // validation and inference:
 //
 //   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
-//     {name:"Pedro"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
+//     {name:"Raffa"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
 //     Arrays unify element types conservatively; objects are “open-world”.
 //   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
 //   - `IsSubtype(A, B)` is a *structural* subtyping relation.
@@ -37,6 +37,8 @@
 //     with cycle protection and resolution using the alias’s own environment.
 //   - Enums are finite sets of *literal* values (null/bool/int/num/str/array/map).
 //     Their typing, subtyping, and unification follow intuitive set semantics.
+//   - **Modules:** Runtime values tagged `VTModule` are treated as **maps** for
+//     all type-checking and inference purposes (they normalize via `AsMapValue`).
 //
 // TYPE SYNTAX (as S)
 // ------------------
@@ -343,6 +345,10 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 		}
 		return out
 
+	case VTModule:
+		// Treat modules structurally as maps.
+		return ip.valueToTypeS(AsMapValue(v), env)
+
 	case VTFun:
 		f := v.Data.(*Fun)
 		t := f.ReturnType
@@ -436,6 +442,9 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 	if len(t) == 0 {
 		return false
 	}
+
+	// Treat modules structurally as maps during type checks.
+	v = AsMapValue(v)
 
 	switch t[0].(string) {
 	case "id":

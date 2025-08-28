@@ -568,3 +568,65 @@ func Test_Types_Alias_State_With_Enum(t *testing.T) {
 	// 5) Using State in a function parameter (enum mismatch → Go error)
 	evalExpectError(t, ip, `(fun(s: State) -> Str do s.status end)({status: "paused"})`, "type mismatch")
 }
+
+// --- VTModule structural equivalence to maps --------------------------------
+
+func Test_Types_IsType_Module_As_Map(t *testing.T) {
+	ip := newIP()
+
+	// Build a module with export: foo = 1
+	mo := &MapObject{
+		Entries: map[string]Value{"foo": Int(1)},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"foo"},
+	}
+	mod := &Module{Map: mo, Env: NewEnv(ip.Global)}
+	v := Value{Tag: VTModule, Data: mod}
+
+	// Module should satisfy a map type that requires foo:Int
+	tOK := typeS(t, ip, `{foo!: Int}`)
+	if !ip.isType(v, tOK, ip.Global) {
+		t.Fatalf("expected VTModule with {foo:1} to match {foo!: Int}")
+	}
+
+	// But it must fail if a *required* missing field is demanded
+	tMissing := typeS(t, ip, `{foo!: Int, bar!: Num}`)
+	if ip.isType(v, tMissing, ip.Global) {
+		t.Fatalf("did not expect VTModule with {foo:1} to match {foo!: Int, bar!: Num}")
+	}
+
+	// Optional extra field should not be required
+	tOptional := typeS(t, ip, `{foo!: Int, bar: Num}`)
+	if !ip.isType(v, tOptional, ip.Global) {
+		t.Fatalf("expected VTModule with {foo:1} to match {foo!: Int, bar: Num}")
+	}
+}
+
+func Test_Types_ValueToType_Module_Inference(t *testing.T) {
+	ip := newIP()
+
+	// Build a module with exports: x:"hi", n:2
+	mo := &MapObject{
+		Entries: map[string]Value{"x": Str("hi"), "n": Int(2)},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"x", "n"},
+	}
+	mod := &Module{Map: mo, Env: NewEnv(ip.Global)}
+	v := Value{Tag: VTModule, Data: mod}
+
+	// ValueToType should infer an open-world map schema with optional fields
+	typ := ip.ValueToType(v, ip.Global)
+	if len(typ) == 0 || typ[0].(string) != "map" {
+		t.Fatalf("expected ValueToType(VTModule) to yield a 'map' type, got: %#v", typ)
+	}
+
+	fields := mapTypeFields(typ)
+	fx, ok := fields["x"]
+	if !ok || !isId(fx.typ, "Str") || fx.required {
+		t.Fatalf("expected field x: Str (optional), got: %#v", fx)
+	}
+	fn, ok := fields["n"]
+	if !ok || !isId(fn.typ, "Int") || fn.required {
+		t.Fatalf("expected field n: Int (optional), got: %#v", fn)
+	}
+}

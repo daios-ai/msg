@@ -5,9 +5,14 @@ import (
 	"strings"
 )
 
-// ---- standard built-ins ----------------------------------------------------
+// Opaque handle for environment snapshots (unexported).
+type envHandle struct {
+	env *Env
+}
 
-func registerStandardBuiltins(ip *Interpreter) {
+// ---- core built-ins ----------------------------------------------------
+
+func registerCoreBuiltins(ip *Interpreter) {
 	ip.RegisterNative(
 		"fail",
 		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
@@ -34,7 +39,7 @@ Returns:
 	ip.RegisterNative(
 		"try",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
+		S{"map"}, // returns a map with ok/value/error
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.MustArg("f")
 			if fv.Tag != VTFun {
@@ -60,7 +65,6 @@ Returns:
 						}
 					}
 				}()
-				// Use public API; does not rely on internals.
 				res = ip.Call0(fv)
 			}()
 
@@ -115,6 +119,54 @@ Params:
   x: Any — a runtime value
 
 Returns: Type`)
+
+	ip.RegisterNative(
+		"clone",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return cloneValue(ctx.MustArg("x"))
+		},
+	)
+	setBuiltinDoc(ip, "clone", `Clone a value (deep-copy).
+
+For maps, preserves key order and per-key annotations. Primitive values are
+returned as-is. Functions, modules, and handles are not duplicated (identity
+is preserved).
+
+Params:
+  x: Any
+
+Returns:
+  Any — a structurally independent copy for arrays/maps`)
+
+	// snapshot(_: Null) -> Any (VTHandle)
+	// Returns an opaque handle to a flattened, cloned snapshot of the visible env.
+	ip.RegisterNative(
+		"snapshot",
+		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			snap := snapshotEnv(ctx.Env())
+			return Value{Tag: VTHandle, Data: &envHandle{env: snap}}
+		},
+	)
+	setBuiltinDoc(ip, "snapshot", `Return an opaque handle to a snapshot of the current environment.
+
+Behavior:
+  • Captures a flattened view of all visible frames (inner shadows outer).
+  • Values are deep-copied where applicable (arrays/maps preserve order/annotations).
+  • Returned handle is opaque (VTHandle).
+
+Params:
+  _: Null
+
+Returns:
+  Any — an opaque handle (VTHandle) representing the snapshot`)
+
+	// NOTE: Do NOT register noteGet here — it's already provided in the
+	// introspection builtins. Keeping a single authoritative definition avoids
+	// double registration and doc drift.
 
 	ip.RegisterNative(
 		"isType",
@@ -179,7 +231,6 @@ Returns: Bool`)
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("path")
-			// Contractual (ParamSpec enforces Str already). Keep hard error if ever violated.
 			if pv.Tag != VTStr {
 				fail("import expects a string path")
 			}
@@ -189,10 +240,7 @@ Returns: Bool`)
 			}
 			mod, err := ip.importFile(pv.Data.(string), importer)
 			if err != nil {
-				// - Parse errors → HARD (Go error via fail)
-				// - Everything else (I/O, not found, runtime during init) → SOFT (annotated null)
 				msg := err.Error()
-				// Be robust to wording; modules.go formats as "parse error in <display>:\n..."
 				if strings.HasPrefix(strings.ToLower(msg), "parse error in ") ||
 					strings.Contains(strings.ToLower(msg), "parse error") {
 					fail(msg) // hard
@@ -214,7 +262,6 @@ Returns: Bool`)
 		func(ip *Interpreter, ctx CallCtx) Value {
 			nv := ctx.MustArg("name")
 			sv := ctx.MustArg("src")
-			// Contract violations → HARD.
 			if nv.Tag != VTStr || sv.Tag != VTStr {
 				fail("importCode expects (name: Str, src: Str)")
 			}
@@ -224,8 +271,6 @@ Returns: Bool`)
 
 			modVal, err := ip.importCode("mem:"+name, src)
 			if err != nil {
-				// - Parse errors → HARD
-				// - Runtime during module init → SOFT (annotated null)
 				msg := err.Error()
 				lc := strings.ToLower(msg)
 				if strings.HasPrefix(lc, "parse error in ") || strings.Contains(lc, "parse error") {
@@ -237,16 +282,10 @@ Returns: Bool`)
 		},
 	)
 
-}
-
-// --- Map manipulation ----------------------------------------------------
-
-// Map helpers (object utilities that must be native due to ordered/annotated maps).
-func registerMapBuiltins(ip *Interpreter) {
-	// mapHas(obj, key) -> Bool
+	// mapHas(obj: {}, key: Str) -> Bool
 	ip.RegisterNative(
 		"mapHas",
-		[]ParamSpec{{"obj", S{"id", "Any"}}, {"key", S{"id", "Str"}}},
+		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("obj")
@@ -265,13 +304,14 @@ Params:
   obj: {}  — a map value
   key: Str — property name
 
-Returns: Bool`)
+Returns:
+  Bool`)
 
-	// mapDelete(obj, key) -> {}
+	// mapDelete(obj: {}, key: Str) -> {}
 	ip.RegisterNative(
 		"mapDelete",
-		[]ParamSpec{{"obj", S{"id", "Any"}}, {"key", S{"id", "Str"}}},
-		S{"id", "Any"}, // returns the (mutated) input map
+		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
+		S{"map"}, // returns the (mutated) input map
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("obj")
 			k := ctx.MustArg("key").Data.(string)
@@ -305,5 +345,64 @@ Params:
   obj: {}  — a map value (mutated)
   key: Str — property name to remove
 
-Returns: {} (the same map value)`)
+Returns:
+  {} — the same map value`)
+}
+
+// --- Deep copy & snapshot for isolated worlds --------------------------------
+
+func cloneValue(v Value) Value {
+	switch v.Tag {
+	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
+		return v
+	case VTArray:
+		xs := v.Data.([]Value)
+		cp := make([]Value, len(xs))
+		for i := range xs {
+			cp[i] = cloneValue(xs[i])
+		}
+		return Arr(cp)
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		// Deep-copy entries
+		entries := make(map[string]Value, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			entries[k] = cloneValue(vv)
+		}
+		// Preserve insertion order and per-key annotations
+		keys := make([]string, len(mo.Keys))
+		copy(keys, mo.Keys)
+		keyAnn := make(map[string]string, len(mo.KeyAnn))
+		for k, ann := range mo.KeyAnn {
+			keyAnn[k] = ann
+		}
+		return Value{
+			Tag: VTMap,
+			Data: &MapObject{
+				Entries: entries,
+				KeyAnn:  keyAnn,
+				Keys:    keys,
+			},
+		}
+	default:
+		// Userdata/modules/handles are NOT copied (identity preserved).
+		return v
+	}
+}
+
+func snapshotEnv(e *Env) *Env {
+	// Flatten chain into one level (shadowing by nearer scopes wins).
+	flat := map[string]Value{}
+	for cur := e; cur != nil; cur = cur.parent {
+		for k, v := range cur.table {
+			if _, exists := flat[k]; !exists {
+				flat[k] = cloneValue(v)
+			}
+		}
+	}
+	cp := NewEnv(nil)
+	for k, v := range flat {
+		cp.Define(k, v)
+	}
+	return cp
 }

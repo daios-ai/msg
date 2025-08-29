@@ -44,27 +44,24 @@ func NewRuntime() (*Interpreter, error) {
 	ip := NewInterpreter()
 
 	// standard native builtins
-	registerStandardBuiltins(ip)
-	registerIOBuiltins(ip)
+	registerCoreBuiltins(ip)
 	registerIntrospectionBuiltins(ip)
-	registerUtilityBuiltins(ip)
-	registerNetBuiltins(ip)
-	registerMapBuiltins(ip)
 	registerCastBuiltins(ip)
-	registerMathBuiltins(ip)
-	registerTimeExtras(ip)
-	registerProcessBuiltins(ip)
+	registerIOBuiltins(ip)
 	registerOsBuiltins(ip)
-
+	registerNetBuiltins(ip)
+	registerConcurrencyBuiltins(ip)
+	registerProcessBuiltins(ip)
 	registerEncodingURLBuiltins(ip)
 	registerCryptoBuiltins(ip)
 	registerCompressionBuiltins(ip)
 	registerExecBuiltins(ip)
-	registerConcurrencyBuiltins(ip)
 	registerTimeBuiltins(ip)
 	registerPathBuiltins(ip)
 	registerJsonBuiltins(ip)
 	registerStringBuiltins(ip)
+	registerRandomBuiltins(ip)
+	registerMathBuiltins(ip)
 
 	if err := ip.LoadPrelude("std.ms", ""); err != nil {
 		return nil, err

@@ -1,4 +1,4 @@
-// === FILE: std_sys.go ===
+// === FILE: builtin_misc.go ===
 package mindscript
 
 import (
@@ -7,42 +7,29 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
-// --- Utilities: time, rand, json --------------------------------------------
+// --- Random Utilities ----------------------------------------------------
 
-func registerUtilityBuiltins(ip *Interpreter) {
-
-	ip.RegisterNative(
-		"clone",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return cloneValue(ctx.MustArg("x"))
-		},
+func registerRandomBuiltins(ip *Interpreter) {
+	// Instance-local RNG and mutex; closures capture these.
+	var (
+		rng   = rand.New(rand.NewSource(time.Now().UnixNano()))
+		rngMu sync.Mutex
 	)
-	setBuiltinDoc(ip, "clone", `Deep-copy arrays and maps.
 
-For maps, preserves key order and per-key annotations. Primitive values are
-returned as-is. Functions, modules, and handles are not duplicated (identity
-is preserved).
-
-Params:
-  x: Any
-
-Returns:
-  Any — a structurally independent copy for arrays/maps`)
-
-	var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	ip.RegisterNative(
 		"seedRand",
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Null"},
-		func(ip *Interpreter, ctx CallCtx) Value {
+		func(_ *Interpreter, ctx CallCtx) Value {
 			n := ctx.MustArg("n")
+			rngMu.Lock()
 			rng.Seed(n.Data.(int64))
+			rngMu.Unlock()
 			return Null
 		},
 	)
@@ -51,49 +38,67 @@ Returns:
 Use a fixed seed for reproducible sequences.
 
 Params:
-  n: Int — seed value
+	n: Int — seed value
 
 Returns:
-  Null`)
+	Null`)
 
-	ip.RegisterNative("randInt",
+	ip.RegisterNative(
+		"randInt",
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Int"},
-		func(ip *Interpreter, ctx CallCtx) Value {
+		func(_ *Interpreter, ctx CallCtx) Value {
 			n := ctx.MustArg("n").Data.(int64)
 			// Contractual: n must be > 0 (hard error)
 			if n <= 0 {
 				fail("randInt: n must be > 0")
 			}
-			return Int(int64(rng.Intn(int(n))))
+			// Guard against overflow when converting to platform int.
+			intMax := int64(int(^uint(0) >> 1))
+			if n > intMax {
+				fail("randInt: n too large on this platform")
+			}
+			rngMu.Lock()
+			res := rng.Intn(int(n))
+			rngMu.Unlock()
+			return Int(int64(res))
 		},
 	)
 	setBuiltinDoc(ip, "randInt", `Uniform random integer in [0, n).
 
 Params:
-  n: Int — upper bound (must be > 0)
+	n: Int — upper bound (must be > 0)
 
 Returns:
-  Int`)
+	Int`)
 
-	ip.RegisterNative("randFloat", nil, S{"id", "Num"}, func(ip *Interpreter, ctx CallCtx) Value {
-		return Num(rng.Float64())
-	})
+	ip.RegisterNative(
+		"randFloat",
+		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
+		S{"id", "Num"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			rngMu.Lock()
+			f := rng.Float64()
+			rngMu.Unlock()
+			return Num(f)
+		},
+	)
 	setBuiltinDoc(ip, "randFloat", `Uniform random number in [0.0, 1.0).
 
-Returns:
-  Num`)
+Params:
+	_: Null
 
+Returns:
+	Num`)
 }
 
-// --- Casting Utilities --------------------------------------------
+// --- Casting Utilities ----------------------------------------------------
 
 func registerCastBuiltins(ip *Interpreter) {
-
 	// str(x) -> Str (JSON-ish for arrays/maps; quotes preserved for strings)
 	ip.RegisterNative(
 		"str",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
@@ -114,8 +119,9 @@ func registerCastBuiltins(ip *Interpreter) {
 			case VTArray, VTMap:
 				b, err := json.Marshal(valueToGoJSON(v))
 				if err != nil {
-					// Soft error: cannot encode as JSON text (e.g., NaN/Inf)
-					return annotNull("stringify: " + err.Error())
+					// NEVER return null here; str must always return Str.
+					// Fall back to the debug representation.
+					return Str(v.String())
 				}
 				return Str(string(b))
 			default:
@@ -127,22 +133,22 @@ func registerCastBuiltins(ip *Interpreter) {
 	setBuiltinDoc(ip, "str", `Stringify a value.
 
 Rules:
-  • Str stays as-is
-  • Null → "null"
-  • Bool → "true"/"false"
-  • Int/Num → decimal representation
-  • Arrays/Maps → JSON text
-  • Functions/Modules/Handles/Types → readable debug form
+	• Str stays as-is
+	• Null → "null"
+	• Bool → "true"/"false"
+	• Int/Num → decimal representation
+	• Arrays/Maps → JSON text (best-effort; falls back to debug form if not encodable)
+	• Functions/Modules/Handles/Types → readable debug form
 
 Params:
-  x: Any
+	x: Any
 
 Returns:
-  Str`)
+	Str`)
 
 	ip.RegisterNative(
 		"int",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
@@ -169,21 +175,21 @@ Returns:
 	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise return null.
 
 Rules:
-  • Int → Int
-  • Num → truncated toward zero
-  • Bool → 1/0
-  • Str → parsed base-10 integer, or null on failure
-  • Others → null
+	• Int → Int
+	• Num → truncated toward zero
+	• Bool → 1/0
+	• Str → parsed base-10 integer, or null on failure
+	• Others → null
 
 Params:
-  x: Any
+	x: Any
 
 Returns:
-  Int?`)
+	Int?`)
 
 	ip.RegisterNative(
 		"num",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Num"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
@@ -210,22 +216,22 @@ Returns:
 	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise return null.
 
 Rules:
-  • Num → Num
-  • Int → floating-point value
-  • Bool → 1.0/0.0
-  • Str → parsed as float64, or null on failure
-  • Others → null
+	• Num → Num
+	• Int → floating-point value
+	• Bool → 1.0/0.0
+	• Str → parsed as float64, or null on failure
+	• Others → null
 
 Params:
-  x: Any
+	x: Any
 
 Returns:
-  Num?`)
+	Num?`)
 
 	ip.RegisterNative(
 		"bool",
-		[]ParamSpec{{"x", S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Bool"}},
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Bool"}, // not optional; implementation never returns null
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
 			switch v.Tag {
@@ -251,20 +257,20 @@ Returns:
 	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules.
 
 Falsey:
-  • null
-  • 0, 0.0
-  • "" (empty string)
-  • [] (empty array)
-  • {} (empty map)
+	• null
+	• 0, 0.0
+	• "" (empty string)
+	• [] (empty array)
+	• {} (empty map)
 
 Truthy:
-  • everything else (including functions, modules, handles, types)
+	• everything else (including functions, modules, handles, types)
 
 Params:
-  x: Any
+	x: Any
 
 Returns:
-  Bool`)
+	Bool`)
 
 	ip.RegisterNative(
 		"len",
@@ -287,9 +293,22 @@ Returns:
 			}
 		},
 	)
+	setBuiltinDoc(ip, "len", `Length of a value.
+
+Rules:
+	• [a, b, c] → 3
+	• {k: v, ...} → number of keys (in insertion order)
+	• "…unicode…" → rune count
+	• Others → null
+
+Params:
+	x: Any
+
+Returns:
+	Int?`)
 }
 
-// --- Math Utilities --------------------------------------------
+// --- Math Utilities ----------------------------------------------------
 
 func registerMathBuiltins(ip *Interpreter) {
 	// Constants
@@ -298,68 +317,73 @@ func registerMathBuiltins(ip *Interpreter) {
 	setBuiltinDoc(ip, "PI", `Mathematical constant π.
 
 Returns:
-  Num`)
+	Num`)
 	setBuiltinDoc(ip, "E", `Euler's number e.
 
 Returns:
-  Num`)
+	Num`)
 
 	// Unary math helpers
 	un1 := func(name string, f func(float64) float64, doc string) {
 		ip.RegisterNative(
 			name,
-			[]ParamSpec{{"x", S{"id", "Num"}}},
+			[]ParamSpec{{Name: "x", Type: S{"id", "Num"}}},
 			S{"id", "Num"},
-			func(_ *Interpreter, ctx CallCtx) Value { return Num(f(ctx.MustArg("x").Data.(float64))) },
+			func(_ *Interpreter, ctx CallCtx) Value {
+				return Num(f(ctx.MustArg("x").Data.(float64)))
+			},
 		)
 		setBuiltinDoc(ip, name, doc)
 	}
 	un1("sin", math.Sin, `Sine of an angle in radians.
 
 Params:
-  x: Num — radians
+	x: Num — radians
 
 Returns:
-  Num`)
+	Num`)
 	un1("cos", math.Cos, `Cosine of an angle in radians.
 
 Params:
-  x: Num — radians
+	x: Num — radians
 
 Returns:
-  Num`)
+	Num`)
 	un1("tan", math.Tan, `Tangent of an angle in radians.
 
 Params:
-  x: Num — radians
+	x: Num — radians
 
 Returns:
-  Num`)
+	Num`)
 	un1("sqrt", math.Sqrt, `Square root.
 
 Params:
-  x: Num — non-negative
+	x: Num — non-negative
 
 Returns:
-  Num`)
+	Num`)
 	un1("log", math.Log, `Natural logarithm (base e).
 
 Params:
-  x: Num — positive
+	x: Num — positive
 
 Returns:
-  Num`)
+	Num`)
 	un1("exp", math.Exp, `Exponential function e^x.
 
 Params:
-  x: Num
+	x: Num
 
 Returns:
-  Num`)
+	Num`)
 
 	ip.RegisterNative(
 		"pow",
-		[]ParamSpec{{"base", S{"id", "Num"}}, {"exp", S{"id", "Num"}}},
+		[]ParamSpec{
+			{Name: "base", Type: S{"id", "Num"}},
+			{Name: "exp", Type: S{"id", "Num"}},
+		},
 		S{"id", "Num"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			return Num(math.Pow(ctx.MustArg("base").Data.(float64), ctx.MustArg("exp").Data.(float64)))
@@ -368,20 +392,20 @@ Returns:
 	setBuiltinDoc(ip, "pow", `Power: base^exp.
 
 Params:
-  base: Num
-  exp:  Num
+	base: Num
+	exp:  Num
 
 Returns:
-  Num`)
+	Num`)
 }
 
-// --- Process Utilities --------------------------------------------
+// --- Process Utilities ----------------------------------------------------
 
 func registerProcessBuiltins(ip *Interpreter) {
 	// exit(code:Int?) -> Null (terminates the host process)
 	ip.RegisterNative(
 		"exit",
-		[]ParamSpec{{"code", S{"unop", "?", S{"id", "Int"}}}},
+		[]ParamSpec{{Name: "code", Type: S{"unop", "?", S{"id", "Int"}}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			codeV := ctx.MustArg("code")
@@ -398,8 +422,8 @@ func registerProcessBuiltins(ip *Interpreter) {
 By convention, 0 indicates success; non-zero indicates an error.
 
 Params:
-  code: Int? — exit status (default 0)
+	code: Int? — exit status (default 0)
 
 Returns:
-  Null (never returns; process exits)`)
+	Null (never returns; process exits)`)
 }

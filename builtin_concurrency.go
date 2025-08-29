@@ -19,64 +19,6 @@ type chanBox struct {
 	ch chan Value
 }
 
-// --- Deep copy & snapshot for isolated worlds --------------------------------
-
-func cloneValue(v Value) Value {
-	switch v.Tag {
-	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
-		return v
-	case VTArray:
-		xs := v.Data.([]Value)
-		cp := make([]Value, len(xs))
-		for i := range xs {
-			cp[i] = cloneValue(xs[i])
-		}
-		return Arr(cp)
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		// Deep-copy entries
-		entries := make(map[string]Value, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			entries[k] = cloneValue(vv)
-		}
-		// Preserve insertion order and per-key annotations
-		keys := make([]string, len(mo.Keys))
-		copy(keys, mo.Keys)
-		keyAnn := make(map[string]string, len(mo.KeyAnn))
-		for k, ann := range mo.KeyAnn {
-			keyAnn[k] = ann
-		}
-		return Value{
-			Tag: VTMap,
-			Data: &MapObject{
-				Entries: entries,
-				KeyAnn:  keyAnn,
-				Keys:    keys,
-			},
-		}
-	default:
-		// Userdata/modules are NOT copied; processes should not capture them.
-		return v
-	}
-}
-
-func snapshotEnv(e *Env) *Env {
-	// Flatten chain into one level (shadowing by nearer scopes wins).
-	flat := map[string]Value{}
-	for cur := e; cur != nil; cur = cur.parent {
-		for k, v := range cur.table {
-			if _, exists := flat[k]; !exists {
-				flat[k] = cloneValue(v)
-			}
-		}
-	}
-	cp := NewEnv(nil)
-	for k, v := range flat {
-		cp.Define(k, v)
-	}
-	return cp
-}
-
 // safeSend attempts to send v to ch; it returns false if ch is closed.
 func safeSend(ch chan Value, v Value) (ok bool) {
 	defer func() {

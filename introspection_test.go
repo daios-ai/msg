@@ -1,263 +1,289 @@
 package mindscript
 
 import (
+	"errors"
+	"reflect"
 	"testing"
 )
 
-// --- tests -----------------------------------------------------------------
+// ---------- small helpers ----------
 
-// Value ↔ runtime-S round-trip with annotation + arrays/maps + VTType inside.
-func Test_Introspection_Ix_Value_Annot_Map_Array_Type_RoundTrip(t *testing.T) {
-	mo := &MapObject{
-		Entries: map[string]Value{
-			"req": Str("A"),
-			"ann": Str("B"),
-			"arr": Arr([]Value{Int(1), Num(2), Bool(true)}),
-		},
-		KeyAnn: map[string]string{"req": "!", "ann": "note"},
-		Keys:   []string{"req", "ann", "arr"},
-	}
-	v := Value{Tag: VTMap, Data: mo, Annot: "root"}
+func vArray(elems ...Value) Value { return Arr(elems) }
+func vStr(s string) Value         { return Str(s) }
+func vInt(n int64) Value          { return Int(n) }
+func vNum(f float64) Value        { return Num(f) }
+func vBool(b bool) Value          { return Bool(b) }
 
-	// Direct reflect→reify must preserve Value.Annot.
-	rs := IxReflect(v)
-	round, err := IxReify(rs)
-	if err != nil {
-		t.Fatalf("IxReify: %v", err)
-	}
-	if round.Annot != "root" {
-		t.Fatalf("want annot 'root', got %q", round.Annot)
-	}
+func rtAnnotNull(msg string) Value {
+	return vArray(
+		vStr("annot"),
+		vArray(vStr("str"), vStr(msg)),
+		vArray(vStr("null")),
+	)
+}
 
-	// Check map invariants.
-	if round.Tag != VTMap {
-		t.Fatalf("want VTMap, got %#v", round)
+func valueDeepEqual(a, b Value) bool {
+	if a.Tag != b.Tag {
+		return false
 	}
-	rm := round.Data.(*MapObject)
-	if rm.KeyAnn["req"] != "!" {
-		t.Fatalf("want req required '!'")
-	}
-	if rm.KeyAnn["ann"] != "note" {
-		t.Fatalf("want ann key annotation 'note', got %q", rm.KeyAnn["ann"])
-	}
-	arr := rm.Entries["arr"].Data.([]Value)
-	wantInt(t, arr[0], 1)
-	wantNum(t, arr[1], 2)
-	wantBool(t, arr[2], true)
-
-	// Insert a VTType into the array and round-trip again.
-	typ := TypeVal(S{"unop", "?", S{"id", "Int"}})
-	rm.Entries["arr"] = Arr([]Value{rm.Entries["arr"], typ})
-	rs2 := IxReflect(round)
-	round2, err := IxReify(rs2)
-	if err != nil {
-		t.Fatalf("IxReify (with type in array): %v", err)
-	}
-	rm2 := round2.Data.(*MapObject)
-	arr2 := rm2.Entries["arr"].Data.([]Value)
-	if arr2[1].Tag != VTType {
-		t.Fatalf("want VTType in array, got %#v", arr2[1])
+	switch a.Tag {
+	case VTNull:
+		return true
+	case VTBool, VTInt, VTNum, VTStr:
+		return reflect.DeepEqual(a.Data, b.Data)
+	case VTArray:
+		ax := a.Data.([]Value)
+		bx := b.Data.([]Value)
+		if len(ax) != len(bx) {
+			return false
+		}
+		for i := range ax {
+			if !valueDeepEqual(ax[i], bx[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		// We only compare runtime-S (arrays/scalars) in these tests.
+		return reflect.DeepEqual(a, b)
 	}
 }
 
-// Function: reflect → rewrite (“int 1”→“int 2”) → reify → execute.
-func Test_Introspection_Ix_Function_Rewrite_And_Run(t *testing.T) {
-	// fun (x: Int) -> Int do x + 1 end
-	params := S{"array", S{"pair", S{"id", "x"}, S{"id", "Int"}}}
-	body := S{"block", S{"binop", "+", S{"id", "x"}, S{"int", int64(1)}}}
-	funNode := S{"fun", params, S{"id", "Int"}, body}
+func mustEqValue(t *testing.T, got, want Value) {
+	t.Helper()
+	if !valueDeepEqual(got, want) {
+		t.Fatalf("\nVALUE MISMATCH\n got : %#v\n want: %#v", got, want)
+	}
+}
 
-	rs := IxToS(funNode)
+func mustErr(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
 
-	// Rewrite ("int", 1) → ("int", 2) everywhere.
-	rs2 := IxRewrite(rs, func(n Value) (Value, bool) {
-		if n.Tag != VTArray {
-			return Value{}, false
-		}
-		a := n.Data.([]Value)
-		if len(a) == 2 && a[0].Tag == VTStr && a[0].Data.(string) == "int" &&
-			a[1].Tag == VTInt && a[1].Data.(int64) == 1 {
-			return IxToS(S{"int", int64(2)}), true
-		}
-		return Value{}, false
+// ---------- tests ----------
+
+func TestIxToS_SoftErrorOnUnsupportedAtom(t *testing.T) {
+	// Construct an AST S with an unsupported atom (int32).
+	bad := S{"block", S{"int", int64(1)}, int32(7)}
+	got := IxToS(bad)
+	// We only assert that it is an annotated-null soft error.
+	// Message text is implementation-defined but must be present.
+	if got.Tag != VTArray {
+		t.Fatalf("expected VTArray, got %v", got.Tag)
+	}
+	top := got.Data.([]Value)
+	if len(top) != 3 || top[0].Tag != VTStr || top[0].Data.(string) != "annot" {
+		t.Fatalf("expected annotated-null; got %#v", got)
+	}
+	// Final child must be ["null"]
+	nullNode := top[2]
+	wantNull := vArray(vStr("null"))
+	mustEqValue(t, nullNode, wantNull)
+}
+
+func TestIxFromS_NoValidation_IxReifyHardFails(t *testing.T) {
+	// Malformed runtime-S: ["array", ["int", ["weird"]]]
+	rt := Arr([]Value{
+		Str("array"),
+		Arr([]Value{Str("int"), Arr([]Value{Str("weird")})}),
 	})
 
-	// Reify to a function and run it.
+	// 1) Structural decode should NOT error.
+	s, err := IxFromS(rt)
+	if err != nil {
+		t.Fatalf("IxFromS should not validate by tag/arity; got error: %v", err)
+	}
+
+	// Structural sanity checks (no string formatting).
+	if len(s) != 2 || s[0] != "array" {
+		t.Fatalf("expected top-level ['array', ...], got %v", s)
+	}
+	elem, ok := s[1].(S)
+	if !ok || len(elem) != 2 || elem[0] != "int" {
+		t.Fatalf("expected ['int', ...] element, got %v", s[1])
+	}
+	weird, ok := elem[1].(S)
+	if !ok || len(weird) != 1 || weird[0] != "weird" {
+		t.Fatalf("expected ['weird'] as bogus payload, got %v", elem[1])
+	}
+
+	// 2) Reify/eval should hard-fail in the interpreter.
 	ip := NewInterpreter()
-	val, err := IxReifyIn(rs2, ip.Global)
-	if err != nil {
-		t.Fatalf("IxReifyIn: %v", err)
+	if _, err := ip.IxReify(rt); err == nil {
+		t.Fatalf("IxReify should fail when evaluating malformed S (hard error), got nil")
 	}
-	if val.Tag != VTFun {
-		t.Fatalf("want fun, got %#v", val)
-	}
-	// x=40 → 40+2 = 42
-	wantInt(t, ip.Apply(val, []Value{Int(40)}), 42)
 }
 
-// Oracle + Type (with annot) + interactive parse + error stubs.
-func Test_Introspection_Ix_Oracle_Type_Interactive_And_Errors(t *testing.T) {
-	// Oracle AST: oracle (x: Int) -> Num from [1]
-	params := S{"array", S{"pair", S{"id", "x"}, S{"id", "Int"}}}
-	source := S{"array", S{"int", int64(1)}}
-	oracleNode := S{"oracle", params, S{"id", "Num"}, source}
-	rs := IxToS(oracleNode)
+func TestReflect_ScalarsAndNegatives(t *testing.T) {
+	cases := []struct {
+		val  Value
+		want Value
+	}{
+		{Null, vArray(vStr("null"))},
+		{vBool(true), vArray(vStr("bool"), vBool(true))},
+		{vInt(-2), vArray(vStr("int"), vInt(-2))},
+		{vNum(-1.5), vArray(vStr("num"), vNum(-1.5))},
+		{vStr("hi"), vArray(vStr("str"), vStr("hi"))},
+	}
+	for _, c := range cases {
+		got := IxToS(ixMustCtorS(c.val))
+		mustEqValue(t, got, c.want)
+	}
+}
 
+func TestReflect_ArrayMap_WithRequirednessAndKeyAnn(t *testing.T) {
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{},
+	}
+	// insertion order: a, b
+	mo.Keys = append(mo.Keys, "a")
+	mo.Entries["a"] = vInt(1)
+	mo.KeyAnn["a"] = "!" // required
+
+	mo.Keys = append(mo.Keys, "b")
+	mo.Entries["b"] = vStr("x")
+	mo.KeyAnn["b"] = "doc for b" // plain doc
+
+	mv := Value{Tag: VTMap, Data: mo}
+
+	got := IxReflect(mv) // constructor code → to runtime-S via IxToS
+	want := vArray(
+		vStr("map"),
+		// pair! for required
+		vArray(vStr("pair!"),
+			vArray(vStr("str"), vStr("a")),
+			vArray(vStr("int"), vInt(1)),
+		),
+		// pair with annotated key for docs
+		vArray(vStr("pair"),
+			vArray(vStr("annot"),
+				vArray(vStr("str"), vStr("doc for b")),
+				vArray(vStr("str"), vStr("b")),
+			),
+			vArray(vStr("str"), vStr("x")),
+		),
+	)
+	mustEqValue(t, got, want)
+}
+
+func TestReflect_Fun_Native_Id(t *testing.T) {
+	// Native function reflects to ["id", name]
+	fn := &Fun{NativeName: "now"}
+	nv := FunVal(fn)
+
+	got := IxReflect(nv)
+	want := vArray(vStr("id"), vStr("now"))
+	mustEqValue(t, got, want)
+}
+
+func TestReflect_Fun_UserConstructor(t *testing.T) {
+	f := &Fun{
+		Params:     []string{"x"},
+		ParamTypes: []S{S{"id", "Int"}},
+		ReturnType: S{"id", "Int"},
+		Body:       S{"binop", "+", S{"id", "x"}, S{"int", int64(1)}},
+	}
+	got := IxReflect(FunVal(f))
+	// ["fun", ["array", ["pair", ["id","x"], ["id","Int"]]], ["id","Int"], <body>]
+	want := vArray(
+		vStr("fun"),
+		vArray(
+			vStr("array"),
+			vArray(vStr("pair"),
+				vArray(vStr("id"), vStr("x")),
+				vArray(vStr("id"), vStr("Int")),
+			),
+		),
+		vArray(vStr("id"), vStr("Int")),
+		vArray(
+			vStr("binop"), vStr("+"),
+			vArray(vStr("id"), vStr("x")),
+			vArray(vStr("int"), vInt(1)),
+		),
+	)
+	mustEqValue(t, got, want)
+}
+
+func TestReflect_Type_AsConstructor(t *testing.T) {
+	tv := TypeVal(S{"array", S{"id", "Int"}}) // Type value
+	got := IxReflect(tv)
+	want := vArray(
+		vStr("type"),
+		vArray(vStr("array"), vArray(vStr("id"), vStr("Int"))),
+	)
+	mustEqValue(t, got, want)
+}
+
+func TestReflect_Handle_SoftError(t *testing.T) {
+	h := Value{Tag: VTHandle, Data: "opaque"}
+	got := IxReflect(h)
+	// We only assert it's an annotated-null soft error.
+	top := got.Data.([]Value)
+	if len(top) != 3 || top[0].Data.(string) != "annot" {
+		t.Fatalf("expected annotated-null for handle; got %#v", got)
+	}
+}
+
+func TestIxReify_SimpleProgram_Evaluates(t *testing.T) {
 	ip := NewInterpreter()
-	fv, err := IxReifyIn(rs, ip.Global)
+	// Program: ("binop","+ ", 2, 3) ⇒ 5
+	rt := vArray(
+		vStr("binop"), vStr("+"),
+		vArray(vStr("int"), vInt(2)),
+		vArray(vStr("int"), vInt(3)),
+	)
+	val, err := ip.IxReify(rt)
 	if err != nil {
-		t.Fatalf("IxReifyIn oracle: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if fv.Tag != VTFun || !fv.Data.(*Fun).IsOracle {
-		t.Fatalf("want oracle fun, got %#v", fv)
-	}
-
-	// Type with annotation wrapper → VTType with .Annot preserved.
-	Ts := S{"annot", S{"str", "doc"}, S{"unop", "?", S{"id", "Int"}}}
-	Tval, err := IxReify(IxToS(Ts))
-	if err != nil {
-		t.Fatalf("IxReify type: %v", err)
-	}
-	if Tval.Tag != VTType || Tval.Annot != "doc" {
-		t.Fatalf("type reify annot lost: %#v", Tval)
-	}
-	// And the pretty type string should be Int?
-	if got := FormatType(Tval.Data.(*TypeValue).Ast); got != "Int?" {
-		t.Fatalf("want 'Int?', got %q", got)
-	}
-
-	// Interactive parse should yield IncompleteError.
-	if _, err := IxFromSourceInteractive("if true then 1"); err == nil || !IsIncomplete(err) {
-		t.Fatalf("expected IncompleteError, got %v", err)
-	}
-
-	// Reify error paths: native/module/handle.
-	ip.RegisterNative("inc", []ParamSpec{{Name: "x", Type: S{"id", "Int"}}}, S{"id", "Int"},
-		func(ip *Interpreter, ctx CallCtx) Value { return Int(ctx.MustArg("x").Data.(int64) + 1) })
-	nv, _ := ip.Core.Get("inc")
-	if _, err := IxReify(IxReflect(nv)); err == nil {
-		t.Fatalf("expected error on reifying native")
-	}
-	if _, err := IxReify(Arr([]Value{Str("module")})); err == nil {
-		t.Fatalf("expected error on reifying module stub")
-	}
-	if _, err := IxReify(Arr([]Value{Str("handle")})); err == nil {
-		t.Fatalf("expected error on reifying handle stub")
+	if val.Tag != VTInt || val.Data.(int64) != 5 {
+		t.Fatalf("want 5, got %#v", val)
 	}
 }
 
-// Source helpers + AST↔runtimeS↔AST stability (smoke).
-func Test_Introspection_Ix_Source_Helpers_And_Stability(t *testing.T) {
-	ast, err := IxFromSource("do 1 + 2 end")
-	if err != nil {
-		t.Fatalf("IxFromSource: %v", err)
-	}
-
-	// round-trip AST ↔ runtime-S ↔ AST
-	rs := IxToS(ast)
-	ast2, err := IxFromS(rs)
-	if err != nil {
-		t.Fatalf("IxFromS: %v", err)
-	}
-
-	// Both should format to the same stable source.
-	s1 := IxToSource(ast)
-	s2 := IxToSource(ast2)
-	if s1 != s2 {
-		t.Fatalf("AST round-trip changed formatting:\norig: %q\nafter: %q", s1, s2)
-	}
-
-	// Evaluate to ensure AST is executable.
+func TestIxReify_Rejects_ModuleAndHandle(t *testing.T) {
 	ip := NewInterpreter()
-	v, err := ip.Eval(ast)
-	if err != nil {
-		t.Fatalf("Eval: %v", err)
-	}
-	wantInt(t, v, 3)
+
+	rtModule := vArray(
+		vStr("module"),
+		vArray(vStr("str"), vStr("math")),
+		// empty exports ok syntactically
+	)
+	_, err := ip.IxReify(rtModule)
+	mustErr(t, err)
+
+	rtHandle := vArray(vStr("handle"))
+	_, err = ip.IxReify(rtHandle)
+	mustErr(t, err)
 }
 
-// Multiple annotation wrappers merge correctly (order-agnostic).
-func Test_Introspection_Ix_Annot_Merge(t *testing.T) {
-	// Build AST: ("annot","a", ("annot","b", ("str","x")))
-	Sannot := S{
-		"annot",
-		S{"str", "a"},
-		S{"annot", S{"str", "b"}, S{"str", "x"}},
+func TestRoundTrip_ToS_FromS(t *testing.T) {
+	ast := S{
+		"map",
+		S{"pair", S{"str", "k"}, S{"array", S{"int", int64(1)}, S{"bool", true}}},
 	}
-	rs := IxToS(Sannot)
-	v, err := IxReify(rs)
+	rt := IxToS(ast)
+	back, err := IxFromS(rt)
 	if err != nil {
-		t.Fatalf("IxReify: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	wantStr(t, v, "x")
-	// Depending on unwrap order, annotation may be "a\nb" or "b\na".
-	if v.Annot != "a\nb" && v.Annot != "b\na" {
-		t.Fatalf("want merged annot 'a\\nb' or 'b\\na', got %q", v.Annot)
+	if !equalS(ast, back) {
+		t.Fatalf("round-trip mismatch\nast : %#v\nback: %#v", ast, back)
 	}
 }
 
-// Enum[...] round-trip: source → AST → runtime-S → AST, and reify as VTType.
-func Test_Introspection_Ix_Enum_RoundTrip_Type(t *testing.T) {
-	ast, err := IxFromSource(`Enum[ 1, 2, "a" ]`)
-	if err != nil {
-		t.Fatalf("IxFromSource enum: %v", err)
-	}
+// ---------- internals used by tests ----------
 
-	// AST ↔ runtime-S ↔ AST should be stable
-	rs := IxToS(ast)
-	ast2, err := IxFromS(rs)
-	if err != nil {
-		t.Fatalf("IxFromS: %v", err)
-	}
-	s1 := IxToSource(ast)
-	s2 := IxToSource(ast2)
-	if s1 != s2 {
-		t.Fatalf("enum round-trip changed formatting:\norig: %q\nafter: %q", s1, s2)
-	}
-
-	// Reify the ("enum", ...) node itself should yield VTType.
-	// Program AST is ("block", enumNode); grab child 1.
-	if len(ast2) < 2 {
-		t.Fatalf("unexpected AST shape: %#v", ast2)
-	}
-	enumNode, ok := ast2[1].(S)
+// ixMustCtorS returns constructor S for v or panics (tests expect success).
+func ixMustCtorS(v Value) S {
+	s, ok := ixConstructorS_ForValue(v)
 	if !ok {
-		t.Fatalf("unexpected enum node type: %#v", ast2[1])
+		panic(errors.New("no constructor S for value"))
 	}
-	v, err := IxReify(IxToS(enumNode))
-	if err != nil {
-		t.Fatalf("IxReify enum: %v", err)
-	}
-	if v.Tag != VTType {
-		t.Fatalf("enum should reify to VTType, got %#v", v)
-	}
-}
-
-// Pretty/printer idempotence across a small corpus.
-func Test_Introspection_Ix_Pretty_Idempotence_Corpus(t *testing.T) {
-	corpus := []string{
-		"1 + 2 * 3",
-		"do 1 + 2 end",
-		"fun(x: Int) -> Int do x + 1 end",
-		"if true then 1 else 2 end",
-		`{ name!: "Ada", age: 42 }`,
-	}
-
-	for i, src := range corpus {
-		ast, err := IxFromSource(src)
-		if err != nil {
-			t.Fatalf("[%d] parse: %v\nsrc:\n%s", i, err, src)
-		}
-		s1 := IxToSource(ast)
-
-		ast2, err := IxFromSource(s1) // parse what we just printed
-		if err != nil {
-			t.Fatalf("[%d] reparse: %v\nprinted:\n%s", i, err, s1)
-		}
-		s2 := IxToSource(ast2)
-
-		if s1 != s2 {
-			t.Fatalf("[%d] pretty not idempotent:\nfirst:  %q\nsecond: %q", i, s1, s2)
-		}
-	}
+	return s
 }

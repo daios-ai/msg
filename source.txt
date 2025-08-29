@@ -1,356 +1,379 @@
-=== BEGIN FILE: cmd/cli/main.go ===
-// cmd/cli/main.go
-package main
+=== BEGIN FILE: interpreter.go ===
+// interpreter_api.go — SINGLE PUBLIC API SURFACE for the MindScript interpreter.
+// This file contains ONLY exported types, constructors, and the public methods
+// that callers use. Implementations are thin delegations into private parts.
+//
+// Internals live in:
+//   - interpreter_exec.go — execution/call engine (private)
+//   - interpreter_ops.go  — built-ins, assignment, iteration (private)
+//
+// NOTE: Runtime error mode toggles are removed. Runtime failures are always
+// returned as Go errors by the exec layer.
+
+package mindscript
 
 import (
-	"errors"
-	"flag"
 	"fmt"
-	"io"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"strings"
-	"syscall"
-
-	"github.com/peterh/liner"
-
-	// Adjust this to your actual module path
-	mindscript "github.com/DAIOS-AI/msg"
+	"strconv"
 )
+
+////////////////////////////////////////////////////////////////////////////////
+//                              PUBLIC TYPES & CTORS
+////////////////////////////////////////////////////////////////////////////////
+
+// ValueTag enumerates all runtime kinds a Value may hold.
+type ValueTag int
 
 const (
-	colorReset = "\x1b[0m"
-	colorRed   = "\x1b[31m"
-	colorGreen = "\x1b[32m"
-	colorBlue  = "\x1b[34m"
+	VTNull ValueTag = iota
+	VTBool
+	VTInt
+	VTNum
+	VTStr
+	VTArray
+	VTMap
+	VTFun
+	VTType
+	VTModule
+	VTHandle
 )
 
-func red(s string) string   { return colorRed + s + colorReset }
-func green(s string) string { return colorGreen + s + colorReset }
-func blue(s string) string  { return colorBlue + s + colorReset }
-
-// Colorize a formatted value: annotation lines (trim-left starts with "#") → green,
-// everything else → blue.
-func colorizeValue(val string) string {
-	lines := strings.Split(val, "\n")
-	for i, ln := range lines {
-		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
-			lines[i] = green(ln)
-		} else if ln != "" {
-			lines[i] = blue(ln)
-		}
-	}
-	return strings.Join(lines, "\n")
+// Value is the universal runtime carrier.
+//
+// Tag   — discriminant
+// Data  — Go value appropriate for Tag
+// Annot — optional annotation used for doc/error propagation; never affects equality
+type Value struct {
+	Tag   ValueTag
+	Data  interface{}
+	Annot string
 }
 
-const (
-	appName     = "mindscript"
-	historyFile = ".mindscript_history"
-	promptMain  = "==> "
-	promptCont  = "... "
-	banner      = "MindScript REPL — Ctrl+C to cancel input, Ctrl+D to exit. Type :help for commands."
-	helpText    = `
-REPL commands:
-  :help            Show this help
-  :quit / :exit    Exit the REPL
-  :load <file>     Load & execute a file into the current session
-  :fmt [code]      Pretty-print code (multiline if no code provided)
-  :pretty [code]   Alias for :fmt
-  :reset           Reset the interpreter (new empty global scope)
-`
-)
-
-// ---- main ------------------------------------------------------------------
-
-func main() {
-	// Compute an exit code, but call os.Exit only once, after all defers ran.
-	code := 0
-	defer func() {
-		os.Exit(code)
-	}()
-
-	var evalStr string
-	flag.StringVar(&evalStr, "e", "", "Evaluate the given MindScript snippet and exit")
-	flag.Parse()
-
-	args := flag.Args()
-
-	switch {
-	case evalStr != "":
-		code = runEvalString(evalStr)
-	case len(args) > 0:
-		code = runFile(args[0])
+// String renders a human-friendly debug representation; annotations are not shown.
+func (v Value) String() string {
+	switch v.Tag {
+	case VTNull:
+		return "null"
+	case VTBool:
+		return fmt.Sprintf("%v", v.Data.(bool))
+	case VTInt:
+		return strconv.FormatInt(v.Data.(int64), 10)
+	case VTNum:
+		return strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+	case VTStr:
+		return fmt.Sprintf("%q", v.Data.(string))
+	case VTArray:
+		return fmt.Sprintf("<array len=%d>", len(v.Data.([]Value)))
+	case VTMap:
+		return "<map>"
+	case VTFun:
+		return "<fun>"
+	case VTType:
+		return "<type>"
+	case VTModule:
+		return "<module>"
 	default:
-		code = runREPL()
+		return "<unknown>"
 	}
 }
 
-// ---- file & string modes ---------------------------------------------------
+// Null is the singleton null Value (no annotation).
+var Null = Value{Tag: VTNull}
 
-func runFile(path string) int {
-	// File mode: keep colors OFF (library default).
-	src, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: cannot read %s: %v\n", appName, path, err)
-		return 1
-	}
+// Primitive constructors.
+func Bool(b bool) Value    { return Value{Tag: VTBool, Data: b} }
+func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
+func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
+func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
+func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: xs} }
 
-	ip, err := mindscript.NewRuntime()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
-	}
-
-	v, err := ip.EvalSource(string(src))
-	if err != nil {
-		// Parse/Lex errors are already pretty-printed by the library.
-		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
-		return 1
-	}
-	fmt.Println(mindscript.FormatValue(v))
-	return 0
+// MapObject is an ordered map preserving insertion order and per-key annotations.
+// The Value for a map is Value{Tag: VTMap, Data: *MapObject}.
+type MapObject struct {
+	Entries map[string]Value
+	KeyAnn  map[string]string
+	Keys    []string
 }
 
-func runEvalString(code string) int {
-	// -e mode: keep colors OFF (library default).
-	ip, _ := mindscript.NewRuntime()
-	v, err := ip.EvalSource(code)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
-		return 1
+// Map constructs a VTMap from a plain Go map.
+// Literal maps (from source) should be built via __map_from to preserve exact order.
+func Map(m map[string]Value) Value {
+	mo := &MapObject{
+		Entries: m,
+		KeyAnn:  map[string]string{},
 	}
-	fmt.Println(mindscript.FormatValue(v))
-	return 0
+	mo.Keys = make([]string, 0, len(m))
+	for k := range m {
+		mo.Keys = append(mo.Keys, k)
+	}
+	return Value{Tag: VTMap, Data: mo}
 }
 
-// ---- REPL ------------------------------------------------------------------
-
-// exitCoder is a loose interface to catch a runtime "exit" sentinel panic.
-type exitCoder interface{ ExitCode() int }
-type codeGetter interface{ Code() int }
-
-func runREPL() (ret int) {
-	fmt.Println(banner)
-
-	home, _ := os.UserHomeDir()
-	histPath := filepath.Join(home, historyFile)
-
-	ln := liner.NewLiner()
-	defer ln.Close()
-	ln.SetCtrlCAborts(true)
-
-	// Persist history on any return/panic.
-	defer func() {
-		if f, err := os.Create(histPath); err == nil {
-			_, _ = ln.WriteHistory(f)
-			_ = f.Close()
-		}
-	}()
-
-	// Trap common termination signals and restore TTY before exiting.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigc)
-	go func() {
-		s := <-sigc
-		_ = s
-		// Best-effort: close liner to restore terminal settings,
-		// then exit with a conventional code (130 for SIGINT).
-		ln.Close()
-		os.Exit(130)
-	}()
-
-	// Catch a potential "exit sentinel" panic so we can exit with a code
-	// *after* ln.Close() runs.
-	defer func() {
-		if r := recover(); r != nil {
-			switch x := r.(type) {
-			case exitCoder:
-				ret = x.ExitCode()
-			case codeGetter:
-				ret = x.Code()
-			case int:
-				ret = x
-			default:
-				panic(r) // not an exit sentinel → rethrow
-			}
-		}
-	}()
-
-	// Load history (best-effort)
-	if f, err := os.Open(histPath); err == nil {
-		_, _ = ln.ReadHistory(f)
-		_ = f.Close()
-	}
-
-	ip, err := mindscript.NewRuntime()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, red(err.Error()))
-		return 1
-	}
-
-	for {
-		// Accumulate possibly-multiline input until parser says it's complete.
-		code, ok := readByParseProbe(ln, promptMain, promptCont)
-		if !ok { // user pressed Ctrl+D or EOF
-			fmt.Println()
-			break
-		}
-
-		// REPL commands (prefixed with ':')
-		if strings.HasPrefix(strings.TrimSpace(code), ":") {
-			if done := handleReplCommand(ip, ln, code); done {
-				break
-			}
-			continue
-		}
-
-		// Skip blank
-		if strings.TrimSpace(code) == "" {
-			continue
-		}
-
-		// Evaluate (persistent session)
-		v, err := ip.EvalPersistentSource(code)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, red(err.Error()))
-			continue
-		}
-		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
-
-		// Save to history
-		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
-	}
-
-	return 0
+// TypeValue carries a type AST (S) and the lexical Env where it was defined.
+type TypeValue struct {
+	Ast S
+	Env *Env
 }
 
-// ---- REPL helpers ----------------------------------------------------------
+// TypeVal builds a VTType from a type expression AST.
+func TypeVal(expr S) Value { return Value{Tag: VTType, Data: &TypeValue{Ast: expr}} }
 
-// handleReplCommand handles :help, :quit, :load, :type, :reset, :fmt
-func handleReplCommand(ip *mindscript.Interpreter, ln *liner.State, line string) (exit bool) {
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return false
-	}
-	cmd := strings.ToLower(fields[0])
-
-	switch cmd {
-	case ":help":
-		fmt.Print(helpText)
-
-	case ":quit", ":exit":
-		return true
-
-	case ":reset":
-		newIP, err := mindscript.NewRuntime()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, red(err.Error()))
-			fmt.Fprintln(os.Stderr, "reset aborted; keeping current interpreter.")
-			break
-		}
-		*ip = *newIP
-		fmt.Println("interpreter reset.")
-
-	case ":load":
-		if len(fields) < 2 {
-			fmt.Println("usage: :load <file>")
-			return false
-		}
-		path := fields[1]
-		src, err := os.ReadFile(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", red(fmt.Sprintf("cannot read %s: %v", path, err)))
-			return false
-		}
-		if v, err := ip.EvalPersistentSource(string(src)); err != nil {
-			fmt.Fprintln(os.Stderr, red(err.Error()))
-		} else {
-			// Print last value
-			fmt.Println(mindscript.FormatValue(v))
-			ln.AppendHistory(fmt.Sprintf(":load %s", path))
-		}
-
-	case ":fmt", ":pretty":
-		// Inline snippet?
-		inline := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
-		if inline != "" {
-			runFormat(inline)
-			return false
-		}
-		// Otherwise, capture multiline snippet
-		code, ok := readByParseProbe(ln, "fmt> ", "... ")
-		if !ok {
-			fmt.Println() // Ctrl+D
-			return false
-		}
-		if strings.TrimSpace(code) == "" {
-			return false
-		}
-		runFormat(code)
-
-	default:
-		fmt.Printf("unknown command. Type :help for help.\n")
-	}
-	return false
+// TypeValIn builds a VTType and pins its resolution environment.
+func TypeValIn(expr S, env *Env) Value {
+	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
 }
 
-// readByParseProbe reads one or more lines until the parser
-// accepts the current buffer as a complete program, or returns early
-// if the parser reports a non-recoverable error.
-func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
-	var b strings.Builder
+// Fun represents a function/closure.
+// (Fields are stable API; bodies/bytecode are private to the exec layer.)
+type Fun struct {
+	Params     []string
+	Body       S
+	Env        *Env
+	ParamTypes []S
+	ReturnType S
+	HiddenNull bool
 
-	for {
-		var line string
-		var err error
-		if b.Len() == 0 {
-			line, err = ln.Prompt(prompt)
-		} else {
-			line, err = ln.Prompt(cont)
-		}
-		if errors.Is(err, io.EOF) {
-			return "", false
-		}
-		if err != nil {
-			// Ctrl+C aborts the current input; let user start again.
-			return "", true
-		}
+	Chunk      *Chunk // JIT result (from vm.go) — set/used internally
+	NativeName string // non-empty for registered natives
 
-		if b.Len() > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(line)
+	IsOracle bool    // oracle marker (different return-type semantics)
+	Examples []Value // optional example pairs for tooling
 
-		src := b.String()
-		// Use the interactive parser: it reports need-more-input cases via IncompleteError.
-		_, perr := mindscript.ParseSExprInteractive(src)
-		if perr == nil {
-			// Complete and valid.
-			return src, true
-		}
-		// Keep reading only when the parser/lexer signalled an interactive incompleteness.
-		if mindscript.IsIncomplete(perr) {
-			continue
-		}
-		// Real error → return current buffer so the caller can print it.
-		return src, true
-	}
+	Src *SourceRef // source metadata for caret-runtime-errors (optional)
 }
 
-// stripStrings is retained only for endsWithOpenAnnotation helper if you keep it;
-// otherwise you can delete it from the CLI (we no longer use bracket heuristics).
+// FunVal wraps *Fun into a Value.
+func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
 
-// ---- pretty printing -------------------------------------------------------
-
-func runFormat(src string) {
-	formatted, err := mindscript.Pretty(src)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, red(err.Error()))
-		return
-	}
-	fmt.Println(formatted)
+// Env is a lexical environment with parent link.
+type Env struct {
+	parent *Env
+	table  map[string]Value
 }
-=== END FILE: cmd/cli/main.go ===
+
+// NewEnv creates a new lexical frame.
+func NewEnv(parent *Env) *Env { return &Env{parent: parent, table: make(map[string]Value)} }
+
+// Define binds name to v in the current frame (shadowing any outer binding).
+func (e *Env) Define(name string, v Value) { e.table[name] = v }
+
+// Set updates the nearest existing binding of name to v, or errors.
+func (e *Env) Set(name string, v Value) error {
+	if _, ok := e.table[name]; ok {
+		e.table[name] = v
+		return nil
+	}
+	if e.parent != nil {
+		return e.parent.Set(name, v)
+	}
+	return fmt.Errorf("undefined variable: %s", name)
+}
+
+// Get retrieves the nearest visible binding for name or returns an error.
+func (e *Env) Get(name string) (Value, error) {
+	if v, ok := e.table[name]; ok {
+		return v, nil
+	}
+	if e.parent != nil {
+		return e.parent.Get(name)
+	}
+	return Value{}, fmt.Errorf("undefined variable: %s", name)
+}
+
+// ParamSpec documents a function parameter (name + declared type).
+type ParamSpec struct {
+	Name string
+	Type S
+}
+
+// Callable exposes metadata about a function Value.
+type Callable interface {
+	Arity() int
+	ParamSpecs() []ParamSpec
+	ReturnType() S
+	Doc() string
+	ClosureEnv() *Env
+}
+
+// CallCtx is passed to native functions to access arguments and side-effect scope.
+type CallCtx interface {
+	Arg(name string) (Value, bool)
+	MustArg(name string) Value
+	Env() *Env
+}
+
+// NativeImpl is the implementation signature for registered host/native functions.
+type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
+
+// RuntimeError represents an execution-time failure with a source location.
+// Line/Col are 1-based.
+type RuntimeError struct {
+	Line int
+	Col  int
+	Msg  string
+}
+
+func (e *RuntimeError) Error() string {
+	return fmt.Sprintf("RUNTIME ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC INTERPRETER
+////////////////////////////////////////////////////////////////////////////////
+
+// The public Interpreter. Only this type and its exported methods form the API.
+//
+// Internals (_exec/_ops/native/modules/etc.) are unexported and implemented
+// in private files.
+type Interpreter struct {
+	// Publicly visible environments:
+	Global *Env // program-global environment (persistent across EvalPersistent*)
+	Core   *Env // built-ins; parent of Global
+
+	// Private internals (do not rely on these from outside the package):
+	modules   map[string]*moduleRec // private module system (defined elsewhere)
+	native    map[string]NativeImpl // registered natives
+	loadStack []string              // import guard
+
+	oracleLastPrompt string // reserved for tooling
+	currentSrc       *SourceRef
+
+	// Private facades implemented in private files:
+	_exec execCore
+	_ops  opsCore
+}
+
+// Private contracts the internals satisfy (defined/implemented privately).
+type execCore interface {
+	// Parse + evaluate source into the given env (fresh or persistent).
+	evalSource(src string, env *Env) (Value, error)
+
+	// Evaluate AST in the given env, with/without legacy "uncaught" behavior.
+	evalAST(ast S, env *Env) (Value, error)
+	evalASTUncaught(ast S, env *Env, topBlockToSameEnv bool) Value
+
+	// Calls & metadata
+	applyArgsScoped(fn Value, args []Value, callSite *Env) Value
+	funMeta(fn Value) (Callable, bool)
+}
+
+type opsCore interface {
+	initCore()
+}
+
+// NewInterpreter constructs an engine with core natives and empty global scope.
+func NewInterpreter() *Interpreter {
+	ip := &Interpreter{}
+	ip.Core = NewEnv(nil)
+	ip.Global = NewEnv(ip.Core)
+	ip.modules = map[string]*moduleRec{}
+	ip.native = map[string]NativeImpl{}
+
+	// Wire private implementations (defined in private files).
+	ip._exec = newExec(ip)
+	ip._ops = newOps(ip)
+
+	// Install core built-ins.
+	ip._ops.initCore()
+	return ip
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                         PUBLIC METHODS (THIN DELEGATIONS)
+////////////////////////////////////////////////////////////////////////////////
+
+// EvalSource parses and evaluates source in a fresh child of Global.
+// The result does not mutate Global unless the program explicitly does so.
+func (ip *Interpreter) EvalSource(src string) (Value, error) {
+	return ip._exec.evalSource(src, NewEnv(ip.Global))
+}
+
+// Eval parses and evaluates an AST in a fresh child of Global.
+func (ip *Interpreter) Eval(root S) (Value, error) {
+	return ip._exec.evalAST(root, NewEnv(ip.Global))
+}
+
+// EvalPersistentSource parses and evaluates source **in Global** (REPL-style).
+func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
+	return ip._exec.evalSource(src, ip.Global)
+}
+
+// EvalPersistent evaluates an AST **in Global** (REPL-style).
+func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
+	return ip._exec.evalAST(root, ip.Global)
+}
+
+// EvalAST evaluates an AST in the provided environment.
+func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
+	return ip._exec.evalAST(ast, env)
+}
+
+// Apply applies a function Value to a list of arguments with correct scoping,
+// type-checking, and currying semantics.
+func (ip *Interpreter) Apply(fn Value, args []Value) Value {
+	return ip._exec.applyArgsScoped(fn, args, nil)
+}
+
+// Call0 invokes a function with zero arguments (shortcut for Apply(fn, nil)).
+func (ip *Interpreter) Call0(fn Value) Value { return ip._exec.applyArgsScoped(fn, nil, nil) }
+
+// FunMeta exposes a function Value as a Callable (arity/param specs/return type).
+// The returned doc string is taken from v.Annot.
+func (ip *Interpreter) FunMeta(fn Value) (Callable, bool) {
+	return ip._exec.funMeta(fn)
+}
+
+// ResolveType expands a type expression by resolving identifiers bound to
+// user-defined types in the provided environment.
+func (ip *Interpreter) ResolveType(t S, env *Env) S { return ip.resolveType(t, env) }
+
+// IsType reports whether runtime value v conforms to type t.
+func (ip *Interpreter) IsType(v Value, t S, env *Env) bool { return ip.isType(v, t, env) }
+
+// IsSubtype reports whether a is a structural subtype of b.
+func (ip *Interpreter) IsSubtype(a, b S, env *Env) bool { return ip.isSubtype(a, b, env) }
+
+// UnifyTypes computes a least common supertype (LUB) of t1 and t2.
+func (ip *Interpreter) UnifyTypes(t1 S, t2 S, env *Env) S { return ip.unifyTypes(t1, t2, env) }
+
+// ValueToType infers a pragmatic structural type for v (JSON-friendly).
+func (ip *Interpreter) ValueToType(v Value, env *Env) S { return ip.valueToTypeS(v, env) }
+
+// RegisterNative installs a host/native function into Core and exposes it as a
+// first-class function Value. The function is available to programs by `name`.
+// Natives are type-checked on call and on return.
+func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, impl NativeImpl) {
+	if ip.native == nil {
+		ip.native = map[string]NativeImpl{}
+	}
+	ip.native[name] = impl
+
+	if ip.Core == nil {
+		ip.Core = NewEnv(nil)
+	}
+	names := make([]string, len(params))
+	types := make([]S, len(params))
+	for i, p := range params {
+		names[i], types[i] = p.Name, p.Type
+	}
+	ip.Core.Define(name, FunVal(&Fun{
+		Params:     names,
+		ParamTypes: types,
+		ReturnType: ret,
+		Body:       S{"native", name}, // sentinel for debugging; not executed
+		Env:        ip.Core,
+		NativeName: name,
+	}))
+}
+
+// AsMapValue returns a VTMap view for VTMap/VTModule (same MapObject), else the input.
+func AsMapValue(v Value) Value {
+	if v.Tag == VTModule {
+		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
+	}
+	return v
+}
+
+//// END_OF_PUBLIC
+=== END FILE: interpreter.go ===
 

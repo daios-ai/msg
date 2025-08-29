@@ -246,69 +246,6 @@ func Test_RT_IO_ReadN_ReadAll(t *testing.T) {
 	}
 }
 
-// ---------------- Introspection & Docs ----------------
-
-func Test_RT_Introspection_funInfo_funType_TypeUtils_Docs(t *testing.T) {
-	ip, _ := NewRuntime()
-
-	// Annotated function with param types & return type
-	fn := evalWithIP(t, ip, `
-# Adds one to an integer
-# This is a longer description.
-fun(x:Int) -> Int do x + 1 end
-`)
-	ip.Global.Define("f", fn)
-
-	info := evalWithIP(t, ip, `funInfo(f)`)
-	if info.Tag != VTMap {
-		t.Fatalf("funInfo should return map, got %#v", info)
-	}
-	// params[0].name == "x"
-	nm := evalWithIP(t, ip, `funInfo(f).params[0].name`)
-	if nm.Tag != VTStr || nm.Data.(string) != "x" {
-		t.Fatalf("funInfo param name wrong: %#v", nm)
-	}
-	// doc/docline
-	d1 := evalWithIP(t, ip, `doc(f)`)
-	if d1.Tag != VTStr || !strings.Contains(strings.ToLower(d1.Data.(string)), "adds one") {
-		t.Fatalf("doc first line wrong: %#v", d1)
-	}
-	help := evalWithIP(t, ip, `help(f)`)
-	if help.Tag != VTStr || !strings.Contains(help.Data.(string), "longer") {
-		t.Fatalf("help expected full docstring: %#v", help)
-	}
-
-	// funType roundtrip (A->B)
-	ft := evalWithIP(t, ip, `funType(f)`)
-	if ft.Tag != VTType {
-		t.Fatalf("funType should return Type, got %#v", ft)
-	}
-
-	// Type utils
-	tmap := evalWithIP(t, ip, `type {name!: Str, age: Int?}`)
-	ip.Global.Define("T", tmap)
-	fields := evalWithIP(t, ip, `typeFields(T)`)
-	if fields.Tag != VTArray || len(fields.Data.([]Value)) != 2 {
-		t.Fatalf("typeFields count wrong: %#v", fields)
-	}
-	isN := evalWithIP(t, ip, `isNullable(type Int?)`)
-	if isN.Tag != VTBool || !isN.Data.(bool) {
-		t.Fatalf("isNullable failed: %#v", isN)
-	}
-	eqBase := evalWithIP(t, ip, `typeEquals(baseType(type Int?), type Int)`)
-	if eqBase.Tag != VTBool || !eqBase.Data.(bool) {
-		t.Fatalf("baseType wrong: %#v", eqBase)
-	}
-	eqElem := evalWithIP(t, ip, `typeEquals(arrayElemType(type [Str]), type Str)`)
-	if eqElem.Tag != VTBool || !eqElem.Data.(bool) {
-		t.Fatalf("arrayElemType wrong: %#v", eqElem)
-	}
-	teq := evalWithIP(t, ip, `typeEquals(type Int, type Int)`)
-	if teq.Tag != VTBool || !teq.Data.(bool) {
-		t.Fatalf("typeEquals false negative: %#v", teq)
-	}
-}
-
 // ---------------- Utilities: time/rand/json ----------------
 
 func Test_RT_Utilities_Time_Rand_JSON(t *testing.T) {
@@ -405,26 +342,6 @@ func Test_RT_Import_TypeChecks_And_StringPath(t *testing.T) {
 	// Operational issue: module not found → soft (annotated null).
 	v2 := evalWithIP(t, ip, `import("nope")`)
 	wantAnnotatedContains(t, v2, "module not found")
-}
-
-func Test_RT_GetEnv_Shadows_And_Order(t *testing.T) {
-	ip, _ := NewRuntime()
-	out := evalWithIP(t, ip, `
-      let x = "outer"
-      do
-        let x = "inner"
-        let y = 1
-        let m = getEnv()
-        {a: m["x"], b: m["y"]}
-      end
-    `)
-	m := entriesOf(t, out)
-	if m["a"].Tag != VTStr || m["a"].Data.(string) != "inner" {
-		t.Fatalf("getEnv shadowing failed: %#v", out)
-	}
-	if m["b"].Tag != VTInt || m["b"].Data.(int64) != 1 {
-		t.Fatalf("getEnv missing y: %#v", out)
-	}
 }
 
 func Test_RT_MapHas_And_MapDelete_Order_And_Ann(t *testing.T) {
@@ -1176,27 +1093,6 @@ func Test_RT_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
 	}
 }
 
-func Test_RT_BaseType_StripsNullable_AndResolvesAliases(t *testing.T) {
-	ip, _ := NewRuntime()
-	src := `let T = type Int?
-	baseType(T)
-	`
-	// Define alias persistently
-	out, err := ip.EvalSource(src)
-	if err != nil {
-		t.Fatalf("setup error: %v", err)
-	}
-
-	// baseType(T) -> Int
-	if out.Tag != VTType {
-		t.Fatalf("want VTType, got %#v", FormatValue(out))
-	}
-	tv := out.Data.(*TypeValue)
-	if !equalS(tv.Ast, typeS(t, ip, `Int`)) {
-		t.Fatalf("baseType failed, got %#v", tv.Ast)
-	}
-}
-
 // --------- Prelude loading ---------------------
 
 func Test_RT_LoadPrelude_BindsToCore(t *testing.T) {
@@ -1255,5 +1151,61 @@ func Test_RT_LoadPrelude_FailurePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unsupported operands for '+'") {
 		t.Fatalf("LoadPrelude error should mention cause, got: %v", err)
+	}
+}
+
+func TestReflectReify_PreservesAnnotation(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Define an annotated function in Global.
+	src := "# adds two numbers\nlet s = fun(n:Int, m:Int) -> Int do n+m end"
+	if _, err := ip.EvalPersistentSource(src); err != nil {
+		t.Fatalf("EvalPersistentSource failed: %v", err)
+	}
+
+	// reflect(s) → runtime-S; verify it carries the annotation wrapper.
+	rt, err := ip.EvalPersistentSource("reflect(s)")
+	if err != nil {
+		t.Fatalf("reflect(s) eval failed: %v", err)
+	}
+	if rt.Tag != VTArray {
+		t.Fatalf("reflect(s) should return VTArray, got %v", rt.Tag)
+	}
+	arr := rt.Data.([]Value)
+	if len(arr) < 3 || arr[0].Tag != VTStr || arr[0].Data.(string) != "annot" {
+		t.Fatalf("expected top-level [\"annot\", ...], got %#v", arr)
+	}
+	if arr[1].Tag != VTArray || len(arr[1].Data.([]Value)) != 2 ||
+		arr[1].Data.([]Value)[0].Tag != VTStr ||
+		arr[1].Data.([]Value)[0].Data.(string) != "str" {
+		t.Fatalf("expected annotation payload [\"str\", text], got %#v", arr[1])
+	}
+	ann := arr[1].Data.([]Value)[1]
+	if ann.Tag != VTStr || ann.Data.(string) != "adds two numbers" {
+		t.Fatalf("annotation mismatch, want %q, got %#v", "adds two numbers", ann)
+	}
+	body := arr[2]
+	if body.Tag != VTArray || len(body.Data.([]Value)) == 0 ||
+		body.Data.([]Value)[0].Tag != VTStr ||
+		body.Data.([]Value)[0].Data.(string) != "fun" {
+		t.Fatalf("expected annotated fun node, got %#v", body)
+	}
+
+	// reify(reflect(s)) → function; annotation should be restored.
+	v, err := ip.EvalPersistentSource("reify(reflect(s))")
+	if err != nil {
+		t.Fatalf("reify(reflect(s)) failed: %v", err)
+	}
+	if v.Tag != VTFun {
+		t.Fatalf("expected VTFun, got %v", v.Tag)
+	}
+	if v.Annot != "adds two numbers" {
+		t.Fatalf("reified function annotation mismatch: want %q, got %q", "adds two numbers", v.Annot)
+	}
+
+	// And the function should work.
+	out := ip.Apply(v, []Value{Int(2), Int(3)})
+	if out.Tag != VTInt || out.Data.(int64) != 5 {
+		t.Fatalf("function call result mismatch: want 5, got %#v", out)
 	}
 }

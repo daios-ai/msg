@@ -29,14 +29,62 @@ func red(s string) string   { return colorRed + s + colorReset }
 func green(s string) string { return colorGreen + s + colorReset }
 func blue(s string) string  { return colorBlue + s + colorReset }
 
-// Colorize a formatted value: annotation lines (trim-left starts with "#") → green,
-// everything else → blue.
+// splitInlineComment finds the first unquoted '#' that looks like an inline
+// comment (e.g. " # post"). It ignores '#' inside double-quoted strings and
+// respects backslash escapes. It returns the left/code part and the right/comment
+// part (starting at '#'). If no comment is found, ok=false.
+func splitInlineComment(line string) (left, comment string, ok bool) {
+	inStr := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+
+		if inStr {
+			if c == '\\' {
+				// Skip the escaped byte (safe for our quoted-ASCII printer).
+				if i+1 < len(line) {
+					i++
+				}
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			inStr = true
+		case '#':
+			// Treat as inline comment only if preceded by space/tab (matches our printer " # ...").
+			if i > 0 && (line[i-1] == ' ' || line[i-1] == '\t') {
+				return line[:i], line[i:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// Colorize a formatted value:
+//   - Lines whose first non-space char is '#' (PRE) → whole line green.
+//   - Other non-empty lines: if they contain an unquoted inline '#' → left blue, trailing comment green.
+//   - Otherwise → whole line blue.
+//
+// Empty lines unchanged.
 func colorizeValue(val string) string {
 	lines := strings.Split(val, "\n")
 	for i, ln := range lines {
-		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
-			lines[i] = green(ln)
-		} else if ln != "" {
+		trimLeft := strings.TrimLeft(ln, " \t")
+		if strings.HasPrefix(trimLeft, "#") {
+			lines[i] = green(ln) // PRE header line
+			continue
+		}
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		if left, comment, ok := splitInlineComment(ln); ok {
+			lines[i] = blue(left) + green(comment)
+		} else {
 			lines[i] = blue(ln)
 		}
 	}
@@ -98,6 +146,7 @@ func runFile(path string) int {
 	ip, err := mindscript.NewRuntime()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
+		fmt.Fprintf(os.Stderr, "Perhaps the environment variable %s is undefined?\n", mindscript.MindScriptPath)
 		os.Exit(1)
 	}
 
@@ -117,6 +166,7 @@ func runEvalString(code string) int {
 	v, err := ip.EvalSource(code)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
+		fmt.Fprintf(os.Stderr, "Perhaps the environment variable %s is undefined?\n", mindscript.MindScriptPath)
 		return 1
 	}
 	fmt.Println(mindscript.FormatValue(v))
@@ -186,6 +236,7 @@ func runREPL() (ret int) {
 	ip, err := mindscript.NewRuntime()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, red(err.Error()))
+		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
 		return 1
 	}
 

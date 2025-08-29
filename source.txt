@@ -1,15 +1,12 @@
-=== BEGIN FILE: interpreter_ops.go ===
-// interpreter_ops.go — PRIVATE: language ops (built-ins, assignment, iteration)
-// and the AST → bytecode emitter used by the exec layer.
+=== BEGIN FILE: interpreter_exec.go ===
+// interpreter_exec.go — PRIVATE: execution & call engine for MindScript.
+// - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
+//   runs on the VM, and surfaces errors with caret snippets.
+// - Implements function application, currying, and native-call scoping.
+// - No exported identifiers here. The public facade lives in interpreter_api.go.
 //
-// This file:
-//  - Implements `newOps(ip)` with `initCore()` (registers all core natives).
-//  - Provides assignment semantics (`assignTo`) and helpers.
-//  - Normalizes collections to iterators (`__to_iter`) and drives iteration.
-//  - Implements deep value equality for const interning in the emitter.
-//  - Hosts the private emitter (`newEmitter`) used by exec for JIT.
-//
-// Public API is in interpreter_api.go. Exec/call engine is in interpreter_exec.go.
+// Emitter placement:
+//   The emitter is defined here and obtained via newEmitter(ip, sr).
 
 package mindscript
 
@@ -18,720 +15,990 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-//                         PRIVATE PANIC / ERROR HELPERS
+//                          PRIVATE EXEC FACADE (to API)
 ////////////////////////////////////////////////////////////////////////////////
 
-type returnSig struct{ v Value }
-type rtErr struct{ msg string }
+type execImpl struct{ ip *Interpreter }
 
-func fail(msg string)          { panic(rtErr{msg: msg}) }
-func errNull(msg string) Value { return withAnnot(Null, msg) }
-func annotNull(msg string) Value {
-	return Value{Tag: VTNull, Annot: msg}
+func newExec(ip *Interpreter) execCore { return &execImpl{ip: ip} }
+
+// evalSource parses + evaluates in the provided env (fresh or persistent).
+func (x *execImpl) evalSource(src string, env *Env) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		return Value{}, WrapErrorWithSource(err, src)
+	}
+	return x.ip.runTopWithSource(ast, env, false, &SourceRef{Name: "main", Src: src, Spans: spans})
 }
-func withAnnot(v Value, ann string) Value { v.Annot = ann; return v }
+
+// evalAST evaluates an AST in the provided env.
+func (x *execImpl) evalAST(ast S, env *Env) (Value, error) {
+	return x.ip.runTopWithSource(ast, env, false, nil)
+}
+
+// evalASTUncaught never returns an error; failures become annotated-null Values.
+// (topBlockToSameEnv is ignored; kept for API compatibility.)
+func (x *execImpl) evalASTUncaught(ast S, env *Env, _ bool) Value {
+	v, _ := x.ip.runTopWithSource(ast, env, true, nil)
+	return v
+}
+
+func (x *execImpl) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	return x.ip.applyArgsScoped(fn, args, callSite)
+}
+
+func (x *execImpl) funMeta(fn Value) (Callable, bool) {
+	if fn.Tag != VTFun {
+		return nil, false
+	}
+	return &funCallable{f: fn.Data.(*Fun), doc: fn.Annot}, true
+}
 
 ////////////////////////////////////////////////////////////////////////////////
-//                          PRIVATE OPS FACADE (to API)
+//                      CORE EXECUTION PLUMBING (PRIVATE)
 ////////////////////////////////////////////////////////////////////////////////
 
-type opsImpl struct{ ip *Interpreter }
-
-func newOps(ip *Interpreter) opsCore { return &opsImpl{ip: ip} }
-
-func (o *opsImpl) initCore() {
-	ip := o.ip
-	if ip.Core == nil {
-		ip.Core = NewEnv(nil)
-	}
-	// sugar for native registration with a ctx-only closure
-	reg := func(name string, params []ParamSpec, ret S, body func(ctx CallCtx) Value) {
-		ip.RegisterNative(name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
-	}
-
-	// __assign_set(target: Type, value: Any) -> Any
-	reg("__assign_set",
-		[]ParamSpec{{"target", S{"id", "Type"}}, {"value", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			t := ctx.MustArg("target")
-			v := ctx.MustArg("value")
-			tv := t.Data.(*TypeValue)
-			ip.assignTo(tv.Ast, v, ctx.Env())
-			return v
-		})
-
-	// __assign_def(target: Type, value: Any) -> Any
-	reg("__assign_def",
-		[]ParamSpec{{"target", S{"id", "Type"}}, {"value", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			t := ctx.MustArg("target")
-			v := ctx.MustArg("value")
-			tv := t.Data.(*TypeValue)
-			ip.assignTo(tv.Ast, v, ctx.Env(), true)
-			return v
-		})
-
-	// __plus (numbers/strings/arrays/maps)
-	reg("__plus",
-		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			a := AsMapValue(ctx.MustArg("a"))
-			b := AsMapValue(ctx.MustArg("b"))
-			if isNumber(a) && isNumber(b) {
-				if a.Tag == VTInt && b.Tag == VTInt {
-					return Int(a.Data.(int64) + b.Data.(int64))
+// runTopWithSource compiles+executes AST with error surfacing.
+// If uncaught is true, runtime failures become annotated-null Values.
+func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			switch sig := r.(type) {
+			case returnSig:
+				out, err = sig.v, nil
+			case rtErr:
+				if uncaught {
+					out, err = errNull(sig.msg), nil
+				} else {
+					line, col := ip.sourcePosFromChunk(nil, sr, 0)
+					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: sig.msg}, ip.fallbackSrc(sr, ast))
+					out = Value{}
 				}
-				return Num(toFloat(a) + toFloat(b))
-			}
-			if a.Tag == VTStr && b.Tag == VTStr {
-				return Str(a.Data.(string) + b.Data.(string))
-			}
-			if a.Tag == VTArray && b.Tag == VTArray {
-				x := append(append([]Value{}, a.Data.([]Value)...), b.Data.([]Value)...)
-				return Arr(x)
-			}
-			if a.Tag == VTMap && b.Tag == VTMap {
-				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
-				out := &MapObject{
-					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
-					KeyAnn:  make(map[string]string, len(am.KeyAnn)+len(bm.KeyAnn)),
-					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
+			case error:
+				if uncaught {
+					out, err = annotNull(sig.Error()), nil
+				} else {
+					line, col := ip.sourcePosFromChunk(nil, sr, 0)
+					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: sig.Error()}, ip.fallbackSrc(sr, ast))
+					out = Value{}
 				}
-				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
-				// LHS order/content
-				for _, k := range am.Keys {
-					out.Keys = append(out.Keys, k)
-					seen[k] = struct{}{}
-				}
-				for k, v := range am.Entries {
-					out.Entries[k] = v
-				}
-				for k, ann := range am.KeyAnn {
-					out.KeyAnn[k] = ann
-				}
-				// overlay RHS; append new keys in RHS order
-				for _, k := range bm.Keys {
-					if _, ok := seen[k]; !ok {
-						out.Keys = append(out.Keys, k)
-						seen[k] = struct{}{}
-					}
-				}
-				for k, v := range bm.Entries {
-					out.Entries[k] = v
-				}
-				for k, ann := range bm.KeyAnn {
-					out.KeyAnn[k] = ann
-				}
-				return Value{Tag: VTMap, Data: out}
-			}
-			return errNull("unsupported operands for '+'")
-		})
-
-	// __resolve_type: Value(Type) -> Value(Type(resolved))
-	reg("__resolve_type",
-		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
-		func(ctx CallCtx) Value {
-			t := ctx.MustArg("t")
-			resolved := ip.resolveTypeValue(t, ctx.Env())
-			return TypeVal(resolved)
-		})
-
-	// __annotate(text: Str, v: Any) -> Any
-	reg("__annotate",
-		[]ParamSpec{{"text", S{"id", "Str"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value { return withAnnot(ctx.MustArg("v"), ctx.MustArg("text").Data.(string)) })
-
-	// __collect_for_elems(iter: Any) -> Any   (used by high-level mapping helpers)
-	reg("__collect_for_elems",
-		[]ParamSpec{{"iter", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) (out Value) {
-			defer func() {
-				if r := recover(); r != nil {
-					if e, ok := r.(rtErr); ok {
-						out = errNull(e.msg)
-						return
-					}
-					panic(r)
-				}
-			}()
-			out = Arr(ip.collectForElemsScoped(ctx.MustArg("iter"), ctx.Env()))
-			return
-		})
-
-	// __map_from(keys:[Str], vals:[Any]) -> Map
-	reg("__map_from",
-		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			ka := ctx.MustArg("keys").Data.([]Value)
-			va := ctx.MustArg("vals").Data.([]Value)
-			if len(ka) != len(va) {
-				return errNull("map_from: mismatched arity")
-			}
-			mo := &MapObject{
-				Entries: make(map[string]Value, len(ka)),
-				KeyAnn:  make(map[string]string, len(ka)),
-				Keys:    make([]string, 0, len(ka)),
-			}
-			for i := range ka {
-				if ka[i].Tag != VTStr {
-					return errNull("map key must be string")
-				}
-				k := ka[i].Data.(string)
-				mo.Entries[k] = va[i]
-				mo.Keys = append(mo.Keys, k)
-				if ann := ka[i].Annot; ann != "" {
-					mo.KeyAnn[k] = ann
-				}
-			}
-			return Value{Tag: VTMap, Data: mo}
-		})
-
-	// __len(array|map) -> Int
-	reg("__len",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
-		func(ctx CallCtx) Value {
-			x := AsMapValue(ctx.MustArg("x"))
-			switch x.Tag {
-			case VTArray:
-				return Int(int64(len(x.Data.([]Value))))
-			case VTMap:
-				return Int(int64(len(x.Data.(*MapObject).Entries)))
 			default:
-				return errNull("len expects array or map")
-			}
-		})
-
-	// __make_fun(params:[Str], types:[Type], ret:Type, body:Type, isOracle:Bool, examples:Any) -> Fun
-	ip.RegisterNative("__make_fun",
-		[]ParamSpec{
-			{"params", S{"array", S{"id", "Str"}}},
-			{"types", S{"array", S{"id", "Type"}}},
-			{"ret", S{"id", "Type"}},
-			{"body", S{"id", "Type"}},
-			{"isOracle", S{"id", "Bool"}},
-			{"examples", S{"id", "Any"}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			namesV := ctx.MustArg("params").Data.([]Value)
-			typesV := ctx.MustArg("types").Data.([]Value)
-			retTV := ctx.MustArg("ret").Data.(*TypeValue)
-			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
-			isOr := ctx.MustArg("isOracle").Data.(bool)
-			exAny := ctx.MustArg("examples")
-
-			names := make([]string, len(namesV))
-			types := make([]S, len(typesV))
-			for i := range namesV {
-				names[i] = namesV[i].Data.(string)
-			}
-			for i := range typesV {
-				types[i] = typesV[i].Data.(*TypeValue).Ast
-			}
-
-			hidden := false
-			if len(names) == 0 {
-				names = []string{"_"}
-				types = []S{S{"id", "Null"}}
-				hidden = true
-			}
-
-			var exVals []Value
-			if exAny.Tag == VTArray {
-				exVals = append([]Value(nil), exAny.Data.([]Value)...)
-			}
-
-			retAst := retTV.Ast
-			if isOr {
-				retAst = ensureNullableUnlessAny(retAst)
-			}
-
-			return FunVal(&Fun{
-				Params:     names,
-				ParamTypes: types,
-				ReturnType: retAst,
-				Body:       bodyTV.Ast,
-				Env:        ctx.Env(),
-				HiddenNull: hidden,
-				IsOracle:   isOr,
-				Examples:   exVals,
-				Src:        ip.currentSrc,
-			})
-		})
-
-	// __is_fun(x: Any) -> Bool
-	reg("__is_fun",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value { return Bool(ctx.MustArg("x").Tag == VTFun) })
-
-	// __iter_should_stop(x: Any) -> Bool
-	reg("__iter_should_stop",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			if v.Tag == VTNull {
-				if v.Annot != "" {
-					fail(v.Annot)
-				}
-				return Bool(true)
-			}
-			return Bool(false)
-		})
-
-	// __to_iter(x: Any) -> (Null -> Any?)  |  error
-	ip.RegisterNative("__to_iter",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.MustArg("x"))
-
-			// Already an iterator?
-			if x.Tag == VTFun {
-				f := x.Data.(*Fun)
-				if len(f.Params) == 1 && ip.isType(Null, f.ParamTypes[0], f.Env) {
-					return x
-				}
-				return annotNull("for expects array, map, or iterator function (Null -> Any?)")
-			}
-
-			// Helpers
-			newIter := func(parent *Env, lenTarget S, thenBlock S) Value {
-				env := NewEnv(parent)
-				env.Define("$i", Int(0))
-				body := S{"if",
-					S{"pair",
-						S{"binop", "<",
-							S{"id", "$i"},
-							S{"call", S{"id", "__len"}, lenTarget},
-						},
-						S{"block", thenBlock},
-					},
-					S{"block", S{"null"}},
-				}
-				return FunVal(&Fun{
-					Params:     []string{"_"},
-					ParamTypes: []S{S{"id", "Null"}},
-					ReturnType: S{"unop", "?", S{"id", "Any"}},
-					Body:       body,
-					Env:        env,
-					Src:        ip.currentSrc,
-				})
-			}
-			inc := func() S {
-				return S{"assign", S{"id", "$i"},
-					S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
+				if uncaught {
+					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil
+				} else {
+					line, col := ip.sourcePosFromChunk(nil, sr, 0)
+					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: fmt.Sprintf("runtime panic: %v", r)}, ip.fallbackSrc(sr, ast))
+					out = Value{}
 				}
 			}
+		}
+	}()
 
-			// Array → iterator
-			if x.Tag == VTArray {
-				envInit := NewEnv(ctx.Env())
-				envInit.Define("$arr", x)
-				then := S{"block",
-					inc(),
-					S{"idx",
-						S{"id", "$arr"},
-						S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
-					},
-				}
-				return newIter(envInit, S{"id", "$arr"}, then)
-			}
+	ch := ip.jitTop(ast, sr)
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
+	res := ip.runChunk(ch, env, 0) // VM entry (defined in vm.go)
+	ip.currentSrc = prev
 
-			// Map → iterator (yields [key, value]) preserving insertion order + key annotations
-			if x.Tag == VTMap {
-				mo := x.Data.(*MapObject)
-				envInit := NewEnv(ctx.Env())
-				envInit.Define("$map", x)
-				keyVals := make([]Value, 0, len(mo.Keys))
-				for _, k := range mo.Keys {
-					s := Str(k)
-					if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-						s = withAnnot(s, ann)
-					}
-					keyVals = append(keyVals, s)
-				}
-				envInit.Define("$keys", Arr(keyVals))
-
-				then := S{"block",
-					S{"assign", S{"decl", "$k"},
-						S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
-					},
-					inc(),
-					S{"array",
-						S{"id", "$k"},
-						S{"idx", S{"id", "$map"}, S{"id", "$k"}},
-					},
-				}
-				return newIter(envInit, S{"id", "$keys"}, then)
-			}
-
-			return annotNull("for expects array, map, or iterator function (Null -> Any?)")
-		})
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                                ASSIGNMENT
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine ...bool) {
-	allowDefine := len(optAllowDefine) > 0 && optAllowDefine[0]
-	switch target[0].(string) {
-	case "id":
-		name := target[1].(string)
-		if err := env.Set(name, value); err != nil {
-			if allowDefine {
-				env.Define(name, value)
-				return
-			}
-			fail(err.Error())
-		}
-	case "decl":
-		env.Define(target[1].(string), value)
-	case "get":
-		obj := ip.evalFull(target[1].(S), env)
-		// resolve key string (literal or computed)
-		var keyStr string
-		if ks := target[2].(S); len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
-			keyStr = ks[1].(string)
-		} else {
-			k := ip.evalFull(target[2].(S), env)
-			if k.Tag != VTStr {
-				fail("object assignment requires map and string key")
-			}
-			keyStr = k.Data.(string)
-		}
-		mv := AsMapValue(obj)
-		if mv.Tag == VTMap {
-			mo := mv.Data.(*MapObject)
-			if _, exists := mo.Entries[keyStr]; !exists {
-				mo.Keys = append(mo.Keys, keyStr)
-			}
-			mo.Entries[keyStr] = value
-			syncModuleEnv(obj, keyStr, value) // no-op for plain maps
-			return
-		}
-		if obj.Tag == VTModule {
-			fail("object assignment requires map and string key") // unreachable, safety
-		}
-		if obj.Tag == VTArray {
-			fail("object assignment requires map and string key")
-		}
-		fail("object assignment requires map and string key")
-	case "idx":
-		obj, idx := ip.evalFull(target[1].(S), env), ip.evalFull(target[2].(S), env)
-		if obj.Tag == VTArray && idx.Tag == VTInt {
-			xs := obj.Data.([]Value)
-			if len(xs) == 0 {
-				fail("index on empty array")
-			}
-			i := int(idx.Data.(int64))
-			if i < 0 {
-				i = (i%len(xs) + len(xs)) % len(xs)
-			}
-			if i < 0 || i >= len(xs) {
-				fail("array index out of range")
-			}
-			xs[i] = value
-			return
-		}
-		mv := AsMapValue(obj)
-		if mv.Tag == VTMap && idx.Tag == VTStr {
-			mo := mv.Data.(*MapObject)
-			k := idx.Data.(string)
-			if _, exists := mo.Entries[k]; !exists {
-				mo.Keys = append(mo.Keys, k)
-			}
-			mo.Entries[k] = value
-			syncModuleEnv(obj, k, value)
-			return
-		}
-		fail("index assignment requires array[int] or map[string]")
-	case "darr":
-		if value.Tag != VTArray {
-			for i := 1; i < len(target); i++ {
-				ip.assignTo(target[i].(S), annotNull("array pattern: RHS is not an array"), env, true)
-			}
-			return
-		}
-		xs := value.Data.([]Value)
-		for i := 1; i < len(target); i++ {
-			if i-1 < len(xs) {
-				ip.assignTo(target[i].(S), xs[i-1], env, true)
-			} else {
-				ip.assignTo(target[i].(S), annotNull(fmt.Sprintf("array pattern: missing element #%d", i-1)), env, true)
-			}
-		}
-	case "dobj":
-		vmap := AsMapValue(value)
-		if vmap.Tag != VTMap {
-			for i := 1; i < len(target); i++ {
-				p := target[i].(S) // ("pair", key, pattern)
-				ip.assignTo(p[2].(S), annotNull("object pattern: RHS is not a map"), env, true)
-			}
-			return
-		}
-		mo := vmap.Data.(*MapObject)
-		m := mo.Entries
-		for i := 1; i < len(target); i++ {
-			p := target[i].(S)
-			k := unwrapKeyStr(p[1].(S))
-			if v, ok := m[k]; ok {
-				ip.assignTo(p[2].(S), v, env, true)
-			} else {
-				ip.assignTo(p[2].(S), annotNull(fmt.Sprintf("object pattern: missing key '%s'", k)), env, true)
-			}
-		}
-	case "annot":
-		text := target[1].(S)[1].(string)
-		sub := target[2].(S)
-		if len(sub) > 0 && sub[0].(string) == "decl" {
-			env.Define(sub[1].(string), withAnnot(value, text))
-			return
-		}
-		ip.assignTo(sub, value, env, true)
-	default:
-		fail("invalid assignment target")
-	}
-}
-
-// syncModuleEnv keeps a module's Env consistent after a write to its map.
-func syncModuleEnv(obj Value, key string, val Value) {
-	if obj.Tag == VTModule {
-		m := obj.Data.(*Module)
-		if _, ok := m.Env.table[key]; ok {
-			m.Env.table[key] = val
-		} else {
-			m.Env.Define(key, val)
-		}
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                     TINY EVALUATORS (used by assignment)
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) evalSimple(n S, env *Env) Value {
-	switch n[0].(string) {
-	case "id":
-		v, err := env.Get(n[1].(string))
-		if err != nil {
-			fail(err.Error())
-		}
-		return v
-	case "str":
-		return Str(n[1].(string))
-	case "int":
-		return Int(n[1].(int64))
-	case "num":
-		return Num(n[1].(float64))
-	case "bool":
-		return Bool(n[1].(bool))
-	case "null":
-		return Null
-	default:
-		fail("unsupported simple eval")
-		return Null
-	}
-}
-
-// evalFull compiles and runs a single expression in env.
-// Annotated null is turned into a runtime failure (panic(rtErr)) to align with assignment.
-func (ip *Interpreter) evalFull(n S, env *Env) Value {
-	em := newEmitter(ip, ip.currentSrc)
-	em.emitExpr(n)
-	em.emit(opReturn, 0)
-	ch := em.chunk()
-	res := ip.runChunk(ch, env, 0)
 	switch res.status {
 	case vmOK, vmReturn:
-		if res.value.Tag == VTNull && res.value.Annot != "" {
-			fail(res.value.Annot)
+		return res.value, nil
+	case vmRuntimeError:
+		if uncaught {
+			return res.value, nil // annotated-null flows out
+		}
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		msg := res.value.Annot
+		if msg == "" {
+			msg = "runtime error"
+		}
+		return Value{}, WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: msg}, ip.fallbackSrc(ch.Src, ast))
+	default:
+		if uncaught {
+			return errNull("unknown VM status"), nil
+		}
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		return Value{}, WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: "unknown VM status"}, ip.fallbackSrc(ch.Src, ast))
+	}
+}
+
+// Build a one-off top-level function body and ensure it is compiled.
+func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
+	f := &Fun{
+		ReturnType: S{"id", "Any"},
+		Body:       ast,
+		Src:        sr,
+	}
+	ip.ensureChunkWithSource(f, sr)
+	return f.Chunk
+}
+
+func (ip *Interpreter) ensureChunk(f *Fun) { ip.ensureChunkWithSource(f, f.Src) }
+
+func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
+	// Native functions and oracles are not JIT-compiled here.
+	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
+		return
+	}
+	em := newEmitter(ip, sr) // private emitter
+	em.emitFunBody(f.Body)
+	ch := em.chunk()
+	ch.Src = sr
+	f.Chunk = ch
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                    CALL ENGINE: APPLY / CURRY / EXECUTE
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	if fn.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fn.Data.(*Fun)
+
+	// Zero-arg application.
+	if len(args) == 0 {
+		switch len(f.Params) {
+		case 0:
+			return ip.execFunBodyScoped(fn, callSite)
+		case 1:
+			if ip.isType(Null, f.ParamTypes[0], f.Env) {
+				return ip.applyOneScoped(fn, Null, callSite)
+			}
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		default:
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		}
+	}
+
+	cur := fn
+	for i := 0; i < len(args); i++ {
+		cur = ip.applyOneScoped(cur, args[i], callSite)
+		// If more args left but the intermediate result isn't a function → too many args.
+		if i < len(args)-1 && cur.Tag != VTFun {
+			fail("too many arguments")
+		}
+	}
+	return cur
+}
+
+func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Value {
+	if fnVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fnVal.Data.(*Fun)
+
+	// Already saturated → execute, then keep applying to the result (currying chains).
+	if len(f.Params) == 0 {
+		res := ip.execFunBodyScoped(fnVal, callSite)
+		if res.Tag != VTFun {
+			fail("too many arguments")
+		}
+		return ip.applyOneScoped(res, arg, callSite)
+	}
+
+	// Type check against the next parameter.
+	paramName := f.Params[0]
+	paramType := f.ParamTypes[0]
+	if !ip.isType(arg, paramType, f.Env) {
+		fail(fmt.Sprintf("type mismatch in parameter '%s'", paramName))
+	}
+
+	// Bind argument into a fresh call env.
+	parent := f.Env
+	// For natives, if we're being called from a site with a concrete scope, prefer that
+	// as the parent for argument bindings when the closure env is nil or Core.
+	if f.NativeName != "" && callSite != nil {
+		if f.Env == nil || f.Env == ip.Core {
+			parent = callSite
+		}
+	}
+	callEnv := NewEnv(parent)
+	callEnv.Define(paramName, arg)
+
+	// More params left → return partially-applied closure.
+	if len(f.Params) > 1 {
+		return FunVal(&Fun{
+			Params:     append([]string{}, f.Params[1:]...),
+			ParamTypes: append([]S{}, f.ParamTypes[1:]...),
+			ReturnType: f.ReturnType,
+			Body:       f.Body,
+			Env:        callEnv,
+			HiddenNull: f.HiddenNull,
+			Chunk:      f.Chunk,
+			NativeName: f.NativeName,
+			Src:        f.Src,
+		})
+	}
+
+	// Last arg supplied → execute.
+	execFun := &Fun{
+		Params:     nil,
+		ParamTypes: append([]S(nil), f.ParamTypes...),
+		ReturnType: f.ReturnType,
+		Body:       f.Body,
+		Env:        callEnv,
+		Chunk:      f.Chunk,
+		NativeName: f.NativeName,
+		IsOracle:   f.IsOracle,
+		Examples:   f.Examples,
+		HiddenNull: f.HiddenNull,
+		Src:        f.Src,
+	}
+	execVal := FunVal(execFun)
+	execVal.Annot = fnVal.Annot // keep doc
+	return ip.execFunBodyScoped(execVal, callSite)
+}
+
+func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
+	if funVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := funVal.Data.(*Fun)
+
+	// Native fast path
+	if f.NativeName != "" {
+		impl, ok := ip.native[f.NativeName]
+		if !ok {
+			fail(fmt.Sprintf("unknown native %q", f.NativeName))
+		}
+		scope := withScope(f.Env, callSite) // where side effects land
+		prev := ip.currentSrc
+		if f.Src != nil {
+			ip.currentSrc = f.Src
+		}
+		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
+		ip.currentSrc = prev
+		if !ip.isType(res, f.ReturnType, f.Env) {
+			fail("return type mismatch")
+		}
+		return res
+	}
+
+	// Oracles are handled elsewhere (private oracle impl lives in ops or a separate file).
+	if f.IsOracle {
+		return ip.execOracle(funVal, callSite)
+	}
+
+	// User-defined function
+	ip.ensureChunkWithSource(f, f.Src)
+	prev := ip.currentSrc
+	if f.Src != nil {
+		ip.currentSrc = f.Src
+	}
+	res := ip.runChunk(f.Chunk, f.Env, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		if !ip.isType(res.value, f.ReturnType, f.Env) {
+			fail("return type mismatch")
 		}
 		return res.value
 	case vmRuntimeError:
-		if res.value.Tag == VTNull && res.value.Annot != "" {
-			fail(res.value.Annot)
-		}
-		fail("runtime error")
+		return res.value // annotated-null if uncaught mode was used upstream
 	default:
-		fail("unknown VM status")
+		return errNull("unknown VM status")
 	}
-	return Null
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-//                             ITERATOR EXPANSION
+//                      SOURCE MAPPING (PC → (line, col))
 ////////////////////////////////////////////////////////////////////////////////
 
-func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
-	iter = AsMapValue(iter)
-
-	// Normalize to iterator function via Core's __to_iter when needed.
-	if iter.Tag != VTFun {
-		toIter, err := ip.Core.Get("__to_iter")
-		if err != nil {
-			fail("for expects array, map, or iterator function (Null -> Any)")
-		}
-		iter = ip.applyArgsScoped(toIter, []Value{iter}, scope)
+func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
+	src := ""
+	if sr != nil {
+		src = sr.Src
 	}
-
-	f := iter.Data.(*Fun)
-	if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
-		name := "_"
-		if len(f.Params) > 0 {
-			name = f.Params[0]
-		}
-		fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
+	// Unknown → 1:1
+	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
+		return 1, 1
 	}
-
-	stopFn, err := ip.Core.Get("__iter_should_stop")
-	if err != nil {
-		fail("missing __iter_should_stop")
-	}
-
-	out := []Value{}
-	for {
-		next := ip.applyArgsScoped(iter, []Value{Null}, scope)
-		if ip.applyArgsScoped(stopFn, []Value{next}, scope).Data.(bool) {
+	// last mark with mark.PC <= pc
+	i := -1
+	for j := range ch.Marks {
+		if ch.Marks[j].PC <= pc {
+			i = j
+		} else {
 			break
 		}
-		out = append(out, next)
 	}
-	return out
+	if i < 0 {
+		return 1, 1
+	}
+	if span, ok := sr.Spans.Get(ch.Marks[i].Path); ok {
+		return offsetToLineCol(src, span.StartByte)
+	}
+	return 1, 1
+}
+
+func (ip *Interpreter) fallbackSrc(sr *SourceRef, ast S) string {
+	if sr != nil && sr.Src != "" {
+		return sr.Src
+	}
+	// As a last resort, pretty-print the AST (line:col will be coarse).
+	return FormatSExpr(ast)
+}
+
+func offsetToLineCol(src string, off int) (int, int) {
+	if off < 0 {
+		return 1, 1
+	}
+	line, col := 1, 1
+	i := 0
+	for i < len(src) && i < off {
+		if src[i] == '\n' {
+			line++
+			col = 1
+			i++
+			continue
+		}
+		col++
+		i++
+	}
+	return line, col
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-//                          VALUE EQUALITY (for emitter)
+//                 PRIVATE ADAPTERS: Callable / CallCtx impls
 ////////////////////////////////////////////////////////////////////////////////
 
-func (ip *Interpreter) deepEqual(a, b Value) bool {
-	if a.Tag == VTModule {
-		a = Value{Tag: VTMap, Data: a.Data.(*Module).Map}
+type funCallable struct {
+	f   *Fun
+	doc string
+}
+
+func (c *funCallable) Arity() int { return len(c.f.Params) }
+func (c *funCallable) ParamSpecs() []ParamSpec {
+	ps := make([]ParamSpec, len(c.f.Params))
+	for i := range c.f.Params {
+		ps[i] = ParamSpec{Name: c.f.Params[i], Type: c.f.ParamTypes[i]}
 	}
-	if b.Tag == VTModule {
-		b = Value{Tag: VTMap, Data: b.Data.(*Module).Map}
+	return ps
+}
+func (c *funCallable) ReturnType() S    { return c.f.ReturnType }
+func (c *funCallable) Doc() string      { return c.doc }
+func (c *funCallable) ClosureEnv() *Env { return c.f.Env }
+
+type callCtx struct {
+	argEnv *Env // holds bound arguments
+	scope  *Env // where side effects should land (program/call-site env)
+}
+
+func (c *callCtx) Arg(name string) (Value, bool) { v, err := c.argEnv.Get(name); return v, err == nil }
+func (c *callCtx) MustArg(name string) Value {
+	if v, ok := c.Arg(name); ok {
+		return v
 	}
-	if isNumber(a) && isNumber(b) {
-		return toFloat(a) == toFloat(b)
+	fail("missing argument: " + name)
+	return Null
+}
+func (c *callCtx) Env() *Env { return c.scope }
+
+////////////////////////////////////////////////////////////////////////////////
+//                                 HELPERS
+////////////////////////////////////////////////////////////////////////////////
+
+func withScope(parent, override *Env) *Env {
+	if override != nil {
+		return override
 	}
-	if a.Tag != b.Tag {
-		return false
-	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray:
-		ax, bx := a.Data.([]Value), b.Data.([]Value)
-		if len(ax) != len(bx) {
-			return false
-		}
-		for i := range ax {
-			if !ip.deepEqual(ax[i], bx[i]) {
-				return false
-			}
-		}
-		return true
-	case VTMap:
-		am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
-		if len(am.Entries) != len(bm.Entries) {
-			return false
-		}
-		for k, av := range am.Entries {
-			bv, ok := bm.Entries[k]
-			if !ok || !ip.deepEqual(av, bv) {
-				return false
-			}
-		}
-		return true
-	case VTFun:
-		return a.Data.(*Fun) == b.Data.(*Fun)
-	case VTType:
-		ta := a.Data.(*TypeValue)
-		tb := b.Data.(*TypeValue)
-		ea := ta.Env
-		if ea == nil {
-			ea = ip.Core
-		}
-		eb := tb.Env
-		if eb == nil {
-			eb = ip.Core
-		}
-		ra := ip.resolveType(ta.Ast, ea)
-		rb := ip.resolveType(tb.Ast, eb)
-		return equalS(ra, rb)
-	default:
-		return false
-	}
+	return parent
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-//                                SMALL HELPERS
+//                             EMITTER (AST → BYTECODE)
 ////////////////////////////////////////////////////////////////////////////////
 
-func isNumber(v Value) bool { return v.Tag == VTInt || v.Tag == VTNum }
-func toFloat(v Value) float64 {
-	if v.Tag == VTInt {
-		return float64(v.Data.(int64))
-	}
-	return v.Data.(float64)
+type emitter struct {
+	ip        *Interpreter
+	code      []uint32
+	consts    []Value
+	ctrlStack []ctrlCtx // generic block/loop control stack
+
+	// Source mapping
+	src   *SourceRef
+	marks []PCMark
+	path  NodePath
 }
 
-func unwrapKeyStr(k S) string {
-	for len(k) > 0 && k[0].(string) == "annot" {
-		k = k[2].(S)
-	}
-	if len(k) >= 2 && k[0].(string) == "str" {
-		return k[1].(string)
-	}
-	fail("map key is not a string")
-	return ""
+type ctrlCtx struct {
+	isLoop     bool
+	breakJumps []int
+	contJumps  []int
 }
 
-// Noop detection: ("noop") and ("annot", ..., ("noop"), ...) are “noopish” and
-// generate no code inside blocks.
-func isNoopish(n S) bool {
+func newEmitter(ip *Interpreter, src *SourceRef) *emitter { return &emitter{ip: ip, src: src} }
+
+func (e *emitter) k(v Value) uint32 {
+	for i := range e.consts {
+		if e.ip.deepEqual(e.consts[i], v) {
+			return uint32(i)
+		}
+	}
+	e.consts = append(e.consts, v)
+	return uint32(len(e.consts) - 1)
+}
+func (e *emitter) ks(s string) uint32         { return e.k(Str(s)) }
+func (e *emitter) emit(op opcode, imm uint32) { e.code = append(e.code, pack(op, imm)) }
+func (e *emitter) patch(at int, to int)       { e.code[at] = pack(uop(e.code[at]), uint32(to)) }
+func (e *emitter) here() int                  { return len(e.code) }
+func (e *emitter) chunk() *Chunk {
+	return &Chunk{Code: e.code, Consts: e.consts, Marks: e.marks, Src: e.src}
+}
+
+func (e *emitter) pushBlockCtx() { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: false}) }
+func (e *emitter) pushLoopCtx()  { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: true}) }
+func (e *emitter) popCtx() ctrlCtx {
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	e.ctrlStack = e.ctrlStack[:i]
+	return c
+}
+func (e *emitter) addBreakJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.breakJumps = append(c.breakJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.breakJumps = append(c.breakJumps, at)
+	e.ctrlStack[i] = c
+}
+func (e *emitter) addContJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.contJumps = append(c.contJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.contJumps = append(c.contJumps, at)
+	e.ctrlStack[i] = c
+}
+
+// helpers for loops/blocks persisting "last" value
+func (e *emitter) preloadAssignToLast(lastName string) {
+	e.emit(opLoadGlobal, e.ks("__assign_set"))
+	e.emit(opConst, e.k(TypeVal(S{"id", lastName})))
+}
+func (e *emitter) saveLastAndJumpHead(head int) {
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+	e.emit(opJump, uint32(head))
+}
+func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
+	for _, at := range jumps {
+		e.patch(at, gate)
+	}
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+}
+
+func (e *emitter) mark() {
+	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), e.path...)})
+}
+func (e *emitter) withChild(childIdx int, f func()) {
+	e.path = append(e.path, childIdx)
+	f()
+	e.path = e.path[:len(e.path)-1]
+}
+func (e *emitter) callBuiltin(name string, args ...S) {
+	e.emit(opLoadGlobal, e.ks(name))
+	for _, a := range args {
+		e.emitExpr(a)
+	}
+	e.emit(opCall, uint32(len(args)))
+}
+
+func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S) {
+	namesArr := make([]Value, 0, max(0, len(params)-1))
+	typesArr := make([]Value, 0, max(0, len(params)-1))
+	for i := 1; i < len(params); i++ {
+		p := params[i].(S)
+		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+		t := p[2].(S)
+		if len(t) == 0 {
+			t = S{"id", "Any"}
+		}
+		typesArr = append(typesArr, TypeVal(t))
+	}
+	if len(retT) == 0 {
+		retT = S{"id", "Any"}
+	}
+	e.emit(opLoadGlobal, e.ks("__make_fun"))
+	for _, v := range namesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(namesArr)))
+	for _, v := range typesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(typesArr)))
+	e.emit(opConst, e.k(TypeVal(retT)))
+	e.emit(opConst, e.k(TypeVal(bodyCarrier)))
+	e.emit(opConst, e.k(Bool(isOracle)))
+	e.emitExpr(examples)
+	e.emit(opCall, 6)
+}
+
+// Entry: emit whole function body and return.
+func (e *emitter) emitFunBody(body S) {
+	e.path = e.path[:0] // root
+	e.emitExpr(body)
+	e.emit(opReturn, 0)
+}
+
+// Emit an expression node.
+func (e *emitter) emitExpr(n S) {
+	e.mark() // record PC → current AST node
 	if len(n) == 0 {
-		return false
+		e.emit(opConst, e.k(Null))
+		return
 	}
 	switch n[0].(string) {
+	case "int":
+		e.emit(opConst, e.k(Int(n[1].(int64))))
+	case "num":
+		e.emit(opConst, e.k(Num(n[1].(float64))))
+	case "str":
+		e.emit(opConst, e.k(Str(n[1].(string))))
+	case "bool":
+		e.emit(opConst, e.k(Bool(n[1].(bool))))
 	case "noop":
-		// Defensive: treat a stray ("noop") in expression position as plain Null.
-		return true
-	case "annot":
-		// n[2] is the subject node; treat annot(noop) as noop
-		if len(n) >= 3 {
-			if sub, ok := n[2].(S); ok {
-				return isNoopish(sub)
+		e.emit(opConst, e.k(Null))
+	case "null":
+		e.emit(opConst, e.k(Null))
+
+	case "id":
+		e.emit(opLoadGlobal, e.ks(n[1].(string)))
+
+	case "block":
+		e.pushBlockCtx()
+
+		// Skip noopish children entirely. Leave the last non-noop value on the stack;
+		// if all children are noopish, push plain Null. Guarantees callers always get a value.
+		emitted := 0
+		nAll := len(n) - 1
+		for i := 1; i <= nAll; i++ {
+			child := n[i].(S)
+			if isNoopish(child) {
+				continue
+			}
+			if emitted > 0 {
+				e.emit(opPop, 0)
+			}
+			idx := i - 1 // preserve original child index for source marks
+			e.withChild(idx, func() { e.emitExpr(child) })
+			emitted++
+		}
+		if emitted == 0 {
+			e.emit(opConst, e.k(Null))
+		}
+
+		exit := e.here()
+		ctx := e.popCtx()
+		for _, at := range ctx.breakJumps {
+			e.patch(at, exit)
+		}
+		for _, at := range ctx.contJumps {
+			e.patch(at, exit)
+		}
+
+	case "break":
+		e.emitExpr(n[1].(S))
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addBreakJump(at)
+		return
+
+	case "continue":
+		e.emitExpr(n[1].(S))
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addContJump(at)
+		return
+
+	case "unop":
+		op := n[1].(string)
+		if op == "?" {
+			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
+			return
+		}
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		switch op {
+		case "not":
+			e.emit(opNot, 0)
+		case "-":
+			e.emit(opNeg, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unknown unary op")))
+		}
+
+	case "binop":
+		op := n[1].(string)
+		if op == "and" || op == "or" {
+			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+			if op == "and" {
+				jf := e.here()
+				e.emit(opJumpIfFalse, 0)
+				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
+				jend := e.here()
+				e.emit(opJump, 0)
+				lfalse := e.here()
+				e.emit(opConst, e.k(Bool(false)))
+				lend := e.here()
+				e.patch(jf, lfalse)
+				e.patch(jend, lend)
+			} else {
+				jf := e.here()
+				e.emit(opJumpIfFalse, 0)
+				e.emit(opConst, e.k(Bool(true)))
+				jend := e.here()
+				e.emit(opJump, 0)
+				lrhs := e.here()
+				e.patch(jf, lrhs)
+				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
+				lend := e.here()
+				e.patch(jend, lend)
+			}
+			return
+		}
+		a, b := n[2].(S), n[3].(S)
+		switch op {
+		case "==":
+			e.emitBinaryOpAB(a, b, opEq)
+		case "!=":
+			e.emitBinaryOpAB(a, b, opNe)
+		case "+":
+			e.emitBinaryBuiltinAB("__plus", a, b)
+		case "-":
+			e.emitBinaryOpAB(a, b, opSub)
+		case "*":
+			e.emitBinaryOpAB(a, b, opMul)
+		case "/":
+			e.emitBinaryOpAB(a, b, opDiv)
+		case "%":
+			e.emitBinaryOpAB(a, b, opMod)
+		case "<":
+			e.emitBinaryOpAB(a, b, opLt)
+		case "<=":
+			e.emitBinaryOpAB(a, b, opLe)
+		case ">":
+			e.emitBinaryOpAB(a, b, opGt)
+		case ">=":
+			e.emitBinaryOpAB(a, b, opGe)
+		default:
+			e.emit(opConst, e.k(errNull("unsupported operator")))
+		}
+
+	case "assign":
+		lhs := n[1].(S)
+		opName := "__assign_set"
+		switch lhs[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			opName = "__assign_def"
+		}
+		e.emit(opLoadGlobal, e.ks(opName))
+		e.emit(opConst, e.k(TypeVal(lhs)))
+		e.emitExpr(n[2].(S))
+		e.emit(opCall, 2)
+
+	case "decl": // let x → define null
+		e.callBuiltin("__assign_def", S{"type", n}, S{"null"})
+
+	case "array":
+		for i := 1; i < len(n); i++ {
+			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
+		}
+		e.emit(opMakeArr, uint32(len(n)-1))
+
+	case "map":
+		keys := S{"array"}
+		vals := S{"array"}
+		for i := 1; i < len(n); i++ {
+			p := n[i].(S)
+			keys = append(keys, p[1].(S))
+			vals = append(vals, p[2].(S))
+		}
+		e.emit(opLoadGlobal, e.ks("__map_from"))
+		for i := 1; i < len(keys); i++ {
+			// child i-1 is the ("pair", key, val)
+			e.withChild(i-1, func() { e.emitExpr(keys[i].(S)) })
+		}
+		e.emit(opMakeArr, uint32(len(keys)-1))
+		for i := 1; i < len(vals); i++ {
+			e.withChild(i-1, func() { e.emitExpr(vals[i].(S)) })
+		}
+		e.emit(opMakeArr, uint32(len(vals)-1))
+		e.emit(opCall, 2)
+
+	case "get":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.emit(opGetProp, e.ks(n[2].(S)[1].(string)))
+	case "idx":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		e.emit(opGetIdx, 0)
+
+	case "call":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		for i := 2; i < len(n); i++ {
+			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
+		}
+		// Mark the call site itself so CALL-sourced errors (e.g., Apply type checks) map here.
+		e.mark()
+		e.emit(opCall, uint32(len(n)-2))
+
+	case "fun":
+		e.emitMakeFun(
+			n[1].(S),  // params
+			n[2].(S),  // ret (may be empty)
+			n[3].(S),  // body carrier (type AST)
+			false,     // isOracle
+			S{"null"}, // examples
+		)
+	case "oracle":
+		e.emitMakeFun(
+			n[1].(S),    // params
+			n[2].(S),    // ret (may be empty)
+			S{"oracle"}, // body carrier marker for oracle
+			true,        // isOracle
+			n[3].(S),    // source expression
+		)
+
+	case "return":
+		e.emitExpr(n[1].(S))
+		e.emit(opReturn, 0)
+
+	case "if":
+		arms := n[1:]
+		jends := []int{}
+		hasElse := false
+		if len(arms) > 0 {
+			if last, ok := arms[len(arms)-1].(S); ok && last[0].(string) == "block" {
+				hasElse = true
 			}
 		}
-		return false
+		limit := len(arms)
+		if hasElse {
+			limit--
+		}
+		for i := 0; i < limit; i++ {
+			p := arms[i].(S)
+			e.withChild(i, func() {
+				e.withChild(0, func() { e.emitExpr(p[1].(S)) }) // cond
+			})
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
+			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) }) // then
+			jend := e.here()
+			e.emit(opJump, 0)
+			jends = append(jends, jend)
+			e.patch(jf, e.here())
+		}
+		if hasElse {
+			e.withChild(len(arms)-1, func() { e.emitExpr(arms[len(arms)-1].(S)) })
+		} else {
+			e.emit(opConst, e.k(Null))
+		}
+		tail := e.here()
+		for _, at := range jends {
+			e.patch(at, tail)
+		}
+
+	case "while":
+		cond := n[1].(S)
+		body := n[2].(S)
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+
+		head := e.here()
+		e.withChild(0, func() { e.emitExpr(cond) })
+		jf := e.here()
+		e.emit(opJumpIfFalse, 0)
+
+		e.preloadAssignToLast(lastName)
+
+		e.pushLoopCtx()
+		e.withChild(1, func() { e.emitExpr(body) })
+		loopCtx := e.popCtx()
+
+		e.saveLastAndJumpHead(head)
+
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
+		e.emit(opJump, uint32(head))
+
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		end := e.here()
+		e.patch(jf, end)
+		e.patch(jEnd, end)
+
+		e.emit(opLoadGlobal, e.ks(lastName))
+
+	case "for":
+		target := n[1].(S)
+		iterExpr := n[2].(S)
+		body := n[3].(S)
+
+		iterName := fmt.Sprintf("$iter_%d", e.here())
+		// Define iterator variable: __assign_def(Type(decl iterName), __to_iter(iterExpr))
+		e.emit(opLoadGlobal, e.ks("__assign_def"))
+		e.emitExpr(S{"type", S{"decl", iterName}})
+
+		// Build value: __to_iter(iterExpr), attributing marks to child #1 (iterExpr)
+		e.emit(opLoadGlobal, e.ks("__to_iter"))
+		e.withChild(1, func() { e.emitExpr(iterExpr) })
+		e.mark()          // mark the __to_iter call site
+		e.emit(opCall, 1) // __to_iter(iterExpr)
+		e.emit(opCall, 2) // assign_def(TypeDecl, iterator)
+
+		tmpName := fmt.Sprintf("$tmp_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+
+		head := e.here()
+
+		e.emit(opLoadGlobal, e.ks("__assign_set"))
+		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
+		e.emit(opLoadGlobal, e.ks(iterName))
+		e.emit(opConst, e.k(Null))
+		e.emit(opCall, 1)
+		e.emit(opCall, 2)
+
+		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
+		e.emit(opLoadGlobal, e.ks(tmpName))
+		e.emit(opCall, 1)
+		jBody := e.here()
+		e.emit(opJumpIfFalse, 0)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		bodyStart := e.here()
+		e.patch(jBody, bodyStart)
+
+		e.preloadAssignToLast(lastName)
+
+		assignName := "__assign_set"
+		switch target[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			assignName = "__assign_def"
+		}
+		// Attribute the body emission to child #2
+		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
+		e.emit(opPop, 0)
+
+		e.pushLoopCtx()
+		e.withChild(2, func() { e.emitExpr(body) })
+		loopCtx := e.popCtx()
+
+		e.saveLastAndJumpHead(head)
+
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
+		e.emit(opJump, uint32(head))
+
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jToEnd := e.here()
+		e.emit(opJump, 0)
+
+		end := e.here()
+		e.patch(jEnd, end)
+		e.patch(jToEnd, end)
+
+		e.emit(opLoadGlobal, e.ks(lastName))
+
+	case "type":
+		e.emit(opConst, e.k(TypeVal(n[1].(S))))
+
+	case "annot":
+		text := n[1].(S)[1].(string)
+		subj := n[2].(S)
+
+		// Lone PRE annotation over a blank line is a no-op: produce Null, no side effects.
+		if isNoopish(subj) {
+			e.emit(opConst, e.k(Null))
+			return
+		}
+
+		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
+		if len(subj) > 0 && subj[0].(string) == "assign" {
+			lhs := subj[1].(S)
+			rhs := subj[2].(S)
+			opName := "__assign_set"
+			switch lhs[0].(string) {
+			case "decl", "darr", "dobj", "annot":
+				opName = "__assign_def"
+			}
+			e.emit(opLoadGlobal, e.ks(opName))
+			e.emit(opConst, e.k(TypeVal(lhs)))
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.emitExpr(rhs)
+			e.emit(opCall, 2)
+			e.emit(opCall, 2)
+			return
+		}
+
+		// #(doc) (let x)  ==>  let x = #(doc) null
+		if len(subj) > 0 && subj[0].(string) == "decl" {
+			e.emit(opLoadGlobal, e.ks("__assign_def"))
+			e.emit(opConst, e.k(TypeVal(subj)))
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.emit(opConst, e.k(Null))
+			e.emit(opCall, 2)
+			e.emit(opCall, 2)
+			return
+		}
+
+		// default: #(doc) expr  ==>  __annotate(doc, expr)
+		e.callBuiltin("__annotate", S{"str", text}, subj)
+
 	default:
-		return false
+		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
 	}
 }
 
-// Given a VTType, resolve its AST using its own env if present; otherwise use fallback.
-func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
-	if v.Tag != VTType {
-		return S{"id", "Any"}
-	}
-	tv := v.Data.(*TypeValue)
-	env := tv.Env
-	if env == nil {
-		env = fallback
-	}
-	return ip.resolveType(tv.Ast, env)
+func (e *emitter) emitBinaryOpAB(a, b S, op opcode) {
+	e.withChild(1, func() { e.emitExpr(a) })
+	e.withChild(2, func() { e.emitExpr(b) })
+	e.emit(op, 0)
 }
-=== END FILE: interpreter_ops.go ===
+func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {
+	e.emit(opLoadGlobal, e.ks(name))
+	e.withChild(1, func() { e.emitExpr(a) })
+	e.withChild(2, func() { e.emitExpr(b) })
+	e.emit(opCall, 2)
+}
+
+// Private panic signaling & null helpers are defined in interpreter_ops.go:
+//   - type returnSig struct{ v Value }
+//   - type rtErr struct{ msg string }
+//   - func fail(msg string)
+//   - func errNull(msg string) Value
+//   - func annotNull(msg string) Value
+//   - func withAnnot(v Value, ann string) Value
+// These are shared by exec/ops files within the package.
+=== END FILE: interpreter_exec.go ===
 
 === BEGIN FILE: vm.go ===
 // vm.go: minimal bytecode virtual machine for MindScript.
@@ -1051,20 +1318,6 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 // Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
 // currying, native dispatch, type checks, and call-site scoping.
 func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
-	defer func() {
-		if r := recover(); r != nil {
-			if e, ok := r.(rtErr); ok {
-				// convert panic to a VM runtime error, preserving the current PC
-				res.status = vmRuntimeError
-				res.value = annotNull(e.msg) // message carried out
-				// res.pc should already equal the current pc; if not, assign it
-				// res.pc = vm.pc
-				return
-			}
-			panic(r) // rethrow non-runtime panics
-		}
-	}()
-
 	m := &vm{
 		ip:    ip,
 		chunk: chunk,
@@ -1072,6 +1325,21 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res v
 		env:   env,
 		stack: make([]Value, 0, initStackCap),
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(rtErr); ok {
+				// convert panic to a VM runtime error, preserving the current PC
+				res.status = vmRuntimeError
+				res.value = annotNull(e.msg) // message carried out
+				res.pc = m.iptr - 1          // res.pc should already equal the current pc; if not, assign it
+				// res.pc = vm.pc
+				return
+			}
+			panic(r) // rethrow non-runtime panics
+		}
+	}()
+
 	code := chunk.Code
 	consts := chunk.Consts
 

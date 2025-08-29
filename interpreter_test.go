@@ -1435,3 +1435,186 @@ end
 `
 	wantInt(t, evalSrc(t, src), 2)
 }
+func Test_Interpreter_For_Expr_Evaluated_Once_Array_WithPreAnnotation(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `let calls; calls = 0`)
+
+	// PRE annotation sits immediately above the for-loop.
+	res := mustEvalPersistent(t, ip, `
+# doc: EXPR should be evaluated exactly once
+for let x in (fun() do calls = calls + 1; [10, 20, 30] end)() do
+  x
+end
+`)
+	wantInt(t, res, 30)
+	wantInt(t, mustEvalPersistent(t, ip, `calls`), 1)
+}
+
+func Test_Interpreter_For_Expr_Evaluated_Once_Map_WithPreAnnotation(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `let mcalls; mcalls = 0`)
+
+	res := mustEvalPersistent(t, ip, `
+# doc: map EXPR evaluated once; iterator yields [key, value]
+for let v in (fun() do mcalls = mcalls + 1; {a: 1, b: 2} end)() do
+  v[1]     # grab the value from [key, value]
+end
+`)
+	wantInt(t, res, 2)
+	wantInt(t, mustEvalPersistent(t, ip, `mcalls`), 1)
+}
+
+func Test_Interpreter_For_Iterator_Function_Evaluated_Once(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `let icalls; icalls = 0`)
+
+	res := mustEvalPersistent(t, ip, `
+let makeIter = fun() do
+  icalls = icalls + 1
+  let i; i = 0
+  fun(_: Null) -> Any? do
+    if i < 3 then
+      i = i + 1
+      i
+    else
+      null
+    end
+  end
+end
+
+for let x in makeIter() do
+  x
+end
+`)
+	wantInt(t, res, 3)
+	wantInt(t, mustEvalPersistent(t, ip, `icalls`), 1)
+}
+
+func Test_Interpreter_For_Destructure_Map_Yields_KeyValue(t *testing.T) {
+	// Ensure the map iterator yields [key, value] and destructuring works.
+	v := evalSrc(t, `
+for let [k, v] in {a: 1, b: 2} do
+  [k, v]
+end
+`)
+	if v.Tag != VTArray || len(v.Data.([]Value)) != 2 {
+		t.Fatalf("want [key, value], got %#v", v)
+	}
+	wantStr(t, v.Data.([]Value)[0], "b")
+	wantInt(t, v.Data.([]Value)[1], 2)
+}
+
+func Test_Interpreter_For_Target_Binding_Persists(t *testing.T) {
+	v := evalSrc(t, `
+for let y in [7, 8, 9] do
+  y
+end
+y
+`)
+	wantInt(t, v, 9)
+}
+
+func Test_Interpreter_For_ToIterContractError_Message(t *testing.T) {
+	err := evalSrcExpectError(t, `
+# PRE annotation above the loop should not mask the correct error
+for let x in "oops" do
+  x
+end
+`)
+	wantErrContains(t, err, "array, map, or iterator")
+}
+
+func Test_Interpreter_While_Basic_Count_And_Result(t *testing.T) {
+	v := evalSrc(t, `
+let i; i = 0
+while i < 3 do
+  i = i + 1
+end
+i
+`)
+	wantInt(t, v, 3)
+}
+
+func Test_Interpreter_While_Result_As_Expression(t *testing.T) {
+	v := evalSrc(t, `
+let i; i = 3
+let r; r = while i < 6 do
+  i = i + 2
+  i
+end
+[r, i]
+`)
+	if v.Tag != VTArray || len(v.Data.([]Value)) != 2 {
+		t.Fatalf("want [r, i], got %#v", v)
+	}
+	wantInt(t, v.Data.([]Value)[0], 7)
+	wantInt(t, v.Data.([]Value)[1], 7)
+}
+
+func Test_Interpreter_While_Zero_Iterations_Yields_Null(t *testing.T) {
+	wantNull(t, evalSrc(t, `
+let j; j = 10
+while j < 0 do
+  j = j - 1
+end
+`))
+}
+
+func Test_Interpreter_While_Continue_And_Break_Values(t *testing.T) {
+	// continue value should be captured as "last" for that iteration; break value becomes loop result.
+	v1 := evalSrc(t, `
+let i; i = 0
+let acc; acc = []
+while i < 5 do
+  i = i + 1
+  if i % 2 == 0 then
+    acc = acc + [i]
+    continue i * 100
+  else
+    i
+  end
+end
+[acc, i]
+`)
+	if v1.Tag != VTArray || len(v1.Data.([]Value)) != 2 {
+		t.Fatalf("want [acc, i], got %#v", v1)
+	}
+	acc := v1.Data.([]Value)[0]
+	if acc.Tag != VTArray || len(acc.Data.([]Value)) != 2 {
+		t.Fatalf("want acc [2,4], got %#v", acc)
+	}
+	wantInt(t, acc.Data.([]Value)[0], 2)
+	wantInt(t, acc.Data.([]Value)[1], 4)
+	wantInt(t, v1.Data.([]Value)[1], 5)
+
+	v2 := evalSrc(t, `
+let i; i = 0
+let r; r = while true do
+  i = i + 1
+  if i == 3 then
+    break i * 10
+  else
+    i
+  end
+end
+[r, i]
+`)
+	if v2.Tag != VTArray || len(v2.Data.([]Value)) != 2 {
+		t.Fatalf("want [r, i], got %#v", v2)
+	}
+	wantInt(t, v2.Data.([]Value)[0], 30)
+	wantInt(t, v2.Data.([]Value)[1], 3)
+}
+
+func Test_Interpreter_While_WithPreAnnotation(t *testing.T) {
+	// PRE annotation immediately above the while should not disturb stack shape.
+	v := evalSrc(t, `
+let i; i = 0
+# while with PRE annotation
+while i < 3 do
+  i = i + 1
+end
+i
+`)
+	wantInt(t, v, 3)
+}

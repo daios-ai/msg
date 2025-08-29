@@ -5,9 +5,7 @@
 // - No exported identifiers here. The public facade lives in interpreter_api.go.
 //
 // Emitter placement:
-//   The emitter is defined in interpreter_ops.go (private) and is obtained via
-//   newEmitter(ip, sr). If you prefer, you can move it here without changing
-//   the public API.
+//   The emitter is defined here and obtained via newEmitter(ip, sr).
 
 package mindscript
 
@@ -141,7 +139,7 @@ func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
 	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
 		return
 	}
-	em := newEmitter(ip, sr) // private emitter from interpreter_ops.go
+	em := newEmitter(ip, sr) // private emitter
 	em.emitFunBody(f.Body)
 	ch := em.chunk()
 	ch.Src = sr
@@ -733,11 +731,12 @@ func (e *emitter) emitExpr(n S) {
 		}
 		e.emit(opLoadGlobal, e.ks("__map_from"))
 		for i := 1; i < len(keys); i++ {
-			e.emitExpr(keys[i].(S))
+			// child i-1 is the ("pair", key, val)
+			e.withChild(i-1, func() { e.emitExpr(keys[i].(S)) })
 		}
 		e.emit(opMakeArr, uint32(len(keys)-1))
 		for i := 1; i < len(vals); i++ {
-			e.emitExpr(vals[i].(S))
+			e.withChild(i-1, func() { e.emitExpr(vals[i].(S)) })
 		}
 		e.emit(opMakeArr, uint32(len(vals)-1))
 		e.emit(opCall, 2)
@@ -755,7 +754,8 @@ func (e *emitter) emitExpr(n S) {
 		for i := 2; i < len(n); i++ {
 			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
 		}
-		e.mark() // ← mark the call node right at the call instruction
+		// Mark the call site itself so CALL-sourced errors (e.g., Apply type checks) map here.
+		e.mark()
 		e.emit(opCall, uint32(len(n)-2))
 
 	case "fun":
@@ -821,6 +821,7 @@ func (e *emitter) emitExpr(n S) {
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.emit(opPop, 0)
 
 		head := e.here()
 		e.withChild(0, func() { e.emitExpr(cond) })
@@ -856,14 +857,25 @@ func (e *emitter) emitExpr(n S) {
 		body := n[3].(S)
 
 		iterName := fmt.Sprintf("$iter_%d", e.here())
-		e.callBuiltin("__assign_def", S{"type", S{"decl", iterName}},
-			S{"call", S{"id", "__to_iter"}, iterExpr})
+		// Define iterator variable: __assign_def(Type(decl iterName), __to_iter(iterExpr))
+		e.emit(opLoadGlobal, e.ks("__assign_def"))
+		e.emitExpr(S{"type", S{"decl", iterName}})
+
+		// Build value: __to_iter(iterExpr), attributing marks to child #1 (iterExpr)
+		e.emit(opLoadGlobal, e.ks("__to_iter"))
+		e.withChild(1, func() { e.emitExpr(iterExpr) })
+		e.mark()          // mark the __to_iter call site
+		e.emit(opCall, 1) // __to_iter(iterExpr)
+		e.emit(opCall, 2) // assign_def(TypeDecl, iterator)
+		e.emit(opPop, 0)  // discard __assign_def return value
 
 		tmpName := fmt.Sprintf("$tmp_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+		e.emit(opPop, 0) // discard __assign_def return value
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.emit(opPop, 0) // discard __assign_def return value
 
 		head := e.here()
 
@@ -873,6 +885,7 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(Null))
 		e.emit(opCall, 1)
 		e.emit(opCall, 2)
+		e.emit(opPop, 0) // discard __assign_set return value
 
 		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
 		e.emit(opLoadGlobal, e.ks(tmpName))
@@ -892,6 +905,7 @@ func (e *emitter) emitExpr(n S) {
 		case "decl", "darr", "dobj", "annot":
 			assignName = "__assign_def"
 		}
+		// Attribute the body emission to child #2
 		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
 		e.emit(opPop, 0)
 

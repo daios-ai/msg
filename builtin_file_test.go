@@ -50,7 +50,7 @@ func mustArray(t *testing.T, v Value) []Value {
 	return v.Data.([]Value)
 }
 
-func Test_Builtin_File_readFile_writeFile_RoundTrip(t *testing.T) {
+func Test_Builtin_Core_File_readFile_writeFile_RoundTrip(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hello.txt")
@@ -64,7 +64,7 @@ func Test_Builtin_File_readFile_writeFile_RoundTrip(t *testing.T) {
 	assertStr(t, v, content)
 }
 
-func Test_Builtin_File_OpenWrite_ReadBack(t *testing.T) {
+func Test_Builtin_Core_File_OpenWrite_ReadBack(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.txt")
@@ -80,7 +80,7 @@ func Test_Builtin_File_OpenWrite_ReadBack(t *testing.T) {
 	assertStr(t, v, "abc")
 }
 
-func Test_Builtin_File_CloseFlushes(t *testing.T) {
+func Test_Builtin_Core_File_CloseFlushes(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "b.txt")
@@ -96,7 +96,7 @@ func Test_Builtin_File_CloseFlushes(t *testing.T) {
 	assertStr(t, v, "xyz")
 }
 
-func Test_Builtin_File_ReadN_EOF_Behavior(t *testing.T) {
+func Test_Builtin_Core_File_ReadN_EOF_Behavior(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.txt")
@@ -117,7 +117,7 @@ func Test_Builtin_File_ReadN_EOF_Behavior(t *testing.T) {
 	assertStr(t, arr[1], "llo")
 }
 
-func Test_Builtin_File_ReadN_Negative_HardError(t *testing.T) {
+func Test_Builtin_Core_File_ReadN_Negative_HardError(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "d.txt")
@@ -130,7 +130,7 @@ func Test_Builtin_File_ReadN_Negative_HardError(t *testing.T) {
 	wantErrContains(t, err, "readN expects n >= 0")
 }
 
-func Test_Builtin_File_ReadLine_Simple(t *testing.T) {
+func Test_Builtin_Core_File_ReadLine_Simple(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "e.txt")
@@ -155,7 +155,7 @@ func Test_Builtin_File_ReadLine_Simple(t *testing.T) {
 	}
 }
 
-func Test_Builtin_File_OpenMode_ReadWrite_Contracts(t *testing.T) {
+func Test_Builtin_Core_File_OpenMode_ReadWrite_Contracts(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	pathR := filepath.Join(dir, "r.txt")
@@ -177,7 +177,7 @@ func Test_Builtin_File_OpenMode_ReadWrite_Contracts(t *testing.T) {
 	wantErrContains(t, err2, "not writable")
 }
 
-func Test_Builtin_File_OpenModes_TruncateAndAppend(t *testing.T) {
+func Test_Builtin_Core_File_OpenModes_TruncateAndAppend(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "modes.txt")
@@ -215,7 +215,7 @@ func Test_Builtin_File_OpenModes_TruncateAndAppend(t *testing.T) {
 	assertStr(t, v3, "XYZ")
 }
 
-func Test_Builtin_File_dirList_ContainsFiles(t *testing.T) {
+func Test_Builtin_Core_File_dirList_ContainsFiles(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	a := "a.txt"
@@ -241,7 +241,7 @@ func Test_Builtin_File_dirList_ContainsFiles(t *testing.T) {
 	}
 }
 
-func Test_Builtin_File_readFile_NotExist_AnnotatedNull(t *testing.T) {
+func Test_Builtin_Core_File_readFile_NotExist_AnnotatedNull(t *testing.T) {
 	ip, _ := NewRuntime()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nope.txt")

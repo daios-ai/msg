@@ -73,7 +73,7 @@ Returns:
 			{Name: "name", Type: S{"id", "Str"}},
 			{Name: "value", Type: S{"unop", "?", S{"id", "Str"}}}, // Str? (null = unset)
 		},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			name := ctx.MustArg("name").Data.(string)
 			v, ok := ctx.Arg("value")
@@ -81,13 +81,13 @@ Returns:
 				if err := os.Setenv(name, v.Data.(string)); err != nil {
 					return annotNull(err.Error())
 				}
-				return Null
+				return Bool(true)
 			}
 			// Null or omitted -> unset
 			if err := os.Unsetenv(name); err != nil {
 				return annotNull(err.Error())
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "osSetEnv", `Set or unset an environment variable.
@@ -99,7 +99,7 @@ Params:
 	value: Str?  # null → unset
 
 Returns:
-	Null (annotated on OS error)`)
+	Bool (annotated null on OS error)`)
 
 	// stat(path) -> { isDir!:Bool, size!:Int, modTimeMillis!:Int, mode!:Int }?
 	ip.RegisterNative(
@@ -143,14 +143,14 @@ Returns:
 	ip.RegisterNative(
 		"mkdir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			p := ctx.MustArg("path").Data.(string)
 			// Create intermediate directories for practicality.
 			if err := os.MkdirAll(p, 0o755); err != nil {
 				return annotNull(err.Error())
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "mkdir", `Create a directory (creating parents as needed).
@@ -159,7 +159,7 @@ Params:
 	path: Str
 
 Returns:
-	Null (annotated on error)`)
+	Bool (annotated null on error)`)
 
 	ip.RegisterNative(
 		"rename",
@@ -167,14 +167,14 @@ Returns:
 			{Name: "old", Type: S{"id", "Str"}},
 			{Name: "new", Type: S{"id", "Str"}},
 		},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			oldP := ctx.MustArg("old").Data.(string)
 			newP := ctx.MustArg("new").Data.(string)
 			if err := os.Rename(oldP, newP); err != nil {
 				return annotNull(err.Error())
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "rename", `Rename (move) a file or directory.
@@ -184,19 +184,19 @@ Params:
 	new: Str
 
 Returns:
-	Null (annotated on error)`)
+	Bool (annotated null on error)`)
 
 	ip.RegisterNative(
 		"remove",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			p := ctx.MustArg("path").Data.(string)
 			// Be conservative: don't remove recursively.
 			if err := os.Remove(p); err != nil {
 				return annotNull(err.Error())
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "remove", `Delete a file or an empty directory.
@@ -205,7 +205,7 @@ Params:
 	path: Str
 
 Returns:
-	Null (annotated on error). Note: fails for non-empty directories.`)
+	Bool (annotated null on error). Note: fails for non-empty directories.`)
 
 	ip.RegisterNative(
 		"cwd",
@@ -227,13 +227,13 @@ Returns:
 	ip.RegisterNative(
 		"chdir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			p := ctx.MustArg("path").Data.(string)
 			if err := os.Chdir(p); err != nil {
 				return annotNull(err.Error())
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "chdir", `Change the current working directory.
@@ -242,7 +242,7 @@ Params:
 	path: Str
 
 Returns:
-	Null (annotated on error)`)
+	Bool (annotated null on error)`)
 
 	ip.RegisterNative(
 		"tempDir",
@@ -409,11 +409,11 @@ Returns:
 	file handle usable with read*/write/flush/close,
 	or null (annotated) on I/O failure.`)
 
-	// close(h: Any) -> Null
+	// close(h: Any) -> Bool
 	ip.RegisterNative(
 		"close",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			h := asHandle(ctx.MustArg("h"), "")
 			var errMsg string
@@ -456,14 +456,17 @@ Returns:
 			if errMsg != "" {
 				return annotNull(errMsg) // soft
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "close", `Close a file, network connection, or listener handle.
 
 Flushes buffered output (if any) before closing.
 Never closes STDIN/STDOUT/STDERR; they are only flushed.
-Returns null (annotated) on I/O failure; hard-errors on misuse.`)
+Returns annotated null on I/O failure; hard-errors on misuse.
+
+Returns:
+	Bool`)
 
 	ip.RegisterNative(
 		"readAll",
@@ -520,7 +523,8 @@ Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 			if err != nil && !errors.Is(err, io.EOF) {
 				return annotNull(err.Error()) // soft
 			}
-			return Str(strings.TrimRight(s, "\n"))
+			// Trim trailing newline(s) (handle CRLF and LF)
+			return Str(strings.TrimRight(s, "\r\n"))
 		},
 	)
 	setBuiltinDoc(ip, "readLine", `Read one line from a handle (without the trailing newline).
@@ -549,19 +553,22 @@ Output is buffered; call flush to ensure delivery.`)
 	ip.RegisterNative(
 		"flush",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
+		S{"id", "Bool"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			wb, _ := getWriter(ctx.MustArg("h"))
 			if err := wb.Flush(); err != nil {
 				return annotNull(err.Error()) // soft
 			}
-			return Null
+			return Bool(true)
 		},
 	)
 	setBuiltinDoc(ip, "flush", `Flush buffered output for a handle.
 
 Ensures written data is visible to readers/peers.
-Returns null (annotated) on I/O error.`)
+Returns annotated null on I/O error.
+
+Returns:
+	Bool`)
 
 	ip.RegisterNative(
 		"readFile",
@@ -587,25 +594,26 @@ Returns:
 	ip.RegisterNative(
 		"writeFile",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}, {Name: "data", Type: S{"id", "Str"}}},
-		S{"id", "Null"},
+		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("path")
 			dv := ctx.MustArg("data")
-			if err := os.WriteFile(pv.Data.(string), []byte(dv.Data.(string)), 0o644); err != nil {
+			data := dv.Data.(string)
+			if err := os.WriteFile(pv.Data.(string), []byte(data), 0o644); err != nil {
 				return annotNull(err.Error()) // soft
 			}
-			return Null
+			return Int(int64(len(data)))
 		},
 	)
 	setBuiltinDoc(ip, "writeFile", `Write a string to a file (overwriting if it exists).
 
 Creates the file if necessary with mode 0644.
-Returns null (annotated) on I/O error.`)
+Returns the number of bytes written as Int, or null (annotated) on I/O error.`)
 
 	ip.RegisterNative(
 		"dirList",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
+		S{"unop", "?", S{"array", S{"id", "Str"}}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("path")
 			ents, err := os.ReadDir(pv.Data.(string))

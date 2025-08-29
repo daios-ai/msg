@@ -1,4 +1,4 @@
-## stdlib.ms
+## std.ms
 ## Minimal standard library implemented in MindScript on top of builtins.
 ##
 
@@ -19,9 +19,8 @@
 ##      type.
 ## 3) Functions should have annotations like Python docstrings. First line
 ##   is a brief summary, then blank line, then detailed description with
-##   explanation of arguments and return type.
+##   explanation of arguments and return type. It should be concise, but complete.
 ## 4) Tabs for indentation.
-
 
 ## -----------------------------
 ## Error/Assert
@@ -33,7 +32,7 @@
 # Args: msg: Str
 # Returns: Null
 let error = fun(msg: Str) -> Null do
-	__annotate(msg)(null)
+	__annotate(msg, null)
 end
 
 # Assert that a condition holds.
@@ -45,6 +44,27 @@ let assert = fun(cond: Bool) -> Bool do
 	if cond then true else fail("assertion failed") end
 end
 
+## -----------------------------
+## Frame bindings
+## -----------------------------
+
+# Current frame bindings (shallow copy).
+#
+# Returns a map of variables bound in the *current* scope only.
+# Args: _: Null (ignored)
+# Returns: {}
+let locals = fun(_: Null) -> {} do
+	bindings(true)
+end
+
+# All visible bindings (merged from current frame outward).
+#
+# Returns a map where inner scopes shadow outer ones.
+# Args: _: Null (ignored)
+# Returns: {}
+let scope = fun(_: Null) -> {} do
+	bindings(false)
+end
 
 ## -----------------------------
 ## Console I/O
@@ -69,7 +89,6 @@ let println = fun(x: Any) -> Any do
 	printf("%s\n", [str(x)])
 	x
 end
-
 
 ## -----------------------------
 ## Time & randomness
@@ -459,7 +478,7 @@ end
 
 
 ## -----------------------------
-## Schemas / grammars
+## Schemas
 ## -----------------------------
 
 # Render a JSON Schema for a Type.
@@ -471,16 +490,6 @@ let jsonSchema = fun(t: Type) -> Str? do
 	let r = try(fun() do typeToJSONSchema(t) end)
 	if r.ok then jsonStringify(r.value) else error("jsonSchema: missing native bridge") end
 end
-
-# Produce a BNF grammar for a Type (placeholder).
-#
-# Requires a native bridge to be useful.
-# Args: _t: Type
-# Returns: Str?
-let bnf = fun(_t: Type) -> Str? do
-	error("bnf(Type) not implemented in stdlib; provide a native bridge")
-end
-
 
 ## -----------------------------
 ## Annotations
@@ -495,28 +504,19 @@ let getNote = fun(x: Any) -> Str? do
 	help(x)
 end
 
-# Set the annotation/note on a value (placeholder).
+# Annotates a value.
 #
 # Requires native support to attach annotations at runtime.
-# Args: _x: Any, _note: Str?
-# Returns: Any?
-let setNote = fun(_x: Any, _note: Str?) -> Any? do
-	error("setNote requires native support to attach annotations at runtime")
+# Args: x: Any, note: Str?
+# Returns: Any
+let setNote = fun(x: Any, note: Str?) -> Any do
+	__annotate(note, x)
 end
 
 
 ## -----------------------------
 ## Misc
 ## -----------------------------
-
-# Bind a method to a value (like partial application of receiver).
-#
-# Returns a unary function that calls `f(value, x)`.
-# Args: value: Any, f: (Any -> Any)
-# Returns: (Any -> Any)
-let bindMethod = fun(value: Any, f: (Any -> Any)) -> (Any -> Any) do
-	fun(x: Any) -> Any do f(value, x) end
-end
 
 # Stable-ish integer id for a value’s string form.
 #
@@ -540,7 +540,6 @@ end
 let mute = fun(_: Any) -> Null do
 	null
 end
-
 
 ## -----------------------------
 ## Oracle hook (owned by prelude/Core)

@@ -189,7 +189,6 @@ Returns: Bool`)
 			}
 			mod, err := ip.importFile(pv.Data.(string), importer)
 			if err != nil {
-				// NEW POLICY:
 				// - Parse errors → HARD (Go error via fail)
 				// - Everything else (I/O, not found, runtime during init) → SOFT (annotated null)
 				msg := err.Error()
@@ -225,7 +224,6 @@ Returns: Bool`)
 
 			modVal, err := ip.importCode("mem:"+name, src)
 			if err != nil {
-				// NEW POLICY:
 				// - Parse errors → HARD
 				// - Runtime during module init → SOFT (annotated null)
 				msg := err.Error()

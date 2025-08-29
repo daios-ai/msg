@@ -13,6 +13,82 @@
 package mindscript
 
 func registerIntrospectionBuiltins(ip *Interpreter) {
+	// note(x: Any) -> Str?
+	// Return the annotation (note) attached to a value, if any.
+	ip.RegisterNative(
+		"noteGet",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Str"}}, // Str?
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			if v.Annot == "" {
+				return Null
+			}
+			return Str(v.Annot)
+		},
+	)
+
+	setBuiltinDoc(ip, "noteGet", `Get the annotation attached to a value, if any.
+
+Params:
+	x: Any — any runtime value
+
+Returns:
+	Str? — the annotation string, or null if not present
+
+Notes:
+	• See also: noteSet(text, value) to attach annotations programmatically.`)
+
+	ip.RegisterNative(
+		"bindings",
+		[]ParamSpec{{Name: "localOnly", Type: S{"unop", "?", S{"id", "Bool"}}}},
+		S{"map"}, // open-world object: {}
+		func(_ *Interpreter, ctx CallCtx) Value {
+			// localOnly == true → only current frame; else merged view (inner shadows outer)
+			localOnly := false
+			if v, ok := ctx.Arg("localOnly"); ok && v.Tag == VTBool {
+				localOnly = v.Data.(bool)
+			}
+
+			out := &MapObject{
+				Entries: map[string]Value{},
+				KeyAnn:  map[string]string{},
+				Keys:    []string{},
+			}
+			for e := ctx.Env(); e != nil; e = e.parent {
+				for k, v := range e.table {
+					if _, seen := out.Entries[k]; !seen {
+						out.Entries[k] = v
+						out.Keys = append(out.Keys, k)
+					}
+				}
+				if localOnly {
+					break
+				}
+			}
+			return Value{Tag: VTMap, Data: out}
+		},
+	)
+
+	setBuiltinDoc(ip, "bindings", `Inspect visible variable bindings as a map.
+
+Returns a map of variable names to values from the current environment. When
+localOnly is true, only the current frame's bindings are returned. Otherwise a
+merged view of all visible frames is returned, where inner frames shadow outer
+frames.
+
+Params:
+	localOnly: Bool? — if true, include only the current frame; if false/null, include all visible frames
+
+Returns:
+	{} — object map of name → value (shallow copy). Order is inner-to-outer
+	     first-seen, suitable for iteration.
+
+Notes:
+	• This is read-only: mutating the returned map does not change the environment.
+	• Useful for testing (detecting state leaks), debugging, and introspection.
+`)
+
 	// astParse(src: Str) -> []
 	// Parse MindScript source into a runtime-S ([]) AST.
 	// On syntax/lex errors, returns a *soft* error as annotated-null runtime-S:

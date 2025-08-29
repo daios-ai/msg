@@ -1,10 +1,13 @@
 // ast_introspection_builtins.go
 //
 // Builtins surfaced:
-//  1. astParse(src: Str) -> []
-//  2. astEval(ast: []) -> Any
-//  3. reflect(val: Any) -> []           // constructor code
-//  4. reify(rt: []) -> Any              // decode + evaluate (persistent)
+//  1. noteGet(x: Any) -> Str?
+//  2. noteSet(text: Str, value: Any) -> Any
+//  3. bindings(localOnly: Bool?) -> {}
+//  4. astParse(src: Str) -> []
+//  5. astEval(ast: []) -> Any
+//  6. reflect(val: Any) -> []           // constructor code
+//  7. reify(rt: []) -> Any              // decode + evaluate (persistent)
 //
 // Conventions:
 //   - Functions are camelCase; docs are docstring-style (first line, blank, details).
@@ -12,8 +15,10 @@
 //   - Tabs for indentation.
 package mindscript
 
+import "sort"
+
 func registerIntrospectionBuiltins(ip *Interpreter) {
-	// note(x: Any) -> Str?
+	// noteGet(x: Any) -> Str?
 	// Return the annotation (note) attached to a value, if any.
 	ip.RegisterNative(
 		"noteGet",
@@ -39,6 +44,39 @@ Returns:
 Notes:
 	• See also: noteSet(text, value) to attach annotations programmatically.`)
 
+	// noteSet(text: Str, value: Any) -> Any
+	// Attach/replace the annotation on a value and return the annotated value.
+	ip.RegisterNative(
+		"noteSet",
+		[]ParamSpec{
+			{Name: "text", Type: S{"id", "Str"}},
+			{Name: "value", Type: S{"id", "Any"}},
+		},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			text := ctx.MustArg("text").Data.(string)
+			v := ctx.MustArg("value")
+			v.Annot = text
+			return v
+		},
+	)
+
+	setBuiltinDoc(ip, "noteSet", `Attach or replace an annotation on a value.
+
+Params:
+	text: Str  — annotation text to attach
+	value: Any — value to annotate
+
+Returns:
+	Any — the same value with its annotation set to text
+
+Notes:
+	• This does not deep-copy arrays/maps; underlying data is shared.
+	• Annotations never affect equality but are rendered by printers.`)
+
+	// bindings(localOnly: Bool?) -> {}
+	// Deterministic order: within each frame keys are sorted ascending; frames
+	// are processed inner → outer. First-seen wins (shadowing preserved).
 	ip.RegisterNative(
 		"bindings",
 		[]ParamSpec{{Name: "localOnly", Type: S{"unop", "?", S{"id", "Bool"}}}},
@@ -55,10 +93,17 @@ Notes:
 				KeyAnn:  map[string]string{},
 				Keys:    []string{},
 			}
+
 			for e := ctx.Env(); e != nil; e = e.parent {
-				for k, v := range e.table {
+				// Collect and sort keys in this frame for deterministic order.
+				frameKeys := make([]string, 0, len(e.table))
+				for k := range e.table {
+					frameKeys = append(frameKeys, k)
+				}
+				sort.Strings(frameKeys)
+				for _, k := range frameKeys {
 					if _, seen := out.Entries[k]; !seen {
-						out.Entries[k] = v
+						out.Entries[k] = e.table[k]
 						out.Keys = append(out.Keys, k)
 					}
 				}
@@ -77,12 +122,15 @@ localOnly is true, only the current frame's bindings are returned. Otherwise a
 merged view of all visible frames is returned, where inner frames shadow outer
 frames.
 
+Ordering:
+	• Within each frame, keys are sorted ascending.
+	• Frames are processed inner-to-outer; the first-seen binding for a name wins.
+
 Params:
 	localOnly: Bool? — if true, include only the current frame; if false/null, include all visible frames
 
 Returns:
-	{} — object map of name → value (shallow copy). Order is inner-to-outer
-	     first-seen, suitable for iteration.
+	{} — object map of name → value (shallow copy). Order is stable and suitable for iteration.
 
 Notes:
 	• This is read-only: mutating the returned map does not change the environment.

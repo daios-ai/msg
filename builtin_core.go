@@ -100,26 +100,6 @@ Notes:
   • If the function returns an annotated null, ok=false and error is that annotation.
   • On success, ok=true and value is the function's result.`)
 
-	// typeOf(x: Any) -> Type
-	ip.RegisterNative(
-		"typeOf",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			return TypeVal(ip.ValueToType(x, ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
-
-This inspects a runtime value and produces its structural Type.
-Useful together with isType/isSubtype for ad-hoc validation.
-
-Params:
-  x: Any — a runtime value
-
-Returns: Type`)
-
 	ip.RegisterNative(
 		"clone",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
@@ -164,9 +144,25 @@ Params:
 Returns:
   Any — an opaque handle (VTHandle) representing the snapshot`)
 
-	// NOTE: Do NOT register noteGet here — it's already provided in the
-	// introspection builtins. Keeping a single authoritative definition avoids
-	// double registration and doc drift.
+	// typeOf(x: Any) -> Type
+	ip.RegisterNative(
+		"typeOf",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Type"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			return TypeVal(ip.ValueToType(x, ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
+
+This inspects a runtime value and produces its structural Type.
+Useful together with isType/isSubtype for ad-hoc validation.
+
+Params:
+  x: Any — a runtime value
+
+Returns: Type`)
 
 	ip.RegisterNative(
 		"isType",

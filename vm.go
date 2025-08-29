@@ -314,7 +314,7 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 //
 // Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
 // currying, native dispatch, type checks, and call-site scoping.
-func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResult {
+func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
 	m := &vm{
 		ip:    ip,
 		chunk: chunk,
@@ -322,6 +322,21 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) vmResu
 		env:   env,
 		stack: make([]Value, 0, initStackCap),
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(rtErr); ok {
+				// convert panic to a VM runtime error, preserving the current PC
+				res.status = vmRuntimeError
+				res.value = annotNull(e.msg) // message carried out
+				res.pc = m.iptr - 1          // res.pc should already equal the current pc; if not, assign it
+				// res.pc = vm.pc
+				return
+			}
+			panic(r) // rethrow non-runtime panics
+		}
+	}()
+
 	code := chunk.Code
 	consts := chunk.Consts
 

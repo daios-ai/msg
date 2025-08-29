@@ -93,24 +93,28 @@ Notes:
 				KeyAnn:  map[string]string{},
 				Keys:    []string{},
 			}
+			seen := map[string]struct{}{}
 
 			for e := ctx.Env(); e != nil; e = e.parent {
-				// Collect and sort keys in this frame for deterministic order.
+				// Collect frame keys not yet seen, then sort ascending for stable order.
 				frameKeys := make([]string, 0, len(e.table))
 				for k := range e.table {
-					frameKeys = append(frameKeys, k)
+					if _, already := seen[k]; !already {
+						frameKeys = append(frameKeys, k)
+					}
 				}
 				sort.Strings(frameKeys)
 				for _, k := range frameKeys {
-					if _, seen := out.Entries[k]; !seen {
-						out.Entries[k] = e.table[k]
-						out.Keys = append(out.Keys, k)
-					}
+					// First-seen wins (inner shadows outer).
+					out.Entries[k] = e.table[k]
+					out.Keys = append(out.Keys, k)
+					seen[k] = struct{}{}
 				}
 				if localOnly {
 					break
 				}
 			}
+
 			return Value{Tag: VTMap, Data: out}
 		},
 	)

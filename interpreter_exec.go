@@ -755,6 +755,7 @@ func (e *emitter) emitExpr(n S) {
 		for i := 2; i < len(n); i++ {
 			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
 		}
+		e.mark() // ← mark the call node right at the call instruction
 		e.emit(opCall, uint32(len(n)-2))
 
 	case "fun":

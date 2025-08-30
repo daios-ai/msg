@@ -75,7 +75,7 @@
 //		("annot", ("str", textOr<text>), wrappedNode)
 //
 //	 Annotation encoding:
-//	   - PRE annotations are stored as-is:        ("annot", ("str", "note"), expr)
+//	   - PRE annotations are stored as-is:        ("annot", ("str", "note"), expr/pattern)
 //	   - POST annotations are prefixed with "<":  ("annot", ("str", "<note"), expr)
 //
 // Node spans
@@ -85,11 +85,13 @@
 // maps each node to its original source span (see spans.go).
 //
 // **Implementation note (this file):**
-// Spans are now emitted *at construction sites* for every AST node, including
-// intermediate postfix nodes like ("get") and ("idx"), and for computed-index
-// grouping via obj.( … ). Children are emitted first; when a parent node is
-// formed, its span is appended using the earliest token of the left-hand side
-// and the last token consumed for the construct, preserving post-order.
+// Spans are emitted *at construction sites* for every AST node, including
+// intermediate postfix nodes like ("get") and ("idx"), computed-index grouping
+// via obj.( … ), structural containers like ("pair")/("pair!"), parameter
+// pairs, "decl" patterns, and PRE-annotation wrappers in pattern/key contexts.
+// Children are emitted first; when a parent node is formed, its span is
+// appended using the earliest token of the left-hand side and the last token
+// consumed for the construct, preserving post-order.
 //
 // Dependencies
 // ------------
@@ -279,7 +281,8 @@ func (e *ParseError) Error() string {
 //
 // Spans (this version):
 //   - Spans are emitted at construction sites for every node, preserving post-order.
-//     This includes intermediate `get`/`idx` nodes and computed indices `.( … )`.
+//     This includes intermediate `get`/`idx` nodes, computed indices `.( … )`,
+//     structural containers like ("pair") inside maps/patterns/params, and wrappers.
 //
 // Errors:
 //   - Does not return *IncompleteError*; unterminated constructs are hard errors.
@@ -361,6 +364,12 @@ type parser struct {
 	// parsed a subexpression (e.g., unary/binary parent) can extend to it.
 	lastSpanStartTok int
 	lastSpanEndTok   int
+}
+
+// internal helper for PRE-annotations in pattern/key contexts.
+type preAnn struct {
+	txt    string
+	tokIdx int
 }
 
 // skipNoops consumes any number of NOOP tokens (blank-line groups). This is
@@ -474,7 +483,7 @@ func lbp(t TokenType) (int, bool) {
 // ---- span helpers ----
 
 func (p *parser) emitSpanByTok(startTok, endTok int) {
-	// Guard: allow empty span (e.g., synthetic "null") by using -1 indexes.
+	// Guard: allow empty span (e.g., synthetic nodes) by using -1 indexes.
 	if startTok >= 0 && endTok >= startTok &&
 		startTok < len(p.toks) && endTok < len(p.toks) {
 		p.post = append(p.post, Span{
@@ -486,6 +495,21 @@ func (p *parser) emitSpanByTok(startTok, endTok int) {
 	}
 	p.lastSpanStartTok = startTok
 	p.lastSpanEndTok = endTok
+}
+
+// takeOnePreAnnotation consumes at most one PRE annotation at the current point.
+// Used in pattern/key contexts where we need to emit spans in proper post-order.
+func (p *parser) takeOnePreAnnotation() (preAnn, bool, error) {
+	if p.atEnd() || p.peek().Type != ANNOTATION || !p.annotationIsPreAt(p.i) {
+		return preAnn{}, false, nil
+	}
+	tok := p.peek()
+	p.i++
+	txt := ""
+	if s, ok := tok.Literal.(string); ok {
+		txt = s
+	}
+	return preAnn{txt: txt, tokIdx: p.i - 1}, true, nil
 }
 
 func (p *parser) program() (S, error) {
@@ -620,6 +644,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			var pairs []any
 			for {
 				p.skipNoops()
+				pairStartTok := p.i
 				k, req, err := p.keyRequired()
 				if err != nil {
 					return nil, err
@@ -637,7 +662,11 @@ func (p *parser) expr(minBP int) (S, error) {
 				if req {
 					tag = "pair!"
 				}
-				pairs = append(pairs, L(tag, k, v))
+				pr := L(tag, k, v)
+				// span for the ("pair"/"pair!") node: from key start to end of value
+				endTok := p.lastSpanEndTok
+				p.emitSpanByTok(pairStartTok, endTok)
+				pairs = append(pairs, pr)
 				p.skipNoops()
 
 				if !p.match(COMMA) {
@@ -724,8 +753,8 @@ func (p *parser) expr(minBP int) (S, error) {
 			default:
 				left = L("continue", L("null"))
 			}
-			// child "null" has no real span
-			p.emitSpanByTok(-1, -1) // ("null")
+			// child "null"
+			p.emitSpanByTok(-1, -1)
 			// parent span is just the keyword token
 			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
 			leftStartTok = tokIndexOfThis
@@ -762,7 +791,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			return nil, err
 		}
 		left = body
-		// No extra node; block span is emitted inside parseBlock/blockUntil.
+		// block span emitted inside parseBlock/blockUntil
 		leftStartTok = tokIndexOfThis
 
 	case FOR:
@@ -784,12 +813,12 @@ func (p *parser) expr(minBP int) (S, error) {
 		leftStartTok = tokIndexOfThis
 
 	case LET:
+		// Optional single PRE-annotation (disallowed stacking) is handled inside declPattern.
 		pat, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
 		left = pat
-		// (pattern nodes emit their own spans where applicable)
 		// If pattern is destructuring, ensure '=' appears after optional POST annotations.
 		base := unwrapAnnots(pat)
 		if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
@@ -839,14 +868,13 @@ func (p *parser) expr(minBP int) (S, error) {
 			if p.atEnd() && p.interactive {
 				return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected expression after annotation"}
 			}
+			// child ("str", txt)
+			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
 			x, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
-			// child: annotation text ("str", txt) — span is the annotation token itself
-			textNode := L("str", txt)
-			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-			left = L("annot", textNode, x)
+			left = L("annot", L("str", txt), x)
 			// parent span from annotation token through end of wrapped expr
 			p.emitSpanByTok(tokIndexOfThis, p.lastSpanEndTok)
 			leftStartTok = tokIndexOfThis
@@ -872,7 +900,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			continue
 
 		case CLROUND:
-			// openTok := p.i
+			openTok := p.i - 0 // record before consuming args
 			p.i++
 			var args []any
 			p.skipNoops()
@@ -895,6 +923,8 @@ func (p *parser) expr(minBP int) (S, error) {
 						break
 					}
 				}
+				pp := p.peek()
+				_ = pp
 				p.skipNoops()
 				if _, err := p.need(RROUND, "expected ')'"); err != nil {
 					return nil, err
@@ -902,6 +932,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 			left = L("call", append([]any{left}, args...)...)
 			p.emitSpanByTok(leftStartTok, p.i-1) // through ')'
+			_ = openTok
 			continue
 
 		case CLSQUARE:
@@ -922,7 +953,6 @@ func (p *parser) expr(minBP int) (S, error) {
 			continue
 
 		case PERIOD:
-			// dotTok := p.i
 			p.i++
 			if p.match(LROUND) || p.match(CLROUND) {
 				p.skipNoops()
@@ -1060,7 +1090,6 @@ func (p *parser) params() (S, error) {
 	if tok, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
 		return nil, err
 	} else {
-		// tok is the '(' token we just consumed; find its index as p.i-1
 		_ = tok
 		openTok = p.i - 1
 	}
@@ -1078,7 +1107,12 @@ func (p *parser) params() (S, error) {
 		if err != nil {
 			return nil, err
 		}
+		idIdx := p.i - 1
+		// child id node (parameter name)
+		_ = idTok
+		p.emitSpanByTok(idIdx, idIdx)
 		var t any = L("id", "Any")
+		endTokForPair := idIdx
 		p.skipNoops()
 		if p.match(COLON) {
 			if p.atEnd() && p.interactive {
@@ -1090,8 +1124,11 @@ func (p *parser) params() (S, error) {
 				return nil, err
 			}
 			t = e
+			endTokForPair = p.lastSpanEndTok
 		}
-		ps = append(ps, L("pair", L("id", tokString(idTok)), t))
+		pr := L("pair", L("id", tokString(idTok)), t)
+		p.emitSpanByTok(idIdx, endTokForPair) // span for parameter pair
+		ps = append(ps, pr)
 		p.skipNoops()
 
 		if !p.match(COMMA) {
@@ -1116,6 +1153,7 @@ func (p *parser) params() (S, error) {
 // (child nodes emit spans internally; the enclosing ("if", ...) span is emitted
 // by the caller in expr(), which knows the 'if' token index.)
 func (p *parser) ifExpr() (S, error) {
+	condStartTok := p.i
 	cond, err := p.expr(0)
 	if err != nil {
 		return nil, err
@@ -1127,8 +1165,13 @@ func (p *parser) ifExpr() (S, error) {
 	if err != nil {
 		return nil, err
 	}
-	arms := []any{L("pair", cond, thenBlk)}
+	arm := L("pair", cond, thenBlk)
+	// span for this arm: from cond start through end of then-block
+	p.emitSpanByTok(condStartTok, p.lastSpanEndTok)
+	arms := []any{arm}
+
 	for p.match(ELIF) {
+		condStartTok = p.i
 		c, err := p.expr(0)
 		if err != nil {
 			return nil, err
@@ -1140,8 +1183,11 @@ func (p *parser) ifExpr() (S, error) {
 		if err != nil {
 			return nil, err
 		}
-		arms = append(arms, L("pair", c, b))
+		arm := L("pair", c, b)
+		p.emitSpanByTok(condStartTok, p.lastSpanEndTok)
+		arms = append(arms, arm)
 	}
+
 	var elseTail []any
 	if p.match(ELSE) {
 		b, err := p.blockUntil(END)
@@ -1264,8 +1310,8 @@ func (p *parser) forTarget() (S, error) {
 
 	if e[0].(string) == "id" {
 		decl := L("decl", e[1].(string))
-		// No dedicated token to span just this decl here; leave empty.
-		p.emitSpanByTok(-1, -1)
+		// Give the decl the same span as the parsed id.
+		p.emitSpanByTok(p.lastSpanStartTok, p.lastSpanEndTok)
 		return decl, nil
 	}
 	return e, nil
@@ -1315,23 +1361,27 @@ func unwrapAnnots(n S) S {
 // ----- Declaration patterns (with optional PRE-annotation wrapper) -----
 
 func (p *parser) declPattern() (S, error) {
-	// Allow line-leading PRE annotations to wrap the next pattern;
-	// still disallow multiple consecutive PRE annotations at a single point.
-	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
+	// Allow a single PRE annotation (multiple consecutive PRE annotations at
+	// one point are not allowed for patterns).
+	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
 		return nil, err
-	} else if len(anns) > 0 {
+	} else if ok {
+		// child ("str", text) BEFORE parsing the wrapped pattern (to maintain post-order)
+		p.emitSpanByTok(ann.tokIdx, ann.tokIdx)
 		sub, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
-		return p.wrapWithPreAnnotations(anns, sub), nil
+		node := L("annot", L("str", ann.txt), sub)
+		p.emitSpanByTok(ann.tokIdx, p.lastSpanEndTok)
+		return node, nil
 	}
 
 	if p.match(ID) {
+		idTok := p.i - 1
 		decl := L("decl", tokString(p.prev()))
-		// No dedicated source span for pattern-only decl (could be captured from ID,
-		// but it's often clearer to leave patterns span-less unless part of an expr).
-		p.emitSpanByTok(-1, -1)
+		// span for the decl (use the id token)
+		p.emitSpanByTok(idTok, idTok)
 		return decl, nil
 	}
 	if p.match(LSQUARE, CLSQUARE) {
@@ -1380,6 +1430,7 @@ func (p *parser) arrayDeclPattern() (S, error) {
 		return nil, err
 	}
 	node := L("darr", parts...)
+	// Span from '[' to ']'
 	p.emitSpanByTok(openTok, p.i-1)
 	return node, nil
 }
@@ -1396,6 +1447,7 @@ func (p *parser) objectDeclPattern() (S, error) {
 	var pairs []any
 	for {
 		p.skipNoops()
+		pairStartTok := p.i
 		key, err := p.readKeyString()
 		if err != nil {
 			return nil, err
@@ -1409,7 +1461,10 @@ func (p *parser) objectDeclPattern() (S, error) {
 		if err != nil {
 			return nil, err
 		}
-		pairs = append(pairs, L("pair", key, pt))
+		pr := L("pair", key, pt)
+		endTok := p.lastSpanEndTok
+		p.emitSpanByTok(pairStartTok, endTok) // span for ("pair", key, pt)
+		pairs = append(pairs, pr)
 		p.skipNoops()
 
 		if !p.match(COMMA) {
@@ -1433,15 +1488,21 @@ func (p *parser) objectDeclPattern() (S, error) {
 // readKeyString parses a key for object patterns/maps, allowing stacked PRE-annotation
 // wrapping via recursion (each level allows at most one PRE, but recursion stacks).
 func (p *parser) readKeyString() (S, error) {
-	// Allow stacked PRE annotation(s) directly in front of the key.
-	if anns, err := p.consumePreAnnotationsOrError(); err != nil {
+	// Allow stacked PRE annotation(s) directly in front of the key by recursion:
+	// we consume one annotation, emit its ("str") child span, recurse to read the base key,
+	// then emit the parent ("annot", ...) span.
+	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
 		return nil, err
-	} else if len(anns) > 0 {
+	} else if ok {
+		// child ("str", text)
+		p.emitSpanByTok(ann.tokIdx, ann.tokIdx)
 		k, err := p.readKeyString()
 		if err != nil {
 			return nil, err
 		}
-		return p.wrapWithPreAnnotations(anns, k), nil
+		node := L("annot", L("str", ann.txt), k)
+		p.emitSpanByTok(ann.tokIdx, p.lastSpanEndTok)
+		return node, nil
 	}
 
 	if p.match(STRING) {
@@ -1489,39 +1550,4 @@ func (p *parser) keyRequired() (key S, required bool, err error) {
 	}
 	req := p.match(BANG)
 	return k, req, nil
-}
-
-// --- small helpers for annotations ---
-
-// consumePreAnnotationsOrError collects at most one PRE annotation at the current point.
-func (p *parser) consumePreAnnotationsOrError() ([]string, error) {
-	var texts []string
-	for !p.atEnd() && p.peek().Type == ANNOTATION && p.annotationIsPreAt(p.i) {
-		tok := p.peek()
-		if len(texts) > 0 {
-			return nil, &ParseError{
-				Line: tok.Line, Col: tok.Col,
-				Msg: "multiple consecutive pre-annotations are not allowed",
-			}
-		}
-		p.i++
-		txt := ""
-		if s, ok := tok.Literal.(string); ok {
-			txt = s
-		}
-		texts = append(texts, txt)
-	}
-	return texts, nil
-}
-
-// wrapWithPreAnnotations wraps node with the given texts as PRE annotations.
-// Spans for these wrappers are emitted by the callers that have access to the
-// corresponding annotation token positions (when used in expressions). In
-// pattern/key contexts we leave them span-less.
-func (p *parser) wrapWithPreAnnotations(texts []string, node S) S {
-	for i := len(texts) - 1; i >= 0; i-- {
-		node = L("annot", L("str", texts[i]), node)
-		// (no span emit here; caller may emit if it knows the token positions)
-	}
-	return node
 }

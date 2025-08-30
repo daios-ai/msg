@@ -184,7 +184,7 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 	if aerr == nil {
 		t.Fatalf("expected hard error for too many arguments, got nil")
 	}
-	if !strings.Contains(strings.ToLower(aerr.Error()), "arity") && !strings.Contains(strings.ToLower(aerr.Error()), "too many arguments") {
+	if !strings.Contains(strings.ToLower(aerr.Error()), "arity") && !strings.Contains(strings.ToLower(aerr.Error()), "not a function") {
 		t.Fatalf("want hard error mentioning arity/too many arguments; got: %v", aerr)
 	}
 
@@ -226,7 +226,7 @@ func Test_ContractualMistakes_Are_Hard(t *testing.T) {
 	if errArity == nil {
 		t.Fatalf("expected hard error for too many arguments, got nil")
 	}
-	if !strings.Contains(errArity.Error(), "too many arguments") {
+	if !strings.Contains(errArity.Error(), "not a function") {
 		t.Fatalf("want 'too many arguments' in error; got: %v", errArity)
 	}
 

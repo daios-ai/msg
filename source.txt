@@ -822,6 +822,7 @@ func (e *emitter) emitExpr(n S) {
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.emit(opPop, 0)
 
 		head := e.here()
 		e.withChild(0, func() { e.emitExpr(cond) })
@@ -867,12 +868,15 @@ func (e *emitter) emitExpr(n S) {
 		e.mark()          // mark the __to_iter call site
 		e.emit(opCall, 1) // __to_iter(iterExpr)
 		e.emit(opCall, 2) // assign_def(TypeDecl, iterator)
+		e.emit(opPop, 0)  // discard __assign_def return value
 
 		tmpName := fmt.Sprintf("$tmp_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+		e.emit(opPop, 0) // discard __assign_def return value
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.emit(opPop, 0) // discard __assign_def return value
 
 		head := e.here()
 
@@ -882,6 +886,7 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(Null))
 		e.emit(opCall, 1)
 		e.emit(opCall, 2)
+		e.emit(opPop, 0) // discard __assign_set return value
 
 		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
 		e.emit(opLoadGlobal, e.ks(tmpName))

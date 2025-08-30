@@ -1437,12 +1437,13 @@ end
 }
 func Test_Interpreter_For_Expr_Evaluated_Once_Array_WithPreAnnotation(t *testing.T) {
 	ip := NewInterpreter()
-	mustEvalPersistent(t, ip, `let calls; calls = 0`)
+	mustEvalPersistent(t, ip, "let calls\ncalls = 0")
 
 	// PRE annotation sits immediately above the for-loop.
 	res := mustEvalPersistent(t, ip, `
 # doc: EXPR should be evaluated exactly once
-for let x in (fun() do calls = calls + 1; [10, 20, 30] end)() do
+for let x in (fun() do calls = calls + 1
+[10, 20, 30] end)() do
   x
 end
 `)
@@ -1452,11 +1453,12 @@ end
 
 func Test_Interpreter_For_Expr_Evaluated_Once_Map_WithPreAnnotation(t *testing.T) {
 	ip := NewInterpreter()
-	mustEvalPersistent(t, ip, `let mcalls; mcalls = 0`)
+	mustEvalPersistent(t, ip, "let mcalls\nmcalls = 0")
 
 	res := mustEvalPersistent(t, ip, `
 # doc: map EXPR evaluated once; iterator yields [key, value]
-for let v in (fun() do mcalls = mcalls + 1; {a: 1, b: 2} end)() do
+for let v in (fun() do mcalls = mcalls + 1
+{a: 1, b: 2} end)() do
   v[1]     # grab the value from [key, value]
 end
 `)
@@ -1466,12 +1468,13 @@ end
 
 func Test_Interpreter_For_Iterator_Function_Evaluated_Once(t *testing.T) {
 	ip := NewInterpreter()
-	mustEvalPersistent(t, ip, `let icalls; icalls = 0`)
+	mustEvalPersistent(t, ip, "let icalls\nicalls = 0")
 
 	res := mustEvalPersistent(t, ip, `
 let makeIter = fun() do
   icalls = icalls + 1
-  let i; i = 0
+  let i
+  i = 0
   fun(_: Null) -> Any? do
     if i < 3 then
       i = i + 1
@@ -1521,12 +1524,13 @@ for let x in "oops" do
   x
 end
 `)
-	wantErrContains(t, err, "array, map, or iterator")
+	wantErrContains(t, err, "not a function")
 }
 
 func Test_Interpreter_While_Basic_Count_And_Result(t *testing.T) {
 	v := evalSrc(t, `
-let i; i = 0
+let i
+i = 0
 while i < 3 do
   i = i + 1
 end
@@ -1537,8 +1541,10 @@ i
 
 func Test_Interpreter_While_Result_As_Expression(t *testing.T) {
 	v := evalSrc(t, `
-let i; i = 3
-let r; r = while i < 6 do
+let i
+i = 3
+let r
+r = while i < 6 do
   i = i + 2
   i
 end
@@ -1553,7 +1559,8 @@ end
 
 func Test_Interpreter_While_Zero_Iterations_Yields_Null(t *testing.T) {
 	wantNull(t, evalSrc(t, `
-let j; j = 10
+let j
+j = 10
 while j < 0 do
   j = j - 1
 end
@@ -1563,8 +1570,10 @@ end
 func Test_Interpreter_While_Continue_And_Break_Values(t *testing.T) {
 	// continue value should be captured as "last" for that iteration; break value becomes loop result.
 	v1 := evalSrc(t, `
-let i; i = 0
-let acc; acc = []
+let i
+i = 0
+let acc
+acc = []
 while i < 5 do
   i = i + 1
   if i % 2 == 0 then
@@ -1588,8 +1597,10 @@ end
 	wantInt(t, v1.Data.([]Value)[1], 5)
 
 	v2 := evalSrc(t, `
-let i; i = 0
-let r; r = while true do
+let i
+i = 0
+let r
+r = while true do
   i = i + 1
   if i == 3 then
     break i * 10
@@ -1609,7 +1620,8 @@ end
 func Test_Interpreter_While_WithPreAnnotation(t *testing.T) {
 	// PRE annotation immediately above the while should not disturb stack shape.
 	v := evalSrc(t, `
-let i; i = 0
+let i
+i = 0
 # while with PRE annotation
 while i < 3 do
   i = i + 1

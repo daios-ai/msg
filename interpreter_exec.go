@@ -311,7 +311,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 	if sr != nil {
 		src = sr.Src
 	}
-	// Unknown → 1:1
 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
 		return 1, 1
 	}
@@ -327,8 +326,11 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 	if i < 0 {
 		return 1, 1
 	}
-	if span, ok := sr.Spans.Get(ch.Marks[i].Path); ok {
-		return offsetToLineCol(src, span.StartByte)
+	// NEW: walk backwards until a known path is found
+	for k := i; k >= 0; k-- {
+		if span, ok := sr.Spans.Get(ch.Marks[k].Path); ok {
+			return offsetToLineCol(src, span.StartByte)
+		}
 	}
 	return 1, 1
 }
@@ -743,20 +745,37 @@ func (e *emitter) emitExpr(n S) {
 
 	case "get":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.withChild(1, func() { e.mark() })
 		e.emit(opGetProp, e.ks(n[2].(S)[1].(string)))
+
 	case "idx":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		e.withChild(1, func() { e.mark() })
 		e.emit(opGetIdx, 0)
 
 	case "call":
+		// 1) Evaluate callee once; it stays on the stack for the first application.
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		for i := 2; i < len(n); i++ {
-			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
+
+		argc := len(n) - 2
+		if argc == 0 {
+			// Zero-arg call: keep a single call-site mark (status quo).
+			e.mark() // maps to the whole call node path
+			e.emit(opCall, 0)
+			return
 		}
-		// Mark the call site itself so CALL-sourced errors (e.g., Apply type checks) map here.
-		e.mark()
-		e.emit(opCall, uint32(len(n)-2))
+
+		// 2) Apply arguments one-by-one, marking each CALL at that argument’s path.
+		for i := 2; i < len(n); i++ {
+			argIdx := i - 1
+			e.withChild(argIdx, func() {
+				e.emitExpr(n[i].(S)) // push arg i
+				e.mark()             // << mark tied to *this argument’s* NodePath
+				e.emit(opCall, 1)    // apply exactly one argument
+			})
+		}
+		return
 
 	case "fun":
 		e.emitMakeFun(
@@ -883,6 +902,7 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
 		e.emit(opLoadGlobal, e.ks(iterName))
 		e.emit(opConst, e.k(Null))
+		e.withChild(1, func() { e.mark() })
 		e.emit(opCall, 1)
 		e.emit(opCall, 2)
 		e.emit(opPop, 0) // discard __assign_set return value
@@ -985,6 +1005,7 @@ func (e *emitter) emitExpr(n S) {
 func (e *emitter) emitBinaryOpAB(a, b S, op opcode) {
 	e.withChild(1, func() { e.emitExpr(a) })
 	e.withChild(2, func() { e.emitExpr(b) })
+	e.withChild(1, func() { e.mark() })
 	e.emit(op, 0)
 }
 func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {

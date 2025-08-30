@@ -1,1 +1,3 @@
-null
+
+
+assert(true, true, true)

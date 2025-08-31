@@ -200,3 +200,212 @@ func Test_Errors_And_LHS_ConditionLine(t *testing.T) {
 	mustContain(t, msg, "condition must be boolean")
 	mustContain(t, msg, "^")
 }
+
+func Test_Errors_MapProperty_UnknownKey_PropSite(t *testing.T) {
+	src := `let m = {a:1}
+m.nope`
+
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustRuntimeAtLine(t, msg, 2)
+	mustContain(t, msg, `   2 | m.nope`)
+	mustContain(t, msg, "unknown property")
+	mustContain(t, msg, `"nope"`)
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_MapIndex_UnknownKey_IndexSite(t *testing.T) {
+	src := "let m = {a:1}\n" + `m["nope"]`
+
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustRuntimeAtLine(t, msg, 2)
+	mustContain(t, msg, `   2 | m["nope"]`)
+	mustContain(t, msg, "unknown key")
+	mustContain(t, msg, `"nope"`)
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_For_IteratorAnnotatedNull_BlamedOnIterHeader(t *testing.T) {
+	src := `let it = fun(_: Null) -> Any? do
+  # BOOM
+  null
+end
+for x in
+  it
+do
+  1
+end`
+
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	// Error currently blames the 'for x in' header (line 5), not the iter expr line.
+	mustRuntimeAtLine(t, msg, 5)
+	mustContain(t, msg, "BOOM")
+	mustContain(t, msg, "   5 | for x in")
+	mustContain(t, msg, "   6 |   it")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_ArrayIndex_NegativeWrap_NoError(t *testing.T) {
+	src := `let a = [10, 20, 30]
+a[-1]`
+
+	ip := NewInterpreter()
+	v, err := ip.EvalSource(src)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v.Tag != VTInt {
+		t.Fatalf("expected VTInt, got %v", v.Tag)
+	}
+	if v.Data.(int64) != 30 {
+		t.Fatalf("expected 30 from negative index wrap, got %v", v.Data)
+	}
+}
+
+func Test_Errors_EmptyArrayIndex_CaretOnIndex(t *testing.T) {
+	src := `let a = []
+a[0]`
+
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	// Index expression is on line 2; caret should point there.
+	mustRuntimeAtLine(t, msg, 2)
+	mustContain(t, msg, "index on empty array")
+	mustContain(t, msg, "   2 | a[0]")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_ModZero_IntAndFloat_RHSLine(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+	}{
+		{"int_zero_rhs", "10 %\n 0"},
+		{"float_zero_rhs", "10 %\n 0.0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := NewInterpreter()
+			_, err := ip.EvalSource(tc.src)
+			if err == nil {
+				t.Fatalf("expected runtime error, got nil")
+			}
+			msg := err.Error()
+			mustRuntimeAtLine(t, msg, 2)
+			mustContain(t, msg, "modulo by zero")
+			mustContain(t, msg, "     | ")
+			mustContain(t, msg, "^")
+		})
+	}
+}
+
+func Test_Errors_And_BadRHS_CaretOnRHSLine(t *testing.T) {
+	// LHS true, RHS triggers a unary type error; blame should be on RHS line.
+	src := "true and\n not 1"
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustRuntimeAtLine(t, msg, 2)
+	mustContain(t, msg, "not expects boolean")
+	mustContain(t, msg, "   1 | true and")
+	mustContain(t, msg, "   2 |  not 1")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_Or_BadRHS_CaretOnRHSLine(t *testing.T) {
+	// LHS false, RHS triggers a unary type error; blame should be on RHS line.
+	src := "false or\n not 1"
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustRuntimeAtLine(t, msg, 2)
+	mustContain(t, msg, "not expects boolean")
+	mustContain(t, msg, "   1 | false or")
+	mustContain(t, msg, "   2 |  not 1")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_Assign_PropertyOnNonMap_LHSLine(t *testing.T) {
+	// LHS is not a map/module; assignment should blame the LHS site.
+	src := `1.x = 2`
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustRuntimeAtLine(t, msg, 1)
+	mustContain(t, msg, "undefined variable")
+	mustContain(t, msg, "   1 | 1.x = 2")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_ComputedIndex_OnNonIndexable_BlamedOnIndexExprLine(t *testing.T) {
+	// obj.(1) when obj is not array/map; caret should point at the computed index expr site.
+	src := `let x = 1
+x.(1)`
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustRuntimeAtLine(t, msg, 2)
+	mustContain(t, msg, "index requires array[int] or map[string]")
+	mustContain(t, msg, "   2 | x.(1)")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_Curried_TooManyArgs_BlamedOnExtraArg(t *testing.T) {
+	src := `let f = fun(x: Int) -> Int do x end
+f(1,
+  2)`
+	ip := NewInterpreter()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	// Extra argument '2' is on line 3.
+	mustRuntimeAtLine(t, msg, 3)
+	mustContain(t, msg, "not a function")
+	mustContain(t, msg, "   2 | f(1,")
+	mustContain(t, msg, "   3 |   2)")
+	mustContain(t, msg, "^")
+}

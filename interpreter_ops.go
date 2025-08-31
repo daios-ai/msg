@@ -324,7 +324,7 @@ func (o *opsImpl) initCore() {
 				if len(f.Params) == 1 && ip.isType(Null, f.ParamTypes[0], f.Env) {
 					return x
 				}
-				return annotNull("for expects array, map, or iterator function (Null -> Any?)")
+				fail("for expects array, map, or iterator function (Null -> Any?)")
 			}
 
 			// Helpers
@@ -341,13 +341,18 @@ func (o *opsImpl) initCore() {
 					},
 					S{"block", S{"null"}},
 				}
+				var sr *SourceRef
+				if ip.currentSrc != nil {
+					cpy := *ip.currentSrc // shallow copy; Spans pointer intentionally shared
+					sr = &cpy
+				}
 				return FunVal(&Fun{
 					Params:     []string{"_"},
 					ParamTypes: []S{S{"id", "Null"}},
 					ReturnType: S{"unop", "?", S{"id", "Any"}},
 					Body:       body,
 					Env:        env,
-					Src:        ip.currentSrc,
+					Src:        sr,
 				})
 			}
 			inc := func() S {
@@ -398,7 +403,8 @@ func (o *opsImpl) initCore() {
 				return newIter(envInit, S{"id", "$keys"}, then)
 			}
 
-			return annotNull("for expects array, map, or iterator function (Null -> Any?)")
+			fail("for expects array, map, or iterator function (Null -> Any?)")
+			return annotNull("__for_iter: unreachable")
 		})
 }
 
@@ -603,12 +609,22 @@ func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 	if iter.Tag != VTFun {
 		toIter, err := ip.Core.Get("__to_iter")
 		if err != nil {
-			fail("for expects array, map, or iterator function (Null -> Any)")
+			fail("for expects array, map, or iterator function (Null -> Any?)")
 		}
 		iter = ip.applyArgsScoped(toIter, []Value{iter}, scope)
+
+		// Safety: __to_iter now fails itself for bad inputs; if it ever
+		// returns non-fun here, keep the user-facing invariant.
+		if iter.Tag != VTFun {
+			fail("for expects array, map, or iterator function (Null -> Any?)")
+		}
 	}
 
-	f := iter.Data.(*Fun)
+	// At this point, iter must be a function of shape (Null) -> Any?
+	f, ok := iter.Data.(*Fun)
+	if !ok {
+		fail("for expects array, map, or iterator function (Null -> Any?)")
+	}
 	if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
 		name := "_"
 		if len(f.Params) > 0 {

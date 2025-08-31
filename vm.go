@@ -257,7 +257,7 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 		case opMod:
 			// guard zero (match division error text)
 			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
-				res := m.fail("division by zero")
+				res := m.fail("modulo by zero")
 				return Null, &res
 			}
 			if bothInt {

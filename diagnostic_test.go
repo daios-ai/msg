@@ -252,3 +252,240 @@ func Test_E2E_InnerCaret_UsesNestedFunctionSource(t *testing.T) {
 		t.Fatalf("snippet appears to be call-site instead of inner nested function:\n%s", err)
 	}
 }
+
+// ----------------- helpers to walk S-expression AST -----------------
+
+// getChildren returns child nodes as (childIndex, childNode).
+func getChildren(n S) [][2]any {
+	out := make([][2]any, 0, max(0, len(n)-1))
+	for i := 1; i < len(n); i++ {
+		if child, ok := n[i].(S); ok {
+			out = append(out, [2]any{i - 1, child}) // child index is i-1 (see NodePath doc)
+		}
+	}
+	return out
+}
+
+func findFirstPath(root S, pred func(S) bool) (NodePath, bool) {
+	var dfs func(n S, path NodePath) (NodePath, bool)
+	dfs = func(n S, path NodePath) (NodePath, bool) {
+		if len(n) > 0 {
+			if tag, _ := n[0].(string); pred != nil && tag != "" && pred(n) {
+				return append(NodePath(nil), path...), true
+			}
+		}
+		for _, ch := range getChildren(n) {
+			idx := ch[0].(int)
+			child := ch[1].(S)
+			if p, ok := dfs(child, append(append(NodePath(nil), path...), idx)); ok {
+				return p, true
+			}
+		}
+		return nil, false
+	}
+	return dfs(root, nil)
+}
+
+func subtreeHasBinopDiv(n S) bool {
+	found := false
+	var dfs func(S)
+	dfs = func(x S) {
+		if found || len(x) == 0 {
+			return
+		}
+		if x[0].(string) == "binop" && len(x) >= 2 && x[1].(string) == "/" {
+			found = true
+			return
+		}
+		for _, ch := range getChildren(x) {
+			dfs(ch[1].(S))
+			if found {
+				return
+			}
+		}
+	}
+	dfs(n)
+	return found
+}
+
+func findBinopDivPath(root S) (NodePath, bool) {
+	return findFirstPath(root, func(n S) bool {
+		return len(n) > 1 && n[0].(string) == "binop" && n[1].(string) == "/"
+	})
+}
+
+// ----------------- diagnostics -----------------
+
+// 1) Spans: do we have entries for inner fun, its body, and "/" under it?
+func Test_Spans_For_InnerFun_And_Binop(t *testing.T) {
+	src := "let f = fun() do\n  let g = fun() do 1/0 end\n  g()\nend"
+
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		t.Fatalf("ParseSExprWithSpans error: %v", err)
+	}
+
+	// Find the inner ("fun", ...) whose subtree contains the "/" binop
+	funPath, ok := findFirstPath(ast, func(n S) bool {
+		if len(n) == 0 || n[0].(string) != "fun" {
+			return false
+		}
+		// Child 2 (NodePath index) is the body by design ("fun", params, ret, body)
+		if len(n) < 4 {
+			return false
+		}
+		body := n[3].(S)
+		return subtreeHasBinopDiv(body)
+	})
+	if !ok {
+		t.Fatalf("could not locate inner fun path with '/' in body")
+	}
+
+	// Its body child is funPath + [2]
+	bodyPath := append(append(NodePath(nil), funPath...), 2)
+
+	// Binop path under the inner fun
+	binopPath, ok := findBinopDivPath(ast)
+	if !ok {
+		t.Fatalf("could not locate '/' binop path")
+	}
+
+	// Assert spans exist and substrings look right
+	if sp, ok := spans.Get(funPath); !ok {
+		t.Fatalf("no span for inner fun path %v", funPath)
+	} else {
+		frag := src[sp.StartByte:sp.EndByte]
+		if !strings.Contains(frag, "fun()") {
+			t.Fatalf("funPath span does not include 'fun()': %q", frag)
+		}
+	}
+
+	if sp, ok := spans.Get(bodyPath); !ok {
+		t.Fatalf("no span for inner fun BODY path %v (off-by-one child?)", bodyPath)
+	} else {
+		frag := src[sp.StartByte:sp.EndByte]
+		if !strings.Contains(frag, "1/0") {
+			t.Fatalf("bodyPath span does not include '1/0': %q", frag)
+		}
+	}
+
+	if sp, ok := spans.Get(binopPath); !ok {
+		t.Fatalf("no span for '/' binop path %v", binopPath)
+	} else {
+		frag := src[sp.StartByte:sp.EndByte]
+		if !strings.Contains(frag, "1/0") && !strings.Contains(frag, "/ 0") {
+			t.Fatalf("binop span unexpected: %q", frag)
+		}
+	}
+}
+
+// 2) Runtime-built inner function g: does Src.PathBase equal the BODY path?
+func Test_InnerFunc_PathBase_Equals_BodyPath(t *testing.T) {
+	// ret() returns g (the inner function) without calling it.
+	def := "let ret = fun() do\n  let g = fun() do 1/0 end\n  g\nend"
+
+	ip := NewInterpreter()
+	if _, err := ip.EvalPersistentSource(def); err != nil {
+		t.Fatalf("def error: %v", err)
+	}
+
+	// Parse same src to compute expected fun/body paths
+	ast, spans, err := ParseSExprWithSpans(def)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	funPath, ok := findFirstPath(ast, func(n S) bool {
+		if len(n) == 0 || n[0].(string) != "fun" {
+			return false
+		}
+		// We want the INNER fun (g). Look for the one whose body has "/".
+		if len(n) < 4 {
+			return false
+		}
+		return subtreeHasBinopDiv(n[3].(S))
+	})
+	if !ok {
+		t.Fatalf("no inner fun in AST")
+	}
+	bodyPath := append(append(NodePath(nil), funPath...), 2)
+
+	// Sanity: spans has bodyPath
+	if _, ok := spans.Get(bodyPath); !ok {
+		t.Fatalf("spans missing inner body path %v", bodyPath)
+	}
+
+	// Build inner g by calling ret()
+	val, err := ip.EvalPersistentSource("ret()")
+	if err != nil {
+		t.Fatalf("calling ret() failed: %v", err)
+	}
+	if val.Tag != VTFun {
+		t.Fatalf("ret() did not return a function; got %v", val.Tag)
+	}
+	g := val.Data.(*Fun)
+
+	if g.Src == nil {
+		t.Fatalf("g.Src nil")
+	}
+	if len(g.Src.PathBase) == 0 {
+		t.Fatalf("g.Src.PathBase empty (base path not attached by __make_fun?)")
+	}
+
+	// Compare exactly to expected body path (not the fun node path)
+	if strings.TrimSpace(g.Src.Src) != strings.TrimSpace(def) {
+		t.Fatalf("g.Src.Src mismatch; expected it to be the defining source text")
+	}
+	if len(g.Src.PathBase) != len(bodyPath) {
+		t.Fatalf("g.Src.PathBase len=%d != bodyPath len=%d; got %v want %v",
+			len(g.Src.PathBase), len(bodyPath), g.Src.PathBase, bodyPath)
+	}
+	for i := range bodyPath {
+		if g.Src.PathBase[i] != bodyPath[i] {
+			t.Fatalf("g.Src.PathBase differs at index %d: got %v want %v",
+				i, g.Src.PathBase, bodyPath)
+		}
+	}
+}
+
+// 3) JIT marks under g: does the VM map PC to the binop span using g.Src?
+func Test_InnerFunc_VM_PC_Maps_To_Binop_In_Body(t *testing.T) {
+	def := "let ret = fun() do\n  let g = fun() do 1/0 end\n  g\nend"
+
+	ip := NewInterpreter()
+	if _, err := ip.EvalPersistentSource(def); err != nil {
+		t.Fatalf("def error: %v", err)
+	}
+	v, err := ip.EvalPersistentSource("ret()")
+	if err != nil {
+		t.Fatalf("ret() error: %v", err)
+	}
+	if v.Tag != VTFun {
+		t.Fatalf("ret() did not return a function")
+	}
+	g := v.Data.(*Fun)
+
+	// Ensure chunk & spans are set
+	ip.ensureChunkWithSource(g, g.Src)
+	if g.Src == nil || g.Src.Spans == nil {
+		t.Fatalf("g.Src or g.Src.Spans nil")
+	}
+	if len(g.Chunk.Marks) == 0 {
+		t.Fatalf("g.Chunk.Marks empty")
+	}
+
+	// Force executing g to produce the VM failure and get a PC.
+	res := ip.runChunk(g.Chunk, g.Env, 0)
+	if res.status != vmRuntimeError {
+		t.Fatalf("expected vmRuntimeError, got %v", res.status)
+	}
+
+	line, col := ip.sourcePosFromChunk(g.Chunk, g.Src, res.pc)
+
+	// Compute expected pos of "1/0" in def
+	start := strings.Index(def, "1/0")
+	expL, expC := offsetToLineCol(def, start)
+	if line != expL || col < expC {
+		t.Fatalf("inner VM PC map mismatch: got %d:%d, want %d:>=%d", line, col, expL, expC)
+	}
+}

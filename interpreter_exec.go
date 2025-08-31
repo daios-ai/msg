@@ -137,8 +137,6 @@ func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
 	return f.Chunk
 }
 
-func (ip *Interpreter) ensureChunk(f *Fun) { ip.ensureChunkWithSource(f, f.Src) }
-
 func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
 	// Native functions and oracles are not JIT-compiled here.
 	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
@@ -808,15 +806,15 @@ func (e *emitter) emitExpr(n S) {
 		return
 
 	case "fun":
-		// absolute path to the body child of this ("fun", .., .., body)
-		absBody := append(append(NodePath(nil), e.path...), 2)
+		// absolute path to the body child (index 2) of this ("fun", .., .., body)
+		absBase := append(append(NodePath(nil), e.path...), 2)
 		e.emitMakeFun(
 			n[1].(S),  // params
 			n[2].(S),  // ret (may be empty)
 			n[3].(S),  // body carrier (type AST)
 			false,     // isOracle
 			S{"null"}, // examples
-			absBody,
+			absBase,
 		)
 	case "oracle":
 		e.withChild(2, func() { // child #2 is sourceExpr

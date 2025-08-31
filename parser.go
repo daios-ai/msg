@@ -59,8 +59,9 @@
 //		("map",   ("pair!", keyStrExpr, value)*)      // required-field (key! : value)
 //		("enum",  item1, item2, ...)                  // from Enum[ ... ]
 //
-//		("fun",    paramsArray, retTypeExprOrAny, bodyBlock)
-//		("oracle", paramsArray, outTypeExprOrAny, sourceExpr)  // optional 'from' expression
+//		("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
+//		("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)  // optional 'from' expression
+//		("module",  nameExpr, bodyBlock)             // module NAME do ... end
 //
 //		("if", ("pair", cond1, thenBlk1), ..., elseBlk?)       // if/elif/else
 //		("while", cond, bodyBlock)
@@ -159,6 +160,7 @@
 //	                | unary ("-" | "not") expr
 //	                | "fun"    params ["->" type] block
 //	                | "oracle" params ["->" type] ["from" expr] block
+//	                | "module" expr "do" block "end"
 //	                | "if" cond "then" block {"elif" cond "then" block} ["else" block] "end"
 //	                | "do" block "end"
 //	                | "for" forTarget "in" expr block
@@ -739,6 +741,23 @@ func (p *parser) expr(minBP int) (S, error) {
 			src = ex
 		}
 		left = L("oracle", params, out, src)
+		p.emitSpanByTok(tokIndexOfThis, p.i-1)
+		leftStartTok = tokIndexOfThis
+
+	case MODULE:
+		// module NAME do ... end
+		if p.atEnd() && p.interactive {
+			return nil, &IncompleteError{Line: t.Line, Col: t.Col, Msg: "expected module name expression"}
+		}
+		name, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		body, err := p.parseBlock(true) // requires 'do ... end'
+		if err != nil {
+			return nil, err
+		}
+		left = L("module", name, body)
 		p.emitSpanByTok(tokIndexOfThis, p.i-1)
 		leftStartTok = tokIndexOfThis
 
@@ -1536,7 +1555,7 @@ func isWordLike(tt TokenType) bool {
 	switch tt {
 	case ID, TYPE, ENUM, BOOLEAN, NULL,
 		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
-		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, FOR, IN, FROM,
+		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, MODULE, FOR, IN, FROM,
 		TYPECONS:
 		return true
 	}

@@ -110,3 +110,58 @@ func Test_Spans_KeyPreAnnotation(t *testing.T) {
 	//   value "1"
 	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "1")
 }
+func Test_Spans_Module_Whole_And_Parts(t *testing.T) {
+	src := `module "M" do let x = 1 end`
+	_, idx := mustParseWithSpansMS(t, src)
+
+	// The module node (root child) covers the whole construct
+	assertSpanTextMS(t, idx, NodePath{0}, src, `module "M" do let x = 1 end`)
+
+	// Name expression is the string literal (including quotes)
+	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `"M"`)
+
+	// Body block span covers only the contents between 'do' and 'end'
+	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `let x = 1`)
+}
+
+func Test_Spans_Module_NameExpression_And_EmptyBody(t *testing.T) {
+	// Note: grouping parens belong to the *parent* construct span, not the child.
+	// So the name expression span excludes '(' and ')', mirroring computed props.
+	src := `module ("M" + "1") do end`
+	_, idx := mustParseWithSpansMS(t, src)
+
+	// Name expression (without parentheses)
+	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `"M" + "1"`)
+
+	// Empty body block has an empty span
+	assertSpanTextMS(t, idx, NodePath{0, 1}, src, ``)
+
+	// Whole module span is the full construct (including parens around the name)
+	assertSpanTextMS(t, idx, NodePath{0}, src, `module ("M" + "1") do end`)
+}
+
+func Test_Spans_PropertyAfterDot_ModuleKeyword(t *testing.T) {
+	src := `obj.module`
+	_, idx := mustParseWithSpansMS(t, src)
+
+	// ("get" obj "module") spans the entire chain
+	assertSpanTextMS(t, idx, NodePath{0}, src, `obj.module`)
+
+	//   object id
+	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `obj`)
+	//   property name ("str") — taken from the ID token after '.'
+	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `module`)
+}
+
+func Test_Spans_ComputedPropertyAfterDot(t *testing.T) {
+	src := `obj.("x" + "y")`
+	_, idx := mustParseWithSpansMS(t, src)
+
+	// ("idx" obj ("binop" ...)) covers from 'obj' through the closing ')'
+	assertSpanTextMS(t, idx, NodePath{0}, src, `obj.("x" + "y")`)
+
+	//   LHS object id
+	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `obj`)
+	//   inner expression (without the parentheses)
+	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `"x" + "y"`)
+}

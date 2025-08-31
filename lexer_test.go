@@ -617,3 +617,66 @@ func Test_Lexer_Annotation_StripAtMostOneSpace_NotTab(t *testing.T) {
 		t.Fatalf("annotation text mismatch:\nwant: %q\ngot:  %q", want, text)
 	}
 }
+
+func Test_Lexer_Module_Keyword_Simple(t *testing.T) {
+	src := `module name do end`
+	want := []TokenType{
+		MODULE, ID, DO, END,
+	}
+	wantTypes(t, src, want)
+}
+
+func Test_Lexer_Module_NameAsString(t *testing.T) {
+	src := `module "MyLib" do end`
+	ts := wantTypes(t, src, []TokenType{
+		MODULE, STRING, DO, END,
+	})
+	// Sanity-check decoded literal of the STRING
+	if lit, ok := ts[1].Literal.(string); !ok || lit != "MyLib" {
+		t.Fatalf("expected STRING literal \"MyLib\", got %#v", ts[1].Literal)
+	}
+}
+
+func Test_Lexer_Module_AfterDot_ForcesID(t *testing.T) {
+	src := `obj.module`
+	ts := wantTypes(t, src, []TokenType{
+		ID, PERIOD, ID,
+	})
+	if ts[2].Type != ID || ts[2].Literal != "module" {
+		t.Fatalf("property after '.' should be ID with Literal \"module\"; got %#v", ts[2])
+	}
+}
+
+func Test_Lexer_Module_AfterDot_Quoted_ForcesID(t *testing.T) {
+	src := `obj."module"`
+	ts := wantTypes(t, src, []TokenType{
+		ID, PERIOD, ID,
+	})
+	if ts[2].Type != ID {
+		t.Fatalf("expected ID token for quoted property; got %v", ts[2].Type)
+	}
+	// Literal should be the decoded string without quotes; Lexeme retains quotes.
+	if lit, ok := ts[2].Literal.(string); !ok || lit != "module" {
+		t.Fatalf("expected forced ID literal \"module\"; got %#v", ts[2].Literal)
+	}
+	if ts[2].Lexeme != `"module"` {
+		t.Fatalf("expected Lexeme to retain quotes, got %q", ts[2].Lexeme)
+	}
+}
+
+func Test_Lexer_Module_NotPrefixOfLongerIdent(t *testing.T) {
+	src := `modulex do end`
+	want := []TokenType{
+		ID, DO, END,
+	}
+	wantTypes(t, src, want)
+}
+
+func Test_Lexer_Module_CapitalizedIsNotKeyword(t *testing.T) {
+	src := `Module do end`
+	// 'Module' (capital M) is not a keyword; should lex as ID.
+	want := []TokenType{
+		ID, DO, END,
+	}
+	wantTypes(t, src, want)
+}

@@ -141,20 +141,13 @@ import (
 //	AND, OR, NOT,
 //	LET, DO, END, RETURN, BREAK, CONTINUE,
 //	IF, THEN, ELIF, ELSE,
-//	FUNCTION, ORACLE,
+//	FUNCTION, ORACLE, MODULE,
 //	FOR, IN, FROM, WHILE,
 //	TYPECONS, TYPE, ENUM
 //
 // Annotation:
 //
 //	ANNOTATION — emitted for multi-line blocks starting with '#'.
-//
-// NOOP tokens:
-//
-// The lexer may surface blank-line runs as NOOP. Inside delimiters they’re ignored
-// by the parser; elsewhere they become the AST node ("noop"). Runtime handling is
-// in interpreter.go.
-
 type TokenType int
 
 const (
@@ -216,6 +209,7 @@ const (
 	ELSE
 	FUNCTION
 	ORACLE
+	MODULE
 	FOR
 	IN
 	FROM
@@ -403,6 +397,7 @@ var keywords = map[string]TokenType{
 	"else":     ELSE,
 	"fun":      FUNCTION,
 	"oracle":   ORACLE,
+	"module":   MODULE,
 	"for":      FOR,
 	"in":       IN,
 	"from":     FROM,
@@ -799,7 +794,6 @@ func (l *Lexer) scanAnnotation() (string, error) {
 	}
 
 	// Trim at most one ASCII space (NOT tab) after the first '#'.
-	// This preserves tabs and multi-space indentation in docstrings.
 	if b, ok := l.peek(); ok && b == ' ' {
 		l.advance()
 	}
@@ -825,7 +819,7 @@ func (l *Lexer) scanAnnotation() (string, error) {
 		if len(s) == 0 {
 			return "", errors.New("incomplete annotation")
 		}
-		for len(s) > 0 && s[len(s)-1] == '\n' { // keep existing trailing-trim behavior
+		for len(s) > 0 && s[len(s)-1] == '\n' {
 			s = s[:len(s)-1]
 		}
 		return s, nil
@@ -890,7 +884,6 @@ func (l *Lexer) scanAnnotation() (string, error) {
 	if len(s) == 0 {
 		return "", errors.New("incomplete annotation")
 	}
-	// keep trimming of trailing '\n' in the emitted annotation text
 	for len(s) > 0 && s[len(s)-1] == '\n' {
 		s = s[:len(s)-1]
 	}
@@ -911,8 +904,6 @@ func (l *Lexer) handleSingleHash() (bool, string, error) {
 
 // scanNoopIfPresent emits a NOOP token if the source at the current position
 // matches: '\n' ( hws* '\n' )+  where hws ∈ {' ', '\r', '\t'}.
-// On success, it advances the cursor and returns (token, true).
-// On failure, it restores the cursor and returns (Token{}, false).
 func (l *Lexer) scanNoopIfPresent() (Token, bool) {
 	b, ok := l.peek()
 	if !ok || b != '\n' {

@@ -1670,3 +1670,134 @@ func Test_SkipNoop_Inside_Params(t *testing.T) {
 		t.Fatalf("second param not y: %s", dump(p1))
 	}
 }
+
+func Test_Parser_Module_SimpleStringName_EmptyBody(t *testing.T) {
+	root := mustParse(t, `module "M" do end`)
+	wantTag(t, root, "block")
+	if len(root) != 2 {
+		t.Fatalf("want 1 child in root block, got %d\n%s", len(root)-1, dump(root))
+	}
+	mod := kid(root, 0)
+	wantTag(t, mod, "module")
+	name := kid(mod, 0)
+	wantTag(t, name, "str")
+	if name[1].(string) != "M" {
+		t.Fatalf("module name mismatch, got %v", name[1])
+	}
+	body := kid(mod, 1)
+	wantTag(t, body, "block")
+	if len(body) != 1 { // empty body → only the "block" tag
+		t.Fatalf("expected empty module body, got %s", dump(body))
+	}
+}
+
+func Test_Parser_Module_NameIsExpression(t *testing.T) {
+	root := mustParse(t, `module ("M" + "1") do end`)
+	mod := kid(root, 0)
+	wantTag(t, mod, "module")
+	name := kid(mod, 0)
+	wantTag(t, name, "binop")
+	if name[1].(string) != "+" {
+		t.Fatalf("want '+' in module name expression, got %v", name[1])
+	}
+}
+
+func Test_Parser_Module_WithBody_Content(t *testing.T) {
+	src := `
+module "Core" do
+  let x = 1
+  return x
+end`
+	root := mustParse(t, src)
+	mod := kid(root, 0)
+	wantTag(t, mod, "module")
+
+	// name
+	name := kid(mod, 0)
+	wantTag(t, name, "str")
+	if name[1].(string) != "Core" {
+		t.Fatalf("module name mismatch: %v", name[1])
+	}
+
+	// body
+	body := kid(mod, 1)
+	wantTag(t, body, "block")
+	children := body[1:]
+	if len(children) != 2 {
+		t.Fatalf("want 2 items in body, got %d\n%s", len(children), dump(body))
+	}
+
+	assign := children[0].(S)
+	wantTag(t, assign, "assign")
+	tgt := kid(assign, 0)
+	wantTag(t, tgt, "decl")
+	if tgt[1].(string) != "x" {
+		t.Fatalf("decl target mismatch: %v", tgt[1])
+	}
+	val := kid(assign, 1)
+	wantTag(t, val, "int")
+	if val[1].(int64) != 1 {
+		t.Fatalf("assign value mismatch: %v", val[1])
+	}
+
+	ret := children[1].(S)
+	wantTag(t, ret, "return")
+	retExpr := kid(ret, 0)
+	wantTag(t, retExpr, "id")
+	if retExpr[1].(string) != "x" {
+		t.Fatalf("return id mismatch: %v", retExpr[1])
+	}
+}
+
+func Test_Parser_Module_Interactive_Incomplete_NoName(t *testing.T) {
+	mustIncomplete(t, `module`)
+	mustIncomplete(t, `module `)
+}
+
+func Test_Parser_Module_Interactive_Incomplete_NoDo(t *testing.T) {
+	mustIncomplete(t, `module M`)
+}
+
+func Test_Parser_Module_Interactive_Incomplete_NoEnd(t *testing.T) {
+	mustIncomplete(t, "module M do\n  let x = 1")
+}
+
+func Test_Parser_MapKey_AllowsModuleKeyword(t *testing.T) {
+	root := mustParse(t, `{ module: 1 }`)
+	obj := kid(root, 0)
+	wantTag(t, obj, "map")
+	items := obj[1:]
+	if len(items) != 1 {
+		t.Fatalf("want 1 pair in map, got %d\n%s", len(items), dump(obj))
+	}
+	pair := items[0].(S)
+	if head(pair) != "pair" && head(pair) != "pair!" {
+		t.Fatalf("want 'pair' node, got %q\n%s", head(pair), dump(pair))
+	}
+	key := kid(pair, 0)
+	wantTag(t, key, "str")
+	if key[1].(string) != "module" {
+		t.Fatalf("key literal mismatch: %v", key[1])
+	}
+	val := kid(pair, 1)
+	wantTag(t, val, "int")
+	if val[1].(int64) != 1 {
+		t.Fatalf("value mismatch: %v", val[1])
+	}
+}
+
+func Test_Parser_PropertyAfterDot_ModuleKeywordForcedID(t *testing.T) {
+	root := mustParse(t, `obj.module`)
+	get := kid(root, 0)
+	wantTag(t, get, "get")
+	obj := kid(get, 0)
+	wantTag(t, obj, "id")
+	if obj[1].(string) != "obj" {
+		t.Fatalf("object mismatch: %v", obj[1])
+	}
+	prop := kid(get, 1)
+	wantTag(t, prop, "str")
+	if prop[1].(string) != "module" {
+		t.Fatalf("property name mismatch: %v", prop[1])
+	}
+}

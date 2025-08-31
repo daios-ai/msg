@@ -406,6 +406,17 @@ func (o *opsImpl) initCore() {
 			fail("for expects array, map, or iterator function (Null -> Any?)")
 			return annotNull("__for_iter: unreachable")
 		})
+
+	ip.RegisterNative(
+		"__make_module",
+		[]ParamSpec{
+			{Name: "name", Type: S{"id", "Str"}}, // keep lax; runtime checks enforce string
+			{Name: "body", Type: S{"id", "Any"}}, // Type-carried AST
+			{Name: "base", Type: S{"id", "Any"}}, // [Int] path
+		},
+		S{"id", "Any"}, // could be a dedicated Module type later; Any is simplest now
+		nativeMakeModule,
+	)
 }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -527,3 +527,75 @@ func joinCyclePath(stack []string, again string) string {
 	}
 	return strings.Join(out, " -> ")
 }
+
+func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
+	nameV := ctx.MustArg("name")
+	bodyV := ctx.MustArg("body")
+	baseV := ctx.MustArg("base")
+
+	if nameV.Tag != VTStr {
+		fail("module name must be a string")
+	}
+	if bodyV.Tag != VTType {
+		fail("internal error: module body must be a Type")
+	}
+
+	tv := bodyV.Data.(*TypeValue)
+	bodyAst := tv.Ast
+
+	// decode absolute base path from [Int]
+	var base NodePath
+	if baseV.Tag == VTArray {
+		xs := baseV.Data.([]Value)
+		base = make(NodePath, 0, len(xs))
+		for _, v := range xs {
+			if v.Tag != VTInt {
+				fail("internal error: module base path must be [Int]")
+			}
+			base = append(base, int(v.Data.(int64)))
+		}
+	}
+
+	// fresh env
+	modEnv := NewEnv(ip.Core)
+
+	// SourceRef rooted at the module BODY path (absolute)
+	var sr *SourceRef
+	if ip.currentSrc != nil {
+		sr = &SourceRef{
+			Name:     ip.currentSrc.Name,
+			Src:      ip.currentSrc.Src,
+			Spans:    ip.currentSrc.Spans,
+			PathBase: base, // IMPORTANT: use base as-is (no extra prefix)
+		}
+	}
+
+	// JIT + run (like runTopWithSource, but we handle errors to avoid re-wrap)
+	ch := ip.jitTop(bodyAst, sr)
+
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
+	res := ip.runChunk(ch, modEnv, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		// ok
+	case vmRuntimeError:
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		msg := res.value.Annot
+		if msg == "" {
+			msg = "runtime error"
+		}
+		// rethrow as structured inner-source error (single caret at true site)
+		panicRt(msg, ch.Src, line, col)
+	default:
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		panicRt("unknown VM status", ch.Src, line, col)
+	}
+
+	// snapshot exports
+	mo := buildModuleMap(modEnv)
+	m := &Module{Name: nameV.Data.(string), Map: mo, Env: modEnv}
+	return Value{Tag: VTModule, Data: m}
+}

@@ -988,6 +988,19 @@ func (e *emitter) emitExpr(n S) {
 	case "type":
 		e.emit(opConst, e.k(TypeVal(n[1].(S))))
 
+	case "module":
+		// Lower to: __make_module(nameValue, Type(bodyAst), basePathArray)
+		e.emit(opLoadGlobal, e.ks("__make_module"))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.emit(opConst, e.k(TypeVal(n[2].(S))))
+		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, **body**)
+		for _, idx := range absBase {
+			e.emit(opConst, e.k(Int(int64(idx))))
+		}
+		e.emit(opMakeArr, uint32(len(absBase)))
+		e.mark()
+		e.emit(opCall, 3)
+
 	case "annot":
 		text := n[1].(S)[1].(string)
 		subj := n[2].(S)

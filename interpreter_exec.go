@@ -616,14 +616,14 @@ func (e *emitter) emitExpr(n S) {
 		}
 
 	case "break":
-		e.emitExpr(n[1].(S))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		at := e.here()
 		e.emit(opJump, 0)
 		e.addBreakJump(at)
 		return
 
 	case "continue":
-		e.emitExpr(n[1].(S))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		at := e.here()
 		e.emit(opJump, 0)
 		e.addContJump(at)
@@ -636,6 +636,7 @@ func (e *emitter) emitExpr(n S) {
 			return
 		}
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		e.mark()
 		switch op {
 		case "not":
 			e.emit(opNot, 0)
@@ -651,6 +652,7 @@ func (e *emitter) emitExpr(n S) {
 			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 			if op == "and" {
 				jf := e.here()
+				e.mark()
 				e.emit(opJumpIfFalse, 0)
 				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
 				jend := e.here()
@@ -665,6 +667,7 @@ func (e *emitter) emitExpr(n S) {
 				e.emit(opJumpIfFalse, 0)
 				e.emit(opConst, e.k(Bool(true)))
 				jend := e.here()
+				e.mark()
 				e.emit(opJump, 0)
 				lrhs := e.here()
 				e.patch(jf, lrhs)
@@ -711,7 +714,7 @@ func (e *emitter) emitExpr(n S) {
 		}
 		e.emit(opLoadGlobal, e.ks(opName))
 		e.emit(opConst, e.k(TypeVal(lhs)))
-		e.emitExpr(n[2].(S))
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		e.emit(opCall, 2)
 
 	case "decl": // let x → define null
@@ -734,11 +737,19 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opLoadGlobal, e.ks("__map_from"))
 		for i := 1; i < len(keys); i++ {
 			// child i-1 is the ("pair", key, val)
-			e.withChild(i-1, func() { e.emitExpr(keys[i].(S)) })
+			e.withChild(i-1, func() { // visit ("pair", key, val)
+				e.withChild(0, func() { // key path inside the pair
+					e.emitExpr(keys[i].(S))
+				})
+			})
 		}
 		e.emit(opMakeArr, uint32(len(keys)-1))
 		for i := 1; i < len(vals); i++ {
-			e.withChild(i-1, func() { e.emitExpr(vals[i].(S)) })
+			e.withChild(i-1, func() {
+				e.withChild(1, func() { // value path inside the pair
+					e.emitExpr(vals[i].(S))
+				})
+			})
 		}
 		e.emit(opMakeArr, uint32(len(vals)-1))
 		e.emit(opCall, 2)
@@ -786,16 +797,12 @@ func (e *emitter) emitExpr(n S) {
 			S{"null"}, // examples
 		)
 	case "oracle":
-		e.emitMakeFun(
-			n[1].(S),    // params
-			n[2].(S),    // ret (may be empty)
-			S{"oracle"}, // body carrier marker for oracle
-			true,        // isOracle
-			n[3].(S),    // source expression
-		)
+		e.withChild(2, func() { // child #2 is sourceExpr
+			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S))
+		})
 
 	case "return":
-		e.emitExpr(n[1].(S))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.emit(opReturn, 0)
 
 	case "if":
@@ -976,7 +983,11 @@ func (e *emitter) emitExpr(n S) {
 			e.emit(opConst, e.k(TypeVal(lhs)))
 			e.emit(opLoadGlobal, e.ks("__annotate"))
 			e.emit(opConst, e.k(Str(text)))
-			e.emitExpr(rhs)
+			e.withChild(1, func() { // go into ("assign", lhs, rhs)
+				e.withChild(1, func() { // child #1 inside assign = rhs
+					e.emitExpr(rhs)
+				})
+			})
 			e.emit(opCall, 2)
 			e.emit(opCall, 2)
 			return
@@ -995,7 +1006,12 @@ func (e *emitter) emitExpr(n S) {
 		}
 
 		// default: #(doc) expr  ==>  __annotate(doc, expr)
-		e.callBuiltin("__annotate", S{"str", text}, subj)
+		e.emit(opLoadGlobal, e.ks("__annotate"))
+		e.emit(opConst, e.k(Str(text)))
+		e.withChild(1, func() { // child #1 of ("annot", text, subj)
+			e.emitExpr(subj)
+		})
+		e.emit(opCall, 2)
 
 	default:
 		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
@@ -1005,7 +1021,7 @@ func (e *emitter) emitExpr(n S) {
 func (e *emitter) emitBinaryOpAB(a, b S, op opcode) {
 	e.withChild(1, func() { e.emitExpr(a) })
 	e.withChild(2, func() { e.emitExpr(b) })
-	e.withChild(1, func() { e.mark() })
+	e.mark()
 	e.emit(op, 0)
 }
 func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {

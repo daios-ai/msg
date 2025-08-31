@@ -68,7 +68,12 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 			case rtErr:
 				if uncaught {
 					out, err = errNull(sig.msg), nil
+				} else if sig.src != nil && sig.line > 0 && sig.col > 0 {
+					// Inner function error with its own source mapping
+					err = WrapErrorWithSource(&RuntimeError{Line: sig.line, Col: sig.col, Msg: sig.msg}, ip.fallbackSrc(sig.src, nil))
+					out = Value{}
 				} else {
+					// Legacy fail() without location – fall back to current chunk
 					line, col := ip.sourcePosFromChunk(nil, sr, 0)
 					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: sig.msg}, ip.fallbackSrc(sr, ast))
 					out = Value{}
@@ -296,7 +301,10 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 		}
 		return res.value
 	case vmRuntimeError:
-		return res.value // annotated-null if uncaught mode was used upstream
+		// Map PC→(line,col) against the callee's own chunk/source and bubble up
+		line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
+		panicRt(res.value.Annot, f.Src, line, col)
+		return errNull("unreachable")
 	default:
 		return errNull("unknown VM status")
 	}
@@ -431,7 +439,14 @@ type ctrlCtx struct {
 	contJumps  []int
 }
 
-func newEmitter(ip *Interpreter, src *SourceRef) *emitter { return &emitter{ip: ip, src: src} }
+func newEmitter(ip *Interpreter, src *SourceRef) *emitter {
+	e := &emitter{ip: ip, src: src}
+	if src != nil && len(src.PathBase) > 0 {
+		// Start marks at the absolute path of this sub-tree
+		e.path = append(e.path, src.PathBase...)
+	}
+	return e
+}
 
 func (e *emitter) k(v Value) uint32 {
 	for i := range e.consts {
@@ -521,7 +536,7 @@ func (e *emitter) callBuiltin(name string, args ...S) {
 	e.emit(opCall, uint32(len(args)))
 }
 
-func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S) {
+func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S, basePath NodePath) {
 	namesArr := make([]Value, 0, max(0, len(params)-1))
 	typesArr := make([]Value, 0, max(0, len(params)-1))
 	for i := 1; i < len(params); i++ {
@@ -549,12 +564,16 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 	e.emit(opConst, e.k(TypeVal(bodyCarrier)))
 	e.emit(opConst, e.k(Bool(isOracle)))
 	e.emitExpr(examples)
-	e.emit(opCall, 6)
+	// basePath: [Int]
+	for _, idx := range basePath {
+		e.emit(opConst, e.k(Int(int64(idx))))
+	}
+	e.emit(opMakeArr, uint32(len(basePath)))
+	e.emit(opCall, 7)
 }
 
 // Entry: emit whole function body and return.
 func (e *emitter) emitFunBody(body S) {
-	e.path = e.path[:0] // root
 	e.emitExpr(body)
 	e.emit(opReturn, 0)
 }
@@ -789,16 +808,20 @@ func (e *emitter) emitExpr(n S) {
 		return
 
 	case "fun":
+		// absolute path to the body child of this ("fun", .., .., body)
+		absBody := append(append(NodePath(nil), e.path...), 2)
 		e.emitMakeFun(
 			n[1].(S),  // params
 			n[2].(S),  // ret (may be empty)
 			n[3].(S),  // body carrier (type AST)
 			false,     // isOracle
 			S{"null"}, // examples
+			absBody,
 		)
 	case "oracle":
 		e.withChild(2, func() { // child #2 is sourceExpr
-			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S))
+			// oracles don't JIT a body chunk here → no body base path
+			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
 		})
 
 	case "return":

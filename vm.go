@@ -66,9 +66,10 @@ import (
 
 // SourceRef attaches source text and an optional SpanIndex to bytecode.
 type SourceRef struct {
-	Name  string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
-	Src   string     // full text
-	Spans *SpanIndex // may be nil when unknown
+	Name     string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
+	Src      string     // full text
+	Spans    *SpanIndex // may be nil when unknown
+	PathBase NodePath   // optional absolute prefix for marks emitted in this chunk
 }
 
 // PCMark associates an instruction index with an AST node path.
@@ -325,12 +326,15 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res v
 
 	defer func() {
 		if r := recover(); r != nil {
+			// Structured inner-source error? Re-throw so the outer trampoline can
+			// surface it with the callee's SourceRef and exact (line,col).
 			if e, ok := r.(rtErr); ok {
-				// convert panic to a VM runtime error, preserving the current PC
+				if e.src != nil && e.line > 0 && e.col > 0 {
+					panic(e) // propagate structured inner-caret error
+				}
 				res.status = vmRuntimeError
-				res.value = annotNull(e.msg) // message carried out
-				res.pc = m.iptr - 1          // res.pc should already equal the current pc; if not, assign it
-				// res.pc = vm.pc
+				res.value = annotNull(e.msg)
+				res.pc = m.iptr - 1
 				return
 			}
 			panic(r) // rethrow non-runtime panics

@@ -21,7 +21,12 @@ import (
 ////////////////////////////////////////////////////////////////////////////////
 
 type returnSig struct{ v Value }
-type rtErr struct{ msg string }
+type rtErr struct {
+	msg  string
+	src  *SourceRef
+	line int
+	col  int
+}
 
 func fail(msg string)          { panic(rtErr{msg: msg}) }
 func errNull(msg string) Value { return withAnnot(Null, msg) }
@@ -29,6 +34,12 @@ func annotNull(msg string) Value {
 	return Value{Tag: VTNull, Annot: msg}
 }
 func withAnnot(v Value, ann string) Value { v.Annot = ann; return v }
+
+// panicRt rethrows a structured runtime error as a **value** (never a pointer).
+// Always use this (or fail) to signal runtime errors within the interpreter.
+func panicRt(msg string, src *SourceRef, line, col int) {
+	panic(rtErr{msg: msg, src: src, line: line, col: col})
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //                          PRIVATE OPS FACADE (to API)
@@ -211,6 +222,7 @@ func (o *opsImpl) initCore() {
 			{"body", S{"id", "Type"}},
 			{"isOracle", S{"id", "Bool"}},
 			{"examples", S{"id", "Any"}},
+			{"basePath", S{"array", S{"id", "Int"}}},
 		},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
@@ -220,6 +232,7 @@ func (o *opsImpl) initCore() {
 			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
 			isOr := ctx.MustArg("isOracle").Data.(bool)
 			exAny := ctx.MustArg("examples")
+			baseAny := ctx.MustArg("basePath")
 
 			names := make([]string, len(namesV))
 			types := make([]S, len(typesV))
@@ -242,11 +255,31 @@ func (o *opsImpl) initCore() {
 				exVals = append([]Value(nil), exAny.Data.([]Value)...)
 			}
 
+			// Build absolute base path for the body
+			var base NodePath
+			if baseAny.Tag == VTArray {
+				xs := baseAny.Data.([]Value)
+				base = make(NodePath, 0, len(xs))
+				for _, v := range xs {
+					if v.Tag == VTInt {
+						base = append(base, int(v.Data.(int64)))
+					}
+				}
+			}
+
 			retAst := retTV.Ast
 			if isOr {
 				retAst = ensureNullableUnlessAny(retAst)
 			}
 
+			// Clone current SourceRef and attach base path
+			var sr *SourceRef
+			if ip.currentSrc != nil {
+				// shallow copy – Spans pointer is shared intentionally
+				cpy := *ip.currentSrc
+				cpy.PathBase = base
+				sr = &cpy
+			}
 			return FunVal(&Fun{
 				Params:     names,
 				ParamTypes: types,
@@ -256,7 +289,7 @@ func (o *opsImpl) initCore() {
 				HiddenNull: hidden,
 				IsOracle:   isOr,
 				Examples:   exVals,
-				Src:        ip.currentSrc,
+				Src:        sr,
 			})
 		})
 

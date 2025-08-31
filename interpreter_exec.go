@@ -295,7 +295,9 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 	switch res.status {
 	case vmOK, vmReturn:
 		if !ip.isType(res.value, f.ReturnType, f.Env) {
-			fail("return type mismatch")
+			// Map the mismatch to the return expression location.
+			line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
+			panicRt("return type mismatch", f.Src, line, col)
 		}
 		return res.value
 	case vmRuntimeError:
@@ -652,8 +654,7 @@ func (e *emitter) emitExpr(n S) {
 			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
 			return
 		}
-		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-		e.mark()
+		e.withChild(1, func() { e.emitExpr(n[2].(S)); e.mark() })
 		switch op {
 		case "not":
 			e.emit(opNot, 0)
@@ -666,10 +667,9 @@ func (e *emitter) emitExpr(n S) {
 	case "binop":
 		op := n[1].(string)
 		if op == "and" || op == "or" {
-			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+			e.withChild(1, func() { e.emitExpr(n[2].(S)); e.mark() })
 			if op == "and" {
 				jf := e.here()
-				e.mark()
 				e.emit(opJumpIfFalse, 0)
 				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
 				jend := e.here()
@@ -680,11 +680,10 @@ func (e *emitter) emitExpr(n S) {
 				e.patch(jf, lfalse)
 				e.patch(jend, lend)
 			} else {
-				jf := e.here()
+				jf := e.here() // Jump if LHS is false → evaluate RHS
 				e.emit(opJumpIfFalse, 0)
 				e.emit(opConst, e.k(Bool(true)))
 				jend := e.here()
-				e.mark()
 				e.emit(opJump, 0)
 				lrhs := e.here()
 				e.patch(jf, lrhs)
@@ -732,6 +731,10 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opLoadGlobal, e.ks(opName))
 		e.emit(opConst, e.k(TypeVal(lhs)))
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Attribute assignment errors (e.g., bad target/index) to the LHS.
+		e.withChild(0, func() {
+			e.mark()
+		})
 		e.emit(opCall, 2)
 
 	case "decl": // let x → define null
@@ -842,7 +845,7 @@ func (e *emitter) emitExpr(n S) {
 		for i := 0; i < limit; i++ {
 			p := arms[i].(S)
 			e.withChild(i, func() {
-				e.withChild(0, func() { e.emitExpr(p[1].(S)) }) // cond
+				e.withChild(0, func() { e.emitExpr(p[1].(S)); e.mark() }) // cond
 			})
 			jf := e.here()
 			e.emit(opJumpIfFalse, 0)
@@ -871,7 +874,11 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opPop, 0)
 
 		head := e.here()
-		e.withChild(0, func() { e.emitExpr(cond) })
+		// Mark at the loop condition for precise boolean type errors.
+		e.withChild(0, func() {
+			e.emitExpr(cond)
+			e.mark()
+		})
 		jf := e.here()
 		e.emit(opJumpIfFalse, 0)
 
@@ -1041,8 +1048,7 @@ func (e *emitter) emitExpr(n S) {
 
 func (e *emitter) emitBinaryOpAB(a, b S, op opcode) {
 	e.withChild(1, func() { e.emitExpr(a) })
-	e.withChild(2, func() { e.emitExpr(b) })
-	e.mark()
+	e.withChild(2, func() { e.emitExpr(b); e.mark() })
 	e.emit(op, 0)
 }
 func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {

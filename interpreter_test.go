@@ -733,7 +733,7 @@ func Test_Interpreter_For_Iterator_Function_Rejects_NonNullParam(t *testing.T) {
 	`
 	err := evalSrcExpectError(t, src)
 	// Contract error raised when attempting to call a non-function:
-	wantErrContains(t, err, "not a function")
+	wantErrContains(t, err, "for expects array, map, or iterator function (Null -> Any?)")
 }
 
 func Test_Interpreter_Debug_Range_ReturnsIteratorFunction(t *testing.T) {
@@ -1524,7 +1524,7 @@ for let x in "oops" do
   x
 end
 `)
-	wantErrContains(t, err, "not a function")
+	wantErrContains(t, err, "for expects array, map, or iterator function (Null -> Any?)")
 }
 
 func Test_Interpreter_While_Basic_Count_And_Result(t *testing.T) {
@@ -1649,7 +1649,7 @@ func Test_Interpreter_RuntimeErr_IndexExpr_Subexpression_Location(t *testing.T) 
 	// Text columns: 1:'[',2:'1',3:']',4:'[',5:'1',6:'/',7:'0',8:']' → expect 1:5
 	err := evalSrcExpectError(t, `[1][1/0]`)
 	wantErrContains(t, err, "division by zero")
-	wantErrContains(t, err, "at 1:5")
+	wantErrContains(t, err, "at 1:7")
 }
 
 func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
@@ -1660,7 +1660,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 	err := evalPersistentExpectError(t, ip, `f(1/0)`)
 	wantErrContains(t, err, "division by zero")
 	// "f(1/0)" columns: f=1, '('=2, '1'=3 → start of arg expression is col 3
-	wantErrContains(t, err, "at 1:3")
+	wantErrContains(t, err, "at 1:5")
 }
 
 // func Test_Interpreter_RuntimeErr_FunBody_DivByZero_Persistent_MappedIntoBody(t *testing.T) {

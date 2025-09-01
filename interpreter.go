@@ -285,15 +285,21 @@ func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
 // Use Define to bind in the current frame, Set to update an existing visible
 // binding (nearest frame), and Get to retrieve.
 type Env struct {
-	parent *Env
-	table  map[string]Value
+	parent           *Env
+	table            map[string]Value
+	sealParentWrites bool
 }
+
+// Seals the parent environment: env lookup stops here.
+func (e *Env) SealParentWrites() { e.sealParentWrites = true }
 
 // NewEnv creates a new lexical frame with the given parent (which may be nil).
 func NewEnv(parent *Env) *Env { return &Env{parent: parent, table: make(map[string]Value)} }
 
 // Define binds name to v in the current frame, shadowing any outer binding.
-func (e *Env) Define(name string, v Value) { e.table[name] = v }
+func (e *Env) Define(name string, v Value) {
+	e.table[name] = v
+}
 
 // Set updates the nearest existing binding of name to v. If no binding exists
 // in any visible frame, Set returns an error (it does not implicitly define).
@@ -301,6 +307,16 @@ func (e *Env) Set(name string, v Value) error {
 	if _, ok := e.table[name]; ok {
 		e.table[name] = v
 		return nil
+	}
+	// If this frame is sealed, do not climb; emit a friendlier message
+	// when the name exists in an ancestor (e.g., Core builtins).
+	if e.sealParentWrites {
+		for p := e.parent; p != nil; p = p.parent {
+			if _, ok := p.table[name]; ok {
+				return fmt.Errorf("cannot assign to builtin: %s", name)
+			}
+		}
+		return fmt.Errorf("undefined variable: %s", name)
 	}
 	if e.parent != nil {
 		return e.parent.Set(name, v)

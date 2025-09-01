@@ -210,6 +210,7 @@ func (ip *Interpreter) importWithBody(canonName string, display string, body S, 
 
 	// Evaluate in an env that sees Core + natives, with proper VM entry.
 	env := NewEnv(ip.Core)
+	env.SealParentWrites()
 	v, err := ip.runTopWithSource(modAst, env, false, sr)
 	if err != nil {
 		return Null, err // hard runtime/parse errors with carets
@@ -457,16 +458,13 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	canon := nameV.Data.(string)
 
 	// ---- Uniform cycle detection (stack + in-progress record) ----
-	// Re-entrant against the same canonical identity → cycle.
 	for _, s := range ip.loadStack {
 		if s == canon {
 			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon)))
 		}
 	}
-	// Cache guard for re-entry (if present and still loading).
 	if ip.modules != nil {
 		if rec, ok := ip.modules[canon]; ok && rec.state == modLoading {
-			// Ensure chain ends with the repeated key.
 			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(append(ip.loadStack, canon), canon)))
 		}
 	}
@@ -479,13 +477,25 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	} else {
 		ip.modules = map[string]*moduleRec{}
 	}
-	// Mark as loading + push on stack
+
+	// Mark as loading and push on stack.
 	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
 	ip.loadStack = append(ip.loadStack, canon)
+
+	// Ensure we never leave a stale modLoading record or a stuck stack entry.
+	// On panic/failure, delete the cache record; always pop loadStack.
 	defer func() {
-		// Pop on exit
+		// Pop load stack
 		if n := len(ip.loadStack); n > 0 {
 			ip.loadStack = ip.loadStack[:n-1]
+		}
+		// If not successfully flipped to modLoaded, remove the half-built record.
+		if rec, ok := ip.modules[canon]; ok && rec.state != modLoaded {
+			delete(ip.modules, canon)
+		}
+		// Preserve existing error semantics.
+		if r := recover(); r != nil {
+			panic(r)
 		}
 	}()
 
@@ -508,6 +518,7 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 
 	// Fresh env for the module (Core is parent so builtins are visible).
 	modEnv := NewEnv(ip.Core)
+	modEnv.SealParentWrites()
 
 	// SourceRef rooted at the module BODY path (absolute)
 	var sr *SourceRef

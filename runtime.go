@@ -67,6 +67,8 @@ func NewRuntime() (*Interpreter, error) {
 		return nil, err
 	}
 
+	ip.Global.SealParentWrites()
+
 	return ip, nil
 }
 

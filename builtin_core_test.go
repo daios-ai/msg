@@ -183,3 +183,71 @@ func Test_Builtin_Core_import_and_importCode_paths(t *testing.T) {
 		t.Fatalf("importCode should return a module (VTModule), got %#v", mod)
 	}
 }
+
+func Test_Builtin_Core_assign_builtin_friendly_error(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Attempt to override a Core builtin without let → friendly error.
+	_, err := ip.EvalSource(`import = 1`)
+	wantErrContains(t, err, "cannot assign to builtin: import")
+}
+
+func Test_Builtin_Core_assign_undefined_in_sealed_global(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Assign to an unknown name in a sealed Global should say "undefined variable".
+	_, err := ip.EvalSource(`totally_unknown_name = 1`)
+	wantErrContains(t, err, "undefined variable: totally_unknown_name")
+}
+
+func Test_Builtin_Core_let_shadow_builtin_ok(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Shadowing a builtin with let is allowed (local to the eval scope).
+	if _, err := ip.EvalSource(`let import = 123`); err != nil {
+		t.Fatalf("let shadow of builtin should succeed, got error: %v", err)
+	}
+
+	// And the real builtin remains available in a fresh eval.
+	if _, err := ip.EvalSource(`import("std")`); err != nil {
+		t.Fatalf("builtin import should remain usable, got error: %v", err)
+	}
+}
+
+func Test_Builtin_Core_assign_builtin_persistent_repl(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// In persistent (Global) scope, assigning to a Core name should also be blocked
+	// with the friendly message.
+	_, err := ip.EvalPersistentSource(`import = 1`)
+	wantErrContains(t, err, "cannot assign to builtin: import")
+
+	// But explicit let in Global is allowed (shadow locally in Global).
+	if _, err := ip.EvalPersistentSource(`let import = 123`); err != nil {
+		t.Fatalf("let shadow of builtin in Global should succeed, got error: %v", err)
+	}
+}
+func Test_Builtin_Core_module_cannot_assign_builtin(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Inline module attempts to overwrite a Core builtin → friendly error.
+	_, err := ip.EvalSource(`module "M" do import = 1 end`)
+	wantErrContains(t, err, "cannot assign to builtin: import")
+}
+
+func Test_Builtin_Core_module_let_shadow_builtin_ok(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Inline module shadows a Core builtin with let → allowed.
+	v := evalWithIP(t, ip, `module "M2" do let import = 123 end`)
+	m := mustMap(t, AsMapValue(v))
+	got := m.Entries["import"]
+	if got.Tag != VTInt || got.Data.(int64) != 123 {
+		t.Fatalf("module export import should be 123, got %#v", got)
+	}
+
+	// Core builtin remains intact after module evaluation.
+	if _, err := ip.EvalSource(`import("std")`); err != nil {
+		t.Fatalf("builtin import should remain usable: %v", err)
+	}
+}

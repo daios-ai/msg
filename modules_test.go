@@ -629,3 +629,57 @@ a.y`)
 	// Should have used sub/b.ms → x = 2
 	wantInt(t, v, 2)
 }
+
+// Failed inline module should NOT leave a stale "loading" record.
+// Retrying with the same name must NOT report an import cycle.
+// After a failure, using the same name for a successful module should work.
+func Test_Modules_InlineFailure_DoesNotStaleCacheAndRetry(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	bad := `let m = module "M" do 1/0 end`
+
+	// First attempt: real runtime error from body.
+	if _, err := ip.EvalPersistentSource(bad); err == nil {
+		t.Fatalf("expected runtime error on first construction")
+	} else if msg := err.Error(); !strings.Contains(msg, "division by zero") {
+		t.Fatalf("want division-by-zero error, got: %s", msg)
+	} else if strings.Contains(msg, "import cycle") {
+		t.Fatalf("unexpected import cycle on first attempt: %s", msg)
+	}
+
+	// Second attempt with the same name should NOT report a cycle.
+	if _, err := ip.EvalPersistentSource(bad); err == nil {
+		t.Fatalf("expected runtime error on second construction")
+	} else if msg := err.Error(); !strings.Contains(msg, "division by zero") {
+		t.Fatalf("want division-by-zero error again, got: %s", msg)
+	} else if strings.Contains(msg, "import cycle") {
+		t.Fatalf("BUG: stale modLoading caused false cycle on retry: %s", msg)
+	}
+
+	// Now succeed with the same name; cache must be clean after failures.
+	ok := `let m = module "M" do let x = 7 end m.x`
+	v, err := ip.EvalPersistentSource(ok)
+	if err != nil {
+		t.Fatalf("unexpected error building module after prior failure: %v", err)
+	}
+	wantInt(t, v, 7)
+}
+
+// Successful inline modules are cached by canonical name: the second construction
+// with the same name returns the cached module (does not re-run the body).
+func Test_Modules_Inline_Success_CachesByName(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	v1, err := ip.EvalPersistentSource(`let m1 = module "C" do let x = 1 end m1.x`)
+	if err != nil {
+		t.Fatalf("unexpected error on first inline module: %v", err)
+	}
+	wantInt(t, v1, 1)
+
+	// Body sets x = 2, but since "C" is already cached, result must still be 1.
+	v2, err := ip.EvalPersistentSource(`let m2 = module "C" do let x = 2 end m2.x`)
+	if err != nil {
+		t.Fatalf("unexpected error on second inline module: %v", err)
+	}
+	wantInt(t, v2, 1)
+}

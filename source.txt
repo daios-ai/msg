@@ -1,508 +1,134 @@
-=== BEGIN FILE: modules.go ===
-// modules.go — MindScript module system (public API + private implementation)
+=== BEGIN FILE: runtime.go ===
+// runtime.go
 //
-// OVERVIEW
-// --------
-// MindScript modules are ordinary MindScript programs whose *exported bindings*
-// are snapshotted into a map-like value and paired with the lexical environment
-// where the program executed.
-//
-// At runtime, a module is represented as a `VTModule` value whose payload is:
-//
-//	type Module struct {
-//	  Name string     // canonical identity (path/URL) or caller-provided name
-//	  Map  *MapObject // ordered export surface with per-key annotations
-//	  Env  *Env       // lexical environment where the module executed
-//	}
-//
-// Design goal: a module should behave ergonomically like a map. The interpreter
-// exposes a small coercion (`AsMapValue`, defined in interpreter.go) that lets
-// module values participate in all `VTMap` operations (length, overlay with '+',
-// iteration, property/index reads, etc.) without duplicating map logic.
-//
-// PUBLIC API (this file)
-// ----------------------
-// The public surface is deliberately minimal and stable:
-//
-//   - (*Interpreter).ImportAST(name string, ast S) (Value, error)
-//     Evaluate a *ready AST* as a module and return a `VTModule`. No cache.
-//     Evaluation happens in a fresh env parented to the interpreter's Core.
-//     Cycle detection is applied with a synthetic identity "mem:<name>".
-//
-//   - (*Interpreter).ImportCode(name, src string) (Value, error)
-//     Parse `src` into an AST (with spans for precise caret mapping) and delegate
-//     to the unified loader (no cache). Uses the same cycle handling as ImportAST.
-//
-//   - (*Interpreter).ImportFile(spec, importer string) (Value, error)
-//     Resolve + fetch + parse + evaluate with cycle detection and caching.
-//     Resolution rules support both filesystem and absolute http(s) URLs.
-//     Successful loads are cached by their *canonical* identity.
-//
-//   - (*Module).Get(key string) (Value, bool)
-//     Return an exported binding and a presence flag. This mirrors the private
-//     `get` method used by the VM for property/index reads.
-//
-// What ImportFile does, precisely:
-//  1. Resolution & Fetching
-//     • HTTP(S) — only absolute URLs are accepted. If the path lacks an
-//     extension, `.ms` is appended. The canonical cache key is the full URL.
-//     • Filesystem — resolve `spec` relative to the *importer’s directory*
-//     (when importer is a file path), then the current working directory,
-//     then each root in `MindScriptPath`. If `spec` lacks an extension,
-//     try `spec + ".ms"` and then `spec`. The canonical key is the cleaned,
-//     absolute path of the resolved file.
-//  2. Cycle detection
-//     A per-import call stack (`ip.loadStack`) plus an in-progress state guard
-//     detects cycles and produces a friendly `A -> B -> … -> A` chain.
-//  3. Parse + Evaluate
-//     Parsing wraps syntax errors with the *original source* for good diagnostics,
-//     using spans so runtime errors can point into the module’s own text. Evaluation
-//     runs in an isolated child env of Core.
-//  4. Snapshot
-//     The module’s public surface is captured into a `MapObject`:
-//     • Exported keys are sorted lexicographically (deterministic order).
-//     • Exported `VTType` values that lack a pinned env are rewritten via
-//     `TypeValIn(..., modEnv)` so they resolve under the module’s env.
-//     • If an exported value carries `Annot`, it is mirrored to `KeyAnn[key]`.
-//
-// Error semantics (MindScript policy):
-//   - **Contractual/hard errors**: `fail(msg)` for things like type/arity/contract
-//     problems. These bubble out as hard Go errors. Try/catch can handle them at
-//     the language level.
-//   - **Operational/soft errors**: functions return `null` with an annotation.
-//     These are not converted to hard errors.
-//   - This module follows the policy:
-//   - **Parse errors** → hard Go errors: `"parse error in <display>:\n<caret...>"`
-//   - **Import cycles** → hard Go errors: `"import cycle detected: A -> B -> … -> A"`
-//   - **Module body runtime** → propagated *as produced by the runtime*
-//     (contract errors remain hard; annotated `null` stays soft).
-//   - **Resolve/fetch failures** → operational; `ImportFile` returns annotated
-//     `null` with a nil Go error. The `import(...)` builtin simply returns that
-//     `null` value unchanged (see builtins), keeping the failure soft.
-//
-// Caching:
-//   - Only successful loads are cached under the canonical identity.
-//   - Failures are never cached.
-//   - This cache is in-memory and persistent for the lifetime of the Interpreter.
-//
-// Concurrency:
-//   - The module cache and import stack are not synchronized; callers should
-//     avoid concurrent ImportFile calls on the same Interpreter.
-//
-// SOURCE MAPPING & SPANS
-// ----------------------
-// Precise error carets require a `SourceRef` carrying the original source and its
-// spans. For `ImportCode` and `ImportFile`, this file parses with
-// `ParseSExprWithSpans` and executes the synthesized ("module", name, body)
-// under a real `SourceRef`. This ensures that runtime errors inside the module
-// body point at the *module’s own text* (or filename for files/URLs) instead of
-// a generic `<module>`.
-//
-// The emitter lowers ("module", …) to a `__make_module` native call and passes
-// an absolute NodePath to the body; `nativeMakeModule` re-roots the SourceRef so
-// that per-instruction marks are mapped to the correct body range. Do not bypass
-// `runTopWithSource` when evaluating modules—VM entry sets up recovery and source
-// plumbing.
-//
-// The remainder of this file is intentionally split into:
-//  1. PUBLIC API — small, heavily documented wrappers that define behavior.
-//  2. PRIVATE    — detailed implementation (resolution, fetching, parsing,
-//     evaluation, snapshotting, caching, and cycle detection).
+// This file implements the standard runtime/builtins *against the stable engine
+// surface* defined in interpreter.go. It avoids reaching into the engine's
+// internals (no ip.eval, no direct stack/VM knowledge). The only remaining
+// intentional touch-point is for `spawn`, where we temporarily copy a function's
+// closure to a snapshot Env to preserve isolation semantics. See the TODO there.
+
 package mindscript
 
 import (
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"sort"
 	"strings"
-	"time"
 )
 
-////////////////////////////////////////////////////////////////////////////////
-//                                   PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
+// --- Opaque, universal handle (Lua-like userdata) + concrete boxed types ---
 
-// MindScript Library Path
-const MindScriptPath = "MSGPATH"
-
-// Module is the payload carried by a VTModule value.
-//
-// A Module’s public *map-like* surface is stored in Map (ordered exports with
-// per-key annotations), while Env retains the lexical environment used during
-// evaluation (closures/types capture from here). Name is the canonical identity
-// (absolute path or full URL) when loaded from ImportFile, or the caller’s
-// chosen label for ImportAST/ImportCode. See `AsMapValue` in interpreter.go for
-// VTModule→VTMap coercion when consuming a module as a map.
-type Module struct {
-	Name string
-	Map  *MapObject
-	Env  *Env
+type Handle struct {
+	Kind string
+	Data any
 }
 
-// Get returns the exported binding named key and whether it exists.
-// It mirrors the private `get` used by the VM for fast property/index reads.
-func (m *Module) Get(key string) (Value, bool) { return m.get(key) }
-
-// ImportAST evaluates a ready AST as a module.
-//
-// Behavior:
-//   - Evaluates `ast` in a fresh environment parented to `ip.Core`.
-//   - On success, returns a VTModule whose Module.Name = `name`.
-//   - No cache; cycle detection uses synthetic identity "mem:<name>".
-//   - Source mapping is coarse (no spans); prefer ImportCode when you need
-//     precise carets for module body errors.
-//
-// Errors:
-//   - **Runtime outcomes propagate as produced by the runtime**.
-func (ip *Interpreter) ImportAST(name string, ast S) (Value, error) {
-	canon := "mem:" + name
-	// Note: no source text/spans; run with coarse mapping. Still goes through the
-	// unified loader for consistent cycle handling.
-	return ip.importWithBody(canon, name, ast, "", nil, false /*cache*/)
+func HandleVal(kind string, data any) Value {
+	return Value{Tag: VTHandle, Data: &Handle{Kind: kind, Data: data}}
 }
 
-// ImportCode parses source and evaluates it as a module.
-//
-// Behavior:
-//   - Parses `src` into an AST with source-wrapped diagnostics (with spans).
-//   - Delegates to the unified loader using the same `name`.
-//   - No cache; cycle detection uses synthetic identity "mem:<name>".
-//
-// Errors:
-//   - Syntax errors are wrapped with source and labeled with `name`.
-//   - **Runtime outcomes propagate as produced by the runtime**.
-func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
-	ast, spans, perr := parseSourceWithSpans(name, src)
-	if perr != nil {
-		return Null, perr
+func asHandle(v Value, want string) *Handle {
+	if v.Tag != VTHandle {
+		fail("expected handle")
 	}
-	canon := "mem:" + name
-	return ip.importWithBody(canon, name, ast, src, spans, false /*cache*/)
+	h := v.Data.(*Handle)
+	if want != "" && h.Kind != want {
+		fail("wrong handle kind")
+	}
+	return h
 }
 
-// ImportFile resolves, fetches, parses, evaluates, caches, and detects cycles.
-//
-// Behavior:
-//   - Resolution & fetching follow the rules described in this file header.
-//   - Cycles are detected using a per-call import stack and an in-progress state.
-//   - Successful loads are cached by canonical identity and returned from cache
-//     on subsequent calls.
-//   - On success, returns a VTModule whose Module.Name is the canonical identity.
-//
-// Errors:
-//   - Parse errors are enriched with display context.
-//   - Cycles are reported using a compact `A -> B -> … -> A` chain.
-//   - **Runtime outcomes from executing the module body propagate as produced by the runtime**.
-//   - **Resolve/fetch failures** are converted to annotated null (SOFT) with a nil Go error.
-//     The `import(...)` builtin returns that value unchanged.
-func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
-	src, display, canon, rerr := resolveAndFetch(spec, importer)
-	if rerr != nil {
-		// Operational: soft error. Return annotated null with no Go error.
-		return annotNull(fmt.Sprintf("import %q: %v", spec, rerr)), nil
+// annotate a core builtin function value with a docstring
+func setBuiltinDoc(ip *Interpreter, name, doc string) {
+	if v, err := ip.Core.Get(name); err == nil {
+		ip.Core.Define(name, withAnnot(v, doc))
 	}
-	ast, spans, perr := parseSourceWithSpans(display, src)
-	if perr != nil {
-		return Null, perr
-	}
-	return ip.importWithBody(canon, display, ast, src, spans, true /*cache*/)
 }
 
-// LoadPrelude resolves `spec` (filesystem or absolute http(s) URL), parses it,
-// and executes the prelude directly in the interpreter's Core environment.
-// On success it returns nil. On failure it returns a descriptive error
-// (LEXICAL/PARSE/RUNTIME with caret snippets where available).
+// NewRuntime returns a fully-initialized interpreter with std builtins.
+func NewRuntime() (*Interpreter, error) {
+	ip := NewInterpreter()
+
+	// standard native builtins
+	registerCoreBuiltins(ip)
+	registerIntrospectionBuiltins(ip)
+	registerCastBuiltins(ip)
+	registerIOBuiltins(ip)
+	registerOsBuiltins(ip)
+	registerNetBuiltins(ip)
+	registerConcurrencyBuiltins(ip)
+	registerProcessBuiltins(ip)
+	registerEncodingURLBuiltins(ip)
+	registerCryptoBuiltins(ip)
+	registerCompressionBuiltins(ip)
+	registerExecBuiltins(ip)
+	registerTimeBuiltins(ip)
+	registerPathBuiltins(ip)
+	registerJsonBuiltins(ip)
+	registerStringBuiltins(ip)
+	registerRandomBuiltins(ip)
+	registerMathBuiltins(ip)
+
+	// if err := ip.LoadPrelude("std", ""); err != nil {
+	// 	return nil, err
+	// }
+
+	return ip, nil
+}
+
+// LoadPrelude resolves `spec` (filesystem only), parses it with spans,
+// and executes the prelude directly in Core (not as a module).
+// Resolution order: importer directory (if provided) → CWD → each root in MSGPATH.
+// If spec has no extension, try "<spec>.ms" then "<spec>".
 func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
-	// 1) Resolve + fetch
-	src, display, _, err := resolveAndFetch(spec, importer)
+	src, display, err := loadPreludeSource(spec, importer)
 	if err != nil {
 		return err
 	}
 
-	// 2) Parse with spans for caret diagnostics
+	// Parse with spans for precise caret diagnostics
 	ast, spans, perr := ParseSExprWithSpans(src)
 	if perr != nil {
 		return WrapErrorWithSource(perr, src) // LEXICAL/PARSE with caret
 	}
 
-	// 3) Evaluate in Core. We want real errors for VM runtime failures,
-	//    *and* we also want to treat annotated-null as an error.
+	// Execute in Core. Annotated-null at top level is promoted to an error.
 	v, rterr := ip.runTopWithSource(ast, ip.Core /*uncaught=*/, false, &SourceRef{
 		Name:  display,
 		Src:   src,
 		Spans: spans,
 	})
 	if rterr != nil {
-		return rterr // already a caret RUNTIME ERROR
+		return rterr // already caret-enriched RUNTIME ERROR
 	}
-
-	// Top-level returned an annotated null → promote to runtime error.
 	if v.Tag == VTNull && v.Annot != "" {
-		// We can’t map a PC here (it wasn’t a VM runtime error), so keep the
-		// existing module-like message shape:
 		return fmt.Errorf("runtime error in %s: %s", display, v.Annot)
 	}
-
 	return nil
 }
 
-//// END_OF_PUBLIC
+// --- Prelude-only filesystem resolver (independent from module loaders) ---
 
-////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-// ---- Module runtime structs & VM hook --------------------------------------
-
-type moduleState int
-
-const (
-	modUnloaded moduleState = iota
-	modLoading
-	modLoaded
-)
-
-// moduleRec tracks cached module state by canonical identity.
-type moduleRec struct {
-	spec        string
-	displayName string
-	src         string
-	env         *Env
-	mod         *Module
-	state       moduleState
-	err         error
-}
-
-// get returns an exported binding by key. The VM uses this for property/index reads.
-func (m *Module) get(key string) (Value, bool) {
-	v, ok := m.Map.Entries[key]
-	return v, ok
-}
-
-// ---- Unified module import path --------------------------------------------
-
-// importWithBody is the unified implementation all public import forms converge on.
-//
-// Responsibilities:
-//   - Cycle detection using the canonical identity (`canon`). We use a per-call
-//     stack (`ip.loadStack`) and also guard against re-entry on the cache record.
-//   - Optional cache lookup/commit of successful loads.
-//   - Execution of the ("module", name, body) wrapper under a proper SourceRef,
-//     so module-body errors show precise carets in the module’s own text.
-//   - Propagate runtime outcomes as-is (no reclassification).
-//
-// `display` is the user-facing name (file path, URL, or friendly label).
-// `src`/`spans` may be empty/nil (e.g., ImportAST), in which case caret
-// mapping will be coarse (still correct but not as precise).
-func (ip *Interpreter) importWithBody(canon string, display string, body S, src string, spans *SpanIndex, useCache bool) (Value, error) {
-	// 1) Cycle detection against canonical identity
-	for _, s := range ip.loadStack {
-		if s == canon {
-			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
-		}
+// loadPreludeSource resolves a filesystem spec using importer dir → CWD → MSGPATH
+// (MindScriptPath), reads the file, and returns (src, displayPath).
+// HTTP/HTTPS are rejected; preludes are filesystem-only by design.
+func loadPreludeSource(spec string, importer string) (string, string, error) {
+	if spec == "" {
+		return "", "", fmt.Errorf("prelude spec is empty")
 	}
-	ip.loadStack = append(ip.loadStack, canon)
-	defer func() { ip.loadStack = ip.loadStack[:len(ip.loadStack)-1] }()
-
-	// 2) Cache
-	if useCache {
-		if ip.modules == nil {
-			ip.modules = map[string]*moduleRec{}
-		}
-		if rec, ok := ip.modules[canon]; ok {
-			if rec.state == modLoading {
-				return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
-			}
-			if rec.state == modLoaded && rec.mod != nil {
-				return Value{Tag: VTModule, Data: rec.mod}, nil
-			}
-		}
-		// mark as loading to catch re-entrancy
-		ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
-	}
-
-	// 3) Build & execute the module with proper source info
-	m, err := ip.buildModuleFromBody(display, src, body, spans)
-	if err != nil {
-		// Do not cache failures
-		if useCache {
-			delete(ip.modules, canon)
-		}
-		return Null, err
-	}
-
-	// 4) Success → name + cache commit
-	m.Name = canon
-	if !useCache {
-		return Value{Tag: VTModule, Data: m}, nil
-	}
-
-	rec := ip.modules[canon]
-	rec.displayName = display
-	rec.src = src
-	rec.env = m.Env
-	rec.mod = m
-	rec.state = modLoaded
-	rec.err = nil
-
-	return Value{Tag: VTModule, Data: rec.mod}, nil
-}
-
-// parseSourceWithSpans parses src into an S-expr AST + spans and wraps errors with source context.
-// Implementation note: always prefer this (vs ParseSExpr) when you have the source text, so we
-// can produce precise caret diagnostics during module execution.
-func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
-	ast, spans, perr := ParseSExprWithSpans(src)
-	if perr != nil {
-		perr = WrapErrorWithSource(perr, src)
-		return nil, nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
-	}
-	return ast, spans, nil
-}
-
-// buildModuleFromBody evaluates the *body* AST as a module by lowering to
-// ("module", ("str", display), body) and running it via runTopWithSource
-// under a SourceRef that points to the module's own source text and spans.
-//
-// **Runtime outcomes propagate as produced by the runtime**: contract errors
-// become hard Go errors; annotated nulls remain soft. We do not re-wrap them.
-//
-// IMPORTANT: Do not call __make_module directly from here. VM entry (`runTopWithSource`)
-// installs recovery and anchors ip.currentSrc, and the emitter will pass the body’s
-// absolute NodePath as `base` into the native, ensuring perfect caret mapping.
-func (ip *Interpreter) buildModuleFromBody(display string, src string, body S, spans *SpanIndex) (*Module, error) {
-	// Prepare SourceRef for the *module file/source* so the emitter can hand the
-	// absolute body path to __make_module, and the VM can render correct carets.
-	var sr *SourceRef
-	if src != "" && spans != nil {
-		sr = &SourceRef{Name: display, Src: src, Spans: spans}
-	}
-
-	// Lower to ("module", name, body) — emitter will call __make_module with
-	// a base path that points exactly at the body.
-	modAst := S{"module", S{"str", display}, body}
-
-	// Evaluate in an env that sees Core + natives, with proper VM entry (recover + mapping).
-	env := NewEnv(ip.Core)
-	v, err := ip.runTopWithSource(modAst, env, false, sr)
-	if err != nil {
-		// Hard runtime/parse errors propagate as Go errors (with carets).
-		return nil, err
-	}
-	if v.Tag != VTModule {
-		// Invariant: module evaluation must return a module.
-		return nil, fmt.Errorf("internal error: expected module value")
-	}
-	return v.Data.(*Module), nil
-}
-
-// buildModuleMap snapshots modEnv.table into a MapObject:
-// • Keys are sorted for determinism (Env.table is a Go map).
-// • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
-// • If a value carries Annot, mirror it into KeyAnn for that key.
-//
-// NOTE: This surfaces the module’s public shape in a deterministic order even
-// though Env.table is unordered, which keeps iteration/tests stable.
-func buildModuleMap(modEnv *Env) *MapObject {
-	keys := make([]string, 0, len(modEnv.table))
-	for k := range modEnv.table {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys) // deterministic order
-
-	mo := &MapObject{
-		Entries: make(map[string]Value, len(keys)),
-		KeyAnn:  make(map[string]string, len(keys)),
-		Keys:    make([]string, 0, len(keys)),
-	}
-	for _, k := range keys {
-		v := modEnv.table[k]
-
-		// Pin exported types to the module env if needed
-		if v.Tag == VTType {
-			tv := v.Data.(*TypeValue)
-			if tv.Env == nil {
-				nv := TypeValIn(tv.Ast, modEnv)
-				nv.Annot = v.Annot // preserve docs on the value
-				v = nv
-			}
-		}
-
-		mo.Entries[k] = v
-		mo.Keys = append(mo.Keys, k)
-		if ann := v.Annot; ann != "" {
-			mo.KeyAnn[k] = ann
-		}
-	}
-	return mo
-}
-
-// ---- Autoloader (resolution & fetching) ------------------------------------
-
-const defaultModuleExt = ".ms" // adjust if you prefer a different extension
-
-// resolveAndFetch returns (src, display, canonicalKey) for the given spec.
-//
-// Network:
-//   - Absolute http(s) URLs are fetched via GET with a timeout.
-//   - If the URL path has no extension, defaultModuleExt is appended.
-//
-// Filesystem:
-//   - Resolve relative specs against importer dir → CWD → MindScriptPath.
-//   - If spec has no extension, try spec+defaultModuleExt then spec.
-//   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
-//
-// NOTE: This function returns Go errors; ImportFile is responsible for classifying
-// them as soft (annotated null) at the API boundary for operational failures.
-func resolveAndFetch(spec string, importer string) (string, string, string, error) {
-	// Network?
 	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
-		u, perr := url.Parse(spec)
-		if perr != nil {
-			return "", "", "", fmt.Errorf("invalid import url: %w", perr)
-		}
-		if path.Ext(u.Path) == "" && defaultModuleExt != "" {
-			u.Path = strings.TrimSuffix(u.Path, "/") + defaultModuleExt
-		}
-		canon := u.String()
-		src, display, err := httpFetch(canon)
-		return src, display, canon, err
-	}
-
-	// Filesystem
-	canon, ferr := resolveFS(spec, importer)
-	if ferr != nil {
-		return "", "", "", ferr
-	}
-	b, rerr := os.ReadFile(canon)
-	if rerr != nil {
-		return "", "", "", fmt.Errorf("module not found: %s", spec)
-	}
-	return string(b), canon, canon, nil
-}
-
-func resolveFS(spec string, importer string) (string, error) {
-	var bases []string
-	// Prefer the importer’s directory, if present and not a URL.
-	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
-		bases = append(bases, filepath.Dir(importer))
-	}
-	// Then the current working directory.
-	if cwd, err := os.Getwd(); err == nil {
-		bases = append(bases, cwd)
+		return "", "", fmt.Errorf("preludes must be loaded from the filesystem (got URL)")
 	}
 
 	try := func(base, s string) (string, bool) {
-		cands := []string{}
+		var cands []string
 		if filepath.Ext(s) != "" {
-			cands = append(cands, filepath.Join(base, s))
+			cands = []string{filepath.Join(base, s)}
 		} else {
-			cands = append(cands, filepath.Join(base, s)+defaultModuleExt, filepath.Join(base, s))
+			cands = []string{
+				filepath.Join(base, s) + defaultModuleExt, // ".ms"
+				filepath.Join(base, s),
+			}
 		}
 		for _, c := range cands {
 			if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
@@ -516,172 +142,471 @@ func resolveFS(spec string, importer string) (string, error) {
 	// Absolute path?
 	if filepath.IsAbs(spec) {
 		if p, ok := try("", spec); ok {
-			return p, nil
-		}
-		// fallthrough to MindScriptPath for completeness
-	} else {
-		for _, b := range bases {
-			if p, ok := try(b, spec); ok {
-				return p, nil
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return "", "", err
 			}
+			return string(b), p, nil
 		}
+		return "", "", fmt.Errorf("prelude not found: %s", spec)
 	}
 
-	// MindScriptPath
-	if sp := os.Getenv(MindScriptPath); sp != "" {
+	// Candidate bases: importer dir (if local path) → CWD → MSGPATH roots
+	var bases []string
+	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
+		bases = append(bases, filepath.Dir(importer))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		bases = append(bases, cwd)
+	}
+	if sp := os.Getenv(MindScriptPath); sp != "" { // MSGPATH
 		for _, root := range filepath.SplitList(sp) {
-			if root == "" {
-				continue
-			}
-			if p, ok := try(root, spec); ok {
-				return p, nil
+			if root != "" {
+				bases = append(bases, root)
 			}
 		}
 	}
 
-	return "", fmt.Errorf("module not found: %s", spec)
-}
-
-func httpFetch(canonURL string) (src string, display string, err error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(canonURL)
-	if err != nil {
-		return "", canonURL, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", canonURL, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", canonURL, err
-	}
-	return string(b), canonURL, nil
-}
-
-// prettySpec returns a short display name for a canonical spec:
-//   - file path   -> basename without extension
-//   - http(s) URL -> last segment without extension
-//   - fallback: original string if parsing fails
-func prettySpec(s string) string {
-	// Try URL first
-	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
-		base := path.Base(u.Path)
-		name := strings.TrimSuffix(base, path.Ext(base))
-		if name != "" {
-			return name
-		}
-		return base
-	}
-	// Filesystem path
-	base := filepath.Base(s)
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	if name != "" {
-		return name
-	}
-	return base
-}
-
-// "A -> B -> C -> A" using pretty names instead of full canonical specs.
-func joinCyclePath(stack []string, again string) string {
-	i := 0
-	for idx, s := range stack {
-		if s == again {
-			i = idx
-			break
-		}
-	}
-	chain := append(stack[i:], again)
-	out := make([]string, len(chain))
-	for k, s := range chain {
-		out[k] = prettySpec(s)
-	}
-	return strings.Join(out, " -> ")
-}
-
-// nativeMakeModule is the implementation of the __make_module primitive.
-//
-// It receives:
-//   - name: Str  — user-facing module name for diagnostics (display)
-//   - body: Type — AST for the module body wrapped as a type value
-//   - base: [Int] — absolute NodePath indicating where the body lives in the
-//     *caller’s* SourceRef; used to re-root spans to the body.
-//
-// Important plumbing:
-//   - We build a child SourceRef with PathBase = base so that VM marks and
-//     PC→(line,col) mapping land inside the body text.
-//   - Runtime errors are rethrown with exact location using panicRt, so they
-//     bubble to runTopWithSource and render a single caret at the true site.
-func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
-	nameV := ctx.MustArg("name")
-	bodyV := ctx.MustArg("body")
-	baseV := ctx.MustArg("base")
-
-	if nameV.Tag != VTStr {
-		fail("module name must be a string")
-	}
-	if bodyV.Tag != VTType {
-		fail("internal error: module body must be a Type")
-	}
-
-	tv := bodyV.Data.(*TypeValue)
-	bodyAst := tv.Ast
-
-	// Decode absolute base path from [Int]
-	var base NodePath
-	if baseV.Tag == VTArray {
-		xs := baseV.Data.([]Value)
-		base = make(NodePath, 0, len(xs))
-		for _, v := range xs {
-			if v.Tag != VTInt {
-				fail("internal error: module base path must be [Int]")
+	for _, b := range bases {
+		if p, ok := try(b, spec); ok {
+			bs, err := os.ReadFile(p)
+			if err != nil {
+				return "", "", err
 			}
-			base = append(base, int(v.Data.(int64)))
+			return string(bs), p, nil
 		}
 	}
 
-	// Fresh env for the module (Core is parent so builtins are visible).
-	modEnv := NewEnv(ip.Core)
+	return "", "", fmt.Errorf("prelude not found: %s", spec)
+}
+=== END FILE: runtime.go ===
 
-	// SourceRef rooted at the module BODY path (absolute)
-	var sr *SourceRef
-	if ip.currentSrc != nil {
-		sr = &SourceRef{
-			Name:     ip.currentSrc.Name,
-			Src:      ip.currentSrc.Src,
-			Spans:    ip.currentSrc.Spans,
-			PathBase: base, // IMPORTANT: base is absolute path into the caller source tree
+=== BEGIN FILE: builtin_core.go ===
+package mindscript
+
+import (
+	"fmt"
+)
+
+// Opaque handle for environment snapshots (unexported).
+type envHandle struct {
+	env *Env
+}
+
+// ---- core built-ins ----------------------------------------------------
+
+func registerCoreBuiltins(ip *Interpreter) {
+	ip.RegisterNative(
+		"fail",
+		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
+		S{"id", "Null"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			mv := ctx.MustArg("message")
+			msg := "error"
+			if mv.Tag == VTStr {
+				msg = mv.Data.(string)
+			}
+			fail(msg) // raises rtErr; no return
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "fail", `Fail: throw a runtime error (hard fault).
+
+Params:
+  message: Str? — optional message (default "error")
+
+Returns:
+  Null (never returns)`)
+
+	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
+	ip.RegisterNative(
+		"try",
+		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
+		S{"map"}, // returns a map with ok/value/error
+		func(ip *Interpreter, ctx CallCtx) Value {
+			fv := ctx.MustArg("f")
+			if fv.Tag != VTFun {
+				fail("try expects a function") // contractual → hard error
+			}
+
+			out := Map(map[string]Value{
+				"ok":    Bool(false),
+				"value": Null,
+				"error": Null,
+			})
+
+			var hardErr error
+			var res Value
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						switch sig := r.(type) {
+						case rtErr:
+							hardErr = fmt.Errorf("%s", sig.msg)
+						default:
+							hardErr = fmt.Errorf("runtime panic: %v", r)
+						}
+					}
+				}()
+				res = ip.Call0(fv)
+			}()
+
+			if hardErr != nil {
+				out.Data.(*MapObject).Entries["ok"] = Bool(false)
+				out.Data.(*MapObject).Entries["error"] = Str(hardErr.Error())
+				out.Data.(*MapObject).Entries["value"] = Null
+				return out
+			}
+
+			// treat annotated-null as failure-with-message (soft)
+			if res.Tag == VTNull && res.Annot != "" {
+				out.Data.(*MapObject).Entries["ok"] = Bool(false)
+				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
+				out.Data.(*MapObject).Entries["value"] = Null
+				return out
+			}
+
+			// success
+			out.Data.(*MapObject).Entries["ok"] = Bool(true)
+			out.Data.(*MapObject).Entries["error"] = Null
+			out.Data.(*MapObject).Entries["value"] = res
+			return out
+		},
+	)
+	setBuiltinDoc(ip, "try", `Run a function and capture hard failures.
+
+Returns:
+  { ok: Bool, value: Any, error: Str? }
+
+Notes:
+  • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
+  • If the function returns an annotated null, ok=false and error is that annotation.
+  • On success, ok=true and value is the function's result.`)
+
+	ip.RegisterNative(
+		"clone",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return cloneValue(ctx.MustArg("x"))
+		},
+	)
+	setBuiltinDoc(ip, "clone", `Clone a value (deep-copy).
+
+For maps, preserves key order and per-key annotations. Primitive values are
+returned as-is. Functions, modules, and handles are not duplicated (identity
+is preserved).
+
+Params:
+  x: Any
+
+Returns:
+  Any — a structurally independent copy for arrays/maps`)
+
+	// snapshot(_: Null) -> Any (VTHandle)
+	// Returns an opaque handle to a flattened, cloned snapshot of the visible env.
+	ip.RegisterNative(
+		"snapshot",
+		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			snap := snapshotEnv(ctx.Env())
+			return Value{Tag: VTHandle, Data: &envHandle{env: snap}}
+		},
+	)
+	setBuiltinDoc(ip, "snapshot", `Return an opaque handle to a snapshot of the current environment.
+
+Behavior:
+  • Captures a flattened view of all visible frames (inner shadows outer).
+  • Values are deep-copied where applicable (arrays/maps preserve order/annotations).
+  • Returned handle is opaque (VTHandle).
+
+Params:
+  _: Null
+
+Returns:
+  Any — an opaque handle (VTHandle) representing the snapshot`)
+
+	// typeOf(x: Any) -> Type
+	ip.RegisterNative(
+		"typeOf",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Type"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			return TypeVal(ip.ValueToType(x, ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
+
+This inspects a runtime value and produces its structural Type.
+Useful together with isType/isSubtype for ad-hoc validation.
+
+Params:
+  x: Any — a runtime value
+
+Returns: Type`)
+
+	ip.RegisterNative(
+		"isType",
+		[]ParamSpec{
+			{Name: "x", Type: S{"id", "Any"}},
+			{Name: "T", Type: S{"id", "Type"}},
+		},
+		S{"id", "Bool"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			Tv := ctx.MustArg("T")
+			if Tv.Tag != VTType {
+				fail("isType expects a Type as second argument") // contractual → hard
+			}
+			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "isType", `Check whether a value conforms to a Type.
+
+Params:
+  x: Any   — value to check
+  T: Type  — type to check against (must be a Type value, e.g. type Int)
+
+Returns: Bool`)
+
+	// isSubtype(A: Type, B: Type) -> Bool
+	ip.RegisterNative(
+		"isSubtype",
+		[]ParamSpec{
+			{Name: "A", Type: S{"id", "Type"}},
+			{Name: "B", Type: S{"id", "Type"}},
+		},
+		S{"id", "Bool"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			Av := ctx.MustArg("A")
+			Bv := ctx.MustArg("B")
+			if Av.Tag != VTType || Bv.Tag != VTType {
+				fail("isSubtype expects Types as both arguments") // contractual → hard
+			}
+			A := ip.resolveTypeValue(Av, ctx.Env())
+			B := ip.resolveTypeValue(Bv, ctx.Env())
+			return Bool(ip.IsSubtype(A, B, ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "isSubtype", `Structural subtype test: A <: B.
+
+Function types are compared structurally:
+- Parameters are contravariant
+- Return types are covariant
+- Arrows associate to the right (A -> B -> C == A -> (B -> C))
+
+Params:
+  A: Type — candidate subtype
+  B: Type — candidate supertype
+
+Returns: Bool`)
+
+	// import(path: Str) -> Module
+	// import(path: Str) -> Module (nullable on soft failure)
+	ip.RegisterNative(
+		"import",
+		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			pv := ctx.MustArg("path")
+			if pv.Tag != VTStr {
+				fail("import expects path: Str")
+			}
+			// Use the current importer identity when available (enables relative resolution).
+			importer := ""
+			if n := len(ip.loadStack); n > 0 {
+				importer = ip.loadStack[n-1] // canonical identity of the importing module
+			} else if ip.currentSrc != nil && ip.currentSrc.Name != "" {
+				importer = ip.currentSrc.Name
+			}
+
+			v, err := ip.ImportFile(pv.Data.(string), importer)
+			if err != nil {
+				// HARD: parse errors, import cycles, and module-body contract errors.
+				fail(err.Error())
+			}
+			// SOFT: resolve/fetch issues come back as annotated null with err == nil.
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "import", `Load a module from filesystem or HTTP(S).
+
+Resolution rules:
+  - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
+  - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
+
+Params:
+  path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
+
+Returns:
+  Module (nullable) — the loaded module value; or null with an error annotation on soft failures.`)
+
+	// importCode(name: Str, src: Str) -> Module (nullable if user code returns annotated null)
+	ip.RegisterNative(
+		"importCode",
+		[]ParamSpec{
+			{Name: "name", Type: S{"id", "Str"}},
+			{Name: "src", Type: S{"id", "Str"}},
+		},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			nv := ctx.MustArg("name")
+			sv := ctx.MustArg("src")
+			if nv.Tag != VTStr || sv.Tag != VTStr {
+				fail("importCode expects (name: Str, src: Str)")
+			}
+			name := nv.Data.(string)
+			src := sv.Data.(string)
+
+			// The loader assigns a synthetic identity "mem:<name>" internally.
+			v, err := ip.ImportCode(name, src)
+			if err != nil {
+				// HARD: parse errors; module-body contract errors.
+				fail(err.Error())
+			}
+			// Module body may deliberately produce annotated null; propagate as-is (SOFT).
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "importCode", `Evaluate source text as a module in memory.
+
+Parses 'src' and evaluates it as a module named 'name' (no caching).
+The module's environment is fresh and parented to Core.
+The synthetic identity "mem:<name>" is used for cycle detection.
+
+Params:
+  name: Str — display name for diagnostics and identity ("mem:<name>").
+  src:  Str — MindScript source code.
+
+Returns:
+  Module (nullable) — the created module value; or null with an error annotation if the
+  user code intentionally returns a soft failure.`)
+
+	// mapHas(obj: {}, key: Str) -> Bool
+	ip.RegisterNative(
+		"mapHas",
+		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
+		S{"id", "Bool"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("obj")
+			k := ctx.MustArg("key").Data.(string)
+			if v.Tag != VTMap {
+				fail("mapHas expects a map") // contractual → hard
+			}
+			mo := v.Data.(*MapObject)
+			_, ok := mo.Entries[k]
+			return Bool(ok)
+		},
+	)
+	setBuiltinDoc(ip, "mapHas", `Return true if a key exists in a map.
+
+Params:
+  obj: {}  — a map value
+  key: Str — property name
+
+Returns:
+  Bool`)
+
+	// mapDelete(obj: {}, key: Str) -> {}
+	ip.RegisterNative(
+		"mapDelete",
+		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
+		S{"map"}, // returns the (mutated) input map
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("obj")
+			k := ctx.MustArg("key").Data.(string)
+			if v.Tag != VTMap {
+				fail("mapDelete expects a map") // contractual → hard
+			}
+			mo := v.Data.(*MapObject)
+			if _, ok := mo.Entries[k]; !ok {
+				return v // no-op
+			}
+			// delete from Entries
+			delete(mo.Entries, k)
+			// delete annotation if present
+			delete(mo.KeyAnn, k)
+			// remove from Keys while preserving order
+			keys := mo.Keys[:0]
+			for _, kk := range mo.Keys {
+				if kk != k {
+					keys = append(keys, kk)
+				}
+			}
+			mo.Keys = keys
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "mapDelete", `Delete a property from a map (in place).
+
+Preserves the key order and per-key annotations for the remaining entries.
+
+Params:
+  obj: {}  — a map value (mutated)
+  key: Str — property name to remove
+
+Returns:
+  {} — the same map value`)
+}
+
+// --- Deep copy & snapshot for isolated worlds --------------------------------
+
+func cloneValue(v Value) Value {
+	switch v.Tag {
+	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
+		return v
+	case VTArray:
+		xs := v.Data.([]Value)
+		cp := make([]Value, len(xs))
+		for i := range xs {
+			cp[i] = cloneValue(xs[i])
 		}
-	}
-
-	// JIT + run (like runTopWithSource, but we handle errors to avoid re-wrap)
-	ch := ip.jitTop(bodyAst, sr)
-
-	prev := ip.currentSrc
-	ip.currentSrc = ch.Src
-	res := ip.runChunk(ch, modEnv, 0)
-	ip.currentSrc = prev
-
-	switch res.status {
-	case vmOK, vmReturn:
-		// ok
-	case vmRuntimeError:
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		msg := res.value.Annot
-		if msg == "" {
-			msg = "runtime error"
+		return Arr(cp)
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		// Deep-copy entries
+		entries := make(map[string]Value, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			entries[k] = cloneValue(vv)
 		}
-		// Rethrow as structured inner-source error (single caret at true site).
-		panicRt(msg, ch.Src, line, col)
+		// Preserve insertion order and per-key annotations
+		keys := make([]string, len(mo.Keys))
+		copy(keys, mo.Keys)
+		keyAnn := make(map[string]string, len(mo.KeyAnn))
+		for k, ann := range mo.KeyAnn {
+			keyAnn[k] = ann
+		}
+		return Value{
+			Tag: VTMap,
+			Data: &MapObject{
+				Entries: entries,
+				KeyAnn:  keyAnn,
+				Keys:    keys,
+			},
+		}
 	default:
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		panicRt("unknown VM status", ch.Src, line, col)
+		// Userdata/modules/handles are NOT copied (identity preserved).
+		return v
 	}
-
-	// Snapshot exports
-	mo := buildModuleMap(modEnv)
-	m := &Module{Name: nameV.Data.(string), Map: mo, Env: modEnv}
-	return Value{Tag: VTModule, Data: m}
 }
-=== END FILE: modules.go ===
+
+func snapshotEnv(e *Env) *Env {
+	// Flatten chain into one level (shadowing by nearer scopes wins).
+	flat := map[string]Value{}
+	for cur := e; cur != nil; cur = cur.parent {
+		for k, v := range cur.table {
+			if _, exists := flat[k]; !exists {
+				flat[k] = cloneValue(v)
+			}
+		}
+	}
+	cp := NewEnv(nil)
+	for k, v := range flat {
+		cp.Define(k, v)
+	}
+	return cp
+}
+=== END FILE: builtin_core.go ===
 

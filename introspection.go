@@ -91,11 +91,12 @@ func (ip *Interpreter) IxReify(rt Value) (Value, error) {
 	if ixContainsTag(ast, "handle") {
 		return Value{}, fmt.Errorf("cannot reify handle constructs")
 	}
-	if ixContainsTag(ast, "module") {
-		return Value{}, fmt.Errorf("module capsules are not installed by IxReify")
-	}
+	// Rewrite any ("module", ["str", name], ("pair", ["id", k], ctor)*) capsules
+	// into the inline module form understood by the interpreter:
+	// ("module", ["str", name], ("block", ("assign", ("decl", k), ctor)*))
+	lowered := ixLowerModuleCapsules(ast)
 	// Evaluate in Global (same as EvalPersistent).
-	return ip.EvalPersistent(ast)
+	return ip.EvalPersistent(lowered)
 }
 
 //// END_OF_PUBLIC
@@ -348,4 +349,103 @@ func ixContainsTag(n S, want string) bool {
 		}
 	}
 	return false
+}
+
+// ---------- Module capsule lowering ----------
+// A "module capsule" (from IxReflect) looks like:
+//
+//	("module", ("str", name), ("pair", ("id", export), ctor)*)
+//
+// We lower it to the inline VM form:
+//
+//	("module", ("str", name), ("block", ("assign", ("decl", export), ctor)*))
+//
+// This lets the normal module pipeline (caching, cycle detection, span rooting)
+// handle installation via nativeMakeModule.
+func ixLowerModuleCapsules(n S) S {
+	if len(n) == 0 {
+		return n
+	}
+	if isModuleCapsule(n) {
+		name := "" // safe default
+		if hdr, ok := n[1].(S); ok && len(hdr) >= 2 {
+			if t, _ := hdr[0].(string); t == "str" {
+				if s, _ := hdr[1].(string); s != "" {
+					name = s
+				}
+			}
+		}
+		body := S{"block"}
+		for i := 2; i < len(n); i++ {
+			pair, ok := n[i].(S)
+			if !ok || len(pair) < 3 {
+				continue
+			}
+			ptag, _ := pair[0].(string)
+			if ptag != "pair" && ptag != "pair!" {
+				continue
+			}
+			idNode, _ := pair[1].(S)
+			if len(idNode) < 2 {
+				continue
+			}
+			if idTag, _ := idNode[0].(string); idTag != "id" {
+				continue
+			}
+			key, _ := idNode[1].(string)
+			ctor, _ := pair[2].(S)
+			// Recursively lower nested capsules inside constructor code.
+			ctor = ixLowerModuleCapsules(ctor)
+			body = append(body, S{"assign", S{"decl", key}, ctor})
+		}
+		return S{"module", S{"str", name}, body}
+	}
+	// Generic deep copy + rewrite.
+	out := make(S, 0, len(n))
+	out = append(out, n[0])
+	for i := 1; i < len(n); i++ {
+		switch c := n[i].(type) {
+		case S:
+			out = append(out, ixLowerModuleCapsules(c))
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func isModuleCapsule(n S) bool {
+	if len(n) < 2 {
+		return false
+	}
+	if tag, _ := n[0].(string); tag != "module" {
+		return false
+	}
+	// Second element must be ("str", name)
+	hdr, ok := n[1].(S)
+	if !ok || len(hdr) < 2 {
+		return false
+	}
+	if t, _ := hdr[0].(string); t != "str" {
+		return false
+	}
+	// Remaining elements must all be ("pair" | "pair!", ("id", k), ctor)
+	for i := 2; i < len(n); i++ {
+		p, ok := n[i].(S)
+		if !ok || len(p) < 3 {
+			return false
+		}
+		ptag, _ := p[0].(string)
+		if ptag != "pair" && ptag != "pair!" {
+			return false
+		}
+		idn, ok := p[1].(S)
+		if !ok || len(idn) < 2 {
+			return false
+		}
+		if it, _ := idn[0].(string); it != "id" {
+			return false
+		}
+	}
+	return true
 }

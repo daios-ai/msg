@@ -117,7 +117,7 @@ func TestIxFromS_NoValidation_IxReifyHardFails(t *testing.T) {
 	}
 }
 
-func TestReflect_ScalarsAndNegatives(t *testing.T) {
+func Test_Introspection_ScalarsAndNegatives(t *testing.T) {
 	cases := []struct {
 		val  Value
 		want Value
@@ -134,7 +134,7 @@ func TestReflect_ScalarsAndNegatives(t *testing.T) {
 	}
 }
 
-func TestReflect_ArrayMap_WithRequirednessAndKeyAnn(t *testing.T) {
+func Test_Introspection_ArrayMap_WithRequirednessAndKeyAnn(t *testing.T) {
 	mo := &MapObject{
 		Entries: map[string]Value{},
 		KeyAnn:  map[string]string{},
@@ -171,7 +171,7 @@ func TestReflect_ArrayMap_WithRequirednessAndKeyAnn(t *testing.T) {
 	mustEqValue(t, got, want)
 }
 
-func TestReflect_Fun_Native_Id(t *testing.T) {
+func Test_Introspection_Fun_Native_Id(t *testing.T) {
 	// Native function reflects to ["id", name]
 	fn := &Fun{NativeName: "now"}
 	nv := FunVal(fn)
@@ -181,7 +181,7 @@ func TestReflect_Fun_Native_Id(t *testing.T) {
 	mustEqValue(t, got, want)
 }
 
-func TestReflect_Fun_UserConstructor(t *testing.T) {
+func Test_Introspection_Fun_UserConstructor(t *testing.T) {
 	f := &Fun{
 		Params:     []string{"x"},
 		ParamTypes: []S{S{"id", "Int"}},
@@ -209,7 +209,7 @@ func TestReflect_Fun_UserConstructor(t *testing.T) {
 	mustEqValue(t, got, want)
 }
 
-func TestReflect_Type_AsConstructor(t *testing.T) {
+func Test_Introspection_Type_AsConstructor(t *testing.T) {
 	tv := TypeVal(S{"array", S{"id", "Int"}}) // Type value
 	got := IxReflect(tv)
 	want := vArray(
@@ -219,7 +219,7 @@ func TestReflect_Type_AsConstructor(t *testing.T) {
 	mustEqValue(t, got, want)
 }
 
-func TestReflect_Handle_SoftError(t *testing.T) {
+func Test_Introspection_Handle_SoftError(t *testing.T) {
 	h := Value{Tag: VTHandle, Data: "opaque"}
 	got := IxReflect(h)
 	// We only assert it's an annotated-null soft error.
@@ -246,19 +246,11 @@ func TestIxReify_SimpleProgram_Evaluates(t *testing.T) {
 	}
 }
 
-func TestIxReify_Rejects_ModuleAndHandle(t *testing.T) {
+func TestIxReify_Rejects_Handle(t *testing.T) {
 	ip := NewInterpreter()
 
-	rtModule := vArray(
-		vStr("module"),
-		vArray(vStr("str"), vStr("math")),
-		// empty exports ok syntactically
-	)
-	_, err := ip.IxReify(rtModule)
-	mustErr(t, err)
-
 	rtHandle := vArray(vStr("handle"))
-	_, err = ip.IxReify(rtHandle)
+	_, err := ip.IxReify(rtHandle)
 	mustErr(t, err)
 }
 
@@ -286,4 +278,155 @@ func ixMustCtorS(v Value) S {
 		panic(errors.New("no constructor S for value"))
 	}
 	return s
+}
+func Test_Introspection_IxReflect_ModuleCapsule(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Build a simple module via source, then reflect it.
+	src := `module "Refl" do
+  let a = 1
+end`
+	v, err := ip.EvalPersistentSource(src)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource failed: %v", err)
+	}
+	if v.Tag != VTModule {
+		t.Fatalf("expected VTModule, got %v", v.Tag)
+	}
+
+	got := IxReflect(v)
+
+	// Expect a module capsule:
+	// ["module", ["str","Refl"], ("pair", ["id","a"], ["int",1])]
+	want := vArray(
+		vStr("module"),
+		vArray(vStr("str"), vStr("Refl")),
+		vArray(
+			vStr("pair"),
+			vArray(vStr("id"), vStr("a")),
+			vArray(vStr("int"), vInt(1)),
+		),
+	)
+	mustEqValue(t, got, want)
+}
+
+func Test_Introspection_IxReify_ModuleCapsule_LowersAndCaches(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Register a native "tick" that increments ip.Global["counter"] and returns the new value.
+	ip.Global.Define("counter", vInt(0))
+	ip.RegisterNative(
+		"tick",
+		[]ParamSpec{},
+		S{"id", "Int"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			// read
+			cv, err := ip.Global.Get("counter")
+			if err != nil {
+				ip.Global.Define("counter", vInt(0))
+				cv = vInt(0)
+			}
+			n := cv.Data.(int64) + 1
+			_ = ip.Global.Set("counter", vInt(n)) // Set must succeed (binding exists)
+			return vInt(n)
+		},
+	)
+
+	// Capsule:
+	// ["module", ["str","M"], ("pair", ["id","x"], ["call", ["id","tick"]])]
+	rt := vArray(
+		vStr("module"),
+		vArray(vStr("str"), vStr("M")),
+		vArray(
+			vStr("pair"),
+			vArray(vStr("id"), vStr("x")),
+			vArray(vStr("call"), vArray(vStr("id"), vStr("tick"))),
+		),
+	)
+
+	// First reify: should execute body (tick once), produce a VTModule with x = 1.
+	v1, err := ip.IxReify(rt)
+	if err != nil {
+		t.Fatalf("IxReify failed: %v", err)
+	}
+	if v1.Tag != VTModule {
+		t.Fatalf("expected VTModule, got %v", v1.Tag)
+	}
+	mv1 := AsMapValue(v1)
+	if mv1.Tag != VTMap {
+		t.Fatalf("AsMapValue should coerce module to map, got %v", mv1.Tag)
+	}
+	mo1 := mv1.Data.(*MapObject)
+	x1, ok := mo1.Entries["x"]
+	if !ok {
+		t.Fatalf("expected export 'x'")
+	}
+	if x1.Tag != VTInt || x1.Data.(int64) != 1 {
+		t.Fatalf("expected x=1, got %#v", x1)
+	}
+	cv1, _ := ip.Global.Get("counter")
+	if cv1.Data.(int64) != 1 {
+		t.Fatalf("expected counter=1 after first install, got %v", cv1)
+	}
+
+	// Second reify of the SAME capsule: must hit cache (no second tick).
+	v2, err := ip.IxReify(rt)
+	if err != nil {
+		t.Fatalf("IxReify failed on second install: %v", err)
+	}
+	if v2.Tag != VTModule {
+		t.Fatalf("expected VTModule, got %v", v2.Tag)
+	}
+	// Same Module pointer proves the cache was used.
+	m1 := v1.Data.(*Module)
+	m2 := v2.Data.(*Module)
+	if m1 != m2 {
+		t.Fatalf("expected cached module pointer; got different instances")
+	}
+	cv2, _ := ip.Global.Get("counter")
+	if cv2.Data.(int64) != 1 {
+		t.Fatalf("expected counter to remain 1 (cache hit), got %v", cv2)
+	}
+}
+
+func Test_Introspection_IxReify_ModuleCapsule_Nested(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Outer capsule exports "sub" which itself is a module capsule "Inner" exporting y=2.
+	rt := vArray(
+		vStr("module"),
+		vArray(vStr("str"), vStr("Outer")),
+		vArray(
+			vStr("pair"),
+			vArray(vStr("id"), vStr("sub")),
+			vArray(
+				vStr("module"),
+				vArray(vStr("str"), vStr("Inner")),
+				vArray(
+					vStr("pair"),
+					vArray(vStr("id"), vStr("y")),
+					vArray(vStr("int"), vInt(2)),
+				),
+			),
+		),
+	)
+
+	v, err := ip.IxReify(rt)
+	if err != nil {
+		t.Fatalf("IxReify failed: %v", err)
+	}
+	if v.Tag != VTModule {
+		t.Fatalf("expected VTModule for outer, got %v", v.Tag)
+	}
+
+	outer := AsMapValue(v).Data.(*MapObject)
+	sub, ok := outer.Entries["sub"]
+	if !ok || sub.Tag != VTModule {
+		t.Fatalf("expected outer.sub to be a module, got %#v", sub)
+	}
+	inner := AsMapValue(sub).Data.(*MapObject)
+	y, ok := inner.Entries["y"]
+	if !ok || y.Tag != VTInt || y.Data.(int64) != 2 {
+		t.Fatalf("expected inner.y = 2, got %#v", y)
+	}
 }

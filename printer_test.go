@@ -587,3 +587,58 @@ userId: id, profile: { name: n } } = obj`,
 		}
 	}
 }
+func Test_Printer_Module_Basic(t *testing.T) {
+	in := `module MyLib do x = 1 end`
+	want := "module MyLib do\n" +
+		"\tx = 1\n" +
+		"end"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_StringName_EmptyBody(t *testing.T) {
+	in := `module "my mod" do end`
+	want := "module \"my mod\" do\n" +
+		"end"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_NameExpression(t *testing.T) {
+	// Name can be any expression; ensure precedence/parentheses are handled.
+	in := `module "a" + "b" do end`
+	// (+) has lower precedence than a primary, so printer should parenthesize.
+	want := "module \"a\" + \"b\" do\n" + // name position uses normal expr printing
+		"end"
+	got := pretty(t, in)
+	// Note: the header prints the name expression with minimal parens;
+	// for simple "+", no extra parens are introduced because it sits
+	// directly after "module ".
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_With_PreAnnotation(t *testing.T) {
+	in := `# about this module
+module M do
+end`
+	want := "# about this module\n" +
+		"module M do\n" +
+		"end"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_Amid_Other_Statements(t *testing.T) {
+	in := `let x = 1
+module M do
+  x = 2
+end
+return x`
+	want := "let x = 1\n" +
+		"module M do\n" +
+		"\tx = 2\n" +
+		"end\n" +
+		"return(x)"
+	got := pretty(t, in)
+	eq(t, got, want)
+}

@@ -592,6 +592,14 @@ func (p *pp) printStmt(n S) {
 		p.pad()
 		p.write("end")
 
+	case "module":
+		// ("module", nameExpr, bodyBlock)
+		nameExpr, body := n[1].(S), n[2].(S)
+		p.kwBlock(func() {
+			p.write("module ")
+			p.printExpr(nameExpr)
+		}, body)
+
 	case "type":
 		p.pad()
 		p.write("type ")
@@ -765,6 +773,9 @@ func (p *pp) printExpr(n S) {
 		p.write("let " + getId(n))
 
 	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
+		p.printStmt(n)
+
+	case "module":
 		p.printStmt(n)
 
 	default:

@@ -26,10 +26,11 @@
 //   - (*Interpreter).ImportAST(name string, ast S) (Value, error)
 //     Evaluate a *ready AST* as a module and return a `VTModule`. No cache.
 //     Evaluation happens in a fresh env parented to the interpreter's Core.
+//     Cycle detection is applied with a synthetic identity "mem:<name>".
 //
 //   - (*Interpreter).ImportCode(name, src string) (Value, error)
-//     Parse `src` into an AST (with rich source-wrapped errors) and delegate
-//     to ImportAST. No cache.
+//     Parse `src` into an AST (with spans for precise caret mapping) and delegate
+//     to the unified loader (no cache). Uses the same cycle handling as ImportAST.
 //
 //   - (*Interpreter).ImportFile(spec, importer string) (Value, error)
 //     Resolve + fetch + parse + evaluate with cycle detection and caching.
@@ -53,10 +54,9 @@
 //     A per-import call stack (`ip.loadStack`) plus an in-progress state guard
 //     detects cycles and produces a friendly `A -> B -> … -> A` chain.
 //  3. Parse + Evaluate
-//     Parsing wraps syntax errors with the *original source* for good diagnostics.
-//     Evaluation runs in an isolated child env of Core. Both runtime annotated
-//     nulls and internal `rtErr` panics are converted into rich errors that
-//     include a display name for the module being loaded.
+//     Parsing wraps syntax errors with the *original source* for good diagnostics,
+//     using spans so runtime errors can point into the module’s own text. Evaluation
+//     runs in an isolated child env of Core.
 //  4. Snapshot
 //     The module’s public surface is captured into a `MapObject`:
 //     • Exported keys are sorted lexicographically (deterministic order).
@@ -64,11 +64,20 @@
 //     `TypeValIn(..., modEnv)` so they resolve under the module’s env.
 //     • If an exported value carries `Annot`, it is mirrored to `KeyAnn[key]`.
 //
-// Error semantics:
-//   - Parse errors are reported as `parse error in <display>:\n<wrapped error>`.
-//   - Runtime failures during module init are reported as
-//     `runtime error in <display>: <message>`.
-//   - Cycles are reported as `import cycle detected: A -> B -> … -> A`.
+// Error semantics (MindScript policy):
+//   - **Contractual/hard errors**: `fail(msg)` for things like type/arity/contract
+//     problems. These bubble out as hard Go errors. Try/catch can handle them at
+//     the language level.
+//   - **Operational/soft errors**: functions return `null` with an annotation.
+//     These are not converted to hard errors.
+//   - This module follows the policy:
+//   - **Parse errors** → hard Go errors: `"parse error in <display>:\n<caret...>"`
+//   - **Import cycles** → hard Go errors: `"import cycle detected: A -> B -> … -> A"`
+//   - **Module body runtime** → propagated *as produced by the runtime*
+//     (contract errors remain hard; annotated `null` stays soft).
+//   - **Resolve/fetch failures** → operational; `ImportFile` returns annotated
+//     `null` with a nil Go error. The `import(...)` builtin simply returns that
+//     `null` value unchanged (see builtins), keeping the failure soft.
 //
 // Caching:
 //   - Only successful loads are cached under the canonical identity.
@@ -79,18 +88,20 @@
 //   - The module cache and import stack are not synchronized; callers should
 //     avoid concurrent ImportFile calls on the same Interpreter.
 //
-// DEPENDENCIES (other files)
-// -------------------------
-//   - lexer.go / parser.go
-//   - ParseSExpr(src string) (S, error) — building ASTs.
-//   - interpreter.go
-//   - types: Value, Env, MapObject, TypeValue, TypeValIn, Null
-//   - methods: EvalASTUncaught, AsMapValue (for module/map coercion)
-//   - struct: Interpreter (fields Core, modules, loadStack)
-//   - errors.go
-//   - WrapErrorWithSource(err, src string) error — enrich parse errors.
-//   - vm.go
-//   - The VM performs property/index reads via (*Module).get (private here).
+// SOURCE MAPPING & SPANS
+// ----------------------
+// Precise error carets require a `SourceRef` carrying the original source and its
+// spans. For `ImportCode` and `ImportFile`, this file parses with
+// `ParseSExprWithSpans` and executes the synthesized ("module", name, body)
+// under a real `SourceRef`. This ensures that runtime errors inside the module
+// body point at the *module’s own text* (or filename for files/URLs) instead of
+// a generic `<module>`.
+//
+// The emitter lowers ("module", …) to a `__make_module` native call and passes
+// an absolute NodePath to the body; `nativeMakeModule` re-roots the SourceRef so
+// that per-instruction marks are mapped to the correct body range. Do not bypass
+// `runTopWithSource` when evaluating modules—VM entry sets up recovery and source
+// plumbing.
 //
 // The remainder of this file is intentionally split into:
 //  1. PUBLIC API — small, heavily documented wrappers that define behavior.
@@ -141,27 +152,36 @@ func (m *Module) Get(key string) (Value, bool) { return m.get(key) }
 // Behavior:
 //   - Evaluates `ast` in a fresh environment parented to `ip.Core`.
 //   - On success, returns a VTModule whose Module.Name = `name`.
-//   - No cache and no cycle detection are involved.
+//   - No cache; cycle detection uses synthetic identity "mem:<name>".
+//   - Source mapping is coarse (no spans); prefer ImportCode when you need
+//     precise carets for module body errors.
 //
 // Errors:
-//   - Runtime failures during evaluation (including annotated nulls) are
-//     converted into rich errors whose messages include `name`.
+//   - **Runtime outcomes propagate as produced by the runtime**.
 func (ip *Interpreter) ImportAST(name string, ast S) (Value, error) {
-	return ip.importAST(name, ast)
+	canon := "mem:" + name
+	// Note: no source text/spans; run with coarse mapping. Still goes through the
+	// unified loader for consistent cycle handling.
+	return ip.importWithBody(canon, name, ast, "", nil, false /*cache*/)
 }
 
 // ImportCode parses source and evaluates it as a module.
 //
 // Behavior:
-//   - Parses `src` into an AST with source-wrapped diagnostics.
-//   - Delegates to ImportAST using the same `name`.
-//   - No cache and no cycle detection are involved.
+//   - Parses `src` into an AST with source-wrapped diagnostics (with spans).
+//   - Delegates to the unified loader using the same `name`.
+//   - No cache; cycle detection uses synthetic identity "mem:<name>".
 //
 // Errors:
 //   - Syntax errors are wrapped with source and labeled with `name`.
-//   - Runtime failures during evaluation are reported like ImportAST.
+//   - **Runtime outcomes propagate as produced by the runtime**.
 func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
-	return ip.importCode(name, src)
+	ast, spans, perr := parseSourceWithSpans(name, src)
+	if perr != nil {
+		return Null, perr
+	}
+	canon := "mem:" + name
+	return ip.importWithBody(canon, name, ast, src, spans, false /*cache*/)
 }
 
 // ImportFile resolves, fetches, parses, evaluates, caches, and detects cycles.
@@ -174,10 +194,22 @@ func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
 //   - On success, returns a VTModule whose Module.Name is the canonical identity.
 //
 // Errors:
-//   - Parse/runtime errors are enriched with display context.
+//   - Parse errors are enriched with display context.
 //   - Cycles are reported using a compact `A -> B -> … -> A` chain.
+//   - **Runtime outcomes from executing the module body propagate as produced by the runtime**.
+//   - **Resolve/fetch failures** are converted to annotated null (SOFT) with a nil Go error.
+//     The `import(...)` builtin returns that value unchanged.
 func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
-	return ip.importFile(spec, importer)
+	src, display, canon, rerr := resolveAndFetch(spec, importer)
+	if rerr != nil {
+		// Operational: soft error. Return annotated null with no Go error.
+		return annotNull(fmt.Sprintf("import %q: %v", spec, rerr)), nil
+	}
+	ast, spans, perr := parseSourceWithSpans(display, src)
+	if perr != nil {
+		return Null, perr
+	}
+	return ip.importWithBody(canon, display, ast, src, spans, true /*cache*/)
 }
 
 //// END_OF_PUBLIC
@@ -213,37 +245,23 @@ func (m *Module) get(key string) (Value, bool) {
 	return v, ok
 }
 
-// ---- Public-ish entry points (backing the exported wrappers) ---------------
+// ---- Unified module import path --------------------------------------------
 
-// importAST creates a module from a READY AST, evaluating it in an Env parented to Core.
-// The produced module is NOT cached (no cycles involved).
-func (ip *Interpreter) importAST(name string, ast S) (Value, error) {
-	m, err := ip.buildModuleFromAST(name, ast)
-	if err != nil {
-		return Null, err
-	}
-	m.Name = name
-	return Value{Tag: VTModule, Data: m}, nil
-}
-
-// importCode parses source then delegates to importAST. No cache/cycle handling here.
-func (ip *Interpreter) importCode(name string, src string) (Value, error) {
-	ast, err := parseSource(name, src)
-	if err != nil {
-		return Null, err
-	}
-	return ip.importAST(name, ast)
-}
-
-// importFile resolves (FS/HTTP), parses, evaluates, caches successes, and detects cycles.
-func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
-	// Resolve + fetch → (src, display, canon)
-	src, display, canon, rerr := resolveAndFetch(spec, importer)
-	if rerr != nil {
-		return Null, rerr
-	}
-
-	// Detect cycles against canonical key
+// importWithBody is the unified implementation all public import forms converge on.
+//
+// Responsibilities:
+//   - Cycle detection using the canonical identity (`canon`). We use a per-call
+//     stack (`ip.loadStack`) and also guard against re-entry on the cache record.
+//   - Optional cache lookup/commit of successful loads.
+//   - Execution of the ("module", name, body) wrapper under a proper SourceRef,
+//     so module-body errors show precise carets in the module’s own text.
+//   - Propagate runtime outcomes as-is (no reclassification).
+//
+// `display` is the user-facing name (file path, URL, or friendly label).
+// `src`/`spans` may be empty/nil (e.g., ImportAST), in which case caret
+// mapping will be coarse (still correct but not as precise).
+func (ip *Interpreter) importWithBody(canon string, display string, body S, src string, spans *SpanIndex, useCache bool) (Value, error) {
+	// 1) Cycle detection against canonical identity
 	for _, s := range ip.loadStack {
 		if s == canon {
 			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
@@ -252,42 +270,43 @@ func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 	ip.loadStack = append(ip.loadStack, canon)
 	defer func() { ip.loadStack = ip.loadStack[:len(ip.loadStack)-1] }()
 
-	// Cache lookup
-	if ip.modules == nil {
-		ip.modules = map[string]*moduleRec{}
-	}
-	if rec, ok := ip.modules[canon]; ok {
-		if rec.state == modLoading {
-			return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
+	// 2) Cache
+	if useCache {
+		if ip.modules == nil {
+			ip.modules = map[string]*moduleRec{}
 		}
-		if rec.state == modLoaded && rec.mod != nil {
-			return Value{Tag: VTModule, Data: rec.mod}, nil
+		if rec, ok := ip.modules[canon]; ok {
+			if rec.state == modLoading {
+				return Null, fmt.Errorf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon))
+			}
+			if rec.state == modLoaded && rec.mod != nil {
+				return Value{Tag: VTModule, Data: rec.mod}, nil
+			}
 		}
+		// mark as loading to catch re-entrancy
+		ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
 	}
 
-	// Mark loading
-	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
-
-	// Parse (shared helper)
-	ast, perr := parseSource(display, src)
-	if perr != nil {
-		delete(ip.modules, canon) // do not cache failures
-		return Null, perr
-	}
-
-	// Build module from AST (shared helper)
-	m, err := ip.buildModuleFromAST(display, ast)
+	// 3) Build & execute the module with proper source info
+	m, err := ip.buildModuleFromBody(display, src, body, spans)
 	if err != nil {
-		delete(ip.modules, canon) // do not cache failures
+		// Do not cache failures
+		if useCache {
+			delete(ip.modules, canon)
+		}
 		return Null, err
 	}
 
-	// Commit success to cache
+	// 4) Success → name + cache commit
+	m.Name = canon
+	if !useCache {
+		return Value{Tag: VTModule, Data: m}, nil
+	}
+
 	rec := ip.modules[canon]
 	rec.displayName = display
 	rec.src = src
 	rec.env = m.Env
-	m.Name = canon
 	rec.mod = m
 	rec.state = modLoaded
 	rec.err = nil
@@ -295,53 +314,61 @@ func (ip *Interpreter) importFile(spec string, importer string) (Value, error) {
 	return Value{Tag: VTModule, Data: rec.mod}, nil
 }
 
-// ---- Shared helpers ---------------------------------------------------------
-
-// parseSource parses src into an S-expr AST and wraps errors with source context.
-func parseSource(display string, src string) (S, error) {
-	ast, perr := ParseSExpr(src)
+// parseSourceWithSpans parses src into an S-expr AST + spans and wraps errors with source context.
+// Implementation note: always prefer this (vs ParseSExpr) when you have the source text, so we
+// can produce precise caret diagnostics during module execution.
+func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
+	ast, spans, perr := ParseSExprWithSpans(src)
 	if perr != nil {
 		perr = WrapErrorWithSource(perr, src)
-		return nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
+		return nil, nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
 	}
-	return ast, nil
+	return ast, spans, nil
 }
 
-// buildModuleFromAST evaluates ast in an Env parented to Core and snapshots the public surface.
-// Runtime annotated nulls and rtErr panics are converted to rich errors with display context.
-func (ip *Interpreter) buildModuleFromAST(display string, ast S) (*Module, error) {
-	modEnv := NewEnv(ip.Core)
-
-	// Prefer direct evaluation that returns (Value, error).
-	// This respects runtimeErrorsAsGoError=true and doesn't drop errors.
-	var v Value
-	var err error
-
-	if len(ast) > 0 {
-		v, err = ip.runTopWithSource(ast, modEnv, false, nil)
+// buildModuleFromBody evaluates the *body* AST as a module by lowering to
+// ("module", ("str", display), body) and running it via runTopWithSource
+// under a SourceRef that points to the module's own source text and spans.
+//
+// **Runtime outcomes propagate as produced by the runtime**: contract errors
+// become hard Go errors; annotated nulls remain soft. We do not re-wrap them.
+//
+// IMPORTANT: Do not call __make_module directly from here. VM entry (`runTopWithSource`)
+// installs recovery and anchors ip.currentSrc, and the emitter will pass the body’s
+// absolute NodePath as `base` into the native, ensuring perfect caret mapping.
+func (ip *Interpreter) buildModuleFromBody(display string, src string, body S, spans *SpanIndex) (*Module, error) {
+	// Prepare SourceRef for the *module file/source* so the emitter can hand the
+	// absolute body path to __make_module, and the VM can render correct carets.
+	var sr *SourceRef
+	if src != "" && spans != nil {
+		sr = &SourceRef{Name: display, Src: src, Spans: spans}
 	}
 
-	// Convert failures into the conventional module error wording.
+	// Lower to ("module", name, body) — emitter will call __make_module with
+	// a base path that points exactly at the body.
+	modAst := S{"module", S{"str", display}, body}
+
+	// Evaluate in an env that sees Core + natives, with proper VM entry (recover + mapping).
+	env := NewEnv(ip.Core)
+	v, err := ip.runTopWithSource(modAst, env, false, sr)
 	if err != nil {
-		return nil, fmt.Errorf("runtime error in %s: %s", display, err.Error())
+		// Hard runtime/parse errors propagate as Go errors (with carets).
+		return nil, err
 	}
-	if v.Tag == VTNull && v.Annot != "" {
-		return nil, fmt.Errorf("runtime error in %s: %s", display, v.Annot)
+	if v.Tag != VTModule {
+		// Invariant: module evaluation must return a module.
+		return nil, fmt.Errorf("internal error: expected module value")
 	}
-
-	// Snapshot public surface (ordered keys, key annotations, pin VTType envs)
-	mo := buildModuleMap(modEnv)
-
-	return &Module{
-		Map: mo,
-		Env: modEnv,
-	}, nil
+	return v.Data.(*Module), nil
 }
 
 // buildModuleMap snapshots modEnv.table into a MapObject:
 // • Keys are sorted for determinism (Env.table is a Go map).
 // • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
 // • If a value carries Annot, mirror it into KeyAnn for that key.
+//
+// NOTE: This surfaces the module’s public shape in a deterministic order even
+// though Env.table is unordered, which keeps iteration/tests stable.
 func buildModuleMap(modEnv *Env) *MapObject {
 	keys := make([]string, 0, len(modEnv.table))
 	for k := range modEnv.table {
@@ -390,6 +417,9 @@ const defaultModuleExt = ".ms" // adjust if you prefer a different extension
 //   - Resolve relative specs against importer dir → CWD → MindScriptPath.
 //   - If spec has no extension, try spec+defaultModuleExt then spec.
 //   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
+//
+// NOTE: This function returns Go errors; ImportFile is responsible for classifying
+// them as soft (annotated null) at the API boundary for operational failures.
 func resolveAndFetch(spec string, importer string) (string, string, string, error) {
 	// Network?
 	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
@@ -419,9 +449,11 @@ func resolveAndFetch(spec string, importer string) (string, string, string, erro
 
 func resolveFS(spec string, importer string) (string, error) {
 	var bases []string
+	// Prefer the importer’s directory, if present and not a URL.
 	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
 		bases = append(bases, filepath.Dir(importer))
 	}
+	// Then the current working directory.
 	if cwd, err := os.Getwd(); err == nil {
 		bases = append(bases, cwd)
 	}
@@ -528,6 +560,19 @@ func joinCyclePath(stack []string, again string) string {
 	return strings.Join(out, " -> ")
 }
 
+// nativeMakeModule is the implementation of the __make_module primitive.
+//
+// It receives:
+//   - name: Str  — user-facing module name for diagnostics (display)
+//   - body: Type — AST for the module body wrapped as a type value
+//   - base: [Int] — absolute NodePath indicating where the body lives in the
+//     *caller’s* SourceRef; used to re-root spans to the body.
+//
+// Important plumbing:
+//   - We build a child SourceRef with PathBase = base so that VM marks and
+//     PC→(line,col) mapping land inside the body text.
+//   - Runtime errors are rethrown with exact location using panicRt, so they
+//     bubble to runTopWithSource and render a single caret at the true site.
 func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	nameV := ctx.MustArg("name")
 	bodyV := ctx.MustArg("body")
@@ -543,7 +588,7 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	tv := bodyV.Data.(*TypeValue)
 	bodyAst := tv.Ast
 
-	// decode absolute base path from [Int]
+	// Decode absolute base path from [Int]
 	var base NodePath
 	if baseV.Tag == VTArray {
 		xs := baseV.Data.([]Value)
@@ -556,7 +601,7 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 		}
 	}
 
-	// fresh env
+	// Fresh env for the module (Core is parent so builtins are visible).
 	modEnv := NewEnv(ip.Core)
 
 	// SourceRef rooted at the module BODY path (absolute)
@@ -566,7 +611,7 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 			Name:     ip.currentSrc.Name,
 			Src:      ip.currentSrc.Src,
 			Spans:    ip.currentSrc.Spans,
-			PathBase: base, // IMPORTANT: use base as-is (no extra prefix)
+			PathBase: base, // IMPORTANT: base is absolute path into the caller source tree
 		}
 	}
 
@@ -587,14 +632,14 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 		if msg == "" {
 			msg = "runtime error"
 		}
-		// rethrow as structured inner-source error (single caret at true site)
+		// Rethrow as structured inner-source error (single caret at true site).
 		panicRt(msg, ch.Src, line, col)
 	default:
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
 		panicRt("unknown VM status", ch.Src, line, col)
 	}
 
-	// snapshot exports
+	// Snapshot exports
 	mo := buildModuleMap(modEnv)
 	m := &Module{Name: nameV.Data.(string), Map: mo, Env: modEnv}
 	return Value{Tag: VTModule, Data: m}

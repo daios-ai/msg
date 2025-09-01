@@ -2,7 +2,6 @@ package mindscript
 
 import (
 	"fmt"
-	"strings"
 )
 
 // Opaque handle for environment snapshots (unexported).
@@ -221,6 +220,7 @@ Params:
 Returns: Bool`)
 
 	// import(path: Str) -> Module
+	// import(path: Str) -> Module (nullable on soft failure)
 	ip.RegisterNative(
 		"import",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
@@ -228,26 +228,38 @@ Returns: Bool`)
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("path")
 			if pv.Tag != VTStr {
-				fail("import expects a string path")
+				fail("import expects path: Str")
 			}
+			// Use the current importer identity when available (enables relative resolution).
 			importer := ""
 			if n := len(ip.loadStack); n > 0 {
-				importer = ip.loadStack[n-1]
+				importer = ip.loadStack[n-1] // canonical identity of the importing module
+			} else if ip.currentSrc != nil && ip.currentSrc.Name != "" {
+				importer = ip.currentSrc.Name
 			}
-			mod, err := ip.importFile(pv.Data.(string), importer)
+
+			v, err := ip.ImportFile(pv.Data.(string), importer)
 			if err != nil {
-				msg := err.Error()
-				if strings.HasPrefix(strings.ToLower(msg), "parse error in ") ||
-					strings.Contains(strings.ToLower(msg), "parse error") {
-					fail(msg) // hard
-				}
-				return annotNull(msg) // soft
+				// HARD: parse errors, import cycles, and module-body contract errors.
+				fail(err.Error())
 			}
-			return mod
+			// SOFT: resolve/fetch issues come back as annotated null with err == nil.
+			return v
 		},
 	)
+	setBuiltinDoc(ip, "import", `Load a module from filesystem or HTTP(S).
 
-	// importCode(name: Str, src: Str) -> Module
+Resolution rules:
+  - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
+  - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
+
+Params:
+  path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
+
+Returns:
+  Module (nullable) — the loaded module value; or null with an error annotation on soft failures.`)
+
+	// importCode(name: Str, src: Str) -> Module (nullable if user code returns annotated null)
 	ip.RegisterNative(
 		"importCode",
 		[]ParamSpec{
@@ -261,22 +273,32 @@ Returns: Bool`)
 			if nv.Tag != VTStr || sv.Tag != VTStr {
 				fail("importCode expects (name: Str, src: Str)")
 			}
-
 			name := nv.Data.(string)
 			src := sv.Data.(string)
 
-			modVal, err := ip.importCode("mem:"+name, src)
+			// The loader assigns a synthetic identity "mem:<name>" internally.
+			v, err := ip.ImportCode(name, src)
 			if err != nil {
-				msg := err.Error()
-				lc := strings.ToLower(msg)
-				if strings.HasPrefix(lc, "parse error in ") || strings.Contains(lc, "parse error") {
-					fail(msg) // hard
-				}
-				return annotNull(msg) // soft
+				// HARD: parse errors; module-body contract errors.
+				fail(err.Error())
 			}
-			return modVal
+			// Module body may deliberately produce annotated null; propagate as-is (SOFT).
+			return v
 		},
 	)
+	setBuiltinDoc(ip, "importCode", `Evaluate source text as a module in memory.
+
+Parses 'src' and evaluates it as a module named 'name' (no caching).
+The module's environment is fresh and parented to Core.
+The synthetic identity "mem:<name>" is used for cycle detection.
+
+Params:
+  name: Str — display name for diagnostics and identity ("mem:<name>").
+  src:  Str — MindScript source code.
+
+Returns:
+  Module (nullable) — the created module value; or null with an error annotation if the
+  user code intentionally returns a soft failure.`)
 
 	// mapHas(obj: {}, key: Str) -> Bool
 	ip.RegisterNative(

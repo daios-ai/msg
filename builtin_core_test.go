@@ -174,8 +174,8 @@ func Test_Builtin_Core_import_and_importCode_paths(t *testing.T) {
 	wantErrContains(t, err, "parse error")
 
 	// importCode: runtime failure during init becomes annotated null
-	v2 := evalWithIP(t, ip, `importCode("m2", "fail(\"boom\")")`)
-	wantAnnotatedContains(t, v2, "boom")
+	_, err2 := ip.EvalSource(`importCode("m2", "fail(\"boom\")")`)
+	wantErrContains(t, err2, "boom")
 
 	// importCode: a simple valid module should succeed
 	mod := evalWithIP(t, ip, `importCode("m3", "let answer = 42")`)

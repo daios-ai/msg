@@ -513,7 +513,6 @@ let setNote = fun(x: Any, note: Str?) -> Any do
 	__annotate(note, x)
 end
 
-
 ## -----------------------------
 ## Misc
 ## -----------------------------

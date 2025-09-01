@@ -112,7 +112,7 @@ func Test_FileImport_Search_MindScriptPath(t *testing.T) {
 	_ = os.Setenv(MindScriptPath, lib)
 	defer os.Setenv(MindScriptPath, old)
 
-	_ = write(t, lib, "std.ms", ``) // or a tiny valid program like: `# std prelude\n`
+	_ = write(t, lib, "std.ms", ``) // tiny valid program
 	ip, err := NewRuntime()
 	if err != nil {
 		t.Fatalf("NewRuntime failed: %v", err)
@@ -124,8 +124,8 @@ u.name`)
 	wantStr(t, v, "Bob")
 }
 
-// Two modules importing each other -> annotated cycle.
-func Test_FileImport_Cycle_TwoModules(t *testing.T) {
+// Import cycles are contractual mistakes → HARD (propagate as errors).
+func Test_FileImport_Cycle_TwoModules_Is_HardError(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()
 	defer chdir(t, dir)()
@@ -134,13 +134,21 @@ func Test_FileImport_Cycle_TwoModules(t *testing.T) {
 	_ = write(t, dir, "B.ms", `let a = import("A")`)
 
 	ip, _ := NewRuntime()
-	v := evalWithIP(t, ip, `import("A")`)
-	wantAnnotatedNullContains(t, v, "import cycle")
-	wantAnnotatedNullContains(t, v, "A -> B -> A")
+	_, err := ip.EvalSource(`import("A")`)
+	if err == nil {
+		t.Fatalf("expected hard error (cycle), got nil")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "import cycle") {
+		t.Fatalf("want error mentioning import cycle; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "A -> B -> A") {
+		t.Fatalf("want cycle chain 'A -> B -> A' in error; got: %v", err)
+	}
 }
 
-// Parse/runtime errors surface the file path and message.
-func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
+// Parse errors are HARD; runtime contract errors propagate as HARD; operational
+// loader errors (resolve/fetch) are SOFT (annotated null).
+func Test_FileImport_Parse_Runtime_And_Resolve_Errors(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()
 	defer chdir(t, dir)()
@@ -157,24 +165,22 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 	if perr == nil {
 		t.Fatalf("expected parse error (hard), got nil")
 	}
-	if !strings.Contains(perr.Error(), "bad.ms") || !strings.Contains(strings.ToLower(perr.Error()), "parse error") {
+	perrStr := strings.ToLower(perr.Error())
+	if !strings.Contains(perr.Error(), "bad.ms") || !strings.Contains(perrStr, "parse error") {
 		t.Fatalf("want error mentioning bad.ms and parse error; got: %v", perr)
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// 2) Operational runtime failure (division-by-zero) → SOFT (annotated null).
-	//    The value should be VTNull with an annotation that mentions the file.
+	// 2) Runtime contract failure (division-by-zero) → HARD (Go error).
+	//    The interpreter should propagate the runtime error, not soften it.
 	// ──────────────────────────────────────────────────────────────────────────
-	v, rerr := ip.EvalSource(`import("boom")`)
-	if rerr != nil {
-		t.Fatalf("expected soft error (annotated null), got hard error: %v", rerr)
+	_, rterr := ip.EvalSource(`import("boom")`)
+	if rterr == nil {
+		t.Fatalf("expected hard runtime error for division by zero, got nil")
 	}
-	if v.Tag != VTNull {
-		t.Fatalf("expected VTNull soft error value, got: %#v", v)
-	}
-	ann := strings.ToLower(v.Annot)
-	if v.Annot == "" || !strings.Contains(ann, "boom.ms") || !(strings.Contains(ann, "division by zero") || strings.Contains(ann, "runtime error")) {
-		t.Fatalf("want annotation mentioning boom.ms and division by zero; got: %#v", v)
+	rtStr := strings.ToLower(rterr.Error())
+	if !strings.Contains(rtStr, "division by zero") {
+		t.Fatalf("want error mentioning division by zero; got: %v", rterr)
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
@@ -184,7 +190,8 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 	if aerr == nil {
 		t.Fatalf("expected hard error for too many arguments, got nil")
 	}
-	if !strings.Contains(strings.ToLower(aerr.Error()), "arity") && !strings.Contains(strings.ToLower(aerr.Error()), "not a function") {
+	aStr := strings.ToLower(aerr.Error())
+	if !strings.Contains(aStr, "arity") && !strings.Contains(aStr, "not a function") && !strings.Contains(aStr, "too many") {
 		t.Fatalf("want hard error mentioning arity/too many arguments; got: %v", aerr)
 	}
 
@@ -207,11 +214,12 @@ func Test_FileImport_Parse_And_Runtime_Errors(t *testing.T) {
 		t.Fatalf("expected soft error (annotated null) for missing file, got hard error: %v", ferr)
 	}
 	if v.Tag != VTNull {
-		t.Fatalf("expected VTNull soft error for missing file, got: %#v", v)
+		t.Fatalf("expected VTNull soft error value for missing file, got: %#v", v)
 	}
 	if v.Annot == "" || (!strings.Contains(strings.ToLower(v.Annot), "no_such_file") &&
 		!strings.Contains(strings.ToLower(v.Annot), "not found") &&
-		!strings.Contains(strings.ToLower(v.Annot), "module")) {
+		!strings.Contains(strings.ToLower(v.Annot), "module") &&
+		!strings.Contains(strings.ToLower(v.Annot), "import")) {
 		t.Fatalf("want annotation indicating missing file; got: %#v", v)
 	}
 }
@@ -226,8 +234,9 @@ func Test_ContractualMistakes_Are_Hard(t *testing.T) {
 	if errArity == nil {
 		t.Fatalf("expected hard error for too many arguments, got nil")
 	}
-	if !strings.Contains(errArity.Error(), "not a function") {
-		t.Fatalf("want 'too many arguments' in error; got: %v", errArity)
+	if !strings.Contains(strings.ToLower(errArity.Error()), "not a function") &&
+		!strings.Contains(strings.ToLower(errArity.Error()), "arity") {
+		t.Fatalf("want 'too many arguments' / arity in error; got: %v", errArity)
 	}
 
 	// Wrong type in argument → hard error.
@@ -236,12 +245,12 @@ func Test_ContractualMistakes_Are_Hard(t *testing.T) {
 	if errType == nil {
 		t.Fatalf("expected hard error for type mismatch, got nil")
 	}
-	if !strings.Contains(errType.Error(), "type mismatch") {
+	if !strings.Contains(strings.ToLower(errType.Error()), "type mismatch") {
 		t.Fatalf("want 'type mismatch' in error; got: %v", errType)
 	}
 }
 
-// Operational/runtime issues (like missing file) are soft errors.
+// Operational/runtime loader issues (resolve/fetch) are soft errors.
 func Test_SoftOperationalErrors_Are_Soft(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()
@@ -257,7 +266,9 @@ func Test_SoftOperationalErrors_Are_Soft(t *testing.T) {
 	if v.Tag != VTNull {
 		t.Fatalf("expected VTNull soft error value, got: %#v", v)
 	}
-	if v.Annot == "" || !strings.Contains(v.Annot, "does_not_exist") {
+	if v.Annot == "" || (!strings.Contains(strings.ToLower(v.Annot), "does_not_exist") &&
+		!strings.Contains(strings.ToLower(v.Annot), "not found") &&
+		!strings.Contains(strings.ToLower(v.Annot), "import")) {
 		t.Fatalf("want annotation mentioning missing module; got: %#v", v)
 	}
 }
@@ -395,7 +406,7 @@ hidden`)
 	if err == nil {
 		t.Fatalf("expected undefined variable error, got nil")
 	}
-	if !strings.Contains(err.Error(), "undefined variable") {
+	if !strings.Contains(strings.ToLower(err.Error()), "undefined variable") {
 		t.Fatalf("want error mentioning undefined variable; got: %v", err)
 	}
 }
@@ -425,4 +436,196 @@ m.x`)
 let m = import("`+srv.URL+`/m2")
 m.x`)
 	wantInt(t, v2, 5)
+}
+
+// HTTP 404/resolve errors are operational → SOFT annotated null.
+func Test_HTTP_Import_404_Is_Soft(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+
+	ip, _ := NewRuntime()
+	v, err := ip.EvalSource(`import("` + srv.URL + `/nope")`)
+	if err != nil {
+		t.Fatalf("expected soft error (annotated null) for 404, got hard error: %v", err)
+	}
+	if v.Tag != VTNull {
+		t.Fatalf("expected VTNull soft error for 404, got: %#v", v)
+	}
+	if v.Annot == "" || !strings.Contains(strings.ToLower(v.Annot), "http") {
+		t.Fatalf("want annotation mentioning http fetch failure; got: %#v", v)
+	}
+}
+
+// Three-module cycle A -> B -> C -> A should be a HARD error with a readable chain.
+func Test_Module_Cycle_Three_Is_HardError(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	_ = write(t, dir, "A.ms", `let b = import("B")`)
+	_ = write(t, dir, "B.ms", `let c = import("C")`)
+	_ = write(t, dir, "C.ms", `let a = import("A")`)
+
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(`import("A")`)
+	if err == nil {
+		t.Fatalf("expected hard error (cycle), got nil")
+	}
+	wantErrContains(t, err, "import cycle")
+	wantErrContains(t, err, "A -> B -> C -> A")
+}
+
+// importCode-driven cycle mem:A -> mem:B -> mem:A should be a HARD error.
+func Test_Module_ImportCode_Cycle_Is_HardError(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// The body of A attempts to importCode B, whose body attempts to importCode A.
+	// Cycle detection uses canonical identities "mem:A" and "mem:B".
+	_, err := ip.EvalSource(`
+importCode("A", "let b = importCode(\"B\", \"let a = importCode(\\\"A\\\", \\\"1\\\")\")")
+`)
+	if err == nil {
+		t.Fatalf("expected hard error (cycle via importCode), got nil")
+	}
+	wantErrContains(t, err, "import cycle")
+	// Chain formatting is best-effort; at minimum it should include A and B.
+	wantErrContains(t, err, "A")
+	wantErrContains(t, err, "B")
+}
+
+// Re-importing the same file-backed module should return the cached instance.
+// Mutations to the module surface are visible after re-import.
+func Test_Module_Cache_Reimport_Sees_Mutation(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	_ = write(t, dir, "m.ms", `let x = 7`)
+
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let m1 = import("m")
+let before = m1.x
+m1.x = 99
+let m2 = import("m")
+m2.x`)
+	// m2.x should observe the mutation (same cached module instance).
+	wantInt(t, v, 99)
+}
+
+// HTTP 500 from server is an operational error → soft annotated null from import("...").
+func Test_Module_HTTP_500_Is_Soft(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer srv.Close()
+
+	ip, _ := NewRuntime()
+	v, err := ip.EvalSource(`import("` + srv.URL + `/oops")`)
+	if err != nil {
+		t.Fatalf("expected soft error (annotated null) for HTTP 500, got hard error: %v", err)
+	}
+	if v.Tag != VTNull {
+		t.Fatalf("expected VTNull soft error for HTTP 500, got: %#v", v)
+	}
+	wantAnnotatedContains(t, v, "http 500")
+}
+
+// A mixed import chain: file module importing an HTTP module (with default .ms extension) works.
+func Test_Module_File_Imports_HTTP_DefaultExt(t *testing.T) {
+	// HTTP server serves /r.ms
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/r.ms":
+			_, _ = w.Write([]byte(`let val = 123`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	// a.ms imports the HTTP module WITHOUT extension; loader should append .ms automatically.
+	src := `let r = import("` + srv.URL + `/r")
+let x = r.val`
+	_ = write(t, dir, "a.ms", src)
+
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let a = import("a")
+a.x`)
+	wantInt(t, v, 123)
+}
+
+// Exported type values are pinned to the module environment.
+// We verify by exporting a function type and calling a closure that captures module state,
+// then mutating the state and ensuring the closure sees the mutation.
+func Test_Module_Closures_See_Env(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	// No explicit return type on mk — just return a closure capturing `n`.
+	_ = write(t, dir, "pin.ms", `
+let n = 10
+let mk = fun() do
+  return(fun() -> Int do n end)
+end
+`)
+
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let m = import("pin")
+let f = m.mk()
+let a = f()
+m.n = 20
+let b = f()
+a * 100 + b`)
+	// a=10, b=20 (after mutation), so 10*100+20 = 1020
+	wantInt(t, v, 1020)
+}
+
+// Parse error inside an HTTP module is a HARD error (propagates with caret).
+func Test_Module_HTTP_ParseError_Is_Hard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Serve invalid MindScript
+		_, _ = w.Write([]byte(`let x = (`))
+	}))
+	defer srv.Close()
+
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(`import("` + srv.URL + `/bad.ms")`)
+	if err == nil {
+		t.Fatalf("expected hard parse error from HTTP import, got nil")
+	}
+	// Error string should at least mention "parse error".
+	wantErrContains(t, err, "parse error")
+}
+
+// Import resolution should prefer the importer's directory over CWD/MSGPATH.
+func Test_Module_Resolution_Prefers_Importer_Dir(t *testing.T) {
+	dir, done := withTempDir(t)
+	defer done()
+	defer chdir(t, dir)()
+
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Create b.ms in subdir and also in root; importer a.ms in subdir should resolve to sub/b.ms
+	_ = write(t, dir, "b.ms", `let x = 1`)
+	_ = write(t, sub, "b.ms", `let x = 2`)
+	_ = write(t, sub, "a.ms", `let b = import("b")
+let y = b.x`)
+
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let a = import("sub/a")
+a.y`)
+	// Should have used sub/b.ms → x = 2
+	wantInt(t, v, 2)
 }

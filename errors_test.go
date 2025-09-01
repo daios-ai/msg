@@ -13,12 +13,44 @@ func mustContain(t *testing.T, s, sub string) {
 	}
 }
 
+// Accepts either:
+//
+//	"RUNTIME ERROR at <line>:"
+//
+// or
+//
+//	"RUNTIME ERROR in <anything> at <line>:"
 func mustRuntimeAtLine(t *testing.T, msg string, line int) {
 	t.Helper()
-	want := "RUNTIME ERROR at " + strconv.Itoa(line) + ":"
-	if !strings.Contains(msg, want) {
-		t.Fatalf("expected runtime error to report line %d\n--- output ---\n%s", line, msg)
+	// Old format
+	old := "RUNTIME ERROR at " + strconv.Itoa(line) + ":"
+	if strings.Contains(msg, old) {
+		return
 	}
+	// New format: look for "RUNTIME ERROR in ... at <line>:"
+	prefix := "RUNTIME ERROR in "
+	if i := strings.Index(msg, prefix); i >= 0 {
+		wantTail := " at " + strconv.Itoa(line) + ":"
+		if strings.Contains(msg[i+len(prefix):], wantTail) {
+			return
+		}
+	}
+	t.Fatalf("expected runtime error to report line %d\n--- output ---\n%s", line, msg)
+}
+
+// Accepts either:
+//
+//	"<KIND> at ..."
+//
+// or
+//
+//	"<KIND> in <anything> at ..."
+func mustHaveHeader(t *testing.T, msg, kind string) {
+	t.Helper()
+	if strings.Contains(msg, kind+" in ") || strings.Contains(msg, kind+" at") {
+		return
+	}
+	t.Fatalf("expected header to contain %q (with optional 'in <src>')\n--- output ---\n%s", kind, msg)
 }
 
 func Test_ErrorWrap_Parse_ShowsCaretAndContext(t *testing.T) {
@@ -33,8 +65,8 @@ f(1`
 	}
 	msg := err.Error()
 
-	// Header
-	mustContain(t, msg, "PARSE ERROR at")
+	// Header (allow both old/new)
+	mustHaveHeader(t, msg, "PARSE ERROR")
 	// Context lines (line numbers + source)
 	mustContain(t, msg, "   1 | let x = 1")
 	mustContain(t, msg, "   2 | f(1")
@@ -54,8 +86,8 @@ func Test_ErrorWrap_Lex_ShowsCaretAndContext(t *testing.T) {
 	}
 	msg := err.Error()
 
-	// Header
-	mustContain(t, msg, "LEXICAL ERROR at")
+	// Header (allow both old/new)
+	mustHaveHeader(t, msg, "LEXICAL ERROR")
 	// Context lines
 	mustContain(t, msg, "   1 | let ok = 1")
 	mustContain(t, msg, "   2 | \"bad \\u12GZ\"")
@@ -64,8 +96,6 @@ func Test_ErrorWrap_Lex_ShowsCaretAndContext(t *testing.T) {
 	mustContain(t, msg, "^")
 
 	// A bit of the lexer message to be sure it's the unicode escape path
-	// (exact wording can vary; loosen as needed)
-	// e.g. "unicode escape was not terminated" or "invalid unicode escape"
 	if !(strings.Contains(strings.ToLower(msg), "unicode") || strings.Contains(strings.ToLower(msg), "escape")) {
 		t.Fatalf("expected unicode escape related message, got:\n%s", msg)
 	}

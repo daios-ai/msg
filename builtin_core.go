@@ -219,7 +219,6 @@ Params:
 
 Returns: Bool`)
 
-	// import(path: Str) -> Module
 	// import(path: Str) -> Module (nullable on soft failure)
 	ip.RegisterNative(
 		"import",

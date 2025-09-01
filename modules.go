@@ -227,8 +227,7 @@ func (ip *Interpreter) importWithBody(canonName string, display string, body S, 
 func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
 	ast, spans, perr := ParseSExprWithSpans(src)
 	if perr != nil {
-		perr = WrapErrorWithSource(perr, src)
-		return nil, nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
+		return nil, nil, WrapErrorWithName(perr, display, src)
 	}
 	return ast, spans, nil
 }

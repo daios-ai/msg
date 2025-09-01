@@ -466,25 +466,47 @@ func NewInterpreter() *Interpreter {
 //
 // Returns the resulting Value or a *RuntimeError (as error) on failure.
 func (ip *Interpreter) EvalSource(src string) (Value, error) {
-	return ip._exec.evalSource(src, NewEnv(ip.Global))
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		return Null, WrapErrorWithName(err, "<main>", src)
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	return ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
 }
 
 // Eval evaluates a pre-parsed AST **in a fresh child of Global**.
 // See EvalSource for scoping and error semantics.
 func (ip *Interpreter) Eval(root S) (Value, error) {
-	return ip._exec.evalAST(root, NewEnv(ip.Global))
+	src := FormatSExpr(root)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		return Null, WrapErrorWithName(err, "<main>", src)
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	return ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
 }
 
 // EvalPersistentSource parses and evaluates source **in Global** (REPL-style).
 // Effects directly mutate Global. Returns Value or *RuntimeError (as error).
 func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
-	return ip._exec.evalSource(src, ip.Global)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		return Null, WrapErrorWithName(err, "<repl>", src)
+	}
+	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+	return ip.runTopWithSource(ast, ip.Global, false, sr)
 }
 
 // EvalPersistent evaluates a pre-parsed AST **in Global** (REPL-style).
 // Effects directly mutate Global. Returns Value or *RuntimeError (as error).
 func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
-	return ip._exec.evalAST(root, ip.Global)
+	src := FormatSExpr(root)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		return Null, WrapErrorWithName(err, "<repl>", src)
+	}
+	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+	return ip.runTopWithSource(ast, ip.Global, false, sr)
 }
 
 // EvalAST evaluates an AST in the provided environment exactly as given.

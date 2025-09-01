@@ -75,13 +75,20 @@ import (
 //     not crash rendering.
 //   - Output is plain text (no ANSI escapes), suitable for logs and terminals.
 func WrapErrorWithSource(err error, src string) error {
+	// Fall back to a name-less header (won’t show "in <src>").
+	return WrapErrorWithName(err, "", src)
+}
+
+func WrapErrorWithName(err error, srcName string, src string) error {
 	switch e := err.(type) {
 	case *LexError:
-		return fmt.Errorf("%s", prettyErrorString(src, "LEXICAL ERROR", e.Line, e.Col, e.Msg))
+		// Lex/parse Col are 0-based; render as 1-based.
+		return fmt.Errorf("%s", prettyErrorStringLabeled(src, "LEXICAL ERROR", srcName, e.Line, e.Col+1, e.Msg))
 	case *ParseError:
-		return fmt.Errorf("%s", prettyErrorString(src, "PARSE ERROR", e.Line, e.Col, e.Msg))
+		return fmt.Errorf("%s", prettyErrorStringLabeled(src, "PARSE ERROR", srcName, e.Line, e.Col+1, e.Msg))
 	case *RuntimeError:
-		return fmt.Errorf("%s", prettyErrorString(src, "RUNTIME ERROR", e.Line, e.Col, e.Msg))
+		// RuntimeError is already 1-based.
+		return fmt.Errorf("%s", prettyErrorStringLabeled(src, "RUNTIME ERROR", srcName, e.Line, e.Col, e.Msg))
 	default:
 		return err
 	}
@@ -104,7 +111,7 @@ func max(a, b int) int {
 // prettyErrorString builds a Python-like snippet with a header and a caret.
 // It shows at most one previous and one next line when available.
 // Coordinates are treated as 1-based and clamped to the source bounds.
-func prettyErrorString(src, header string, line, col int, msg string) string {
+func prettyErrorStringLabeled(src, header, name string, line, col int, msg string) string {
 	lines := strings.Split(src, "\n")
 	if line < 1 {
 		line = 1
@@ -118,26 +125,23 @@ func prettyErrorString(src, header string, line, col int, msg string) string {
 	if line > len(lines) {
 		line = len(lines)
 	}
-
 	lineTxt := lines[line-1]
 
 	var b strings.Builder
-	// Plain header, no ANSI
-	fmt.Fprintf(&b, "%s at %d:%d: %s\n\n", header, line, col, msg)
-
-	// Optional previous line
+	if name != "" {
+		fmt.Fprintf(&b, "%s in %s at %d:%d: %s\n\n", header, name, line, col, msg)
+	} else {
+		fmt.Fprintf(&b, "%s at %d:%d: %s\n\n", header, line, col, msg) // legacy
+	}
 	if line > 1 {
 		fmt.Fprintf(&b, "%4d | %s\n", line-1, lines[line-2])
 	}
-	// Error line
 	fmt.Fprintf(&b, "%4d | %s\n", line, lineTxt)
-
-	// Caret (plain)
-	caretPad := max(0, col-1)
-	caret := strings.Repeat(" ", caretPad) + "^"
-	fmt.Fprintf(&b, "     | %s\n", caret)
-
-	// Optional next line
+	caretPad := col - 1
+	if caretPad < 0 {
+		caretPad = 0
+	}
+	fmt.Fprintf(&b, "     | %s^\n", strings.Repeat(" ", caretPad))
 	if line < len(lines) {
 		fmt.Fprintf(&b, "%4d | %s\n", line+1, lines[line])
 	}

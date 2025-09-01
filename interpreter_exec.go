@@ -62,38 +62,39 @@ func (x *execImpl) funMeta(fn Value) (Callable, bool) {
 func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			name := ip.fallbackName(sr)
+			src := ip.fallbackSrc(sr, ast)
 			switch sig := r.(type) {
 			case returnSig:
 				out, err = sig.v, nil
 			case rtErr:
 				if uncaught {
-					out, err = errNull(sig.msg), nil
-				} else if sig.src != nil && sig.line > 0 && sig.col > 0 {
-					// Inner function error with its own source mapping
-					err = WrapErrorWithSource(&RuntimeError{Line: sig.line, Col: sig.col, Msg: sig.msg}, ip.fallbackSrc(sig.src, nil))
-					out = Value{}
-				} else {
-					// Legacy fail() without location – fall back to current chunk
-					line, col := ip.sourcePosFromChunk(nil, sr, 0)
-					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: sig.msg}, ip.fallbackSrc(sr, ast))
-					out = Value{}
+					out, err = errNull(sig.msg), nil // SOFT: pass annotated-null
+					return
 				}
+				if sig.src != nil && sig.line > 0 && sig.col > 0 {
+					err = WrapErrorWithName(&RuntimeError{Line: sig.line, Col: sig.col, Msg: sig.msg}, name, ip.fallbackSrc(sig.src, nil))
+				} else {
+					line, col := ip.sourcePosFromChunk(nil, sr, 0)
+					err = WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: sig.msg}, name, src)
+				}
+				out = Value{}
 			case error:
 				if uncaught {
-					out, err = annotNull(sig.Error()), nil
-				} else {
-					line, col := ip.sourcePosFromChunk(nil, sr, 0)
-					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: sig.Error()}, ip.fallbackSrc(sr, ast))
-					out = Value{}
+					out, err = annotNull(sig.Error()), nil // SOFT
+					return
 				}
+				line, col := ip.sourcePosFromChunk(nil, sr, 0)
+				err = WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: sig.Error()}, name, src)
+				out = Value{}
 			default:
 				if uncaught {
-					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil
-				} else {
-					line, col := ip.sourcePosFromChunk(nil, sr, 0)
-					err = WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: fmt.Sprintf("runtime panic: %v", r)}, ip.fallbackSrc(sr, ast))
-					out = Value{}
+					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil // SOFT
+					return
 				}
+				line, col := ip.sourcePosFromChunk(nil, sr, 0)
+				err = WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: fmt.Sprintf("runtime panic: %v", r)}, name, src)
+				out = Value{}
 			}
 		}
 	}()
@@ -101,28 +102,34 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 	ch := ip.jitTop(ast, sr)
 	prev := ip.currentSrc
 	ip.currentSrc = ch.Src
-	res := ip.runChunk(ch, env, 0) // VM entry (defined in vm.go)
+	res := ip.runChunk(ch, env, 0)
 	ip.currentSrc = prev
 
 	switch res.status {
 	case vmOK, vmReturn:
 		return res.value, nil
+
 	case vmRuntimeError:
 		if uncaught {
-			return res.value, nil // annotated-null flows out
+			return res.value, nil // SOFT: annotated-null flows out
 		}
+		name := ip.fallbackName(ch.Src)
+		src := ip.fallbackSrc(ch.Src, ast)
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
 		msg := res.value.Annot
 		if msg == "" {
 			msg = "runtime error"
 		}
-		return Value{}, WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: msg}, ip.fallbackSrc(ch.Src, ast))
+		return Value{}, WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: msg}, name, src)
+
 	default:
 		if uncaught {
-			return errNull("unknown VM status"), nil
+			return errNull("unknown VM status"), nil // SOFT
 		}
+		name := ip.fallbackName(ch.Src)
+		src := ip.fallbackSrc(ch.Src, ast)
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		return Value{}, WrapErrorWithSource(&RuntimeError{Line: line, Col: col, Msg: "unknown VM status"}, ip.fallbackSrc(ch.Src, ast))
+		return Value{}, WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: "unknown VM status"}, name, src)
 	}
 }
 
@@ -347,10 +354,18 @@ func (ip *Interpreter) fallbackSrc(sr *SourceRef, ast S) string {
 	if sr != nil && sr.Src != "" {
 		return sr.Src
 	}
-	// As a last resort, pretty-print the AST (line:col will be coarse).
-	return FormatSExpr(ast)
+	if ast != nil {
+		return FormatSExpr(ast)
+	}
+	return ""
 }
 
+func (ip *Interpreter) fallbackName(sr *SourceRef) string {
+	if sr != nil && sr.Name != "" {
+		return sr.Name
+	}
+	return "<main>" // conservative default; callers set "<repl>" where needed
+}
 func offsetToLineCol(src string, off int) (int, int) {
 	if off < 0 {
 		return 1, 1

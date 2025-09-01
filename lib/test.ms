@@ -1,3 +1,1 @@
-
-
-assert(true, true, true)
+1/0

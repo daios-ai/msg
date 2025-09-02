@@ -120,13 +120,40 @@ func Test_Builtin_Core_clone_deepcopy(t *testing.T) {
 	}
 }
 
-func Test_Builtin_Core_snapshot_returns_handle(t *testing.T) {
+func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 	ip, _ := NewRuntime()
 
-	// Should return a VTHandle (opaque)
+	// Should now return a VTMap (flattened visible env, including builtins)
 	v := evalWithIP(t, ip, `snapshot(null)`)
-	if v.Tag != VTHandle || v.Data == nil {
-		t.Fatalf("snapshot should return an opaque handle (VTHandle), got %#v", v)
+	if v.Tag != VTMap || v.Data == nil {
+		t.Fatalf("snapshot should return a map (VTMap), got %#v", v)
+	}
+
+	mo, ok := v.Data.(*MapObject)
+	if !ok {
+		t.Fatalf("snapshot value.Data should be *MapObject, got %T", v.Data)
+	}
+
+	// Must include builtins from Core; check a couple of known ones.
+	failVal, ok := mo.Entries["fail"]
+	if !ok {
+		t.Fatalf("snapshot should include builtins (missing 'fail')")
+	}
+	if failVal.Tag != VTFun {
+		t.Fatalf("'fail' should be a function value, got %#v", failVal)
+	}
+
+	typeOfVal, ok := mo.Entries["typeOf"]
+	if !ok {
+		t.Fatalf("snapshot should include builtins (missing 'typeOf')")
+	}
+	if typeOfVal.Tag != VTFun {
+		t.Fatalf("'typeOf' should be a function value, got %#v", typeOfVal)
+	}
+
+	// Per-key annotations should carry the variable's Value.Annot (docs set by setBuiltinDoc).
+	if ann, ok := mo.KeyAnn["fail"]; !ok || ann == "" {
+		t.Fatalf("'fail' should have a non-empty per-key annotation (doc), got %#v", ann)
 	}
 }
 

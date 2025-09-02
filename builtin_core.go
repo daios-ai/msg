@@ -2,6 +2,7 @@ package mindscript
 
 import (
 	"fmt"
+	"sort"
 )
 
 // Opaque handle for environment snapshots (unexported).
@@ -119,29 +120,30 @@ Params:
 Returns:
   Any — a structurally independent copy for arrays/maps`)
 
-	// snapshot(_: Null) -> Any (VTHandle)
-	// Returns an opaque handle to a flattened, cloned snapshot of the visible env.
+	// snapshot(_: Null) -> {}
+	// Returns a flattened map of all visible bindings (inner shadows outer).
 	ip.RegisterNative(
 		"snapshot",
 		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
-		S{"id", "Any"},
+		S{"map"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			snap := snapshotEnv(ctx.Env())
-			return Value{Tag: VTHandle, Data: &envHandle{env: snap}}
+			return snapshotVisibleEnvAsMap(ctx.Env())
 		},
 	)
-	setBuiltinDoc(ip, "snapshot", `Return an opaque handle to a snapshot of the current environment.
+	setBuiltinDoc(ip, "snapshot", `Return a map snapshot of the visible environment (including built-ins).
 
 Behavior:
-  • Captures a flattened view of all visible frames (inner shadows outer).
-  • Values are deep-copied where applicable (arrays/maps preserve order/annotations).
-  • Returned handle is opaque (VTHandle).
+  • Captures a flattened view of the current frame and its parents (Core included).
+  • Inner bindings shadow outer ones.
+  • Values are deep-copied where applicable (arrays/maps preserve order & per-key annotations).
+  • Each entry's per-key annotation is taken from the variable's Value.Annot.
+ 
 
 Params:
   _: Null
 
 Returns:
-  Any — an opaque handle (VTHandle) representing the snapshot`)
+  {} — map of { name: value } with per-key annotations`)
 
 	// typeOf(x: Any) -> Type
 	ip.RegisterNative(
@@ -384,7 +386,9 @@ func cloneValue(v Value) Value {
 		for i := range xs {
 			cp[i] = cloneValue(xs[i])
 		}
-		return Arr(cp)
+		out := Arr(cp)
+		out.Annot = v.Annot
+		return out
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		// Deep-copy entries
@@ -406,6 +410,7 @@ func cloneValue(v Value) Value {
 				KeyAnn:  keyAnn,
 				Keys:    keys,
 			},
+			Annot: v.Annot, // preserve the top-level annotation
 		}
 	default:
 		// Userdata/modules/handles are NOT copied (identity preserved).
@@ -413,19 +418,34 @@ func cloneValue(v Value) Value {
 	}
 }
 
-func snapshotEnv(e *Env) *Env {
-	// Flatten chain into one level (shadowing by nearer scopes wins).
-	flat := map[string]Value{}
+// snapshotVisibleEnvAsMap flattens the current environment and all parents
+// (nearest frame wins) into a deterministic, ordered map:
+// - Entries[name] = cloned value
+// - KeyAnn[name]  = original Value.Annot (if non-empty)
+// - Keys ordered by frame proximity (inner→outer), with names sorted within frame
+func snapshotVisibleEnvAsMap(e *Env) Value {
+	entries := map[string]Value{}
+	keyAnn := map[string]string{}
+	var order []string
+
 	for cur := e; cur != nil; cur = cur.parent {
-		for k, v := range cur.table {
-			if _, exists := flat[k]; !exists {
-				flat[k] = cloneValue(v)
+		// stable per-frame iteration
+		names := make([]string, 0, len(cur.table))
+		for k := range cur.table {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			if _, seen := entries[k]; seen {
+				continue // inner binding already took precedence
 			}
+			v := cur.table[k]
+			entries[k] = cloneValue(v)
+			if v.Annot != "" {
+				keyAnn[k] = v.Annot
+			}
+			order = append(order, k)
 		}
 	}
-	cp := NewEnv(nil)
-	for k, v := range flat {
-		cp.Define(k, v)
-	}
-	return cp
+	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: keyAnn, Keys: order}}
 }

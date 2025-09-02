@@ -1,363 +1,434 @@
-=== BEGIN FILE: builtin_concurrency.go ===
-// === FILE: builtin_concurrency.go ===
+=== BEGIN FILE: builtin_core.go ===
 package mindscript
 
 import (
 	"fmt"
-	"time"
 )
 
-// --- Concurrency primitives -------------------------------------------------
-
-type procState struct {
-	done   chan struct{}
-	result Value
-	cancel chan struct{} // cooperative
+// Opaque handle for environment snapshots (unexported).
+type envHandle struct {
+	env *Env
 }
 
-// Channel box (shared by all channel builtins)
-type chanBox struct {
-	ch chan Value
-}
+// ---- core built-ins ----------------------------------------------------
 
-// snapshotEnvInto clones an Env chain and re-parents the outermost to newParent.
-// Values are copied by reference (MindScript Values are immutable at the Go level).
-func snapshotEnvInto(src *Env, newParent *Env) *Env {
-	if src == nil {
-		return newParent
-	}
-	parent := snapshotEnvInto(src.parent, newParent)
-	dst := NewEnv(parent)
-	dst.sealParentWrites = src.sealParentWrites
-	for k, v := range src.table {
-		dst.table[k] = v
-	}
-	return dst
-}
-
-// safeSend attempts to send v to ch; it returns false if ch is closed.
-func safeSend(ch chan Value, v Value) (ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			ok = false
-		}
-	}()
-	ch <- v
-	return true
-}
-
-// safeClose closes ch, ignoring double-close panics.
-func safeClose(ch chan Value) {
-	defer func() { _ = recover() }()
-	close(ch)
-}
-
-func registerConcurrencyBuiltins(ip *Interpreter) {
-	// ------------------------------------------------------------------------
-	// procSpawn(f: Any->Any) -> Any (proc handle)
-	// Runs the function concurrently on an interpreter CLONE (isolate).
+func registerCoreBuiltins(ip *Interpreter) {
 	ip.RegisterNative(
-		"procSpawn",
+		"fail",
+		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
+		S{"id", "Null"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			mv := ctx.MustArg("message")
+			msg := "error"
+			if mv.Tag == VTStr {
+				msg = mv.Data.(string)
+			}
+			fail(msg) // raises rtErr; no return
+			return Null
+		},
+	)
+	setBuiltinDoc(ip, "fail", `Fail: throw a runtime error (hard fault).
+
+Params:
+  message: Str? — optional message (default "error")
+
+Returns:
+  Null (never returns)`)
+
+	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
+	ip.RegisterNative(
+		"try",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
+		S{"map"}, // returns a map with ok/value/error
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.MustArg("f")
 			if fv.Tag != VTFun {
-				fail("procSpawn expects a function")
+				fail("try expects a function") // contractual → hard error
 			}
-			orig := fv.Data.(*Fun)
 
-			// New isolate (clone) for concurrent execution
-			child := ip.Clone()
+			out := Map(map[string]Value{
+				"ok":    Bool(false),
+				"value": Null,
+				"error": Null,
+			})
 
-			// Snapshot the closure env into the child isolate (Core becomes parent)
-			snap := snapshotEnvInto(orig.Env, child.Core)
-
-			// Rebind the function to the snapshot env; reuse its compiled chunk if any
-			work := &Fun{
-				Params:     append([]string{}, orig.Params...),
-				ParamTypes: append([]S{}, orig.ParamTypes...),
-				ReturnType: orig.ReturnType,
-				Body:       orig.Body,
-				Env:        snap,
-				HiddenNull: orig.HiddenNull,
-				Chunk:      orig.Chunk,
-				NativeName: orig.NativeName,
-				IsOracle:   orig.IsOracle,
-				Examples:   append([]Value(nil), orig.Examples...),
-				Src:        orig.Src,
-			}
-			execVal := FunVal(work)
-			execVal.Annot = fv.Annot
-
-			pr := &procState{done: make(chan struct{}), cancel: make(chan struct{})}
-			go func() {
+			var hardErr error
+			var res Value
+			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						switch sig := r.(type) {
-						case returnSig:
-							pr.result = sig.v
 						case rtErr:
-							pr.result = errNull(sig.msg)
-						case error:
-							pr.result = errNull(sig.Error())
+							hardErr = fmt.Errorf("%s", sig.msg)
 						default:
-							pr.result = errNull(fmt.Sprintf("runtime panic: %v", r))
+							hardErr = fmt.Errorf("runtime panic: %v", r)
 						}
 					}
-					close(pr.done)
 				}()
-
-				// Execute in the child isolate. Any hard runtime issues get caught above.
-				pr.result = child.Call0(execVal)
+				res = ip.Call0(fv)
 			}()
 
-			return HandleVal("proc", pr)
+			if hardErr != nil {
+				out.Data.(*MapObject).Entries["ok"] = Bool(false)
+				out.Data.(*MapObject).Entries["error"] = Str(hardErr.Error())
+				out.Data.(*MapObject).Entries["value"] = Null
+				return out
+			}
+
+			// treat annotated-null as failure-with-message (soft)
+			if res.Tag == VTNull && res.Annot != "" {
+				out.Data.(*MapObject).Entries["ok"] = Bool(false)
+				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
+				out.Data.(*MapObject).Entries["value"] = Null
+				return out
+			}
+
+			// success
+			out.Data.(*MapObject).Entries["ok"] = Bool(true)
+			out.Data.(*MapObject).Entries["error"] = Null
+			out.Data.(*MapObject).Entries["value"] = res
+			return out
 		},
 	)
-	setBuiltinDoc(ip, "procSpawn", `Run a function concurrently in an isolated process.
-
-Takes a zero-arity function (after any partial application). The function runs
-on a cloned interpreter (fresh Global/module cache; shared read-only Core), with
-its closure environment snapshotted into the clone.
-
-Params:
-  f: Any — a function value (must be zero-arity after partial application)
+	setBuiltinDoc(ip, "try", `Run a function and capture hard failures.
 
 Returns:
-  Process handle (opaque). Use procJoin/procCancel/procJoinAll/procJoinAny.`)
+  { ok: Bool, value: Any, error: Str? }
 
-	// procJoin(p) -> Any
+Notes:
+  • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
+  • If the function returns an annotated null, ok=false and error is that annotation.
+  • On success, ok=true and value is the function's result.`)
+
 	ip.RegisterNative(
-		"procJoin",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		"clone",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.MustArg("p"), "proc").Data.(*procState)
-			<-pr.done
-			return pr.result
+			return cloneValue(ctx.MustArg("x"))
 		},
 	)
-	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.`)
+	setBuiltinDoc(ip, "clone", `Clone a value (deep-copy).
 
-	// procCancel(p) -> Null  (best-effort, cooperative)
+For maps, preserves key order and per-key annotations. Primitive values are
+returned as-is. Functions, modules, and handles are not duplicated (identity
+is preserved).
+
+Params:
+  x: Any
+
+Returns:
+  Any — a structurally independent copy for arrays/maps`)
+
+	// snapshot(_: Null) -> Any (VTHandle)
+	// Returns an opaque handle to a flattened, cloned snapshot of the visible env.
 	ip.RegisterNative(
-		"procCancel",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.MustArg("p"), "proc").Data.(*procState)
-			select {
-			case <-pr.cancel:
-				// already requested
-			default:
-				close(pr.cancel)
-			}
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process (best effort).`)
-
-	// procJoinAll(ps:[Any]) -> [Any]
-	ip.RegisterNative(
-		"procJoinAll",
-		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
-		S{"array", S{"id", "Any"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ps := ctx.MustArg("ps").Data.([]Value)
-			out := make([]Value, len(ps))
-			for i, p := range ps {
-				pr := asHandle(p, "proc").Data.(*procState)
-				<-pr.done
-				out[i] = pr.result
-			}
-			return Arr(out)
-		},
-	)
-	setBuiltinDoc(ip, "procJoinAll", `Wait for all processes to finish and return their results in order.`)
-
-	// procJoinAny(ps:[Any]) -> { index:Int, value:Any }
-	ip.RegisterNative(
-		"procJoinAny",
-		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
-		S{"map"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ps := ctx.MustArg("ps").Data.([]Value)
-			type res struct {
-				i int
-				v Value
-			}
-			ch := make(chan res, len(ps))
-			for i, p := range ps {
-				pr := asHandle(p, "proc").Data.(*procState)
-				go func(i int, pr *procState) {
-					<-pr.done
-					ch <- res{i, pr.result}
-				}(i, pr)
-			}
-			r := <-ch
-			mo := &MapObject{
-				Entries: map[string]Value{"index": Int(int64(r.i)), "value": r.v},
-				KeyAnn:  map[string]string{},
-				Keys:    []string{"index", "value"},
-			}
-			return Value{Tag: VTMap, Data: mo}
-		},
-	)
-	setBuiltinDoc(ip, "procJoinAny", `Wait for any process to finish; return its index and value.`)
-
-	// ------------------------------------------------------------------------
-	// Channels (untyped) + timers — unchanged from your version
-	// (keeping them verbatim for brevity; they were already correct)
-
-	ip.RegisterNative(
-		"chanOpen",
-		[]ParamSpec{{Name: "cap", Type: S{"unop", "?", S{"id", "Int"}}}},
+		"snapshot",
+		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			capacity := int64(0)
-			if v, ok := ctx.Arg("cap"); ok && v.Tag == VTInt {
-				capacity = v.Data.(int64)
-				if capacity < 0 {
-					fail("chanOpen: cap must be >= 0")
+			snap := snapshotEnv(ctx.Env())
+			return Value{Tag: VTHandle, Data: &envHandle{env: snap}}
+		},
+	)
+	setBuiltinDoc(ip, "snapshot", `Return an opaque handle to a snapshot of the current environment.
+
+Behavior:
+  • Captures a flattened view of all visible frames (inner shadows outer).
+  • Values are deep-copied where applicable (arrays/maps preserve order/annotations).
+  • Returned handle is opaque (VTHandle).
+
+Params:
+  _: Null
+
+Returns:
+  Any — an opaque handle (VTHandle) representing the snapshot`)
+
+	// typeOf(x: Any) -> Type
+	ip.RegisterNative(
+		"typeOf",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"id", "Type"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			return TypeVal(ip.ValueToType(x, ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
+
+This inspects a runtime value and produces its structural Type.
+Useful together with isType/isSubtype for ad-hoc validation.
+
+Params:
+  x: Any — a runtime value
+
+Returns: Type`)
+
+	ip.RegisterNative(
+		"isType",
+		[]ParamSpec{
+			{Name: "x", Type: S{"id", "Any"}},
+			{Name: "T", Type: S{"id", "Type"}},
+		},
+		S{"id", "Bool"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := ctx.MustArg("x")
+			Tv := ctx.MustArg("T")
+			if Tv.Tag != VTType {
+				fail("isType expects a Type as second argument") // contractual → hard
+			}
+			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "isType", `Check whether a value conforms to a Type.
+
+Params:
+  x: Any   — value to check
+  T: Type  — type to check against (must be a Type value, e.g. type Int)
+
+Returns: Bool`)
+
+	// isSubtype(A: Type, B: Type) -> Bool
+	ip.RegisterNative(
+		"isSubtype",
+		[]ParamSpec{
+			{Name: "A", Type: S{"id", "Type"}},
+			{Name: "B", Type: S{"id", "Type"}},
+		},
+		S{"id", "Bool"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			Av := ctx.MustArg("A")
+			Bv := ctx.MustArg("B")
+			if Av.Tag != VTType || Bv.Tag != VTType {
+				fail("isSubtype expects Types as both arguments") // contractual → hard
+			}
+			A := ip.resolveTypeValue(Av, ctx.Env())
+			B := ip.resolveTypeValue(Bv, ctx.Env())
+			return Bool(ip.IsSubtype(A, B, ctx.Env()))
+		},
+	)
+	setBuiltinDoc(ip, "isSubtype", `Structural subtype test: A <: B.
+
+Function types are compared structurally:
+- Parameters are contravariant
+- Return types are covariant
+- Arrows associate to the right (A -> B -> C == A -> (B -> C))
+
+Params:
+  A: Type — candidate subtype
+  B: Type — candidate supertype
+
+Returns: Bool`)
+
+	// import(path: Str) -> Module (nullable on soft failure)
+	ip.RegisterNative(
+		"import",
+		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			pv := ctx.MustArg("path")
+			if pv.Tag != VTStr {
+				fail("import expects path: Str")
+			}
+			// Use the current importer identity when available (enables relative resolution).
+			importer := ""
+			if n := len(ip.loadStack); n > 0 {
+				importer = ip.loadStack[n-1] // canonical identity of the importing module
+			} else if ip.currentSrc != nil && ip.currentSrc.Name != "" {
+				importer = ip.currentSrc.Name
+			}
+
+			v, err := ip.ImportFile(pv.Data.(string), importer)
+			if err != nil {
+				// HARD: parse errors, import cycles, and module-body contract errors.
+				if e, ok := err.(*Error); ok {
+					panicRt(e.Msg, e.Src, e.Line, e.Col)
 				}
+				fail(err.Error())
 			}
-			return HandleVal("chan", &chanBox{ch: make(chan Value, int(capacity))})
-		},
-	)
-	setBuiltinDoc(ip, "chanOpen", `Create a new channel (buffered when cap>0).`)
-
-	ip.RegisterNative(
-		"chanSend",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			cb.ch <- ctx.MustArg("x")
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "chanSend", `Send a value on a channel (blocking).`)
-
-	ip.RegisterNative(
-		"chanRecv",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			v, ok := <-cb.ch
-			if !ok {
-				return annotNull("channel closed")
-			}
+			// SOFT: resolve/fetch issues come back as annotated null with err == nil.
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel (blocking).`)
+	setBuiltinDoc(ip, "import", `Load a module from filesystem or HTTP(S).
 
+Resolution rules:
+  - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
+  - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
+
+Params:
+  path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
+
+Returns:
+  Module (nullable) — the loaded module value; or null with an error annotation on soft failures.`)
+
+	// importCode(name: Str, src: Str) -> Module (nullable if user code returns annotated null)
 	ip.RegisterNative(
-		"chanTrySend",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
+		"importCode",
+		[]ParamSpec{
+			{Name: "name", Type: S{"id", "Str"}},
+			{Name: "src", Type: S{"id", "Str"}},
+		},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			nv := ctx.MustArg("name")
+			sv := ctx.MustArg("src")
+			if nv.Tag != VTStr || sv.Tag != VTStr {
+				fail("importCode expects (name: Str, src: Str)")
+			}
+			name := nv.Data.(string)
+			src := sv.Data.(string)
+
+			// The loader assigns a synthetic identity "mem:<name>" internally.
+			v, err := ip.ImportCode(name, src)
+			if err != nil {
+				// HARD: parse errors; module-body contract errors.
+				if e, ok := err.(*Error); ok {
+					panicRt(e.Msg, e.Src, e.Line, e.Col)
+				}
+				fail(err.Error())
+			}
+			// Module body may deliberately produce annotated null; propagate as-is (SOFT).
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "importCode", `Evaluate source text as a module in memory.
+
+Parses 'src' and evaluates it as a module named 'name' (no caching).
+The module's environment is fresh and parented to Core.
+The synthetic identity "mem:<name>" is used for cycle detection.
+
+Params:
+  name: Str — display name for diagnostics and identity ("mem:<name>").
+  src:  Str — MindScript source code.
+
+Returns:
+  Module (nullable) — the created module value; or null with an error annotation if the
+  user code intentionally returns a soft failure.`)
+
+	// mapHas(obj: {}, key: Str) -> Bool
+	ip.RegisterNative(
+		"mapHas",
+		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			x := ctx.MustArg("x")
-			select {
-			case cb.ch <- x:
-				return Bool(true)
-			default:
-				return Bool(false)
+			v := ctx.MustArg("obj")
+			k := ctx.MustArg("key").Data.(string)
+			if v.Tag != VTMap {
+				fail("mapHas expects a map") // contractual → hard
 			}
+			mo := v.Data.(*MapObject)
+			_, ok := mo.Entries[k]
+			return Bool(ok)
 		},
 	)
-	setBuiltinDoc(ip, "chanTrySend", `Attempt a non-blocking send on a channel.`)
+	setBuiltinDoc(ip, "mapHas", `Return true if a key exists in a map.
 
+Params:
+  obj: {}  — a map value
+  key: Str — property name
+
+Returns:
+  Bool`)
+
+	// mapDelete(obj: {}, key: Str) -> {}
 	ip.RegisterNative(
-		"chanTryRecv",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"map"},
+		"mapDelete",
+		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
+		S{"map"}, // returns the (mutated) input map
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			out := &MapObject{
-				Entries: map[string]Value{},
-				KeyAnn:  map[string]string{},
-				Keys:    []string{"ok", "value"},
+			v := ctx.MustArg("obj")
+			k := ctx.MustArg("key").Data.(string)
+			if v.Tag != VTMap {
+				fail("mapDelete expects a map") // contractual → hard
 			}
-			select {
-			case v, ok := <-cb.ch:
-				if !ok {
-					out.Entries["ok"] = Bool(true)
-					out.Entries["value"] = annotNull("channel closed")
-				} else {
-					out.Entries["ok"] = Bool(true)
-					out.Entries["value"] = v
+			mo := v.Data.(*MapObject)
+			if _, ok := mo.Entries[k]; !ok {
+				return v // no-op
+			}
+			// delete from Entries
+			delete(mo.Entries, k)
+			// delete annotation if present
+			delete(mo.KeyAnn, k)
+			// remove from Keys while preserving order
+			keys := mo.Keys[:0]
+			for _, kk := range mo.Keys {
+				if kk != k {
+					keys = append(keys, kk)
 				}
-			default:
-				out.Entries["ok"] = Bool(false)
-				out.Entries["value"] = Null
 			}
-			return Value{Tag: VTMap, Data: out}
+			mo.Keys = keys
+			return v
 		},
 	)
-	setBuiltinDoc(ip, "chanTryRecv", `Attempt a non-blocking receive from a channel.`)
+	setBuiltinDoc(ip, "mapDelete", `Delete a property from a map (in place).
 
-	ip.RegisterNative(
-		"chanClose",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			close(cb.ch)
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "chanClose", `Close a channel.`)
+Preserves the key order and per-key annotations for the remaining entries.
 
-	// --- Timers --------------------------------------------------------------
+Params:
+  obj: {}  — a map value (mutated)
+  key: Str — property name to remove
 
-	ip.RegisterNative(
-		"timerAfter",
-		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms").Data.(int64)
-			if ms < 0 {
-				fail("timerAfter: ms must be >= 0")
-			}
-			cb := &chanBox{ch: make(chan Value, 1)}
-			go func() {
-				<-time.After(time.Duration(ms) * time.Millisecond)
-				if safeSend(cb.ch, Int(time.Now().UnixMilli())) {
-					safeClose(cb.ch)
-				}
-			}()
-			return HandleVal("chan", cb)
-		},
-	)
-	setBuiltinDoc(ip, "timerAfter", `Emit one tick after a delay, then close.`)
-
-	ip.RegisterNative(
-		"ticker",
-		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms").Data.(int64)
-			if ms <= 0 {
-				fail("ticker: ms must be > 0")
-			}
-			cb := &chanBox{ch: make(chan Value, 1)}
-			go func() {
-				tk := time.NewTicker(time.Duration(ms) * time.Millisecond)
-				defer tk.Stop()
-				for t := range tk.C {
-					if !safeSend(cb.ch, Int(t.UnixMilli())) {
-						return
-					}
-				}
-			}()
-			return HandleVal("chan", cb)
-		},
-	)
-	setBuiltinDoc(ip, "ticker", `Emit periodic ticks on a channel until closed.`)
+Returns:
+  {} — the same map value`)
 }
-=== END FILE: builtin_concurrency.go ===
+
+// --- Deep copy & snapshot for isolated worlds --------------------------------
+
+func cloneValue(v Value) Value {
+	switch v.Tag {
+	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
+		return v
+	case VTArray:
+		xs := v.Data.([]Value)
+		cp := make([]Value, len(xs))
+		for i := range xs {
+			cp[i] = cloneValue(xs[i])
+		}
+		return Arr(cp)
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		// Deep-copy entries
+		entries := make(map[string]Value, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			entries[k] = cloneValue(vv)
+		}
+		// Preserve insertion order and per-key annotations
+		keys := make([]string, len(mo.Keys))
+		copy(keys, mo.Keys)
+		keyAnn := make(map[string]string, len(mo.KeyAnn))
+		for k, ann := range mo.KeyAnn {
+			keyAnn[k] = ann
+		}
+		return Value{
+			Tag: VTMap,
+			Data: &MapObject{
+				Entries: entries,
+				KeyAnn:  keyAnn,
+				Keys:    keys,
+			},
+		}
+	default:
+		// Userdata/modules/handles are NOT copied (identity preserved).
+		return v
+	}
+}
+
+func snapshotEnv(e *Env) *Env {
+	// Flatten chain into one level (shadowing by nearer scopes wins).
+	flat := map[string]Value{}
+	for cur := e; cur != nil; cur = cur.parent {
+		for k, v := range cur.table {
+			if _, exists := flat[k]; !exists {
+				flat[k] = cloneValue(v)
+			}
+		}
+	}
+	cp := NewEnv(nil)
+	for k, v := range flat {
+		cp.Define(k, v)
+	}
+	return cp
+}
+=== END FILE: builtin_core.go ===
 

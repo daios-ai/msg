@@ -14,6 +14,7 @@ package mindscript
 
 import (
 	"fmt"
+	"strings"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -789,4 +790,162 @@ func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
 		env = fallback
 	}
 	return ip.resolveType(tv.Ast, env)
+}
+
+// "A -> B -> C -> A" using pretty names instead of full canonical specs.
+func joinCyclePath(stack []string, again string) string {
+	i := 0
+	for idx, s := range stack {
+		if s == again {
+			i = idx
+			break
+		}
+	}
+	chain := append(stack[i:], again)
+	out := make([]string, len(chain))
+	for k, s := range chain {
+		out[k] = prettySpec(s)
+	}
+	return strings.Join(out, " -> ")
+}
+
+// nativeMakeModule is the implementation of the __make_module primitive.
+//
+// UNIFORM CACHING & CYCLE DETECTION LIVE HERE.
+// This ensures AST/Code/File/inline constructions all behave the same.
+//
+// It receives:
+//   - name: Str   — the **canonical identity** for the module (NOT overwritten).
+//   - body: Type  — AST for the module body wrapped as a type value.
+//   - base: [Int] — absolute NodePath indicating where the body lives in the
+//     caller’s SourceRef; used to re-root spans to the body.
+//
+// Plumbing:
+//   - We build a child SourceRef with PathBase=base so VM marks and PC→(line,col)
+//     map into the module body text.
+//   - Runtime errors are rethrown with exact location using panicRt, so they
+//     bubble to runTopWithSource and render a single caret at the true site.
+func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
+	nameV := ctx.MustArg("name")
+	bodyV := ctx.MustArg("body")
+	baseV := ctx.MustArg("base")
+
+	if nameV.Tag != VTStr {
+		fail("module name must be a string")
+	}
+	if bodyV.Tag != VTType {
+		fail("internal error: module body must be a Type")
+	}
+	canon := nameV.Data.(string)
+
+	// ---- Uniform cycle detection (stack + in-progress record) ----
+	for _, s := range ip.loadStack {
+		if s == canon {
+			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon)))
+		}
+	}
+	if ip.modules != nil {
+		if rec, ok := ip.modules[canon]; ok && rec.state == modLoading {
+			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(append(ip.loadStack, canon), canon)))
+		}
+	}
+
+	// ---- Uniform caching (success-only) ----
+	if ip.modules != nil {
+		if rec, ok := ip.modules[canon]; ok && rec.state == modLoaded && rec.mod != nil {
+			return Value{Tag: VTModule, Data: rec.mod}
+		}
+	} else {
+		ip.modules = map[string]*moduleRec{}
+	}
+
+	// Mark as loading and push on stack.
+	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
+	ip.loadStack = append(ip.loadStack, canon)
+
+	// Ensure we never leave a stale modLoading record or a stuck stack entry.
+	// On panic/failure, delete the cache record; always pop loadStack.
+	defer func() {
+		// Pop load stack
+		if n := len(ip.loadStack); n > 0 {
+			ip.loadStack = ip.loadStack[:n-1]
+		}
+		// If not successfully flipped to modLoaded, remove the half-built record.
+		if rec, ok := ip.modules[canon]; ok && rec.state != modLoaded {
+			delete(ip.modules, canon)
+		}
+		// Preserve existing error semantics.
+		if r := recover(); r != nil {
+			panic(r)
+		}
+	}()
+
+	// ---- Decode body AST and base path ----
+	tv := bodyV.Data.(*TypeValue)
+	bodyAst := tv.Ast
+
+	// Decode absolute base path from [Int]
+	var base NodePath
+	if baseV.Tag == VTArray {
+		xs := baseV.Data.([]Value)
+		base = make(NodePath, 0, len(xs))
+		for _, v := range xs {
+			if v.Tag != VTInt {
+				fail("internal error: module base path must be [Int]")
+			}
+			base = append(base, int(v.Data.(int64)))
+		}
+	}
+
+	// Fresh env for the module (Core is parent so builtins are visible).
+	modEnv := NewEnv(ip.Core)
+	modEnv.SealParentWrites()
+
+	// SourceRef rooted at the module BODY path (absolute)
+	var sr *SourceRef
+	if ip.currentSrc != nil {
+		sr = &SourceRef{
+			Name:     ip.currentSrc.Name,
+			Src:      ip.currentSrc.Src,
+			Spans:    ip.currentSrc.Spans,
+			PathBase: base, // IMPORTANT: absolute path into the caller source tree
+		}
+	}
+
+	// JIT + run (like runTopWithSource, but we handle errors to avoid re-wrap)
+	ch := ip.jitTop(bodyAst, sr)
+
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
+	res := ip.runChunk(ch, modEnv, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		// ok
+	case vmRuntimeError:
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		msg := res.value.Annot
+		if msg == "" {
+			msg = "runtime error"
+		}
+		// Rethrow as structured inner-source error (single caret at true site).
+		panicRt(msg, ch.Src, line, col)
+	default:
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		panicRt("unknown VM status", ch.Src, line, col)
+	}
+
+	// Snapshot exports
+	mo := buildModuleMap(modEnv)
+	m := &Module{Name: canon, Map: mo, Env: modEnv}
+
+	// Commit cache (success-only)
+	rec := ip.modules[canon]
+	rec.mod = m
+	rec.env = modEnv
+	rec.state = modLoaded
+	rec.err = nil
+
+	return Value{Tag: VTModule, Data: m}
 }

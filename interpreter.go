@@ -89,6 +89,29 @@
 // functions contravariant/covariant, enums, `Int <: Num`, etc.) are defined in
 // `types.go` and fully respected by this API.
 //
+// PROCESSES & CONCURRENCY (MINIMAL, LUA-STYLE)
+// --------------------------------------------
+// The simplest safe model is **isolates**: each `Interpreter` instance is an
+// independent “process” with its own `Global`, module cache, stacks, and
+// ephemeral state. The `Core` environment is shared **read-only** across
+// isolates (user code cannot mutate Core; see sealing notes below).
+//
+// You can spawn concurrent work by **cloning** an interpreter and running code
+// in a new goroutine. This file exposes:
+//   • `(*Interpreter) Clone()` — snapshot the current interpreter into a new
+//     isolate (shares a read-only Core; copies native registry; new Global).
+//   • Host-level spawns: `SpawnSource` / `SpawnAST` returning a `ProcessHandle`.
+//   • A helper `HandleVal` to wrap/unwrap process handles as `Value` (VTHandle),
+//     so `spawn`/`join` natives can be implemented in `interpreter_ops.go`.
+//
+// Concurrency contract:
+//   • Instantiate and register natives **before** spawning concurrent processes.
+//     (Clones copy the native registry; mutating a Go `map` concurrently is not
+//     allowed. Core is treated as immutable after init.)
+//   • Each `Interpreter` instance is not re-entrant; run at most one evaluation
+//     at a time per instance. For parallel work, use `Clone()`.
+//   • `Global`/module caches are **not** shared between clones.
+//
 // DEPENDENCIES (OTHER FILES)
 // --------------------------
 //   • lexer.go / parser.go: tokenization and Pratt parser that produce S-expr ASTs.
@@ -109,6 +132,7 @@
 //   • Register natives with explicit param/return types.
 //   • Call functions and introspect them.
 //   • Ask type questions and perform type inference.
+//   • Clone interpreters and spawn concurrent processes safely.
 //
 // Everything else—parsing details, bytecode shapes, opcodes, cache strategies,
 // optimization passes—remains private and may evolve without breaking this API.
@@ -158,6 +182,18 @@ type Value struct {
 	Tag   ValueTag
 	Data  interface{}
 	Annot string
+}
+
+// Handle is the single opaque/userdata-like carrier (Lua-style).
+// Hosts can box arbitrary data behind a "kind" discriminator.
+type Handle struct {
+	Kind string
+	Data any
+}
+
+// HandleVal boxes host data into an opaque runtime Value.
+func HandleVal(kind string, data any) Value {
+	return Value{Tag: VTHandle, Data: &Handle{Kind: kind, Data: data}}
 }
 
 // String renders a human-friendly debug representation (annotations are omitted).
@@ -372,6 +408,31 @@ type CallCtx interface {
 type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
 
 ////////////////////////////////////////////////////////////////////////////////
+//                          PROCESSES (MINIMAL CONCURRENCY)
+////////////////////////////////////////////////////////////////////////////////
+
+// ProcessHandle is a tiny, host-visible handle for a spawned evaluation.
+// Join blocks until the process completes and returns the same (Value, error)
+// shape as Eval* entry points (errors already pretty-printed).
+type ProcessHandle struct {
+	ch chan processResult
+}
+
+type processResult struct {
+	v   Value
+	err error
+}
+
+// Join waits for the spawned evaluation to finish and returns its result.
+func (h *ProcessHandle) Join() (Value, error) {
+	if h == nil || h.ch == nil {
+		return Null, fmt.Errorf("invalid process handle")
+	}
+	r := <-h.ch
+	return r.v, r.err
+}
+
+////////////////////////////////////////////////////////////////////////////////
 //                               PUBLIC INTERPRETER
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -391,6 +452,8 @@ type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
 //   - EvalAST runs in the environment you pass.
 //   - Apply/Call0 invoke function Values with type-checking & currying.
 //   - FunMeta returns a Callable to inspect signatures/docs.
+//   - (New) Clone returns an isolated interpreter suitable for concurrent runs.
+//   - (New) SpawnSource/SpawnAST run code in a fresh isolate on a goroutine.
 //
 // Hard-error discipline:
 //   - Internals bubble `*Error` up **unformatted**.
@@ -399,7 +462,7 @@ type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
 type Interpreter struct {
 	// Publicly visible environments:
 	Global *Env // program-global environment (persistent across EvalPersistent*)
-	Core   *Env // built-ins; parent of Global
+	Core   *Env // built-ins; parent of Global (read-only to user code)
 
 	// Private internals (opaque to callers):
 	modules   map[string]*moduleRec // private module system (defined elsewhere)
@@ -434,6 +497,7 @@ type opsCore interface {
 // (child of Core). After construction:
 //   - Core is populated with built-ins and any subsequently registered natives.
 //   - Global is empty and inherits from Core.
+//   - Global is sealed from mutating Core (user code cannot overwrite builtins).
 //   - The interpreter is ready for Eval*/Apply/FunMeta/etc.
 func NewInterpreter() *Interpreter {
 	ip := &Interpreter{}
@@ -448,6 +512,11 @@ func NewInterpreter() *Interpreter {
 
 	// Install core built-ins.
 	ip._ops.initCore()
+
+	// Make Core effectively read-only to user code by sealing the child frame:
+	// assignments in Global won't climb into Core.
+	ip.Global.SealParentWrites()
+
 	return ip
 }
 
@@ -481,7 +550,7 @@ func formatAtAPI(err error) error {
 
 // EvalSource parses and evaluates source **in a fresh child of Global**.
 // Effects (lets/assignments) land in that ephemeral child; Global is unchanged
-// unless the program explicitly mutates Global.
+// unless the program explicitly mutates it.
 //
 // Returns the resulting Value; on hard failure returns a Go error with a
 // caret-formatted snippet (LEXICAL/PARSE/RUNTIME) produced at the API surface.
@@ -640,6 +709,10 @@ func (ip *Interpreter) ValueToType(v Value, env *Env) S { return ip.valueToTypeS
 //   - Natives participate in currying and type-checking like user functions.
 //   - The doc string for introspection is taken from the Value’s Annot (callers
 //     may annotate after registration if desired).
+//
+// Concurrency:
+//   - Register natives **before** using Clone/Spawn for concurrent work.
+//     Clones copy the native registry; mutating maps concurrently is not supported.
 func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, impl NativeImpl) {
 	if ip.native == nil {
 		ip.native = map[string]NativeImpl{}
@@ -672,6 +745,102 @@ func AsMapValue(v Value) Value {
 		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
 	}
 	return v
+}
+
+// Clone creates a new Interpreter isolate that shares no mutable runtime state
+// with the original. It has a fresh Core+Global, an empty module cache, and a
+// copied native registry. All registered natives are rebound into the clone’s
+// Core with the same signatures/docs, but their closure env is set to the
+// clone’s Core. Global/user state and module caches are NOT copied.
+//
+// Concurrency model (Lua-style):
+//   - Each *Interpreter is single-threaded; run many clones in parallel.
+//   - Call Clone() before you start running code to avoid racing with
+//     RegisterNative calls on the original.
+//
+// Notes:
+//   - Built-ins are installed via initCore() in NewInterpreter(). We then
+//     overlay every native known to the source interpreter (including any user-
+//     registered natives) by rebuilding a function value for the clone’s Core.
+//   - We intentionally do not duplicate Global or module cache state.
+func (ip *Interpreter) Clone() *Interpreter {
+	// Start from a clean engine (built-ins installed, empty Global).
+	cl := NewInterpreter()
+
+	// Copy the native registry (name -> implementation) so the clone invokes
+	// the same host functions, but through its own *Interpreter.
+	cl.native = make(map[string]NativeImpl, len(ip.native))
+	for name, impl := range ip.native {
+		cl.native[name] = impl
+
+		// Rebuild the function binding in the clone's Core using the original
+		// function's signature and docs, but rebind the closure env to cl.Core.
+		orig, err := ip.Core.Get(name)
+		if err != nil || orig.Tag != VTFun {
+			// If it's missing or not a function (unexpected), leave the clone's
+			// built-in as initialized by NewInterpreter().
+			continue
+		}
+		of := orig.Data.(*Fun)
+
+		nf := &Fun{
+			Params:     append([]string(nil), of.Params...),
+			ParamTypes: append([]S(nil), of.ParamTypes...),
+			ReturnType: of.ReturnType, // S-expr; treated as immutable schema
+			Body:       of.Body,       // natives use the ("native", name) sentinel
+			Env:        cl.Core,       // IMPORTANT: rebind to clone's Core
+			Chunk:      nil,           // no JIT chunk for natives
+			NativeName: of.NativeName,
+			IsOracle:   of.IsOracle,
+			Examples:   append([]Value(nil), of.Examples...),
+			HiddenNull: of.HiddenNull,
+			Src:        of.Src, // optional; safe to share for diagnostics
+		}
+		nv := FunVal(nf)
+		nv.Annot = orig.Annot // preserve documentation if present
+		cl.Core.Define(name, nv)
+	}
+
+	// Fresh, empty persistent scope for the clone.
+	cl.Global = NewEnv(cl.Core)
+
+	// Fresh module cache/loader state (no sharing).
+	cl.modules = map[string]*moduleRec{}
+	cl.loadStack = nil
+	cl.oracleLastPrompt = ""
+	cl.currentSrc = nil
+
+	return cl
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                      ISOLATES: CLONE & HOST-LEVEL SPAWN
+////////////////////////////////////////////////////////////////////////////////
+
+// SpawnSource clones the interpreter and evaluates `src` persistently (in the
+// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
+// yields the same (Value, error) contract as EvalPersistentSource.
+func (ip *Interpreter) SpawnSource(src string) *ProcessHandle {
+	child := ip.Clone()
+	h := &ProcessHandle{ch: make(chan processResult, 1)}
+	go func() {
+		v, err := child.EvalPersistentSource(src)
+		h.ch <- processResult{v: v, err: err}
+	}()
+	return h
+}
+
+// SpawnAST clones the interpreter and evaluates `ast` persistently (in the
+// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
+// yields the same (Value, error) contract as EvalPersistent.
+func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
+	child := ip.Clone()
+	h := &ProcessHandle{ch: make(chan processResult, 1)}
+	go func() {
+		v, err := child.EvalPersistent(ast)
+		h.ch <- processResult{v: v, err: err}
+	}()
+	return h
 }
 
 //// END_OF_PUBLIC

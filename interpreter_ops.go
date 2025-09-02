@@ -8,7 +8,19 @@
 //  - Implements deep value equality for const interning in the emitter.
 //  - Hosts the private emitter (`newEmitter`) used by exec for JIT.
 //
-// Public API is in interpreter_api.go. Exec/call engine is in interpreter_exec.go.
+// Public API is in interpreter.go. Exec/call engine is in interpreter_exec.go.
+//
+// Concurrency model (minimal, Lua-style isolates):
+//  - A single *Interpreter is **not re-entrant**; do not call it from multiple
+//    goroutines. For parallelism, clone via (*Interpreter).Clone() and use the
+//    clone in another goroutine. Each clone has its own Core/Global/env graph,
+//    module cache, and source-tracking, so no locks are required here.
+//  - All state touched in this file is per-interpreter (o.ip / ip.*). There are
+//    no package-level mutable singletons. As long as an Interpreter isn't shared
+//    concurrently, operations here are race-free without additional locking.
+//  - Host native functions you register may themselves use goroutines, but they
+//    must not touch the *same* Interpreter or its Env from multiple goroutines.
+//    Use isolates (clones) for truly concurrent execution.
 
 package mindscript
 
@@ -546,6 +558,9 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 }
 
 // syncModuleEnv keeps a module's Env consistent after a write to its map.
+// NOTE (isolates): modules live within a single Interpreter instance; this
+// function updates the module's *local* Env only. Do not cross-post between
+// interpreters.
 func syncModuleEnv(obj Value, key string, val Value) {
 	if obj.Tag == VTModule {
 		m := obj.Data.(*Module)
@@ -825,6 +840,9 @@ func joinCyclePath(stack []string, again string) string {
 //     map into the module body text.
 //   - Runtime errors are rethrown with exact location using panicRt, so they
 //     bubble to runTopWithSource and render a single caret at the true site.
+//
+// Concurrency note: module load state (ip.modules, ip.loadStack) belongs to a
+// single Interpreter isolate. Do not share the same Interpreter across goroutines.
 func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	nameV := ctx.MustArg("name")
 	bodyV := ctx.MustArg("body")

@@ -2,11 +2,23 @@
 //
 // OVERVIEW
 // --------
-// This file implements a compact, goroutine-safe, stack-based VM that executes
-// MindScript bytecode ("Chunk") and returns a result Value. The VM is *intended
-// to be internal* to the package: it exposes only the Chunk container in the
-// public section; everything else (opcodes, instruction encoding, VM loop) is
-// private implementation detail.
+// This file implements a compact, goroutine-safe-by-isolation, stack-based VM
+// that executes MindScript bytecode ("Chunk") and returns a result Value.
+// The VM is *internal to the package*: it exposes only the Chunk container;
+// everything else (opcodes, instruction encoding, VM loop) is private.
+//
+// Concurrency model (Lua-style isolates)
+// -------------------------------------
+//   - A single *Interpreter is **not re-entrant**. Do not invoke its methods from
+//     multiple goroutines at the same time.
+//   - For parallelism, create multiple *Interpreter instances (or use Clone if
+//     provided) and run each in its own goroutine. Each instance maintains its own
+//     Core/Global envs, module cache, current source tracking, and VM state.
+//   - This file has no package-level mutable state; all VM state is per-run and
+//     per-Interpreter. As long as an Interpreter isn't shared concurrently, there
+//     are no data races here.
+//   - Host natives may spin goroutines, but they must not touch a *shared*
+//     Interpreter/Env concurrently. Use isolated instances to run work in parallel.
 //
 // Execution model
 //   - The interpreter (see interpreter.go) lowers S-expr AST into a Chunk using
@@ -23,8 +35,8 @@
 //   - 32-bit instruction: [ opcode:8 | imm:24 ].
 //   - Opcodes cover constants/globals, stack ops, property/index access,
 //     arithmetic/compare/unary, control flow, and calls.
-//   - The emitter (interpreter.go) constructs instruction words via `pack`.
-//     Decoding uses `uop` and `uimm`. These are all private to the package.
+//   - The emitter constructs instruction words via `pack`. Decoding uses `uop`
+//     and `uimm`. These are all private to the package.
 //
 // Data & semantics used by the VM
 //   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
@@ -315,6 +327,9 @@ func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 //
 // Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
 // currying, native dispatch, type checks, and call-site scoping.
+//
+// Concurrency: this method uses the *Interpreter instance* provided on the vm.
+// Do not call it concurrently on the same Interpreter from multiple goroutines.
 func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
 	m := &vm{
 		ip:    ip,

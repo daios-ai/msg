@@ -10,17 +10,10 @@ package mindscript
 
 import "fmt"
 
-// --- Opaque, universal handle (Lua-like userdata) + concrete boxed types ---
+// --- Handle helpers (use central Handle from interpreter.go) ---
 
-type Handle struct {
-	Kind string
-	Data any
-}
-
-func HandleVal(kind string, data any) Value {
-	return Value{Tag: VTHandle, Data: &Handle{Kind: kind, Data: data}}
-}
-
+// asHandle asserts v is a VTHandle (and optionally of a specific kind)
+// and returns the underlying *Handle. Used by runtime builtins.
 func asHandle(v Value, want string) *Handle {
 	if v.Tag != VTHandle {
 		fail("expected handle")

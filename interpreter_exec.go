@@ -9,6 +9,12 @@
 //   • Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; no pretty printing here.
 //     Pretty printing happens only at the public API surface (see interpreter.go / errors.go).
 //
+// Concurrency & isolates (minimal, Lua-style):
+//   • A single Interpreter instance is **not** re-entrant. For parallelism,
+//     call (*Interpreter).Clone() and run the clone in another goroutine.
+//   • This file keeps per-interpreter mutable state (e.g., currentSrc) confined
+//     to the instance. Using clones ensures there are no data races.
+//
 // Emitter placement:
 //   The emitter is defined here and obtained via newEmitter(ip, sr).
 

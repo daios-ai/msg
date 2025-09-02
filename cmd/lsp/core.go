@@ -475,21 +475,29 @@ func (s *server) clearDiagnostics(uri string) {
 
 func (s *server) publishError(doc *docState, err error) {
 	// REPL-friendly: don't nag on incomplete constructs.
-	if _, ok := err.(*mindscript.IncompleteError); ok {
-		s.clearDiagnostics(doc.uri)
-		return
+	if e, ok := err.(*mindscript.Error); ok {
+		// Until a dedicated flag is exposed, treat parse/lex errors containing
+		// "incomplete" or "unterminated" as incomplete input.
+		if e.Kind == mindscript.DiagParse || e.Kind == mindscript.DiagLex {
+			msg := strings.ToLower(e.Msg)
+			if strings.Contains(msg, "incomplete") || strings.Contains(msg, "unterminated") {
+				s.clearDiagnostics(doc.uri)
+				return
+			}
+		}
 	}
+
 	line, col := 0, 0
 	code := ""
-
-	switch e := err.(type) {
-	case *mindscript.ParseError:
-		line, col = e.Line, e.Col
-		code = "PARSE"
-	case *mindscript.LexError:
-		line, col = e.Line, e.Col
-		code = "LEX"
-	default:
+	if e, ok := err.(*mindscript.Error); ok {
+		line, col = e.Line, e.Col // 1-based positions from MindScript
+		switch e.Kind {
+		case mindscript.DiagParse:
+			code = "PARSE"
+		case mindscript.DiagLex:
+			code = "LEX"
+		default:
+		}
 	}
 	if line > 0 {
 		line-- // engine lines are 1-based
@@ -908,9 +916,8 @@ func (s *server) analyze(doc *docState) {
 	if err != nil {
 		// Try to salvage tokens up to the error position so semantic tokens
 		// still color the prefix.
-		if le, ok := err.(*mindscript.LexError); ok {
-			// Convert (1-based line, 0-based byte col) to absolute byte offset.
-			off := byteColToOffset(doc.lines, le.Line-1, le.Col, doc.text)
+		if e, ok := err.(*mindscript.Error); ok && e.Kind == mindscript.DiagLex {
+			off := byteColToOffset(doc.lines, e.Line-1, e.Col-1, doc.text)
 			if off < 0 {
 				off = 0
 			}

@@ -86,25 +86,38 @@ func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
 	// 2) Parse with spans for caret diagnostics
 	ast, spans, perr := ParseSExprWithSpans(src)
 	if perr != nil {
-		return WrapErrorWithSource(perr, src) // LEXICAL/PARSE with caret
+		if e, ok := perr.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: display, Src: src}
+			}
+			return fmt.Errorf("%s", FormatError(e))
+		}
+		return perr
 	}
 
 	// 3) Evaluate in Core. We want real errors for VM runtime failures,
-	//    *and* we also want to treat annotated-null as an error.
-	v, rterr := ip.runTopWithSource(ast, ip.Core /*uncaught=*/, false, &SourceRef{
+	//    and we also want to treat annotated-null as an error.
+	v, rterr := ip.runTopWithSource(ast, ip.Core, false, &SourceRef{
 		Name:  display,
 		Src:   src,
 		Spans: spans,
 	})
 	if rterr != nil {
-		return rterr // already a caret RUNTIME ERROR
+		if e, ok := rterr.(*Error); ok {
+			// Already has proper Src/coords; just pretty-print here.
+			return fmt.Errorf("%s", FormatError(e))
+		}
+		return rterr
 	}
 
-	// Top-level returned an annotated null → promote to runtime error.
+	// Top-level returned an annotated null → promote to a hard runtime *Error*.
 	if v.Tag == VTNull && v.Annot != "" {
-		// We can’t map a PC here (it wasn’t a VM runtime error), so keep the
-		// existing module-like message shape:
-		return fmt.Errorf("runtime error in %s: %s", display, v.Annot)
+		return fmt.Errorf("%s", FormatError(&Error{
+			Kind: DiagRuntime,
+			Msg:  v.Annot,
+			Src:  &SourceRef{Name: display, Src: src},
+			Line: 1, Col: 1, // no precise PC; anchor at file start
+		}))
 	}
 
 	return nil

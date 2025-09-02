@@ -126,7 +126,13 @@ var MaxInlineWidth = 80
 func Pretty(src string) (string, error) {
 	ast, err := ParseSExpr(src)
 	if err != nil {
-		return "", WrapErrorWithSource(err, src)
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: "<main>", Src: src}
+			}
+			return "", fmt.Errorf("%s", FormatError(e))
+		}
+		return "", err
 	}
 	return FormatSExpr(ast), nil
 }
@@ -140,7 +146,13 @@ func Pretty(src string) (string, error) {
 func Standardize(src string) (string, error) {
 	ast, err := ParseSExpr(src)
 	if err != nil {
-		return "", WrapErrorWithSource(err, src)
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: "<standardize>", Src: src}
+			}
+			return "", fmt.Errorf("%s", FormatError(e))
+		}
+		return "", err
 	}
 	out := FormatSExpr(ast)
 	if !strings.HasSuffix(out, "\n") {

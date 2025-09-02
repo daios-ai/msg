@@ -1,4 +1,4 @@
-// interpreter_api.go — SINGLE PUBLIC API SURFACE for the MindScript interpreter.
+// interpreter.go — SINGLE PUBLIC API SURFACE for the MindScript interpreter.
 //
 // OVERVIEW
 // ========
@@ -18,7 +18,8 @@
 //        - function introspection (`FunMeta`),
 //        - native registration (`RegisterNative`),
 //        - type helpers (`ResolveType`, `IsType`, `IsSubtype`, `UnifyTypes`, `ValueToType`).
-//   • A structured `RuntimeError` surfaced as a Go error by all Eval* methods.
+//   • Hard errors bubble as a single `*Error` (see errors.go). Entry points
+//     format them with caret snippets; internals do **not** format.
 //
 // What this file does **not** include:
 //   • Any algorithmic implementation, bytecode generation, or the VM. Those live
@@ -42,13 +43,20 @@
 //   • Advanced embedding: `EvalAST(ast, env)` evaluates exactly in the provided
 //     environment, letting hosts control scoping explicitly.
 //
-// RUNTIME ERRORS
-// --------------
-// All `Eval*` methods return `(Value, error)`. On failure, they return a Go
-// `error` of type `*RuntimeError` enriched with a caret-style snippet (produced
-// by private code) and a **1-based (Line, Col)**. Successful runs return a
-// `Value` and `nil` error. There is no “uncaught/soft error” mode in the public
-// API; hosts that need “always return a Value” can wrap the call themselves.
+// ERROR MODEL
+// -----------
+// MindScript distinguishes:
+//   1) **Soft errors** for operational conditions (file-not-found, no space,
+//      etc.). These surface as annotated-null **Values** (not Go errors).
+//   2) **Hard errors** for contractual failures (lex/parse mistakes, wrong
+//      arity/type contracts, runtime invariants). These bubble as a single
+//      `*Error` with (Kind, Msg, Line, Col, Src). Internals NEVER pretty print.
+//      Public entry points attach the correct SourceRef and format them.
+//
+// All `Eval*` methods return `(Value, error)`. On hard failure they return a Go
+// `error` whose message is a caret-formatted snippet produced **only here** at
+// the API surface via `FormatError` (see errors.go). Internals pass `*Error` up
+// unformatted.
 //
 // VALUES & MAPS
 // -------------
@@ -83,8 +91,6 @@
 //
 // DEPENDENCIES (OTHER FILES)
 // --------------------------
-// This public surface depends on the following (all internal/private unless
-// otherwise noted):
 //   • lexer.go / parser.go: tokenization and Pratt parser that produce S-expr ASTs.
 //     (Public alias `type S = []any` is defined in parser.go.)
 //   • spans.go: sidecar source spans used for caret-style runtime errors.
@@ -92,7 +98,7 @@
 //   • interpreter_exec.go (private): parsing, JIT, VM dispatch, calls/currying.
 //   • interpreter_ops.go  (private): built-ins, assignment, iteration, emitter.
 //   • types.go: structural type system (used via public wrappers here).
-//   • errors.go: error wrapping with source snippets.
+//   • errors.go: unified diagnostic (`*Error`) and pretty-printing at API surface.
 //   • oracles.go, modules.go: optional features used internally (opaque here).
 //
 // DESIGN INTENT
@@ -365,19 +371,6 @@ type CallCtx interface {
 // the interpreter enforces parameter and return types on every call.
 type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
 
-// RuntimeError represents an execution-time failure with a source location.
-// Line/Col are 1-based. Eval* methods return this as a Go error enriched with
-// a caret-style snippet (provided by private code).
-type RuntimeError struct {
-	Line int
-	Col  int
-	Msg  string
-}
-
-func (e *RuntimeError) Error() string {
-	return fmt.Sprintf("RUNTIME ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 //                               PUBLIC INTERPRETER
 ////////////////////////////////////////////////////////////////////////////////
@@ -399,8 +392,10 @@ func (e *RuntimeError) Error() string {
 //   - Apply/Call0 invoke function Values with type-checking & currying.
 //   - FunMeta returns a Callable to inspect signatures/docs.
 //
-// Internal fields and the private facades are not part of the API contract and
-// may change without notice.
+// Hard-error discipline:
+//   - Internals bubble `*Error` up **unformatted**.
+//   - Public entry points attach the correct `SourceRef` and return a Go error
+//     whose message is a pretty, caret-labeled snippet via `FormatError`.
 type Interpreter struct {
 	// Publicly visible environments:
 	Global *Env // program-global environment (persistent across EvalPersistent*)
@@ -460,60 +455,130 @@ func NewInterpreter() *Interpreter {
 //                         PUBLIC METHODS (THIN DELEGATIONS)
 ////////////////////////////////////////////////////////////////////////////////
 
+// ensureErrorHasSource attaches sr to e if e is a *Error and Src is nil.
+// Returns the possibly-updated error.
+func ensureErrorHasSource(err error, sr *SourceRef) error {
+	if err == nil || sr == nil {
+		return err
+	}
+	if e, ok := err.(*Error); ok && e.Src == nil {
+		e.Src = sr
+	}
+	return err
+}
+
+// formatAtAPI pretty-prints a hard error to a Go error (string message).
+// If err is not a *Error, it is passed through unchanged.
+func formatAtAPI(err error) error {
+	if err == nil {
+		return nil
+	}
+	if e, ok := err.(*Error); ok {
+		return fmt.Errorf("%s", FormatError(e))
+	}
+	return err
+}
+
 // EvalSource parses and evaluates source **in a fresh child of Global**.
 // Effects (lets/assignments) land in that ephemeral child; Global is unchanged
 // unless the program explicitly mutates Global.
 //
-// Returns the resulting Value or a *RuntimeError (as error) on failure.
+// Returns the resulting Value; on hard failure returns a Go error with a
+// caret-formatted snippet (LEXICAL/PARSE/RUNTIME) produced at the API surface.
 func (ip *Interpreter) EvalSource(src string) (Value, error) {
 	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
-		return Null, WrapErrorWithName(err, "<main>", src)
+		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
 	}
 	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-	return ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
 }
 
 // Eval evaluates a pre-parsed AST **in a fresh child of Global**.
 // See EvalSource for scoping and error semantics.
+//
+// Implementation detail:
+//
+//	We format the AST back to source to construct a SourceRef with spans
+//	(via ParseSExprWithSpans) so hard errors can be shown with carets.
 func (ip *Interpreter) Eval(root S) (Value, error) {
 	src := FormatSExpr(root)
 	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
-		return Null, WrapErrorWithName(err, "<main>", src)
+		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
 	}
 	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-	return ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
 }
 
 // EvalPersistentSource parses and evaluates source **in Global** (REPL-style).
-// Effects directly mutate Global. Returns Value or *RuntimeError (as error).
+// Effects directly mutate Global. Returns Value; on hard failure returns a
+// caret-formatted Go error produced at the API surface.
 func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
 	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
-		return Null, WrapErrorWithName(err, "<repl>", src)
+		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
 	}
 	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
-	return ip.runTopWithSource(ast, ip.Global, false, sr)
+	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
 }
 
 // EvalPersistent evaluates a pre-parsed AST **in Global** (REPL-style).
-// Effects directly mutate Global. Returns Value or *RuntimeError (as error).
+// Effects directly mutate Global. Returns Value; on hard failure returns a
+// caret-formatted Go error produced at the API surface.
 func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
 	src := FormatSExpr(root)
 	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
-		return Null, WrapErrorWithName(err, "<repl>", src)
+		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
 	}
 	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
-	return ip.runTopWithSource(ast, ip.Global, false, sr)
+	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
 }
 
 // EvalAST evaluates an AST in the provided environment exactly as given.
 // Hosts use this to control scoping (e.g., per-request envs, sandboxes).
-// Returns Value or *RuntimeError (as error).
+// Returns Value; on hard failure returns a caret-formatted Go error if the
+// bubbled *Error already carries a SourceRef; otherwise the error is passed
+// through unchanged (callers without source can still inspect *Error fields).
 func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
-	return ip._exec.evalAST(ast, env)
+	val, err := ip._exec.evalAST(ast, env)
+	if err != nil {
+		// If the error already has a SourceRef, pretty print; else pass through.
+		if _, ok := err.(*Error); ok {
+			return Null, formatAtAPI(err)
+		}
+		return Null, err
+	}
+	return val, nil
 }
 
 // Apply applies a function Value to the provided argument Values.

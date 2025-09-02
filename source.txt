@@ -226,10 +226,15 @@ func (ip *Interpreter) importWithBody(canonName string, display string, body S, 
 // with source context. Prefer this whenever you have the source text so we can
 // produce precise caret diagnostics during module execution.
 func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
-	ast, spans, perr := ParseSExprWithSpans(src)
-	if perr != nil {
-		perr = WrapErrorWithSource(perr, src)
-		return nil, nil, fmt.Errorf("parse error in %s:\n%s", display, perr.Error())
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: display, Src: src}
+			}
+			return nil, nil, fmt.Errorf("%s", FormatError(e))
+		}
+		return nil, nil, err
 	}
 	return ast, spans, nil
 }

@@ -240,6 +240,9 @@ Returns: Bool`)
 			v, err := ip.ImportFile(pv.Data.(string), importer)
 			if err != nil {
 				// HARD: parse errors, import cycles, and module-body contract errors.
+				if e, ok := err.(*Error); ok {
+					panicRt(e.Msg, e.Src, e.Line, e.Col)
+				}
 				fail(err.Error())
 			}
 			// SOFT: resolve/fetch issues come back as annotated null with err == nil.
@@ -279,6 +282,9 @@ Returns:
 			v, err := ip.ImportCode(name, src)
 			if err != nil {
 				// HARD: parse errors; module-body contract errors.
+				if e, ok := err.(*Error); ok {
+					panicRt(e.Msg, e.Src, e.Line, e.Col)
+				}
 				fail(err.Error())
 			}
 			// Module body may deliberately produce annotated null; propagate as-is (SOFT).

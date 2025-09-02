@@ -419,8 +419,8 @@ func Test_Lexer_DotStartsNumber_ContextSensitivity(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected LexError for malformed number, got nil")
 		}
-		if _, ok := err.(*LexError); !ok {
-			t.Fatalf("expected *LexError, got %T (%v)", err, err)
+		if e, ok := err.(*Error); !ok || e.Kind != DiagLex {
+			t.Fatalf("expected lexical *Error for non-interactive unterminated string, got %T (%v)", err, err)
 		}
 		if !strings.Contains(err.Error(), "malformed number") &&
 			!strings.Contains(err.Error(), "invalid") {
@@ -446,6 +446,7 @@ func Test_Lexer_DotStartsNumber_ContextSensitivity(t *testing.T) {
 		}
 	}
 }
+
 func Test_Lexer_WhitespaceSensitive_Delimiters(t *testing.T) {
 	// Calls: only CLROUND is for calls (no space before '(')
 	wantTypes(t, `f(x)`, []TokenType{ID, CLROUND, ID, RROUND})
@@ -547,10 +548,10 @@ func Test_Lexer_UnterminatedString_NonInteractive_IsLexError(t *testing.T) {
 	l := NewLexer(`"abc`)
 	_, err := l.Scan()
 	if err == nil {
-		t.Fatalf("expected error, got nil")
+		t.Fatalf("expected lexical error for malformed number, got nil")
 	}
-	if _, ok := err.(*LexError); !ok {
-		t.Fatalf("expected *LexError for non-interactive unterminated string, got %T (%v)", err, err)
+	if e, ok := err.(*Error); !ok || e.Kind != DiagLex {
+		t.Fatalf("expected lexical *Error, got %T (%v)", err, err)
 	}
 }
 

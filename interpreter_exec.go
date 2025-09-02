@@ -1,8 +1,13 @@
 // interpreter_exec.go — PRIVATE: execution & call engine for MindScript.
 // - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
-//   runs on the VM, and surfaces errors with caret snippets.
+//   runs on the VM, and **bubbles unified hard errors (*Error) without formatting**.
 // - Implements function application, currying, and native-call scoping.
-// - No exported identifiers here. The public facade lives in interpreter_api.go.
+// - No exported identifiers here. The public facade lives in interpreter.go.
+//
+// Error policy (post-refactor):
+//   • Soft errors → annotated-null Values (never returned as Go errors).
+//   • Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; no pretty printing here.
+//     Pretty printing happens only at the public API surface (see interpreter.go / errors.go).
 //
 // Emitter placement:
 //   The emitter is defined here and obtained via newEmitter(ip, sr).
@@ -22,15 +27,22 @@ type execImpl struct{ ip *Interpreter }
 func newExec(ip *Interpreter) execCore { return &execImpl{ip: ip} }
 
 // evalSource parses + evaluates in the provided env (fresh or persistent).
+// Returns Value on success; on hard failure returns a *Error with Src attached.
+// No pretty printing here.
 func (x *execImpl) evalSource(src string, env *Env) (Value, error) {
 	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
-		return Value{}, WrapErrorWithSource(err, src)
+		// Attach SourceRef if missing; do not format.
+		if e, ok := err.(*Error); ok && e.Src == nil {
+			e.Src = &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		}
+		return Value{}, err
 	}
-	return x.ip.runTopWithSource(ast, env, false, &SourceRef{Name: "main", Src: src, Spans: spans})
+	return x.ip.runTopWithSource(ast, env, false, &SourceRef{Name: "<main>", Src: src, Spans: spans})
 }
 
 // evalAST evaluates an AST in the provided env.
+// No pretty printing here.
 func (x *execImpl) evalAST(ast S, env *Env) (Value, error) {
 	return x.ip.runTopWithSource(ast, env, false, nil)
 }
@@ -59,41 +71,69 @@ func (x *execImpl) funMeta(fn Value) (Callable, bool) {
 
 // runTopWithSource compiles+executes AST with error surfacing.
 // If uncaught is true, runtime failures become annotated-null Values.
+// Otherwise, hard failures bubble as *Error (no formatting).
 func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			name := ip.fallbackName(sr)
-			src := ip.fallbackSrc(sr, ast)
 			switch sig := r.(type) {
 			case returnSig:
 				out, err = sig.v, nil
+
 			case rtErr:
+				// rtErr carries msg and optional precise (src, line, col).
+				// If position is missing, map PC → (line, col) using current chunk/source.
+				srcRef := sig.src
+				if srcRef == nil {
+					srcRef = sr
+				}
+				line, col := sig.line, sig.col
+				if line <= 0 || col <= 0 {
+					// Best-effort mapping from current ip.currentSrc.
+					line, col = ip.sourcePosFromChunk(nil, srcRef, 0)
+				}
 				if uncaught {
-					out, err = errNull(sig.msg), nil // SOFT: pass annotated-null
+					out, err = errNull(sig.msg), nil // SOFT: annotated-null flows out
 					return
 				}
-				if sig.src != nil && sig.line > 0 && sig.col > 0 {
-					err = WrapErrorWithName(&RuntimeError{Line: sig.line, Col: sig.col, Msg: sig.msg}, name, ip.fallbackSrc(sig.src, nil))
-				} else {
-					line, col := ip.sourcePosFromChunk(nil, sr, 0)
-					err = WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: sig.msg}, name, src)
+				err = &Error{
+					Kind: DiagRuntime,
+					Msg:  sig.msg,
+					Src:  srcRef,
+					Line: line,
+					Col:  col,
 				}
 				out = Value{}
+
 			case error:
+				// Unknown panic error → treat as runtime hard error.
 				if uncaught {
 					out, err = annotNull(sig.Error()), nil // SOFT
 					return
 				}
 				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: sig.Error()}, name, src)
+				err = &Error{
+					Kind: DiagRuntime,
+					Msg:  sig.Error(),
+					Src:  sr,
+					Line: line,
+					Col:  col,
+				}
 				out = Value{}
+
 			default:
+				// Non-error panic payload.
 				if uncaught {
 					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil // SOFT
 					return
 				}
 				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: fmt.Sprintf("runtime panic: %v", r)}, name, src)
+				err = &Error{
+					Kind: DiagRuntime,
+					Msg:  fmt.Sprintf("runtime panic: %v", r),
+					Src:  sr,
+					Line: line,
+					Col:  col,
+				}
 				out = Value{}
 			}
 		}
@@ -110,26 +150,35 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 		return res.value, nil
 
 	case vmRuntimeError:
+		// Value contains the message in Annot. Hard error unless uncaught.
 		if uncaught {
 			return res.value, nil // SOFT: annotated-null flows out
 		}
-		name := ip.fallbackName(ch.Src)
-		src := ip.fallbackSrc(ch.Src, ast)
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
 		msg := res.value.Annot
 		if msg == "" {
 			msg = "runtime error"
 		}
-		return Value{}, WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: msg}, name, src)
+		return Value{}, &Error{
+			Kind: DiagRuntime,
+			Msg:  msg,
+			Src:  ch.Src,
+			Line: line,
+			Col:  col,
+		}
 
 	default:
 		if uncaught {
 			return errNull("unknown VM status"), nil // SOFT
 		}
-		name := ip.fallbackName(ch.Src)
-		src := ip.fallbackSrc(ch.Src, ast)
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		return Value{}, WrapErrorWithName(&RuntimeError{Line: line, Col: col, Msg: "unknown VM status"}, name, src)
+		return Value{}, &Error{
+			Kind: DiagRuntime,
+			Msg:  "unknown VM status",
+			Src:  ch.Src,
+			Line: line,
+			Col:  col,
+		}
 	}
 }
 
@@ -360,12 +409,6 @@ func (ip *Interpreter) fallbackSrc(sr *SourceRef, ast S) string {
 	return ""
 }
 
-func (ip *Interpreter) fallbackName(sr *SourceRef) string {
-	if sr != nil && sr.Name != "" {
-		return sr.Name
-	}
-	return "<main>" // conservative default; callers set "<repl>" where needed
-}
 func offsetToLineCol(src string, off int) (int, int) {
 	if off < 0 {
 		return 1, 1
@@ -1088,8 +1131,9 @@ func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {
 
 // Private panic signaling & null helpers are defined in interpreter_ops.go:
 //   - type returnSig struct{ v Value }
-//   - type rtErr struct{ msg string }
+//   - type rtErr struct{ msg string; src *SourceRef; line, col int }
 //   - func fail(msg string)
+//   - func panicRt(msg string, src *SourceRef, line, col int)
 //   - func errNull(msg string) Value
 //   - func annotNull(msg string) Value
 //   - func withAnnot(v Value, ann string) Value

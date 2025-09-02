@@ -1,45 +1,15 @@
-// errors.go: user-facing error wrapping and caret-snippet rendering
+// errors.go: unified diagnostics and pretty-print rendering (public-facing)
 //
-// What this file does
-// -------------------
-// This module turns low-level lexer/parser diagnostics into readable,
-// Python-style error snippets with a caret pointing at the offending column.
-// The primary entry point is `WrapErrorWithSource`, which recognizes
-// `*LexError` (from lexer.go) and `*ParseError` (from parser.go), formats
-// them, and returns a new `error` that contains a multi-line snippet:
+// Overview
+// --------
+// MindScript distinguishes between:
+//   • SOFT errors (operational) → represented as annotated-null Values (not here).
+//   • HARD errors (contractual) → represented by *Error and bubbled to the API.
 //
-//	PARSE ERROR at 3:12: unexpected token ')'
-//
-//	   2 | let x = (1 + 2
-//	   3 |              )
-//	       |            ^
-//	   4 | end
-//
-// The snippet includes up to one line of context before and after the error,
-// numbers the lines, and places a caret under the 1-based column.
-//
-// Dependencies (other files)
-// --------------------------
-//   - lexer.go: defines `*LexError { Line, Col, Msg }`, produced by the lexer.
-//   - parser.go: defines `*ParseError { Line, Col, Msg }`, produced by the parser.
-//     Both carry 1-based Line and Col coordinates. `WrapErrorWithSource` depends
-//     on those types to detect when it should render a caret snippet.
-//
-// Scope of the public API
-// -----------------------
-// Public:   `WrapErrorWithSource(err error, src string) error`
-// Private:  caret-snippet renderer and tiny helpers.
-//
-// Behavior guarantees
-// -------------------
-//   - If `err` is a `*LexError` or `*ParseError`, the returned error’s message
-//     is a fully formatted, plain-text snippet (no ANSI colors).
-//   - If `err` is anything else, it is returned unchanged.
-//   - Line/column are treated as 1-based. If out of range, they are clamped so
-//     the caret can be rendered safely. Empty/short source strings are handled.
-//
-// This utility is intentionally independent of the interpreter/VM. It can be
-// used anywhere you want to surface lex/parse errors with helpful context.
+// This module defines the single diagnostic type (*Error) and a pretty-printer
+// used ONLY by public entry points. Engine internals should construct *Error
+// (with correct src/line/col) and return it upward WITHOUT formatting.
+
 package mindscript
 
 import (
@@ -48,100 +18,117 @@ import (
 )
 
 /* ===========================
-   PUBLIC API
+   PUBLIC TYPES & HELPERS
    =========================== */
 
-// WrapErrorWithSource returns an error augmented with a caret-annotated snippet
-// of the provided source. It recognizes lexer/parser errors and leaves other
-// errors untouched.
-//
-// Inputs
-//   - err: The original error. If it is a *LexError (lexer.go) or *ParseError
-//     (parser.go), the function renders a multi-line snippet describing the
-//     error location and message. Otherwise, `err` is returned as-is.
-//   - src: The full source text that was being lexed/parsed.
-//
-// Output
-//   - error: If `err` was a lex/parse error, a new error whose .Error() string
-//     is a human-readable snippet with:
-//   - a header: "LEXICAL ERROR" or "PARSE ERROR"
-//   - the 1-based line/column and the original message
-//   - up to one previous and one next line of context
-//   - a caret aligned under the 1-based column
-//     For all other error kinds, the original `err` is returned.
-//
-// Notes
-//   - Line/column bounds are clamped to the source; missing lines/columns do
-//     not crash rendering.
-//   - Output is plain text (no ANSI escapes), suitable for logs and terminals.
-func WrapErrorWithSource(err error, src string) error {
-	// Fall back to a name-less header (won’t show "in <src>").
-	return WrapErrorWithName(err, "", src)
+// DiagKind classifies a hard diagnostic.
+type DiagKind int
+
+const (
+	DiagLex DiagKind = iota
+	DiagParse
+	DiagRuntime
+	DiagIncomplete // REPL “need more input” (hard signal to prompt for more)
+)
+
+// Error is the single hard diagnostic that bubbles up to public APIs.
+// Msg is plain text (no snippets); pretty-printing happens at the API boundary.
+type Error struct {
+	Kind DiagKind
+	Msg  string
+	Src  *SourceRef // preferred source for rendering (<main>, <repl>, module)
+	Line int        // 1-based
+	Col  int        // 1-based
 }
 
-func WrapErrorWithName(err error, srcName string, src string) error {
-	switch e := err.(type) {
-	case *LexError:
-		// Lex/parse Col are 0-based; render as 1-based.
-		return fmt.Errorf("%s", prettyErrorStringLabeled(src, "LEXICAL ERROR", srcName, e.Line, e.Col+1, e.Msg))
-	case *ParseError:
-		return fmt.Errorf("%s", prettyErrorStringLabeled(src, "PARSE ERROR", srcName, e.Line, e.Col+1, e.Msg))
-	case *RuntimeError:
-		// RuntimeError is already 1-based.
-		return fmt.Errorf("%s", prettyErrorStringLabeled(src, "RUNTIME ERROR", srcName, e.Line, e.Col, e.Msg))
-	default:
-		return err
+// Error implements the error interface, returning ONLY the message.
+// Pretty snippets are produced by FormatError at the API boundary.
+func (e *Error) Error() string { return e.Msg }
+
+// IsIncomplete reports whether err represents an incomplete-input condition.
+func IsIncomplete(err error) bool {
+	if e, ok := err.(*Error); ok {
+		return e.Kind == DiagIncomplete
 	}
+	return false
 }
 
-//// END_OF_PUBLIC
+// FormatError renders a human-friendly, caret-annotated snippet for a *Error.
+// Call this ONLY at public entry points (Eval*/Parse*), never in engine internals.
+func FormatError(e *Error) string {
+	if e == nil {
+		return ""
+	}
+	header := diagHeader(e.Kind)
+
+	var name, src string
+	if e.Src != nil {
+		name = e.Src.Name
+		src = e.Src.Src
+	}
+	return prettyErrorStringLabeled(src, header, name, e.Line, e.Col, e.Msg)
+}
 
 /* ===========================
-   PRIVATE: helpers & rendering
+   PRIVATE: rendering helpers
    =========================== */
 
-// max returns the greater of a and b (used for caret padding).
-func max(a, b int) int {
-	if a > b {
-		return a
+func diagHeader(k DiagKind) string {
+	switch k {
+	case DiagLex:
+		return "LEXICAL ERROR"
+	case DiagParse:
+		return "PARSE ERROR"
+	case DiagRuntime:
+		return "RUNTIME ERROR"
+	case DiagIncomplete:
+		return "INCOMPLETE"
+	default:
+		return "ERROR"
 	}
-	return b
 }
 
-// prettyErrorString builds a Python-like snippet with a header and a caret.
+// prettyErrorStringLabeled builds a Python-like snippet with a header and caret.
 // It shows at most one previous and one next line when available.
 // Coordinates are treated as 1-based and clamped to the source bounds.
 func prettyErrorStringLabeled(src, header, name string, line, col int, msg string) string {
 	lines := strings.Split(src, "\n")
-	if line < 1 {
-		line = 1
-	}
-	if col < 1 {
-		col = 1
-	}
 	if len(lines) == 0 {
 		lines = []string{""}
+	}
+	if line < 1 {
+		line = 1
 	}
 	if line > len(lines) {
 		line = len(lines)
 	}
+	if col < 1 {
+		col = 1
+	}
+
 	lineTxt := lines[line-1]
 
 	var b strings.Builder
 	if name != "" {
 		fmt.Fprintf(&b, "%s in %s at %d:%d: %s\n\n", header, name, line, col, msg)
 	} else {
-		fmt.Fprintf(&b, "%s at %d:%d: %s\n\n", header, line, col, msg) // legacy
+		fmt.Fprintf(&b, "%s at %d:%d: %s\n\n", header, line, col, msg)
 	}
 	if line > 1 {
 		fmt.Fprintf(&b, "%4d | %s\n", line-1, lines[line-2])
 	}
 	fmt.Fprintf(&b, "%4d | %s\n", line, lineTxt)
+
+	// Clamp caret padding to the line length (defensive).
 	caretPad := col - 1
 	if caretPad < 0 {
 		caretPad = 0
 	}
+	if caretPad > len(lineTxt) {
+		caretPad = len(lineTxt)
+	}
 	fmt.Fprintf(&b, "     | %s^\n", strings.Repeat(" ", caretPad))
+
 	if line < len(lines) {
 		fmt.Fprintf(&b, "%4d | %s\n", line+1, lines[line])
 	}

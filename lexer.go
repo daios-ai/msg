@@ -250,43 +250,11 @@ type Token struct {
 	EndByte   int
 }
 
-// LexError reports a lexical error detected during scanning (e.g., invalid
-// escape sequence, malformed number, unexpected character, invalid UTF-8).
-// In non-interactive mode, unterminated strings also produce LexError.
-//
-// The error position (Line, Col) refers to the location where the lexer
-// detected the problem (generally close to the token’s start).
-type LexError struct {
-	Line int
-	Col  int
-	Msg  string
-}
+// HARD errors produced by the lexer use the unified *Error type defined in
+// errors.go. See DiagLex and DiagIncomplete.
 
-func (e *LexError) Error() string {
-	return fmt.Sprintf("LEXICAL ERROR at %d:%d: %s", e.Line, e.Col, e.Msg)
-}
-
-// IncompleteError signals that more input is required to complete a construct.
-// It is returned *only* by a lexer created with NewLexerInteractive when the
-// end of input is reached inside a string literal.
-// Use IsIncomplete(err) to detect this case in REPLs and prompt the user for
-// more lines instead of failing the parse.
-type IncompleteError struct {
-	Line int
-	Col  int
-	Msg  string
-}
-
-func (e *IncompleteError) Error() string {
-	return fmt.Sprintf("INCOMPLETE at %d:%d: %s", e.Line, e.Col, e.Msg)
-}
-
-// IsIncomplete reports whether err is an *IncompleteError. Helpful in REPLs
-// to distinguish “need more input” from real lexical errors.
-func IsIncomplete(err error) bool {
-	_, ok := err.(*IncompleteError)
-	return ok
-}
+// In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
+// when input ends inside an unterminated construct (e.g., string literal).
 
 // Lexer is a streaming tokenizer for MindScript.
 //
@@ -537,11 +505,13 @@ func (l *Lexer) afterDotIsProperty() bool {
 // ---------------- error builders ----------------
 
 func (l *Lexer) err(msg string) error {
-	return &LexError{Line: l.line, Col: l.col, Msg: msg}
+	// Lexer maintains 1-based line and 0-based column; diagnostics are 1-based.
+	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.line, Col: l.col + 1}
 }
 
 func (l *Lexer) errIncomplete(msg string) error {
-	return &IncompleteError{Line: l.line, Col: l.col, Msg: msg}
+	// Report need-more-input conditions in interactive mode.
+	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.line, Col: l.col + 1}
 }
 
 // ---------------- scanners ----------------

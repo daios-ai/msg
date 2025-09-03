@@ -95,36 +95,42 @@ Returns:
 // --- Casting Utilities ----------------------------------------------------
 
 func registerCastBuiltins(ip *Interpreter) {
-	// str(x) -> Str (JSON for arrays/maps; annotations are ignored)
+	// pretty(src: Str) -> Str?   (caret-formatted parse errors as soft null)
 	ip.RegisterNative(
-		"str",
+		"formatCode",
+		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.MustArg("src").Data.(string)
+			out, err := Pretty(s)
+			if err != nil {
+				return annotNull("pretty: " + err.Error())
+			}
+			return Str(out)
+		},
+	)
+	setBuiltinDoc(ip, "formatCode", `Format source code.
+
+Parses the input and pretty-prints it with normalized whitespace and minimal parentheses. Supports PRE/POST annotations (# ... lines above; trailing # ... forces newline). On parse failure, returns null with a caret-formatted error.
+
+Params:
+	src: Str
+
+Returns:
+	Str?`)
+
+	// formatValue(x: Any) -> Str   (renders with annotations)
+	ip.RegisterNative(
+		"formatValue",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			if v.Tag == VTStr {
-				// Return as-is; do not touch annotations on the returned string Value.
-				return v
-			}
-			// Convert value (sans annotations) to a JSON-friendly Go shape.
-			goVal := valueToGoJSON(v)
-			b, err := json.Marshal(goVal)
-			if err != nil {
-				// Soft error when not representable (e.g., NaN/Inf)
-				return annotNull("str: value cannot be represented as JSON (" + err.Error() + ")")
-			}
-			return Str(string(b))
+			return Str(FormatValue(ctx.MustArg("x")))
 		},
 	)
-	setBuiltinDoc(ip, "str", `Stringify a value (ignores annotations).
+	setBuiltinDoc(ip, "formatValue", `Render a runtime value (with annotations).
 
-Rules:
-	• Str stays as-is
-	• Null → "null"
-	• Bool → "true"/"false"
-	• Int/Num → decimal representation
-	• Arrays/Maps → JSON text (annotations omitted)
-	• Functions/Modules/Handles/Types → readable debug form (implementation-defined)
+Produces a stable, readable string: scalars are literal; arrays/maps inline when short, otherwise multi-line (maps sort keys). PRE annotations print as header lines; POST as trailing comments. Functions show as <fun: ...>, types as <type: ...>, modules as <module: ...>.
 
 Params:
 	x: Any
@@ -132,7 +138,43 @@ Params:
 Returns:
 	Str`)
 
-	// int(x) -> Int? (soft-error on unsupported)
+	// str(x: Any) -> Str?   (ignores annotations; soft-error on unsupported)
+	ip.RegisterNative(
+		"str",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			if v.Tag == VTStr {
+				return v // return as-is
+			}
+			gv, err := valueToGoJSON(v)
+			if err != nil {
+				return annotNull("str: " + err.Error())
+			}
+			b, err := json.Marshal(gv)
+			if err != nil {
+				return annotNull("str: " + err.Error())
+			}
+			return Str(string(b))
+		},
+	)
+	setBuiltinDoc(ip, "str", `Stringify a value.
+
+Rules:
+	• Str stays as-is
+	• Null → "null"
+	• Bool → "true"/"false"
+	• Int/Num → decimal representation
+	• Arrays/Maps → JSON text (best-effort; falls back to debug form if not encodable)
+	• Functions/Modules/Handles/Types → readable debug form
+
+Params:
+	x: Any
+
+Returns:
+	Str`)
+
 	ip.RegisterNative(
 		"int",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
@@ -153,20 +195,20 @@ Returns:
 				if n, err := strconv.ParseInt(v.Data.(string), 10, 64); err == nil {
 					return Int(n)
 				}
-				return annotNull("int: parse error")
+				return Null
 			default:
-				return annotNull("int: unsupported conversion")
+				return Null
 			}
 		},
 	)
-	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise soft-error (null with message).
+	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise return null.
 
 Rules:
 	• Int → Int
 	• Num → truncated toward zero
 	• Bool → 1/0
-	• Str → parsed base-10 integer, or null(annot) on failure
-	• Others → null(annot)
+	• Str → parsed base-10 integer, or null on failure
+	• Others → null
 
 Params:
 	x: Any
@@ -174,7 +216,6 @@ Params:
 Returns:
 	Int?`)
 
-	// num(x) -> Num? (soft-error on unsupported)
 	ip.RegisterNative(
 		"num",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
@@ -195,20 +236,20 @@ Returns:
 				if f, err := strconv.ParseFloat(v.Data.(string), 64); err == nil {
 					return Num(f)
 				}
-				return annotNull("num: parse error")
+				return Null
 			default:
-				return annotNull("num: unsupported conversion")
+				return Null
 			}
 		},
 	)
-	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise soft-error (null with message).
+	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise return null.
 
 Rules:
 	• Num → Num
 	• Int → floating-point value
 	• Bool → 1.0/0.0
-	• Str → parsed as float64, or null(annot) on failure
-	• Others → null(annot)
+	• Str → parsed as float64, or null on failure
+	• Others → null
 
 Params:
 	x: Any
@@ -216,11 +257,10 @@ Params:
 Returns:
 	Num?`)
 
-	// bool(x) -> Bool (unchanged; never returns null)
 	ip.RegisterNative(
 		"bool",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Bool"},
+		S{"id", "Bool"}, // not optional; implementation never returns null
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
 			switch v.Tag {
@@ -239,8 +279,7 @@ Returns:
 			case VTMap:
 				return Bool(len(v.Data.(*MapObject).Entries) > 0)
 			default:
-				// functions, modules, handles, types → truthy
-				return Bool(true)
+				return Bool(true) // functions, modules, handles, types → truthy
 			}
 		},
 	)
@@ -262,8 +301,6 @@ Params:
 Returns:
 	Bool`)
 
-	// len(x) left as-is (not a cast). It already returns null for unsupported.
-	// If you want it to soft-error too, mirror the pattern above.
 	ip.RegisterNative(
 		"len",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
@@ -274,8 +311,11 @@ Returns:
 			case VTArray:
 				return Int(int64(len(x.Data.([]Value))))
 			case VTMap:
-				return Int(int64(len(x.Data.(*MapObject).Keys)))
+				mo := x.Data.(*MapObject)
+				// Use ordered keys length to reflect object “length”
+				return Int(int64(len(mo.Keys)))
 			case VTStr:
+				// Unicode-aware length to match substr’s rune semantics
 				return Int(int64(utf8.RuneCountInString(x.Data.(string))))
 			default:
 				return Null

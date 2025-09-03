@@ -67,23 +67,30 @@ func Test_Builtin_Json_Number_Int_And_Float_Mapping(t *testing.T) {
 	}
 }
 
-func Test_Builtin_Json_Stringify_UnsupportedValues_YieldNull(t *testing.T) {
+func Test_Builtin_Json_Stringify_Behavior(t *testing.T) {
 	ip, _ := NewRuntime()
 
-	// Functions/types/handles/modules are rendered as JSON null by jsonStringify
-	v := evalWithIP(t, ip, `
-		let f = fun() do 0 end
-		let s = jsonStringify({ f: f, n: 1 })
-		let back = jsonParse(s)
-		{ f: back.f, n: back.n }
-	`)
-	m := entriesOf(t, v)
-	if m["f"].Tag != VTNull {
-		t.Fatalf("unsupported value should serialize as null, got %#v", m["f"])
-	}
-	if m["n"].Tag != VTInt || m["n"].Data.(int64) != 1 {
-		t.Fatalf("numeric field lost: %#v", m["n"])
-	}
+	t.Run("SupportedValues_RoundTrip", func(t *testing.T) {
+		v := evalWithIP(t, ip, `
+			let s = jsonStringify({ n: 1 })
+			let back = jsonParse(s)
+			{ n: back.n }
+		`)
+		m := entriesOf(t, v)
+		if m["n"].Tag != VTInt || m["n"].Data.(int64) != 1 {
+			t.Fatalf("numeric field lost: %#v", m["n"])
+		}
+	})
+
+	t.Run("UnsupportedValues_SoftError", func(t *testing.T) {
+		v := evalWithIP(t, ip, `
+			let f = fun() do 0 end
+			jsonStringify({ f: f, n: 1 })
+		`)
+		if v.Tag != VTNull || v.Annot == "" {
+			t.Fatalf("expected soft-error null from jsonStringify, got %#v", v)
+		}
+	})
 }
 
 // ---------------- Type ⇄ JSON Schema ----------------

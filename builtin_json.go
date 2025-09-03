@@ -3,6 +3,7 @@ package mindscript
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -39,13 +40,19 @@ Params:
 Returns:
   Any`)
 
+	// jsonStringify(x: Any) -> Str
+	// jsonStringify(x: Any) -> Str?
 	ip.RegisterNative(
 		"jsonStringify",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Str"},
+		S{"unop", "?", S{"id", "Str"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			xv := ctx.MustArg("x")
-			b, err := json.Marshal(valueToGoJSON(xv))
+			gv, err := valueToGoJSON(xv)
+			if err != nil {
+				return annotNull("json stringify: " + err.Error())
+			}
+			b, err := json.Marshal(gv)
 			if err != nil {
 				// Soft error: value cannot be represented in JSON (e.g., NaN/Inf)
 				return annotNull("json stringify: " + err.Error())
@@ -53,6 +60,7 @@ Returns:
 			return Str(string(b))
 		},
 	)
+
 	setBuiltinDoc(ip, "jsonStringify", `Serialize a value to a compact JSON string.
 
 Arrays and maps are emitted as JSON arrays/objects. Object key order is not
@@ -83,27 +91,29 @@ Params:
 Returns:
   Any — JSON Schema as a map/array structure (use jsonStringify to serialize)`)
 
-	// jsonSchemaToType(schema: Any) -> Type
+	// jsonSchemaToType(schema: Any) -> Type?   (soft-error on unsupported schema)
 	ip.RegisterNative(
 		"jsonSchemaToType",
 		[]ParamSpec{{Name: "schema", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
+		S{"unop", "?", S{"id", "Type"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			raw := valueToGoJSON(ctx.MustArg("schema"))
-			doc, ok := raw.(map[string]any)
+			gv, err := valueToGoJSON(ctx.MustArg("schema"))
+			if err != nil {
+				return annotNull("json schema: " + err.Error())
+			}
+			doc, ok := gv.(map[string]any)
 			if !ok {
 				// Not a JSON object: widen gracefully (soft behavior rather than hard failure)
 				return TypeVal(S{"id", "Any"})
 			}
 
-			// Convert the root to a **Type value** (keeps top-level description in Annot).
+			// Convert the root to a Type value (keeps top-level description in Annot).
 			tv := ip.JSONSchemaToTypeValue(doc)
 
 			// Import $defs/definitions into the current environment as aliases.
 			importDefs := func(defs map[string]any) {
 				for name, defRaw := range defs {
 					if defObj, ok := defRaw.(map[string]any); ok {
-						// Convert def using the whole document as root for local $ref resolution.
 						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
 						ctx.Env().Define(name, TypeVal(s))
 					}
@@ -130,7 +140,7 @@ Params:
   schema: Any — JSON object (e.g., from jsonParse)
 
 Returns:
-  Type`)
+  Type?`)
 
 	// typeStringToJSONSchema(src: Str) -> Any
 	ip.RegisterNative(
@@ -203,38 +213,44 @@ Returns:
 }
 
 // valueToGoJSON converts a MindScript Value into a Go JSON-able value.
-func valueToGoJSON(v Value) any {
+func valueToGoJSON(v Value) (any, error) {
 	switch v.Tag {
 	case VTNull:
-		return nil
+		return nil, nil
 	case VTBool:
-		return v.Data.(bool)
+		return v.Data.(bool), nil
 	case VTInt:
-		return v.Data.(int64)
+		return v.Data.(int64), nil
 	case VTNum:
-		return v.Data.(float64)
+		return v.Data.(float64), nil
 	case VTStr:
-		return v.Data.(string)
+		return v.Data.(string), nil
 	case VTArray:
 		xs := v.Data.([]Value)
 		out := make([]any, len(xs))
 		for i := range xs {
-			out[i] = valueToGoJSON(xs[i])
+			el, err := valueToGoJSON(xs[i])
+			if err != nil {
+				return nil, err
+			}
+			out[i] = el
 		}
-		return out
+		return out, nil
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		out := make(map[string]any, len(mo.Entries))
 		// Note: Go's json encoder doesn't preserve map insertion order.
-		// We still iterate Keys for determinism if you ever serialize manually.
 		for _, k := range mo.Keys {
-			out[k] = valueToGoJSON(mo.Entries[k])
+			ev, err := valueToGoJSON(mo.Entries[k])
+			if err != nil {
+				return nil, err
+			}
+			out[k] = ev
 		}
-		return out
+		return out, nil
 	default:
-		// For non-JSON-serializable values (functions, types, handles, modules),
-		// return null rather than a debug string to keep valid JSON shape.
-		return nil
+		// Functions, types, handles, modules, etc. are not JSON-serializable here.
+		return nil, fmt.Errorf("unsupported value tag %v", v.Tag)
 	}
 }
 

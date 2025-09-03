@@ -1,4 +1,7 @@
 {
+	"$iter_0": <fun: _:Null -> Any?>,
+	"$last_13": "# Write a string to a file (overwriting if it exists).\n# \n# Creates the file if necessary with mode 0644.\n# Returns the number of bytes written as Int, or null (annotated) on I/O error.\n<fun: path:Str -> data:Str -> Int?>",
+	"$tmp_8": null,
 	E:
 		# Euler's number e.
 		# 
@@ -30,9 +33,41 @@
 	__make_fun: <fun: params:[Str] -> types:[Type] -> ret:Type -> body:Type -> isOracle:Bool -> examples:Any -> basePath:[Int] -> Any>,
 	__make_module: <fun: name:Str -> body:Any -> base:Any -> Any>,
 	__map_from: <fun: keys:[Str] -> vals:[Any] -> Any>,
+	__oracle_execute:
+		# Oracle executor entry point — prelude wires this into __oracle_execute.
+		# 
+		# Returns: Str?  (raw JSON or null on failure)
+		<fun: prompt:Str -> inType:Type -> outTypeNullable:Type -> examples:[Any] -> Str?>,
 	__plus: <fun: a:Any -> b:Any -> Any>,
 	__resolve_type: <fun: t:Type -> Type>,
 	__to_iter: <fun: x:Any -> Any>,
+	_arrayBuilder:
+		# Build a JSON array incrementally (string-backed buffer).
+		# 
+		# Returns an object with:
+		# - push(x: Any)  -> Null
+		# - build(_: Null)-> [Any]
+		# Useful to avoid repeated array reallocations.
+		# Args: (none)
+		# Returns: { push:(Any -> Null), build:(Null -> [Any]) }
+		<fun: _:Null -> {build: (Null) -> [Any], push: (Any) -> Null}>,
+	_hello:
+		# Say hello in a surprising, playful one-liner.
+		# 
+		# Produces a short, delightful greeting that directly addresses the given name.
+		# Single sentence, 6–14 words, plain text (no code fences). Emoji allowed.
+		# Runs the full oracle path: prompt build → backend exec → JSON boxing → type-check.
+		# Args: name: Str
+		# Returns: Str
+		<oracle: Str?>,
+	_oracleInstalled: true,
+	assert:
+		# Assert that a condition holds.
+		# 
+		# Returns true if `cond` is true; otherwise throws a hard failure.
+		# Args: cond: Bool
+		# Returns: Bool
+		<fun: cond:Bool -> Bool>,
 	astEval:
 		# Evaluate a runtime-S AST in the caller's scope.
 		# 
@@ -176,6 +211,13 @@
 		# Returns:
 		# Bool
 		<fun: h:Any -> Bool>,
+	codeImport:
+		# Create an importer from a code string.
+		# 
+		# Returns a function that imports the code under a given module name.
+		# Args: code: Str
+		# Returns: (Str -> {})
+		<fun: code:Str -> (Str) -> {}>,
 	cos:
 		# Cosine of an angle in radians.
 		# 
@@ -216,6 +258,28 @@
 		# Returns:
 		# {Str: Any} — a map with the fields above
 		<fun: _:Null -> {}>,
+	delProp:
+		# Delete a property from a map.
+		# 
+		# Returns the updated object.
+		# Args: obj: {}, prop: Str
+		# Returns: {}
+		<fun: obj:{} -> prop:Str -> {}>,
+	dir:
+		# Directory listing of visible fields/functions.
+		# 
+		# For maps: returns keys not starting with "_".
+		# For modules: returns exported names (not starting with "_"), or [] if unavailable.
+		# Args: x: Any
+		# Returns: [Str]
+		<fun: x:{} -> [Str]>,
+	dirFun:
+		# List function names of an object (if supported).
+		# 
+		# Placeholder: requires native function detection support.
+		# Args: _obj: {}
+		# Returns: [Str]?
+		<fun: _obj:{} -> [Str]?>,
 	dirList:
 		# List directory entries as an array of names.
 		# 
@@ -225,6 +289,13 @@
 		# Returns:
 		# [Str], or null (annotated) on I/O error (e.g., permission denied).
 		<fun: path:Str -> [Str]?>,
+	error:
+		# Produce an annotated null (soft error).
+		# 
+		# Returns `null` annotated with `msg`. Use for recoverable failures.
+		# Args: msg: Str
+		# Returns: Null
+		<fun: msg:Str -> Null>,
 	exec:
 		# Run an external program.
 		# 
@@ -274,6 +345,7 @@
 		# Returns:
 		# Num
 		<fun: x:Num -> Num>,
+	f: <fun: _:Null -> Any>,
 	fail:
 		# Fail: throw a runtime error (hard fault).
 		# 
@@ -284,6 +356,13 @@
 		# Null (never returns)
 		<fun: message:Str? -> Null>,
 	fh: <handle: file>,
+	filter:
+		# Filter an iterator (lazy predicate).
+		# 
+		# Returns a thunk that yields only values where `cond(x)` is true.
+		# Args: cond: (Any -> Bool), it: (Null -> Any?)
+		# Returns: (Null -> Any?)
+		<fun: cond:(Any) -> Bool -> it:(Null) -> Any? -> (Null) -> Any?>,
 	flush:
 		# Flush buffered output for a handle.
 		# 
@@ -293,6 +372,41 @@
 		# Returns:
 		# Bool
 		<fun: h:Any -> Bool>,
+	formatCode:
+		# Format source code.
+		# 
+		# Parses the input and pretty-prints it with normalized whitespace and minimal parentheses. Supports PRE/POST annotations (# ... lines above; trailing # ... forces newline). On parse failure, returns null with a caret-formatted error.
+		# 
+		# Params:
+		# src: Str
+		# 
+		# Returns:
+		# Str?
+		<fun: src:Str -> Str?>,
+	formatValue:
+		# Render a runtime value (with annotations).
+		# 
+		# Produces a stable, readable string: scalars are literal; arrays/maps inline when short, otherwise multi-line (maps sort keys). PRE annotations print as header lines; POST as trailing comments. Functions show as <fun: ...>, types as <type: ...>, modules as <module: ...>.
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Str
+		<fun: x:Any -> Str>,
+	getNote:
+		# Get the annotation/note attached to a value, if any.
+		# 
+		# Thin wrapper over native `help(x)` (if provided).
+		# Args: x: Any
+		# Returns: Str?
+		<fun: x:Any -> Str?>,
+	getProp:
+		# Get a property value.
+		# 
+		# Args: obj: {}, key: Str
+		# Returns: Any
+		<fun: obj:{} -> key:Str -> Any>,
 	gzipCompress:
 		# Compress data using gzip (default level).
 		# 
@@ -319,6 +433,12 @@
 		# • Returns annotated null on invalid gzip headers, checksum mismatch, truncated input, etc.
 		# • Output is binary; treat as bytes stored in Str.
 		<fun: data:Str -> Str?>,
+	hasKey:
+		# Whether a key exists in a map.
+		# 
+		# Args: obj: {}, key: Str
+		# Returns: Bool
+		<fun: obj:{} -> key:Str -> Bool>,
 	hexDecode:
 		# Decode a hexadecimal string.
 		# 
@@ -390,6 +510,13 @@
 			statusText: Str,
 			url: Str
 		}?>,
+	httpGet:
+		# Simple HTTP GET helper.
+		# 
+		# Performs a GET and returns the response body on HTTP 200; otherwise an annotated null.
+		# Args: url: Str
+		# Returns: Str?
+		<fun: url:Str -> Str?>,
 	httpStream:
 		# Make an HTTP request (streaming).
 		# 
@@ -462,6 +589,13 @@
 		# Module (nullable) — the created module value; or null with an error annotation if the
 		# user code intentionally returns a soft failure.
 		<fun: name:Str -> src:Str -> Any>,
+	importUrl:
+		# Import a module from a URL.
+		# 
+		# Returns the module object, or annotated null on failure.
+		# Args: url: Str
+		# Returns: {}?
+		<fun: url:Str -> {}?>,
 	int:
 		# Convert to Int when possible; otherwise return null.
 		# 
@@ -501,6 +635,13 @@
 		# 
 		# Returns: Bool
 		<fun: x:Any -> T:Type -> Bool>,
+	iter:
+		# Turn arrays into (Null -> Any?) iterators; pass iterators through unchanged.
+		# 
+		# If `v` is `[Any]`, returns a thunk yielding items then null; otherwise assumes `v` is already an iterator.
+		# Args: v: Any
+		# Returns: (Null -> Any?)
+		<fun: v:Any -> (Null) -> Any?>,
 	join:
 		# Join strings with a separator.
 		# 
@@ -526,6 +667,13 @@
 		# Returns:
 		# Any
 		<fun: s:Str -> Any>,
+	jsonSchema:
+		# Render a JSON Schema for a Type.
+		# 
+		# Uses native `typeToJSONSchema` and serializes to a string.
+		# Args: t: Type
+		# Returns: Str?
+		<fun: t:Type -> Str?>,
 	jsonSchemaStringToType:
 		# Parse a JSON Schema string and convert it to a MindScript Type.
 		# 
@@ -547,8 +695,8 @@
 		# schema: Any — JSON object (e.g., from jsonParse)
 		# 
 		# Returns:
-		# Type
-		<fun: schema:Any -> Type>,
+		# Type?
+		<fun: schema:Any -> Type?>,
 	jsonStringify:
 		# Serialize a value to a compact JSON string.
 		# 
@@ -560,7 +708,14 @@
 		# 
 		# Returns:
 		# Str
-		<fun: x:Any -> Str>,
+		<fun: x:Any -> Str?>,
+	k: "writeFile",
+	keys:
+		# Iterator over keys of an object.
+		# 
+		# Args: obj: {}
+		# Returns: (Null -> Str?)
+		<fun: obj:{} -> (Null) -> Str?>,
 	len:
 		# Length of a value.
 		# 
@@ -576,6 +731,27 @@
 		# Returns:
 		# Int?
 		<fun: x:Any -> Int?>,
+	list:
+		# Collect an iterator into an array.
+		# 
+		# Consumes `it` until it returns null.
+		# Args: it: (Null -> Any?)
+		# Returns: [Any]
+		<fun: it:(Null) -> Any? -> [Any]>,
+	llm:
+		# Load the llm module (namespaced) and install its executor into the global hook.
+		# 
+		# The `llm` module manages backends/models/options; this merely wires it to oracles.
+		# Args: (module import side effects)
+		# Returns: (installs __oracle_execute)
+		<module: llm>,
+	locals:
+		# Current frame bindings (shallow copy).
+		# 
+		# Returns a map of variables bound in the *current* scope only.
+		# Args: _: Null (ignored)
+		# Returns: {}
+		<fun: _:Null -> {}>,
 	log:
 		# Natural logarithm (base e).
 		# 
@@ -594,6 +770,13 @@
 		# Returns:
 		# Str
 		<fun: s:Str -> Str>,
+	map:
+		# Map over an iterator (lazy transform).
+		# 
+		# Returns a thunk that yields `f(x)` for each `x` in `it`.
+		# Args: f: (Any -> Any), it: (Null -> Any?)
+		# Returns: (Null -> Any?)
+		<fun: f:(Any) -> Any -> it:(Null) -> Any? -> (Null) -> Any?>,
 	mapDelete:
 		# Delete a property from a map (in place).
 		# 
@@ -635,6 +818,27 @@
 		# Returns:
 		# Bool (annotated null on error)
 		<fun: path:Str -> Bool>,
+	mute:
+		# Mute (sink) a value.
+		# 
+		# Accepts any value and returns null.
+		# Args: _: Any
+		# Returns: Null
+		<fun: _:Any -> Null>,
+	natural:
+		# Infinite iterator: 1, 2, 3, ...
+		# 
+		# Produces a thunk `(Null -> Int)` that starts at 1.
+		# Args: _: Null (ignored)
+		# Returns: (Null -> Int)
+		<fun: _:Null -> (Null) -> Int>,
+	natural0:
+		# Infinite iterator: 0, 1, 2, ...
+		# 
+		# Produces a thunk `(Null -> Int)` that increments on each call.
+		# Args: _: Null (ignored)
+		# Returns: (Null -> Int)
+		<fun: _:Null -> (Null) -> Int>,
 	netAccept:
 		# Accept one TCP connection from a listener.
 		# 
@@ -724,6 +928,28 @@
 		# file handle usable with read*/write/flush/close,
 		# or null (annotated) on I/O failure.
 		<fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Any>,
+	oracleCheck:
+		# Run oracleHello and report status + timing.
+		# 
+		# On success, returns { ok:true, backend, model, ms, value }.
+		# On failure, returns an annotated null describing the problem.
+		# Args: name: Str
+		# Returns: { ok: Bool, backend: Str, model: Str?, ms: Int, value: Str }?
+		<fun: name:Str -> {}?>,
+	oracleInstall:
+		# Install a new global oracle executor.
+		# 
+		# Rebinds `__oracle_execute` to the provided function.
+		# Args: exec: (Str -> Type -> Type -> [Any] -> Str?)
+		# Returns: Null
+		<fun: exec:(Str, Type, Type, [Any]) -> Str? -> Null>,
+	oracleStatus:
+		# Show oracle installation status.
+		# 
+		# Returns a short string indicating whether a backend is installed.
+		# Args: _: Null (ignored)
+		# Returns: Str
+		<fun: _:Null -> Str>,
 	osEnv:
 		# Read an environment variable.
 		# 
@@ -807,6 +1033,12 @@
 		# • Mirrors Go's filepath.Join semantics (cleans the result, removes empty segments).
 		# • Works cross-platform (Windows/POSIX).
 		<fun: parts:[Str] -> Str>,
+	pop:
+		# Pop the last element without modifying the input array.
+		# 
+		# Args: xs: [Any]
+		# Returns: Any?
+		<fun: xs:[Any] -> Any?>,
 	pow:
 		# Power: base^exp.
 		# 
@@ -817,6 +1049,13 @@
 		# Returns:
 		# Num
 		<fun: base:Num -> exp:Num -> Num>,
+	print:
+		# Print a value and return it.
+		# 
+		# Prints the string form of `x` without a trailing newline, and returns `x`.
+		# Args: x: Any
+		# Returns: Any
+		<fun: x:Any -> Any>,
 	printf:
 		# Print a formatted string to standard output.
 		# 
@@ -830,6 +1069,13 @@
 		# Returns:
 		# Str? — the printed string, or null (annotated) on write error.
 		<fun: fmt:Str -> args:[Any] -> Str?>,
+	println:
+		# Print a value with newline and return it.
+		# 
+		# Prints the string form of `x` followed by a newline, and returns `x`.
+		# Args: x: Any
+		# Returns: Any
+		<fun: x:Any -> Any>,
 	procCancel:
 		# Request cooperative cancellation of a process (best effort).
 		<fun: p:Any -> Null>,
@@ -845,6 +1091,12 @@
 	procSpawn:
 		# Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
 		<fun: f:Any -> Any>,
+	push:
+		# Push a value to the end (returns a new array).
+		# 
+		# Args: xs: [Any], v: Any
+		# Returns: [Any]
+		<fun: xs:[Any] -> v:Any -> [Any]>,
 	randBytes:
 		# Uniform cryptographically secure random bytes.
 		# 
@@ -876,6 +1128,20 @@
 		# Returns:
 		# Int
 		<fun: n:Int -> Int>,
+	random:
+		# Random float uniformly in [0, 1).
+		# 
+		# Thin wrapper over native `randFloat()`.
+		# Args: _: Null (ignored)
+		# Returns: Num
+		<fun: _:Null -> Num>,
+	range:
+		# Integer range iterator (stop exclusive; infinite if stop is null).
+		# 
+		# Returns a thunk that yields start, start+1, ... until `stop-1`, or forever if `stop` is null.
+		# Args: start: Int, stop: Int?
+		# Returns: (Null -> Int?)
+		<fun: start:Int -> stop:Int? -> (Null) -> Int?>,
 	readAll:
 		# Read all remaining bytes from a handle.
 		# 
@@ -902,6 +1168,13 @@
 		# May return fewer than n bytes at EOF. Returns data as Str.
 		# Hard-error if n < 0. Returns null (annotated) on I/O error.
 		<fun: h:Any -> n:Int -> Str?>,
+	reduce:
+		# Fold an iterator with a binary function.
+		# 
+		# Reduces `it` by applying `f` left-to-right. Returns null for empty iterator.
+		# Args: f: (Any -> Any -> Any), it: (Null -> Any?)
+		# Returns: Any?
+		<fun: f:(Any, Any) -> Any -> it:(Null) -> Any? -> Any?>,
 	reflect:
 		# Reflect a value into constructor code (runtime-S).
 		# 
@@ -980,6 +1253,13 @@
 		# Returns:
 		# Str
 		<fun: s:Str -> Str>,
+	scope:
+		# All visible bindings (merged from current frame outward).
+		# 
+		# Returns a map where inner scopes shadow outer ones.
+		# Args: _: Null (ignored)
+		# Returns: {}
+		<fun: _:Null -> {}>,
 	seedRand:
 		# Seed the pseudo-random number generator.
 		# 
@@ -991,6 +1271,19 @@
 		# Returns:
 		# Null
 		<fun: n:Int -> Null>,
+	setNote:
+		# Annotates a value.
+		# 
+		# Requires native support to attach annotations at runtime.
+		# Args: x: Any, note: Str?
+		# Returns: Any
+		<fun: x:Any -> note:Str? -> Any>,
+	setProp:
+		# Set a property value (returns the value).
+		# 
+		# Args: obj: {}, key: Str, value: Any
+		# Returns: Any
+		<fun: obj:{} -> key:Str -> value:Any -> Any>,
 	sha256:
 		# SHA-256 digest (raw bytes).
 		# 
@@ -1000,6 +1293,13 @@
 		# Returns:
 		# Str — 32-byte digest (raw). Use hex/base64 in userland to display.
 		<fun: x:Str -> Str>,
+	shift:
+		# Shift a value to the front (returns a new array).
+		# 
+		# Places `v` at the head and appends all items of `xs`.
+		# Args: xs: [Any], v: Any
+		# Returns: [Any]
+		<fun: xs:[Any] -> v:Any -> [Any]>,
 	sin:
 		# Sine of an angle in radians.
 		# 
@@ -1018,6 +1318,13 @@
 		# Returns:
 		# Null
 		<fun: ms:Int -> Null>,
+	slice:
+		# Slice an array [s, e).
+		# 
+		# Returns a shallow copy of `xs` from index `s` (inclusive) to `e` (exclusive).
+		# Args: xs: [Any], s: Int, e: Int
+		# Returns: [Any]
+		<fun: xs:[Any] -> s:Int -> e:Int -> [Any]>,
 	snapshot:
 		# Return a map snapshot of the visible environment (including built-ins).
 		# 
@@ -1099,7 +1406,7 @@
 		# 
 		# Returns:
 		# Str
-		<fun: x:Any -> Str>,
+		<fun: x:Any -> Str?>,
 	strip:
 		# Remove leading and trailing whitespace (Unicode).
 		# 
@@ -1123,6 +1430,7 @@
 		# Returns:
 		# Str
 		<fun: s:Str -> i:Int -> j:Int -> Str>,
+	t: <type: {}>,
 	tan:
 		# Tangent of an angle in radians.
 		# 
@@ -1196,6 +1504,13 @@
 		# • If the function returns an annotated null, ok=false and error is that annotation.
 		# • On success, ok=true and value is the function's result.
 		<fun: f:Any -> {}>,
+	tsNow:
+		# Current timestamp in milliseconds since the Unix epoch.
+		# 
+		# Thin wrapper over native `nowMillis()`.
+		# Args: _: Null (ignored)
+		# Returns: Int
+		<fun: _:Null -> Int>,
 	typeOf:
 		# Return the dynamic Type of a value.
 		# 
@@ -1225,6 +1540,19 @@
 		# Returns:
 		# Any — JSON Schema as a map/array structure (use jsonStringify to serialize)
 		<fun: t:Type -> Any>,
+	uid:
+		# Stable-ish integer id for a value’s string form.
+		# 
+		# Implements a simple DJB2-like hash over `str(value)`.
+		# Args: value: Any
+		# Returns: Int
+		<fun: value:Any -> Int>,
+	unshift:
+		# Unshift (peek) the first element.
+		# 
+		# Args: xs: [Any]
+		# Returns: Any?
+		<fun: xs:[Any] -> Any?>,
 	urlBuild:
 		# Build a URL string from components.
 		# 
@@ -1286,6 +1614,18 @@
 		# Returns:
 		# Str — percent-encoded query string (without leading '?').
 		<fun: q:{} -> Str>,
+	v:
+		# Write a string to a file (overwriting if it exists).
+		# 
+		# Creates the file if necessary with mode 0644.
+		# Returns the number of bytes written as Int, or null (annotated) on I/O error.
+		<fun: path:Str -> data:Str -> Int?>,
+	values:
+		# Iterator over values of an object.
+		# 
+		# Args: obj: {}
+		# Returns: (Null -> Any?)
+		<fun: obj:{} -> (Null) -> Any?>,
 	write:
 		# Write a string to a file or network handle.
 		# 

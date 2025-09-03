@@ -681,3 +681,113 @@ func Test_Lexer_Module_CapitalizedIsNotKeyword(t *testing.T) {
 	}
 	wantTypes(t, src, want)
 }
+
+func checkLexErr(t *testing.T, src string, wantLine, wantCol int, wantSubstr string) {
+	t.Helper()
+	l := NewLexer(src)
+	_, err := l.Scan()
+	if err == nil {
+		t.Fatalf("expected lex error, got nil\nsource:\n%q", src)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T: %v", err, err)
+	}
+	if e.Kind != DiagLex {
+		t.Fatalf("expected DiagLex, got kind=%v msg=%q", e.Kind, e.Msg)
+	}
+	if e.Line != wantLine || e.Col != wantCol {
+		t.Fatalf("wrong location: want %d:%d, got %d:%d (msg=%q)", wantLine, wantCol, e.Line, e.Col, e.Msg)
+	}
+	if wantSubstr != "" && !strings.Contains(e.Msg, wantSubstr) {
+		t.Fatalf("error message does not contain %q: %q", wantSubstr, e.Msg)
+	}
+}
+
+func checkIncErr(t *testing.T, src string, wantLine, wantCol int, wantSubstr string) {
+	t.Helper()
+	l := NewLexerInteractive(src)
+	_, err := l.Scan()
+	if err == nil {
+		t.Fatalf("expected incomplete error, got nil\nsource:\n%q", src)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T: %v", err, err)
+	}
+	if e.Kind != DiagIncomplete {
+		t.Fatalf("expected DiagIncomplete, got kind=%v msg=%q", e.Kind, e.Msg)
+	}
+	if e.Line != wantLine || e.Col != wantCol {
+		t.Fatalf("wrong location: want %d:%d, got %d:%d (msg=%q)", wantLine, wantCol, e.Line, e.Col, e.Msg)
+	}
+	if wantSubstr != "" && !strings.Contains(e.Msg, wantSubstr) {
+		t.Fatalf("error message does not contain %q: %q", wantSubstr, e.Msg)
+	}
+}
+
+func Test_Lexer_Error_UnexpectedChar_Simple(t *testing.T) {
+	checkLexErr(t, "@", 1, 1, "unexpected character")
+}
+
+func Test_Lexer_Error_UnexpectedChar_WithSpaces(t *testing.T) {
+	checkLexErr(t, "   @", 1, 4, "unexpected character")
+}
+
+func Test_Lexer_Error_UnexpectedChar_WithTab(t *testing.T) {
+	// 2 spaces + 1 tab before '@' → token starts at visual col 4, but lexer columns are byte-based.
+	// Col is 1-based in diagnostics, so expect 4.
+	checkLexErr(t, "  \t@", 1, 4, "unexpected character")
+}
+
+func Test_Lexer_Error_UnexpectedChar_NextLine(t *testing.T) {
+	checkLexErr(t, "\n  @", 2, 3, "unexpected character")
+}
+
+func Test_Lexer_Error_InvalidEscape_AnchorsAtOpeningQuote(t *testing.T) {
+	// MindScript source: "\"" + "\x" + "\""
+	src := "\"\\x\""
+	checkLexErr(t, src, 1, 1, "invalid escape sequence")
+}
+
+func Test_Lexer_Error_InvalidUnicodeHex_AnchorsAtOpeningQuote(t *testing.T) {
+	// MindScript source: "\"" + "\u12G4" + "\""
+	src := "\"\\u12G4\""
+	checkLexErr(t, src, 1, 1, "invalid unicode escape")
+}
+
+func Test_Lexer_Error_UnfinishedEscape_AnchorsAtOpeningQuote(t *testing.T) {
+	// MindScript source: "\"" + "\" (no closing quote, ends mid-escape)
+	src := "\"\\"
+	checkLexErr(t, src, 1, 1, "unfinished escape sequence")
+}
+
+func Test_Lexer_Error_UnterminatedString_AnchorsAtOpeningQuote(t *testing.T) {
+	src := "\"abc"
+	checkLexErr(t, src, 1, 1, "string was not terminated")
+}
+
+func Test_Lexer_Error_UnterminatedString_WithIndentAndNewline(t *testing.T) {
+	// Two spaces then opening quote on line 1; string spills to next line and EOF → anchor must be at opening quote.
+	src := "  \"abc\n"
+	checkLexErr(t, src, 1, 3, "string was not terminated")
+}
+
+func Test_Lexer_Error_InvalidUTF8InString_AnchorsAtOpeningQuote(t *testing.T) {
+	// MindScript source: quote, then a single invalid leading byte 0x80, then quote.
+	// Go string can hold arbitrary bytes via \x80.
+	src := "\"\x80\""
+	checkLexErr(t, src, 1, 1, "invalid UTF-8")
+}
+
+func Test_Lexer_Error_IncompleteUnicodeLowSurrogate_AnchorsAtOpeningQuote(t *testing.T) {
+	// High surrogate \uD800 followed by an unterminated low surrogate (\u12 then EOF).
+	src := "\"\\uD800\\u12"
+	checkLexErr(t, src, 1, 1, "unicode surrogate pair low was not terminated")
+}
+
+func Test_Lexer_Interactive_IncompleteString_AnchorsAtOpeningQuote(t *testing.T) {
+	// In interactive mode, unterminated strings produce DiagIncomplete.
+	src := "\"hello"
+	checkIncErr(t, src, 1, 1, "string was not terminated")
+}

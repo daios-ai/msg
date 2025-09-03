@@ -74,6 +74,48 @@ func mustFailParseContains(t *testing.T, src string, substr string) {
 	}
 }
 
+func checkParseErr(t *testing.T, src string, wantLine, wantCol int, wantSubstr string) {
+	t.Helper()
+	_, err := ParseSExpr(src)
+	if err == nil {
+		t.Fatalf("expected parse error, got nil\nsource:\n%q", src)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T: %v", err, err)
+	}
+	if e.Kind != DiagParse {
+		t.Fatalf("expected DiagParse, got kind=%v msg=%q", e.Kind, e.Msg)
+	}
+	if e.Line != wantLine || e.Col != wantCol {
+		t.Fatalf("wrong location: want %d:%d, got %d:%d (msg=%q)\nsource:\n%q", wantLine, wantCol, e.Line, e.Col, e.Msg, src)
+	}
+	if wantSubstr != "" && !strings.Contains(e.Msg, wantSubstr) {
+		t.Fatalf("error message does not contain %q: %q", wantSubstr, e.Msg)
+	}
+}
+
+func checkParseInc(t *testing.T, src string, wantLine, wantCol int, wantSubstr string) {
+	t.Helper()
+	_, err := ParseSExprInteractive(src)
+	if err == nil {
+		t.Fatalf("expected incomplete parse error, got nil\nsource:\n%q", src)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T: %v", err, err)
+	}
+	if e.Kind != DiagIncomplete {
+		t.Fatalf("expected DiagIncomplete, got kind=%v msg=%q", e.Kind, e.Msg)
+	}
+	if e.Line != wantLine || e.Col != wantCol {
+		t.Fatalf("wrong location: want %d:%d, got %d:%d (msg=%q)\nsource:\n%q", wantLine, wantCol, e.Line, e.Col, e.Msg, src)
+	}
+	if wantSubstr != "" && !strings.Contains(e.Msg, wantSubstr) {
+		t.Fatalf("error message does not contain %q: %q", wantSubstr, e.Msg)
+	}
+}
+
 // --- tests -----------------------------------------------------------------
 
 func Test_Parser_Literals_And_Id(t *testing.T) {
@@ -1800,4 +1842,89 @@ func Test_Parser_PropertyAfterDot_ModuleKeywordForcedID(t *testing.T) {
 	if prop[1].(string) != "module" {
 		t.Fatalf("property name mismatch: %v", prop[1])
 	}
+}
+
+func Test_Parser_Error_UnexpectedToken_AtStart(t *testing.T) {
+	// '!' is not a valid prefix operator in MindScript.
+	checkParseErr(t, "!", 1, 1, "unexpected token '!'")
+}
+
+func Test_Parser_Error_Group_Missing_RPAREN(t *testing.T) {
+	src := "(a"
+	// Error is anchored at EOF token position: 1:len(src)+1
+	checkParseErr(t, src, 1, len(src)+1, "expected ')'")
+}
+
+func Test_Parser_Error_Array_Missing_RSQUARE(t *testing.T) {
+	src := "[1,2"
+	checkParseErr(t, src, 1, len(src)+1, "expected ']'")
+}
+
+func Test_Parser_Error_If_Missing_THEN_At_Do(t *testing.T) {
+	// After 'if x' the parser expects 'then'; we give 'do', so point at 'do'.
+	src := "if x do end"
+	// Columns: i(1) f(2) ' '(3) x(4) ' '(5) d(6)
+	checkParseErr(t, src, 1, 6, "expected 'then'")
+}
+
+func Test_Parser_Error_InvalidAssignmentTarget_AtEquals(t *testing.T) {
+	// 1 = 2 → '=' is where the error is anchored.
+	src := "1 = 2"
+	// '1'(1) ' '(2) '='(3)
+	checkParseErr(t, src, 1, 3, "invalid assignment target")
+}
+
+func Test_Parser_Error_Map_Missing_Colon_After_Key_AtValue(t *testing.T) {
+	// After key 'x' parser expects ':', we give '1' → point at '1'.
+	src := "{x 1}"
+	// '{'(1) 'x'(2) ' '(3) '1'(4)
+	checkParseErr(t, src, 1, 4, "expected ':'")
+}
+
+func Test_Parser_Error_Fun_Params_Require_CLROUND(t *testing.T) {
+	// Space before '(' makes it LROUND; params() requires CLROUND.
+	src := "fun (x: Int) do end"
+	// 'fun'(1..3) ' '(4) '('(5)
+	checkParseErr(t, src, 1, 5, "expected '(' to start parameters")
+}
+
+func Test_Parser_Error_Params_Missing_RPAREN_At_Do(t *testing.T) {
+	// Inside params, after parsing "x:Int" we see 'do' instead of ')'.
+	src := "fun(x:Int do end"
+	// 'fun'(1..3) '('(4) 'x'(5) ':'(6) 'I'(7) 'n'(8) 't'(9) ' '(10) 'd'(11)
+	checkParseErr(t, src, 1, 11, "expected ')' after parameters")
+}
+
+func Test_Parser_Error_ComputedProperty_Missing_RPAREN(t *testing.T) {
+	src := "a.(b"
+	checkParseErr(t, src, 1, len(src)+1, "expected ')' after computed property")
+}
+
+func Test_Parser_Error_For_Target_Invalid_AtNumber(t *testing.T) {
+	src := "for 1 in xs do end"
+	// 'for'(1..3) ' '(4) '1'(5)
+	checkParseErr(t, src, 1, 5, "invalid for-target")
+}
+
+func Test_Parser_Error_While_Missing_DO_AtEnd(t *testing.T) {
+	src := "while x end"
+	// 'while'(1..5) ' '(6) 'x'(7) ' '(8) 'e'(9)
+	checkParseErr(t, src, 1, 9, "expected 'do'")
+}
+
+func Test_Parser_Incomplete_Block_Missing_END_AnchoredAtEOF(t *testing.T) {
+	// In interactive mode, missing 'end' yields DiagIncomplete at EOF.
+	src := "do 1+2"
+	checkParseInc(t, src, 1, len(src)+1, "expected 'end'")
+}
+
+func Test_Parser_Incomplete_If_Missing_END_AnchoredAtEOF(t *testing.T) {
+	src := "if x then y"
+	checkParseInc(t, src, 1, len(src)+1, "expected 'end'")
+}
+
+func Test_Parser_Incomplete_Binary_Op_RHS_AnchoredAtOp(t *testing.T) {
+	// "1 +" → incomplete; anchored at '+' (column 3).
+	src := "1 +"
+	checkParseInc(t, src, 1, 3, "expected expression after operator")
 }

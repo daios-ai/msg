@@ -18,20 +18,32 @@
 //   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
 //     at EOF instead of hard parse errors, suitable for REPLs.
 //
-// NEW IN THIS VERSION (liberal spacing inside delimiters)
-// ------------------------------------------------------
-// The parser **skips NOOP tokens inside delimited constructs** so that blank
-// lines are treated like whitespace within:
-//   - array literals:            [ … ]
-//   - map/object literals:       { … }
-//   - call argument lists:       f( … )
-//   - parameter lists:           fun(x: T, …)
-//   - bracket indices:           a[ … ]
-//   - computed properties:       obj.( … )
-//   - grouping parentheses:      ( … )
+// NEW IN THIS VERSION (liberal spacing inside delimiters + precise error locations)
+// -------------------------------------------------------------------------------
 //
-// The semantics of NOOP at the top level and inside blocks are unchanged: a
-// NOOP still parses as ("noop") outside the above delimited contexts.
+//   - The parser **skips NOOP tokens inside delimited constructs** so that blank
+//     lines are treated like whitespace within:
+//     array literals:            [ … ]
+//     map/object literals:       { … }
+//     call argument lists:       f( … )
+//     parameter lists:           fun(x: T, …)
+//     bracket indices:           a[ … ]
+//     computed properties:       obj.( … )
+//     grouping parentheses:      ( … )
+//
+//     The semantics of NOOP at the top level and inside blocks are unchanged: a
+//     NOOP still parses as ("noop") outside the above delimited contexts.
+//
+//   - **Precise error locations:** the parser now uses lexer byte offsets to place
+//     carets exactly where users expect.
+//
+//   - If a token is **missing** (e.g., expected ')' at EOF), the error is
+//     anchored **immediately after the last completed node** (using EndByte).
+//
+//   - If an **unexpected token** is present (wrong lookahead), the error is
+//     anchored at the **start** of that token (using StartByte).
+//
+//   - Interactive incomplete errors follow the same policy.
 //
 // What the parser returns
 // -----------------------
@@ -200,7 +212,9 @@
 //   - HARD errors are returned as *Error with appropriate Kind:
 //   - DiagParse for grammatical mistakes.
 //   - DiagIncomplete at EOF in interactive mode (REPL continue).
-//     (Lexical problems from the lexer also arrive as *Error with DiagLex.)
+//   - **Error placement (this version):**
+//   - Missing token (e.g. expected ')'): caret after the last completed node.
+//   - Wrong lookahead token: caret at the start of that token.
 //   - The parser never pretty-prints; public entry points format via FormatError.
 //   - The parser never panics for malformed input.
 //
@@ -212,6 +226,7 @@ package mindscript
 
 import (
 	"fmt"
+	"strings"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -271,16 +286,16 @@ func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
 //     This includes intermediate `get`/`idx` nodes, computed indices `.( … )`,
 //     structural containers like ("pair") inside maps/patterns/params, and wrappers.
 //
-// Errors:
-//   - Does not return DiagIncomplete; unterminated constructs are hard errors.
-//   - Never panics on malformed input.
+// Errors (this version):
+//   - Missing token → caret after last completed node (byte-accurate).
+//   - Unexpected token present → caret at lookahead start.
 func ParseSExpr(src string) (S, error) {
 	lex := NewLexer(src)
 	toks, err := lex.Scan()
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
 	return p.program()
 }
 
@@ -302,7 +317,7 @@ func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	p := &parser{toks: toks, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
 	ast, err := p.program()
 	if err != nil {
 		return nil, nil, err
@@ -326,7 +341,7 @@ func ParseSExprInteractive(src string) (S, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
 	return p.program()
 }
 
@@ -350,6 +365,36 @@ type parser struct {
 	// parsed a subexpression (e.g., unary/binary parent) can extend to it.
 	lastSpanStartTok int
 	lastSpanEndTok   int
+
+	// original source for precise byte→(line,col) mapping
+	src string
+}
+
+// posAtByte returns (line, col1) for byte offset b (columns are 1-based, byte-based).
+func (p *parser) posAtByte(b int) (int, int) {
+	if b < 0 {
+		g := p.peek()
+		return g.Line, g.Col + 1
+	}
+	if b > len(p.src) {
+		b = len(p.src)
+	}
+	line := 1 + strings.Count(p.src[:b], "\n")
+	lastNL := strings.LastIndex(p.src[:b], "\n")
+	if lastNL < 0 {
+		return line, b + 1
+	}
+	return line, b - lastNL
+}
+
+// afterLastPos returns the position immediately after the last completed node.
+func (p *parser) afterLastPos() (int, int) {
+	if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
+		endB := p.toks[p.lastSpanEndTok].EndByte
+		return p.posAtByte(endB)
+	}
+	g := p.peek()
+	return g.Line, g.Col + 1
 }
 
 // internal helper for PRE-annotations in pattern/key contexts.
@@ -430,10 +475,18 @@ func (p *parser) need(t TokenType, msg string) (Token, error) {
 		return p.prev(), nil
 	}
 	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		return Token{}, &Error{Kind: DiagIncomplete, Msg: msg, Line: g.Line, Col: g.Col + 1}
+	if g.Type == EOF {
+		// Missing token: anchor where it should be (after last node).
+		line, col := p.afterLastPos()
+		kind := DiagParse
+		if p.interactive {
+			kind = DiagIncomplete
+		}
+		return Token{}, &Error{Kind: kind, Msg: msg, Line: line, Col: col}
 	}
-	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: g.Line, Col: g.Col + 1}
+	// Wrong token present: anchor at offending lookahead start.
+	line, col := p.posAtByte(g.StartByte)
+	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
 }
 
 func (p *parser) nextTokenIsOnSameLine(as Token) bool {
@@ -581,7 +634,8 @@ func (p *parser) expr(minBP int) (S, error) {
 
 	case MINUS, NOT:
 		if p.atEnd() && p.interactive {
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after unary operator", Line: t.Line, Col: t.Col + 1}
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after unary operator", Line: line, Col: col}
 		}
 		r, err := p.expr(80)
 		if err != nil {
@@ -680,8 +734,10 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 		var ret any = L("id", "Any")
 		if p.match(ARROW) {
+			arrowTok := p.prev()
 			if p.atEnd() && p.interactive {
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected return type after '->'", Line: t.Line, Col: t.Col + 1}
+				line, col := p.posAtByte(arrowTok.StartByte)
+				return nil, &Error{Kind: DiagIncomplete, Msg: "expected return type after '->'", Line: line, Col: col}
 			}
 			r, err := p.expr(0)
 			if err != nil {
@@ -704,8 +760,10 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 		var out any = L("id", "Any")
 		if p.match(ARROW) {
+			arrowTok := p.prev()
 			if p.atEnd() && p.interactive {
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected output type after '->'", Line: t.Line, Col: t.Col + 1}
+				line, col := p.posAtByte(arrowTok.StartByte)
+				return nil, &Error{Kind: DiagIncomplete, Msg: "expected output type after '->'", Line: line, Col: col}
 			}
 			o, err := p.expr(0)
 			if err != nil {
@@ -715,8 +773,11 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 		var src any = L("array")
 		if p.match(FROM) {
+			fromTok := p.prev()
+			_ = fromTok
 			if p.atEnd() && p.interactive {
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after 'from'", Line: t.Line, Col: t.Col + 1}
+				line, col := p.afterLastPos()
+				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after 'from'", Line: line, Col: col}
 			}
 			ex, err := p.expr(0)
 			if err != nil {
@@ -731,7 +792,8 @@ func (p *parser) expr(minBP int) (S, error) {
 	case MODULE:
 		// module NAME do ... end
 		if p.atEnd() && p.interactive {
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected module name expression", Line: t.Line, Col: t.Col + 1}
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagIncomplete, Msg: "expected module name expression", Line: line, Col: col}
 		}
 		name, err := p.expr(0)
 		if err != nil {
@@ -832,16 +894,19 @@ func (p *parser) expr(minBP int) (S, error) {
 			if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
 				g := p.peek()
 				if p.interactive && g.Type == EOF {
-					return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: g.Line, Col: g.Col + 1}
+					line, col := p.afterLastPos()
+					return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 				}
-				return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: g.Line, Col: g.Col + 1}
+				line, col := p.posAtByte(g.StartByte)
+				return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 			}
 		}
 		leftStartTok = tokIndexOfThis // used if a parent wraps it
 
 	case TYPECONS:
 		if p.atEnd() && p.interactive {
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected type expression after 'type'", Line: t.Line, Col: t.Col + 1}
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagIncomplete, Msg: "expected type expression after 'type'", Line: line, Col: col}
 		}
 		x, err := p.expr(0)
 		if err != nil {
@@ -862,14 +927,16 @@ func (p *parser) expr(minBP int) (S, error) {
 			// Disallow consecutive PRE annotations at expression level.
 			if !p.atEnd() && p.peek().Type == ANNOTATION && p.annotationIsPreAt(p.i) {
 				next := p.peek()
+				line, col := p.posAtByte(next.StartByte)
 				return nil, &Error{
-					Kind: DiagParse, Line: next.Line, Col: next.Col + 1,
+					Kind: DiagParse, Line: line, Col: col,
 					Msg: "multiple consecutive pre-annotations are not allowed; combine them",
 				}
 			}
 
 			if p.atEnd() && p.interactive {
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: t.Line, Col: t.Col + 1}
+				line, col := p.posAtByte(t.StartByte)
+				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
 			}
 			// child ("str", txt)
 			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
@@ -882,14 +949,17 @@ func (p *parser) expr(minBP int) (S, error) {
 			p.emitSpanByTok(tokIndexOfThis, p.lastSpanEndTok)
 			leftStartTok = tokIndexOfThis
 		} else {
-			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: t.Line, Col: t.Col + 1}
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: line, Col: col}
 		}
 
 	default:
 		if t.Type == EOF && p.interactive {
-			return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: t.Line, Col: t.Col + 1}
+			line, col := p.afterLastPos()
+			return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
 		}
-		return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: t.Line, Col: t.Col + 1}
+		line, col := p.posAtByte(t.StartByte)
+		return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
 	}
 
 	// ---- postfix chain ----
@@ -926,8 +996,6 @@ func (p *parser) expr(minBP int) (S, error) {
 						break
 					}
 				}
-				pp := p.peek()
-				_ = pp
 				p.skipNoops()
 				if _, err := p.need(RROUND, "expected ')'"); err != nil {
 					return nil, err
@@ -989,7 +1057,8 @@ func (p *parser) expr(minBP int) (S, error) {
 				continue
 			}
 			g := p.peek()
-			return nil, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: g.Line, Col: g.Col + 1}
+			line, col := p.posAtByte(g.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
 
 		case ANNOTATION:
 			// POST attaches to 'left'; PRE belongs to the next thing.
@@ -1029,11 +1098,13 @@ func (p *parser) expr(minBP int) (S, error) {
 		}
 
 		if op.Type == ASSIGN && !assignable(left) {
-			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: op.Line, Col: op.Col + 1}
+			line, col := p.posAtByte(op.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
 		}
 
 		if p.atEnd() && p.interactive {
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after operator", Line: op.Line, Col: op.Col + 1}
+			line, col := p.posAtByte(op.StartByte)
+			return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after operator", Line: line, Col: col}
 		}
 		right, err := p.expr(nextBP)
 		if err != nil {
@@ -1119,7 +1190,8 @@ func (p *parser) params() (S, error) {
 		p.skipNoops()
 		if p.match(COLON) {
 			if p.atEnd() && p.interactive {
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected type after ':'", Line: idTok.Line, Col: idTok.Col + 1}
+				line, col := p.posAtByte(idTok.StartByte)
+				return nil, &Error{Kind: DiagIncomplete, Msg: "expected type after ':'", Line: line, Col: col}
 			}
 			p.skipNoops()
 			e, err := p.expr(0)
@@ -1308,7 +1380,8 @@ func (p *parser) forTarget() (S, error) {
 	if !assignable(e) {
 		p.i = save
 		g := p.peek()
-		return nil, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: g.Line, Col: g.Col + 1}
+		line, col := p.posAtByte(g.StartByte)
+		return nil, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
 	}
 
 	if e[0].(string) == "id" {
@@ -1395,9 +1468,11 @@ func (p *parser) declPattern() (S, error) {
 	}
 	g := p.peek()
 	if p.interactive && g.Type == EOF {
-		return nil, &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: g.Line, Col: g.Col + 1}
+		line, col := p.afterLastPos()
+		return nil, &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
 	}
-	return nil, &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: g.Line, Col: g.Col + 1}
+	line, col := p.posAtByte(g.StartByte)
+	return nil, &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
 }
 
 // --- array destructuring pattern: [p1, p2,] ---
@@ -1530,9 +1605,11 @@ func (p *parser) readKeyString() (S, error) {
 
 	g := p.peek()
 	if p.interactive && g.Type == EOF {
-		return nil, &Error{Kind: DiagIncomplete, Msg: "expected key", Line: g.Line, Col: g.Col + 1}
+		line, col := p.afterLastPos()
+		return nil, &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
 	}
-	return nil, &Error{Kind: DiagParse, Msg: "expected key", Line: g.Line, Col: g.Col + 1}
+	line, col := p.posAtByte(g.StartByte)
+	return nil, &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
 }
 
 func isWordLike(tt TokenType) bool {

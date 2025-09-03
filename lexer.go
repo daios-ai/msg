@@ -7,37 +7,34 @@
 //
 // The lexer scans left→right and emits Token values, always ending with EOF.
 // Each token carries:
-//   - Type    — a TokenType enum
-//   - Lexeme  — the exact source slice (verbatim characters from the input)
-//   - Literal — the decoded value for literal tokens (e.g., bool/int/float/string)
-//   - Line/Col— 1-based line and 0-based column of the token’s start
+//   - Type     — a TokenType enum
+//   - Lexeme   — the exact source slice (verbatim characters from the input)
+//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
+//   - Line/Col — 1-based line and 0-based column of the token’s *start*
+//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
 //
-// The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
-// whether there is immediate whitespace before the delimiter:
+// Whitespace-sensitive delimiters:
 //
-//	'('  → LROUND  if there IS preceding whitespace
-//	      CLROUND if there is NO preceding whitespace
-//	'['  → LSQUARE if there IS preceding whitespace
-//	      CLSQUARE if there is NO preceding whitespace
+//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
+//	whether there is immediate whitespace before the delimiter:
+//
+//	  '('  → LROUND  if there IS preceding whitespace
+//	         CLROUND if there is NO preceding whitespace
+//	  '['  → LSQUARE if there IS preceding whitespace
+//	         CLSQUARE if there is NO preceding whitespace
 //
 // Consequences (user-facing syntax):
-//
-//   - Calls and parameter lists require NO space before '('.
+//   - Calls and parameter lists require NO space before '(':
 //     f(x)           // call: uses CLROUND
 //     fun(x: T)      // function params: uses CLROUND
 //     oracle(x: T)   // oracle params: uses CLROUND
 //     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
 //     parameter list; the parser will error.
-//
-//   - Indexing requires NO space before '['.
+//   - Indexing requires NO space before '[':
 //     arr[i]         // indexing: uses CLSQUARE
 //     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
-//
 //   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
 //     CLROUND participates in call/juxtaposition chains.
-//
-// This lets the parser distinguish grouping/indexing from juxtaposition/call-like
-// forms without lookbehind in the parser.
 //
 // The '.' character is context-sensitive:
 //   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
@@ -68,11 +65,12 @@
 //     optional following space) are stripped; lines are joined with '\n', and a
 //     single ANNOTATION token is emitted. A blank/non-# line ends the block.
 //
-// ERRORS
+// ERRORS (start-of-token anchoring)
 //   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
-//     reported as *LexError* with precise location.
+//     reported as *Error* with precise location anchored to the **start** of the
+//     offending token (the token that is being scanned).
 //   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings produce *IncompleteError* instead of LexError.
+//     strings produce *IncompleteError* (still anchored to the token start).
 //
 // OUTPUT
 //   - Scan returns the full token slice *including* the terminal EOF token.
@@ -240,6 +238,7 @@ const (
 //	          (keywords may store their text; property IDs store the property name).
 //	Line    — 1-based line number at which this token starts.
 //	Col     — 0-based column index at which this token starts.
+//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
 type Token struct {
 	Type      TokenType
 	Lexeme    string
@@ -252,9 +251,13 @@ type Token struct {
 
 // HARD errors produced by the lexer use the unified *Error type defined in
 // errors.go. See DiagLex and DiagIncomplete.
-
+//
 // In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
 // when input ends inside an unterminated construct (e.g., string literal).
+//
+// **Error locations:** All lexing errors (both hard and incomplete) are anchored
+// to the **start of the offending token** (the token whose scanning raised
+// the error). This makes diagnostics stable and easy to map to spans.
 
 // Lexer is a streaming tokenizer for MindScript.
 //
@@ -502,16 +505,17 @@ func (l *Lexer) afterDotIsProperty() bool {
 	return p != nil && p.Type == PERIOD
 }
 
-// ---------------- error builders ----------------
+// ---------------- error builders (start-of-token anchored) ----------------
 
 func (l *Lexer) err(msg string) error {
-	// Lexer maintains 1-based line and 0-based column; diagnostics are 1-based.
-	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.line, Col: l.col + 1}
+	// All lexer diagnostics are anchored to the start of the *current* token,
+	// which is the most stable and helpful position for tools and users.
+	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
 }
 
 func (l *Lexer) errIncomplete(msg string) error {
-	// Report need-more-input conditions in interactive mode.
-	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.line, Col: l.col + 1}
+	// Report need-more-input conditions in interactive mode, anchored to token start.
+	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
 }
 
 // ---------------- scanners ----------------

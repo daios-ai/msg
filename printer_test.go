@@ -642,3 +642,62 @@ return x`
 	got := pretty(t, in)
 	eq(t, got, want)
 }
+func Test_Printer_Fun_Rendering(t *testing.T) {
+	f := &Fun{
+		Params:     nil,
+		ParamTypes: nil,
+		ReturnType: S{"id", "Any"},
+	}
+	got := FormatValue(FunVal(f))
+	want := "<fun: _:Null -> Any>"
+	if got != want {
+		t.Fatalf("fun rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Oracle_Rendering(t *testing.T) {
+	f := &Fun{
+		Params:     nil,
+		ParamTypes: nil,
+		ReturnType: S{"id", "Str"},
+		IsOracle:   true,
+	}
+	got := FormatValue(FunVal(f))
+	want := "<oracle: Str>"
+	if got != want {
+		t.Fatalf("oracle rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Type_Rendering(t *testing.T) {
+	// { age: Int, name: Str } — order is sorted by printer
+	typ := S{
+		"map",
+		S{"pair", S{"str", "name"}, S{"id", "Str"}},
+		S{"pair", S{"str", "age"}, S{"id", "Int"}},
+	}
+	got := FormatValue(TypeVal(typ))
+	want := "<type: { age: Int, name: Str }>"
+	if got != want {
+		t.Fatalf("type rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Module_Rendering(t *testing.T) {
+	// Minimal module with a display name that should pass through prettySpec unchanged.
+	m := &Module{Name: "MyMod"}
+	got := FormatValue(Value{Tag: VTModule, Data: m})
+	want := "<module: MyMod>"
+	if got != want {
+		t.Fatalf("module rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Handle_Rendering(t *testing.T) {
+	h := HandleVal("token", 123)
+	got := FormatValue(h)
+	want := "<handle: token>"
+	if got != want {
+		t.Fatalf("handle rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}

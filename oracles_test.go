@@ -52,18 +52,32 @@ func registerAssertingFakeOracle(ip *Interpreter) {
 			if otV.Tag != VTType {
 				return annotNull("outType is not a Type")
 			}
-			ot := strings.TrimSpace(FormatValue(otV)) // e.g. "Str?" or "{ok!: Bool}?" or "Any"
+
+			// Use the type AST → canonical string (no <type: ...> wrapper).
+			var otText string
+			switch tv := otV.Data.(type) {
+			case *TypeValue:
+				otText = strings.TrimSpace(FormatType(tv.Ast))
+			case S:
+				otText = strings.TrimSpace(FormatType(tv))
+			default:
+				// Fallback (shouldn't happen): strip wrappers if any.
+				otText = strings.TrimSpace(FormatValue(otV))
+				otText = strings.TrimPrefix(otText, "<type:")
+				otText = strings.TrimSuffix(otText, ">")
+				otText = strings.TrimSpace(otText)
+			}
 
 			// Case: Any must stay unwrapped by the engine; we still return boxed JSON.
-			if ot == "Any" {
+			if otText == "Any" {
 				return Str(`{"output":{"ok":true}}`)
 			}
 
 			// Non-Any must be nullable (end with '?')
-			if !strings.HasSuffix(ot, "?") {
+			if !strings.HasSuffix(otText, "?") {
 				return annotNull("outType was not nullable")
 			}
-			base := strings.TrimSpace(strings.TrimSuffix(ot, "?"))
+			base := strings.TrimSpace(strings.TrimSuffix(otText, "?"))
 
 			switch base {
 			case "Str":
@@ -252,8 +266,8 @@ func Test_Oracle_PromptUsesNonNullSuccessType(t *testing.T) {
 		}
 		return b.String()
 	}
-	if compact(got) != "{name!:Str}" {
-		t.Fatalf("prompt outType = %q, want %q", got, "{name!: Str}")
+	if compact(got) != compact("<type: { name!: Str }>") {
+		t.Fatalf("prompt outType = %q, want %q", got, "<type: { name!: Str }>")
 	}
 }
 

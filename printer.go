@@ -1287,6 +1287,10 @@ func writeValue(o *out, v Value) {
 		o.write("}")
 	case VTFun:
 		if f, ok := v.Data.(*Fun); ok && f != nil {
+			if f.IsOracle {
+				o.write("<oracle: " + FormatType(f.ReturnType) + ">")
+				break
+			}
 			var sb strings.Builder
 			sb.WriteString("<fun: ")
 			if len(f.ParamTypes) == 0 {
@@ -1314,19 +1318,8 @@ func writeValue(o *out, v Value) {
 		}
 	case VTType:
 		typ := FormatType(typeAst(v.Data))
-		if strings.Contains(typ, "\n") {
-			for i, ln := range strings.Split(typ, "\n") {
-				if i == 0 {
-					o.write(ln)
-					continue
-				}
-				o.nl()
-				o.pad()
-				o.write(ln)
-			}
-		} else {
-			o.write(typ)
-		}
+		inline := strings.Join(strings.Fields(typ), " ") // collapse \n, \t, and multi-spaces
+		o.write("<type: " + inline + ">")
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
@@ -1341,7 +1334,7 @@ func writeValue(o *out, v Value) {
 		s := "<unknown>"
 		if v.Tag == VTHandle {
 			if h, ok := v.Data.(*Handle); ok {
-				s = "<handle:" + h.Kind + ">"
+				s = "<handle: " + h.Kind + ">"
 			} else {
 				s = "<handle>"
 			}

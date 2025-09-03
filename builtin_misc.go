@@ -2,7 +2,6 @@
 package mindscript
 
 import (
-	"encoding/json"
 	"math"
 	"math/rand"
 	"os"
@@ -102,32 +101,12 @@ func registerCastBuiltins(ip *Interpreter) {
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
-			switch v.Tag {
-			case VTStr:
+			if v.Tag == VTStr {
 				return v
-			case VTNull:
-				return Str("null")
-			case VTBool:
-				if v.Data.(bool) {
-					return Str("true")
-				}
-				return Str("false")
-			case VTInt:
-				return Str(strconv.FormatInt(v.Data.(int64), 10))
-			case VTNum:
-				return Str(strconv.FormatFloat(v.Data.(float64), 'g', -1, 64))
-			case VTArray, VTMap:
-				b, err := json.Marshal(valueToGoJSON(v))
-				if err != nil {
-					// NEVER return null here; str must always return Str.
-					// Fall back to the debug representation.
-					return Str(v.String())
-				}
-				return Str(string(b))
-			default:
-				// functions/modules/handles/types: fall back to Value.String()
-				return Str(v.String())
 			}
+			// Delegate to the pretty-printer so arrays/maps/types/annotations
+			// render exactly like the rest of the system.
+			return Str(FormatValue(v))
 		},
 	)
 	setBuiltinDoc(ip, "str", `Stringify a value.

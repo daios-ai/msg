@@ -1,434 +1,757 @@
-=== BEGIN FILE: builtin_core.go ===
+=== BEGIN FILE: oracles_test.go ===
 package mindscript
 
 import (
-	"fmt"
+	"encoding/json"
+	"strings"
+	"testing"
+	"unicode"
 )
 
-// Opaque handle for environment snapshots (unexported).
-type envHandle struct {
-	env *Env
+// --- helpers specific to these oracle tests ----------------------------------
+
+// Installs a fake __oracle_execute that returns the provided raw string
+// (or an annotated null when raw == "").
+// Registered in Core and hoisted to Global (execOracle looks in Global).
+func registerFakeOracle(ip *Interpreter, raw string) {
+	ip.RegisterNative(
+		"__oracle_execute",
+		[]ParamSpec{
+			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "inType", Type: S{"id", "Type"}},
+			{Name: "outType", Type: S{"id", "Type"}}, // engine passes T? here
+			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
+		},
+		S{"unop", "?", S{"id", "Str"}}, // Str? (executor may return null on transport failure)
+		func(_ *Interpreter, ctx CallCtx) Value {
+			if raw == "" {
+				return annotNull("fake backend: empty")
+			}
+			return Str(raw)
+		},
+	)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
 }
 
-// ---- core built-ins ----------------------------------------------------
-
-func registerCoreBuiltins(ip *Interpreter) {
+// Like registerFakeOracle, but the fake inspects outType to ensure the engine
+// passes a *nullable* success type for non-Any, and leaves Any unwrapped.
+// Returns BOXED JSON `{"output":{"ok":true}}` on success, otherwise annotated null with reason.
+func registerAssertingFakeOracle(ip *Interpreter) {
 	ip.RegisterNative(
-		"fail",
-		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			mv := ctx.MustArg("message")
-			msg := "error"
-			if mv.Tag == VTStr {
-				msg = mv.Data.(string)
-			}
-			fail(msg) // raises rtErr; no return
-			return Null
-		},
-	)
-	setBuiltinDoc(ip, "fail", `Fail: throw a runtime error (hard fault).
-
-Params:
-  message: Str? — optional message (default "error")
-
-Returns:
-  Null (never returns)`)
-
-	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
-	ip.RegisterNative(
-		"try",
-		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"map"}, // returns a map with ok/value/error
-		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
-			if fv.Tag != VTFun {
-				fail("try expects a function") // contractual → hard error
-			}
-
-			out := Map(map[string]Value{
-				"ok":    Bool(false),
-				"value": Null,
-				"error": Null,
-			})
-
-			var hardErr error
-			var res Value
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						switch sig := r.(type) {
-						case rtErr:
-							hardErr = fmt.Errorf("%s", sig.msg)
-						default:
-							hardErr = fmt.Errorf("runtime panic: %v", r)
-						}
-					}
-				}()
-				res = ip.Call0(fv)
-			}()
-
-			if hardErr != nil {
-				out.Data.(*MapObject).Entries["ok"] = Bool(false)
-				out.Data.(*MapObject).Entries["error"] = Str(hardErr.Error())
-				out.Data.(*MapObject).Entries["value"] = Null
-				return out
-			}
-
-			// treat annotated-null as failure-with-message (soft)
-			if res.Tag == VTNull && res.Annot != "" {
-				out.Data.(*MapObject).Entries["ok"] = Bool(false)
-				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
-				out.Data.(*MapObject).Entries["value"] = Null
-				return out
-			}
-
-			// success
-			out.Data.(*MapObject).Entries["ok"] = Bool(true)
-			out.Data.(*MapObject).Entries["error"] = Null
-			out.Data.(*MapObject).Entries["value"] = res
-			return out
-		},
-	)
-	setBuiltinDoc(ip, "try", `Run a function and capture hard failures.
-
-Returns:
-  { ok: Bool, value: Any, error: Str? }
-
-Notes:
-  • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
-  • If the function returns an annotated null, ok=false and error is that annotation.
-  • On success, ok=true and value is the function's result.`)
-
-	ip.RegisterNative(
-		"clone",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return cloneValue(ctx.MustArg("x"))
-		},
-	)
-	setBuiltinDoc(ip, "clone", `Clone a value (deep-copy).
-
-For maps, preserves key order and per-key annotations. Primitive values are
-returned as-is. Functions, modules, and handles are not duplicated (identity
-is preserved).
-
-Params:
-  x: Any
-
-Returns:
-  Any — a structurally independent copy for arrays/maps`)
-
-	// snapshot(_: Null) -> Any (VTHandle)
-	// Returns an opaque handle to a flattened, cloned snapshot of the visible env.
-	ip.RegisterNative(
-		"snapshot",
-		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			snap := snapshotEnv(ctx.Env())
-			return Value{Tag: VTHandle, Data: &envHandle{env: snap}}
-		},
-	)
-	setBuiltinDoc(ip, "snapshot", `Return an opaque handle to a snapshot of the current environment.
-
-Behavior:
-  • Captures a flattened view of all visible frames (inner shadows outer).
-  • Values are deep-copied where applicable (arrays/maps preserve order/annotations).
-  • Returned handle is opaque (VTHandle).
-
-Params:
-  _: Null
-
-Returns:
-  Any — an opaque handle (VTHandle) representing the snapshot`)
-
-	// typeOf(x: Any) -> Type
-	ip.RegisterNative(
-		"typeOf",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Type"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			return TypeVal(ip.ValueToType(x, ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
-
-This inspects a runtime value and produces its structural Type.
-Useful together with isType/isSubtype for ad-hoc validation.
-
-Params:
-  x: Any — a runtime value
-
-Returns: Type`)
-
-	ip.RegisterNative(
-		"isType",
+		"__oracle_execute",
 		[]ParamSpec{
-			{Name: "x", Type: S{"id", "Any"}},
-			{Name: "T", Type: S{"id", "Type"}},
+			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "inType", Type: S{"id", "Type"}},
+			{Name: "outType", Type: S{"id", "Type"}}, // engine passes T? for non-Any
+			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
 		},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			Tv := ctx.MustArg("T")
-			if Tv.Tag != VTType {
-				fail("isType expects a Type as second argument") // contractual → hard
-			}
-			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "isType", `Check whether a value conforms to a Type.
-
-Params:
-  x: Any   — value to check
-  T: Type  — type to check against (must be a Type value, e.g. type Int)
-
-Returns: Bool`)
-
-	// isSubtype(A: Type, B: Type) -> Bool
-	ip.RegisterNative(
-		"isSubtype",
-		[]ParamSpec{
-			{Name: "A", Type: S{"id", "Type"}},
-			{Name: "B", Type: S{"id", "Type"}},
-		},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			Av := ctx.MustArg("A")
-			Bv := ctx.MustArg("B")
-			if Av.Tag != VTType || Bv.Tag != VTType {
-				fail("isSubtype expects Types as both arguments") // contractual → hard
-			}
-			A := ip.resolveTypeValue(Av, ctx.Env())
-			B := ip.resolveTypeValue(Bv, ctx.Env())
-			return Bool(ip.IsSubtype(A, B, ctx.Env()))
-		},
-	)
-	setBuiltinDoc(ip, "isSubtype", `Structural subtype test: A <: B.
-
-Function types are compared structurally:
-- Parameters are contravariant
-- Return types are covariant
-- Arrows associate to the right (A -> B -> C == A -> (B -> C))
-
-Params:
-  A: Type — candidate subtype
-  B: Type — candidate supertype
-
-Returns: Bool`)
-
-	// import(path: Str) -> Module (nullable on soft failure)
-	ip.RegisterNative(
-		"import",
-		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			if pv.Tag != VTStr {
-				fail("import expects path: Str")
-			}
-			// Use the current importer identity when available (enables relative resolution).
-			importer := ""
-			if n := len(ip.loadStack); n > 0 {
-				importer = ip.loadStack[n-1] // canonical identity of the importing module
-			} else if ip.currentSrc != nil && ip.currentSrc.Name != "" {
-				importer = ip.currentSrc.Name
-			}
-
-			v, err := ip.ImportFile(pv.Data.(string), importer)
-			if err != nil {
-				// HARD: parse errors, import cycles, and module-body contract errors.
-				if e, ok := err.(*Error); ok {
-					panicRt(e.Msg, e.Src, e.Line, e.Col)
-				}
-				fail(err.Error())
-			}
-			// SOFT: resolve/fetch issues come back as annotated null with err == nil.
-			return v
-		},
-	)
-	setBuiltinDoc(ip, "import", `Load a module from filesystem or HTTP(S).
-
-Resolution rules:
-  - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
-  - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
-
-Params:
-  path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
-
-Returns:
-  Module (nullable) — the loaded module value; or null with an error annotation on soft failures.`)
-
-	// importCode(name: Str, src: Str) -> Module (nullable if user code returns annotated null)
-	ip.RegisterNative(
-		"importCode",
-		[]ParamSpec{
-			{Name: "name", Type: S{"id", "Str"}},
-			{Name: "src", Type: S{"id", "Str"}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			nv := ctx.MustArg("name")
-			sv := ctx.MustArg("src")
-			if nv.Tag != VTStr || sv.Tag != VTStr {
-				fail("importCode expects (name: Str, src: Str)")
-			}
-			name := nv.Data.(string)
-			src := sv.Data.(string)
-
-			// The loader assigns a synthetic identity "mem:<name>" internally.
-			v, err := ip.ImportCode(name, src)
-			if err != nil {
-				// HARD: parse errors; module-body contract errors.
-				if e, ok := err.(*Error); ok {
-					panicRt(e.Msg, e.Src, e.Line, e.Col)
-				}
-				fail(err.Error())
-			}
-			// Module body may deliberately produce annotated null; propagate as-is (SOFT).
-			return v
-		},
-	)
-	setBuiltinDoc(ip, "importCode", `Evaluate source text as a module in memory.
-
-Parses 'src' and evaluates it as a module named 'name' (no caching).
-The module's environment is fresh and parented to Core.
-The synthetic identity "mem:<name>" is used for cycle detection.
-
-Params:
-  name: Str — display name for diagnostics and identity ("mem:<name>").
-  src:  Str — MindScript source code.
-
-Returns:
-  Module (nullable) — the created module value; or null with an error annotation if the
-  user code intentionally returns a soft failure.`)
-
-	// mapHas(obj: {}, key: Str) -> Bool
-	ip.RegisterNative(
-		"mapHas",
-		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("obj")
-			k := ctx.MustArg("key").Data.(string)
-			if v.Tag != VTMap {
-				fail("mapHas expects a map") // contractual → hard
+			otV := ctx.MustArg("outType")
+			if otV.Tag != VTType {
+				return annotNull("outType is not a Type")
 			}
-			mo := v.Data.(*MapObject)
-			_, ok := mo.Entries[k]
-			return Bool(ok)
-		},
-	)
-	setBuiltinDoc(ip, "mapHas", `Return true if a key exists in a map.
+			ot := strings.TrimSpace(FormatValue(otV)) // e.g. "Str?" or "{ok!: Bool}?" or "Any"
 
-Params:
-  obj: {}  — a map value
-  key: Str — property name
-
-Returns:
-  Bool`)
-
-	// mapDelete(obj: {}, key: Str) -> {}
-	ip.RegisterNative(
-		"mapDelete",
-		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
-		S{"map"}, // returns the (mutated) input map
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("obj")
-			k := ctx.MustArg("key").Data.(string)
-			if v.Tag != VTMap {
-				fail("mapDelete expects a map") // contractual → hard
+			// Case: Any must stay unwrapped by the engine; we still return boxed JSON.
+			if ot == "Any" {
+				return Str(`{"output":{"ok":true}}`)
 			}
-			mo := v.Data.(*MapObject)
-			if _, ok := mo.Entries[k]; !ok {
-				return v // no-op
+
+			// Non-Any must be nullable (end with '?')
+			if !strings.HasSuffix(ot, "?") {
+				return annotNull("outType was not nullable")
 			}
-			// delete from Entries
-			delete(mo.Entries, k)
-			// delete annotation if present
-			delete(mo.KeyAnn, k)
-			// remove from Keys while preserving order
-			keys := mo.Keys[:0]
-			for _, kk := range mo.Keys {
-				if kk != k {
-					keys = append(keys, kk)
+			base := strings.TrimSpace(strings.TrimSuffix(ot, "?"))
+
+			switch base {
+			case "Str":
+				return Str(`{"output":"ok"}`)
+			default:
+				// If the declared success type is the object {ok!: Bool}, return that shape.
+				if strings.Contains(base, "ok!: Bool") {
+					return Str(`{"output":{"ok":true}}`)
 				}
+				// Fallback for other types: still boxed & valid under T?
+				return Str(`{"output":null}`)
 			}
-			mo.Keys = keys
-			return v
 		},
 	)
-	setBuiltinDoc(ip, "mapDelete", `Delete a property from a map (in place).
-
-Preserves the key order and per-key annotations for the remaining entries.
-
-Params:
-  obj: {}  — a map value (mutated)
-  key: Str — property name to remove
-
-Returns:
-  {} — the same map value`)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
 }
 
-// --- Deep copy & snapshot for isolated worlds --------------------------------
+// Minimal jsonParse native (Str -> Any | annotated Null).
+// Uses Go's encoding/json and converts into MindScript Values.
+func registerJSONParse(ip *Interpreter) {
+	ip.RegisterNative(
+		"jsonParse",
+		[]ParamSpec{{Name: "text", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			raw := ctx.MustArg("text").Data.(string)
+			var x any
+			if err := json.Unmarshal([]byte(raw), &x); err != nil {
+				return annotNull("json parse error")
+			}
+			return goJSONToValue(x)
+		},
+	)
+	if v, err := ip.Core.Get("jsonParse"); err == nil {
+		ip.Global.Define("jsonParse", v)
+	}
+}
 
-func cloneValue(v Value) Value {
-	switch v.Tag {
-	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
-		return v
-	case VTArray:
-		xs := v.Data.([]Value)
-		cp := make([]Value, len(xs))
-		for i := range xs {
-			cp[i] = cloneValue(xs[i])
+// Simple prompt hook that echoes the outType textual form into the prompt.
+func registerBuildPromptEchoOutType(ip *Interpreter) {
+	ip.RegisterNative(
+		"__oracle_build_prompt",
+		[]ParamSpec{
+			{Name: "instruction", Type: S{"id", "Str"}},
+			{Name: "inType", Type: S{"id", "Type"}},
+			{Name: "outType", Type: S{"id", "Type"}},
+			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
+		},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			ot := ctx.MustArg("outType")
+			return Str(strings.TrimSpace(FormatValue(ot)))
+		},
+	)
+	if v, err := ip.Core.Get("__oracle_build_prompt"); err == nil {
+		ip.Global.Define("__oracle_build_prompt", v)
+	}
+}
+
+// Fake executor that returns count of *validated* examples it received.
+// It returns BOXED JSON `{"output":"ok"}` on success.
+func registerCountingExecutor(ip *Interpreter) {
+	ip.RegisterNative(
+		"__oracle_execute",
+		[]ParamSpec{
+			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "inType", Type: S{"id", "Type"}},
+			{Name: "outType", Type: S{"id", "Type"}},
+			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
+		},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			ex := ctx.MustArg("examples")
+			if ex.Tag != VTArray {
+				return annotNull("examples not array")
+			}
+			n := len(ex.Data.([]Value))
+			_ = n // we don’t surface it, the tests only validate length via separate helper
+			return Str(`{"output":"ok"}`)
+		},
+	)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
+}
+
+// --- tiny assertions ---------------------------------------------------------
+
+func wantNullAnnotContains(t *testing.T, v Value, substr string) {
+	t.Helper()
+	if v.Tag != VTNull {
+		t.Fatalf("got %v, want annotated Null", v)
+	}
+	if !strings.Contains(v.Annot, substr) {
+		t.Fatalf("annot %q does not contain %q", v.Annot, substr)
+	}
+}
+
+// --- tests -------------------------------------------------------------------
+
+func Test_Oracle_StrSuccess(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
+
+	v, err := ip.EvalSource(`
+		# Say a scientist's name as plain text.
+		let scientist = oracle() -> Str
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Ada Lovelace")
+}
+
+func Test_Oracle_JSONSuccess_Object(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"name":"Marie Curie"}}`)
+
+	// Pull the field via MindScript to keep the test simple & stable.
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Marie Curie")
+}
+
+func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `not-json`)
+
+	v, err := ip.EvalSource(`
+		let f = oracle() -> {name!: Str}
+		f()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantNullAnnotContains(t, v, "not valid JSON")
+}
+
+func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"ok":true}`)
+
+	v, err := ip.EvalSource(`
+		let f = oracle() -> {name!: Str}
+		f()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantNullAnnotContains(t, v, "did not match the declared return type")
+}
+
+func Test_Oracle_PromptUsesNonNullSuccessType(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerBuildPromptEchoOutType(ip)
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"name":"X"}}`)
+
+	// outType echoed into prompt should be NON-null success type, i.e., "{name!: Str}"
+	_, err := ip.EvalSource(`
+		let g = oracle() -> {name!: Str}
+		g()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	got := ip.LastOraclePrompt()
+	compact := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			if !unicode.IsSpace(r) {
+				b.WriteRune(r)
+			}
 		}
-		return Arr(cp)
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		// Deep-copy entries
-		entries := make(map[string]Value, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			entries[k] = cloneValue(vv)
+		return b.String()
+	}
+	if compact(got) != compact("<type: { name!: Str }>") {
+		t.Fatalf("prompt outType = %q, want %q", got, "<type: { name!: Str }>")
+	}
+}
+
+func Test_Oracle_ExecutorReceivesNullableOutType(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerAssertingFakeOracle(ip)
+
+	// Case 1: Any stays unwrapped (executor accepts "Any").
+	v1, err := ip.EvalSource(`
+		let a = oracle() -> Any
+		a()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v1.Tag == VTNull && v1.Annot != "" {
+		t.Fatalf("executor rejected outType for Any: %v", v1.Annot)
+	}
+
+	// Case 2: Str is wrapped to Str? (executor requires nullable; returns boxed JSON).
+	v2, err := ip.EvalSource(`
+		let b = oracle() -> Str
+		b()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Just ensure not Null.
+	if v2.Tag == VTNull {
+		t.Fatalf("executor rejected outType for Str?: %v", v2.Annot)
+	}
+}
+
+func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"wrong":42}}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "type") // centralized type mismatch → annotated null
+}
+
+func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"foo":123}}`)
+
+	v, err := ip.EvalSource(`
+		let anything = oracle() -> Any
+		anything().foo
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantInt(t, v, 123) // Any accepts whatever JSON parses to
+}
+
+func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```json\n{\"output\":{\"name\":\"Rosalind Franklin\"}}\n```")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Rosalind Franklin")
+}
+
+func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	// Simulate transport failure: executor returns annotated null
+	ip.RegisterNative(
+		"__oracle_execute",
+		[]ParamSpec{
+			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "inType", Type: S{"id", "Type"}},
+			{Name: "outType", Type: S{"id", "Type"}},
+			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
+		},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value { return annotNull("network down") },
+	)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "network down")
+}
+
+func Test_Oracle_OutType_Passed_Is_Nullable_For_NonAny(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerAssertingFakeOracle(ip) // asserts outType is nullable when not Any
+
+	v, err := ip.EvalSource(`
+		## Backend checks that outType is nullable (T?)
+		## Return BOXED JSON {"output":{"ok": true}} so we can validate value too.
+		let s = oracle() -> {ok!: Bool}
+		s().ok
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantBool(t, v, true)
+}
+
+func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	// Fake checks Any is not wrapped; if fine, returns BOXED {"output":{"ok":true}}
+	registerAssertingFakeOracle(ip)
+
+	v, err := ip.EvalSource(`
+		let a = oracle() -> Any
+		## Backend returns {"output":{"ok": true}}; engine should parse because return type isn't Str.
+		a().ok
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantBool(t, v, true)
+}
+
+// Fake that inspects the "examples" argument and returns "ok" if it looks right.
+func registerExamplesAssertingOracle(ip *Interpreter, wantLen int) {
+	ip.RegisterNative(
+		"__oracle_execute",
+		[]ParamSpec{
+			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "inType", Type: S{"id", "Type"}},
+			{Name: "outType", Type: S{"id", "Type"}},
+			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
+		},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			ex := ctx.MustArg("examples")
+			if ex.Tag != VTArray {
+				return annotNull("examples not array")
+			}
+			arr := ex.Data.([]Value)
+			if len(arr) != wantLen {
+				return annotNull("wrong examples length")
+			}
+			// Optional: verify each item is a 2-tuple [input, output]
+			for _, it := range arr {
+				if it.Tag != VTArray || len(it.Data.([]Value)) != 2 {
+					return annotNull("example is not [input, output]")
+				}
+			}
+			return Str(`{"output":"ok"}`)
+		},
+	)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
+}
+
+func wantHardErrorContains(t *testing.T, err error, substr string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected hard error containing %q, got nil error", substr)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, substr) {
+		t.Fatalf("hard error mismatch: want msg to contain %q, got: %s", substr, msg)
+	}
+	// Optional: assert caret header is present when runtimeErrorsAsGoError=true
+	if !strings.Contains(msg, "RUNTIME ERROR") {
+		t.Fatalf("expected caret-style RUNTIME ERROR, got: %s", msg)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// New tests
+// -----------------------------------------------------------------------------
+
+func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
+	ip, _ := NewRuntime()
+	// Backend won't be reached if params fail type-checking (engine enforces)
+	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
+
+	// Wrong type for first parameter (expects Int) → CONTRACT VIOLATION ⇒ HARD ERROR
+	_, err := ip.EvalSource(`
+		let f = oracle(a: Int, b: Str) -> Str
+		f("not-int", "ok")
+	`)
+	wantHardErrorContains(t, err, "type mismatch")
+}
+
+func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Katherine Johnson")
+}
+
+func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
+
+	v, err := ip.EvalSource(`
+		let greet = oracle() -> Str
+		greet()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Hello, world!")
+}
+
+func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerFakeOracle(ip, "null") // executor returns the literal string "null"
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "returned null")
+}
+
+func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "this is not json at all")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "valid JSON")
+}
+
+func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerFakeOracle(ip, "null")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "returned null")
+}
+
+func Test_Oracle_Examples_Passed_To_Backend(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerExamplesAssertingOracle(ip, 3)
+
+	v, err := ip.EvalSource(`
+		let ex = [
+			[0, "zero"],
+			[1, "one"],
+			[2, "two"]
+		]
+		let number2word = oracle(n: Int) -> Str from ex
+		number2word(5)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+}
+
+func Test_Oracle_Examples_From_Variable_Expr(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerExamplesAssertingOracle(ip, 3)
+
+	v, err := ip.EvalSource(`
+        let ex = [
+            [0, "zero"],
+            [1, "one"],
+            [2, "two"]
+        ]
+        let number2word = oracle(n: Int) -> Str from ex
+        number2word(5)
+    `)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+}
+
+func Test_Oracle_Examples_From_Expression(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerExamplesAssertingOracle(ip, 2)
+
+	v, err := ip.EvalSource(`
+        let a = [[0,"zero"]]
+        let b = [[1,"one"]]
+        let number2word = oracle(n: Int) -> Str from (a + b)
+        number2word(7)
+    `)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+}
+
+// Already had a transport error test; add one more variant: backend returns empty -> annotated null
+func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
+
+	v, err := ip.EvalSource(`
+		let s = oracle() -> Str
+		s()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "fake backend")
+}
+
+func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
+	ip, _ := NewRuntime()
+	// We don't care about the result here; we only want the prompt.
+	// Returning "null" avoids needing jsonParse in this test.
+	registerFakeOracle(ip, "null")
+
+	// Program modeled on the manual’s example.
+	src := `
+		# Example input output pairs.
+		let examples = [
+		  [{in: 9}, {out: 16}],
+		  [{in: 25}, {out: 36}],
+		  [{in: 1}, {out: 4}]
+		]
+
+		# The input number.
+		let Input = type {in!: Int}
+
+		# The output number.
+		let Output = type {out!: Int}
+
+		# Given a square number, provide the next square.
+		let square = oracle(args: Input) -> Output from examples
+
+		square({in: 144})
+	`
+	if _, err := ip.EvalSource(src); err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+
+	got := ip.LastOraclePrompt()
+	if strings.TrimSpace(got) == "" {
+		t.Fatalf("engine did not capture last oracle prompt")
+	}
+
+	// ---- Build the expected prompt exactly like the engine does ----
+
+	// Helpers (mirror oracles.go)
+	indentBlock := func(s string, n int) string {
+		pad := strings.Repeat(" ", n)
+		lines := strings.Split(s, "\n")
+		for i := range lines {
+			lines[i] = pad + lines[i]
 		}
-		// Preserve insertion order and per-key annotations
-		keys := make([]string, len(mo.Keys))
-		copy(keys, mo.Keys)
-		keyAnn := make(map[string]string, len(mo.KeyAnn))
-		for k, ann := range mo.KeyAnn {
-			keyAnn[k] = ann
+		return strings.Join(lines, "\n")
+	}
+	pretty := func(m map[string]any) string {
+		bs, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return "{}"
 		}
-		return Value{
-			Tag: VTMap,
-			Data: &MapObject{
-				Entries: entries,
-				KeyAnn:  keyAnn,
-				Keys:    keys,
+		return string(bs)
+	}
+
+	// Recreate the schemas the prompt should contain.
+	// Input inner schema: the alias itself.
+	inSchemaInner := map[string]any{
+		"type":        "object",
+		"description": "The input number.",
+		"properties": map[string]any{
+			"in": map[string]any{
+				"type": "integer",
 			},
-		}
-	default:
-		// Userdata/modules/handles are NOT copied (identity preserved).
-		return v
+		},
+		"required": []any{"in"},
 	}
-}
 
-func snapshotEnv(e *Env) *Env {
-	// Flatten chain into one level (shadowing by nearer scopes wins).
-	flat := map[string]Value{}
-	for cur := e; cur != nil; cur = cur.parent {
-		for k, v := range cur.table {
-			if _, exists := flat[k]; !exists {
-				flat[k] = cloneValue(v)
-			}
-		}
+	// Boxed output schema: {output: Output}
+	boxedOutSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"output": map[string]any{
+				"$ref": "#/$defs/Out",
+			},
+		},
+		"required": []any{"output"},
+		"$defs": map[string]any{
+			"Out": map[string]any{
+				"type":        "object",
+				"description": "The output number.",
+				"properties": map[string]any{
+					"out": map[string]any{
+						"type": "integer",
+					},
+				},
+				"required": []any{"out"},
+			},
+		},
 	}
-	cp := NewEnv(nil)
-	for k, v := range flat {
-		cp.Define(k, v)
+
+	// Examples and final call (render like the manual)
+	exIn := []string{
+		`{"in": 9}`,
+		`{"in": 25}`,
+		`{"in": 1}`,
 	}
-	return cp
+	exOut := []string{
+		`{"output": {"out": 16}}`,
+		`{"output": {"out": 36}}`,
+		`{"output": {"out": 4}}`,
+	}
+	finalInput := `{"in": 144}`
+
+	var b strings.Builder
+	b.WriteString("PROMPT:\n")
+	b.WriteString("Please follow the instruction to the best of your ability:\n")
+	b.WriteString("for every input, provide an output that solves the task and\n")
+	b.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
+	b.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
+
+	b.WriteString("INPUT JSON SCHEMA:\n\n")
+	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
+	b.WriteString("\n\n")
+
+	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
+	// For output, we show the *boxed* schema directly.
+	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
+	b.WriteString("\n\n")
+
+	// Example blocks
+	for i := range exIn {
+		b.WriteString("TASK:\n\n")
+		b.WriteString("Given a square number, provide the next square.\n\n")
+		b.WriteString("INPUT:\n\n")
+		b.WriteString(exIn[i])
+		b.WriteString("\n\n")
+		b.WriteString("OUTPUT:\n\n")
+		b.WriteString(exOut[i])
+		b.WriteString("\n\n")
+	}
+
+	// Final task with the oracle’s instruction (from the annotation)
+	b.WriteString("TASK:\n\n")
+	b.WriteString("Given a square number, provide the next square.\n\n")
+	b.WriteString("INPUT:\n\n")
+	b.WriteString(finalInput)
+	b.WriteString("\n\n")
+	b.WriteString("OUTPUT:\n")
+
+	want := b.String()
+
+	if got != want {
+		// Make mismatches easy to inspect in CI logs.
+		t.Fatalf("prompt mismatch:\n--- GOT ---\n%s\n--- WANT ---\n%s", got, want)
+	}
 }
-=== END FILE: builtin_core.go ===
+=== END FILE: oracles_test.go ===
 

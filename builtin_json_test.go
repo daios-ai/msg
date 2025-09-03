@@ -205,8 +205,8 @@ func Test_Builtin_Json_JSONSchemaStringToType_Convenience(t *testing.T) {
 	if out.Tag != VTType {
 		t.Fatalf("expected Type; got %v", out.Tag)
 	}
-	if got := strings.TrimSpace(FormatValue(out)); got != "[Num]" {
-		t.Fatalf("expected [Num]; got %q", got)
+	if got := strings.TrimSpace(FormatValue(out)); got != "<type: [Num]>" {
+		t.Fatalf("expected <type: [Num]>; got %q", got)
 	}
 }
 
@@ -333,8 +333,8 @@ func Test_Builtin_Json_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Eval error: %v", err)
 	}
-	if out.Tag != VTType || strings.TrimSpace(FormatValue(out)) != "Any" {
-		t.Fatalf("expected Any; got %v", FormatValue(out))
+	if out.Tag != VTType || strings.TrimSpace(FormatValue(out)) != "<type: Any>" {
+		t.Fatalf("expected <type: Any>; got %v", FormatValue(out))
 	}
 }
 

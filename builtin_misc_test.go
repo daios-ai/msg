@@ -78,21 +78,17 @@ func Test_Builtin_Misc_str_basic_and_fallback(t *testing.T) {
 		t.Fatalf("str(null) => 'null', got %#v", s)
 	}
 
-	// Arrays/maps as JSON
-	if s := evalWithIP(t, ip, `str([1, 2])`); s.Tag != VTStr || s.Data.(string) != `[1,2]` {
-		t.Fatalf(`str([1,2]) => "[1,2]", got %#v`, s)
+	// Arrays/maps now use the pretty-printer (not JSON)
+	if s := evalWithIP(t, ip, `str([1, 2])`); s.Tag != VTStr || s.Data.(string) != "[ 1, 2 ]" {
+		t.Fatalf(`str([1,2]) => "[ 1, 2 ]", got %#v`, s)
 	}
-	if s := evalWithIP(t, ip, `str({a:1, b:2})`); s.Tag != VTStr || !strings.Contains(s.Data.(string), `"a":1`) {
-		t.Fatalf(`str({a:1,b:2}) should contain JSON, got %#v`, s)
-	}
-
-	// Fallback path: NaN in array must still return Str, not null.
-	s := evalWithIP(t, ip, `str([0.0, sqrt(-1.0)])`) // sqrt(-1.0) = NaN
+	s := evalWithIP(t, ip, `str({a:1, b:2})`)
 	if s.Tag != VTStr {
-		t.Fatalf("str([0,NaN]) must return Str, got %#v", s)
+		t.Fatalf(`str({a:1,b:2}) should return Str, got %#v`, s)
 	}
-	if s.Data.(string) == "" {
-		t.Fatalf("fallback string must be non-empty")
+	got := s.Data.(string)
+	if !(strings.HasPrefix(got, "{") && strings.Contains(got, "a: 1") && strings.Contains(got, "b: 2") && strings.HasSuffix(got, "}")) {
+		t.Fatalf(`str({a:1,b:2}) => pretty map string, got %q`, got)
 	}
 }
 

@@ -1,4 +1,4 @@
-=== BEGIN FILE: lexer.go ===
+=== BEGIN PUBLIC SECTION OF FILE: lexer.go ===
 // lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
 // MindScript language. It converts a source string into a linear stream of
 // tokens with accurate source positions and rich literal decoding.
@@ -8,37 +8,34 @@
 //
 // The lexer scans left→right and emits Token values, always ending with EOF.
 // Each token carries:
-//   - Type    — a TokenType enum
-//   - Lexeme  — the exact source slice (verbatim characters from the input)
-//   - Literal — the decoded value for literal tokens (e.g., bool/int/float/string)
-//   - Line/Col— 1-based line and 0-based column of the token’s start
+//   - Type     — a TokenType enum
+//   - Lexeme   — the exact source slice (verbatim characters from the input)
+//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
+//   - Line/Col — 1-based line and 0-based column of the token’s *start*
+//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
 //
-// The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
-// whether there is immediate whitespace before the delimiter:
+// Whitespace-sensitive delimiters:
 //
-//	'('  → LROUND  if there IS preceding whitespace
-//	      CLROUND if there is NO preceding whitespace
-//	'['  → LSQUARE if there IS preceding whitespace
-//	      CLSQUARE if there is NO preceding whitespace
+//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
+//	whether there is immediate whitespace before the delimiter:
+//
+//	  '('  → LROUND  if there IS preceding whitespace
+//	         CLROUND if there is NO preceding whitespace
+//	  '['  → LSQUARE if there IS preceding whitespace
+//	         CLSQUARE if there is NO preceding whitespace
 //
 // Consequences (user-facing syntax):
-//
-//   - Calls and parameter lists require NO space before '('.
+//   - Calls and parameter lists require NO space before '(':
 //     f(x)           // call: uses CLROUND
 //     fun(x: T)      // function params: uses CLROUND
 //     oracle(x: T)   // oracle params: uses CLROUND
 //     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
 //     parameter list; the parser will error.
-//
-//   - Indexing requires NO space before '['.
+//   - Indexing requires NO space before '[':
 //     arr[i]         // indexing: uses CLSQUARE
 //     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
-//
 //   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
 //     CLROUND participates in call/juxtaposition chains.
-//
-// This lets the parser distinguish grouping/indexing from juxtaposition/call-like
-// forms without lookbehind in the parser.
 //
 // The '.' character is context-sensitive:
 //   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
@@ -69,11 +66,12 @@
 //     optional following space) are stripped; lines are joined with '\n', and a
 //     single ANNOTATION token is emitted. A blank/non-# line ends the block.
 //
-// ERRORS
+// ERRORS (start-of-token anchoring)
 //   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
-//     reported as *LexError* with precise location.
+//     reported as *Error* with precise location anchored to the **start** of the
+//     offending token (the token that is being scanned).
 //   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings produce *IncompleteError* instead of LexError.
+//     strings produce *IncompleteError* (still anchored to the token start).
 //
 // OUTPUT
 //   - Scan returns the full token slice *including* the terminal EOF token.
@@ -241,6 +239,7 @@ const (
 //	          (keywords may store their text; property IDs store the property name).
 //	Line    — 1-based line number at which this token starts.
 //	Col     — 0-based column index at which this token starts.
+//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
 type Token struct {
 	Type      TokenType
 	Lexeme    string
@@ -253,9 +252,13 @@ type Token struct {
 
 // HARD errors produced by the lexer use the unified *Error type defined in
 // errors.go. See DiagLex and DiagIncomplete.
-
+//
 // In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
 // when input ends inside an unterminated construct (e.g., string literal).
+//
+// **Error locations:** All lexing errors (both hard and incomplete) are anchored
+// to the **start of the offending token** (the token whose scanning raised
+// the error). This makes diagnostics stable and easy to map to spans.
 
 // Lexer is a streaming tokenizer for MindScript.
 //
@@ -339,772 +342,230 @@ func (l *Lexer) Scan() ([]Token, error) {
 	}
 }
 
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                            PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-// ---------------- keywords map (private) ----------------
-
-var keywords = map[string]TokenType{
-	"null":     NULL,
-	"false":    BOOLEAN,
-	"true":     BOOLEAN,
-	"and":      AND,
-	"or":       OR,
-	"not":      NOT,
-	"let":      LET,
-	"do":       DO,
-	"end":      END,
-	"return":   RETURN,
-	"break":    BREAK,
-	"continue": CONTINUE,
-	"if":       IF,
-	"then":     THEN,
-	"elif":     ELIF,
-	"else":     ELSE,
-	"fun":      FUNCTION,
-	"oracle":   ORACLE,
-	"module":   MODULE,
-	"for":      FOR,
-	"in":       IN,
-	"from":     FROM,
-	"while":    WHILE,
-	"type":     TYPECONS,
-	"Type":     TYPE,
-	"Null":     TYPE,
-	"Str":      TYPE,
-	"Int":      TYPE,
-	"Num":      TYPE,
-	"Bool":     TYPE,
-	"Any":      TYPE,
-	"Enum":     ENUM,
-}
-
-// ---------------- core scanning helpers ----------------
-
-func (l *Lexer) isAtEnd() bool { return l.cur >= len(l.src) }
-
-func (l *Lexer) peek() (byte, bool) {
-	if l.isAtEnd() {
-		return 0, false
-	}
-	return l.src[l.cur], true
-}
-
-func (l *Lexer) peekN(n int) (byte, bool) {
-	idx := l.cur + n
-	if idx >= len(l.src) {
-		return 0, false
-	}
-	return l.src[idx], true
-}
-
-func (l *Lexer) advance() (byte, bool) {
-	if l.isAtEnd() {
-		return 0, false
-	}
-	ch := l.src[l.cur]
-	l.cur++
-	if ch == '\n' {
-		l.line++
-		l.col = 0
-	} else {
-		l.col++
-	}
-	return ch, true
-}
-
-func (l *Lexer) rewindToStart() {
-	// We rewind only within the bounds of the current token start; line/col are kept
-	// for error arrows (OK since we set tokStartLine/Col before scanning).
-	l.cur = l.start
-}
-
-func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
-	lex := l.src[l.start:l.cur]
-	tok := Token{
-		Type:      tt,
-		Lexeme:    lex,
-		Literal:   lit,
-		Line:      l.tokStartLine,
-		Col:       l.tokStartCol,
-		StartByte: l.start,
-		EndByte:   l.cur,
-	}
-	l.tokens = append(l.tokens, tok)
-	l.start = l.cur
-	return tok
-}
-
-func (l *Lexer) previousToken() *Token {
-	if len(l.tokens) == 0 {
-		return nil
-	}
-	return &l.tokens[len(l.tokens)-1]
-}
-
-func (l *Lexer) skipHorizontalWhitespace() {
-	for !l.isAtEnd() {
-		ch, _ := l.peek()
-		switch ch {
-		case ' ', '\t', '\r':
-			l.advance()
-			l.start = l.cur
-		default:
-			return
-		}
-	}
-}
-
-// immediateWhitespaceBefore reports whether the byte immediately preceding the
-// current token start is ASCII whitespace. Called *after* skipWhitespace.
-func (l *Lexer) immediateWhitespaceBefore() bool {
-	if l.start == 0 {
-		return false
-	}
-	switch l.src[l.start-1] {
-	case ' ', '\t', '\n', '\r':
-		return true
-	default:
-		return false
-	}
-}
-
-// ---------------- small predicates ----------------
-
-func canBeLeftOperand(t TokenType) bool {
-	switch t {
-	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
-		TYPE, ENUM,
-		RROUND, RSQUARE, RCURLY,
-		QUESTION:
-		return true
-	default:
-		return false
-	}
-}
-
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-func isHex(b byte) bool {
-	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
-}
-func isAlpha(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' }
-func isAlphaNum(b byte) bool {
-	return (b >= 'a' && b <= 'z') ||
-		(b >= 'A' && b <= 'Z') ||
-		(b >= '0' && b <= '9') ||
-		b == '_'
-}
-
-func (l *Lexer) afterDotIsProperty() bool {
-	p := l.previousToken()
-	return p != nil && p.Type == PERIOD
-}
-
-// ---------------- error builders ----------------
-
-func (l *Lexer) err(msg string) error {
-	// Lexer maintains 1-based line and 0-based column; diagnostics are 1-based.
-	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.line, Col: l.col + 1}
-}
-
-func (l *Lexer) errIncomplete(msg string) error {
-	// Report need-more-input conditions in interactive mode.
-	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.line, Col: l.col + 1}
-}
-
-// ---------------- scanners ----------------
-
-// scanString parses a JSON-style string literal (single or double quotes).
-func (l *Lexer) scanString() (string, error) {
-	del := l.src[l.start]
-	if del != '"' && del != '\'' {
-		return "", l.err("internal: scanString without quote")
-	}
-	// consume the delimiter
-	l.advance()
-
-	var out []rune
-	for !l.isAtEnd() {
-		ch, _ := l.advance()
-		if ch == byte(del) {
-			return string(out), nil
-		}
-		if ch == '\\' {
-			if l.isAtEnd() {
-				if l.interactive {
-					return "", l.errIncomplete("unfinished escape sequence")
-				}
-				return "", l.err("unfinished escape sequence")
-			}
-			esc, _ := l.advance()
-			switch esc {
-			case '"':
-				out = append(out, '"')
-			case '\'':
-				out = append(out, '\'')
-			case '\\':
-				out = append(out, '\\')
-			case '/':
-				out = append(out, '/')
-			case 'b':
-				out = append(out, '\b')
-			case 'f':
-				out = append(out, '\f')
-			case 'n':
-				out = append(out, '\n')
-			case 'r':
-				out = append(out, '\r')
-			case 't':
-				out = append(out, '\t')
-			case 'u':
-				// expect 4 hex digits
-				toHex := func(b byte) int {
-					switch {
-					case b >= '0' && b <= '9':
-						return int(b - '0')
-					case b >= 'a' && b <= 'f':
-						return 10 + int(b-'a')
-					case b >= 'A' && b <= 'F':
-						return 10 + int(b-'A')
-					default:
-						return -1
-					}
-				}
-				val := 0
-				for i := 0; i < 4; i++ {
-					b, ok := l.peek()
-					if !ok {
-						if l.interactive {
-							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
-						}
-						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
-					}
-					d := toHex(b)
-					if d < 0 {
-						return "", l.err("invalid unicode escape")
-					}
-					val = (val << 4) | d
-					l.advance()
-				}
-				r := rune(val)
-
-				// handle surrogate pair \uD800-\uDBFF followed by \uDC00-\uDFFF
-				if 0xD800 <= r && r <= 0xDBFF {
-					saveCur := l.cur
-					saveLine, saveCol := l.line, l.col
-					if b1, ok := l.peek(); ok && b1 == '\\' {
-						l.advance()
-						if b2, ok := l.peek(); ok && b2 == 'u' {
-							l.advance()
-							val2 := 0
-							for i := 0; i < 4; i++ {
-								b, ok := l.peek()
-								if !ok {
-									if l.interactive {
-										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
-									}
-									return "", l.err("unicode surrogate pair low was not terminated")
-								}
-								d := toHex(b)
-								if d < 0 {
-									return "", l.err("invalid unicode surrogate pair low")
-								}
-								val2 = (val2 << 4) | d
-								l.advance()
-							}
-							r2 := rune(val2)
-							if 0xDC00 <= r2 && r2 <= 0xDFFF {
-								cp := utf16.DecodeRune(r, r2)
-								out = append(out, cp)
-								continue
-							}
-						}
-					}
-					// not a valid pair; rewind and just emit r
-					l.cur = saveCur
-					l.line, l.col = saveLine, saveCol
-				}
-				out = append(out, r)
-			default:
-				return "", l.err(fmt.Sprintf("invalid escape sequence: \\%c", esc))
-			}
-			continue
-		}
-		// normal char; ensure it’s valid UTF-8 boundary (source may be UTF-8)
-		if ch < utf8.RuneSelf {
-			out = append(out, rune(ch))
-			continue
-		}
-		// If we see a non-ASCII byte here, the source itself is UTF-8; back up one byte and decode rune.
-		l.cur-- // step back 1 byte to let utf8.DecodeRuneInString read from correct start
-		r, size := utf8.DecodeRuneInString(l.src[l.cur:])
-		if r == utf8.RuneError && size == 1 {
-			return "", l.err("invalid UTF-8 in source")
-		}
-		out = append(out, r)
-		l.cur += size
-		l.col += size - 1
-	}
-	if l.interactive {
-		return "", l.errIncomplete("string was not terminated")
-	}
-	return "", l.err("string was not terminated")
-}
-
-// scanIdentifier parses [A-Za-z_][A-Za-z0-9_]*
-func (l *Lexer) scanIdentifier() string {
-	for {
-		b, ok := l.peek()
-		if !ok || !isAlphaNum(b) {
-			break
-		}
-		l.advance()
-	}
-	return l.src[l.start:l.cur]
-}
-
-// scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
-// Precondition: current position is at l.start and the first rune is either a digit
-// or a '.' that has already been verified to start a number.
-func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
-	sawDigits := false
-	sawDot := false
-	sawExp := false
-
-	// integral part (optional for leading '.')
-	for {
-		b, ok := l.peek()
-		if !ok || !isDigit(b) {
-			break
-		}
-		l.advance()
-		sawDigits = true
-	}
-
-	// fractional part
-	if b, ok := l.peek(); ok && b == '.' {
-		// Do NOT consume '.' if we're after a property PERIOD (obj.<digits>)
-		// OR if the next char is also '.' (e.g. "1..2").
-		if !(l.afterDotIsProperty()) {
-			if b2, ok2 := l.peekN(1); !(ok2 && b2 == '.') {
-				l.advance() // consume '.'
-				sawDot = true
-				for {
-					b2, ok2 := l.peek()
-					if !ok2 || !isDigit(b2) {
-						break
-					}
-					l.advance()
-					sawDigits = true
-				}
-			}
-		}
-	}
-
-	// exponent part: ([eE][+-]?digits)?
-	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
-		save := l.cur
-		l.advance() // consume e/E
-		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
-			l.advance()
-		}
-		if b3, ok := l.peek(); ok && isDigit(b3) {
-			sawExp = true
-			for {
-				b4, ok := l.peek()
-				if !ok || !isDigit(b4) {
-					break
-				}
-				l.advance()
-			}
-		} else {
-			l.cur = save // no exponent
-		}
-	}
-
-	if !sawDigits {
-		return ILLEGAL, nil, l.err("malformed number")
-	}
-
-	lex := l.src[l.start:l.cur]
-	if !sawDot && !sawExp {
-		v, convErr := strconv.ParseInt(lex, 10, 64)
-		if convErr != nil {
-			return ILLEGAL, nil, l.err("invalid integer literal")
-		}
-		return INTEGER, v, nil
-	}
-	vf, convErr := strconv.ParseFloat(lex, 64)
-	if convErr != nil {
-		return ILLEGAL, nil, l.err("invalid float literal")
-	}
-	return NUMBER, vf, nil
-}
-
-// scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
-// Terminates on blank line or a line that does not begin (after spaces) with '#'.
-func (l *Lexer) scanAnnotation() (string, error) {
-	var bldr strings.Builder
-
-	// helper: check if the *next* line (after current '\n') starts with '#'
-	nextLineStartsWithHash := func() bool {
-		// we are currently positioned at the '\n' (unconsumed)
-		probe := l.cur + 1
-		for probe < len(l.src) {
-			c := l.src[probe]
-			if c == ' ' || c == '\t' || c == '\r' {
-				probe++
-				continue
-			}
-			break
-		}
-		return probe < len(l.src) && l.src[probe] == '#'
-	}
-
-	// Trim at most one ASCII space (NOT tab) after the first '#'.
-	if b, ok := l.peek(); ok && b == ' ' {
-		l.advance()
-	}
-
-	// ----- capture first line, but DO NOT consume its trailing '\n' -----
-	for {
-		b, ok := l.peek()
-		if !ok || b == '\n' {
-			// do not l.advance() here; leave '\n' in the stream
-			bldr.WriteByte('\n')
-			break
-		}
-		bldr.WriteByte(b)
-		l.advance()
-	}
-
-	// If there is another annotation line, consume the '\n' now and continue.
-	if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
-		l.advance() // consume newline to move to start of the next line
-	} else {
-		// single-line block; leave the '\n' unconsumed
-		s := bldr.String()
-		if len(s) == 0 {
-			return "", errors.New("incomplete annotation")
-		}
-		for len(s) > 0 && s[len(s)-1] == '\n' {
-			s = s[:len(s)-1]
-		}
-		return s, nil
-	}
-
-	// ----- capture subsequent '#'-prefixed lines -----
-	consumeHashOnLine := func() (bool, error) {
-		for {
-			b, ok := l.peek()
-			if !ok || b == '\n' {
-				break
-			}
-			if b == ' ' || b == '\t' || b == '\r' {
-				l.advance()
-				continue
-			}
-			break
-		}
-		b, ok := l.peek()
-		if !ok || b != '#' {
-			return false, nil
-		}
-		l.advance() // '#'
-		// Trim at most one ASCII space (NOT tab) after '#'
-		if b2, ok2 := l.peek(); ok2 && b2 == ' ' {
-			l.advance()
-		}
-		return true, nil
-	}
-
-	for {
-		save := l.cur
-		cont, err := consumeHashOnLine()
-		if err != nil {
-			return "", err
-		}
-		if !cont {
-			l.cur = save
-			break
-		}
-
-		// read rest of line, but DO NOT consume trailing '\n'
-		for {
-			b, ok := l.peek()
-			if !ok || b == '\n' {
-				bldr.WriteByte('\n')
-				break
-			}
-			bldr.WriteByte(b)
-			l.advance()
-		}
-
-		// If another '#'-line follows, eat this '\n' and continue; else stop (leave '\n').
-		if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
-			l.advance() // consume newline to move to next line
-		} else {
-			break // leave final '\n' unconsumed
-		}
-	}
-
-	s := bldr.String()
-	if len(s) == 0 {
-		return "", errors.New("incomplete annotation")
-	}
-	for len(s) > 0 && s[len(s)-1] == '\n' {
-		s = s[:len(s)-1]
-	}
-	return s, nil
-}
-
-// --- hash/comment helpers ---
-
-// handleSingleHash processes '#' annotations (inline or multiline).
-// Returns (producedAnnotation, text, err).
-func (l *Lexer) handleSingleHash() (bool, string, error) {
-	annot, err := l.scanAnnotation()
-	if err != nil {
-		return false, "", l.err("incomplete annotation")
-	}
-	return true, annot, nil
-}
-
-// scanNoopIfPresent emits a NOOP token if the source at the current position
-// matches: '\n' ( hws* '\n' )+  where hws ∈ {' ', '\r', '\t'}.
-func (l *Lexer) scanNoopIfPresent() (Token, bool) {
-	b, ok := l.peek()
-	if !ok || b != '\n' {
-		return Token{}, false
-	}
-
-	// Snapshot so we can roll back on non-match (i.e., if we don't see at least one repetition).
-	saveCur, saveLine, saveCol, saveStart := l.cur, l.line, l.col, l.start
-
-	// Token starts here.
-	l.tokStartLine = l.line
-	l.tokStartCol = l.col
-	l.start = l.cur
-
-	// Consume the initial newline.
-	l.advance()
-
-	matchedReps := 0
-	for {
-		// Consume zero or more horizontal whitespace chars.
-		for {
-			nb, ok := l.peek()
-			if !ok || (nb != ' ' && nb != '\t' && nb != '\r') {
-				break
-			}
-			l.advance()
-		}
-		// Require a newline to complete one (hws* '\n') repetition.
-		nb, ok := l.peek()
-		if ok && nb == '\n' {
-			l.advance()
-			matchedReps++
-			continue
-		}
-		break
-	}
-
-	if matchedReps >= 1 {
-		return l.addToken(NOOP, nil), true
-	}
-
-	// Not a full match: restore and report no-op not present.
-	l.cur, l.line, l.col, l.start = saveCur, saveLine, saveCol, saveStart
-	return Token{}, false
-}
-
-// --- misc helpers ---
-
-func (l *Lexer) dotStartsNumber() bool {
-	b, ok := l.peek()
-	if !ok || !isDigit(b) {
-		return false
-	}
-	prev := l.previousToken()
-	if l.immediateWhitespaceBefore() || prev == nil || !canBeLeftOperand(prev.Type) {
-		return true
-	}
-	return false
-}
-
-// ---------------- main tokenization ----------------
-
-func (l *Lexer) scanToken() (Token, error) {
-	for {
-		l.skipHorizontalWhitespace()
-		l.tokStartLine = l.line
-		l.tokStartCol = l.col
-		l.start = l.cur
-
-		if l.isAtEnd() {
-			return l.addToken(EOF, nil), nil
-		}
-
-		// No-op (blank lines)
-		if b, _ := l.peek(); b == '\n' {
-			if tok, ok := l.scanNoopIfPresent(); ok {
-				return tok, nil
-			}
-			// Lone newline (or newline followed by non-hws) → skip it as whitespace and loop.
-			l.advance()
-			l.start = l.cur
-			continue
-		}
-
-		ch, _ := l.advance()
-
-		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
-		switch ch {
-		case '(':
-			if l.immediateWhitespaceBefore() {
-				return l.addToken(LROUND, "("), nil
-			}
-			return l.addToken(CLROUND, "("), nil
-		case ')':
-			return l.addToken(RROUND, ")"), nil
-		case '[':
-			if l.immediateWhitespaceBefore() {
-				return l.addToken(LSQUARE, "["), nil
-			}
-			return l.addToken(CLSQUARE, "["), nil
-		case ']':
-			return l.addToken(RSQUARE, "]"), nil
-		case '{':
-			return l.addToken(LCURLY, "{"), nil
-		case '}':
-			return l.addToken(RCURLY, "}"), nil
-		case '+':
-			return l.addToken(PLUS, "+"), nil
-		case '*':
-			return l.addToken(MULT, "*"), nil
-		case '/':
-			return l.addToken(DIV, "/"), nil
-		case '%':
-			return l.addToken(MOD, "%"), nil
-		case ':':
-			return l.addToken(COLON, ":"), nil
-		case ',':
-			return l.addToken(COMMA, ","), nil
-		case '?':
-			return l.addToken(QUESTION, "?"), nil
-		}
-
-		// '.' : either decimal-starting float or PERIOD
-		if ch == '.' {
-			if l.dotStartsNumber() {
-				l.rewindToStart()
-				tt, lit, err := l.scanNumber()
-				if err != nil {
-					return Token{}, err
-				}
-				return l.addToken(tt, lit), nil
-			}
-			return l.addToken(PERIOD, "."), nil
-		}
-
-		// Two-char operators and fallbacks
-		switch ch {
-		case '-':
-			if b, ok := l.peek(); ok && b == '>' {
-				l.advance()
-				return l.addToken(ARROW, "->"), nil
-			}
-			return l.addToken(MINUS, "-"), nil
-		case '=':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(EQ, "=="), nil
-			}
-			return l.addToken(ASSIGN, "="), nil
-		case '!':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(NEQ, "!="), nil
-			}
-			return l.addToken(BANG, "!"), nil
-		case '<':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(LESS_EQ, "<="), nil
-			}
-			return l.addToken(LESS, "<"), nil
-		case '>':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(GREATER_EQ, ">="), nil
-			}
-			return l.addToken(GREATER, ">"), nil
-		}
-
-		// Annotations
-		if ch == '#' {
-			ok, text, err := l.handleSingleHash()
-			if err != nil {
-				return Token{}, err
-			}
-			if ok {
-				return l.addToken(ANNOTATION, text), nil
-			}
-		}
-
-		// Strings
-		if ch == '"' || ch == '\'' {
-			l.rewindToStart()
-			text, err := l.scanString()
-			if err != nil {
-				return Token{}, err
-			}
-			// After '.' a quoted key becomes ID (property name)
-			if l.afterDotIsProperty() {
-				return l.addToken(ID, text), nil
-			}
-			return l.addToken(STRING, text), nil
-		}
-
-		// Numbers (starting with digit)
-		if isDigit(ch) {
-			l.rewindToStart()
-			tt, lit, err := l.scanNumber()
-			if err != nil {
-				return Token{}, err
-			}
-			return l.addToken(tt, lit), nil
-		}
-
-		// Identifiers / Keywords
-		if isAlpha(ch) {
-			l.rewindToStart()
-			lex := l.scanIdentifier()
-			// After '.', treat as property name (ID)
-			if l.afterDotIsProperty() {
-				return l.addToken(ID, lex), nil
-			}
-			if tt, ok := keywords[lex]; ok {
-				switch tt {
-				case NULL:
-					return l.addToken(NULL, nil), nil
-				case BOOLEAN:
-					if lex == "true" {
-						return l.addToken(BOOLEAN, true), nil
-					}
-					return l.addToken(BOOLEAN, false), nil
-				default:
-					return l.addToken(tt, nil), nil
-				}
-			}
-			return l.addToken(ID, lex), nil
-		}
-
-		return Token{}, l.err(fmt.Sprintf("unexpected character: %q", ch))
-	}
-}
-=== END FILE: lexer.go ===
+=== END PUBLIC SECTION FOR FILE: lexer.go ===
+
+=== BEGIN PUBLIC SECTION OF FILE: parser.go ===
+// parser.go — Pratt parser for MindScript that produces compact S-expressions.
+//
+// OVERVIEW
+// --------
+// This module implements the newline-aware Pratt parser for the MindScript
+// language. It consumes the token stream produced by the *whitespace-sensitive*
+// lexer (see lexer.go) and builds a compact, Lisp-style S-expression (AST).
+//
+// Design goals:
+//   - Keep the grammar readable via precedence rules (Pratt parser).
+//   - Encode the AST in a tiny, serialisable structure (S-expressions).
+//   - Respect whitespace-sensitive signals emitted by the lexer:
+//   - '(' can be LROUND or CLROUND; only CLROUND participates in calls.
+//   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
+//   - '.' is PERIOD unless it started a number in the lexer.
+//   - multi-line '#' annotations become ANNOTATION tokens.
+//   - blank-line runs may be emitted as NOOP tokens.
+//   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
+//     at EOF instead of hard parse errors, suitable for REPLs.
+//
+// NEW IN THIS VERSION (liberal spacing inside delimiters + precise error locations)
+// -------------------------------------------------------------------------------
+//
+//   - The parser **skips NOOP tokens inside delimited constructs** so that blank
+//     lines are treated like whitespace within:
+//     array literals:            [ … ]
+//     map/object literals:       { … }
+//     call argument lists:       f( … )
+//     parameter lists:           fun(x: T, …)
+//     bracket indices:           a[ … ]
+//     computed properties:       obj.( … )
+//     grouping parentheses:      ( … )
+//
+//     The semantics of NOOP at the top level and inside blocks are unchanged: a
+//     NOOP still parses as ("noop") outside the above delimited contexts.
+//
+//   - **Precise error locations:** the parser now uses lexer byte offsets to place
+//     carets exactly where users expect.
+//
+//   - If a token is **missing** (e.g., expected ')' at EOF), the error is
+//     anchored **immediately after the last completed node** (using EndByte).
+//
+//   - If an **unexpected token** is present (wrong lookahead), the error is
+//     anchored at the **start** of that token (using StartByte).
+//
+//   - Interactive incomplete errors follow the same policy.
+//
+// What the parser returns
+// -----------------------
+// The AST is a tree of S-expressions: []any whose first element is a string tag.
+// Examples (non-exhaustive):
+//
+//		("block", n1, n2, ...)
+//		("id",   name)               // string
+//		("int",  int64)              // from INTEGER
+//		("num",  float64)            // from NUMBER
+//		("str",  string)             // decoded literal
+//		("bool", bool)               // from BOOLEAN
+//		("null")                     // from NULL
+//
+//		("unop", op, rhs)            // prefix "-" or "not"; postfix "?"  (op is string)
+//		("binop", op, lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
+//		("assign", target, value)    // "=" (right-assoc)
+//
+//		("call", callee, arg1, arg2, ...)
+//		("get",  obj, ("str", name))                  // property: obj.name or obj."name"
+//		("idx",  obj, indexExpr)                      // obj[expr] or obj.(expr) or obj.12
+//
+//		("array", e1, e2, ...)
+//		("map",   ("pair",  keyStrExpr, value)*)
+//		("map",   ("pair!", keyStrExpr, value)*)      // required-field (key! : value)
+//		("enum",  item1, item2, ...)                  // from Enum[ ... ]
+//
+//		("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
+//		("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)  // optional 'from' expression
+//		("module",  nameExpr, bodyBlock)             // module NAME do ... end
+//
+//		("if", ("pair", cond1, thenBlk1), ..., elseBlk?)       // if/elif/else
+//		("while", cond, bodyBlock)
+//		("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//
+//		// Declaration patterns (used by 'let' and 'for' targets):
+//		("decl", name)
+//		("darr", p1, p2, ...)                               // array destructure
+//		("dobj", ("pair", keyStrExpr, subPattern), ...)     // object destructure
+//
+//		// Annotations (from '#'-blocks). POST is encoded by a leading "<" in text.
+//		("annot", ("str", textOr<text>), wrappedNode)
+//
+//	 Annotation encoding:
+//	   - PRE annotations are stored as-is:        ("annot", ("str", "note"), expr/pattern)
+//	   - POST annotations are prefixed with "<":  ("annot", ("str", "<note"), expr)
+//
+// Node spans
+// ----------
+// For tooling, the parser records byte spans (StartByte/EndByte) for each node
+// in post-order. Use ParseSExprWithSpans to receive a sidecar *SpanIndex that
+// maps each node to its original source span (see spans.go).
+//
+// **Implementation note (this file):**
+// Spans are emitted *at construction sites* for every AST node, including
+// intermediate postfix nodes like ("get") and ("idx"), computed-index grouping
+// via obj.( … ), structural containers like ("pair")/("pair!"), parameter
+// pairs, "decl" patterns, and PRE-annotation wrappers in pattern/key contexts.
+// Children are emitted first; when a parent node is formed, its span is
+// appended using the earliest token of the left-hand side and the last token
+// consumed for the construct, preserving post-order.
+//
+// Dependencies
+// ------------
+//   - lexer.go
+//   - NewLexer / NewLexerInteractive
+//   - Token / TokenType definitions and the tokenization rules
+//   - *Error (unified hard diagnostic) with DiagKind; the parser may return
+//     *Error{Kind:DiagIncomplete} in interactive mode.
+//   - spans.go
+//   - type Span, type SpanIndex
+//   - func BuildSpanIndexPostOrder(ast S, spans []Span) *SpanIndex
+//
+// Whitespace-sensitive behavior consumed from the lexer
+// -----------------------------------------------------
+//
+//   - CLROUND vs LROUND:
+//
+//   - Prefix  (both) parse a parenthesised *grouping*.
+//
+//   - Postfix only CLROUND starts a *call* chain: f(x) → ("call", ...).
+//     `f (x)` uses LROUND and is *not* a call.
+//
+//   - CLSQUARE vs LSQUARE:
+//
+//   - Prefix  (both) parse an array literal.
+//
+//   - Postfix only CLSQUARE is indexing: a[i]. `a [i]` is not indexing.
+//
+//   - PERIOD chains:
+//
+//   - After '.', the next token is coerced by the lexer to an ID if it is an
+//     identifier or a quoted string, even if it lexically matches a keyword.
+//     The parser accepts after '.' one of:
+//     (a) LROUND/CLROUND expr RROUND   → computed property: ("idx", obj, expr)
+//     (b) INTEGER                      → numeric index:    ("idx", obj, ("int", ...))
+//     (c) ID or STRING                 → property:         ("get", obj, ("str", name))
+//     Anything else is a parse error.
+//
+//   - Annotations (ANNOTATION tokens):
+//
+//   - Classification into PRE vs POST is *line-sensitive*:
+//     If the last token on the same line before '#' can end an expression,
+//     the annotation is POST (attaches to the left); otherwise it is PRE.
+//
+//   - General rule: multiple *consecutive PRE* annotations are disallowed
+//     (parser error; suggest combining). Inside key parsing, recursion allows
+//     stacked PRE annotations in front of a key.
+//
+//   - POST annotations are attached in the postfix chain; PRE wrap the node
+//     that follows. In the AST, POST is represented by a leading "<" in the
+//     stored text (see encoding above).
+//
+//   - NOOP (blank lines):
+//     Inside delimiters (() [] {} args/params/indices/grouping): skipped like
+//     whitespace. Elsewhere (top level, block bodies): parsed as ("noop").
+//     Lone PRE annotation followed by a blank line:
+//     ("annot", ("str", text), ("noop"), true),
+//     the interpreter treats these as true no-ops; see interpreter.go.
+//
+// Grammar sketch (informal)
+// -------------------------
+//
+//	program      := expr* EOF
+//	expr         := prefix (postfix | infix)*
+//	prefix       := literals | ids | grouping | arrays | maps | enums
+//	                | unary ("-" | "not") expr
+//	                | "fun"    params ["->" type] block
+//	                | "oracle" params ["->" type] ["from" expr] block
+//	                | "module" expr "do" block "end"
+//	                | "if" cond "then" block {"elif" cond "then" block} ["else" block] "end"
+//	                | "do" block "end"
+//	                | "for" forTarget "in" expr block
+//	                | "while" expr block
+//	                | "let" declPattern
+//	                | annotation (PRE) expr
+//	postfix      := "?" | call | index | dot | annotation (POST)
+//	call         := CLROUND [args] RROUND
+//	index        := CLSQUARE expr RSQUARE
+//	dot          := PERIOD ( LROUND expr RROUND | INTEGER | ID | STRING )
+//	infix        := right-assoc "=" | right-assoc "->" | precedence-based binary op
+//
+//	declPattern  := ID | "[" [declPattern {"," declPattern}] "]"
+//	                     | "{" [key ":" declPattern {"," key ":" declPattern}] "}"
+//	forTarget    := ["let"] (declPattern | assignable)
+//	params       := CLROUND [param {"," param}] RROUND
+//	param        := ID [":" typeExpr]
+//	block        := "do" blockBody "end"    // in forms that require it
+//	blockBody    := expr*                    // until a listed keyword (e.g. "end")
+//
+// Precedence & associativity
+// --------------------------
+//
+//	Highest …  unary ("-", "not"), postfix '?'
+//	70         "*" "/" "%"
+//	60         "+" "-"
+//	50         "<" "<=" ">" ">="
+//	40         "==" "!="
+//	30         "and"
+//	20         "or"
+//	15         "->"     (right-assoc as general operator; also used in fun/oracle headers)
+//	10         "="      (right-assoc; target must be id/get/idx/decl/darr/dobj)
+//
+// Errors
+// ------
+//   - HARD errors are returned as *Error with appropriate Kind:
+//   - DiagParse for grammatical mistakes.
+//   - DiagIncomplete at EOF in interactive mode (REPL continue).
+//   - **Error placement (this version):**
+//   - Missing token (e.g. expected ')'): caret after the last completed node.
+//   - Wrong lookahead token: caret at the start of that token.
+//   - The parser never pretty-prints; public entry points format via FormatError.
+//   - The parser never panics for malformed input.
+//
+// PUBLIC API
+// ----------
+=== END PUBLIC SECTION FOR FILE: parser.go ===
 

@@ -174,13 +174,11 @@ const (
 
 // moduleRec tracks cached module state by canonical identity.
 type moduleRec struct {
-	spec        string
-	displayName string
-	src         string
-	env         *Env
-	mod         *Module
-	state       moduleState
-	err         error
+	spec  string
+	env   *Env
+	mod   *Module
+	state moduleState
+	err   error
 }
 
 // get returns an exported binding by key. The VM uses this for property/index reads.

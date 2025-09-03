@@ -15,6 +15,7 @@ package mindscript
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 /* ===========================
@@ -88,6 +89,36 @@ func diagHeader(k DiagKind) string {
 	}
 }
 
+// caretPadPrefix returns a prefix for the caret line that aligns with col (1-based)
+// on the *original* line without assuming any tab width. It preserves '\t' characters
+// and replaces every other rune with a single space, so tabs expand identically in
+// both the code line and the caret line.
+func caretPadPrefix(line string, col int) string {
+	if col < 1 {
+		col = 1
+	}
+	// Clamp to [1 .. runeCount+1]
+	rc := utf8.RuneCountInString(line)
+	if col > rc+1 {
+		col = rc + 1
+	}
+
+	var b strings.Builder
+	i := 0
+	for _, r := range line {
+		if i >= col-1 {
+			break
+		}
+		if r == '\t' {
+			b.WriteByte('\t') // preserve tab so the caret aligns under any tab width
+		} else {
+			b.WriteByte(' ') // single space for all non-tab runes
+		}
+		i++
+	}
+	return b.String()
+}
+
 // prettyErrorStringLabeled builds a Python-like snippet with a header and caret.
 // It shows at most one previous and one next line when available.
 // Coordinates are treated as 1-based and clamped to the source bounds.
@@ -107,6 +138,7 @@ func prettyErrorStringLabeled(src, header, name string, line, col int, msg strin
 	}
 
 	lineTxt := lines[line-1]
+	pad := caretPadPrefix(lineTxt, col)
 
 	var b strings.Builder
 	if name != "" {
@@ -118,17 +150,7 @@ func prettyErrorStringLabeled(src, header, name string, line, col int, msg strin
 		fmt.Fprintf(&b, "%4d | %s\n", line-1, lines[line-2])
 	}
 	fmt.Fprintf(&b, "%4d | %s\n", line, lineTxt)
-
-	// Clamp caret padding to the line length (defensive).
-	caretPad := col - 1
-	if caretPad < 0 {
-		caretPad = 0
-	}
-	if caretPad > len(lineTxt) {
-		caretPad = len(lineTxt)
-	}
-	fmt.Fprintf(&b, "     | %s^\n", strings.Repeat(" ", caretPad))
-
+	fmt.Fprintf(&b, "     | %s^\n", pad)
 	if line < len(lines) {
 		fmt.Fprintf(&b, "%4d | %s\n", line+1, lines[line])
 	}

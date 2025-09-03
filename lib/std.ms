@@ -414,12 +414,16 @@ end
 # Returns: [Str]
 let dir = fun(x: {}) -> [Str] do
 	let out = []
-	for let [k, _] in x do
+	for let [k, v] in x do
 		if not (substr(k, 0, 1) == "_") then
+			let ann = noteGet(v)
+			if ann != null then
+				ann = split(ann, "\n").0
+				k = noteSet(ann, k)
+			end
 			out = out + [k]
 		end
 	end
-	out
 end
 
 # List function names of an object (if supported).
@@ -491,27 +495,6 @@ let jsonSchema = fun(t: Type) -> Str? do
 	if r.ok then jsonStringify(r.value) else error("jsonSchema: missing native bridge") end
 end
 
-## -----------------------------
-## Annotations
-## -----------------------------
-
-# Get the annotation/note attached to a value, if any.
-#
-# Thin wrapper over native `help(x)` (if provided).
-# Args: x: Any
-# Returns: Str?
-let getNote = fun(x: Any) -> Str? do
-	help(x)
-end
-
-# Annotates a value.
-#
-# Requires native support to attach annotations at runtime.
-# Args: x: Any, note: Str?
-# Returns: Any
-let setNote = fun(x: Any, note: Str?) -> Any do
-	__annotate(note, x)
-end
 
 ## -----------------------------
 ## Misc

@@ -14,14 +14,6 @@ func vInt(n int64) Value          { return Int(n) }
 func vNum(f float64) Value        { return Num(f) }
 func vBool(b bool) Value          { return Bool(b) }
 
-func rtAnnotNull(msg string) Value {
-	return vArray(
-		vStr("annot"),
-		vArray(vStr("str"), vStr(msg)),
-		vArray(vStr("null")),
-	)
-}
-
 func valueDeepEqual(a, b Value) bool {
 	if a.Tag != b.Tag {
 		return false

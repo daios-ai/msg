@@ -1,330 +1,240 @@
-## test.ms — tiny test registry & runner for MindScript
-##
-## Features:
-##  - Register tests with `suite(name){ test(name){ ... } }`
-##  - Hooks: beforeAll/afterAll, beforeEach/afterEach
-##  - Run all or by substring match: runAll(), runMatch("math")
-##  - `expect(...)` matchers + `assertEq(...)`
-##  - `withOracle(exec, body)` to fake oracles within a test
-##
-## Conventions:
-##  - Contract failures use fail(msg); runner catches with try(...)
-##  - Returning annotated null (soft error) from a test also counts as failure
-##  - Tabs for indentation
-
-## -----------------------------
-## State
-## -----------------------------
-
-let _tests = []				# [{name:Str, fn:(Null->Any?)}]
-let _suiteStack = []		# ["parent","child",...]
-let _beforeAll = []			# [(Null->Any?)]
-let _afterAll = []			# [(Null->Any?)]
-let _beforeEach = []		# [(Null->Any?)]
-let _afterEach = []			# [(Null->Any?)]
-
-## -----------------------------
-## Registry API
-## -----------------------------
-
-# Register a test case.
+# MindScript testing toolkit (minimal, Go-like ergonomics).
 #
-# Adds a test named by the current suite path + `name`. Body throws on failure
-# (via fail) or may return annotated null to signal a soft failure.
-# Args: name: Str, fn: (Null -> Any?)
-# Returns: Null
-let test = fun(name: Str, fn: (Null -> Any?)) -> Null do
-	let full = (fun(_: Null) -> Str do
-		if len(_suiteStack) == 0 then name
-		else
-			let path = ""
-			for p in iter(_suiteStack) do
-				path = (if path == "" then p else path + "/" + p end)
-			end
-			path + "/" + name
-		end
-	end)(null)
-	_tests = _tests + [{ name: full, fn: fn }]
-	null
+# Exports:
+# 	test(name, fn)        — register a test function
+# 	tests()               — return the registered tests map (name → fn)
+# 	assert(ok, msg?)      — boolean assertion
+# 	assertEq(want, got)   — deep-ish equality with readable diff
+# 	assertType(v, T)      — runtime type assertion
+# 	assertThrows(fn, sub?)— expect a failure; optional substring match
+# 	cases(name, xs, fn)   — table tests: register one subtest per element
+# 	snapshot(path, v)     — golden/snapshot compare (update with MS_UPDATE_SNAPSHOTS=1)
+# 	seed(n)               — seed the RNG for reproducible tests
+
+# Name of the opt-in environment flag for updating snapshots.
+let MS_UPDATE_SNAPSHOTS = "MS_UPDATE_SNAPSHOTS"
+
+# Internal registry (insertion order preserved by map semantics).
+let _tests = {}
+
+# --- helpers ---------------------------------------------------------------
+
+# Render a value to a stable string (JSON when possible).
+let _repr = fun(x: Any) -> Str do
+	# jsonStringify is stable and compact; fall back to str(x) only if ever needed.
+	return jsonStringify(x)
 end
 
-# Define a suite (group) of tests.
-#
-# Pushes `name` onto a suite stack while executing `body`, so inner tests
-# receive a prefixed path. Errors thrown while defining a suite propagate.
-# Args: name: Str, body: (Null -> Any?)
-# Returns: Null
-let suite = fun(name: Str, body: (Null -> Any?)) -> Null do
-	_suiteStack = _suiteStack + [name]
-	let r = try(body)
-	# pop even if body failed
-	_suiteStack = slice(_suiteStack, 0, len(_suiteStack) - 1)
-	if not r.ok then fail("suite '" + name + "' init failed: " + str(r.error)) end
-	null
+# Simple substring test using split (no regex surprises).
+let _contains = fun(hay: Str, needle: Str) -> Bool do
+	return len(split(hay, needle)) > 1
 end
 
-# Register a function to run once before all tests.
-#
-# Args: fn: (Null -> Any?)
-# Returns: Null
-let beforeAll = fun(fn: (Null -> Any?)) -> Null do
-	_beforeAll = _beforeAll + [fn]
-	null
-end
-
-# Register a function to run once after all tests.
-#
-# Args: fn: (Null -> Any?)
-# Returns: Null
-let afterAll = fun(fn: (Null -> Any?)) -> Null do
-	_afterAll = _afterAll + [fn]
-	null
-end
-
-# Register a function to run before each test.
-#
-# Args: fn: (Null -> Any?)
-# Returns: Null
-let beforeEach = fun(fn: (Null -> Any?)) -> Null do
-	_beforeEach = _beforeEach + [fn]
-	null
-end
-
-# Register a function to run after each test.
-#
-# Args: fn: (Null -> Any?)
-# Returns: Null
-let afterEach = fun(fn: (Null -> Any?)) -> Null do
-	_afterEach = _afterEach + [fn]
-	null
-end
-
-
-## -----------------------------
-## Runner
-## -----------------------------
-
-# Run all registered tests.
-#
-# Executes hooks and tests in registration order. Returns a structured summary.
-# Args: _: Null (ignored)
-# Returns: { ok: Bool, total: Int, passed: Int, failed: Int, ms: Int, results: [ {} ] }
-let runAll = fun(_: Null) -> {} do
-	_runSelected(_tests)
-end
-
-# Run tests whose names contain `pattern` (substring match).
-#
-# Args: pattern: Str
-# Returns: { ok: Bool, total: Int, passed: Int, failed: Int, ms: Int, results: [ {} ] }
-let runMatch = fun(pattern: Str) -> {} do
-	let selected = []
-	for t in iter(_tests) do
-		if _contains(t.name, pattern) then selected = selected + [t] end
+# Trim long blobs for diffs.
+let _trim = fun(s: Str, limit: Int) -> Str do
+	if len(s) <= limit then
+		return s
 	end
-	_runSelected(selected)
+	return sprintf("%s…(%d bytes total)", [substr(s, 0, limit), len(s)])
 end
 
+# Fail with a formatted message (internal).
+let _failf = fun(fmt: Str, args: [Any]) -> Null do
+	fail(sprintf(fmt, args))
+end
 
-## -----------------------------
-## Matchers / assertions
-## -----------------------------
+# --- API -------------------------------------------------------------------
 
-# Create an expectation object with basic matchers.
+# Register a test function under a unique name.
 #
-# All mismatch cases call fail(msg). Successful matches return null.
-# Args: actual: Any
-# Returns: { toBe:(Any->Null), toEqual:(Any->Null), toBeClose:(Num->Num->Null), toBeType:(Type->Null), toBeNull:(Null->Null), toContain:(Any->Null) }
-let expect = fun(actual: Any) -> {} do
-	{
-		toBe: fun(expected: Any) -> Null do
-			if actual == expected then null else fail("expected == " + str(expected) + ", got " + str(actual)) end
-		end,
+# Registers a test that will be discovered by a runner. Names must be unique.
+#
+# Args:
+# 	name: Str — test name
+# 	fn:   Any — zero-arg function to execute for this test
+#
+# Returns:
+# 	Bool — true on success
+let test = fun(name: Str, fn: Any) -> Bool do
+	if not __is_fun(fn) then
+		_failf("test(%s): second argument must be a function", [_repr(name)])
+	end
+	if mapHas(_tests, name) then
+		_failf("duplicate test name: %s", [_repr(name)])
+	end
+	_tests.(name) = fn
+	return true
+end
 
-		toEqual: fun(expected: Any) -> Null do
-			# stringified deep-ish equality for JSON-friendly values
-			let a = jsonStringify(actual)
-			let b = jsonStringify(expected)
-			if a == b then null else fail("expected equal\nwant: " + b + "\n got: " + a) end
-		end,
+# Return the registered tests (name → function).
+#
+# Returns:
+# 	{} — shallow map view of the registry (modifying it does not affect internal state)
+let tests = fun(_: Null) -> {} do
+	return clone(_tests)
+end
 
-		toBeClose: fun(expected: Num, eps: Num) -> Null do
-			let diff = (if actual > expected then actual - expected else expected - actual end)
-			if diff <= eps then null else fail("expected close to " + str(expected) + " ± " + str(eps) + ", got " + str(actual)) end
-		end,
-
-		toBeType: fun(t: Type) -> Null do
-			if isType(actual, t) then null else fail("expected type " + str(t) + ", got " + str(actual)) end
-		end,
-
-		toBeNull: fun(_: Null) -> Null do
-			if actual == null then null else fail("expected null, got " + str(actual)) end
-		end,
-
-		toContain: fun(elem: Any) -> Null do
-			if isType(actual, type [Any]) then
-				let ok = false
-				for x in iter(actual) do
-					if jsonStringify(x) == jsonStringify(elem) then ok = true end
-				end
-				if ok then null else fail("expected array to contain " + str(elem)) end
-			elif isType(actual, type Str) then
-				if _contains(actual, elem) then null else fail("expected substring: " + str(elem)) end
-			elif isType(actual, type {}) then
-				if hasKey(actual, elem) then null else fail("expected object to have key " + str(elem)) end
-			else
-				fail("toContain not supported for value: " + str(actual))
-			end
+# Boolean assertion.
+#
+# Fails with msg (or a default) when ok is false.
+#
+# Args:
+# 	ok:  Bool
+# 	msg: Str? — optional message
+#
+# Returns:
+# 	Bool — true when assertion holds
+let assert = fun(ok: Bool, msg: Str?) -> Bool do
+	if not ok then
+		if msg == null then
+			fail("assertion failed")
 		end
-	}
-end
-
-# Assert equality (shortcut).
-#
-# Throws a hard failure if a != b (via stringify comparison).
-# Args: a: Any, b: Any, note: Str?
-# Returns: Null
-let assertEq = fun(a: Any, b: Any, note: Str?) -> Null do
-	let sa = jsonStringify(a)
-	let sb = jsonStringify(b)
-	if sa == sb then null else
-		let msg = (if note == null then "" else note + ": " end) + "want " + sb + ", got " + sa
 		fail(msg)
 	end
+	return true
 end
 
-
-## -----------------------------
-## Oracle test helper
-## -----------------------------
-
-# Run a block with a temporary oracle executor.
+# Equality assertion with a readable diff.
 #
-# Installs `exec` via oracleInstall, runs `body`, then restores the previous executor.
-# Any failure inside `body` is rethrown after restoration.
-# Args: exec: (Str -> Type -> Type -> [Any] -> Str?), body: (Null -> Any?)
-# Returns: Any?
-let withOracle = fun(exec: (Str -> Type -> Type -> [Any] -> Str?), body: (Null -> Any?)) -> Any? do
-	let prev = __oracle_execute
-	oracleInstall(exec)
-	let r = try(body)
-	oracleInstall(prev)
-	if r.ok then r.value else fail(r.error) end
+# Uses structural equality (==). On mismatch, shows JSONified want/got.
+#
+# Args:
+# 	want: Any
+# 	got:  Any
+#
+# Returns:
+# 	Bool — true when equal
+let assertEq = fun(want: Any, got: Any) -> Bool do
+	if want == got then
+		return true
+	end
+	let w = _repr(want)
+	let g = _repr(got)
+	_failf("not equal:\nwant: %s\ngot:  %s", [_trim(w, 4000), _trim(g, 4000)])
+	# unreachable
+	return true
 end
 
-
-## -----------------------------
-## Internals
-## -----------------------------
-
-# Run a list of tests with hooks; return summary map.
+# Runtime type assertion.
 #
-# Args: selected: [ {name:Str, fn:(Null->Any?)} ]
-# Returns: { ok: Bool, total: Int, passed: Int, failed: Int, ms: Int, results: [ {} ] }
-let _runSelected = fun(selected: [Any]) -> {} do
-	let t0 = tsNow(null)
-
-	# beforeAll
-	let ba = _runHooks("beforeAll", _beforeAll)
-	if not ba.ok then
-		let ms = tsNow(null) - t0
-		return {
-			ok: false, total: len(selected), passed: 0, failed: len(selected),
-			ms: ms,
-			results: [{ name: "beforeAll", ok: false, ms: ba.ms, error: ba.error }]
-		}
+# Asserts that value v conforms to the declared Type T.
+#
+# Args:
+# 	v: Any
+# 	T: Type
+#
+# Returns:
+# 	Bool — true when v : T
+let assertType = fun(v: Any, T: Type) -> Bool do
+	if isType(v, T) then
+		return true
 	end
-
-	let results = []
-	let passed = 0
-	let failed = 0
-
-	for t in iter(selected) do
-		let tStart = tsNow(null)
-
-		# beforeEach
-		let be = _runHooks("beforeEach", _beforeEach)
-		let testOk = be.ok
-		let errMsg = (if be.ok then "" else be.error)
-
-		# run test if be.ok
-		if testOk then
-			let r = try(t.fn)
-			if r.ok then
-				# treat annotated null as soft failure
-				if r.value == null then
-					let note = getNote(r.value)
-					if note != null then
-						testOk = false
-						errMsg = "soft failure: " + str(note)
-					end
-				end
-			else
-				testOk = false
-				errMsg = r.error
-			end
-		end
-
-		# afterEach (run regardless; append error if any)
-		let ae = _runHooks("afterEach", _afterEach)
-		if testOk and not ae.ok then
-			testOk = false
-			errMsg = "afterEach: " + ae.error
-		end
-
-		let tMs = tsNow(null) - tStart
-		if testOk then
-			results = results + [{ name: t.name, ok: true, ms: tMs }]
-			passed = passed + 1
-		else
-			results = results + [{ name: t.name, ok: false, ms: tMs, error: errMsg }]
-			failed = failed + 1
-		end
-	end
-
-	# afterAll
-	let aa = _runHooks("afterAll", _afterAll)
-	if not aa.ok then
-		results = results + [{ name: "afterAll", ok: false, ms: aa.ms, error: aa.error }]
-		failed = failed + 1
-	end
-
-	let total = len(selected)
-	let ms = tsNow(null) - t0
-	{ ok: failed == 0, total: total, passed: passed, failed: failed, ms: ms, results: results }
+	_failf("type mismatch:\nvalue: %s\ndoes not satisfy: %s",
+		[_trim(_repr(v), 4000), str(T)])
+	# unreachable
+	return true
 end
 
-# Run a list of hook functions; accumulate first error only.
+# Expect a failure (hard error), optionally matching a substring.
 #
-# Args: label: Str, fns: [(Null->Any?)]
-# Returns: { ok: Bool, ms: Int, error: Str }
-let _runHooks = fun(label: Str, fns: [Any]) -> {} do
-	let h0 = tsNow(null)
-	for fn in iter(fns) do
-		let r = try(fn)
-		if not r.ok then
-			let ms = tsNow(null) - h0
-			return { ok: false, ms: ms, error: label + ": " + str(r.error) }
-		else
-			# soft error from a hook counts as failure
-			if r.value == null then
-				let note = getNote(r.value)
-				if note != null then
-					let ms2 = tsNow(null) - h0
-					return { ok: false, ms: ms2, error: label + " (soft): " + str(note) }
-				end
-			end
-		end
+# Runs fn and asserts that it fails. If sub is provided, the error message
+# must contain sub.
+#
+# Args:
+# 	fn:  Any   — zero-arg function expected to fail
+# 	sub: Str?  — optional substring that must appear in the error
+#
+# Returns:
+# 	Bool — true when a failure occurred (and matched, if sub provided)
+let assertThrows = fun(fn: Any, sub: Str?) -> Bool do
+	if not __is_fun(fn) then
+		_failf("assertThrows: argument must be a function", [])
 	end
-	let ms = tsNow(null) - h0
-	{ ok: true, ms: ms, error: "" }
+	let r = try(fn)
+	if r.ok then
+		_failf("expected failure, got success with value: %s", [_trim(_repr(r.value), 4000)])
+	end
+	if sub != null and not _contains(r.error, sub) then
+		_failf("failure did not contain substring.\nwant in: %s\ngot:     %s",
+			[_repr(sub), _trim(r.error, 4000)])
+	end
+	return true
 end
 
-# Substring check for strings (needle may be Any; coerced to Str).
+# Table-driven tests (register subtests).
 #
-# Args: hay: Str, needle: Any
-# Returns: Bool
-let _contains = fun(hay: Str, needle: Any) -> Bool do
-	let n = str(needle)
-	if n == "" then true else len(split(hay, n)) >= 2 end
+# Registers one subtest per element in xs, named "name/i" (0-based).
+# The function fn is called as fn(x) for each element.
+#
+# Args:
+# 	name: Str
+# 	xs:   [Any]
+# 	fn:   Any   — function accepting one argument (each element)
+#
+# Returns:
+# 	Int — number of subtests registered
+let cases = fun(name: Str, xs: [Any], fn: Any) -> Int do
+	if not __is_fun(fn) then
+		_failf("cases(%s): fn must be a function taking one argument", [_repr(name)])
+	end
+	let n = len(xs)
+	let i = 0
+	for _ in xs do
+		let subName = sprintf("%s/%d", [name, i])
+		let x = xs[i]
+		test(subName, fun(_: Null) -> Any do
+			# Delegate to user-supplied function; they perform assertions inside.
+			return fn(x)
+		end)
+		i = i + 1
+	end
+	return n
+end
+
+# Snapshot (golden) testing for values.
+#
+# Compares the stable serialization of value to the file at path.
+# If MS_UPDATE_SNAPSHOTS=1, the file is (over)written with the new value.
+#
+# Args:
+# 	path:  Str — snapshot file path
+# 	value: Any — value to serialize and compare
+#
+# Returns:
+# 	Bool — true when snapshot matches or was updated
+let snapshot = fun(path: Str, value: Any) -> Bool do
+	let want = _repr(value)
+	let have = readFile(path)
+	let update = osEnv(MS_UPDATE_SNAPSHOTS) == "1"
+
+	if have == null then
+		if update then
+			writeFile(path, want)
+			return true
+		end
+		_failf("snapshot missing (set %s=1 to write): %s", [MS_UPDATE_SNAPSHOTS, path])
+	end
+
+	if have != want then
+		if update then
+			writeFile(path, want)
+			return true
+		end
+		_failf("snapshot mismatch:\nfile: %s\n--- have ---\n%s\n--- want ---\n%s\n(set %s=1 to update)",
+			[path, _trim(have, 4000), _trim(want, 4000), MS_UPDATE_SNAPSHOTS])
+	end
+
+	return true
+end
+
+# Seed the RNG for reproducible tests.
+#
+# Args:
+# 	n: Int — seed value
+#
+# Returns:
+# 	Int — the same seed (convenient for logging)
+let seed = fun(n: Int) -> Int do
+	seedRand(n)
+	return n
 end

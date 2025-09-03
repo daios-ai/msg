@@ -1,31 +1,25 @@
 {
-	# Euler's number e.
-	# 
-	# Returns:
-	# Num
-	# Euler's number e.
-	# 
-	# Returns:
-	# Num
-	E: 2.718281828459045,
-	# Mathematical constant π.
-	# 
-	# Returns:
-	# Num
-	# Mathematical constant π.
-	# 
-	# Returns:
-	# Num
-	PI: 3.141592653589793,
-	# Writable handle for the process standard error.
-	# Writable handle for the process standard error.
-	STDERR: <handle: file>,
-	# Readable handle for the process standard input.
-	# Readable handle for the process standard input.
-	STDIN: <handle: file>,
-	# Writable handle for the process standard output.
-	# Writable handle for the process standard output.
-	STDOUT: <handle: file>,
+	E:
+		# Euler's number e.
+		# 
+		# Returns:
+		# Num
+		2.718281828459045,
+	PI:
+		# Mathematical constant π.
+		# 
+		# Returns:
+		# Num
+		3.141592653589793,
+	STDERR:
+		# Writable handle for the process standard error.
+		<handle: file>,
+	STDIN:
+		# Readable handle for the process standard input.
+		<handle: file>,
+	STDOUT:
+		# Writable handle for the process standard output.
+		<handle: file>,
 	__annotate: <fun: text:Str -> v:Any -> Any>,
 	__assign_def: <fun: target:Type -> value:Any -> Any>,
 	__assign_set: <fun: target:Type -> value:Any -> Any>,
@@ -39,2169 +33,1269 @@
 	__plus: <fun: a:Any -> b:Any -> Any>,
 	__resolve_type: <fun: t:Type -> Type>,
 	__to_iter: <fun: x:Any -> Any>,
-	# Evaluate a runtime-S AST in the caller's scope.
-	# 
-	# Validates and evaluates a packed AST (the ["tag", …] encoding) in the
-	# *current* environment.
-	# 
-	# Params:
-	# ast: [] — runtime-S AST (see astParse)
-	# 
-	# Returns:
-	# Any — the evaluation result
-	# 
-	# Notes:
-	# • Effects (let/assignment) occur in the caller's scope.
-	# • Malformed AST or runtime failures are hard errors; wrap with try(...) to capture.
-	# Evaluate a runtime-S AST in the caller's scope.
-	# 
-	# Validates and evaluates a packed AST (the ["tag", …] encoding) in the
-	# *current* environment.
-	# 
-	# Params:
-	# ast: [] — runtime-S AST (see astParse)
-	# 
-	# Returns:
-	# Any — the evaluation result
-	# 
-	# Notes:
-	# • Effects (let/assignment) occur in the caller's scope.
-	# • Malformed AST or runtime failures are hard errors; wrap with try(...) to capture.
-	astEval: <fun: ast:[Any] -> Any>,
-	# Parse source code into runtime-S (VTArray).
-	# 
-	# Parses a MindScript source string and returns its AST encoded as a runtime
-	# S-expression (a VTArray whose first element is a tag string).
-	# 
-	# Params:
-	# src: Str — MindScript source
-	# 
-	# Returns:
-	# [] — a runtime-S AST
-	# • On lex/parse error this returns an annotated-null runtime-S:
-	# ["annot", ["str", <message>], ["null"]]
-	# 
-	# Notes:
-	# • The encoding is stable and round-trippable with astEval / reify.
-	# Parse source code into runtime-S (VTArray).
-	# 
-	# Parses a MindScript source string and returns its AST encoded as a runtime
-	# S-expression (a VTArray whose first element is a tag string).
-	# 
-	# Params:
-	# src: Str — MindScript source
-	# 
-	# Returns:
-	# [] — a runtime-S AST
-	# • On lex/parse error this returns an annotated-null runtime-S:
-	# ["annot", ["str", <message>], ["null"]]
-	# 
-	# Notes:
-	# • The encoding is stable and round-trippable with astEval / reify.
-	astParse: <fun: src:Str -> [Any]>,
-	# Decode a standard Base64 string.
-	# 
-	# Params:
-	# s: Str — standard Base64 with '=' padding
-	# 
-	# Returns:
-	# Str? — decoded bytes as Str, or null (annotated) on invalid input.
-	# Decode a standard Base64 string.
-	# 
-	# Params:
-	# s: Str — standard Base64 with '=' padding
-	# 
-	# Returns:
-	# Str? — decoded bytes as Str, or null (annotated) on invalid input.
-	base64Decode: <fun: s:Str -> Str?>,
-	# Base64-encode bytes from a string.
-	# 
-	# Params:
-	# x: Str — input bytes (string may contain arbitrary bytes)
-	# 
-	# Returns:
-	# Str — standard Base64 with '=' padding (RFC 4648).
-	# Base64-encode bytes from a string.
-	# 
-	# Params:
-	# x: Str — input bytes (string may contain arbitrary bytes)
-	# 
-	# Returns:
-	# Str — standard Base64 with '=' padding (RFC 4648).
-	base64Encode: <fun: x:Str -> Str>,
-	# Inspect visible variable bindings as a map.
-	# 
-	# Returns a map of variable names to values from the current environment. When
-	# localOnly is true, only the current frame's bindings are returned. Otherwise a
-	# merged view of all visible frames is returned, where inner frames shadow outer
-	# frames.
-	# 
-	# Ordering:
-	# • Within each frame, keys are sorted ascending.
-	# • Frames are processed inner-to-outer; the first-seen binding for a name wins.
-	# 
-	# Params:
-	# localOnly: Bool? — if true, include only the current frame; if false/null, include all visible frames
-	# 
-	# Returns:
-	# {} — object map of name → value (shallow copy). Order is stable and suitable for iteration.
-	# 
-	# Notes:
-	# • This is read-only: mutating the returned map does not change the environment.
-	# • Useful for testing (detecting state leaks), debugging, and introspection.
-	# 
-	# Inspect visible variable bindings as a map.
-	# 
-	# Returns a map of variable names to values from the current environment. When
-	# localOnly is true, only the current frame's bindings are returned. Otherwise a
-	# merged view of all visible frames is returned, where inner frames shadow outer
-	# frames.
-	# 
-	# Ordering:
-	# • Within each frame, keys are sorted ascending.
-	# • Frames are processed inner-to-outer; the first-seen binding for a name wins.
-	# 
-	# Params:
-	# localOnly: Bool? — if true, include only the current frame; if false/null, include all visible frames
-	# 
-	# Returns:
-	# {} — object map of name → value (shallow copy). Order is stable and suitable for iteration.
-	# 
-	# Notes:
-	# • This is read-only: mutating the returned map does not change the environment.
-	# • Useful for testing (detecting state leaks), debugging, and introspection.
-	# 
-	bindings: <fun: localOnly:Bool? -> {
-}>,
-	# Convert to Bool using common "truthiness" rules.
-	# 
-	# Falsey:
-	# • null
-	# • 0, 0.0
-	# • "" (empty string)
-	# • [] (empty array)
-	# • {} (empty map)
-	# 
-	# Truthy:
-	# • everything else (including functions, modules, handles, types)
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Bool
-	# Convert to Bool using common "truthiness" rules.
-	# 
-	# Falsey:
-	# • null
-	# • 0, 0.0
-	# • "" (empty string)
-	# • [] (empty array)
-	# • {} (empty map)
-	# 
-	# Truthy:
-	# • everything else (including functions, modules, handles, types)
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Bool
-	bool: <fun: x:Any -> Bool>,
-	# Close a channel (idempotent).
-	# Close a channel (idempotent).
-	chanClose: <fun: c:Any -> Null>,
-	# Create a new channel (buffered when cap>0).
-	# Create a new channel (buffered when cap>0).
-	chanOpen: <fun: cap:Int? -> Any>,
-	# Receive a value from a channel (blocking).
-	# Receive a value from a channel (blocking).
-	chanRecv: <fun: c:Any -> Any>,
-	# Send a value on a channel (blocking).
-	# Send a value on a channel (blocking).
-	chanSend: <fun: c:Any -> x:Any -> Null>,
-	# Attempt a non-blocking receive from a channel.
-	# Attempt a non-blocking receive from a channel.
-	chanTryRecv: <fun: c:Any -> {
-}>,
-	# Attempt a non-blocking send on a channel.
-	# Attempt a non-blocking send on a channel.
-	chanTrySend: <fun: c:Any -> x:Any -> Bool>,
-	# Change the current working directory.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error)
-	# Change the current working directory.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error)
-	chdir: <fun: path:Str -> Bool>,
-	# Clone a value (deep-copy).
-	# 
-	# For maps, preserves key order and per-key annotations. Primitive values are
-	# returned as-is. Functions, modules, and handles are not duplicated (identity
-	# is preserved).
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Any — a structurally independent copy for arrays/maps
-	# Clone a value (deep-copy).
-	# 
-	# For maps, preserves key order and per-key annotations. Primitive values are
-	# returned as-is. Functions, modules, and handles are not duplicated (identity
-	# is preserved).
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Any — a structurally independent copy for arrays/maps
-	clone: <fun: x:Any -> Any>,
-	# Close a file, network connection, or listener handle.
-	# 
-	# Flushes buffered output (if any) before closing.
-	# Never closes STDIN/STDOUT/STDERR; they are only flushed.
-	# Returns annotated null on I/O failure; hard-errors on misuse.
-	# 
-	# Returns:
-	# Bool
-	# Close a file, network connection, or listener handle.
-	# 
-	# Flushes buffered output (if any) before closing.
-	# Never closes STDIN/STDOUT/STDERR; they are only flushed.
-	# Returns annotated null on I/O failure; hard-errors on misuse.
-	# 
-	# Returns:
-	# Bool
-	close: <fun: h:Any -> Bool>,
-	# Cosine of an angle in radians.
-	# 
-	# Params:
-	# x: Num — radians
-	# 
-	# Returns:
-	# Num
-	# Cosine of an angle in radians.
-	# 
-	# Params:
-	# x: Num — radians
-	# 
-	# Returns:
-	# Num
-	cos: <fun: x:Num -> Num>,
-	# Constant-time equality for byte strings.
-	# 
-	# Params:
-	# a: Str
-	# b: Str
-	# 
-	# Returns:
-	# Bool — true iff a and b are byte-for-byte equal
-	# 
-	# Notes:
-	# • Time is proportional to length; comparison avoids data-dependent early exits.
-	# • Use for verifying MACs, tokens, etc.
-	# Constant-time equality for byte strings.
-	# 
-	# Params:
-	# a: Str
-	# b: Str
-	# 
-	# Returns:
-	# Bool — true iff a and b are byte-for-byte equal
-	# 
-	# Notes:
-	# • Time is proportional to length; comparison avoids data-dependent early exits.
-	# • Use for verifying MACs, tokens, etc.
-	ctEqual: <fun: a:Str -> b:Str -> Bool>,
-	# Get the current working directory.
-	# 
-	# Returns:
-	# Str? (annotated null on error)
-	# Get the current working directory.
-	# 
-	# Returns:
-	# Str? (annotated null on error)
-	cwd: <fun: _:Null -> Str?>,
-	# Current local date/time components.
-	# 
-	# Fields:
-	# year, month(1–12), day(1–31),
-	# hour(0–23), minute(0–59), second(0–59),
-	# millisecond(0–999)
-	# 
-	# Returns:
-	# {Str: Any} — a map with the fields above
-	# Current local date/time components.
-	# 
-	# Fields:
-	# year, month(1–12), day(1–31),
-	# hour(0–23), minute(0–59), second(0–59),
-	# millisecond(0–999)
-	# 
-	# Returns:
-	# {Str: Any} — a map with the fields above
-	dateNow: <fun: _:Null -> {
-}>,
-	# List directory entries as an array of names.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# [Str], or null (annotated) on I/O error (e.g., permission denied).
-	# List directory entries as an array of names.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# [Str], or null (annotated) on I/O error (e.g., permission denied).
-	dirList: <fun: path:Str -> [Str]?>,
-	# Run an external program.
-	# 
-	# Executes a command synchronously and returns its exit status and captured output.
-	# Contract mistakes (types/shapes) are hard errors; spawn failures return an annotated null.
-	# 
-	# Params:
-	# cmd:  [Str]                     # argv vector; cmd[0] is the executable
-	# opts: {                         # optional
-	# cwd:   Str,                 # working directory
-	# env:   {},                  # map Str -> Str; overlaid on current environment
-	# stdin: Str                  # text passed to the process' stdin
-	# }?
-	# 
-	# Returns:
-	# {
-	# status!: Int,               # exit code (0 on success)
-	# stdout!: Str,               # captured stdout (text)
-	# stderr!: Str                # captured stderr (text)
-	# }?                             # annotated null on spawn error (e.g., executable not found)
-	# 
-	# Notes:
-	# • Non-zero exit codes are NOT errors; they return a result with status>0.
-	# • To stream large I/O or interact incrementally, prefer adding higher-level process APIs later.
-	# Run an external program.
-	# 
-	# Executes a command synchronously and returns its exit status and captured output.
-	# Contract mistakes (types/shapes) are hard errors; spawn failures return an annotated null.
-	# 
-	# Params:
-	# cmd:  [Str]                     # argv vector; cmd[0] is the executable
-	# opts: {                         # optional
-	# cwd:   Str,                 # working directory
-	# env:   {},                  # map Str -> Str; overlaid on current environment
-	# stdin: Str                  # text passed to the process' stdin
-	# }?
-	# 
-	# Returns:
-	# {
-	# status!: Int,               # exit code (0 on success)
-	# stdout!: Str,               # captured stdout (text)
-	# stderr!: Str                # captured stderr (text)
-	# }?                             # annotated null on spawn error (e.g., executable not found)
-	# 
-	# Notes:
-	# • Non-zero exit codes are NOT errors; they return a result with status>0.
-	# • To stream large I/O or interact incrementally, prefer adding higher-level process APIs later.
-	exec: <fun: cmd:[Str] -> opts:{
-	cwd: Str,
-	env: {
-	},
-	stdin: Str
-}? -> {
-	status!: Int,
-	stderr!: Str,
-	stdout!: Str
-}?>,
-	# Terminate the current process with an optional status code.
-	# 
-	# By convention, 0 indicates success; non-zero indicates an error.
-	# 
-	# Params:
-	# code: Int? — exit status (default 0)
-	# 
-	# Returns:
-	# Null (never returns; process exits)
-	# Terminate the current process with an optional status code.
-	# 
-	# By convention, 0 indicates success; non-zero indicates an error.
-	# 
-	# Params:
-	# code: Int? — exit status (default 0)
-	# 
-	# Returns:
-	# Null (never returns; process exits)
-	exit: <fun: code:Int? -> Null>,
-	# Exponential function e^x.
-	# 
-	# Params:
-	# x: Num
-	# 
-	# Returns:
-	# Num
-	# Exponential function e^x.
-	# 
-	# Params:
-	# x: Num
-	# 
-	# Returns:
-	# Num
-	exp: <fun: x:Num -> Num>,
-	# Fail: throw a runtime error (hard fault).
-	# 
-	# Params:
-	# message: Str? — optional message (default "error")
-	# 
-	# Returns:
-	# Null (never returns)
-	# Fail: throw a runtime error (hard fault).
-	# 
-	# Params:
-	# message: Str? — optional message (default "error")
-	# 
-	# Returns:
-	# Null (never returns)
-	fail: <fun: message:Str? -> Null>,
+	astEval:
+		# Evaluate a runtime-S AST in the caller's scope.
+		# 
+		# Validates and evaluates a packed AST (the ["tag", …] encoding) in the
+		# *current* environment.
+		# 
+		# Params:
+		# ast: [] — runtime-S AST (see astParse)
+		# 
+		# Returns:
+		# Any — the evaluation result
+		# 
+		# Notes:
+		# • Effects (let/assignment) occur in the caller's scope.
+		# • Malformed AST or runtime failures are hard errors; wrap with try(...) to capture.
+		<fun: ast:[Any] -> Any>,
+	astParse:
+		# Parse source code into runtime-S (VTArray).
+		# 
+		# Parses a MindScript source string and returns its AST encoded as a runtime
+		# S-expression (a VTArray whose first element is a tag string).
+		# 
+		# Params:
+		# src: Str — MindScript source
+		# 
+		# Returns:
+		# [] — a runtime-S AST
+		# • On lex/parse error this returns an annotated-null runtime-S:
+		# ["annot", ["str", <message>], ["null"]]
+		# 
+		# Notes:
+		# • The encoding is stable and round-trippable with astEval / reify.
+		<fun: src:Str -> [Any]>,
+	base64Decode:
+		# Decode a standard Base64 string.
+		# 
+		# Params:
+		# s: Str — standard Base64 with '=' padding
+		# 
+		# Returns:
+		# Str? — decoded bytes as Str, or null (annotated) on invalid input.
+		<fun: s:Str -> Str?>,
+	base64Encode:
+		# Base64-encode bytes from a string.
+		# 
+		# Params:
+		# x: Str — input bytes (string may contain arbitrary bytes)
+		# 
+		# Returns:
+		# Str — standard Base64 with '=' padding (RFC 4648).
+		<fun: x:Str -> Str>,
+	bindings:
+		# Inspect visible variable bindings as a map.
+		# 
+		# Returns a map of variable names to values from the current environment. When
+		# localOnly is true, only the current frame's bindings are returned. Otherwise a
+		# merged view of all visible frames is returned, where inner frames shadow outer
+		# frames.
+		# 
+		# Ordering:
+		# • Within each frame, keys are sorted ascending.
+		# • Frames are processed inner-to-outer; the first-seen binding for a name wins.
+		# 
+		# Params:
+		# localOnly: Bool? — if true, include only the current frame; if false/null, include all visible frames
+		# 
+		# Returns:
+		# {} — object map of name → value (shallow copy). Order is stable and suitable for iteration.
+		# 
+		# Notes:
+		# • This is read-only: mutating the returned map does not change the environment.
+		# • Useful for testing (detecting state leaks), debugging, and introspection.
+		# 
+		<fun: localOnly:Bool? -> {}>,
+	bool:
+		# Convert to Bool using common "truthiness" rules.
+		# 
+		# Falsey:
+		# • null
+		# • 0, 0.0
+		# • "" (empty string)
+		# • [] (empty array)
+		# • {} (empty map)
+		# 
+		# Truthy:
+		# • everything else (including functions, modules, handles, types)
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Bool
+		<fun: x:Any -> Bool>,
+	chanClose:
+		# Close a channel (idempotent).
+		<fun: c:Any -> Null>,
+	chanOpen:
+		# Create a new channel (buffered when cap>0).
+		<fun: cap:Int? -> Any>,
+	chanRecv:
+		# Receive a value from a channel (blocking).
+		<fun: c:Any -> Any>,
+	chanSend:
+		# Send a value on a channel (blocking).
+		<fun: c:Any -> x:Any -> Null>,
+	chanTryRecv:
+		# Attempt a non-blocking receive from a channel.
+		<fun: c:Any -> {}>,
+	chanTrySend:
+		# Attempt a non-blocking send on a channel.
+		<fun: c:Any -> x:Any -> Bool>,
+	chdir:
+		# Change the current working directory.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Bool (annotated null on error)
+		<fun: path:Str -> Bool>,
+	clone:
+		# Clone a value (deep-copy).
+		# 
+		# For maps, preserves key order and per-key annotations. Primitive values are
+		# returned as-is. Functions, modules, and handles are not duplicated (identity
+		# is preserved).
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Any — a structurally independent copy for arrays/maps
+		<fun: x:Any -> Any>,
+	close:
+		# Close a file, network connection, or listener handle.
+		# 
+		# Flushes buffered output (if any) before closing.
+		# Never closes STDIN/STDOUT/STDERR; they are only flushed.
+		# Returns annotated null on I/O failure; hard-errors on misuse.
+		# 
+		# Returns:
+		# Bool
+		<fun: h:Any -> Bool>,
+	cos:
+		# Cosine of an angle in radians.
+		# 
+		# Params:
+		# x: Num — radians
+		# 
+		# Returns:
+		# Num
+		<fun: x:Num -> Num>,
+	ctEqual:
+		# Constant-time equality for byte strings.
+		# 
+		# Params:
+		# a: Str
+		# b: Str
+		# 
+		# Returns:
+		# Bool — true iff a and b are byte-for-byte equal
+		# 
+		# Notes:
+		# • Time is proportional to length; comparison avoids data-dependent early exits.
+		# • Use for verifying MACs, tokens, etc.
+		<fun: a:Str -> b:Str -> Bool>,
+	cwd:
+		# Get the current working directory.
+		# 
+		# Returns:
+		# Str? (annotated null on error)
+		<fun: _:Null -> Str?>,
+	dateNow:
+		# Current local date/time components.
+		# 
+		# Fields:
+		# year, month(1–12), day(1–31),
+		# hour(0–23), minute(0–59), second(0–59),
+		# millisecond(0–999)
+		# 
+		# Returns:
+		# {Str: Any} — a map with the fields above
+		<fun: _:Null -> {}>,
+	dirList:
+		# List directory entries as an array of names.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# [Str], or null (annotated) on I/O error (e.g., permission denied).
+		<fun: path:Str -> [Str]?>,
+	exec:
+		# Run an external program.
+		# 
+		# Executes a command synchronously and returns its exit status and captured output.
+		# Contract mistakes (types/shapes) are hard errors; spawn failures return an annotated null.
+		# 
+		# Params:
+		# cmd:  [Str]                     # argv vector; cmd[0] is the executable
+		# opts: {                         # optional
+		# cwd:   Str,                 # working directory
+		# env:   {},                  # map Str -> Str; overlaid on current environment
+		# stdin: Str                  # text passed to the process' stdin
+		# }?
+		# 
+		# Returns:
+		# {
+		# status!: Int,               # exit code (0 on success)
+		# stdout!: Str,               # captured stdout (text)
+		# stderr!: Str                # captured stderr (text)
+		# }?                             # annotated null on spawn error (e.g., executable not found)
+		# 
+		# Notes:
+		# • Non-zero exit codes are NOT errors; they return a result with status>0.
+		# • To stream large I/O or interact incrementally, prefer adding higher-level process APIs later.
+		<fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> {
+			status!: Int,
+			stderr!: Str,
+			stdout!: Str
+		}?>,
+	exit:
+		# Terminate the current process with an optional status code.
+		# 
+		# By convention, 0 indicates success; non-zero indicates an error.
+		# 
+		# Params:
+		# code: Int? — exit status (default 0)
+		# 
+		# Returns:
+		# Null (never returns; process exits)
+		<fun: code:Int? -> Null>,
+	exp:
+		# Exponential function e^x.
+		# 
+		# Params:
+		# x: Num
+		# 
+		# Returns:
+		# Num
+		<fun: x:Num -> Num>,
+	fail:
+		# Fail: throw a runtime error (hard fault).
+		# 
+		# Params:
+		# message: Str? — optional message (default "error")
+		# 
+		# Returns:
+		# Null (never returns)
+		<fun: message:Str? -> Null>,
 	fh: <handle: file>,
-	# Flush buffered output for a handle.
-	# 
-	# Ensures written data is visible to readers/peers.
-	# Returns annotated null on I/O error.
-	# 
-	# Returns:
-	# Bool
-	# Flush buffered output for a handle.
-	# 
-	# Ensures written data is visible to readers/peers.
-	# Returns annotated null on I/O error.
-	# 
-	# Returns:
-	# Bool
-	flush: <fun: h:Any -> Bool>,
-	# Compress data using gzip (default level).
-	# 
-	# Params:
-	# data: Str — input bytes (may contain arbitrary bytes)
-	# 
-	# Returns:
-	# Str — gzip-compressed bytes
-	# 
-	# Notes:
-	# • Output is binary; treat as bytes stored in Str.
-	# • Compatible with standard gzip tools and RFC 1952.
-	# Compress data using gzip (default level).
-	# 
-	# Params:
-	# data: Str — input bytes (may contain arbitrary bytes)
-	# 
-	# Returns:
-	# Str — gzip-compressed bytes
-	# 
-	# Notes:
-	# • Output is binary; treat as bytes stored in Str.
-	# • Compatible with standard gzip tools and RFC 1952.
-	gzipCompress: <fun: data:Str -> Str>,
-	# Decompress a gzip payload.
-	# 
-	# Params:
-	# data: Str — gzip-compressed bytes
-	# 
-	# Returns:
-	# Str? — decompressed bytes, or null (annotated) on error
-	# 
-	# Notes:
-	# • Returns annotated null on invalid gzip headers, checksum mismatch, truncated input, etc.
-	# • Output is binary; treat as bytes stored in Str.
-	# Decompress a gzip payload.
-	# 
-	# Params:
-	# data: Str — gzip-compressed bytes
-	# 
-	# Returns:
-	# Str? — decompressed bytes, or null (annotated) on error
-	# 
-	# Notes:
-	# • Returns annotated null on invalid gzip headers, checksum mismatch, truncated input, etc.
-	# • Output is binary; treat as bytes stored in Str.
-	gzipDecompress: <fun: data:Str -> Str?>,
-	# Decode a hexadecimal string.
-	# 
-	# Params:
-	# s: Str — hex string (case-insensitive), even length
-	# 
-	# Returns:
-	# Str? — decoded bytes as Str, or null (annotated) on invalid input.
-	# Decode a hexadecimal string.
-	# 
-	# Params:
-	# s: Str — hex string (case-insensitive), even length
-	# 
-	# Returns:
-	# Str? — decoded bytes as Str, or null (annotated) on invalid input.
-	hexDecode: <fun: s:Str -> Str?>,
-	# Hex-encode bytes to a lowercase hexadecimal string.
-	# 
-	# Params:
-	# x: Str — input bytes
-	# 
-	# Returns:
-	# Str — lowercase hex (two chars per byte).
-	# Hex-encode bytes to a lowercase hexadecimal string.
-	# 
-	# Params:
-	# x: Str — input bytes
-	# 
-	# Returns:
-	# Str — lowercase hex (two chars per byte).
-	hexEncode: <fun: x:Str -> Str>,
-	# HMAC-SHA256 authentication tag (raw bytes).
-	# 
-	# Params:
-	# key: Str — secret key (raw bytes)
-	# msg: Str — message bytes
-	# 
-	# Returns:
-	# Str — 32-byte MAC (raw). Use hex/base64 to render as text.
-	# 
-	# Notes:
-	# • Suitable for signatures, request auth, etc.
-	# HMAC-SHA256 authentication tag (raw bytes).
-	# 
-	# Params:
-	# key: Str — secret key (raw bytes)
-	# msg: Str — message bytes
-	# 
-	# Returns:
-	# Str — 32-byte MAC (raw). Use hex/base64 to render as text.
-	# 
-	# Notes:
-	# • Suitable for signatures, request auth, etc.
-	hmacSha256: <fun: key:Str -> msg:Str -> Str>,
-	# Make an HTTP request (buffered).
-	# 
-	# Input:
-	# req: {
-	# url!:       Str
-	# method:     Str?         # default "GET"
-	# headers:    {}?
-	# body:       Str?         # text body
-	# bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
-	# timeoutMs:  Int?         # default 30000
-	# }
-	# 
-	# Output:
-	# {
-	# status!:     Int
-	# statusText:  Str
-	# headers!:    {Str: Str}   # multi-values joined by ", "
-	# body!:       Str           # full response body (text/binary-as-text)
-	# url:         Str           # final URL after redirects
-	# proto:       Str           # "HTTP/1.1", "HTTP/2.0"
-	# durationMs:  Int           # end-to-end (including body read)
-	# }?  # annotated null on network/IO error
-	# Make an HTTP request (buffered).
-	# 
-	# Input:
-	# req: {
-	# url!:       Str
-	# method:     Str?         # default "GET"
-	# headers:    {}?
-	# body:       Str?         # text body
-	# bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
-	# timeoutMs:  Int?         # default 30000
-	# }
-	# 
-	# Output:
-	# {
-	# status!:     Int
-	# statusText:  Str
-	# headers!:    {Str: Str}   # multi-values joined by ", "
-	# body!:       Str           # full response body (text/binary-as-text)
-	# url:         Str           # final URL after redirects
-	# proto:       Str           # "HTTP/1.1", "HTTP/2.0"
-	# durationMs:  Int           # end-to-end (including body read)
-	# }?  # annotated null on network/IO error
-	http: <fun: req:{
-	body: Str,
-	bodyH: Any,
-	headers: {
-	},
-	method: Str,
-	timeoutMs: Int,
-	url!: Str
-} -> {
-	body: Str,
-	bodyH: Any,
-	durationMs: Int,
-	headers!: {
-	},
-	proto: Str,
-	status!: Int,
-	statusText: Str,
-	url: Str
-}?>,
-	# Make an HTTP request (streaming).
-	# 
-	# Input:
-	# req: {
-	# url!:       Str
-	# method:     Str?         # default "GET"
-	# headers:    {}?
-	# body:       Str?         # text body
-	# bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
-	# timeoutMs:  Int?         # default 30000
-	# }
-	# 
-	# Output:
-	# {
-	# status!:     Int
-	# statusText:  Str
-	# headers!:    {Str: Str}
-	# bodyH!:      Any          # readable handle (Kind "net"); use readN/readAll/close
-	# url:         Str
-	# proto:       Str
-	# durationMs:  Int          # time until headers (body not read)
-	# }?  # annotated null on network/IO error
-	# 
-	# Notes:
-	# • The returned bodyH is *read-only*. Writing to it will fail.
-	# • Use close(bodyH) when done to release the connection early.
-	# Make an HTTP request (streaming).
-	# 
-	# Input:
-	# req: {
-	# url!:       Str
-	# method:     Str?         # default "GET"
-	# headers:    {}?
-	# body:       Str?         # text body
-	# bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
-	# timeoutMs:  Int?         # default 30000
-	# }
-	# 
-	# Output:
-	# {
-	# status!:     Int
-	# statusText:  Str
-	# headers!:    {Str: Str}
-	# bodyH!:      Any          # readable handle (Kind "net"); use readN/readAll/close
-	# url:         Str
-	# proto:       Str
-	# durationMs:  Int          # time until headers (body not read)
-	# }?  # annotated null on network/IO error
-	# 
-	# Notes:
-	# • The returned bodyH is *read-only*. Writing to it will fail.
-	# • Use close(bodyH) when done to release the connection early.
-	httpStream: <fun: req:{
-	body: Str,
-	bodyH: Any,
-	headers: {
-	},
-	method: Str,
-	timeoutMs: Int,
-	url!: Str
-} -> {
-	body: Str,
-	bodyH: Any,
-	durationMs: Int,
-	headers!: {
-	},
-	proto: Str,
-	status!: Int,
-	statusText: Str,
-	url: Str
-}?>,
-	# Load a module from filesystem or HTTP(S).
-	# 
-	# Resolution rules:
-	# - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
-	# - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
-	# 
-	# Params:
-	# path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
-	# 
-	# Returns:
-	# Module (nullable) — the loaded module value; or null with an error annotation on soft failures.
-	# Load a module from filesystem or HTTP(S).
-	# 
-	# Resolution rules:
-	# - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
-	# - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
-	# 
-	# Params:
-	# path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
-	# 
-	# Returns:
-	# Module (nullable) — the loaded module value; or null with an error annotation on soft failures.
-	import: <fun: path:Str -> Any>,
-	# Evaluate source text as a module in memory.
-	# 
-	# Parses 'src' and evaluates it as a module named 'name' (no caching).
-	# The module's environment is fresh and parented to Core.
-	# The synthetic identity "mem:<name>" is used for cycle detection.
-	# 
-	# Params:
-	# name: Str — display name for diagnostics and identity ("mem:<name>").
-	# src:  Str — MindScript source code.
-	# 
-	# Returns:
-	# Module (nullable) — the created module value; or null with an error annotation if the
-	# user code intentionally returns a soft failure.
-	# Evaluate source text as a module in memory.
-	# 
-	# Parses 'src' and evaluates it as a module named 'name' (no caching).
-	# The module's environment is fresh and parented to Core.
-	# The synthetic identity "mem:<name>" is used for cycle detection.
-	# 
-	# Params:
-	# name: Str — display name for diagnostics and identity ("mem:<name>").
-	# src:  Str — MindScript source code.
-	# 
-	# Returns:
-	# Module (nullable) — the created module value; or null with an error annotation if the
-	# user code intentionally returns a soft failure.
-	importCode: <fun: name:Str -> src:Str -> Any>,
-	# Convert to Int when possible; otherwise return null.
-	# 
-	# Rules:
-	# • Int → Int
-	# • Num → truncated toward zero
-	# • Bool → 1/0
-	# • Str → parsed base-10 integer, or null on failure
-	# • Others → null
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Int?
-	# Convert to Int when possible; otherwise return null.
-	# 
-	# Rules:
-	# • Int → Int
-	# • Num → truncated toward zero
-	# • Bool → 1/0
-	# • Str → parsed base-10 integer, or null on failure
-	# • Others → null
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Int?
-	int: <fun: x:Any -> Int?>,
-	# Structural subtype test: A <: B.
-	# 
-	# Function types are compared structurally:
-	# - Parameters are contravariant
-	# - Return types are covariant
-	# - Arrows associate to the right (A -> B -> C == A -> (B -> C))
-	# 
-	# Params:
-	# A: Type — candidate subtype
-	# B: Type — candidate supertype
-	# 
-	# Returns: Bool
-	# Structural subtype test: A <: B.
-	# 
-	# Function types are compared structurally:
-	# - Parameters are contravariant
-	# - Return types are covariant
-	# - Arrows associate to the right (A -> B -> C == A -> (B -> C))
-	# 
-	# Params:
-	# A: Type — candidate subtype
-	# B: Type — candidate supertype
-	# 
-	# Returns: Bool
-	isSubtype: <fun: A:Type -> B:Type -> Bool>,
-	# Check whether a value conforms to a Type.
-	# 
-	# Params:
-	# x: Any   — value to check
-	# T: Type  — type to check against (must be a Type value, e.g. type Int)
-	# 
-	# Returns: Bool
-	# Check whether a value conforms to a Type.
-	# 
-	# Params:
-	# x: Any   — value to check
-	# T: Type  — type to check against (must be a Type value, e.g. type Int)
-	# 
-	# Returns: Bool
-	isType: <fun: x:Any -> T:Type -> Bool>,
-	# Join strings with a separator.
-	# 
-	# Params:
-	# xs: [Str] — pieces to join
-	# sep: Str  — separator
-	# 
-	# Returns:
-	# Str
-	# Join strings with a separator.
-	# 
-	# Params:
-	# xs: [Str] — pieces to join
-	# sep: Str  — separator
-	# 
-	# Returns:
-	# Str
-	join: <fun: xs:[Str] -> sep:Str -> Str>,
-	# Parse a JSON string into MindScript values.
-	# 
-	# Mapping rules:
-	# • null/bool/number/string map to Null/Bool/Int|Num/Str
-	# • arrays map to [Any]
-	# • objects map to {Str: Any}
-	# • integral JSON numbers become Int; other numbers become Num
-	# 
-	# Params:
-	# s: Str — JSON text
-	# 
-	# Returns:
-	# Any
-	# Parse a JSON string into MindScript values.
-	# 
-	# Mapping rules:
-	# • null/bool/number/string map to Null/Bool/Int|Num/Str
-	# • arrays map to [Any]
-	# • objects map to {Str: Any}
-	# • integral JSON numbers become Int; other numbers become Num
-	# 
-	# Params:
-	# s: Str — JSON text
-	# 
-	# Returns:
-	# Any
-	jsonParse: <fun: s:Str -> Any>,
-	# Parse a JSON Schema string and convert it to a MindScript Type.
-	# 
-	# Params:
-	# src: Str — JSON text
-	# 
-	# Returns:
-	# Type
-	# Parse a JSON Schema string and convert it to a MindScript Type.
-	# 
-	# Params:
-	# src: Str — JSON text
-	# 
-	# Returns:
-	# Type
-	jsonSchemaStringToType: <fun: src:Str -> Type>,
-	# Convert a JSON Schema object to a MindScript Type.
-	# 
-	# Notes:
-	# • Same-document $ref and common keywords are handled.
-	# • Unsupported constructs widen to Any.
-	# • "$defs"/"definitions" are imported into the current scope as type aliases.
-	# 
-	# Params:
-	# schema: Any — JSON object (e.g., from jsonParse)
-	# 
-	# Returns:
-	# Type
-	# Convert a JSON Schema object to a MindScript Type.
-	# 
-	# Notes:
-	# • Same-document $ref and common keywords are handled.
-	# • Unsupported constructs widen to Any.
-	# • "$defs"/"definitions" are imported into the current scope as type aliases.
-	# 
-	# Params:
-	# schema: Any — JSON object (e.g., from jsonParse)
-	# 
-	# Returns:
-	# Type
-	jsonSchemaToType: <fun: schema:Any -> Type>,
-	# Serialize a value to a compact JSON string.
-	# 
-	# Arrays and maps are emitted as JSON arrays/objects. Object key order is not
-	# guaranteed.
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Str
-	# Serialize a value to a compact JSON string.
-	# 
-	# Arrays and maps are emitted as JSON arrays/objects. Object key order is not
-	# guaranteed.
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Str
-	jsonStringify: <fun: x:Any -> Str>,
-	# Length of a value.
-	# 
-	# Rules:
-	# • [a, b, c] → 3
-	# • {k: v, ...} → number of keys (in insertion order)
-	# • "…unicode…" → rune count
-	# • Others → null
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Int?
-	# Length of a value.
-	# 
-	# Rules:
-	# • [a, b, c] → 3
-	# • {k: v, ...} → number of keys (in insertion order)
-	# • "…unicode…" → rune count
-	# • Others → null
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Int?
-	len: <fun: x:Any -> Int?>,
-	# Natural logarithm (base e).
-	# 
-	# Params:
-	# x: Num — positive
-	# 
-	# Returns:
-	# Num
-	# Natural logarithm (base e).
-	# 
-	# Params:
-	# x: Num — positive
-	# 
-	# Returns:
-	# Num
-	log: <fun: x:Num -> Num>,
-	# Remove leading whitespace (Unicode).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	# Remove leading whitespace (Unicode).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	lstrip: <fun: s:Str -> Str>,
-	# Delete a property from a map (in place).
-	# 
-	# Preserves the key order and per-key annotations for the remaining entries.
-	# 
-	# Params:
-	# obj: {}  — a map value (mutated)
-	# key: Str — property name to remove
-	# 
-	# Returns:
-	# {} — the same map value
-	# Delete a property from a map (in place).
-	# 
-	# Preserves the key order and per-key annotations for the remaining entries.
-	# 
-	# Params:
-	# obj: {}  — a map value (mutated)
-	# key: Str — property name to remove
-	# 
-	# Returns:
-	# {} — the same map value
-	mapDelete: <fun: obj:{
-} -> key:Str -> {
-}>,
-	# Return true if a key exists in a map.
-	# 
-	# Params:
-	# obj: {}  — a map value
-	# key: Str — property name
-	# 
-	# Returns:
-	# Bool
-	# Return true if a key exists in a map.
-	# 
-	# Params:
-	# obj: {}  — a map value
-	# key: Str — property name
-	# 
-	# Returns:
-	# Bool
-	mapHas: <fun: obj:{
-} -> key:Str -> Bool>,
-	# Find all non-overlapping matches of a regex.
-	# 
-	# Params:
-	# pattern: Str — RE2-compatible regular expression
-	# string:  Str — input
-	# 
-	# Returns:
-	# [Str] — matched substrings (no capture groups)
-	# Find all non-overlapping matches of a regex.
-	# 
-	# Params:
-	# pattern: Str — RE2-compatible regular expression
-	# string:  Str — input
-	# 
-	# Returns:
-	# [Str] — matched substrings (no capture groups)
-	match: <fun: pattern:Str -> string:Str -> [Str]>,
-	# Create a directory (creating parents as needed).
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error)
-	# Create a directory (creating parents as needed).
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error)
-	mkdir: <fun: path:Str -> Bool>,
-	# Accept one TCP connection from a listener.
-	# 
-	# Blocks until a client connects. Returns a network handle,
-	# or null (annotated) on accept error.
-	# Accept one TCP connection from a listener.
-	# 
-	# Blocks until a client connects. Returns a network handle,
-	# or null (annotated) on accept error.
-	netAccept: <fun: l:Any -> Any>,
-	# Open a TCP connection to "host:port".
-	# 
-	# Returns a network handle usable with read*/write/flush/close,
-	# or null (annotated) on network error.
-	# Open a TCP connection to "host:port".
-	# 
-	# Returns a network handle usable with read*/write/flush/close,
-	# or null (annotated) on network error.
-	netConnect: <fun: addr:Str -> Any>,
-	# Listen on a TCP address "host:port".
-	# 
-	# Returns a listener handle for netAccept. Use close(listener) to stop listening.
-	# Returns null (annotated) on bind/listen error.
-	# Listen on a TCP address "host:port".
-	# 
-	# Returns a listener handle for netAccept. Use close(listener) to stop listening.
-	# Returns null (annotated) on bind/listen error.
-	netListen: <fun: addr:Str -> Any>,
-	# Get the annotation attached to a value, if any.
-	# 
-	# Params:
-	# x: Any — any runtime value
-	# 
-	# Returns:
-	# Str? — the annotation string, or null if not present
-	# 
-	# Notes:
-	# • See also: noteSet(text, value) to attach annotations programmatically.
-	# Get the annotation attached to a value, if any.
-	# 
-	# Params:
-	# x: Any — any runtime value
-	# 
-	# Returns:
-	# Str? — the annotation string, or null if not present
-	# 
-	# Notes:
-	# • See also: noteSet(text, value) to attach annotations programmatically.
-	noteGet: <fun: x:Any -> Str?>,
-	# Attach or replace an annotation on a value.
-	# 
-	# Params:
-	# text: Str  — annotation text to attach
-	# value: Any — value to annotate
-	# 
-	# Returns:
-	# Any — the same value with its annotation set to text
-	# 
-	# Notes:
-	# • This does not deep-copy arrays/maps; underlying data is shared.
-	# • Annotations never affect equality but are rendered by printers.
-	# Attach or replace an annotation on a value.
-	# 
-	# Params:
-	# text: Str  — annotation text to attach
-	# value: Any — value to annotate
-	# 
-	# Returns:
-	# Any — the same value with its annotation set to text
-	# 
-	# Notes:
-	# • This does not deep-copy arrays/maps; underlying data is shared.
-	# • Annotations never affect equality but are rendered by printers.
-	noteSet: <fun: text:Str -> value:Any -> Any>,
-	# Current wall-clock time in milliseconds since the Unix epoch.
-	# 
-	# Returns:
-	# Int
-	# Current wall-clock time in milliseconds since the Unix epoch.
-	# 
-	# Returns:
-	# Int
-	nowMillis: <fun: _:Null -> Int>,
-	# Current wall-clock time in nanoseconds since the Unix epoch.
-	# 
-	# Returns:
-	# Int
-	# Current wall-clock time in nanoseconds since the Unix epoch.
-	# 
-	# Returns:
-	# Int
-	nowNanos: <fun: _:Null -> Int>,
-	# Convert to Num when possible; otherwise return null.
-	# 
-	# Rules:
-	# • Num → Num
-	# • Int → floating-point value
-	# • Bool → 1.0/0.0
-	# • Str → parsed as float64, or null on failure
-	# • Others → null
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Num?
-	# Convert to Num when possible; otherwise return null.
-	# 
-	# Rules:
-	# • Num → Num
-	# • Int → floating-point value
-	# • Bool → 1.0/0.0
-	# • Str → parsed as float64, or null on failure
-	# • Others → null
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Num?
-	num: <fun: x:Any -> Num?>,
-	# Open a file and return a handle.
-	# 
-	# Modes:
-	# "r"  — read-only
-	# "w"  — write (truncate or create)
-	# "a"  — append (create if needed)
-	# "rw" — read/write (create if needed)
-	# 
-	# Params:
-	# path: Str
-	# mode: Str ("r" | "w" | "a" | "rw")
-	# 
-	# Returns:
-	# file handle usable with read*/write/flush/close,
-	# or null (annotated) on I/O failure.
-	# Open a file and return a handle.
-	# 
-	# Modes:
-	# "r"  — read-only
-	# "w"  — write (truncate or create)
-	# "a"  — append (create if needed)
-	# "rw" — read/write (create if needed)
-	# 
-	# Params:
-	# path: Str
-	# mode: Str ("r" | "w" | "a" | "rw")
-	# 
-	# Returns:
-	# file handle usable with read*/write/flush/close,
-	# or null (annotated) on I/O failure.
-	open: <fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Any>,
-	# Read an environment variable.
-	# 
-	# Params:
-	# name: Str
-	# Returns:
-	# Str? (null if unset)
-	# Read an environment variable.
-	# 
-	# Params:
-	# name: Str
-	# Returns:
-	# Str? (null if unset)
-	osEnv: <fun: name:Str -> Str?>,
-	# Set or unset an environment variable.
-	# 
-	# If value is null (or omitted), the variable is unset.
-	# 
-	# Params:
-	# name:  Str
-	# value: Str?  # null → unset
-	# 
-	# Returns:
-	# Bool (annotated null on OS error)
-	# Set or unset an environment variable.
-	# 
-	# If value is null (or omitted), the variable is unset.
-	# 
-	# Params:
-	# name:  Str
-	# value: Str?  # null → unset
-	# 
-	# Returns:
-	# Bool (annotated null on OS error)
-	osSetEnv: <fun: name:Str -> value:Str? -> Bool>,
-	# Return the last element of a path (OS-specific).
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — base name
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Base semantics ("" → ".", strips trailing separators).
-	# Return the last element of a path (OS-specific).
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — base name
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Base semantics ("" → ".", strips trailing separators).
-	pathBase: <fun: path:Str -> Str>,
-	# Clean a path by applying lexical simplifications.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — cleaned path
-	# 
-	# Notes:
-	# • Removes redundant separators and up-levels like "." and ".." where possible.
-	# • Mirrors Go's filepath.Clean semantics; no I/O performed.
-	# • Cross-platform behavior handled by filepath.
-	# Clean a path by applying lexical simplifications.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — cleaned path
-	# 
-	# Notes:
-	# • Removes redundant separators and up-levels like "." and ".." where possible.
-	# • Mirrors Go's filepath.Clean semantics; no I/O performed.
-	# • Cross-platform behavior handled by filepath.
-	pathClean: <fun: path:Str -> Str>,
-	# Return all but the last element of a path.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — directory component
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Dir semantics ("" → ".", root stays root).
-	# Return all but the last element of a path.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — directory component
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Dir semantics ("" → ".", root stays root).
-	pathDir: <fun: path:Str -> Str>,
-	# Return the file extension (including the leading dot), or "" if none.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — extension
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Ext semantics (".bashrc" → ".bashrc", "archive.tar.gz" → ".gz").
-	# Return the file extension (including the leading dot), or "" if none.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str — extension
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Ext semantics (".bashrc" → ".bashrc", "archive.tar.gz" → ".gz").
-	pathExt: <fun: path:Str -> Str>,
-	# Join path elements using the OS-specific separator.
-	# 
-	# Params:
-	# parts: [Str] — path fragments
-	# 
-	# Returns:
-	# Str — joined path
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Join semantics (cleans the result, removes empty segments).
-	# • Works cross-platform (Windows/POSIX).
-	# Join path elements using the OS-specific separator.
-	# 
-	# Params:
-	# parts: [Str] — path fragments
-	# 
-	# Returns:
-	# Str — joined path
-	# 
-	# Notes:
-	# • Mirrors Go's filepath.Join semantics (cleans the result, removes empty segments).
-	# • Works cross-platform (Windows/POSIX).
-	pathJoin: <fun: parts:[Str] -> Str>,
-	# Power: base^exp.
-	# 
-	# Params:
-	# base: Num
-	# exp:  Num
-	# 
-	# Returns:
-	# Num
-	# Power: base^exp.
-	# 
-	# Params:
-	# base: Num
-	# exp:  Num
-	# 
-	# Returns:
-	# Num
-	pow: <fun: base:Num -> exp:Num -> Num>,
-	# Print a formatted string to standard output.
-	# 
-	# Convenience over sprintf + stdout. Caller controls newlines:
-	# printf("%s = %v\n", ["x", 42])
-	# 
-	# Params:
-	# fmt:  Str
-	# args: [Any]
-	# 
-	# Returns:
-	# Str? — the printed string, or null (annotated) on write error.
-	# Print a formatted string to standard output.
-	# 
-	# Convenience over sprintf + stdout. Caller controls newlines:
-	# printf("%s = %v\n", ["x", 42])
-	# 
-	# Params:
-	# fmt:  Str
-	# args: [Any]
-	# 
-	# Returns:
-	# Str? — the printed string, or null (annotated) on write error.
-	printf: <fun: fmt:Str -> args:[Any] -> Str?>,
-	# Request cooperative cancellation of a process (best effort).
-	# Request cooperative cancellation of a process (best effort).
-	procCancel: <fun: p:Any -> Null>,
-	# Wait for a process to finish and return its result.
-	# Wait for a process to finish and return its result.
-	procJoin: <fun: p:Any -> Any>,
-	# Wait for all processes to finish and return their results in order.
-	# Wait for all processes to finish and return their results in order.
-	procJoinAll: <fun: ps:[Any] -> [Any]>,
-	# Wait for any process to finish; return its index and value.
-	# Wait for any process to finish; return its index and value.
-	procJoinAny: <fun: ps:[Any] -> {
-}>,
-	# Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
-	# Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
-	procSpawn: <fun: f:Any -> Any>,
-	# Uniform cryptographically secure random bytes.
-	# 
-	# Params:
-	# n: Int — number of bytes (>= 0)
-	# 
-	# Returns:
-	# Str? — raw bytes; annotated null on OS RNG failure
-	# 
-	# Notes:
-	# • Returns raw bytes in Str (may contain non-UTF-8).
-	# • Use hex/base64 helpers in userland to render textually.
-	# Uniform cryptographically secure random bytes.
-	# 
-	# Params:
-	# n: Int — number of bytes (>= 0)
-	# 
-	# Returns:
-	# Str? — raw bytes; annotated null on OS RNG failure
-	# 
-	# Notes:
-	# • Returns raw bytes in Str (may contain non-UTF-8).
-	# • Use hex/base64 helpers in userland to render textually.
-	randBytes: <fun: n:Int -> Str?>,
-	# Uniform random number in [0.0, 1.0).
-	# 
-	# Params:
-	# _: Null
-	# 
-	# Returns:
-	# Num
-	# Uniform random number in [0.0, 1.0).
-	# 
-	# Params:
-	# _: Null
-	# 
-	# Returns:
-	# Num
-	randFloat: <fun: _:Null -> Num>,
-	# Uniform random integer in [0, n).
-	# 
-	# Params:
-	# n: Int — upper bound (must be > 0)
-	# 
-	# Returns:
-	# Int
-	# Uniform random integer in [0, n).
-	# 
-	# Params:
-	# n: Int — upper bound (must be > 0)
-	# 
-	# Returns:
-	# Int
-	randInt: <fun: n:Int -> Int>,
-	# Read all remaining bytes from a handle.
-	# 
-	# Blocks until EOF and returns the data as Str.
-	# Returns null (annotated) on I/O error.
-	# Read all remaining bytes from a handle.
-	# 
-	# Blocks until EOF and returns the data as Str.
-	# Returns null (annotated) on I/O error.
-	readAll: <fun: h:Any -> Str?>,
-	# Read an entire file into a string.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str, or null (annotated) on I/O error.
-	# Read an entire file into a string.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Str, or null (annotated) on I/O error.
-	readFile: <fun: path:Str -> Str?>,
-	# Read one line from a handle (without the trailing newline).
-	# 
-	# Returns null at EOF. Returns null (annotated) on I/O error.
-	# Read one line from a handle (without the trailing newline).
-	# 
-	# Returns null at EOF. Returns null (annotated) on I/O error.
-	readLine: <fun: h:Any -> Str?>,
-	# Read up to n bytes from a handle.
-	# 
-	# May return fewer than n bytes at EOF. Returns data as Str.
-	# Hard-error if n < 0. Returns null (annotated) on I/O error.
-	# Read up to n bytes from a handle.
-	# 
-	# May return fewer than n bytes at EOF. Returns data as Str.
-	# Hard-error if n < 0. Returns null (annotated) on I/O error.
-	readN: <fun: h:Any -> n:Int -> Str?>,
-	# Reflect a value into constructor code (runtime-S).
-	# 
-	# Returns a program AST (as runtime-S) that, when reified, reconstructs the
-	# given value as closely as possible.
-	# 
-	# Params:
-	# val: Any — value to reflect
-	# 
-	# Returns:
-	# [] — constructor code (runtime-S)
-	# • Scalars/arrays/maps → literal nodes
-	# • Types (VTType) → ["type", <typeAst>]
-	# • User/oracle functions → ["fun"/"oracle", params, type, body]
-	# • Native functions → ["id", nativeName] (resolved by host env)
-	# • Modules → ["module", ["str", name], ("pair", ["id", export], <ctor>)*]
-	# • Opaque handles/unknowns → annotated-null runtime-S (soft error)
-	# 
-	# Notes:
-	# • This is *constructor code*, not a snapshot; closures do not capture lexical env.
-	# Reflect a value into constructor code (runtime-S).
-	# 
-	# Returns a program AST (as runtime-S) that, when reified, reconstructs the
-	# given value as closely as possible.
-	# 
-	# Params:
-	# val: Any — value to reflect
-	# 
-	# Returns:
-	# [] — constructor code (runtime-S)
-	# • Scalars/arrays/maps → literal nodes
-	# • Types (VTType) → ["type", <typeAst>]
-	# • User/oracle functions → ["fun"/"oracle", params, type, body]
-	# • Native functions → ["id", nativeName] (resolved by host env)
-	# • Modules → ["module", ["str", name], ("pair", ["id", export], <ctor>)*]
-	# • Opaque handles/unknowns → annotated-null runtime-S (soft error)
-	# 
-	# Notes:
-	# • This is *constructor code*, not a snapshot; closures do not capture lexical env.
-	reflect: <fun: val:Any -> [Any]>,
-	# Decode and evaluate constructor code (runtime-S).
-	# 
-	# Validates a runtime-S program and evaluates it in the host (persistent/global)
-	# environment, equivalent to EvalPersistent.
-	# 
-	# Params:
-	# rt: [] — constructor code produced by reflect(...) or astParse(...)
-	# 
-	# Returns:
-	# Any — the constructed value
-	# 
-	# Hard errors:
-	# • Malformed runtime-S input
-	# • Module capsules (installer not provided here)
-	# • Handle constructs
-	# • Runtime evaluation failures (use try(...) to capture)
-	# Decode and evaluate constructor code (runtime-S).
-	# 
-	# Validates a runtime-S program and evaluates it in the host (persistent/global)
-	# environment, equivalent to EvalPersistent.
-	# 
-	# Params:
-	# rt: [] — constructor code produced by reflect(...) or astParse(...)
-	# 
-	# Returns:
-	# Any — the constructed value
-	# 
-	# Hard errors:
-	# • Malformed runtime-S input
-	# • Module capsules (installer not provided here)
-	# • Handle constructs
-	# • Runtime evaluation failures (use try(...) to capture)
-	reify: <fun: rt:[Any] -> Any>,
-	# Delete a file or an empty directory.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error). Note: fails for non-empty directories.
-	# Delete a file or an empty directory.
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error). Note: fails for non-empty directories.
-	remove: <fun: path:Str -> Bool>,
-	# Rename (move) a file or directory.
-	# 
-	# Params:
-	# old: Str
-	# new: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error)
-	# Rename (move) a file or directory.
-	# 
-	# Params:
-	# old: Str
-	# new: Str
-	# 
-	# Returns:
-	# Bool (annotated null on error)
-	rename: <fun: old:Str -> new:Str -> Bool>,
-	# Replace all non-overlapping regex matches.
-	# 
-	# Params:
-	# pattern: Str — RE2-compatible regular expression
-	# replace: Str — replacement (no backrefs)
-	# string:  Str — input
-	# 
-	# Returns:
-	# Str
-	# Replace all non-overlapping regex matches.
-	# 
-	# Params:
-	# pattern: Str — RE2-compatible regular expression
-	# replace: Str — replacement (no backrefs)
-	# string:  Str — input
-	# 
-	# Returns:
-	# Str
-	replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str>,
-	# Remove trailing whitespace (Unicode).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	# Remove trailing whitespace (Unicode).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	rstrip: <fun: s:Str -> Str>,
-	# Seed the pseudo-random number generator.
-	# 
-	# Use a fixed seed for reproducible sequences.
-	# 
-	# Params:
-	# n: Int — seed value
-	# 
-	# Returns:
-	# Null
-	# Seed the pseudo-random number generator.
-	# 
-	# Use a fixed seed for reproducible sequences.
-	# 
-	# Params:
-	# n: Int — seed value
-	# 
-	# Returns:
-	# Null
-	seedRand: <fun: n:Int -> Null>,
-	# SHA-256 digest (raw bytes).
-	# 
-	# Params:
-	# x: Str — input bytes (may be arbitrary, not necessarily UTF-8)
-	# 
-	# Returns:
-	# Str — 32-byte digest (raw). Use hex/base64 in userland to display.
-	# SHA-256 digest (raw bytes).
-	# 
-	# Params:
-	# x: Str — input bytes (may be arbitrary, not necessarily UTF-8)
-	# 
-	# Returns:
-	# Str — 32-byte digest (raw). Use hex/base64 in userland to display.
-	sha256: <fun: x:Str -> Str>,
-	# Sine of an angle in radians.
-	# 
-	# Params:
-	# x: Num — radians
-	# 
-	# Returns:
-	# Num
-	# Sine of an angle in radians.
-	# 
-	# Params:
-	# x: Num — radians
-	# 
-	# Returns:
-	# Num
-	sin: <fun: x:Num -> Num>,
-	# Pause execution for a number of milliseconds.
-	# 
-	# Params:
-	# ms: Int — milliseconds to sleep
-	# 
-	# Returns:
-	# Null
-	# Pause execution for a number of milliseconds.
-	# 
-	# Params:
-	# ms: Int — milliseconds to sleep
-	# 
-	# Returns:
-	# Null
-	sleep: <fun: ms:Int -> Null>,
-	# Return a map snapshot of the visible environment (including built-ins).
-	# 
-	# Behavior:
-	# • Captures a flattened view of the current frame and its parents (Core included).
-	# • Inner bindings shadow outer ones.
-	# • Values are deep-copied where applicable (arrays/maps preserve order & per-key annotations).
-	# • Each entry's per-key annotation is taken from the variable's Value.Annot.
-	# 
-	# 
-	# Params:
-	# _: Null
-	# 
-	# Returns:
-	# {} — map of { name: value } with per-key annotations
-	# Return a map snapshot of the visible environment (including built-ins).
-	# 
-	# Behavior:
-	# • Captures a flattened view of the current frame and its parents (Core included).
-	# • Inner bindings shadow outer ones.
-	# • Values are deep-copied where applicable (arrays/maps preserve order & per-key annotations).
-	# • Each entry's per-key annotation is taken from the variable's Value.Annot.
-	# 
-	# 
-	# Params:
-	# _: Null
-	# 
-	# Returns:
-	# {} — map of { name: value } with per-key annotations
-	snapshot: <fun: _:Null -> {
-}>,
-	# Split a string on a separator (no regex).
-	# 
-	# If sep is empty (""), splits between UTF-8 code points.
-	# 
-	# Params:
-	# s: Str   — source string
-	# sep: Str — separator
-	# 
-	# Returns:
-	# [Str]
-	# Split a string on a separator (no regex).
-	# 
-	# If sep is empty (""), splits between UTF-8 code points.
-	# 
-	# Params:
-	# s: Str   — source string
-	# sep: Str — separator
-	# 
-	# Returns:
-	# [Str]
-	split: <fun: s:Str -> sep:Str -> [Str]>,
-	# Format a string with printf-style verbs.
-	# 
-	# Supports Go-style verbs like %s, %v, %d, %f, etc.
-	# Args are passed as an array: sprintf("%s = %v", ["x", 42])
-	# 
-	# Params:
-	# fmt:  Str
-	# args: [Any]
-	# 
-	# Returns:
-	# Str? — the formatted string, or null (annotated) on format/arg mismatch.
-	# Format a string with printf-style verbs.
-	# 
-	# Supports Go-style verbs like %s, %v, %d, %f, etc.
-	# Args are passed as an array: sprintf("%s = %v", ["x", 42])
-	# 
-	# Params:
-	# fmt:  Str
-	# args: [Any]
-	# 
-	# Returns:
-	# Str? — the formatted string, or null (annotated) on format/arg mismatch.
-	sprintf: <fun: fmt:Str -> args:[Any] -> Str?>,
-	# Square root.
-	# 
-	# Params:
-	# x: Num — non-negative
-	# 
-	# Returns:
-	# Num
-	# Square root.
-	# 
-	# Params:
-	# x: Num — non-negative
-	# 
-	# Returns:
-	# Num
-	sqrt: <fun: x:Num -> Num>,
-	# File status (like ls -l metadata).
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# { isDir!: Bool, size!: Int, modTimeMillis!: Int, mode!: Int }?,
-	# or annotated null on error (e.g., not found).
-	# File status (like ls -l metadata).
-	# 
-	# Params:
-	# path: Str
-	# 
-	# Returns:
-	# { isDir!: Bool, size!: Int, modTimeMillis!: Int, mode!: Int }?,
-	# or annotated null on error (e.g., not found).
-	stat: <fun: path:Str -> {
-	isDir!: Bool,
-	modTimeMillis!: Int,
-	mode!: Int,
-	size!: Int
-}?>,
-	# Stringify a value.
-	# 
-	# Rules:
-	# • Str stays as-is
-	# • Null → "null"
-	# • Bool → "true"/"false"
-	# • Int/Num → decimal representation
-	# • Arrays/Maps → JSON text (best-effort; falls back to debug form if not encodable)
-	# • Functions/Modules/Handles/Types → readable debug form
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Str
-	# Stringify a value.
-	# 
-	# Rules:
-	# • Str stays as-is
-	# • Null → "null"
-	# • Bool → "true"/"false"
-	# • Int/Num → decimal representation
-	# • Arrays/Maps → JSON text (best-effort; falls back to debug form if not encodable)
-	# • Functions/Modules/Handles/Types → readable debug form
-	# 
-	# Params:
-	# x: Any
-	# 
-	# Returns:
-	# Str
-	str: <fun: x:Any -> Str>,
-	# Remove leading and trailing whitespace (Unicode).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	# Remove leading and trailing whitespace (Unicode).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	strip: <fun: s:Str -> Str>,
-	# Unicode-safe substring by rune index.
-	# 
-	# Takes the half-open slice [i, j). Indices are clamped to bounds and negative
-	# values are treated as 0.
-	# 
-	# Params:
-	# s: Str — source string
-	# i: Int — start index (inclusive)
-	# j: Int — end index (exclusive)
-	# 
-	# Returns:
-	# Str
-	# Unicode-safe substring by rune index.
-	# 
-	# Takes the half-open slice [i, j). Indices are clamped to bounds and negative
-	# values are treated as 0.
-	# 
-	# Params:
-	# s: Str — source string
-	# i: Int — start index (inclusive)
-	# j: Int — end index (exclusive)
-	# 
-	# Returns:
-	# Str
-	substr: <fun: s:Str -> i:Int -> j:Int -> Str>,
-	# Tangent of an angle in radians.
-	# 
-	# Params:
-	# x: Num — radians
-	# 
-	# Returns:
-	# Num
-	# Tangent of an angle in radians.
-	# 
-	# Params:
-	# x: Num — radians
-	# 
-	# Returns:
-	# Num
-	tan: <fun: x:Num -> Num>,
-	# Return the system temporary directory.
-	# 
-	# Returns:
-	# Str
-	# Return the system temporary directory.
-	# 
-	# Returns:
-	# Str
-	tempDir: <fun: _:Null -> Str>,
-	# Emit periodic ticks on a channel until closed.
-	# Emit periodic ticks on a channel until closed.
-	ticker: <fun: ms:Int -> Any>,
-	# Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
-	# 
-	# Params:
-	# millis: Int — milliseconds since the Unix epoch
-	# 
-	# Returns:
-	# Str
-	# 
-	# Notes:
-	# • Uses UTC and emits fractional seconds only when needed (RFC3339Nano).
-	# Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
-	# 
-	# Params:
-	# millis: Int — milliseconds since the Unix epoch
-	# 
-	# Returns:
-	# Str
-	# 
-	# Notes:
-	# • Uses UTC and emits fractional seconds only when needed (RFC3339Nano).
-	timeFormatRFC3339: <fun: millis:Int -> Str>,
-	# Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
-	# 
-	# Accepts both second-precision (RFC3339) and fractional (RFC3339Nano) forms.
-	# 
-	# Params:
-	# s: Str — RFC 3339 timestamp (e.g., "2024-06-18T12:34:56Z")
-	# 
-	# Returns:
-	# Int? — milliseconds since the Unix epoch, or null (annotated) on parse error
-	# Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
-	# 
-	# Accepts both second-precision (RFC3339) and fractional (RFC3339Nano) forms.
-	# 
-	# Params:
-	# s: Str — RFC 3339 timestamp (e.g., "2024-06-18T12:34:56Z")
-	# 
-	# Returns:
-	# Int? — milliseconds since the Unix epoch, or null (annotated) on parse error
-	timeParseRFC3339: <fun: s:Str -> Int?>,
-	# Emit one tick after a delay, then close.
-	# Emit one tick after a delay, then close.
-	timerAfter: <fun: ms:Int -> Any>,
-	# Lowercase conversion (Unicode aware).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	# Lowercase conversion (Unicode aware).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	toLower: <fun: s:Str -> Str>,
-	# Uppercase conversion (Unicode aware).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	# Uppercase conversion (Unicode aware).
-	# 
-	# Params:
-	# s: Str
-	# 
-	# Returns:
-	# Str
-	toUpper: <fun: s:Str -> Str>,
-	# Run a function and capture hard failures.
-	# 
-	# Returns:
-	# { ok: Bool, value: Any, error: Str? }
-	# 
-	# Notes:
-	# • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
-	# • If the function returns an annotated null, ok=false and error is that annotation.
-	# • On success, ok=true and value is the function's result.
-	# Run a function and capture hard failures.
-	# 
-	# Returns:
-	# { ok: Bool, value: Any, error: Str? }
-	# 
-	# Notes:
-	# • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
-	# • If the function returns an annotated null, ok=false and error is that annotation.
-	# • On success, ok=true and value is the function's result.
-	try: <fun: f:Any -> {
-}>,
-	# Return the dynamic Type of a value.
-	# 
-	# This inspects a runtime value and produces its structural Type.
-	# Useful together with isType/isSubtype for ad-hoc validation.
-	# 
-	# Params:
-	# x: Any — a runtime value
-	# 
-	# Returns: Type
-	# Return the dynamic Type of a value.
-	# 
-	# This inspects a runtime value and produces its structural Type.
-	# Useful together with isType/isSubtype for ad-hoc validation.
-	# 
-	# Params:
-	# x: Any — a runtime value
-	# 
-	# Returns: Type
-	typeOf: <fun: x:Any -> Type>,
-	# Parse a MindScript type string and convert it to JSON Schema.
-	# 
-	# Params:
-	# src: Str — a single type expression (annotations map to "description")
-	# 
-	# Returns:
-	# Any — JSON Schema object
-	# Parse a MindScript type string and convert it to JSON Schema.
-	# 
-	# Params:
-	# src: Str — a single type expression (annotations map to "description")
-	# 
-	# Returns:
-	# Any — JSON Schema object
-	typeStringToJSONSchema: <fun: src:Str -> Any>,
-	# Convert a MindScript Type to a JSON Schema object.
-	# 
-	# Params:
-	# t: Type
-	# 
-	# Returns:
-	# Any — JSON Schema as a map/array structure (use jsonStringify to serialize)
-	# Convert a MindScript Type to a JSON Schema object.
-	# 
-	# Params:
-	# t: Type
-	# 
-	# Returns:
-	# Any — JSON Schema as a map/array structure (use jsonStringify to serialize)
-	typeToJSONSchema: <fun: t:Type -> Any>,
-	# Build a URL string from components.
-	# 
-	# Params:
-	# u: {
-	# scheme!:  Str,
-	# host!:    Str,           # hostname only; port via 'port'
-	# port:     Int?,
-	# path:     Str?,          # escaped path (e.g. "/a%20b")
-	# query:    {},            # map Str -> Str|[Str]
-	# fragment: Str?
-	# }
-	# 
-	# Returns:
-	# Str — URL string.
-	# 
-	# Notes:
-	# • Use 'port' to add a port; IPv6 hosts are handled via proper bracket formatting.
-	# • 'query' values accept Str or [Str].
-	# Build a URL string from components.
-	# 
-	# Params:
-	# u: {
-	# scheme!:  Str,
-	# host!:    Str,           # hostname only; port via 'port'
-	# port:     Int?,
-	# path:     Str?,          # escaped path (e.g. "/a%20b")
-	# query:    {},            # map Str -> Str|[Str]
-	# fragment: Str?
-	# }
-	# 
-	# Returns:
-	# Str — URL string.
-	# 
-	# Notes:
-	# • Use 'port' to add a port; IPv6 hosts are handled via proper bracket formatting.
-	# • 'query' values accept Str or [Str].
-	urlBuild: <fun: u:{
-} -> Str>,
-	# Parse a URL into components.
-	# 
-	# Params:
-	# s: Str — URL string
-	# 
-	# Returns:
-	# {
-	# scheme!:   Str,
-	# host!:     Str,
-	# port:      Int?,         # present if URL has an explicit numeric port
-	# path!:     Str,          # escaped path
-	# query!:    {},           # map Str -> [Str]
-	# fragment:  Str?
-	# }?
-	# 
-	# Notes:
-	# • Query values preserve multiplicity as arrays.
-	# • IPv6 hosts are returned without brackets in 'host'.
-	# Parse a URL into components.
-	# 
-	# Params:
-	# s: Str — URL string
-	# 
-	# Returns:
-	# {
-	# scheme!:   Str,
-	# host!:     Str,
-	# port:      Int?,         # present if URL has an explicit numeric port
-	# path!:     Str,          # escaped path
-	# query!:    {},           # map Str -> [Str]
-	# fragment:  Str?
-	# }?
-	# 
-	# Notes:
-	# • Query values preserve multiplicity as arrays.
-	# • IPv6 hosts are returned without brackets in 'host'.
-	urlParse: <fun: s:Str -> {
-}?>,
-	# Parse a URL query string into a map.
-	# 
-	# Params:
-	# s: Str — query string with or without the leading '?'
-	# 
-	# Returns:
-	# {}? — map Str -> [Str], or null on invalid input.
-	# 
-	# Notes:
-	# • Percent-decoding is applied to keys and values.
-	# Parse a URL query string into a map.
-	# 
-	# Params:
-	# s: Str — query string with or without the leading '?'
-	# 
-	# Returns:
-	# {}? — map Str -> [Str], or null on invalid input.
-	# 
-	# Notes:
-	# • Percent-decoding is applied to keys and values.
-	urlQueryParse: <fun: s:Str -> {
-}?>,
-	# Serialize a query map to 'application/x-www-form-urlencoded'.
-	# 
-	# Params:
-	# q: {} — map Str -> Str|[Str]
-	# 
-	# Returns:
-	# Str — percent-encoded query string (without leading '?').
-	# Serialize a query map to 'application/x-www-form-urlencoded'.
-	# 
-	# Params:
-	# q: {} — map Str -> Str|[Str]
-	# 
-	# Returns:
-	# Str — percent-encoded query string (without leading '?').
-	urlQueryString: <fun: q:{
-} -> Str>,
-	# Write a string to a file or network handle.
-	# 
-	# Returns the number of bytes written as Int, or null (annotated) on I/O error.
-	# Output is buffered; call flush to ensure delivery.
-	# Write a string to a file or network handle.
-	# 
-	# Returns the number of bytes written as Int, or null (annotated) on I/O error.
-	# Output is buffered; call flush to ensure delivery.
-	write: <fun: h:Any -> s:Str -> Int?>,
-	# Write a string to a file (overwriting if it exists).
-	# 
-	# Creates the file if necessary with mode 0644.
-	# Returns the number of bytes written as Int, or null (annotated) on I/O error.
-	# Write a string to a file (overwriting if it exists).
-	# 
-	# Creates the file if necessary with mode 0644.
-	# Returns the number of bytes written as Int, or null (annotated) on I/O error.
-	writeFile: <fun: path:Str -> data:Str -> Int?>
+	flush:
+		# Flush buffered output for a handle.
+		# 
+		# Ensures written data is visible to readers/peers.
+		# Returns annotated null on I/O error.
+		# 
+		# Returns:
+		# Bool
+		<fun: h:Any -> Bool>,
+	gzipCompress:
+		# Compress data using gzip (default level).
+		# 
+		# Params:
+		# data: Str — input bytes (may contain arbitrary bytes)
+		# 
+		# Returns:
+		# Str — gzip-compressed bytes
+		# 
+		# Notes:
+		# • Output is binary; treat as bytes stored in Str.
+		# • Compatible with standard gzip tools and RFC 1952.
+		<fun: data:Str -> Str>,
+	gzipDecompress:
+		# Decompress a gzip payload.
+		# 
+		# Params:
+		# data: Str — gzip-compressed bytes
+		# 
+		# Returns:
+		# Str? — decompressed bytes, or null (annotated) on error
+		# 
+		# Notes:
+		# • Returns annotated null on invalid gzip headers, checksum mismatch, truncated input, etc.
+		# • Output is binary; treat as bytes stored in Str.
+		<fun: data:Str -> Str?>,
+	hexDecode:
+		# Decode a hexadecimal string.
+		# 
+		# Params:
+		# s: Str — hex string (case-insensitive), even length
+		# 
+		# Returns:
+		# Str? — decoded bytes as Str, or null (annotated) on invalid input.
+		<fun: s:Str -> Str?>,
+	hexEncode:
+		# Hex-encode bytes to a lowercase hexadecimal string.
+		# 
+		# Params:
+		# x: Str — input bytes
+		# 
+		# Returns:
+		# Str — lowercase hex (two chars per byte).
+		<fun: x:Str -> Str>,
+	hmacSha256:
+		# HMAC-SHA256 authentication tag (raw bytes).
+		# 
+		# Params:
+		# key: Str — secret key (raw bytes)
+		# msg: Str — message bytes
+		# 
+		# Returns:
+		# Str — 32-byte MAC (raw). Use hex/base64 to render as text.
+		# 
+		# Notes:
+		# • Suitable for signatures, request auth, etc.
+		<fun: key:Str -> msg:Str -> Str>,
+	http:
+		# Make an HTTP request (buffered).
+		# 
+		# Input:
+		# req: {
+		# url!:       Str
+		# method:     Str?         # default "GET"
+		# headers:    {}?
+		# body:       Str?         # text body
+		# bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
+		# timeoutMs:  Int?         # default 30000
+		# }
+		# 
+		# Output:
+		# {
+		# status!:     Int
+		# statusText:  Str
+		# headers!:    {Str: Str}   # multi-values joined by ", "
+		# body!:       Str           # full response body (text/binary-as-text)
+		# url:         Str           # final URL after redirects
+		# proto:       Str           # "HTTP/1.1", "HTTP/2.0"
+		# durationMs:  Int           # end-to-end (including body read)
+		# }?  # annotated null on network/IO error
+		<fun: req:{
+			body: Str,
+			bodyH: Any,
+			headers: {},
+			method: Str,
+			timeoutMs: Int,
+			url!: Str
+		} -> {
+			body: Str,
+			bodyH: Any,
+			durationMs: Int,
+			headers!: {},
+			proto: Str,
+			status!: Int,
+			statusText: Str,
+			url: Str
+		}?>,
+	httpStream:
+		# Make an HTTP request (streaming).
+		# 
+		# Input:
+		# req: {
+		# url!:       Str
+		# method:     Str?         # default "GET"
+		# headers:    {}?
+		# body:       Str?         # text body
+		# bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
+		# timeoutMs:  Int?         # default 30000
+		# }
+		# 
+		# Output:
+		# {
+		# status!:     Int
+		# statusText:  Str
+		# headers!:    {Str: Str}
+		# bodyH!:      Any          # readable handle (Kind "net"); use readN/readAll/close
+		# url:         Str
+		# proto:       Str
+		# durationMs:  Int          # time until headers (body not read)
+		# }?  # annotated null on network/IO error
+		# 
+		# Notes:
+		# • The returned bodyH is *read-only*. Writing to it will fail.
+		# • Use close(bodyH) when done to release the connection early.
+		<fun: req:{
+			body: Str,
+			bodyH: Any,
+			headers: {},
+			method: Str,
+			timeoutMs: Int,
+			url!: Str
+		} -> {
+			body: Str,
+			bodyH: Any,
+			durationMs: Int,
+			headers!: {},
+			proto: Str,
+			status!: Int,
+			statusText: Str,
+			url: Str
+		}?>,
+	import:
+		# Load a module from filesystem or HTTP(S).
+		# 
+		# Resolution rules:
+		# - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
+		# - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
+		# 
+		# Params:
+		# path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
+		# 
+		# Returns:
+		# Module (nullable) — the loaded module value; or null with an error annotation on soft failures.
+		<fun: path:Str -> Any>,
+	importCode:
+		# Evaluate source text as a module in memory.
+		# 
+		# Parses 'src' and evaluates it as a module named 'name' (no caching).
+		# The module's environment is fresh and parented to Core.
+		# The synthetic identity "mem:<name>" is used for cycle detection.
+		# 
+		# Params:
+		# name: Str — display name for diagnostics and identity ("mem:<name>").
+		# src:  Str — MindScript source code.
+		# 
+		# Returns:
+		# Module (nullable) — the created module value; or null with an error annotation if the
+		# user code intentionally returns a soft failure.
+		<fun: name:Str -> src:Str -> Any>,
+	int:
+		# Convert to Int when possible; otherwise return null.
+		# 
+		# Rules:
+		# • Int → Int
+		# • Num → truncated toward zero
+		# • Bool → 1/0
+		# • Str → parsed base-10 integer, or null on failure
+		# • Others → null
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Int?
+		<fun: x:Any -> Int?>,
+	isSubtype:
+		# Structural subtype test: A <: B.
+		# 
+		# Function types are compared structurally:
+		# - Parameters are contravariant
+		# - Return types are covariant
+		# - Arrows associate to the right (A -> B -> C == A -> (B -> C))
+		# 
+		# Params:
+		# A: Type — candidate subtype
+		# B: Type — candidate supertype
+		# 
+		# Returns: Bool
+		<fun: A:Type -> B:Type -> Bool>,
+	isType:
+		# Check whether a value conforms to a Type.
+		# 
+		# Params:
+		# x: Any   — value to check
+		# T: Type  — type to check against (must be a Type value, e.g. type Int)
+		# 
+		# Returns: Bool
+		<fun: x:Any -> T:Type -> Bool>,
+	join:
+		# Join strings with a separator.
+		# 
+		# Params:
+		# xs: [Str] — pieces to join
+		# sep: Str  — separator
+		# 
+		# Returns:
+		# Str
+		<fun: xs:[Str] -> sep:Str -> Str>,
+	jsonParse:
+		# Parse a JSON string into MindScript values.
+		# 
+		# Mapping rules:
+		# • null/bool/number/string map to Null/Bool/Int|Num/Str
+		# • arrays map to [Any]
+		# • objects map to {Str: Any}
+		# • integral JSON numbers become Int; other numbers become Num
+		# 
+		# Params:
+		# s: Str — JSON text
+		# 
+		# Returns:
+		# Any
+		<fun: s:Str -> Any>,
+	jsonSchemaStringToType:
+		# Parse a JSON Schema string and convert it to a MindScript Type.
+		# 
+		# Params:
+		# src: Str — JSON text
+		# 
+		# Returns:
+		# Type
+		<fun: src:Str -> Type>,
+	jsonSchemaToType:
+		# Convert a JSON Schema object to a MindScript Type.
+		# 
+		# Notes:
+		# • Same-document $ref and common keywords are handled.
+		# • Unsupported constructs widen to Any.
+		# • "$defs"/"definitions" are imported into the current scope as type aliases.
+		# 
+		# Params:
+		# schema: Any — JSON object (e.g., from jsonParse)
+		# 
+		# Returns:
+		# Type
+		<fun: schema:Any -> Type>,
+	jsonStringify:
+		# Serialize a value to a compact JSON string.
+		# 
+		# Arrays and maps are emitted as JSON arrays/objects. Object key order is not
+		# guaranteed.
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Str
+		<fun: x:Any -> Str>,
+	len:
+		# Length of a value.
+		# 
+		# Rules:
+		# • [a, b, c] → 3
+		# • {k: v, ...} → number of keys (in insertion order)
+		# • "…unicode…" → rune count
+		# • Others → null
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Int?
+		<fun: x:Any -> Int?>,
+	log:
+		# Natural logarithm (base e).
+		# 
+		# Params:
+		# x: Num — positive
+		# 
+		# Returns:
+		# Num
+		<fun: x:Num -> Num>,
+	lstrip:
+		# Remove leading whitespace (Unicode).
+		# 
+		# Params:
+		# s: Str
+		# 
+		# Returns:
+		# Str
+		<fun: s:Str -> Str>,
+	mapDelete:
+		# Delete a property from a map (in place).
+		# 
+		# Preserves the key order and per-key annotations for the remaining entries.
+		# 
+		# Params:
+		# obj: {}  — a map value (mutated)
+		# key: Str — property name to remove
+		# 
+		# Returns:
+		# {} — the same map value
+		<fun: obj:{} -> key:Str -> {}>,
+	mapHas:
+		# Return true if a key exists in a map.
+		# 
+		# Params:
+		# obj: {}  — a map value
+		# key: Str — property name
+		# 
+		# Returns:
+		# Bool
+		<fun: obj:{} -> key:Str -> Bool>,
+	match:
+		# Find all non-overlapping matches of a regex.
+		# 
+		# Params:
+		# pattern: Str — RE2-compatible regular expression
+		# string:  Str — input
+		# 
+		# Returns:
+		# [Str] — matched substrings (no capture groups)
+		<fun: pattern:Str -> string:Str -> [Str]>,
+	mkdir:
+		# Create a directory (creating parents as needed).
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Bool (annotated null on error)
+		<fun: path:Str -> Bool>,
+	netAccept:
+		# Accept one TCP connection from a listener.
+		# 
+		# Blocks until a client connects. Returns a network handle,
+		# or null (annotated) on accept error.
+		<fun: l:Any -> Any>,
+	netConnect:
+		# Open a TCP connection to "host:port".
+		# 
+		# Returns a network handle usable with read*/write/flush/close,
+		# or null (annotated) on network error.
+		<fun: addr:Str -> Any>,
+	netListen:
+		# Listen on a TCP address "host:port".
+		# 
+		# Returns a listener handle for netAccept. Use close(listener) to stop listening.
+		# Returns null (annotated) on bind/listen error.
+		<fun: addr:Str -> Any>,
+	noteGet:
+		# Get the annotation attached to a value, if any.
+		# 
+		# Params:
+		# x: Any — any runtime value
+		# 
+		# Returns:
+		# Str? — the annotation string, or null if not present
+		# 
+		# Notes:
+		# • See also: noteSet(text, value) to attach annotations programmatically.
+		<fun: x:Any -> Str?>,
+	noteSet:
+		# Attach or replace an annotation on a value.
+		# 
+		# Params:
+		# text: Str  — annotation text to attach
+		# value: Any — value to annotate
+		# 
+		# Returns:
+		# Any — the same value with its annotation set to text
+		# 
+		# Notes:
+		# • This does not deep-copy arrays/maps; underlying data is shared.
+		# • Annotations never affect equality but are rendered by printers.
+		<fun: text:Str -> value:Any -> Any>,
+	nowMillis:
+		# Current wall-clock time in milliseconds since the Unix epoch.
+		# 
+		# Returns:
+		# Int
+		<fun: _:Null -> Int>,
+	nowNanos:
+		# Current wall-clock time in nanoseconds since the Unix epoch.
+		# 
+		# Returns:
+		# Int
+		<fun: _:Null -> Int>,
+	num:
+		# Convert to Num when possible; otherwise return null.
+		# 
+		# Rules:
+		# • Num → Num
+		# • Int → floating-point value
+		# • Bool → 1.0/0.0
+		# • Str → parsed as float64, or null on failure
+		# • Others → null
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Num?
+		<fun: x:Any -> Num?>,
+	open:
+		# Open a file and return a handle.
+		# 
+		# Modes:
+		# "r"  — read-only
+		# "w"  — write (truncate or create)
+		# "a"  — append (create if needed)
+		# "rw" — read/write (create if needed)
+		# 
+		# Params:
+		# path: Str
+		# mode: Str ("r" | "w" | "a" | "rw")
+		# 
+		# Returns:
+		# file handle usable with read*/write/flush/close,
+		# or null (annotated) on I/O failure.
+		<fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Any>,
+	osEnv:
+		# Read an environment variable.
+		# 
+		# Params:
+		# name: Str
+		# Returns:
+		# Str? (null if unset)
+		<fun: name:Str -> Str?>,
+	osSetEnv:
+		# Set or unset an environment variable.
+		# 
+		# If value is null (or omitted), the variable is unset.
+		# 
+		# Params:
+		# name:  Str
+		# value: Str?  # null → unset
+		# 
+		# Returns:
+		# Bool (annotated null on OS error)
+		<fun: name:Str -> value:Str? -> Bool>,
+	pathBase:
+		# Return the last element of a path (OS-specific).
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Str — base name
+		# 
+		# Notes:
+		# • Mirrors Go's filepath.Base semantics ("" → ".", strips trailing separators).
+		<fun: path:Str -> Str>,
+	pathClean:
+		# Clean a path by applying lexical simplifications.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Str — cleaned path
+		# 
+		# Notes:
+		# • Removes redundant separators and up-levels like "." and ".." where possible.
+		# • Mirrors Go's filepath.Clean semantics; no I/O performed.
+		# • Cross-platform behavior handled by filepath.
+		<fun: path:Str -> Str>,
+	pathDir:
+		# Return all but the last element of a path.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Str — directory component
+		# 
+		# Notes:
+		# • Mirrors Go's filepath.Dir semantics ("" → ".", root stays root).
+		<fun: path:Str -> Str>,
+	pathExt:
+		# Return the file extension (including the leading dot), or "" if none.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Str — extension
+		# 
+		# Notes:
+		# • Mirrors Go's filepath.Ext semantics (".bashrc" → ".bashrc", "archive.tar.gz" → ".gz").
+		<fun: path:Str -> Str>,
+	pathJoin:
+		# Join path elements using the OS-specific separator.
+		# 
+		# Params:
+		# parts: [Str] — path fragments
+		# 
+		# Returns:
+		# Str — joined path
+		# 
+		# Notes:
+		# • Mirrors Go's filepath.Join semantics (cleans the result, removes empty segments).
+		# • Works cross-platform (Windows/POSIX).
+		<fun: parts:[Str] -> Str>,
+	pow:
+		# Power: base^exp.
+		# 
+		# Params:
+		# base: Num
+		# exp:  Num
+		# 
+		# Returns:
+		# Num
+		<fun: base:Num -> exp:Num -> Num>,
+	printf:
+		# Print a formatted string to standard output.
+		# 
+		# Convenience over sprintf + stdout. Caller controls newlines:
+		# printf("%s = %v\n", ["x", 42])
+		# 
+		# Params:
+		# fmt:  Str
+		# args: [Any]
+		# 
+		# Returns:
+		# Str? — the printed string, or null (annotated) on write error.
+		<fun: fmt:Str -> args:[Any] -> Str?>,
+	procCancel:
+		# Request cooperative cancellation of a process (best effort).
+		<fun: p:Any -> Null>,
+	procJoin:
+		# Wait for a process to finish and return its result.
+		<fun: p:Any -> Any>,
+	procJoinAll:
+		# Wait for all processes to finish and return their results in order.
+		<fun: ps:[Any] -> [Any]>,
+	procJoinAny:
+		# Wait for any process to finish; return its index and value.
+		<fun: ps:[Any] -> {}>,
+	procSpawn:
+		# Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
+		<fun: f:Any -> Any>,
+	randBytes:
+		# Uniform cryptographically secure random bytes.
+		# 
+		# Params:
+		# n: Int — number of bytes (>= 0)
+		# 
+		# Returns:
+		# Str? — raw bytes; annotated null on OS RNG failure
+		# 
+		# Notes:
+		# • Returns raw bytes in Str (may contain non-UTF-8).
+		# • Use hex/base64 helpers in userland to render textually.
+		<fun: n:Int -> Str?>,
+	randFloat:
+		# Uniform random number in [0.0, 1.0).
+		# 
+		# Params:
+		# _: Null
+		# 
+		# Returns:
+		# Num
+		<fun: _:Null -> Num>,
+	randInt:
+		# Uniform random integer in [0, n).
+		# 
+		# Params:
+		# n: Int — upper bound (must be > 0)
+		# 
+		# Returns:
+		# Int
+		<fun: n:Int -> Int>,
+	readAll:
+		# Read all remaining bytes from a handle.
+		# 
+		# Blocks until EOF and returns the data as Str.
+		# Returns null (annotated) on I/O error.
+		<fun: h:Any -> Str?>,
+	readFile:
+		# Read an entire file into a string.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Str, or null (annotated) on I/O error.
+		<fun: path:Str -> Str?>,
+	readLine:
+		# Read one line from a handle (without the trailing newline).
+		# 
+		# Returns null at EOF. Returns null (annotated) on I/O error.
+		<fun: h:Any -> Str?>,
+	readN:
+		# Read up to n bytes from a handle.
+		# 
+		# May return fewer than n bytes at EOF. Returns data as Str.
+		# Hard-error if n < 0. Returns null (annotated) on I/O error.
+		<fun: h:Any -> n:Int -> Str?>,
+	reflect:
+		# Reflect a value into constructor code (runtime-S).
+		# 
+		# Returns a program AST (as runtime-S) that, when reified, reconstructs the
+		# given value as closely as possible.
+		# 
+		# Params:
+		# val: Any — value to reflect
+		# 
+		# Returns:
+		# [] — constructor code (runtime-S)
+		# • Scalars/arrays/maps → literal nodes
+		# • Types (VTType) → ["type", <typeAst>]
+		# • User/oracle functions → ["fun"/"oracle", params, type, body]
+		# • Native functions → ["id", nativeName] (resolved by host env)
+		# • Modules → ["module", ["str", name], ("pair", ["id", export], <ctor>)*]
+		# • Opaque handles/unknowns → annotated-null runtime-S (soft error)
+		# 
+		# Notes:
+		# • This is *constructor code*, not a snapshot; closures do not capture lexical env.
+		<fun: val:Any -> [Any]>,
+	reify:
+		# Decode and evaluate constructor code (runtime-S).
+		# 
+		# Validates a runtime-S program and evaluates it in the host (persistent/global)
+		# environment, equivalent to EvalPersistent.
+		# 
+		# Params:
+		# rt: [] — constructor code produced by reflect(...) or astParse(...)
+		# 
+		# Returns:
+		# Any — the constructed value
+		# 
+		# Hard errors:
+		# • Malformed runtime-S input
+		# • Module capsules (installer not provided here)
+		# • Handle constructs
+		# • Runtime evaluation failures (use try(...) to capture)
+		<fun: rt:[Any] -> Any>,
+	remove:
+		# Delete a file or an empty directory.
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# Bool (annotated null on error). Note: fails for non-empty directories.
+		<fun: path:Str -> Bool>,
+	rename:
+		# Rename (move) a file or directory.
+		# 
+		# Params:
+		# old: Str
+		# new: Str
+		# 
+		# Returns:
+		# Bool (annotated null on error)
+		<fun: old:Str -> new:Str -> Bool>,
+	replace:
+		# Replace all non-overlapping regex matches.
+		# 
+		# Params:
+		# pattern: Str — RE2-compatible regular expression
+		# replace: Str — replacement (no backrefs)
+		# string:  Str — input
+		# 
+		# Returns:
+		# Str
+		<fun: pattern:Str -> replace:Str -> string:Str -> Str>,
+	rstrip:
+		# Remove trailing whitespace (Unicode).
+		# 
+		# Params:
+		# s: Str
+		# 
+		# Returns:
+		# Str
+		<fun: s:Str -> Str>,
+	seedRand:
+		# Seed the pseudo-random number generator.
+		# 
+		# Use a fixed seed for reproducible sequences.
+		# 
+		# Params:
+		# n: Int — seed value
+		# 
+		# Returns:
+		# Null
+		<fun: n:Int -> Null>,
+	sha256:
+		# SHA-256 digest (raw bytes).
+		# 
+		# Params:
+		# x: Str — input bytes (may be arbitrary, not necessarily UTF-8)
+		# 
+		# Returns:
+		# Str — 32-byte digest (raw). Use hex/base64 in userland to display.
+		<fun: x:Str -> Str>,
+	sin:
+		# Sine of an angle in radians.
+		# 
+		# Params:
+		# x: Num — radians
+		# 
+		# Returns:
+		# Num
+		<fun: x:Num -> Num>,
+	sleep:
+		# Pause execution for a number of milliseconds.
+		# 
+		# Params:
+		# ms: Int — milliseconds to sleep
+		# 
+		# Returns:
+		# Null
+		<fun: ms:Int -> Null>,
+	snapshot:
+		# Return a map snapshot of the visible environment (including built-ins).
+		# 
+		# Behavior:
+		# • Captures a flattened view of the current frame and its parents (Core included).
+		# • Inner bindings shadow outer ones.
+		# • Values are deep-copied where applicable (arrays/maps preserve order & per-key annotations).
+		# • Each entry's per-key annotation is taken from the variable's Value.Annot.
+		# 
+		# 
+		# Params:
+		# _: Null
+		# 
+		# Returns:
+		# {} — map of { name: value } with per-key annotations
+		<fun: _:Null -> {}>,
+	split:
+		# Split a string on a separator (no regex).
+		# 
+		# If sep is empty (""), splits between UTF-8 code points.
+		# 
+		# Params:
+		# s: Str   — source string
+		# sep: Str — separator
+		# 
+		# Returns:
+		# [Str]
+		<fun: s:Str -> sep:Str -> [Str]>,
+	sprintf:
+		# Format a string with printf-style verbs.
+		# 
+		# Supports Go-style verbs like %s, %v, %d, %f, etc.
+		# Args are passed as an array: sprintf("%s = %v", ["x", 42])
+		# 
+		# Params:
+		# fmt:  Str
+		# args: [Any]
+		# 
+		# Returns:
+		# Str? — the formatted string, or null (annotated) on format/arg mismatch.
+		<fun: fmt:Str -> args:[Any] -> Str?>,
+	sqrt:
+		# Square root.
+		# 
+		# Params:
+		# x: Num — non-negative
+		# 
+		# Returns:
+		# Num
+		<fun: x:Num -> Num>,
+	stat:
+		# File status (like ls -l metadata).
+		# 
+		# Params:
+		# path: Str
+		# 
+		# Returns:
+		# { isDir!: Bool, size!: Int, modTimeMillis!: Int, mode!: Int }?,
+		# or annotated null on error (e.g., not found).
+		<fun: path:Str -> {
+			isDir!: Bool,
+			modTimeMillis!: Int,
+			mode!: Int,
+			size!: Int
+		}?>,
+	str:
+		# Stringify a value.
+		# 
+		# Rules:
+		# • Str stays as-is
+		# • Null → "null"
+		# • Bool → "true"/"false"
+		# • Int/Num → decimal representation
+		# • Arrays/Maps → JSON text (best-effort; falls back to debug form if not encodable)
+		# • Functions/Modules/Handles/Types → readable debug form
+		# 
+		# Params:
+		# x: Any
+		# 
+		# Returns:
+		# Str
+		<fun: x:Any -> Str>,
+	strip:
+		# Remove leading and trailing whitespace (Unicode).
+		# 
+		# Params:
+		# s: Str
+		# 
+		# Returns:
+		# Str
+		<fun: s:Str -> Str>,
+	substr:
+		# Unicode-safe substring by rune index.
+		# 
+		# Takes the half-open slice [i, j). Indices are clamped to bounds and negative
+		# values are treated as 0.
+		# 
+		# Params:
+		# s: Str — source string
+		# i: Int — start index (inclusive)
+		# j: Int — end index (exclusive)
+		# 
+		# Returns:
+		# Str
+		<fun: s:Str -> i:Int -> j:Int -> Str>,
+	tan:
+		# Tangent of an angle in radians.
+		# 
+		# Params:
+		# x: Num — radians
+		# 
+		# Returns:
+		# Num
+		<fun: x:Num -> Num>,
+	tempDir:
+		# Return the system temporary directory.
+		# 
+		# Returns:
+		# Str
+		<fun: _:Null -> Str>,
+	ticker:
+		# Emit periodic ticks on a channel until closed.
+		<fun: ms:Int -> Any>,
+	timeFormatRFC3339:
+		# Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
+		# 
+		# Params:
+		# millis: Int — milliseconds since the Unix epoch
+		# 
+		# Returns:
+		# Str
+		# 
+		# Notes:
+		# • Uses UTC and emits fractional seconds only when needed (RFC3339Nano).
+		<fun: millis:Int -> Str>,
+	timeParseRFC3339:
+		# Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
+		# 
+		# Accepts both second-precision (RFC3339) and fractional (RFC3339Nano) forms.
+		# 
+		# Params:
+		# s: Str — RFC 3339 timestamp (e.g., "2024-06-18T12:34:56Z")
+		# 
+		# Returns:
+		# Int? — milliseconds since the Unix epoch, or null (annotated) on parse error
+		<fun: s:Str -> Int?>,
+	timerAfter:
+		# Emit one tick after a delay, then close.
+		<fun: ms:Int -> Any>,
+	toLower:
+		# Lowercase conversion (Unicode aware).
+		# 
+		# Params:
+		# s: Str
+		# 
+		# Returns:
+		# Str
+		<fun: s:Str -> Str>,
+	toUpper:
+		# Uppercase conversion (Unicode aware).
+		# 
+		# Params:
+		# s: Str
+		# 
+		# Returns:
+		# Str
+		<fun: s:Str -> Str>,
+	try:
+		# Run a function and capture hard failures.
+		# 
+		# Returns:
+		# { ok: Bool, value: Any, error: Str? }
+		# 
+		# Notes:
+		# • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
+		# • If the function returns an annotated null, ok=false and error is that annotation.
+		# • On success, ok=true and value is the function's result.
+		<fun: f:Any -> {}>,
+	typeOf:
+		# Return the dynamic Type of a value.
+		# 
+		# This inspects a runtime value and produces its structural Type.
+		# Useful together with isType/isSubtype for ad-hoc validation.
+		# 
+		# Params:
+		# x: Any — a runtime value
+		# 
+		# Returns: Type
+		<fun: x:Any -> Type>,
+	typeStringToJSONSchema:
+		# Parse a MindScript type string and convert it to JSON Schema.
+		# 
+		# Params:
+		# src: Str — a single type expression (annotations map to "description")
+		# 
+		# Returns:
+		# Any — JSON Schema object
+		<fun: src:Str -> Any>,
+	typeToJSONSchema:
+		# Convert a MindScript Type to a JSON Schema object.
+		# 
+		# Params:
+		# t: Type
+		# 
+		# Returns:
+		# Any — JSON Schema as a map/array structure (use jsonStringify to serialize)
+		<fun: t:Type -> Any>,
+	urlBuild:
+		# Build a URL string from components.
+		# 
+		# Params:
+		# u: {
+		# scheme!:  Str,
+		# host!:    Str,           # hostname only; port via 'port'
+		# port:     Int?,
+		# path:     Str?,          # escaped path (e.g. "/a%20b")
+		# query:    {},            # map Str -> Str|[Str]
+		# fragment: Str?
+		# }
+		# 
+		# Returns:
+		# Str — URL string.
+		# 
+		# Notes:
+		# • Use 'port' to add a port; IPv6 hosts are handled via proper bracket formatting.
+		# • 'query' values accept Str or [Str].
+		<fun: u:{} -> Str>,
+	urlParse:
+		# Parse a URL into components.
+		# 
+		# Params:
+		# s: Str — URL string
+		# 
+		# Returns:
+		# {
+		# scheme!:   Str,
+		# host!:     Str,
+		# port:      Int?,         # present if URL has an explicit numeric port
+		# path!:     Str,          # escaped path
+		# query!:    {},           # map Str -> [Str]
+		# fragment:  Str?
+		# }?
+		# 
+		# Notes:
+		# • Query values preserve multiplicity as arrays.
+		# • IPv6 hosts are returned without brackets in 'host'.
+		<fun: s:Str -> {}?>,
+	urlQueryParse:
+		# Parse a URL query string into a map.
+		# 
+		# Params:
+		# s: Str — query string with or without the leading '?'
+		# 
+		# Returns:
+		# {}? — map Str -> [Str], or null on invalid input.
+		# 
+		# Notes:
+		# • Percent-decoding is applied to keys and values.
+		<fun: s:Str -> {}?>,
+	urlQueryString:
+		# Serialize a query map to 'application/x-www-form-urlencoded'.
+		# 
+		# Params:
+		# q: {} — map Str -> Str|[Str]
+		# 
+		# Returns:
+		# Str — percent-encoded query string (without leading '?').
+		<fun: q:{} -> Str>,
+	write:
+		# Write a string to a file or network handle.
+		# 
+		# Returns the number of bytes written as Int, or null (annotated) on I/O error.
+		# Output is buffered; call flush to ensure delivery.
+		<fun: h:Any -> s:Str -> Int?>,
+	writeFile:
+		# Write a string to a file (overwriting if it exists).
+		# 
+		# Creates the file if necessary with mode 0644.
+		# Returns the number of bytes written as Int, or null (annotated) on I/O error.
+		<fun: path:Str -> data:Str -> Int?>
 }

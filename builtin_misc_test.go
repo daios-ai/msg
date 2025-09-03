@@ -79,15 +79,15 @@ func Test_Builtin_Misc_str_basic_and_fallback(t *testing.T) {
 	}
 
 	// Arrays/maps now use the pretty-printer (not JSON)
-	if s := evalWithIP(t, ip, `str([1, 2])`); s.Tag != VTStr || s.Data.(string) != "[1, 2]" {
-		t.Fatalf(`str([1,2]) => "[1, 2]", got %#v`, s)
+	if s := evalWithIP(t, ip, `str([1, 2])`); s.Tag != VTStr || s.Data.(string) != "[1,2]" {
+		t.Fatalf(`str([1,2]) => "[1,2]", got %#v`, s)
 	}
 	s := evalWithIP(t, ip, `str({a:1, b:2})`)
 	if s.Tag != VTStr {
 		t.Fatalf(`str({a:1,b:2}) should return Str, got %#v`, s)
 	}
 	got := s.Data.(string)
-	if !(strings.HasPrefix(got, "{") && strings.Contains(got, "a: 1") && strings.Contains(got, "b: 2") && strings.HasSuffix(got, "}")) {
+	if !(strings.HasPrefix(got, "{") && strings.Contains(got, "\"a\":1") && strings.Contains(got, "\"b\":2") && strings.HasSuffix(got, "}")) {
 		t.Fatalf(`str({a:1,b:2}) => pretty map string, got %q`, got)
 	}
 }

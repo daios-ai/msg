@@ -347,7 +347,7 @@ const (
 type Doc struct {
 	k      docKind
 	s      string
-	a, b   *Doc
+	a      *Doc
 	kids   []*Doc
 	indent int // for Nest
 }
@@ -1383,11 +1383,4 @@ func docValueNoAnn(v Value) *Doc {
 		}
 		return Text("<unknown>")
 	}
-}
-
-// docForTarget is no longer needed as a separate helper; the 'for' statement
-// now prints its target via docPattern directly (no "let" prefix).
-// Keeping a tiny helper for completeness in case future tweaks are needed.
-func docForTarget(tgt S) *Doc {
-	return docPattern(tgt)
 }

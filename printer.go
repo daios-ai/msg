@@ -104,10 +104,9 @@ import (
 // ==============================
 
 // MaxInlineWidth controls when arrays/maps are rendered on a single line by
-// FormatValue. If the one-line candidate exceeds this many characters, or if
-// any element/key has a PRE annotation (non '<' prefixed), the value is rendered
-// across multiple lines with indentation. This setting is read at call time
-// and may be changed between calls.
+// FormatValue / FormatType / FormatSExpr. The single-line decision accounts for
+// the current indentation; i.e., it uses the remaining space on the line after
+// tabs (tab width = 4) and any preceding text.
 var MaxInlineWidth = 80
 
 // Pretty parses a MindScript source string and returns a formatted version.
@@ -179,9 +178,14 @@ func Standardize(src string) (string, error) {
 //
 // This function does not parse; it strictly formats the provided AST.
 func FormatSExpr(n S) string {
+	doc := docProgram(n)
 	var b strings.Builder
-	p := pp{out: out{b: &b}}
-	p.printProgram(n)
+	r := renderer{
+		out:      &b,
+		maxWidth: MaxInlineWidth,
+		tabWidth: 4,
+	}
+	r.render(doc)
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -189,9 +193,14 @@ func FormatSExpr(n S) string {
 // It respects PRE (header lines) vs POST (trailing inline) annotations in the
 // same way as the AST/code printer.
 func FormatType(t S) string {
+	doc := docType(t)
 	var b strings.Builder
-	o := out{b: &b}
-	writeType(&o, t)
+	r := renderer{
+		out:      &b,
+		maxWidth: MaxInlineWidth,
+		tabWidth: 4,
+	}
+	r.render(doc)
 	return b.String()
 }
 
@@ -200,19 +209,23 @@ func FormatType(t S) string {
 // Layout policy:
 //   - Scalars: null, booleans, ints, floats (with a decimal point for
 //     non-scientific output), and quoted strings.
-//   - Arrays: single-line `[ a, b, c ]` when all elements are single-line,
-//     have no PRE annotations, and total length ≤ MaxInlineWidth; otherwise
-//     multi-line with indentation. POST annotations render inline trailing.
+//   - Arrays: single-line `[ a, b, c ]` when the group fits and there are no
+//     PRE annotations forcing multi-line; otherwise multi-line with indentation.
 //   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short,
 //     with no PRE key/value annotations; else multi-line with indentation,
 //     where PRE annotations print as header lines, POST as inline trailing.
-//   - Functions: `<fun: name1:T1 -> name2:T2 -> R>` (zero-arg uses `_:Null`).
-//   - Types (VTType): pretty-printed via FormatType.
+//   - Functions: `<fun: name:T -> name2:U -> R>` (zero-arg uses `_:Null`).
+//   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
 //   - Modules: `<module: pretty-name>` when available.
 func FormatValue(v Value) string {
+	doc := docValue(v)
 	var b strings.Builder
-	o := out{b: &b}
-	writeValue(&o, v)
+	r := renderer{
+		out:      &b,
+		maxWidth: MaxInlineWidth,
+		tabWidth: 4,
+	}
+	r.render(doc)
 	return b.String()
 }
 
@@ -269,44 +282,6 @@ func quoteString(s string) string {
 	return b.String()
 }
 
-type out struct {
-	b     *strings.Builder
-	depth int
-}
-
-func (o *out) write(s string) { o.b.WriteString(s) }
-func (o *out) nl()            { o.b.WriteByte('\n') }
-func (o *out) pad() {
-	for i := 0; i < o.depth; i++ {
-		o.b.WriteByte('\t')
-	}
-}
-func (o *out) withIndent(fn func()) { o.depth++; fn(); o.depth-- }
-
-// PRE annotations (block/head) — prints as lines above current position.
-func (o *out) annot(text string) {
-	if text == "" {
-		return
-	}
-	for _, ln := range strings.Split(text, "\n") {
-		o.pad()
-		o.b.WriteString("# " + strings.TrimSpace(ln))
-		o.nl()
-	}
-}
-
-// POST annotations (inline/trailing) — prints on the same line.
-func (o *out) annotInline(text string) {
-	if text == "" {
-		return
-	}
-	trim := oneLine(text)
-	if trim == "" {
-		return
-	}
-	o.write(" # " + trim)
-}
-
 func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	return strings.TrimSpace(s)
@@ -335,33 +310,298 @@ func splitAnnotText(s string) (pre, post string) {
 	return s, ""
 }
 
+/* ---------- Doc engine (tiny) ---------- */
+
+type docKind int
+
+const (
+	dText     docKind = iota
+	dLine             // space if flat, newline if broken
+	dSoftLine         // empty if flat, newline if broken
+	dHardLine         // always newline
+	dGroup
+	dNest
+	dConcat
+)
+
+type Doc struct {
+	k      docKind
+	s      string
+	a, b   *Doc
+	kids   []*Doc
+	indent int // for Nest
+}
+
+func Text(s string) *Doc      { return &Doc{k: dText, s: s} }
+func LineDoc() *Doc           { return &Doc{k: dLine} }
+func SoftLineDoc() *Doc       { return &Doc{k: dSoftLine} }
+func HardLineDoc() *Doc       { return &Doc{k: dHardLine} }
+func Group(d *Doc) *Doc       { return &Doc{k: dGroup, a: d} }
+func Nest(n int, d *Doc) *Doc { return &Doc{k: dNest, a: d, indent: n} }
+func Concat(ds ...*Doc) *Doc  { return &Doc{k: dConcat, kids: ds} }
+
+func Join(sep *Doc, items []*Doc) *Doc {
+	if len(items) == 0 {
+		return Concat()
+	}
+	out := make([]*Doc, 0, len(items)*2-1)
+	for i, it := range items {
+		if i > 0 {
+			out = append(out, sep)
+		}
+		out = append(out, it)
+	}
+	return Concat(out...)
+}
+
+type renderer struct {
+	out      *strings.Builder
+	maxWidth int
+	tabWidth int
+
+	col         int  // current column in characters (tabs count as tabWidth)
+	depth       int  // indentation depth (tabs)
+	atLineStart bool // just after newline
+}
+
+func (r *renderer) writeIndentIfNeeded() {
+	if r.atLineStart {
+		for i := 0; i < r.depth; i++ {
+			r.out.WriteByte('\t')
+		}
+		r.col = r.depth * r.tabWidth
+		r.atLineStart = false
+	}
+}
+func (r *renderer) writeString(s string) {
+	if s == "" {
+		return
+	}
+	r.writeIndentIfNeeded()
+	r.out.WriteString(s)
+	r.col += len(s)
+}
+func (r *renderer) newline() {
+	r.out.WriteByte('\n')
+	r.atLineStart = true
+	// col will be set when indent is written
+}
+
+func (r *renderer) render(d *Doc) {
+	r.atLineStart = false // caller controls leading indentation
+	r.renderGroup(d)
+}
+
+func (r *renderer) renderGroup(d *Doc) {
+	// Render a group with "flat if fits" policy.
+	if r.fitsFlat(d, r.maxWidth-r.col) {
+		r.renderFlat(d)
+	} else {
+		r.renderBroken(d)
+	}
+}
+
+func (r *renderer) renderFlat(d *Doc) {
+	switch d.k {
+	case dText:
+		r.writeString(d.s)
+	case dLine:
+		r.writeString(" ")
+	case dSoftLine:
+		// nothing
+	case dHardLine:
+		// hard line cannot appear in flat mode if fitsFlat was true,
+		// but guard just in case: break the line.
+		r.newline()
+	case dGroup:
+		r.renderFlat(d.a)
+	case dNest:
+		old := r.depth
+		r.depth += d.indent
+		r.renderFlat(d.a)
+		r.depth = old
+	case dConcat:
+		for _, k := range d.kids {
+			r.renderFlat(k)
+		}
+	}
+}
+
+func (r *renderer) renderBroken(d *Doc) {
+	switch d.k {
+	case dText:
+		r.writeString(d.s)
+	case dLine:
+		r.newline()
+	case dSoftLine:
+		r.newline()
+	case dHardLine:
+		r.newline()
+	case dGroup:
+		// In broken mode, nested groups still try flat if they fit at this point.
+		r.renderGroup(d.a)
+	case dNest:
+		old := r.depth
+		r.depth += d.indent
+		r.renderBroken(d.a)
+		r.depth = old
+	case dConcat:
+		for _, k := range d.kids {
+			r.renderBroken(k)
+		}
+	}
+}
+
+// fitsFlat reports whether the doc can be rendered flat within the given budget.
+// Any HardLine inside makes it not flat-fit.
+func (r *renderer) fitsFlat(d *Doc, budget int) bool {
+	if budget < 0 {
+		return false
+	}
+	switch d.k {
+	case dText:
+		return len(d.s) <= budget
+	case dLine:
+		return 1 <= budget
+	case dSoftLine:
+		return 0 <= budget
+	case dHardLine:
+		return false
+	case dGroup:
+		return r.fitsFlat(d.a, budget)
+	case dNest:
+		return r.fitsFlat(d.a, budget)
+	case dConcat:
+		for _, k := range d.kids {
+			if !r.fitsFlat(k, budget) {
+				return false
+			}
+			// reduce budget by flat width of k
+			budget -= flatWidth(k)
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func flatWidth(d *Doc) int {
+	switch d.k {
+	case dText:
+		return len(d.s)
+	case dLine:
+		return 1
+	case dSoftLine:
+		return 0
+	case dHardLine:
+		return 1 // arbitrary; but any hardline makes fitsFlat false before using this
+	case dGroup:
+		return flatWidth(d.a)
+	case dNest:
+		return flatWidth(d.a)
+	case dConcat:
+		sum := 0
+		for _, k := range d.kids {
+			sum += flatWidth(k)
+		}
+		return sum
+	default:
+		return 0
+	}
+}
+
+/* ---------- shared Doc helpers ---------- */
+
+func idOrQuoted(name string) *Doc {
+	if isIdent(name) {
+		return Text(name)
+	}
+	return Text(quoteString(name))
+}
+
+// PRE annotations (block/head) — prints as lines above current position.
+func annotPre(text string) *Doc {
+	if strings.TrimSpace(text) == "" {
+		return Concat()
+	}
+	lines := strings.Split(text, "\n")
+	ds := make([]*Doc, 0, len(lines)*2)
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		ds = append(ds, Text("# "+ln), HardLineDoc())
+	}
+	return Concat(ds...)
+}
+
+// POST annotations (inline/trailing) — prints on the same line.
+// NOTE: annotations capture the remainder of a line. We just append.
+func annotInline(text string) *Doc {
+	trim := oneLine(text)
+	if trim == "" {
+		return Concat()
+	}
+	return Text(" # " + trim)
+}
+
+func braced(open string, inside *Doc, close string) *Doc {
+	return Concat(Text(open), inside, Text(close))
+}
+
+// inlineOrMulti builds a `[ a, b ]` or multi-line with indentation based on fit.
+// It uses the standard Group + SoftLine + Nest pattern to decide.
+func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
+	if len(elems) == 0 {
+		// exact-empty without spaces: [] or {}
+		return Text(open + close)
+	}
+	sep := Concat(Text(","), LineDoc())
+	inside := Join(sep, elems)
+	body := Nest(1, Concat(SoftLineDoc(), inside, SoftLineDoc()))
+	return Group(braced(open, body, close))
+}
+
+// kvEntry builds a single map entry, respecting PRE/POST placement.
+//   - keyPre prints above the key.
+//   - If valPre is non-empty, the value is placed on its own indented line under `key:`,
+//     and valPre prints above the value.
+//   - POSTs are appended inline after the value (value POST first, then key POST).
+func kvEntry(keyDoc *Doc, valDoc *Doc, keyPre, valPre, keyPost, valPost string) *Doc {
+	var parts []*Doc
+	// key PRE above entry
+	if keyPre != "" {
+		parts = append(parts, annotPre(keyPre))
+	}
+	// `key:` (+ space only when the value stays on the same line)
+	parts = append(parts, keyDoc)
+
+	if valPre != "" {
+		// force value onto its own line under the key (no trailing space after ':')
+		parts = append(parts,
+			Text(":"), HardLineDoc(),
+			Nest(1, Concat(annotPre(valPre), valDoc)),
+		)
+	} else {
+		// same line
+		parts = append(parts, Text(": "), valDoc)
+	}
+	// POSTs inline at the end of the value line (value, then key)
+	if valPost != "" {
+		parts = append(parts, annotInline(valPost))
+	}
+	if keyPost != "" {
+		parts = append(parts, annotInline(keyPost))
+	}
+	return Concat(parts...)
+}
+
 /* ---------- AST helpers: tags, shapes, precedence ---------- */
 
 func tag(n S) string   { return n[0].(string) }
 func getId(n S) string { return n[1].(string) }
 func getStr(n S) string {
-	// Used for ("str", s), but safe for ("id", name) too (both carry string at [1]).
+	// Used for ("str", s), but safe for ("id", name) too.
 	return n[1].(string)
 }
-
-// Shape helpers (safe indexing in one place)
-func asUnop(n S) (op string, rhs S)       { return n[1].(string), n[2].(S) }
-func asBinop(n S) (op string, lhs, rhs S) { return n[1].(string), n[2].(S), n[3].(S) }
-func asAssign(n S) (lhs, rhs S)           { return n[1].(S), n[2].(S) }
-func asCall(n S) (recv S, args []S)       { recv = n[1].(S); return recv, listS(n, 2) }
-func asIdx(n S) (recv, idx S)             { return n[1].(S), n[2].(S) }
-func asGet(n S) (recv S, name string)     { return n[1].(S), n[2].(S)[1].(string) }
-
-// New: decode 3-ary ("annot", ("str", textOr<text>), wrapped) to (text, wrapped, pre?)
-func asAnnot(n S) (text string, wrapped S, pre bool) {
-	raw := n[1].(S)[1].(string)
-	preText, postText := splitAnnotText(raw)
-	if preText != "" {
-		return preText, n[2].(S), true
-	}
-	return postText, n[2].(S), false
-}
-
 func listS(n S, from int) []S {
 	if len(n) <= from {
 		return nil
@@ -373,23 +613,11 @@ func listS(n S, from int) []S {
 	return out
 }
 
-func bracketed(o *out, open, close string, elems []S, emit func(S)) {
-	o.write(open)
-	for i, e := range elems {
-		if i > 0 {
-			o.write(", ")
-		}
-		emit(e)
+func unwrapKeyAST(n S) (name string, annot string) {
+	if tag(n) == "annot" {
+		return n[2].(S)[1].(string), n[1].(S)[1].(string)
 	}
-	o.write(close)
-}
-
-func keyOut(o *out, name string) {
-	if isIdent(name) {
-		o.write(name)
-	} else {
-		o.write(quoteString(name))
-	}
+	return n[1].(string), ""
 }
 
 var binPrec = map[string]struct {
@@ -405,7 +633,7 @@ var binPrec = map[string]struct {
 	"or":  {20, false},
 }
 
-func precOf(n S) int {
+func exprPrec(n S) int {
 	switch tag(n) {
 	case "assign":
 		return 10
@@ -426,426 +654,283 @@ func precOf(n S) int {
 	}
 }
 
-/* ---------- source → pretty (AST printer) ---------- */
-
-type pp struct{ out out }
-
-func (p *pp) write(s string) { p.out.write(s) }
-func (p *pp) nl()            { p.out.nl() }
-func (p *pp) pad()           { p.out.pad() }
-func (p *pp) sp()            { p.write(" ") }
-
-func (p *pp) printMin(n S, need int) {
-	if precOf(n) < need {
-		p.write("(")
-		p.printExpr(n)
-		p.write(")")
-		return
+func parenIf(need int, d *Doc, n S) *Doc {
+	if exprPrec(n) < need {
+		return Concat(Text("("), d, Text(")"))
 	}
-	p.printExpr(n)
-}
-func (p *pp) recv90(n S) { p.printMin(n, 90) }
-
-func (p *pp) bin(op string, l, r S) {
-	my := 60
-	if pr, ok := binPrec[op]; ok {
-		my = pr.p
-	}
-	p.printMin(l, my)
-	p.write(" " + op + " ")
-	p.printMin(r, my)
+	return d
 }
 
-func (p *pp) printProgram(n S) {
+/* ---------- AST → Doc ---------- */
+
+func docProgram(n S) *Doc {
 	if tag(n) != "block" {
-		p.printStmt(n)
-		return
+		return docStmt(n)
 	}
 	kids := listS(n, 1)
+	var ds []*Doc
 	for i, k := range kids {
-		p.printStmt(k)
+		ds = append(ds, docStmt(k))
 		if i < len(kids)-1 {
-			p.nl()
+			ds = append(ds, HardLineDoc())
 		}
 	}
+	return Concat(ds...)
 }
 
-func (p *pp) kwCall(name string, arg S) {
-	p.pad()
-	p.write(name)
-	p.write("(")
-	p.printExpr(arg)
-	p.write(")")
-}
-
-func (p *pp) kwBlock(header func(), body S) {
-	p.pad()
-	header()
-	p.sp()
-	p.write("do")
-	p.nl()
-	p.out.withIndent(func() { p.printBlock(body) })
-	if len(body) > 1 {
-		p.nl()
-	}
-	p.pad()
-	p.write("end")
-}
-
-func (p *pp) callableHeader(kind string, params, outT S) {
-	p.write(kind)
-	p.write("(")
-	p.printParams(params)
-	p.write(")")
-	if !(tag(outT) == "id" && getId(outT) == "Any") {
-		p.sp()
-		p.write("->")
-		p.sp()
-		p.printExpr(outT)
-	}
-}
-
-func isEmptyArray(n S) bool { return tag(n) == "array" && len(n) == 1 }
-
-func (p *pp) printAnnotStmt(n S) {
-	text, wrapped, pre := asAnnot(n)
-	if pre {
-		p.out.annot(text)
-		p.printStmt(wrapped)
-		return
-	}
-	// POST: print wrapped, then trailing inline comment (no newline here).
-	p.printStmt(wrapped)
-	p.out.annotInline(text)
-}
-
-func (p *pp) printStmt(n S) {
+func docStmt(n S) *Doc {
 	switch tag(n) {
 	case "noop":
-		return
+		return Concat()
+
 	case "annot":
-		p.printAnnotStmt(n)
+		text, wrapped, pre := asAnnotAST(n)
+		if pre {
+			return Concat(annotPre(text), docStmt(wrapped))
+		}
+		// POST: trailing inline — wrap the whole stmt as a group so the comment captures the remainder.
+		return Concat(docStmt(wrapped), annotInline(text))
 
 	case "fun":
 		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
-		p.kwBlock(func() { p.callableHeader("fun", params, ret) }, body)
+		header := Concat(Text("fun("), docParams(params), Text(")"))
+		if !(tag(ret) == "id" && getId(ret) == "Any") {
+			header = Concat(header, Text(" -> "), docExpr(ret))
+		}
+		return Concat(
+			header, Text(" do"), HardLineDoc(),
+			Nest(1, docBlock(body)), HardLineDoc(),
+			Text("end"),
+		)
 
 	case "oracle":
 		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
-		p.pad()
-		p.callableHeader("oracle", params, outT)
-		if !isEmptyArray(src) {
-			p.sp()
-			p.write("from ")
-			p.printExpr(src)
+		header := Concat(Text("oracle("), docParams(params), Text(")"))
+		if !(tag(outT) == "id" && getId(outT) == "Any") {
+			header = Concat(header, Text(" -> "), docExpr(outT))
 		}
+		if !(tag(src) == "array" && len(src) == 1) {
+			header = Concat(header, Text(" from "), docExpr(src))
+		}
+		return header
 
 	case "for":
 		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
-		p.kwBlock(func() {
-			p.write("for ")
-			if isDeclPattern(tgt) {
-				if tag(tgt) == "decl" {
-					p.write("let ")
-					p.printPattern(tgt)
-				} else {
-					p.printPattern(tgt)
-				}
-			} else {
-				p.printExpr(tgt)
-			}
-			p.sp()
-			p.write("in ")
-			p.printExpr(iter)
-		}, body)
+		head := Concat(Text("for "), docForTarget(tgt), Text(" in "), docExpr(iter), Text(" do"))
+		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
 
 	case "while":
 		cond, body := n[1].(S), n[2].(S)
-		p.kwBlock(func() { p.write("while "); p.printExpr(cond) }, body)
+		head := Concat(Text("while "), docExpr(cond), Text(" do"))
+		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
 
 	case "if":
 		arms := listS(n, 1)
 		first := arms[0]
-		p.pad()
-		p.write("if ")
-		p.printExpr(first[1].(S))
-		p.sp()
-		p.write("then")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(first[2].(S)) })
-		if len(first[2].(S)) > 1 {
-			p.nl()
-		}
-		i := 1
-		for i < len(arms) && tag(arms[i]) == "pair" {
+		d := Concat(
+			Text("if "), docExpr(first[1].(S)), Text(" then"), HardLineDoc(),
+			Nest(1, docBlock(first[2].(S))),
+		)
+		for i := 1; i < len(arms) && tag(arms[i]) == "pair"; i++ {
 			arm := arms[i]
-			p.pad()
-			p.write("elif ")
-			p.printExpr(arm[1].(S))
-			p.sp()
-			p.write("then")
-			p.nl()
-			p.out.withIndent(func() { p.printBlock(arm[2].(S)) })
-			if len(arm[2].(S)) > 1 {
-				p.nl()
-			}
-			i++
+			d = Concat(d, HardLineDoc(),
+				Text("elif "), docExpr(arm[1].(S)), Text(" then"), HardLineDoc(),
+				Nest(1, docBlock(arm[2].(S))),
+			)
 		}
-		if i < len(arms) {
-			elseBlk := arms[i]
-			p.pad()
-			p.write("else")
-			p.nl()
-			p.out.withIndent(func() { p.printBlock(elseBlk) })
-			if len(elseBlk) > 1 {
-				p.nl()
-			}
+		// possible else block
+		if last := arms[len(arms)-1]; tag(last) != "pair" {
+			d = Concat(d, HardLineDoc(), Text("else"), HardLineDoc(), Nest(1, docBlock(last)))
 		}
-		p.pad()
-		p.write("end")
+		return Concat(d, HardLineDoc(), Text("end"))
 
 	case "module":
-		// ("module", nameExpr, bodyBlock)
 		nameExpr, body := n[1].(S), n[2].(S)
-		p.kwBlock(func() {
-			p.write("module ")
-			p.printExpr(nameExpr)
-		}, body)
+		return Concat(Text("module "), docExpr(nameExpr), Text(" do"), HardLineDoc(),
+			Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
 
 	case "type":
-		p.pad()
-		p.write("type ")
-		p.printExpr(n[1].(S))
+		return Concat(Text("type "), docExpr(n[1].(S)))
 
 	case "return":
-		p.kwCall("return", n[1].(S))
+		return Concat(Text("return("), docExpr(n[1].(S)), Text(")"))
 	case "break":
-		p.kwCall("break", n[1].(S))
+		return Concat(Text("break("), docExpr(n[1].(S)), Text(")"))
 	case "continue":
-		p.kwCall("continue", n[1].(S))
+		return Concat(Text("continue("), docExpr(n[1].(S)), Text(")"))
 
+	case "decl", "darr", "dobj":
+		return Concat(Text("let "), docPattern(n))
 	case "assign":
-		lhs, rhs := asAssign(n)
-		p.pad()
+		lhs, rhs := n[1].(S), n[2].(S)
 		if isDeclPattern(lhs) {
-			p.write("let ")
-			p.printPattern(lhs)
-			p.sp()
-			p.write("=")
-			p.sp()
-			p.printExpr(rhs)
-		} else {
-			p.printExpr(lhs)
-			p.sp()
-			p.write("=")
-			p.sp()
-			p.printExpr(rhs)
+			return Concat(Text("let "), docPattern(lhs), Text(" = "), docExpr(rhs))
 		}
+		return Concat(docExpr(lhs), Text(" = "), docExpr(rhs))
 
 	case "block":
-		p.pad()
-		p.write("do")
-		p.nl()
-		p.out.withIndent(func() { p.printBlock(n) })
-		if len(n) > 1 {
-			p.nl()
-		}
-		p.pad()
-		p.write("end")
+		return Concat(Text("do"), HardLineDoc(), Nest(1, docBlock(n)), HardLineDoc(), Text("end"))
 
 	default:
-		p.pad()
-		p.printExpr(n)
+		return docExpr(n)
 	}
 }
 
-func (p *pp) printBlock(n S) {
+func docBlock(n S) *Doc {
 	if tag(n) != "block" {
-		p.printStmt(n)
-		return
+		return docStmt(n)
 	}
 	kids := listS(n, 1)
+	var ds []*Doc
 	for i, k := range kids {
-		p.printStmt(k)
+		ds = append(ds, docStmt(k))
 		if i < len(kids)-1 {
-			p.nl()
+			ds = append(ds, HardLineDoc())
 		}
 	}
+	return Concat(ds...)
 }
 
-func (p *pp) printParams(arr S) {
+func docParams(arr S) *Doc {
 	if tag(arr) != "array" || len(arr) == 1 {
-		return
+		return Concat()
 	}
 	items := listS(arr, 1)
+	var parts []*Doc
 	for i, pi := range items {
-		p.write(getId(pi[1].(S)))
+		name := getId(pi[1].(S))
 		ty := pi[2].(S)
 		if !(tag(ty) == "id" && getId(ty) == "Any") {
-			p.write(": ")
-			p.printExpr(ty)
+			parts = append(parts, Concat(Text(name), Text(": "), docExpr(ty)))
+		} else {
+			parts = append(parts, Text(name))
 		}
 		if i < len(items)-1 {
-			p.write(", ")
+			parts = append(parts, Text(", "))
 		}
 	}
+	return Concat(parts...)
 }
 
-func (p *pp) printCommaList(xs []S, emit func(S)) {
-	for i, a := range xs {
-		if i > 0 {
-			p.write(", ")
-		}
-		emit(a)
-	}
+func docExprMin(n S, need int) *Doc {
+	return parenIf(need, docExpr(n), n)
 }
 
-func (p *pp) printExpr(n S) {
+func docExpr(n S) *Doc {
 	switch tag(n) {
 	case "id":
-		p.write(getId(n))
+		return Text(getId(n))
 	case "int":
-		p.write(fmt.Sprint(n[1]))
+		return Text(fmt.Sprint(n[1]))
 	case "num":
 		s := strconv.FormatFloat(n[1].(float64), 'g', -1, 64)
 		if !strings.ContainsAny(s, ".eE") {
 			s += ".0"
 		}
-		p.write(s)
+		return Text(s)
 	case "str":
-		p.write(quoteString(getStr(n)))
+		return Text(quoteString(getStr(n)))
 	case "bool":
 		if n[1].(bool) {
-			p.write("true")
-		} else {
-			p.write("false")
+			return Text("true")
 		}
+		return Text("false")
 	case "null":
-		p.write("null")
+		return Text("null")
 
 	case "unop":
-		op, rhs := asUnop(n)
+		op, rhs := n[1].(string), n[2].(S)
 		if op == "?" {
-			p.recv90(rhs)
-			p.write("?")
-			return
+			return Concat(docExprMin(rhs, 90), Text("?"))
 		}
 		if op == "not" {
-			p.write("not ")
-		} else {
-			p.write(op)
+			return Concat(Text("not "), docExprMin(rhs, 80))
 		}
-		p.printMin(rhs, 80)
+		return Concat(Text(op), docExprMin(rhs, 80))
 
 	case "binop":
-		op, l, r := asBinop(n)
-		p.bin(op, l, r)
+		op, l, r := n[1].(string), n[2].(S), n[3].(S)
+		my := 60
+		if pr, ok := binPrec[op]; ok {
+			my = pr.p
+		}
+		return Concat(docExprMin(l, my), Text(" "+op+" "), docExprMin(r, my))
 
 	case "assign":
-		l, r := asAssign(n)
-		p.printMin(l, 10)
-		p.write(" = ")
-		p.printMin(r, 10)
+		l, r := n[1].(S), n[2].(S)
+		return Concat(docExprMin(l, 10), Text(" = "), docExprMin(r, 10))
 
 	case "call":
-		recv, args := asCall(n)
-		p.recv90(recv)
-		p.write("(")
-		if len(args) > 0 {
-			p.printCommaList(args, func(s S) { p.printExpr(s) })
+		recv := n[1].(S)
+		args := listS(n, 2)
+		var argDocs []*Doc
+		for _, a := range args {
+			argDocs = append(argDocs, docExpr(a))
 		}
-		p.write(")")
+		return Concat(docExprMin(recv, 90), Text("("), Join(Text(", "), argDocs), Text(")"))
 
 	case "idx":
-		recv, ix := asIdx(n)
-		p.recv90(recv)
-		p.write("[")
-		p.printExpr(ix)
-		p.write("]")
+		recv, ix := n[1].(S), n[2].(S)
+		// Be careful with array indices: this is indexing, not array literal.
+		return Concat(docExprMin(recv, 90), Text("["), docExpr(ix), Text("]"))
 
 	case "get":
-		recv, name := asGet(n)
-		p.recv90(recv)
+		recv, name := n[1].(S), n[2].(S)[1].(string)
 		if isIdent(name) {
-			p.write("." + name)
-		} else {
-			p.write("." + quoteString(name))
+			return Concat(docExprMin(recv, 90), Text("."+name))
 		}
+		return Concat(docExprMin(recv, 90), Text("."+quoteString(name)))
 
 	case "array":
-		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
+		elems := listS(n, 1)
+		var ds []*Doc
+		for _, e := range elems {
+			ds = append(ds, docExpr(e))
+		}
+		return inlineOrMulti("[", ds, "]")
 
 	case "map":
-		p.printMapAST(n)
+		items := listS(n, 1)
+		var entries []*Doc
+		for _, pr := range items {
+			keyNode := pr[1].(S)
+			valNode := pr[2].(S)
+
+			key, kAnn := unwrapKeyAST(keyNode)
+			kPre, kPost := splitAnnotText(kAnn)
+
+			vPre, vPost := "", ""
+			if tag(valNode) == "annot" {
+				txt, wrapped, pre := asAnnotAST(valNode)
+				if pre {
+					vPre = txt
+				} else {
+					vPost = txt
+				}
+				valNode = wrapped
+			}
+			entry := kvEntry(idOrQuoted(key), docExpr(valNode), kPre, vPre, kPost, vPost)
+			entries = append(entries, entry)
+		}
+		return inlineOrMulti("{", entries, "}")
 
 	case "enum":
-		bracketed(&p.out, "Enum[", "]", listS(n, 1), func(s S) { p.printExpr(s) })
+		elems := listS(n, 1)
+		var ds []*Doc
+		for _, e := range elems {
+			ds = append(ds, docExpr(e))
+		}
+		return inlineOrMulti("Enum[", ds, "]")
 
-	case "decl":
-		p.write("let " + getId(n))
+	case "decl", "darr", "dobj":
+		return docPattern(n)
 
-	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot":
-		p.printStmt(n)
-
-	case "module":
-		p.printStmt(n)
+	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot", "module":
+		return docStmt(n)
 
 	default:
-		p.write("<" + tag(n) + ">")
+		return Text("<" + tag(n) + ">")
 	}
-}
-
-func (p *pp) printMapAST(n S) {
-	p.write("{")
-	items := listS(n, 1)
-	for i, pr := range items {
-		if i > 0 {
-			p.write(", ")
-		}
-		keyNode := pr[1].(S)
-		valNode := pr[2].(S)
-
-		// Unwrap key annotation (keys are PRE-only in the grammar).
-		key, keyAnn := unwrapKey(keyNode)
-		keyPre, keyPost := splitAnnotText(keyAnn)
-
-		// Unwrap value annotation if present.
-		valPre, valPost := "", ""
-		if tag(valNode) == "annot" {
-			txt, wrapped, pre := asAnnot(valNode)
-			if pre {
-				valPre = txt
-			} else {
-				valPost = txt
-			}
-			valNode = wrapped
-		}
-
-		// PRE annotations before the entry.
-		if keyPre != "" {
-			p.out.annot(keyPre)
-			p.pad()
-		}
-		if valPre != "" {
-			p.out.annot(valPre)
-			p.pad()
-		}
-
-		// key: value
-		p.pad()
-		keyOut(&p.out, key)
-		p.write(": ")
-		p.printExpr(valNode)
-
-		// POST annotations after value, inline.
-		if valPost != "" {
-			p.out.annotInline(valPost)
-		}
-		if keyPost != "" {
-			p.out.annotInline(keyPost)
-		}
-	}
-	p.write("}")
 }
 
 /* ---------- patterns ---------- */
@@ -861,127 +946,88 @@ func isDeclPattern(n S) bool {
 	}
 }
 
-// unwrapKey returns the bare key name and its (possibly empty) annotation text.
-// The annotation, if present, is assumed to be PRE in parsed keys, but we still
-// return the raw text to let the printers decide (POST would be treated inline).
-func unwrapKey(n S) (name string, annot string) {
-	if tag(n) == "annot" {
-		return n[2].(S)[1].(string), n[1].(S)[1].(string)
-	}
-	return n[1].(string), ""
-}
-
-func (p *pp) printPattern(n S) {
+func docPattern(n S) *Doc {
 	switch tag(n) {
 	case "decl":
-		p.write(getId(n))
+		return Text(getId(n))
 	case "darr":
-		bracketed(&p.out, "[", "]", listS(n, 1), func(s S) { p.printPattern(s) })
+		items := listS(n, 1)
+		var ds []*Doc
+		for _, it := range items {
+			ds = append(ds, docPattern(it))
+		}
+		return inlineOrMulti("[", ds, "]")
 	case "dobj":
 		items := listS(n, 1)
-		multi := false
+		// Try flat without annotations; otherwise multiline
+		var entries []*Doc
 		for _, it := range items {
-			_, ann := unwrapKey(it[1].(S))
-			if ann != "" || tag(it[2].(S)) == "annot" {
-				multi = true
-				break
-			}
-		}
-		if !multi {
-			p.write("{")
-			for i, it := range items {
-				if i > 0 {
-					p.write(", ")
-				}
-				key, _ := unwrapKey(it[1].(S))
-				keyOut(&p.out, key)
-				p.write(": ")
-				p.printPattern(it[2].(S))
-			}
-			p.write("}")
-			return
-		}
-		p.write("{")
-		p.nl()
-		p.out.withIndent(func() {
-			for i, it := range items {
-				key, ann := unwrapKey(it[1].(S))
-				keyPre, keyPost := splitAnnotText(ann)
-				if keyPre != "" {
-					p.out.annot(keyPre)
-				}
-				p.pad()
-				keyOut(&p.out, key)
-				p.write(": ")
-				val := it[2].(S)
-				if tag(val) == "annot" {
-					txt, wrapped, pre := asAnnot(val)
-					if pre {
-						p.nl()
-						p.out.annot(txt)
-						p.pad()
-						keyOut(&p.out, key)
-						p.write(": ")
-						p.printPattern(wrapped)
-					} else {
-						p.printPattern(wrapped)
-						p.out.annotInline(txt)
-					}
+			key, ann := unwrapKeyAST(it[1].(S))
+			kPre, kPost := splitAnnotText(ann)
+			val := it[2].(S)
+			vPre, vPost := "", ""
+			if tag(val) == "annot" {
+				txt, wrapped, pre := asAnnotAST(val)
+				if pre {
+					vPre = txt
 				} else {
-					p.printPattern(val)
+					vPost = txt
 				}
-				if keyPost != "" {
-					p.out.annotInline(keyPost)
-				}
-				if i < len(items)-1 {
-					p.write(",")
-				}
-				p.nl()
+				val = wrapped
 			}
-		})
-		p.pad()
-		p.write("}")
-	case "annot":
-		text, wrapped, pre := asAnnot(n)
-		if pre {
-			p.out.annot(text)
-			p.pad()
-			p.printPattern(wrapped)
-		} else {
-			p.pad()
-			p.printPattern(wrapped)
-			p.out.annotInline(text)
+			entries = append(entries, kvEntry(idOrQuoted(key), docPattern(val), kPre, vPre, kPost, vPost))
 		}
+		return inlineOrMulti("{", entries, "}")
+	case "annot":
+		text, wrapped, pre := asAnnotAST(n)
+		if pre {
+			return Concat(annotPre(text), docPattern(wrapped))
+		}
+		return Concat(docPattern(wrapped), annotInline(text))
 	default:
-		p.printExpr(n)
+		return docExpr(n)
 	}
 }
 
-/* ---------- Type pretty-printer ---------- */
+/* ---------- AST "annot" helpers ---------- */
 
-func writeType(o *out, t S) {
+// New: decode 3-ary ("annot", ("str", textOr<text>), wrapped) to (text, wrapped, pre?)
+func asAnnotAST(n S) (text string, wrapped S, pre bool) {
+	raw := n[1].(S)[1].(string)
+	preText, postText := splitAnnotText(raw)
+	if preText != "" {
+		return preText, n[2].(S), true
+	}
+	return postText, n[2].(S), false
+}
+
+/* ---------- Type pretty-printer (as Doc) ---------- */
+
+func docType(t S) *Doc {
 	if len(t) == 0 {
-		o.write("<type>")
-		return
+		return Text("<type>")
 	}
 	switch tag(t) {
 	case "id":
-		o.write(getStr(t))
+		return Text(getStr(t))
 	case "unop":
 		if t[1].(string) == "?" {
-			writeType(o, t[2].(S))
-			o.write("?")
-		} else {
-			o.write("<unop>")
+			return Concat(docType(t[2].(S)), Text("?"))
 		}
+		return Text("<unop>")
 	case "array":
 		elem := S{"id", "Any"}
 		if len(t) == 2 {
 			elem = t[1].(S)
 		}
-		bracketed(o, "[", "]", []S{elem}, func(s S) { writeType(o, s) }) // prints [T]
+		return Concat(Text("["), docType(elem), Text("]"))
 	case "enum":
-		bracketed(o, "Enum[", "]", listS(t, 1), func(s S) { writeTypeLiteral(o, s) })
+		elems := listS(t, 1)
+		var ds []*Doc
+		for _, e := range elems {
+			ds = append(ds, docTypeLiteral(e))
+		}
+		return inlineOrMulti("Enum[", ds, "]")
 	case "map":
 		type fld struct {
 			name     string
@@ -995,12 +1041,12 @@ func writeType(o *out, t S) {
 		var fs []fld
 		for _, raw := range listS(t, 1) {
 			req := raw[0].(string) == "pair!"
-			k, kAnn := unwrapKey(raw[1].(S))
+			k, kAnn := unwrapKeyAST(raw[1].(S))
 			kPre, kPost := splitAnnotText(kAnn)
 			ft := raw[2].(S)
 			vPre, vPost := "", ""
 			if len(ft) > 0 && tag(ft) == "annot" {
-				txt, inner, pre := asAnnot(ft)
+				txt, inner, pre := asAnnotAST(ft)
 				if pre {
 					vPre = txt
 				} else {
@@ -1015,104 +1061,74 @@ func writeType(o *out, t S) {
 			})
 		}
 		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
-		// Empty object type prints as {} (no space).
 		if len(fs) == 0 {
-			o.write("{}")
-			return
+			return Text("{}")
 		}
-		o.write("{")
-		o.nl()
-		o.withIndent(func() {
-			for i, f := range fs {
-				if f.kAnnPre != "" {
-					o.annot(f.kAnnPre)
-				}
-				if f.vAnnPre != "" {
-					o.annot(f.vAnnPre)
-				}
-				o.pad()
-				keyOut(o, f.name)
-				if f.req {
-					o.write("!")
-				}
-				o.write(": ")
-				writeType(o, f.typ)
-				if f.vAnnPost != "" {
-					o.annotInline(f.vAnnPost)
-				}
-				if f.kAnnPost != "" {
-					o.annotInline(f.kAnnPost)
-				}
-				if i < len(fs)-1 {
-					o.write(",")
-				}
-				o.nl()
+		var entries []*Doc
+		for _, f := range fs {
+			key := idOrQuoted(f.name)
+			if f.req {
+				key = Concat(key, Text("!"))
 			}
-		})
-		o.pad()
-		o.write("}")
+			entries = append(entries, kvEntry(key, docType(f.typ), f.kAnnPre, f.vAnnPre, f.kAnnPost, f.vAnnPost))
+		}
+		return inlineOrMulti("{", entries, "}")
 	case "binop":
 		if t[1].(string) == "->" && len(t) >= 4 {
 			params, ret := flattenArrow(t)
-			o.write("(")
-			for i := range params {
-				if i > 0 {
-					o.write(", ")
-				}
-				writeType(o, params[i])
+			var ps []*Doc
+			for _, p := range params {
+				ps = append(ps, docType(p))
 			}
-			o.write(") -> ")
-			writeType(o, ret)
-		} else {
-			o.write("<binop>")
+			return Concat(Text("("), Join(Text(", "), ps), Text(") -> "), docType(ret))
 		}
+		return Text("<binop>")
 	case "annot":
-		txt, wrapped, pre := asAnnot(t)
+		txt, wrapped, pre := asAnnotAST(t)
 		if pre {
-			o.annot(txt)
-			writeType(o, wrapped)
-		} else {
-			writeType(o, wrapped)
-			o.annotInline(txt)
+			return Concat(annotPre(txt), docType(wrapped))
 		}
+		return Concat(docType(wrapped), annotInline(txt))
 	default:
-		o.write("<type>")
+		return Text("<type>")
 	}
 }
 
-func writeTypeLiteral(o *out, lit S) {
+func docTypeLiteral(lit S) *Doc {
 	switch tag(lit) {
 	case "null":
-		o.write("null")
+		return Text("null")
 	case "bool":
 		if lit[1].(bool) {
-			o.write("true")
-		} else {
-			o.write("false")
+			return Text("true")
 		}
+		return Text("false")
 	case "int":
-		o.write(fmt.Sprint(lit[1]))
+		return Text(fmt.Sprint(lit[1]))
 	case "num":
-		o.write(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
+		return Text(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
 	case "str":
-		o.write(quoteString(getStr(lit)))
+		return Text(quoteString(getStr(lit)))
 	case "array":
-		bracketed(o, "[", "]", listS(lit, 1), func(s S) { writeTypeLiteral(o, s) })
-	case "map":
-		o.write("{")
 		items := listS(lit, 1)
-		for i, pr := range items {
-			if i > 0 {
-				o.write(", ")
-			}
-			k := pr[1].(S)[1].(string)
-			keyOut(o, k)
-			o.write(": ")
-			writeTypeLiteral(o, pr[2].(S))
+		var ds []*Doc
+		for _, s := range items {
+			ds = append(ds, docTypeLiteral(s))
 		}
-		o.write("}")
+		return inlineOrMulti("[", ds, "]")
+	case "map":
+		items := listS(lit, 1)
+		if len(items) == 0 {
+			return Text("{}")
+		}
+		var parts []*Doc
+		for _, pr := range items {
+			k := pr[1].(S)[1].(string)
+			parts = append(parts, kvEntry(idOrQuoted(k), docTypeLiteral(pr[2].(S)), "", "", "", ""))
+		}
+		return inlineOrMulti("{", parts, "}")
 	default:
-		o.write("<lit>")
+		return Text("<lit>")
 	}
 }
 
@@ -1125,260 +1141,107 @@ func flattenArrow(t S) (params []S, ret S) {
 	return
 }
 
-/* ---------- Runtime value pretty-printer ---------- */
+/* ---------- Runtime value pretty-printer (as Doc) ---------- */
 
-// Single-line candidate for a map. Respects PRE/POST:
-// - PRE in key or value → force multi-line (return "").
-// - POST allowed inline (appended after value).
-func mapOneLineMO(keys []string, mo *MapObject) string {
-	if len(keys) == 0 {
-		return "{}"
+func numString(f float64) string {
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
 	}
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		kAnn := ""
-		if ann, ok := mo.KeyAnn[k]; ok {
-			kAnn = ann
-		}
-		kPre, kPost := splitAnnotText(kAnn)
-		if kPre != "" {
-			return ""
-		}
-		v := mo.Entries[k]
-		if isValueMultiline(v) { // honors PRE as multiline, POST ok
-			return ""
-		}
-		key := k
-		if !isIdent(key) {
-			key = quoteString(key)
-		}
-		var b strings.Builder
-		o := out{b: &b}
-		// Render value without its PRE/POST annotations here;
-		// attach POST inline after the value if present.
-		vPre, vPost := splitAnnotText(v.Annot)
-		if vPre != "" {
-			return ""
-		}
-		vNoAnn := v
-		vNoAnn.Annot = ""
-		writeValue(&o, vNoAnn)
-		valStr := b.String()
-		if vPost != "" {
-			valStr += " # " + oneLine(vPost)
-		}
-		if kPost != "" {
-			valStr += " # " + oneLine(kPost)
-		}
-		parts = append(parts, key+": "+valStr)
-	}
-	return "{ " + strings.Join(parts, ", ") + " }"
+	return s
 }
 
-func writeValue(o *out, v Value) {
-	// PRE vs POST for the value itself.
+func docValue(v Value) *Doc {
 	pre, post := splitAnnotText(v.Annot)
+	var head []*Doc
 	if pre != "" {
-		o.annot(pre)
-		o.pad()
+		head = append(head, annotPre(pre))
 	}
+	body := docValueNoAnn(v)
+	if post != "" {
+		body = Concat(body, annotInline(post))
+	}
+	return Concat(append(head, body)...)
+}
 
+func docValueNoAnn(v Value) *Doc {
 	switch v.Tag {
 	case VTNull:
-		o.write("null")
+		return Text("null")
 	case VTBool:
 		if v.Data.(bool) {
-			o.write("true")
-		} else {
-			o.write("false")
+			return Text("true")
 		}
+		return Text("false")
 	case VTInt:
-		o.write(strconv.FormatInt(v.Data.(int64), 10))
+		return Text(strconv.FormatInt(v.Data.(int64), 10))
 	case VTNum:
-		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		o.write(s)
+		return Text(numString(v.Data.(float64)))
 	case VTStr:
-		o.write(quoteString(v.Data.(string)))
+		return Text(quoteString(v.Data.(string)))
 	case VTArray:
 		xs := v.Data.([]Value)
-		if oneline := arrayOneLine(xs); oneline != "" && len(oneline) <= MaxInlineWidth {
-			o.write(oneline)
-			if post != "" {
-				o.annotInline(post)
-			}
-			return
+		if len(xs) == 0 {
+			return Text("[]")
 		}
-		o.write("[")
-		o.nl()
-		o.withIndent(func() {
-			for i, it := range xs {
-				itPre, itPost := splitAnnotText(it.Annot)
-				if itPre != "" {
-					o.annot(itPre)
-				}
-				o.pad()
-				itNoAnn := it
-				itNoAnn.Annot = ""
-				writeValue(o, itNoAnn)
-				if itPost != "" {
-					o.annotInline(itPost)
-				}
-				if i < len(xs)-1 {
-					o.write(",")
-				}
-				o.nl()
+		var elems []*Doc
+		for _, it := range xs {
+			pre, post := splitAnnotText(it.Annot)
+			var d *Doc = docValueNoAnn(Value{Tag: it.Tag, Data: it.Data}) // value without its own annots
+			if pre != "" {
+				// force element on its own line with pre above it
+				elems = append(elems, Concat(annotPre(pre), d, annotInline(post)))
+			} else {
+				elems = append(elems, Concat(d, annotInline(post)))
 			}
-		})
-		o.pad()
-		o.write("]")
+		}
+		return inlineOrMulti("[", elems, "]")
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		keys := append([]string(nil), mo.Keys...)
 		sort.Strings(keys)
-		if oneline := mapOneLineMO(keys, mo); oneline != "" && len(oneline) <= MaxInlineWidth {
-			o.write(oneline)
-			if post != "" {
-				o.annotInline(post)
-			}
-			return
-		}
 		if len(keys) == 0 {
-			o.write("{}")
-			return
+			return Text("{}")
 		}
-		o.write("{")
-		o.nl()
-		o.withIndent(func() {
-			for i, k := range keys {
-				kAnn := ""
-				if ann, ok := mo.KeyAnn[k]; ok {
-					kAnn = ann
-				}
-				kPre, kPost := splitAnnotText(kAnn)
-				vv := mo.Entries[k]
-				vPre, vPost := splitAnnotText(vv.Annot)
-
-				// Key PRE before entry.
-				if kPre != "" {
-					o.annot(kPre)
-				}
-
-				o.pad()
-				keyOut(o, k)
-				if vPre == "" {
-					// Inline value.
-					o.write(": ")
-					vNoAnn := vv
-					vNoAnn.Annot = ""
-					writeValue(o, vNoAnn)
-					// POST inline (value, then key).
-					if vPost != "" {
-						o.annotInline(vPost)
-					}
-					if kPost != "" {
-						o.annotInline(kPost)
-					}
-				} else {
-					// Value has PRE: place it between the key and the value.
-					o.write(":")
-					o.nl()
-					o.withIndent(func() {
-						o.annot(vPre)
-						o.pad()
-						vNoAnn := vv
-						vNoAnn.Annot = ""
-						writeValue(o, vNoAnn)
-						// POST inline (value, then key).
-						if vPost != "" {
-							o.annotInline(vPost)
-						}
-						if kPost != "" {
-							o.annotInline(kPost)
-						}
-					})
-				}
-
-				if i < len(keys)-1 {
-					o.write(",")
-				}
-				o.nl()
-			}
-		})
-		o.pad()
-		o.write("}")
+		var entries []*Doc
+		for _, k := range keys {
+			kAnn := mo.KeyAnn[k]
+			kPre, kPost := splitAnnotText(kAnn)
+			vv := mo.Entries[k]
+			vPre, vPost := splitAnnotText(vv.Annot)
+			entry := kvEntry(idOrQuoted(k), docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}), kPre, vPre, kPost, vPost)
+			entries = append(entries, entry)
+		}
+		return inlineOrMulti("{", entries, "}")
 	case VTFun:
 		if f, ok := v.Data.(*Fun); ok && f != nil {
 			if f.IsOracle {
-				cand := "<oracle: " + inlineType(f.ReturnType) + ">"
-				if len(cand) <= MaxInlineWidth {
-					o.write(cand)
-				} else {
-					o.write("<oracle: ")
-					o.write(FormatType(f.ReturnType))
-					o.write(">")
-				}
-				break
+				inner := Concat(Text("<oracle: "), docType(f.ReturnType), Text(">"))
+				return Group(inner)
 			}
-
-			var sb strings.Builder
-			sb.WriteString("<fun: ")
+			// Build `<fun: a:T -> b:U -> R>` with automatic break if needed.
+			var chain []*Doc
 			if len(f.ParamTypes) == 0 {
-				sb.WriteString("_:Null")
+				chain = append(chain, Text("_:Null"))
 			} else {
 				for i := range f.ParamTypes {
 					if i > 0 {
-						sb.WriteString(" -> ")
+						chain = append(chain, Text(" -> "))
 					}
 					name := "_"
 					if i < len(f.Params) && f.Params[i] != "" {
 						name = f.Params[i]
 					}
-					sb.WriteString(name)
-					sb.WriteString(":")
-					sb.WriteString(inlineType(f.ParamTypes[i]))
+					chain = append(chain, Text(name), Text(":"), docType(f.ParamTypes[i]))
 				}
 			}
-			sb.WriteString(" -> ")
-			sb.WriteString(inlineType(f.ReturnType))
-			sb.WriteString(">")
-
-			cand := sb.String()
-			if len(cand) <= MaxInlineWidth {
-				o.write(cand)
-			} else {
-				var long strings.Builder
-				long.WriteString("<fun: ")
-				if len(f.ParamTypes) == 0 {
-					long.WriteString("_:Null")
-				} else {
-					for i := range f.ParamTypes {
-						if i > 0 {
-							long.WriteString(" -> ")
-						}
-						name := "_"
-						if i < len(f.Params) && f.Params[i] != "" {
-							name = f.Params[i]
-						}
-						long.WriteString(name)
-						long.WriteString(":")
-						long.WriteString(FormatType(f.ParamTypes[i]))
-					}
-				}
-				long.WriteString(" -> ")
-				long.WriteString(FormatType(f.ReturnType))
-				long.WriteString(">")
-				o.write(long.String())
-			}
-		} else {
-			o.write("<fun>")
+			chain = append(chain, Text(" -> "), docType(f.ReturnType))
+			return Group(Concat(Text("<fun: "), Concat(chain...), Text(">")))
 		}
-
+		return Text("<fun>")
 	case VTType:
-		typ := inlineType(typeAst(v.Data))
-		o.write("<type: " + typ + ">")
+		t := typeAst(v.Data)
+		return Group(Concat(Text("<type: "), docType(t), Text(">")))
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
@@ -1388,96 +1251,27 @@ func writeValue(o *out, v Value) {
 			}
 			name = "<module: " + disp + ">"
 		}
-		o.write(name)
+		return Text(name)
 	default:
-		s := "<unknown>"
 		if v.Tag == VTHandle {
 			if h, ok := v.Data.(*Handle); ok {
-				s = "<handle: " + h.Kind + ">"
-			} else {
-				s = "<handle>"
+				return Text("<handle: " + h.Kind + ">")
 			}
+			return Text("<handle>")
 		}
-		o.write(s)
-	}
-
-	// POST (inline) for the value itself.
-	if post != "" {
-		o.annotInline(post)
+		return Text("<unknown>")
 	}
 }
 
-/* ---------- single-line candidates ---------- */
-
-func arrayOneLine(xs []Value) string {
-	if len(xs) == 0 {
-		return "[]"
+// docForTarget prints the 'for' loop target:
+// - If it's a declaration pattern: "let <pattern>" for decl, or the pattern itself for obj/arr.
+// - Otherwise, it's a regular expression target.
+func docForTarget(tgt S) *Doc {
+	if isDeclPattern(tgt) {
+		if tag(tgt) == "decl" {
+			return Concat(Text("let "), docPattern(tgt))
+		}
+		return docPattern(tgt)
 	}
-	parts := make([]string, 0, len(xs))
-	for _, it := range xs {
-		// PRE annotation in any element forces multiline.
-		pre, post := splitAnnotText(it.Annot)
-		if pre != "" || isValueMultiline(it) {
-			return ""
-		}
-		// Render element without ANN and append inline POST if present.
-		var b strings.Builder
-		o := out{b: &b}
-		itNoAnn := it
-		itNoAnn.Annot = ""
-		writeValue(&o, itNoAnn)
-		elem := b.String()
-		if post != "" {
-			elem += " # " + oneLine(post)
-		}
-		parts = append(parts, elem)
-	}
-	return "[ " + strings.Join(parts, ", ") + " ]"
-}
-
-func isValueMultiline(v Value) bool {
-	// PRE annotation on the value itself forces multiline.
-	pre, _ := splitAnnotText(v.Annot)
-	if pre != "" {
-		return true
-	}
-	switch v.Tag {
-	case VTArray:
-		xs := v.Data.([]Value)
-		if len(xs) == 0 {
-			return false
-		}
-		for _, it := range xs {
-			// Any PRE in nested items forces multiline.
-			ipre, _ := splitAnnotText(it.Annot)
-			if ipre != "" || isValueMultiline(it) {
-				return true
-			}
-		}
-		line := arrayOneLine(xs)
-		return line == "" || len(line) > MaxInlineWidth
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		if len(mo.Keys) == 0 {
-			return false
-		}
-		keys := append([]string(nil), mo.Keys...)
-		sort.Strings(keys)
-		line := mapOneLineMO(keys, mo)
-		return line == "" || len(line) > MaxInlineWidth
-	case VTType:
-		t := typeAst(v.Data)
-		return len(t) > 0 && tag(t) == "map" && len(t) > 1
-	default:
-		return false
-	}
-}
-
-func inlineType(t S) string {
-	// Flatten multi-line type text and normalize whitespace so maps render like
-	// "{ age: Int, name: Str }" rather than "{  age: Int,  name: Str }".
-	s := strings.ReplaceAll(FormatType(t), "\t", " ")
-	s = oneLine(s)
-	s = strings.Join(strings.Fields(s), " ")
-	return s
+	return docExpr(tgt)
 }

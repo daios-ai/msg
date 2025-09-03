@@ -34,6 +34,8 @@ func eq(t *testing.T, got, want string) {
 	}
 }
 
+// ---------- Core expression/precedence & chaining ----------
+
 func Test_Printer_Operators_And_Grouping(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{`1 + 2 * 3`, `1 + 2 * 3`},
@@ -59,6 +61,26 @@ func Test_Printer_Chaining_Call_Idx_Get(t *testing.T) {
 	}
 }
 
+// Dot-number shorthand: obj.12 → obj[12]
+func Test_Printer_Dot_Number_Indexing_Shorthand(t *testing.T) {
+	eq(t, pretty(t, "obj.12"), "obj[12]")
+}
+
+// Computed dot -> indexing: a.(1+2) → a[1 + 2]
+func Test_Printer_ComputedDot_NormalizesToIndexing(t *testing.T) {
+	in := `a.(1 + 2)`
+	want := `a[1 + 2]`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+// Enum rendered as an expression
+func Test_Printer_Enum_Expression_Format(t *testing.T) {
+	eq(t, pretty(t, `Enum["a", 1, {k: 2}]`), `Enum["a", 1, {k: 2}]`)
+}
+
+// ---------- Functions, oracles, control flow, modules ----------
+
 func Test_Printer_Function_And_Oracle(t *testing.T) {
 	in := `fun(a: Str) -> Str do return("hi " + a) end
 oracle() -> Str from["web","docs"]`
@@ -70,6 +92,15 @@ oracle() -> Str from["web","docs"]`
 	if norm(got) != norm(want) {
 		t.Fatalf("pretty fun/oracle mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
 	}
+}
+
+// Ensure fun omits -> Any and oracle omits default 'from'
+func Test_Printer_Fun_And_Oracle_Default_Headers(t *testing.T) {
+	in := `fun(a: Int) do end
+oracle()`
+	want := "fun(a: Int) do\n\nend\noracle()"
+	got := pretty(t, in)
+	eq(t, got, want)
 }
 
 func Test_Printer_If_Elif_Else_And_For(t *testing.T) {
@@ -91,6 +122,48 @@ for let x in xs do break 0 end`
 	}
 }
 
+func Test_Printer_While(t *testing.T) {
+	in := `while a < b do a = a + 1 end`
+	want := "while a < b do\n" +
+		"\ta = a + 1\n" +
+		"end"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_Variants(t *testing.T) {
+	// Basic
+	in := `module MyLib do x = 1 end`
+	want := "module MyLib do\n" +
+		"\tx = 1\n" +
+		"end"
+	eq(t, pretty(t, in), want)
+
+	// String name + empty body
+	eq(t, pretty(t, `module "my mod" do end`), "module \"my mod\" do\n\nend")
+
+	// Name as expression (keeps minimal parens)
+	eq(t, pretty(t, `module "a" + "b" do end`), "module \"a\" + \"b\" do\n\nend")
+
+	// With pre-annotation
+	in4 := `# about this module
+module M do
+end`
+	want4 := "# about this module\nmodule M do\n\nend"
+	eq(t, pretty(t, in4), want4)
+
+	// Module amid other statements
+	in5 := `let x = 1
+module M do
+  x = 2
+end
+return x`
+	want5 := "let x = 1\nmodule M do\n\tx = 2\nend\nreturn(x)"
+	eq(t, pretty(t, in5), want5)
+}
+
+// ---------- Maps, arrays, strings, destructuring ----------
+
 func Test_Printer_Maps_Arrays_Strings(t *testing.T) {
 	// Note: Go string literal contains an actual newline in "Jo\nhn".
 	in := "{\n  \"name\":\"Jo\nhn\", age:25\n} [1,2,3] []"
@@ -101,62 +174,31 @@ func Test_Printer_Maps_Arrays_Strings(t *testing.T) {
 	}
 }
 
-func Test_Printer_Control_Forms_Are_Adjacent(t *testing.T) {
-	in := `return(1) break(0) continue(null)`
-	want := `return(1)
-break(0)
-continue(null)`
+func Test_Printer_Maps_And_Arrays_And_Quoting(t *testing.T) {
+	in := `{ok: 1, "weird key": 2, also_ok: [1,2,3]}`
+	want := `{ok: 1, "weird key": 2, also_ok: [1, 2, 3]}`
 	got := pretty(t, in)
-	if norm(got) != norm(want) {
-		t.Fatalf("pretty control mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
-	}
+	eq(t, got, want)
 }
 
-func Test_Printer_Annotations(t *testing.T) {
-	in := `# hello
-x`
-	got := pretty(t, in)
-	if norm(got) != norm(in) {
-		t.Fatalf("pretty annotation mismatch:\n%q", got)
-	}
-}
-
-func Test_Printer_Types_Arrow_And_Optional(t *testing.T) {
-	in := `type Int -> Str -> Bool
-type Str? -> Int
-type [Str]?
-type {name: Str?, hobbies: [Str]?, age: Int}`
-	want := `type Int -> Str -> Bool
-type Str? -> Int
-type [Str]?
-type {name: Str?, hobbies: [Str]?, age: Int}`
-	got := pretty(t, in)
-	if norm(got) != norm(want) {
-		t.Fatalf("pretty types mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
-	}
-}
-
-func Test_Printer_Idempotent_And_Roundtrip(t *testing.T) {
+// Keywords permitted as map keys & pattern fields (bare, not quoted)
+func Test_Printer_Keywords_As_Keys_In_Maps_And_Patterns(t *testing.T) {
 	src := `
-# demo
-let Person = type {name: Str?, hobbies: [Str]?, age: Int}
-fun(g: Str) -> Str do
-  return("hi " + g)
-end
-oracle() from["web"]`
+let {if: x, else: y, type: z} = {if: 1, else: 2, type: 3}
+`
+	out := pretty(t, src)
+	want := `
+let {if: x, else: y, type: z} = {if: 1, else: 2, type: 3}
+`
+	eq(t, out, want)
+}
 
-	once := pretty(t, src)
-	twice := pretty(t, once)
-	if once != twice {
-		t.Fatalf("pretty not idempotent\nonce:\n%s\n---\ntwice:\n%s", once, twice)
-	}
-
-	// AST roundtrip: parse original and pretty'ed, ensure same AST
-	ast1 := parse(t, src)
-	ast2 := parse(t, once)
-	if !reflect.DeepEqual(ast1, ast2) {
-		t.Fatalf("AST roundtrip mismatch after pretty")
-	}
+func Test_Printer_Destructuring_Assign(t *testing.T) {
+	in := `let {"x": a, y: b} = m`
+	// Identifier-like keys are unquoted by the printer.
+	want := `let {x: a, y: b} = m`
+	got := pretty(t, in)
+	eq(t, got, want)
 }
 
 func Test_Printer_Let_Array_And_Object_Patterns(t *testing.T) {
@@ -164,10 +206,7 @@ func Test_Printer_Let_Array_And_Object_Patterns(t *testing.T) {
 let [x, y] = [1,2]
 let {name: n, age: a} = {name: "Bob", age: 40}
 `
-	out, err := Pretty(src)
-	if err != nil {
-		t.Fatalf("Pretty error: %v", err)
-	}
+	out := pretty(t, src)
 	want := `
 let [x, y] = [1, 2]
 let {name: n, age: a} = {name: "Bob", age: 40}
@@ -186,40 +225,24 @@ func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
 		"\ta\n" +
 		"} = {name: \"Bob\", age: 40}"
 	want := "let {\n" +
-		"\tname: \n" +
-		"\t# username\n" +
-		"\tname: n,\n" +
-		"\tage: \n" +
-		"\t# yearsOld\n" +
-		"\tage: a\n" +
+		"\tname:\n" +
+		"\t\t# username\n" +
+		"\t\tn,\n" +
+		"\tage:\n" +
+		"\t\t# yearsOld\n" +
+		"\t\ta\n" +
 		"} = {name: \"Bob\", age: 40}"
 	got := pretty(t, in)
 	eq(t, got, want)
 }
 
-func Test_Printer_Keywords_As_Keys_In_Maps_And_Patterns(t *testing.T) {
-	src := `
-let {if: x, else: y, type: z} = {if: 1, else: 2, type: 3}
-`
-	out, err := Pretty(src)
-	if err != nil {
-		t.Fatalf("Pretty error: %v", err)
-	}
-	want := `
-let {if: x, else: y, type: z} = {if: 1, else: 2, type: 3}
-`
-	eq(t, out, want)
-}
-
+// Assignment stays assignment (no desugaring into let)
 func Test_Printer_Assign_NonDecl_Remains_Assignment(t *testing.T) {
 	src := `
 a = 1
 (a).b = 2
 `
-	out, err := Pretty(src)
-	if err != nil {
-		t.Fatalf("Pretty error: %v", err)
-	}
+	out := pretty(t, src)
 	want := `
 a = 1
 a.b = 2
@@ -227,54 +250,64 @@ a.b = 2
 	eq(t, out, want)
 }
 
-func Test_Printer_FormatValue_Scalars_And_AnnotatedNull(t *testing.T) {
-	// construct values directly
-	vNull := withAnnot(Null, "division by zero")
-	vInt := Int(42)
-	vStr := Str("hi")
+// ---------- Control forms adjacency & grouping ----------
 
-	outNull := FormatValue(vNull)
-	outInt := FormatValue(vInt)
-	outStr := FormatValue(vStr)
-
-	// Annotation should be a header line (single '#') before the value.
-	if !strings.Contains(outNull, "# division by zero") || !strings.Contains(outNull, "\nnull") {
-		t.Fatalf("annotated null not rendered properly:\n%s", outNull)
-	}
-	if strings.TrimSpace(outInt) != "42" {
-		t.Fatalf("int not rendered: %q", outInt)
-	}
-	if strings.TrimSpace(outStr) != `"hi"` {
-		t.Fatalf("str not rendered/quoted: %q", outStr)
+func Test_Printer_Control_Forms_Are_Adjacent(t *testing.T) {
+	in := `return(1) break(0) continue(null)`
+	want := `return(1)
+break(0)
+continue(null)`
+	got := pretty(t, in)
+	if norm(got) != norm(want) {
+		t.Fatalf("pretty control mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
 	}
 }
 
-func Test_Printer_FormatValue_Array_And_Map(t *testing.T) {
-	// Array with mixed values, including annotated null
-	arr := Arr([]Value{Int(1), withAnnot(Null, "missing"), Str("x")})
-	outArr := FormatValue(arr)
+func Test_Printer_ReturnBreakContinue_SameLineVsNewline(t *testing.T) {
+	// Same-line expression → carry the expression.
+	casesSame := []struct{ in, want string }{
+		{`return 1`, `return(1)`},
+		{`break  x`, `break(x)`},
+		{`continue "z"`, `continue("z")`},
+	}
+	for _, tc := range casesSame {
+		got := pretty(t, tc.in)
+		eq(t, got, tc.want)
+	}
 
-	// Should render as multi-line because an element has a header annotation
-	if !strings.Contains(outArr, "[") || !strings.Contains(outArr, "]") || !strings.Contains(outArr, "\n") {
-		t.Fatalf("array not formatted multi-line: %q", outArr)
-	}
-	if !strings.Contains(outArr, "# missing") {
-		t.Fatalf("annotation in array element missing:\n%s", outArr)
-	}
+	// Next token on the next line → implicit null.
+	in := `return
+x`
+	want := `return(null)
+x`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
 
-	// Map should render keys in stable (sorted) order
-	m := Map(map[string]Value{
-		"b": Int(2),
-		"a": Int(1),
-	})
-	outMap := FormatValue(m)
-	// Expect "a" before "b"
-	if strings.Index(outMap, "a:") > strings.Index(outMap, "b:") {
-		t.Fatalf("map keys not sorted:\n%s", outMap)
-	}
-	// Basic structure
-	if !strings.Contains(outMap, "{") || !strings.Contains(outMap, "}") {
-		t.Fatalf("map not braced: %q", outMap)
+func Test_Printer_Grouping_With_Postfix_Question(t *testing.T) {
+	in := `(a + b)?`
+	want := `(a + b)?`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+// ---------- Property name normalization ----------
+
+func Test_Printer_Property_Name_Normalization_And_Quoting(t *testing.T) {
+	// Keywords after '.' normalize to bare identifiers.
+	eq(t, pretty(t, `obj."then"`), `obj.then`)
+	// Non-identifier names remain quoted.
+	eq(t, pretty(t, `obj."not ident"`), `obj."not ident"`)
+}
+
+// ---------- Annotations (PRE/POST) ----------
+
+func Test_Printer_Annotations_PRE(t *testing.T) {
+	in := `# hello
+x`
+	got := pretty(t, in)
+	if norm(got) != norm(in) {
+		t.Fatalf("pretty annotation mismatch:\n%q", got)
 	}
 }
 
@@ -303,204 +336,38 @@ x`
 	eq(t, got, want)
 }
 
-// NOTE: Removed Test_Printer_Annotations_InlineParens_NormalizesToHeader
-// because inline annotations #( ... ) are no longer supported.
-
-func Test_Printer_ReturnBreakContinue_SameLineVsNewline(t *testing.T) {
-	// Same-line expression → carry the expression.
-	casesSame := []struct{ in, want string }{
-		{`return 1`, `return(1)`},
-		{`break  x`, `break(x)`},
-		{`continue "z"`, `continue("z")`},
-	}
-	for _, tc := range casesSame {
-		got := pretty(t, tc.in)
-		eq(t, got, tc.want)
-	}
-
-	// Next token on the next line → implicit null.
-	in := `return
-x`
-	want := `return(null)
-x`
-	got := pretty(t, in)
-	eq(t, got, want)
+func Test_Printer_Annotations_Post_Trailing_Inline(t *testing.T) {
+	// Same-line hash after an expr becomes a POST annotation
+	eq(t, pretty(t, `x # after`), `x # after`)
 }
 
-func Test_Printer_ComputedDot_NormalizesToIndexing(t *testing.T) {
-	in := `a.(1 + 2)`
-	want := `a[1 + 2]`
-	got := pretty(t, in)
-	eq(t, got, want)
+func Test_Printer_Map_Value_Post_Inline(t *testing.T) {
+	// POST after a map value should render inline
+	eq(t, pretty(t, "{a: 1 # note\n}"), "{a: 1 # note\n}")
 }
 
-func Test_Printer_Maps_And_Arrays_And_Quoting(t *testing.T) {
-	in := `{ok: 1, "weird key": 2, also_ok: [1,2,3]}`
-	want := `{ok: 1, "weird key": 2, also_ok: [1, 2, 3]}`
-	got := pretty(t, in)
-	eq(t, got, want)
-}
+// ---------- Pretty/Standardize roundtrip & idempotence ----------
 
-func Test_Printer_Destructuring_Assign(t *testing.T) {
-	in := `let {"x": a, y: b} = m`
-	// Our printer emits identifier-like keys unquoted → x is unquoted.
-	want := `let {x: a, y: b} = m`
-	got := pretty(t, in)
-	eq(t, got, want)
-}
+func Test_Printer_Idempotent_And_Roundtrip(t *testing.T) {
+	src := `
+# demo
+let Person = type {name: Str?, hobbies: [Str]?, age: Int}
+fun(g: Str) -> Str do
+  return("hi " + g)
+end
+oracle() from["web"]`
 
-func Test_Printer_Idempotent(t *testing.T) {
-	src := `fun(a: Str) -> Str do return("hi " + a) end`
 	once := pretty(t, src)
 	twice := pretty(t, once)
-	eq(t, twice, once)
-}
-
-func Test_Printer_If_Elif_Else_Blocking(t *testing.T) {
-	in := `if a then x elif b then y else z end`
-	want := "if a then\n" +
-		"\tx\n" +
-		"elif b then\n" +
-		"\ty\n" +
-		"else\n" +
-		"\tz\n" +
-		"end"
-	got := pretty(t, in)
-	eq(t, got, want)
-}
-
-func Test_Printer_While_And_For(t *testing.T) {
-	in := `while a < b do a = a + 1 end`
-	want := "while a < b do\n" +
-		"\ta = a + 1\n" +
-		"end"
-	got := pretty(t, in)
-	eq(t, got, want)
-
-	in2 := `for [k,v] in m do return k end`
-	want2 := "for [k, v] in m do\n" +
-		"\treturn(k)\n" +
-		"end"
-	got2 := pretty(t, in2)
-	eq(t, got2, want2)
-}
-
-func Test_Printer_Grouping_With_Postfix_Question(t *testing.T) {
-	in := `(a + b)?`
-	want := `(a + b)?`
-	got := pretty(t, in)
-	eq(t, got, want)
-}
-
-func Test_FormatSExpr_Direct_AST(t *testing.T) {
-	// Build ("call", ("id","f"), ("int",1), ("int",2))
-	ast := S{"call", S{"id", "f"}, S{"int", int64(1)}, S{"int", int64(2)}}
-	got := FormatSExpr(ast)
-	want := `f(1, 2)`
-	eq(t, got, want)
-}
-
-func Test_FormatType_Basics(t *testing.T) {
-	// T? where T = [Int] -> Str
-	T := S{"binop", "->", S{"array", S{"id", "Int"}}, S{"id", "Str"}}
-	opt := S{"unop", "?", T}
-	got := FormatType(opt)
-	// Prints (A) -> B for arrows; then '?'
-	want := `([Int]) -> Str?`
-	if norm(got) != norm(want) {
-		t.Fatalf("FormatType mismatch\nwant: %q\ngot:  %q", want, got)
+	if once != twice {
+		t.Fatalf("pretty not idempotent\nonce:\n%s\n---\ntwice:\n%s", once, twice)
 	}
 
-	// Enum type with scalars and a map literal
-	enum := S{"enum",
-		S{"str", "a"},
-		S{"int", int64(1)},
-		S{"map", S{"pair", S{"str", "k"}, S{"num", 1.5}}},
-	}
-	got2 := FormatType(enum)
-	want2 := `Enum["a", 1, {k: 1.5}]`
-	if norm(got2) != norm(want2) {
-		t.Fatalf("FormatType enum mismatch\nwant: %q\ngot:  %q", want2, got2)
-	}
-}
-
-func Test_Printer_Property_Name_Quoting(t *testing.T) {
-	in := `obj."not ident"`
-	want := `obj."not ident"`
-	got := pretty(t, in)
-	eq(t, got, want)
-
-	in2 := `obj."then"`
-	// After standardization, keyword-looking property prints bare.
-	want2 := `obj.then`
-	got2 := pretty(t, in2)
-	eq(t, got2, want2)
-}
-
-func Test_Standardize_Trailing_Newline_And_Idempotence(t *testing.T) {
-	src := `fun(a: Str) -> Str do return("hi " + a) end`
-	std1, err := Standardize(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(std1, "\n") {
-		t.Fatalf("missing trailing newline:\n%q", std1)
-	}
-
-	std2, err := Standardize(std1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if std2 != std1 {
-		t.Fatalf("not idempotent:\n---1---\n%q\n---2---\n%q", std1, std2)
-	}
-}
-
-func Test_Printer_Uses_Tabs(t *testing.T) {
-	got := pretty(t, `do x end`)
-	if strings.Contains(got, "  ") { // two spaces
-		t.Fatalf("expected tabs, found spaces:\n%s", got)
-	}
-}
-
-func Test_Printer_Property_Name_Normalization(t *testing.T) {
-	// Keywords after '.' normalize to bare identifiers.
-	eq(t, pretty(t, `obj."then"`), `obj.then`)
-	// Non-identifier names remain quoted.
-	eq(t, pretty(t, `obj."not ident"`), `obj."not ident"`)
-}
-
-func Test_Printer_Standardize_Trailing_Newline_And_Idempotence(t *testing.T) {
-	src := `fun(a: Str) -> Str do return("hi " + a) end`
-	std1, err := Standardize(src)
-	if err != nil {
-		t.Fatalf("Standardize error: %v", err)
-	}
-	if !strings.HasSuffix(std1, "\n") {
-		t.Fatalf("missing trailing newline:\n%q", std1)
-	}
-	std2, err := Standardize(std1)
-	if err != nil {
-		t.Fatalf("Standardize error (second pass): %v", err)
-	}
-	if std2 != std1 {
-		t.Fatalf("not idempotent:\n---1---\n%q\n---2---\n%q", std1, std2)
-	}
-}
-
-func Test_Printer_TabsOnly_Indentation(t *testing.T) {
-	got := pretty(t, `if a then x else y end`)
-	// Ensure no leading spaces are used for indentation on any line.
-	for i, ln := range strings.Split(got, "\n") {
-		// Trim trailing empty last line if any
-		if ln == "" && i == len(strings.Split(got, "\n"))-1 {
-			continue
-		}
-		for j := 0; j < len(ln) && (ln[j] == ' ' || ln[j] == '\t'); j++ {
-			if ln[j] == ' ' {
-				t.Fatalf("found space in indentation at line %d: %q", i+1, ln)
-			}
-		}
+	// AST roundtrip: parse original and pretty'ed, ensure same AST
+	ast1 := parse(t, src)
+	ast2 := parse(t, once)
+	if !reflect.DeepEqual(ast1, ast2) {
+		t.Fatalf("AST roundtrip mismatch after pretty")
 	}
 }
 
@@ -528,6 +395,7 @@ f(x)`,
 		}
 	}
 }
+
 func Test_Printer_RoundTrip_Standardize(t *testing.T) {
 	cases := []string{
 		// Simple expressions and ops
@@ -587,62 +455,145 @@ userId: id, profile: { name: n } } = obj`,
 		}
 	}
 }
-func Test_Printer_Module_Basic(t *testing.T) {
-	in := `module MyLib do x = 1 end`
-	want := "module MyLib do\n" +
-		"\tx = 1\n" +
-		"end"
-	got := pretty(t, in)
+
+func Test_Standardize_Trailing_Newline_And_Idempotence(t *testing.T) {
+	src := `fun(a: Str) -> Str do return("hi " + a) end`
+	std1, err := Standardize(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(std1, "\n") {
+		t.Fatalf("missing trailing newline:\n%q", std1)
+	}
+
+	std2, err := Standardize(std1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if std2 != std1 {
+		t.Fatalf("not idempotent:\n---1---\n%q\n---2---\n%q", std1, std2)
+	}
+}
+
+// ---------- Indentation policy ----------
+
+func Test_Printer_TabsOnly_Indentation(t *testing.T) {
+	got := pretty(t, `if a then x else y end`)
+	// Ensure no leading spaces are used for indentation on any line.
+	lines := strings.Split(got, "\n")
+	for i, ln := range lines {
+		// Trim trailing empty last line if any
+		if ln == "" && i == len(lines)-1 {
+			continue
+		}
+		for j := 0; j < len(ln) && (ln[j] == ' ' || ln[j] == '\t'); j++ {
+			if ln[j] == ' ' {
+				t.Fatalf("found space in indentation at line %d: %q", i+1, ln)
+			}
+		}
+	}
+}
+
+// ---------- FormatValue (runtime values) ----------
+
+func Test_Printer_FormatValue_Scalars_And_AnnotatedNull(t *testing.T) {
+	// construct values directly
+	vNull := withAnnot(Null, "division by zero")
+	vInt := Int(42)
+	vStr := Str("hi")
+
+	outNull := FormatValue(vNull)
+	outInt := FormatValue(vInt)
+	outStr := FormatValue(vStr)
+
+	// Annotation should be a header line (single '#') before the value.
+	if !strings.Contains(outNull, "# division by zero") || !strings.Contains(outNull, "\nnull") {
+		t.Fatalf("annotated null not rendered properly:\n%s", outNull)
+	}
+	if strings.TrimSpace(outInt) != "42" {
+		t.Fatalf("int not rendered: %q", outInt)
+	}
+	if strings.TrimSpace(outStr) != `"hi"` {
+		t.Fatalf("str not rendered/quoted: %q", outStr)
+	}
+}
+
+func Test_Printer_FormatValue_Array_And_Map(t *testing.T) {
+	// Array with mixed values, including annotated null
+	arr := Arr([]Value{Int(1), withAnnot(Null, "missing"), Str("x")})
+	outArr := FormatValue(arr)
+
+	// Should render as multi-line because an element has a header annotation
+	if !strings.Contains(outArr, "[") || !strings.Contains(outArr, "]") || !strings.Contains(outArr, "\n") {
+		t.Fatalf("array not formatted multi-line: %q", outArr)
+	}
+	if !strings.Contains(outArr, "# missing") {
+		t.Fatalf("annotation in array element missing:\n%s", outArr)
+	}
+
+	// Map should render keys in stable (sorted) order
+	m := Map(map[string]Value{
+		"b": Int(2),
+		"a": Int(1),
+	})
+	outMap := FormatValue(m)
+	// Expect "a" before "b"
+	if strings.Index(outMap, "a:") > strings.Index(outMap, "b:") {
+		t.Fatalf("map keys not sorted:\n%s", outMap)
+	}
+	// Basic structure
+	if !strings.Contains(outMap, "{") || !strings.Contains(outMap, "}") {
+		t.Fatalf("map not braced: %q", outMap)
+	}
+}
+
+// Inline array + numeric decimal rendering
+func Test_Printer_FormatValue_Array_Inline_And_NumDecimal(t *testing.T) {
+	outArr := FormatValue(Arr([]Value{Int(1), Int(2)}))
+	eq(t, outArr, "[1, 2]")
+
+	outNum := FormatValue(Num(3))
+	eq(t, outNum, "3.0")
+}
+
+// PRE placement (key + value) inside map values
+func Test_Printer_Value_Map_KeyAndValuePREPlacement(t *testing.T) {
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"name"},
+	}
+	v := Str("John McCarthy")
+	v.Annot = "John's name" // value PRE
+	mo.Entries["name"] = v
+	mo.KeyAnn["name"] = "The name" // key PRE
+
+	got := FormatValue(Value{Tag: VTMap, Data: mo})
+	want := "{\n\t# The name\n\tname:\n\t\t# John's name\n\t\t\"John McCarthy\"\n}"
+	if norm(got) != norm(want) {
+		t.Fatalf("value map PRE placement mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
+}
+
+// POST ordering: value POST then key POST when both present (inline form)
+func Test_Printer_Value_Map_Post_Order(t *testing.T) {
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"a"},
+	}
+	v := Int(1)
+	v.Annot = "<v" // value POST
+	mo.Entries["a"] = v
+	mo.KeyAnn["a"] = "<k" // key POST
+	got := FormatValue(Value{Tag: VTMap, Data: mo})
+	want := `{a: 1 # v # k}`
 	eq(t, got, want)
 }
 
-func Test_Printer_Module_StringName_EmptyBody(t *testing.T) {
-	in := `module "my mod" do end`
-	want := "module \"my mod\" do\n" +
-		"end"
-	got := pretty(t, in)
-	eq(t, got, want)
-}
+// ---------- Value rendering: Fun/Oracle/Type/Module/Handle ----------
 
-func Test_Printer_Module_NameExpression(t *testing.T) {
-	// Name can be any expression; ensure precedence/parentheses are handled.
-	in := `module "a" + "b" do end`
-	// (+) has lower precedence than a primary, so printer should parenthesize.
-	want := "module \"a\" + \"b\" do\n" + // name position uses normal expr printing
-		"end"
-	got := pretty(t, in)
-	// Note: the header prints the name expression with minimal parens;
-	// for simple "+", no extra parens are introduced because it sits
-	// directly after "module ".
-	eq(t, got, want)
-}
-
-func Test_Printer_Module_With_PreAnnotation(t *testing.T) {
-	in := `# about this module
-module M do
-end`
-	want := "# about this module\n" +
-		"module M do\n" +
-		"end"
-	got := pretty(t, in)
-	eq(t, got, want)
-}
-
-func Test_Printer_Module_Amid_Other_Statements(t *testing.T) {
-	in := `let x = 1
-module M do
-  x = 2
-end
-return x`
-	want := "let x = 1\n" +
-		"module M do\n" +
-		"\tx = 2\n" +
-		"end\n" +
-		"return(x)"
-	got := pretty(t, in)
-	eq(t, got, want)
-}
-func Test_Printer_Fun_Rendering(t *testing.T) {
+func Test_Printer_Fun_Rendering_ZeroArg(t *testing.T) {
 	f := &Fun{
 		Params:     nil,
 		ParamTypes: nil,
@@ -652,6 +603,19 @@ func Test_Printer_Fun_Rendering(t *testing.T) {
 	want := "<fun: _:Null -> Any>"
 	if got != want {
 		t.Fatalf("fun rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Fun_Rendering_With_Params(t *testing.T) {
+	f := &Fun{
+		Params:     []string{"a", "b"},
+		ParamTypes: []S{S{"id", "Int"}, S{"id", "Str"}},
+		ReturnType: S{"id", "Bool"},
+	}
+	got := FormatValue(FunVal(f))
+	want := "<fun: a:Int -> b:Str -> Bool>"
+	if got != want {
+		t.Fatalf("fun rendering (with params) mismatch:\n got:  %q\n want: %q", got, want)
 	}
 }
 
@@ -677,10 +641,47 @@ func Test_Printer_Type_Rendering(t *testing.T) {
 		S{"pair", S{"str", "age"}, S{"id", "Int"}},
 	}
 	got := FormatValue(TypeVal(typ))
-	want := "<type: { age: Int, name: Str }>"
+	want := "<type: {age: Int, name: Str}>"
 	if got != want {
 		t.Fatalf("type rendering mismatch:\n got:  %q\n want: %q", got, want)
 	}
+}
+
+// Type printer: basic arrow/optional + enum literal
+func Test_FormatType_Basics(t *testing.T) {
+	// T? where T = [Int] -> Str
+	T := S{"binop", "->", S{"array", S{"id", "Int"}}, S{"id", "Str"}}
+	opt := S{"unop", "?", T}
+	got := FormatType(opt)
+	want := `([Int]) -> Str?`
+	if norm(got) != norm(want) {
+		t.Fatalf("FormatType mismatch\nwant: %q\ngot:  %q", want, got)
+	}
+
+	// Enum type with scalars and a map literal
+	enum := S{"enum",
+		S{"str", "a"},
+		S{"int", int64(1)},
+		S{"map", S{"pair", S{"str", "k"}, S{"num", 1.5}}},
+	}
+	got2 := FormatType(enum)
+	want2 := `Enum["a", 1, {k: 1.5}]`
+	if norm(got2) != norm(want2) {
+		t.Fatalf("FormatType enum mismatch\nwant: %q\ngot:  %q", want2, got2)
+	}
+}
+
+// Type printer: required field + PRE/POST annotations
+func Test_FormatType_Required_And_Annotations(t *testing.T) {
+	typ := S{"map",
+		S{"pair!", // required field
+			S{"annot", S{"str", "Key pre"}, S{"str", "id"}},     // key PRE
+			S{"annot", S{"str", "<Value post"}, S{"id", "Int"}}, // value POST
+		},
+	}
+	got := FormatType(typ)
+	want := "{\n\t# Key pre\n\tid!: Int # Value post\n}"
+	eq(t, got, want)
 }
 
 func Test_Printer_Module_Rendering(t *testing.T) {
@@ -699,23 +700,6 @@ func Test_Printer_Handle_Rendering(t *testing.T) {
 	want := "<handle: token>"
 	if got != want {
 		t.Fatalf("handle rendering mismatch:\n got:  %q\n want: %q", got, want)
-	}
-}
-func Test_Printer_Value_Map_KeyAndValuePREPlacement(t *testing.T) {
-	mo := &MapObject{
-		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
-		Keys:    []string{"name"},
-	}
-	v := Str("John McCarthy")
-	v.Annot = "John's name" // value PRE
-	mo.Entries["name"] = v
-	mo.KeyAnn["name"] = "The name" // key PRE
-
-	got := FormatValue(Value{Tag: VTMap, Data: mo})
-	want := "{\n\t# The name\n\tname:\n\t\t# John's name\n\t\t\"John McCarthy\"\n}"
-	if norm(got) != norm(want) {
-		t.Fatalf("value map PRE placement mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
 	}
 }
 

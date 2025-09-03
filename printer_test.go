@@ -85,7 +85,7 @@ func Test_Printer_Function_And_Oracle(t *testing.T) {
 	in := `fun(a: Str) -> Str do return("hi " + a) end
 oracle() -> Str from["web","docs"]`
 	want := "fun(a: Str) -> Str do\n" +
-		"\treturn(\"hi \" + a)\n" +
+		"\treturn \"hi \" + a\n" +
 		"end\n" +
 		"oracle() -> Str from [\"web\", \"docs\"]"
 	got := pretty(t, in)
@@ -113,8 +113,8 @@ for let x in xs do break 0 end`
 		"else\n" +
 		"\tz\n" +
 		"end\n" +
-		"for let x in xs do\n" +
-		"\tbreak(0)\n" +
+		"for x in xs do\n" +
+		"\tbreak 0\n" +
 		"end"
 	got := pretty(t, in)
 	if norm(got) != norm(want) {
@@ -158,7 +158,7 @@ module M do
   x = 2
 end
 return x`
-	want5 := "let x = 1\nmodule M do\n\tx = 2\nend\nreturn(x)"
+	want5 := "let x = 1\nmodule M do\n\tx = 2\nend\nreturn x"
 	eq(t, pretty(t, in5), want5)
 }
 
@@ -254,9 +254,9 @@ a.b = 2
 
 func Test_Printer_Control_Forms_Are_Adjacent(t *testing.T) {
 	in := `return(1) break(0) continue(null)`
-	want := `return(1)
-break(0)
-continue(null)`
+	want := `return 1
+break 0
+continue`
 	got := pretty(t, in)
 	if norm(got) != norm(want) {
 		t.Fatalf("pretty control mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
@@ -266,9 +266,9 @@ continue(null)`
 func Test_Printer_ReturnBreakContinue_SameLineVsNewline(t *testing.T) {
 	// Same-line expression → carry the expression.
 	casesSame := []struct{ in, want string }{
-		{`return 1`, `return(1)`},
-		{`break  x`, `break(x)`},
-		{`continue "z"`, `continue("z")`},
+		{`return 1`, `return 1`},
+		{`break  x`, `break x`},
+		{`continue "z"`, `continue "z"`},
 	}
 	for _, tc := range casesSame {
 		got := pretty(t, tc.in)
@@ -278,7 +278,7 @@ func Test_Printer_ReturnBreakContinue_SameLineVsNewline(t *testing.T) {
 	// Next token on the next line → implicit null.
 	in := `return
 x`
-	want := `return(null)
+	want := `return
 x`
 	got := pretty(t, in)
 	eq(t, got, want)
@@ -342,8 +342,11 @@ func Test_Printer_Annotations_Post_Trailing_Inline(t *testing.T) {
 }
 
 func Test_Printer_Map_Value_Post_Inline(t *testing.T) {
-	// POST after a map value should render inline
-	eq(t, pretty(t, "{a: 1 # note\n}"), "{a: 1 # note\n}")
+	// POST after a map value consumes the rest of the line,
+	// so the closing brace must move to the next line.
+	got := pretty(t, "{a: 1 # note\n}")
+	want := "{\n\ta: 1 # note\n}"
+	eq(t, got, want)
 }
 
 // ---------- Pretty/Standardize roundtrip & idempotence ----------
@@ -587,7 +590,7 @@ func Test_Printer_Value_Map_Post_Order(t *testing.T) {
 	mo.Entries["a"] = v
 	mo.KeyAnn["a"] = "<k" // key POST
 	got := FormatValue(Value{Tag: VTMap, Data: mo})
-	want := `{a: 1 # v # k}`
+	want := "{\n\ta: # k\n\t\t1 # v\n}"
 	eq(t, got, want)
 }
 

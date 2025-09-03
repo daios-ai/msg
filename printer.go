@@ -19,11 +19,21 @@
 //     by a leading "<" in the stored text. PRE annotations print as `# ...`
 //     lines immediately above the construct; POST annotations print as a
 //     trailing `# ...` inline comment on the same line as the construct.
+//     **Important (POST semantics):** POST annotations capture the rest of
+//     the current line and therefore *force a newline*. No tokens (commas,
+//     braces, brackets, etc.) may follow a POST on the same line. Printers
+//     account for this and avoid emitting an extra blank line before a
+//     closing brace/bracket.
 //     - Property names are emitted bare if they are identifier-like, otherwise
 //     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
 //     are rendered in a compact, readable form.
 //     - Formatting emits no space before '(' for calls and for 'fun(...)'
 //     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
+//     - Control keywords render without parens:
+//     return expr
+//     break expr
+//     continue [expr]
+//     A `null` payload prints as the bare keyword (e.g. `continue`).
 //
 //  2. Type ASTs (S-expressions) → compact type strings.
 //     - Entry point: FormatType.
@@ -34,13 +44,16 @@
 //     ("map", ("pair"| "pair!", ("str",k), T) ...)
 //     Required fields print with a trailing `!` on the key.
 //     Key/value annotations (if wrapped in "annot") are respected:
-//     PRE as header lines; POST as trailing inline comments.
+//     PRE as header lines; POST as trailing inline comments that force a
+//     newline (see POST semantics above).
 //     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
 //     may be scalars, arrays, or maps.
 //     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
 //     right-associated chains.
 //     - Output is stable. Multi-line maps are rendered with sorted keys to
 //     avoid visual churn.
+//     - When the last field ends with a POST, the closing `}` appears on the
+//     next line without an extra blank line.
 //
 //  3. Runtime values (Value) → width-aware strings.
 //     - Entry point: FormatValue.
@@ -52,8 +65,10 @@
 //     - Annotations distinguish PRE vs POST using the same `<` convention:
 //     • PRE (no '<' prefix): printed as `# ...` lines before the value.
 //     • POST (with '<' prefix): printed as an inline trailing comment
-//     on the same line as the value.
+//     on the same line as the value **and forces a newline**.
 //     This applies to Value.Annot (per-value) and MapObject.KeyAnn[k] (per-key).
+//     When a POST ends the last element/entry line, the closing bracket/brace
+//     is placed on the next line without an extra blank line.
 //     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
 //     - Types (VTType) are printed by extracting the embedded type AST and
 //     delegating to FormatType.
@@ -118,7 +133,8 @@ var MaxInlineWidth = 80
 //     whitespace-normalized code with minimal parentheses.
 //   - Supports annotations using the 3-ary form:
 //     ("annot", ("str", textOr<text>), X)
-//     PRE prints as `# ...` above; POST prints as trailing `# ...` on the line.
+//     PRE prints as `# ...` above; POST prints as trailing `# ...` on the line
+//     and forces a newline.
 //
 // Errors:
 //   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
@@ -174,6 +190,8 @@ func Standardize(src string) (string, error) {
 //     property access vs calls/indexing binds tightly.
 //   - Arrays and maps are printed inline (AST form); map key annotations print
 //     as preceding `# ...` lines (PRE) or trailing inline comments (POST).
+//     POST consumes the rest of the line and forces a newline, and containers
+//     avoid emitting an extra blank line before closing delimiters.
 //   - Annotation nodes wrap the printed construct; POST becomes trailing inline.
 //
 // This function does not parse; it strictly formats the provided AST.
@@ -190,8 +208,8 @@ func FormatSExpr(n S) string {
 }
 
 // FormatType renders a type S-expression into a compact, human-readable string.
-// It respects PRE (header lines) vs POST (trailing inline) annotations in the
-// same way as the AST/code printer.
+// It respects PRE (header lines) vs POST (trailing inline that forces newline)
+// in the same way as the AST/code printer.
 func FormatType(t S) string {
 	doc := docType(t)
 	var b strings.Builder
@@ -213,7 +231,9 @@ func FormatType(t S) string {
 //     PRE annotations forcing multi-line; otherwise multi-line with indentation.
 //   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short,
 //     with no PRE key/value annotations; else multi-line with indentation,
-//     where PRE annotations print as header lines, POST as inline trailing.
+//     where PRE annotations print as header lines, POST as inline trailing
+//     comments that force a newline. When the last entry ends with a POST, the
+//     closing brace is on the next line without an extra blank line.
 //   - Functions: `<fun: name:T -> name2:U -> R>` (zero-arg uses `_:Null`).
 //   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
 //   - Modules: `<module: pretty-name>` when available.
@@ -534,63 +554,90 @@ func annotPre(text string) *Doc {
 }
 
 // POST annotations (inline/trailing) — prints on the same line.
-// NOTE: annotations capture the remainder of a line. We just append.
+// IMPORTANT: POST captures the rest of the line, so we force a newline here.
 func annotInline(text string) *Doc {
 	trim := oneLine(text)
 	if trim == "" {
 		return Concat()
 	}
-	return Text(" # " + trim)
+	return Concat(Text(" # "+trim), HardLineDoc())
 }
 
 func braced(open string, inside *Doc, close string) *Doc {
 	return Concat(Text(open), inside, Text(close))
 }
 
-// inlineOrMulti builds a `[ a, b ]` or multi-line with indentation based on fit.
-// It uses the standard Group + SoftLine + Nest pattern to decide.
-func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
+// inlineOrMultiAdvanced builds a `[ a, b ]` or multi-line with indentation.
+// If endsLastLine is true, the trailing SoftLine is omitted to avoid an extra
+// blank line before the closing bracket/brace.
+func inlineOrMultiAdvanced(open string, elems []*Doc, close string, endsLastLine bool) *Doc {
 	if len(elems) == 0 {
 		// exact-empty without spaces: [] or {}
 		return Text(open + close)
 	}
 	sep := Concat(Text(","), LineDoc())
 	inside := Join(sep, elems)
-	body := Nest(1, Concat(SoftLineDoc(), inside, SoftLineDoc()))
-	return Group(braced(open, body, close))
+	body := Concat(SoftLineDoc(), inside)
+	if !endsLastLine {
+		body = Concat(body, SoftLineDoc())
+	}
+	return Group(braced(open, Nest(1, body), close))
 }
 
-// kvEntry builds a single map entry, respecting PRE/POST placement.
+// inlineOrMulti is the default variant when the last element does not force
+// a newline (or when callers don't track it).
+func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
+	return inlineOrMultiAdvanced(open, elems, close, false)
+}
+
+// kvEntry builds a single map entry, respecting PRE/POST placement and
+// POST-newline semantics.
 //   - keyPre prints above the key.
-//   - If valPre is non-empty, the value is placed on its own indented line under `key:`,
-//     and valPre prints above the value.
-//   - POSTs are appended inline after the value (value POST first, then key POST).
+//   - If valPre is non-empty, the value is placed on its own indented line
+//     under `key:` and valPre prints above the value.
+//   - POSTs: key POST lives on the key line (after ':'), value POST lives on
+//     the value line. Both force a newline.
 func kvEntry(keyDoc *Doc, valDoc *Doc, keyPre, valPre, keyPost, valPost string) *Doc {
 	var parts []*Doc
 	// key PRE above entry
 	if keyPre != "" {
 		parts = append(parts, annotPre(keyPre))
 	}
-	// `key:` (+ space only when the value stays on the same line)
+	// key:
 	parts = append(parts, keyDoc)
 
-	if valPre != "" {
-		// force value onto its own line under the key (no trailing space after ':')
-		parts = append(parts,
-			Text(":"), HardLineDoc(),
-			Nest(1, Concat(annotPre(valPre), valDoc)),
-		)
-	} else {
-		// same line
+	// Cases:
+	switch {
+	case valPre != "":
+		// Own line for value; key POST attaches to key line.
+		if keyPost != "" {
+			parts = append(parts, Text(":"), annotInline(keyPost))
+		} else {
+			parts = append(parts, Text(":"))
+		}
+		parts = append(parts, HardLineDoc(),
+			Nest(1, Concat(annotPre(valPre), valDoc)))
+		// Value POST on the value line.
+		if valPost != "" {
+			parts = append(parts, annotInline(valPost))
+		}
+
+	case keyPost != "":
+		// No valPre; key has POST → put key POST on key line, then value below.
+		parts = append(parts, Text(":"), annotInline(keyPost),
+			Nest(1, Concat(valDoc)))
+		if valPost != "" {
+			parts = append(parts, annotInline(valPost))
+		}
+
+	default:
+		// Same line `key: value`; only value POST trails and forces newline.
 		parts = append(parts, Text(": "), valDoc)
+		if valPost != "" {
+			parts = append(parts, annotInline(valPost))
+		}
 	}
-	// POSTs inline at the end of the value line (value, then key)
-	if valPost != "" {
-		parts = append(parts, annotInline(valPost))
-	}
-	if keyPost != "" {
-		parts = append(parts, annotInline(keyPost))
-	}
+
 	return Concat(parts...)
 }
 
@@ -661,6 +708,15 @@ func parenIf(need int, d *Doc, n S) *Doc {
 	return d
 }
 
+// AST helper: does this node carry a top-level POST annotation?
+func astHasPostInline(n S) bool {
+	if tag(n) == "annot" {
+		_, _, pre := asAnnotAST(n)
+		return !pre
+	}
+	return false
+}
+
 /* ---------- AST → Doc ---------- */
 
 func docProgram(n S) *Doc {
@@ -688,7 +744,7 @@ func docStmt(n S) *Doc {
 		if pre {
 			return Concat(annotPre(text), docStmt(wrapped))
 		}
-		// POST: trailing inline — wrap the whole stmt as a group so the comment captures the remainder.
+		// POST: trailing inline — capture the remainder of the line and break.
 		return Concat(docStmt(wrapped), annotInline(text))
 
 	case "fun":
@@ -716,7 +772,8 @@ func docStmt(n S) *Doc {
 
 	case "for":
 		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
-		head := Concat(Text("for "), docForTarget(tgt), Text(" in "), docExpr(iter), Text(" do"))
+		// Target never prints "let" — it's implied in the surface syntax.
+		head := Concat(Text("for "), docPattern(tgt), Text(" in "), docExpr(iter), Text(" do"))
 		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
 
 	case "while":
@@ -753,11 +810,23 @@ func docStmt(n S) *Doc {
 		return Concat(Text("type "), docExpr(n[1].(S)))
 
 	case "return":
-		return Concat(Text("return("), docExpr(n[1].(S)), Text(")"))
+		arg := n[1].(S)
+		if tag(arg) == "null" {
+			return Text("return")
+		}
+		return Concat(Text("return "), docExpr(arg))
 	case "break":
-		return Concat(Text("break("), docExpr(n[1].(S)), Text(")"))
+		arg := n[1].(S)
+		if tag(arg) == "null" {
+			return Text("break")
+		}
+		return Concat(Text("break "), docExpr(arg))
 	case "continue":
-		return Concat(Text("continue("), docExpr(n[1].(S)), Text(")"))
+		arg := n[1].(S)
+		if tag(arg) == "null" {
+			return Text("continue")
+		}
+		return Concat(Text("continue "), docExpr(arg))
 
 	case "decl", "darr", "dobj":
 		return Concat(Text("let "), docPattern(n))
@@ -887,7 +956,11 @@ func docExpr(n S) *Doc {
 		for _, e := range elems {
 			ds = append(ds, docExpr(e))
 		}
-		return inlineOrMulti("[", ds, "]")
+		lastEnds := false
+		if len(elems) > 0 && astHasPostInline(elems[len(elems)-1]) {
+			lastEnds = true
+		}
+		return inlineOrMultiAdvanced("[", ds, "]", lastEnds)
 
 	case "map":
 		items := listS(n, 1)
@@ -912,7 +985,19 @@ func docExpr(n S) *Doc {
 			entry := kvEntry(idOrQuoted(key), docExpr(valNode), kPre, vPre, kPost, vPost)
 			entries = append(entries, entry)
 		}
-		return inlineOrMulti("{", entries, "}")
+		// Last element ends the line iff its value had a POST.
+		lastEnds := false
+		if len(items) > 0 {
+			last := items[len(items)-1]
+			valNode := last[2].(S)
+			if tag(valNode) == "annot" {
+				_, _, pre := asAnnotAST(valNode)
+				if !pre {
+					lastEnds = true
+				}
+			}
+		}
+		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
 
 	case "enum":
 		elems := listS(n, 1)
@@ -959,7 +1044,6 @@ func docPattern(n S) *Doc {
 		return inlineOrMulti("[", ds, "]")
 	case "dobj":
 		items := listS(n, 1)
-		// Try flat without annotations; otherwise multiline
 		var entries []*Doc
 		for _, it := range items {
 			key, ann := unwrapKeyAST(it[1].(S))
@@ -977,7 +1061,18 @@ func docPattern(n S) *Doc {
 			}
 			entries = append(entries, kvEntry(idOrQuoted(key), docPattern(val), kPre, vPre, kPost, vPost))
 		}
-		return inlineOrMulti("{", entries, "}")
+		// last ends only if last value had POST
+		lastEnds := false
+		if len(items) > 0 {
+			val := items[len(items)-1][2].(S)
+			if tag(val) == "annot" {
+				_, _, pre := asAnnotAST(val)
+				if !pre {
+					lastEnds = true
+				}
+			}
+		}
+		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
 	case "annot":
 		text, wrapped, pre := asAnnotAST(n)
 		if pre {
@@ -1072,7 +1167,12 @@ func docType(t S) *Doc {
 			}
 			entries = append(entries, kvEntry(key, docType(f.typ), f.kAnnPre, f.vAnnPre, f.kAnnPost, f.vAnnPost))
 		}
-		return inlineOrMulti("{", entries, "}")
+		// Last ends only if last field had a value POST.
+		lastEnds := false
+		if len(fs) > 0 && fs[len(fs)-1].vAnnPost != "" {
+			lastEnds = true
+		}
+		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
 	case "binop":
 		if t[1].(string) == "->" && len(t) >= 4 {
 			params, ret := flattenArrow(t)
@@ -1187,15 +1287,29 @@ func docValueNoAnn(v Value) *Doc {
 		var elems []*Doc
 		for _, it := range xs {
 			pre, post := splitAnnotText(it.Annot)
-			var d *Doc = docValueNoAnn(Value{Tag: it.Tag, Data: it.Data}) // value without its own annots
+			d := docValueNoAnn(Value{Tag: it.Tag, Data: it.Data}) // value without its own annots
 			if pre != "" {
 				// force element on its own line with pre above it
-				elems = append(elems, Concat(annotPre(pre), d, annotInline(post)))
+				elems = append(elems, Concat(annotPre(pre), d))
+				if post != "" {
+					elems = append(elems, annotInline(post))
+				}
 			} else {
-				elems = append(elems, Concat(d, annotInline(post)))
+				if post != "" {
+					elems = append(elems, Concat(d, annotInline(post)))
+				} else {
+					elems = append(elems, d)
+				}
 			}
 		}
-		return inlineOrMulti("[", elems, "]")
+		lastEnds := false
+		if len(xs) > 0 {
+			_, post := splitAnnotText(xs[len(xs)-1].Annot)
+			if post != "" {
+				lastEnds = true
+			}
+		}
+		return inlineOrMultiAdvanced("[", elems, "]", lastEnds)
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		keys := append([]string(nil), mo.Keys...)
@@ -1212,7 +1326,15 @@ func docValueNoAnn(v Value) *Doc {
 			entry := kvEntry(idOrQuoted(k), docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}), kPre, vPre, kPost, vPost)
 			entries = append(entries, entry)
 		}
-		return inlineOrMulti("{", entries, "}")
+		lastEnds := false
+		if len(keys) > 0 {
+			lastVal := mo.Entries[keys[len(keys)-1]]
+			_, vPost := splitAnnotText(lastVal.Annot)
+			if vPost != "" {
+				lastEnds = true
+			}
+		}
+		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
 	case VTFun:
 		if f, ok := v.Data.(*Fun); ok && f != nil {
 			if f.IsOracle {
@@ -1263,15 +1385,9 @@ func docValueNoAnn(v Value) *Doc {
 	}
 }
 
-// docForTarget prints the 'for' loop target:
-// - If it's a declaration pattern: "let <pattern>" for decl, or the pattern itself for obj/arr.
-// - Otherwise, it's a regular expression target.
+// docForTarget is no longer needed as a separate helper; the 'for' statement
+// now prints its target via docPattern directly (no "let" prefix).
+// Keeping a tiny helper for completeness in case future tweaks are needed.
 func docForTarget(tgt S) *Doc {
-	if isDeclPattern(tgt) {
-		if tag(tgt) == "decl" {
-			return Concat(Text("let "), docPattern(tgt))
-		}
-		return docPattern(tgt)
-	}
-	return docExpr(tgt)
+	return docPattern(tgt)
 }

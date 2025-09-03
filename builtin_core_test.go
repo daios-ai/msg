@@ -123,7 +123,6 @@ func Test_Builtin_Core_clone_deepcopy(t *testing.T) {
 func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 	ip, _ := NewRuntime()
 
-	// Should now return a VTMap (flattened visible env, including builtins)
 	v := evalWithIP(t, ip, `snapshot(null)`)
 	if v.Tag != VTMap || v.Data == nil {
 		t.Fatalf("snapshot should return a map (VTMap), got %#v", v)
@@ -134,7 +133,7 @@ func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 		t.Fatalf("snapshot value.Data should be *MapObject, got %T", v.Data)
 	}
 
-	// Must include builtins from Core; check a couple of known ones.
+	// Builtins should be present and functions.
 	failVal, ok := mo.Entries["fail"]
 	if !ok {
 		t.Fatalf("snapshot should include builtins (missing 'fail')")
@@ -151,9 +150,12 @@ func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 		t.Fatalf("'typeOf' should be a function value, got %#v", typeOfVal)
 	}
 
-	// Per-key annotations should carry the variable's Value.Annot (docs set by setBuiltinDoc).
-	if ann, ok := mo.KeyAnn["fail"]; !ok || ann == "" {
-		t.Fatalf("'fail' should have a non-empty per-key annotation (doc), got %#v", ann)
+	// Value annotations stay on the values; key annotations are independent.
+	if failVal.Annot == "" {
+		t.Fatalf("'fail' should carry docs in its value annotation (Annot); got empty")
+	}
+	if ann, ok := mo.KeyAnn["fail"]; ok && ann != "" {
+		t.Fatalf("per-key annotation for 'fail' should be empty; got %q", ann)
 	}
 }
 

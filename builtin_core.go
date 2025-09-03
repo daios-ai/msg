@@ -376,10 +376,13 @@ Returns:
 
 // --- Deep copy & snapshot for isolated worlds --------------------------------
 
+// cloneValue deep-copies arrays/maps (preserving per-key annotations and order)
+// and **preserves Value.Annot** on the cloned container/value. No special-casing.
 func cloneValue(v Value) Value {
 	switch v.Tag {
-	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun:
+	case VTNull, VTBool, VTInt, VTNum, VTStr, VTType, VTFun, VTModule, VTHandle:
 		return v
+
 	case VTArray:
 		xs := v.Data.([]Value)
 		cp := make([]Value, len(xs))
@@ -387,8 +390,9 @@ func cloneValue(v Value) Value {
 			cp[i] = cloneValue(xs[i])
 		}
 		out := Arr(cp)
-		out.Annot = v.Annot
+		out.Annot = v.Annot // preserve array-level annotation
 		return out
+
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		// Deep-copy entries
@@ -404,48 +408,46 @@ func cloneValue(v Value) Value {
 			keyAnn[k] = ann
 		}
 		return Value{
-			Tag: VTMap,
-			Data: &MapObject{
-				Entries: entries,
-				KeyAnn:  keyAnn,
-				Keys:    keys,
-			},
-			Annot: v.Annot, // preserve the top-level annotation
+			Tag:   VTMap,
+			Data:  &MapObject{Entries: entries, KeyAnn: keyAnn, Keys: keys},
+			Annot: v.Annot, // preserve map-level annotation
 		}
+
 	default:
-		// Userdata/modules/handles are NOT copied (identity preserved).
+		// Other userdata-like cases: identity (and their Annot) preserved.
 		return v
 	}
 }
 
-// snapshotVisibleEnvAsMap flattens the current environment and all parents
-// (nearest frame wins) into a deterministic, ordered map:
-// - Entries[name] = cloned value
-// - KeyAnn[name]  = original Value.Annot (if non-empty)
-// - Keys ordered by frame proximity (inner→outer), with names sorted within frame
+// snapshotVisibleEnvAsMap flattens the current env and parents (nearest wins)
+// into a deterministic, ordered map. **Does not mix value and key annotations**:
+// - Entries[name] = cloned value (with its Value.Annot preserved on the value)
+// - KeyAnn[name] remains empty (env has no separate key-annotation source)
+// - Keys ordered inner→outer; names sorted within each frame for stability.
 func snapshotVisibleEnvAsMap(e *Env) Value {
 	entries := map[string]Value{}
-	keyAnn := map[string]string{}
+	keyAnn := map[string]string{} // intentionally left empty; no mixing with value annotations
 	var order []string
 
 	for cur := e; cur != nil; cur = cur.parent {
-		// stable per-frame iteration
+		// Stable per-frame iteration
 		names := make([]string, 0, len(cur.table))
 		for k := range cur.table {
 			names = append(names, k)
 		}
 		sort.Strings(names)
+
 		for _, k := range names {
 			if _, seen := entries[k]; seen {
-				continue // inner binding already took precedence
+				continue // inner binding already won
 			}
-			v := cur.table[k]
-			entries[k] = cloneValue(v)
-			if v.Annot != "" {
-				keyAnn[k] = v.Annot
-			}
+			entries[k] = cloneValue(cur.table[k]) // preserve value annotations on the value itself
 			order = append(order, k)
 		}
 	}
-	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: keyAnn, Keys: order}}
+
+	return Value{
+		Tag:  VTMap,
+		Data: &MapObject{Entries: entries, KeyAnn: keyAnn, Keys: order},
+	}
 }

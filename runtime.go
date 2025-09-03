@@ -56,9 +56,9 @@ func NewRuntime() (*Interpreter, error) {
 	registerRandomBuiltins(ip)
 	registerMathBuiltins(ip)
 
-	if err := ip.LoadPrelude("std.ms", ""); err != nil {
-		return nil, err
-	}
+	// if err := ip.LoadPrelude("std.ms", ""); err != nil {
+	// 	return nil, err
+	// }
 
 	ip.Global.SealParentWrites()
 

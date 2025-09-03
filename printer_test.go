@@ -701,3 +701,28 @@ func Test_Printer_Handle_Rendering(t *testing.T) {
 		t.Fatalf("handle rendering mismatch:\n got:  %q\n want: %q", got, want)
 	}
 }
+func Test_Printer_Value_Map_KeyAndValuePREPlacement(t *testing.T) {
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"name"},
+	}
+	v := Str("John McCarthy")
+	v.Annot = "John's name" // value PRE
+	mo.Entries["name"] = v
+	mo.KeyAnn["name"] = "The name" // key PRE
+
+	got := FormatValue(Value{Tag: VTMap, Data: mo})
+	want := "{\n\t# The name\n\tname:\n\t\t# John's name\n\t\t\"John McCarthy\"\n}"
+	if norm(got) != norm(want) {
+		t.Fatalf("value map PRE placement mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
+}
+
+func Test_Printer_Value_Type_EmptyObject_NoSpace(t *testing.T) {
+	got := FormatValue(TypeVal(S{"map"}))
+	want := "<type: {}>"
+	if norm(got) != norm(want) {
+		t.Fatalf("empty object type spacing mismatch\nwant: %q\ngot:  %q", want, got)
+	}
+}

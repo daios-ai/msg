@@ -1015,6 +1015,11 @@ func writeType(o *out, t S) {
 			})
 		}
 		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
+		// Empty object type prints as {} (no space).
+		if len(fs) == 0 {
+			o.write("{}")
+			return
+		}
 		o.write("{")
 		o.nl()
 		o.withIndent(func() {
@@ -1240,6 +1245,10 @@ func writeValue(o *out, v Value) {
 			}
 			return
 		}
+		if len(keys) == 0 {
+			o.write("{}")
+			return
+		}
 		o.write("{")
 		o.nl()
 		o.withIndent(func() {
@@ -1252,29 +1261,44 @@ func writeValue(o *out, v Value) {
 				vv := mo.Entries[k]
 				vPre, vPost := splitAnnotText(vv.Annot)
 
-				// PRE annotations before entry.
+				// Key PRE before entry.
 				if kPre != "" {
 					o.annot(kPre)
-				}
-				if vPre != "" {
-					o.annot(vPre)
 				}
 
 				o.pad()
 				keyOut(o, k)
-				o.write(": ")
-
-				// Print value without its own annotations (handled above/below).
-				vNoAnn := vv
-				vNoAnn.Annot = ""
-				writeValue(o, vNoAnn)
-
-				// Append POST (value, then key) inline.
-				if vPost != "" {
-					o.annotInline(vPost)
-				}
-				if kPost != "" {
-					o.annotInline(kPost)
+				if vPre == "" {
+					// Inline value.
+					o.write(": ")
+					vNoAnn := vv
+					vNoAnn.Annot = ""
+					writeValue(o, vNoAnn)
+					// POST inline (value, then key).
+					if vPost != "" {
+						o.annotInline(vPost)
+					}
+					if kPost != "" {
+						o.annotInline(kPost)
+					}
+				} else {
+					// Value has PRE: place it between the key and the value.
+					o.write(":")
+					o.nl()
+					o.withIndent(func() {
+						o.annot(vPre)
+						o.pad()
+						vNoAnn := vv
+						vNoAnn.Annot = ""
+						writeValue(o, vNoAnn)
+						// POST inline (value, then key).
+						if vPost != "" {
+							o.annotInline(vPost)
+						}
+						if kPost != "" {
+							o.annotInline(kPost)
+						}
+					})
 				}
 
 				if i < len(keys)-1 {
@@ -1288,9 +1312,17 @@ func writeValue(o *out, v Value) {
 	case VTFun:
 		if f, ok := v.Data.(*Fun); ok && f != nil {
 			if f.IsOracle {
-				o.write("<oracle: " + FormatType(f.ReturnType) + ">")
+				cand := "<oracle: " + inlineType(f.ReturnType) + ">"
+				if len(cand) <= MaxInlineWidth {
+					o.write(cand)
+				} else {
+					o.write("<oracle: ")
+					o.write(FormatType(f.ReturnType))
+					o.write(">")
+				}
 				break
 			}
+
 			var sb strings.Builder
 			sb.WriteString("<fun: ")
 			if len(f.ParamTypes) == 0 {
@@ -1306,20 +1338,47 @@ func writeValue(o *out, v Value) {
 					}
 					sb.WriteString(name)
 					sb.WriteString(":")
-					sb.WriteString(FormatType(f.ParamTypes[i]))
+					sb.WriteString(inlineType(f.ParamTypes[i]))
 				}
 			}
 			sb.WriteString(" -> ")
-			sb.WriteString(FormatType(f.ReturnType))
+			sb.WriteString(inlineType(f.ReturnType))
 			sb.WriteString(">")
-			o.write(sb.String())
+
+			cand := sb.String()
+			if len(cand) <= MaxInlineWidth {
+				o.write(cand)
+			} else {
+				var long strings.Builder
+				long.WriteString("<fun: ")
+				if len(f.ParamTypes) == 0 {
+					long.WriteString("_:Null")
+				} else {
+					for i := range f.ParamTypes {
+						if i > 0 {
+							long.WriteString(" -> ")
+						}
+						name := "_"
+						if i < len(f.Params) && f.Params[i] != "" {
+							name = f.Params[i]
+						}
+						long.WriteString(name)
+						long.WriteString(":")
+						long.WriteString(FormatType(f.ParamTypes[i]))
+					}
+				}
+				long.WriteString(" -> ")
+				long.WriteString(FormatType(f.ReturnType))
+				long.WriteString(">")
+				o.write(long.String())
+			}
 		} else {
 			o.write("<fun>")
 		}
+
 	case VTType:
-		typ := FormatType(typeAst(v.Data))
-		inline := strings.Join(strings.Fields(typ), " ") // collapse \n, \t, and multi-spaces
-		o.write("<type: " + inline + ">")
+		typ := inlineType(typeAst(v.Data))
+		o.write("<type: " + typ + ">")
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
@@ -1412,4 +1471,13 @@ func isValueMultiline(v Value) bool {
 	default:
 		return false
 	}
+}
+
+func inlineType(t S) string {
+	// Flatten multi-line type text and normalize whitespace so maps render like
+	// "{ age: Int, name: Str }" rather than "{  age: Int,  name: Str }".
+	s := strings.ReplaceAll(FormatType(t), "\t", " ")
+	s = oneLine(s)
+	s = strings.Join(strings.Fields(s), " ")
+	return s
 }

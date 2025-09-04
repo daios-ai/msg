@@ -1,494 +1,419 @@
-=== BEGIN FILE: oracles_test.go ===
+=== BEGIN FILE: modules.go ===
+// modules.go — MindScript module system (public API + private implementation)
+//
+// OVERVIEW
+// --------
+// MindScript modules are ordinary MindScript programs whose *exported bindings*
+// are snapshotted into a map-like value and paired with the lexical environment
+// where the program executed.
+//
+// At runtime, a module is represented as a `VTModule` value whose payload is:
+//
+//	type Module struct {
+//	  Name string     // canonical identity (path/URL/memory-name)
+//	  Map  *MapObject // ordered export surface with per-key annotations
+//	  Env  *Env       // lexical environment where the module executed
+//	}
+//
+// Ergonomics: a module should behave like a map. Use `AsMapValue` (see
+// interpreter.go) to coerce VTModule→VTMap for length/overlay/iteration/property
+// reads without duplicating map logic.
+//
+// NEW BEHAVIOR (uniform across all entry points)
+// ---------------------------------------------
+//
+//  1. Cycle detection is **uniform** for *every* entry point (AST/Code/File/inline).
+//     It happens inside the central constructor `nativeMakeModule`, so even inline
+//     `module "…" do … end` participates. Errors are reported as hard errors:
+//     "import cycle detected: A -> B -> … -> A".
+//
+//  2. Caching is **uniform** for *every* entry point. Successful module builds are
+//     cached under their **canonical identity** (see below) by `nativeMakeModule`.
+//     Subsequent constructions of the same canonical name return the cached module.
+//
+//     Canonical identity rules used throughout:
+//     • ImportFile: absolute filesystem path (cleaned) or full https? URL.
+//     • ImportCode / ImportAST: the exact `name` you pass in (no "mem:" prefix).
+//     • Inline `module "Name"`: the string literal "Name".
+//
+// 3) Source mapping is **precise** for *every* entry point.
+//
+//   - ImportFile/ImportCode: parse with spans via ParseSExprWithSpans.
+//
+//   - ImportAST: first render to source via FormatSExpr, then parse with spans.
+//
+//   - Inline `module …`: VM re-roots spans to the body using an absolute NodePath.
+//
+//     4. Module names are **not mutated** post-construction. The value passed as the
+//     "name" argument to `nativeMakeModule` **is** the Module.Name (the canonical
+//     identity). We do not overwrite it afterward.
+//
+// MIND SCRIPT PATH
+// ----------------
+// The environment variable MSGPATH remains the library search path for files.
+// The resolution order is unchanged (importer dir → CWD → each root in MSGPATH).
 package mindscript
 
 import (
-	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
-	"testing"
+	"time"
 )
 
-// --- helpers specific to these oracle tests ----------------------------------
+////////////////////////////////////////////////////////////////////////////////
+//                                   PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
 
-// Installs a fake __oracle_execute that returns the provided raw string
-// (or an annotated null when raw == "").
-// Registered in Core and hoisted to Global (execOracle looks in Global).
-// NOTE: In the current engine, __oracle_execute takes only (prompt: Str) -> Str | Null.
-func registerFakeOracle(ip *Interpreter, raw string) {
-	ip.RegisterNative(
-		"__oracle_execute",
-		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
-		},
-		S{"unop", "?", S{"id", "Str"}}, // Str? (executor may return null on transport failure)
-		func(_ *Interpreter, ctx CallCtx) Value {
-			if raw == "" {
-				return annotNull("fake backend: empty")
+// MindScript Library Path (preserved)
+const MindScriptPath = "MSGPATH"
+
+// Module is the payload carried by a VTModule value.
+type Module struct {
+	Name string
+	Map  *MapObject
+	Env  *Env
+}
+
+// Get returns the exported binding named key and whether it exists.
+func (m *Module) Get(key string) (Value, bool) { return m.get(key) }
+
+// ImportAST evaluates a ready AST as a module with **precise** source mapping,
+// **uniform** caching, and **uniform** cycle detection.
+//
+// Behavior:
+//   - Canonical identity: the provided `name` string (unchanged).
+//   - Formats the AST to a stable source string (FormatSExpr) and reparses it
+//     with spans for caret-precise diagnostics.
+//   - Executes in a fresh environment parented to ip.Core.
+//   - Caching & cycle detection happen in nativeMakeModule (uniform with others).
+//
+// Errors:
+//   - Parse errors are wrapped with source and returned as hard errors.
+//   - Runtime outcomes propagate as produced by the runtime.
+func (ip *Interpreter) ImportAST(name string, ast S) (Value, error) {
+	// Round-trip AST → source → AST-with-spans for precise caret mapping.
+	src := FormatSExpr(ast)
+	parsed, spans, perr := parseSourceWithSpans(name, src)
+	if perr != nil {
+		return Null, perr
+	}
+	// Canonical identity is the exact name.
+	canon := name
+	return ip.importWithBody(canon, name, parsed, src, spans)
+}
+
+// ImportCode parses source and evaluates it as a module with **precise** source
+// mapping, **uniform** caching, and **uniform** cycle detection.
+//
+// Behavior:
+//   - Canonical identity: the provided `name` string (unchanged).
+//   - Parses `src` into an AST with spans (precise diagnostics).
+//   - Executes in a fresh environment parented to ip.Core.
+//
+// Errors:
+//   - Syntax errors are wrapped with source and returned as hard errors.
+//   - Runtime outcomes propagate as produced by the runtime.
+func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
+	ast, spans, perr := parseSourceWithSpans(name, src)
+	if perr != nil {
+		return Null, perr
+	}
+	canon := name
+	return ip.importWithBody(canon, name, ast, src, spans)
+}
+
+// ImportFile resolves, fetches, parses, evaluates, *and* participates in the
+// same **uniform** caching/cycle-detection as other entry points.
+//
+// Behavior:
+//   - Canonical identity: absolute path (filesystem) or full URL (http/https).
+//   - Resolution & fetching follow the preserved rules (see header).
+//   - If resolution/fetch fails, returns **annotated null** with nil Go error.
+//   - Parses with spans for precise carets and evaluates in a fresh env.
+//
+// Caching:
+//   - Uniform caching is centralized in nativeMakeModule (so inline/AST/code/file
+//     all share the same semantics). ImportFile still resolves+reads the source;
+//     if the canonical module is already loaded, execution short-circuits inside
+//     nativeMakeModule and reuses the cached module.
+func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
+	src, display, canon, rerr := resolveAndFetch(spec, importer)
+	if rerr != nil {
+		// Operational/soft: return annotated null; nil Go error.
+		return annotNull(fmt.Sprintf("import %q: %v", spec, rerr)), nil
+	}
+	ast, spans, perr := parseSourceWithSpans(display, src)
+	if perr != nil {
+		return Null, perr
+	}
+	// Pass both canonical identity and display name to preserve error labels.
+	return ip.importWithBody(canon, display, ast, src, spans)
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// ---- Module runtime structs & VM hook --------------------------------------
+
+type moduleState int
+
+const (
+	modUnloaded moduleState = iota
+	modLoading
+	modLoaded
+)
+
+// moduleRec tracks cached module state by canonical identity.
+type moduleRec struct {
+	spec  string
+	env   *Env
+	mod   *Module
+	state moduleState
+	err   error
+}
+
+// get returns an exported binding by key. The VM uses this for property/index reads.
+func (m *Module) get(key string) (Value, bool) {
+	v, ok := m.Map.Entries[key]
+	return v, ok
+}
+
+// ---- Unified module import path --------------------------------------------
+
+// importWithBody evaluates a prepared module BODY AST by lowering to
+// ("module", ("str", canonName), body) and running it via runTopWithSource under
+// a SourceRef that points to the module’s own source text and spans.
+//
+// Cycle detection and caching are **centralized** in nativeMakeModule so that
+// *all* entry points (AST/Code/File/inline) share identical semantics.
+func (ip *Interpreter) importWithBody(canonName string, display string, body S, src string, spans *SpanIndex) (Value, error) {
+	// Prepare SourceRef for the module source so emitter can pass the absolute
+	// body path to __make_module, and the VM can render correct carets.
+	var sr *SourceRef
+	if src != "" && spans != nil {
+		sr = &SourceRef{Name: display, Src: src, Spans: spans}
+	}
+
+	// Lower to ("module", <canonical name>, body). Name is NOT overwritten later.
+	modAst := S{"module", S{"str", canonName}, body}
+
+	// Evaluate in an env that sees Core + natives, with proper VM entry.
+	env := NewEnv(ip.Core)
+	env.SealParentWrites()
+	v, err := ip.runTopWithSource(modAst, env, false, sr)
+	if err != nil {
+		return Null, err // hard runtime/parse errors with carets
+	}
+	if v.Tag != VTModule {
+		return Null, fmt.Errorf("internal error: expected module value")
+	}
+	return v, nil
+}
+
+// parseSourceWithSpans parses src into an S-expr AST + spans and wraps errors
+// with source context. Prefer this whenever you have the source text so we can
+// produce precise caret diagnostics during module execution.
+func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: display, Src: src}
 			}
-			return Str(raw)
-		},
-	)
-	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
-		ip.Global.Define("__oracle_execute", v)
+			return nil, nil, e // return structured error; pretty-print at API boundary
+
+		}
+		return nil, nil, err
 	}
+	return ast, spans, nil
 }
 
-// Minimal jsonParse native (Str -> Any | annotated Null).
-// Uses Go's encoding/json and converts into MindScript Values.
-func registerJSONParse(ip *Interpreter) {
-	ip.RegisterNative(
-		"jsonParse",
-		[]ParamSpec{{Name: "text", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			raw := ctx.MustArg("text").Data.(string)
-			var x any
-			if err := json.Unmarshal([]byte(raw), &x); err != nil {
-				return annotNull("json parse error")
+// buildModuleMap snapshots modEnv.table into a MapObject:
+// • Keys are sorted for determinism (Env.table is a Go map).
+// • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
+// • If a value carries Annot, mirror it into KeyAnn for that key.
+func buildModuleMap(modEnv *Env) *MapObject {
+	keys := make([]string, 0, len(modEnv.table))
+	for k := range modEnv.table {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic order
+
+	mo := &MapObject{
+		Entries: make(map[string]Value, len(keys)),
+		KeyAnn:  make(map[string]string, len(keys)),
+		Keys:    make([]string, 0, len(keys)),
+	}
+	for _, k := range keys {
+		v := modEnv.table[k]
+
+		// Pin exported types to the module env if needed
+		if v.Tag == VTType {
+			tv := v.Data.(*TypeValue)
+			if tv.Env == nil {
+				nv := TypeValIn(tv.Ast, modEnv)
+				nv.Annot = v.Annot // preserve docs on the value
+				v = nv
 			}
-			return goJSONToValue(x)
-		},
-	)
-	if v, err := ip.Core.Get("jsonParse"); err == nil {
-		ip.Global.Define("jsonParse", v)
+		}
+
+		mo.Entries[k] = v
+		mo.Keys = append(mo.Keys, k)
+		if ann := v.Annot; ann != "" {
+			mo.KeyAnn[k] = ann
+		}
 	}
+	return mo
 }
 
-// Simple prompt hook that echoes the outType textual form into the prompt.
-func registerBuildPromptEchoOutType(ip *Interpreter) {
-	ip.RegisterNative(
-		"__oracle_build_prompt",
-		[]ParamSpec{
-			{Name: "instruction", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}},
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
-		},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ot := ctx.MustArg("outType")
-			return Str(strings.TrimSpace(FormatValue(ot)))
-		},
-	)
-	if v, err := ip.Core.Get("__oracle_build_prompt"); err == nil {
-		ip.Global.Define("__oracle_build_prompt", v)
+// ---- Autoloader (resolution & fetching) ------------------------------------
+
+const defaultModuleExt = ".ms" // preserved
+
+// resolveAndFetch returns (src, display, canonicalKey) for the given spec.
+//
+// Network:
+//   - Absolute http(s) URLs are fetched via GET with a timeout.
+//   - If the URL path has no extension, defaultModuleExt is appended.
+//
+// Filesystem:
+//   - Resolve relative specs against importer dir → CWD → MindScriptPath (MSGPATH).
+//   - If spec has no extension, try spec+defaultModuleExt then spec.
+//   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
+//
+// NOTE: This function returns Go errors; ImportFile is responsible for classifying
+// resolution/fetch failures as soft (annotated null) at the API boundary.
+func resolveAndFetch(spec string, importer string) (string, string, string, error) {
+	// Network?
+	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
+		u, perr := url.Parse(spec)
+		if perr != nil {
+			return "", "", "", fmt.Errorf("invalid import url: %w", perr)
+		}
+		if path.Ext(u.Path) == "" && defaultModuleExt != "" {
+			u.Path = strings.TrimSuffix(u.Path, "/") + defaultModuleExt
+		}
+		canon := u.String()
+		src, display, err := httpFetch(canon)
+		return src, display, canon, err
 	}
+
+	// Filesystem
+	canon, ferr := resolveFS(spec, importer)
+	if ferr != nil {
+		return "", "", "", ferr
+	}
+	b, rerr := os.ReadFile(canon)
+	if rerr != nil {
+		return "", "", "", fmt.Errorf("module not found: %s", spec)
+	}
+	return string(b), canon, canon, nil
 }
 
-// --- tiny assertions ---------------------------------------------------------
+func resolveFS(spec string, importer string) (string, error) {
+	var bases []string
+	// Prefer the importer’s directory, if present and not a URL.
+	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
+		bases = append(bases, filepath.Dir(importer))
+	}
+	// Then the current working directory.
+	if cwd, err := os.Getwd(); err == nil {
+		bases = append(bases, cwd)
+	}
 
-func wantAnnotatedNullContains(t *testing.T, v Value, substr string) {
-	t.Helper()
-	if v.Tag != VTNull {
-		t.Fatalf("got %v, want annotated Null", v)
+	try := func(base, s string) (string, bool) {
+		cands := []string{}
+		if filepath.Ext(s) != "" {
+			cands = append(cands, filepath.Join(base, s))
+		} else {
+			cands = append(cands, filepath.Join(base, s)+defaultModuleExt, filepath.Join(base, s))
+		}
+		for _, c := range cands {
+			if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+				abs, _ := filepath.Abs(c)
+				return filepath.Clean(abs), true
+			}
+		}
+		return "", false
 	}
-	if !strings.Contains(v.Annot, substr) {
-		t.Fatalf("annot %q does not contain %q", v.Annot, substr)
+
+	// Absolute path?
+	if filepath.IsAbs(spec) {
+		if p, ok := try("", spec); ok {
+			return p, nil
+		}
+		// fallthrough to MindScriptPath for completeness
+	} else {
+		for _, b := range bases {
+			if p, ok := try(b, spec); ok {
+				return p, nil
+			}
+		}
 	}
+
+	// MindScriptPath (MSGPATH) — preserved behavior
+	if sp := os.Getenv(MindScriptPath); sp != "" {
+		for _, root := range filepath.SplitList(sp) {
+			if root == "" {
+				continue
+			}
+			if p, ok := try(root, spec); ok {
+				return p, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("module not found: %s", spec)
 }
 
-// Back-compat alias used by some tests
-func wantNullAnnotContains(t *testing.T, v Value, substr string) {
-	wantAnnotatedNullContains(t, v, substr)
-}
-
-// Count example TASK blocks in the last prompt (excludes the final TASK).
-// Heuristic: the fallback prompt renders one "TASK:" per example plus one final.
-// So (#TASK occurrences - 1) == #examples.
-func countExamplesInLastPrompt(ip *Interpreter) int {
-	p := ip.LastOraclePrompt()
-	if p == "" {
-		return 0
-	}
-	n := strings.Count(p, "\nTASK:\n\n")
-	if n > 0 {
-		return n - 1
-	}
-	// Be resilient to alternate formatting (very unlikely): fall back to "TASK:" count.
-	n = strings.Count(p, "TASK:\n\n")
-	if n > 0 {
-		return n - 1
-	}
-	return 0
-}
-
-// --- tests -------------------------------------------------------------------
-
-func Test_Oracle_StrSuccess(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
-
-	v, err := ip.EvalSource(`
-		# Say a scientist's name as plain text.
-		let scientist = oracle() -> Str
-		scientist()
-	`)
+func httpFetch(canonURL string) (src string, display string, err error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(canonURL)
 	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
+		return "", canonURL, err
 	}
-	wantStr(t, v, "Ada Lovelace")
-}
-
-func Test_Oracle_JSONSuccess_Object(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":{"name":"Marie Curie"}}`)
-
-	// Pull the field via MindScript to keep the test simple & stable.
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist().name
-	`)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", canonURL, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
+		return "", canonURL, err
 	}
-	wantStr(t, v, "Marie Curie")
+	return string(b), canonURL, nil
 }
 
-func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `not-json`)
-
-	v, err := ip.EvalSource(`
-		let f = oracle() -> {name!: Str}
-		f()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
+// prettySpec returns a short display name for a canonical spec:
+//   - file path   -> basename without extension
+//   - http(s) URL -> last segment without extension
+//   - fallback: original string if parsing fails
+func prettySpec(s string) string {
+	// Try URL first
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
+		base := path.Base(u.Path)
+		name := strings.TrimSuffix(base, path.Ext(base))
+		if name != "" {
+			return name
+		}
+		return base
 	}
-	wantAnnotatedNullContains(t, v, "not valid JSON")
+	// Filesystem path (or arbitrary name)
+	base := filepath.Base(s)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	if name != "" {
+		return name
+	}
+	return base
 }
-
-func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"ok":true}`)
-
-	v, err := ip.EvalSource(`
-		let f = oracle() -> {name!: Str}
-		f()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "did not match the declared return type")
-}
-
-func Test_Oracle_NullableBehavior_For_NonAny(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	// Engine validates return as T? (operationally nullable) → boxed null is accepted.
-	registerFakeOracle(ip, `{"output": null}`)
-
-	v, err := ip.EvalSource(`
-		let b = oracle() -> Str
-		b()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	// Expect a plain (unannotated) null Value (accepted under Str?).
-	if v.Tag != VTNull || v.Annot != "" {
-		t.Fatalf("want plain null (accepted under Str?), got: %v (annot=%q)", v, v.Annot)
-	}
-}
-
-func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":{"wrong":42}}`)
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "declared return type")
-}
-
-func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":{"foo":123}}`)
-
-	v, err := ip.EvalSource(`
-		let anything = oracle() -> Any
-		anything().foo
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantInt(t, v, 123) // Any accepts whatever JSON parses to
-}
-
-func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "```json\n{\"output\":{\"name\":\"Rosalind Franklin\"}}\n```")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist().name
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "Rosalind Franklin")
-}
-
-func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
-	// Simulate transport failure: executor returns annotated null
-	ip.RegisterNative(
-		"__oracle_execute",
-		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
-		},
-		S{"unop", "?", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value { return annotNull("network down") },
-	)
-	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
-		ip.Global.Define("__oracle_execute", v)
-	}
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "network down")
-}
-
-func Test_Oracle_ObjectResult_Parsed_OK(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":{"ok":true}}`)
-
-	v, err := ip.EvalSource(`
-		let s = oracle() -> {ok!: Bool}
-		s().ok
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantBool(t, v, true)
-}
-
-func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":{"ok":true}}`)
-
-	v, err := ip.EvalSource(`
-		let a = oracle() -> Any
-		## Backend returns {"output":{"ok": true}}; engine should parse because return type isn't Str.
-		a().ok
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantBool(t, v, true)
-}
-
-// --- examples handling via prompt inspection --------------------------------
-
-// The engine does not pass examples as a separate argument anymore.
-// We validate that examples are present in the constructed prompt by counting
-// the number of example TASK blocks.
-func Test_Oracle_Examples_Present_In_Prompt(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":"ok"}`)
-
-	v, err := ip.EvalSource(`
-		let ex = [
-			[0, "zero"],
-			[1, "one"],
-			[2, "two"]
-		]
-		let number2word = oracle(n: Int) -> Str from ex
-		number2word(5)
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "ok")
-
-	if got := countExamplesInLastPrompt(ip); got != 3 {
-		t.Fatalf("want 3 examples in prompt, got %d\n\nPROMPT:\n%s", got, ip.LastOraclePrompt())
-	}
-}
-
-func Test_Oracle_Examples_From_Variable_Expr_In_Prompt(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":"ok"}`)
-
-	v, err := ip.EvalSource(`
-        let ex = [
-            [0, "zero"],
-            [1, "one"],
-            [2, "two"]
-        ]
-        let number2word = oracle(n: Int) -> Str from ex
-        number2word(5)
-    `)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "ok")
-
-	if got := countExamplesInLastPrompt(ip); got != 3 {
-		t.Fatalf("want 3 examples in prompt, got %d\n\nPROMPT:\n%s", got, ip.LastOraclePrompt())
-	}
-}
-
-func Test_Oracle_Examples_From_Expression_In_Prompt(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":"ok"}`)
-
-	v, err := ip.EvalSource(`
-        let a = [[0,"zero"]]
-        let b = [[1,"one"]]
-        let number2word = oracle(n: Int) -> Str from (a + b)
-        number2word(7)
-    `)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "ok")
-
-	if got := countExamplesInLastPrompt(ip); got != 2 {
-		t.Fatalf("want 2 examples in prompt, got %d\n\nPROMPT:\n%s", got, ip.LastOraclePrompt())
-	}
-}
-
-// --- fenced / null literal edge cases ---------------------------------------
-
-func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist().name
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "Katherine Johnson")
-}
-
-func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
-
-	v, err := ip.EvalSource(`
-		let greet = oracle() -> Str
-		greet()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "Hello, world!")
-}
-
-func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
-	registerFakeOracle(ip, "null") // executor returns the literal string "null"
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> Str
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "returned null")
-}
-
-func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "this is not json at all")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "valid JSON")
-}
-
-func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
-	registerFakeOracle(ip, "null")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "returned null")
-}
-
-// Already had a transport error test; add one more variant: backend returns empty -> annotated null
-func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
-	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
-
-	v, err := ip.EvalSource(`
-		let s = oracle() -> Str
-		s()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "fake backend")
-}
-
-// -----------------------------------------------------------------------------
-// New tests focusing on arity/type errors at call sites (hard errors).
-// -----------------------------------------------------------------------------
-
-func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
-	ip := NewInterpreter()
-	// Backend won't be reached if params fail type-checking (engine enforces)
-	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
-
-	// Wrong type for first parameter (expects Int) → CONTRACT VIOLATION ⇒ HARD ERROR
-	_, err := ip.EvalSource(`
-		let f = oracle(a: Int, b: Str) -> Str
-		f("not-int", "ok")
-	`)
-	wantHardErrorContains(t, err, "type mismatch")
-}
-
-func wantHardErrorContains(t *testing.T, err error, substr string) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("expected hard error containing %q, got nil error", substr)
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, substr) {
-		t.Fatalf("hard error mismatch: want msg to contain %q, got: %s", substr, msg)
-	}
-	// Optional: assert caret header is present when runtimeErrorsAsGoError=true
-	if !strings.Contains(msg, "RUNTIME ERROR") {
-		t.Fatalf("expected caret-style RUNTIME ERROR, got: %s", msg)
-	}
-}
-=== END FILE: oracles_test.go ===
+=== END FILE: modules.go ===
 

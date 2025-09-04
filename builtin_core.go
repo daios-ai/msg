@@ -5,11 +5,6 @@ import (
 	"sort"
 )
 
-// Opaque handle for environment snapshots (unexported).
-type envHandle struct {
-	env *Env
-}
-
 // ---- core built-ins ----------------------------------------------------
 
 func registerCoreBuiltins(ip *Interpreter) {

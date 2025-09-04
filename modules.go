@@ -351,7 +351,7 @@ func resolveFS(spec string, importer string) (string, error) {
 		if p, ok := try("", spec); ok {
 			return p, nil
 		}
-		// fallthrough to MindScriptPath for completeness
+		// fallthrough to MindScriptPath for completeness.
 	} else {
 		for _, b := range bases {
 			if p, ok := try(b, spec); ok {
@@ -366,7 +366,9 @@ func resolveFS(spec string, importer string) (string, error) {
 			if root == "" {
 				continue
 			}
-			if p, ok := try(root, spec); ok {
+			// Only look under a conventional "lib" subdir of each root.
+			libRoot := filepath.Join(root, "lib")
+			if p, ok := try(libRoot, spec); ok {
 				return p, nil
 			}
 		}

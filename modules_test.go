@@ -101,18 +101,24 @@ a.y`)
 }
 
 // Search via MindScriptPath when not found in importer dir or CWD.
-func Test_FileImport_Search_MindScriptPath(t *testing.T) {
-	lib, done := withTempDir(t)
+func Test_FileImport_Search_MindScriptPath_LibSubdir(t *testing.T) {
+	root, done := withTempDir(t)
 	defer done()
 
-	_ = write(t, lib, "util.ms", `let name = "Bob"`)
+	// Create SDK-like layout: <root>/lib
+	libDir := filepath.Join(root, "lib")
+	if err := os.MkdirAll(libDir, 0o755); err != nil {
+		t.Fatalf("mkdir lib: %v", err)
+	}
 
-	// Empty CWD, rely on `MindScriptPath`
+	_ = write(t, libDir, "util.ms", `let name = "Bob"`)
+	_ = write(t, libDir, "std.ms", ``) // tiny valid program
+
+	// Empty CWD; rely on MSGPATH roots (loader appends /lib)
 	old := os.Getenv(MindScriptPath)
-	_ = os.Setenv(MindScriptPath, lib)
+	_ = os.Setenv(MindScriptPath, root)
 	defer os.Setenv(MindScriptPath, old)
 
-	_ = write(t, lib, "std.ms", ``) // tiny valid program
 	ip, err := NewRuntime()
 	if err != nil {
 		t.Fatalf("NewRuntime failed: %v", err)

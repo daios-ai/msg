@@ -298,6 +298,8 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 			Chunk:      f.Chunk,
 			NativeName: f.NativeName,
 			Src:        f.Src,
+			IsOracle:   f.IsOracle,
+			Examples:   append([]Value(nil), f.Examples...),
 		})
 	}
 
@@ -308,11 +310,11 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		ReturnType: f.ReturnType,
 		Body:       f.Body,
 		Env:        callEnv,
+		HiddenNull: f.HiddenNull,
 		Chunk:      f.Chunk,
 		NativeName: f.NativeName,
 		IsOracle:   f.IsOracle,
 		Examples:   f.Examples,
-		HiddenNull: f.HiddenNull,
 		Src:        f.Src,
 	}
 	execVal := FunVal(execFun)
@@ -347,7 +349,9 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 
 	// Oracles are handled elsewhere (private oracle impl lives in ops or a separate file).
 	if f.IsOracle {
-		return ip.execOracle(funVal, callSite)
+		scope := withScope(f.Env, callSite)          // where effects should land
+		ctx := &callCtx{argEnv: f.Env, scope: scope} // access to bound args + scope
+		return ip.execOracle(funVal, ctx)
 	}
 
 	// User-defined function
@@ -891,7 +895,14 @@ func (e *emitter) emitExpr(n S) {
 	case "oracle":
 		e.withChild(2, func() {
 			// oracles don't JIT a body chunk here → no body base path
-			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
+			e.emitMakeFun(
+				n[1].(S),
+				n[2].(S),
+				S{"oracle"},
+				true,
+				n[3].(S),
+				nil,
+			)
 		})
 
 	case "return":

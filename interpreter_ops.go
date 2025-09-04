@@ -293,12 +293,27 @@ func (o *opsImpl) initCore() {
 				cpy.PathBase = base
 				sr = &cpy
 			}
+
+			// Build closure env that carries hidden signature metadata
+			closure := NewEnv(ctx.Env())
+			nameVals := make([]Value, len(names))
+			for i, n := range names {
+				nameVals[i] = Str(n)
+			}
+			typeVals := make([]Value, len(types))
+			for i, t := range types {
+				typeVals[i] = TypeVal(t)
+			}
+			closure.Define("$__sig_names", Arr(nameVals))
+			closure.Define("$__sig_types", Arr(typeVals))
+
+			// Construct the function with this closure
 			return FunVal(&Fun{
 				Params:     names,
 				ParamTypes: types,
 				ReturnType: retAst,
 				Body:       bodyTV.Ast,
-				Env:        ctx.Env(),
+				Env:        closure, // <-- use the closure with hidden signature
 				HiddenNull: hidden,
 				IsOracle:   isOr,
 				Examples:   exVals,

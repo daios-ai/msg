@@ -107,6 +107,7 @@ package mindscript
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -135,13 +136,193 @@ func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
    PRIVATE
    =========================== */
 
+// execOracle is a CallCtx-based stub used during bring-up.
+// It prints the parameter types, return type, arguments (in declared order),
+// and examples. Then it returns a value that conforms to the oracle's
+// operationally-nullable return type (T?).
+
+// execOracle is a CallCtx-based stub used during bring-up.
+// It prints declared parameter types (and their resolved forms), the declared
+// and operational (nullable) return type, the current call's argument values,
+// and the provided examples. Then it returns a value that conforms to the
+// oracle's operationally-nullable return type (T?).
+func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
+	if funVal.Tag != VTFun {
+		return annotNull("oracle: not a function")
+	}
+	f := funVal.Data.(*Fun)
+
+	// ---- Recover signature from hidden bindings in the closure env ----
+	var paramNames []string
+	var declTypes []S
+
+	if f.Env != nil {
+		// $__sig_names : [Str]
+		if nv, err := f.Env.Get("$__sig_names"); err == nil && nv.Tag == VTArray {
+			for _, v := range nv.Data.([]Value) {
+				if v.Tag == VTStr {
+					paramNames = append(paramNames, v.Data.(string))
+				}
+			}
+		}
+		// $__sig_types : [Type]
+		if tv, err := f.Env.Get("$__sig_types"); err == nil && tv.Tag == VTArray {
+			for _, v := range tv.Data.([]Value) {
+				if v.Tag == VTType {
+					if tvv, ok := v.Data.(*TypeValue); ok {
+						declTypes = append(declTypes, tvv.Ast)
+					}
+				}
+			}
+		}
+	}
+
+	// ---- Fallbacks if hidden signature not found ----
+	if len(paramNames) == 0 {
+		// Recover names from one-binding frames for user-supplied args only.
+		tmp := []string{}
+		stop := false
+		for e := f.Env; e != nil && e.table != nil; e = e.parent {
+			if len(e.table) != 1 {
+				break
+			}
+			for name := range e.table {
+				// If we see __make_fun's own params, stop descending.
+				if name == "params" || name == "types" || name == "ret" ||
+					name == "body" || name == "isOracle" || name == "examples" || name == "basePath" {
+					stop = true
+					break
+				}
+				tmp = append(tmp, name)
+			}
+			if stop {
+				break
+			}
+		}
+		for i := len(tmp) - 1; i >= 0; i-- {
+			paramNames = append(paramNames, tmp[i])
+		}
+	}
+	if len(declTypes) == 0 && len(paramNames) > 0 {
+		// Last resort: align with the current tail of ParamTypes (may be incomplete at saturation).
+		for i := 0; i < len(paramNames) && i < len(f.ParamTypes); i++ {
+			declTypes = append(declTypes, f.ParamTypes[i])
+		}
+	}
+
+	// ---- Print parameter types (declared + resolved) ----
+	fmt.Println("Oracle parameter types:")
+	n := len(paramNames)
+	if len(declTypes) < n {
+		n = len(declTypes)
+	}
+	for i := 0; i < n; i++ {
+		decl := declTypes[i]
+		resolved := ip.resolveType(decl, f.Env)
+		fmt.Printf("  %s: %s (resolved: %s)\n",
+			paramNames[i], FormatSExpr(decl), FormatSExpr(resolved))
+	}
+
+	// ---- Return type (declared + runtime nullable) ----
+	rtDecl := f.ReturnType
+	rtRuntime := ensureNullableUnlessAny(rtDecl)
+	fmt.Printf("Oracle return type: %s (runtime: %s)\n",
+		FormatSExpr(rtDecl), FormatSExpr(rtRuntime))
+
+	// ---- Arguments: values in declared order ----
+	fmt.Println("Oracle arguments:")
+	for _, name := range paramNames {
+		if v, ok := ctx.Arg(name); ok {
+			fmt.Printf("  %s = %s\n", name, FormatValue(v))
+		} else {
+			fmt.Printf("  %s = <unbound>\n", name)
+		}
+	}
+
+	// ---- Examples ----
+	fmt.Println("Oracle examples:")
+	for _, ex := range f.Examples {
+		if ex.Tag != VTArray {
+			continue
+		}
+		xs := ex.Data.([]Value)
+		if len(xs) != 2 {
+			continue
+		}
+		fmt.Printf("  IN  = %s\n", FormatValue(xs[0]))
+		fmt.Printf("  OUT = %s\n", FormatValue(xs[1]))
+	}
+
+	// ---- Conforming return (stub) ----
+	out := ip.defaultValueForType(rtRuntime, f.Env)
+	if !ip.isType(out, rtRuntime, f.Env) {
+		return Null
+	}
+	return out
+}
+
+// defaultValueForType returns a simple default Value that conforms to the given type S.
+// It respects nullable types by stripping '?' and producing a value for the base type.
+// For unknown/complex cases, it returns Null (which conforms to T? at oracle call sites).
+func (ip *Interpreter) defaultValueForType(t S, env *Env) Value {
+	base := stripNullable(t)
+
+	// Built-in ids
+	if len(base) >= 2 {
+		if tag, _ := base[0].(string); tag == "id" {
+			switch base[1].(string) {
+			case "Any":
+				return Null
+			case "Null":
+				return Null
+			case "Bool":
+				return Bool(false)
+			case "Int":
+				return Int(0)
+			case "Num":
+				return Num(0)
+			case "Str":
+				return Str("")
+			default:
+				// Unknown alias: resolve once and retry; if no change, return Null.
+				rt := ip.resolveType(base, env)
+				if !equalS(rt, base) {
+					return ip.defaultValueForType(rt, env)
+				}
+				return Null
+			}
+		}
+	}
+
+	// Structural forms
+	if len(base) >= 1 {
+		switch base[0].(string) {
+		case "array":
+			return Arr([]Value{})
+		case "map":
+			// Empty map satisfies open-world objects; required keys are not enforced here.
+			return Map(map[string]Value{})
+		case "enum":
+			// Try to pick the first literal if present.
+			if len(base) > 1 {
+				if v, ok := ip.litToValue(base[1].(S)); ok {
+					return v
+				}
+			}
+			return Null
+		}
+	}
+
+	return Null
+}
+
 // execOracle centralizes prompt construction, backend dispatch, parsing,
 // and type-checking. It returns a nullable value (success or failure).
 //
 // Current backend contract:
 //
 //	__oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
-func (ip *Interpreter) execOracle(funVal Value, _ *Env) Value {
+func (ip *Interpreter) execOracle2(funVal Value, _ *Env) Value {
 	if funVal.Tag != VTFun {
 		return annotNull("oracle: not a function")
 	}

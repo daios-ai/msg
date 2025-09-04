@@ -146,18 +146,19 @@ func (ip *Interpreter) LastOraclePrompt() string { return ip.oracleLastPrompt }
 // and operational (nullable) return type, the current call's argument values,
 // and the provided examples. Then it returns a value that conforms to the
 // oracle's operationally-nullable return type (T?).
+// execOracle builds the oracle prompt, calls the backend __exec_oracle(prompt),
+// parses the JSON result, validates it against the operational return type (T?),
+// and returns the unboxed value (or annotated null on failure).
 func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	if funVal.Tag != VTFun {
 		return annotNull("oracle: not a function")
 	}
 	f := funVal.Data.(*Fun)
 
-	// ---- Recover signature from hidden bindings in the closure env ----
+	// ---- Recover declared signature from hidden bindings in the closure env ----
 	var paramNames []string
 	var declTypes []S
-
 	if f.Env != nil {
-		// $__sig_names : [Str]
 		if nv, err := f.Env.Get("$__sig_names"); err == nil && nv.Tag == VTArray {
 			for _, v := range nv.Data.([]Value) {
 				if v.Tag == VTStr {
@@ -165,7 +166,6 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 				}
 			}
 		}
-		// $__sig_types : [Type]
 		if tv, err := f.Env.Get("$__sig_types"); err == nil && tv.Tag == VTArray {
 			for _, v := range tv.Data.([]Value) {
 				if v.Tag == VTType {
@@ -177,86 +177,284 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 		}
 	}
 
-	// ---- Fallbacks if hidden signature not found ----
-	if len(paramNames) == 0 {
-		// Recover names from one-binding frames for user-supplied args only.
-		tmp := []string{}
-		stop := false
-		for e := f.Env; e != nil && e.table != nil; e = e.parent {
-			if len(e.table) != 1 {
-				break
-			}
-			for name := range e.table {
-				// If we see __make_fun's own params, stop descending.
-				if name == "params" || name == "types" || name == "ret" ||
-					name == "body" || name == "isOracle" || name == "examples" || name == "basePath" {
-					stop = true
-					break
+	// ---- Build boxes and the prompt ----
+	// Input map value from current arguments.
+	inArgsVal := valueMapFromArgs(ctx, paramNames) // VTMap holding current call args
+
+	// Vector of declared parameter types (as VTType values).
+	inTypesVal := Arr(func() []Value {
+		arr := make([]Value, len(declTypes))
+		for i := range declTypes {
+			arr[i] = TypeVal(declTypes[i])
+		}
+		return arr
+	}())
+
+	// Boxed output type: {"output": T}, where T is the *declared* success type.
+	outBoxTypeS := S{"map", S{"pair!", S{"str", "output"}, stripNullable(f.ReturnType)}}
+
+	// Normalize examples into [inputMap, outputMap] pairs.
+	exPairs := boxExamplesAsMaps(f.Examples, paramNames)
+	examplesVal := Arr(exPairs)
+
+	// Instruction = function annotation (task description).
+	instructionVal := Str(strings.TrimSpace(funVal.Annot))
+
+	// Build prompt text and record it.
+	prompt := ip.buildOraclePromptV(
+		instructionVal,       // Str
+		inArgsVal,            // Any (VTMap of current arguments)
+		inTypesVal,           // [Type] (declared param types)
+		TypeVal(outBoxTypeS), // Type  (boxed {"output": T})
+		examplesVal,          // [Any] ([inputMap, outputMap] pairs)
+		f.Env,
+	)
+	ip.oracleLastPrompt = prompt
+
+	// ---- Call backend: __exec_oracle(prompt: Str) -> Str | Null ----
+	hook, err := ip.Global.Get("__oracle_execute")
+	if err != nil || hook.Tag != VTFun {
+		return annotNull("oracle backend not configured (define __exec_oracle)")
+	}
+	res := ip.Apply(hook, []Value{Str(prompt)})
+
+	// Backend can signal failure with null.
+	if res.Tag == VTNull {
+		return res
+	}
+	if res.Tag != VTStr {
+		fmt.Print(FormatValue(res))
+		return annotNull("oracle executor must return Str (raw model output) or null")
+	}
+
+	// ---- Parse returned JSON and validate it matches {"output": T?} ----
+	raw := strings.TrimSpace(res.Data.(string))
+	raw = unwrapFenced(raw) // tolerate accidental ```json fences
+
+	parsed, perr := ip.callGlobal1("jsonParse", Str(raw))
+	if perr != "" {
+		if raw == "null" {
+			return annotNull("oracle returned null")
+		}
+		return annotNull("oracle output was not valid JSON")
+	}
+	if parsed.Tag != VTMap {
+		return annotNull("oracle output did not match the declared return type")
+	}
+	mo := parsed.Data.(*MapObject)
+	outVal, ok := mo.Entries["output"]
+	if !ok {
+		return annotNull("oracle output did not match the declared return type")
+	}
+
+	// Validate against operationally nullable return type (T?).
+	outTNullable := ensureNullableUnlessAny(f.ReturnType)
+	if !ip.isType(outVal, outTNullable, f.Env) {
+		return annotNull("oracle output did not match the declared return type")
+	}
+	return outVal
+}
+
+// buildOraclePromptV builds the oracle prompt from the pieces you specified.
+// Signature (as requested):
+//
+//	instruction : Value(Str)
+//	input       : Value(Any)   (boxed map of actual call arguments)
+//	inTypes     : Value([Type])  (declared parameter types, order matches names)
+//	outType     : Value(Type)    (declared *success* type; exec makes it nullable)
+//	examples    : Value([Any])   (each item is a boxed map: {input: {..}, output: {...}} or [inputMap, outputMap])
+func (ip *Interpreter) buildOraclePromptV(
+	instruction Value, // Str
+	input Value, // Any (actually a VTMap with param-name keys)
+	inTypes Value, // [Type] (declared param types in declared order)
+	outType Value, // Type   (boxed {"output": T} type)
+	examples Value, // [Any]  (each item is [inputMap, outputMap] or {"input":..,"output":..})
+	env *Env,
+) string {
+	// --- Derive the input MAP TYPE (names + types) from `input` and `inTypes` ---
+	names := []string{}
+	if input.Tag == VTMap {
+		mo := input.Data.(*MapObject)
+		// Preserve insertion/declared order
+		for _, k := range mo.Keys {
+			names = append(names, k)
+		}
+	}
+	declTypes := []S{}
+	if inTypes.Tag == VTArray {
+		for _, v := range inTypes.Data.([]Value) {
+			if v.Tag == VTType {
+				if tv, ok := v.Data.(*TypeValue); ok {
+					declTypes = append(declTypes, tv.Ast)
 				}
-				tmp = append(tmp, name)
-			}
-			if stop {
-				break
 			}
 		}
-		for i := len(tmp) - 1; i >= 0; i-- {
-			paramNames = append(paramNames, tmp[i])
+	}
+	// Build an S for the input map type
+	inMapTypeS := mapTypeFromParams(names, declTypes)
+
+	// Pretty-print a schema from a VTType
+	toSchemaString := func(tv Value) string {
+		s := ip.TypeValueToJSONSchema(tv, env)
+		b, err := json.MarshalIndent(s, "", "  ")
+		if err != nil {
+			return "{}"
+		}
+		return string(b)
+	}
+
+	// INPUT schema from the derived input map TYPE
+	inputSchema := toSchemaString(TypeVal(inMapTypeS))
+	// OUTPUT schema from the boxed output TYPE ({"output": T})
+	outputSchema := toSchemaString(outType)
+
+	// Example/arg JSON stringifier
+	toJSON := func(v Value) string {
+		j, err := valueToGoJSON(v)
+		if err != nil {
+			return "null"
+		}
+		b, err := json.Marshal(j)
+		if err != nil {
+			return "null"
+		}
+		s := string(b)
+		s = strings.ReplaceAll(s, ":", ": ")
+		s = strings.ReplaceAll(s, ",", ", ")
+		return s
+	}
+
+	var bld strings.Builder
+
+	// Header & guidance
+	bld.WriteString("PROMPT:\n")
+	bld.WriteString("Please follow the instruction to the best of your ability:\n")
+	bld.WriteString("for every input, provide an output that solves the task and\n")
+	bld.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
+	bld.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
+
+	// Schemas
+	bld.WriteString("INPUT JSON SCHEMA:\n\n")
+	bld.WriteString(indentBlock(inputSchema, 2))
+	bld.WriteString("\n\n")
+
+	bld.WriteString("OUTPUT JSON SCHEMA:\n\n")
+	bld.WriteString(indentBlock(outputSchema, 2))
+	bld.WriteString("\n\n")
+
+	// Instruction line
+	taskLine := "Given the input, determine the output."
+	if instruction.Tag == VTStr && strings.TrimSpace(instruction.Data.(string)) != "" {
+		taskLine = strings.TrimSpace(instruction.Data.(string))
+	}
+
+	// Examples
+	if examples.Tag == VTArray {
+		for _, ex := range examples.Data.([]Value) {
+			var inVal, outVal Value
+			switch ex.Tag {
+			case VTArray:
+				pair := ex.Data.([]Value)
+				if len(pair) != 2 {
+					continue
+				}
+				inVal, outVal = pair[0], pair[1]
+			case VTMap:
+				mo := ex.Data.(*MapObject)
+				inVal = mo.Entries["input"]
+				outVal = mo.Entries["output"]
+			default:
+				continue
+			}
+
+			bld.WriteString("TASK:\n\n")
+			bld.WriteString(taskLine + "\n\n")
+			bld.WriteString("INPUT:\n\n")
+			bld.WriteString(toJSON(inVal) + "\n\n")
+			bld.WriteString("OUTPUT:\n\n")
+			bld.WriteString(toJSON(outVal) + "\n\n")
 		}
 	}
-	if len(declTypes) == 0 && len(paramNames) > 0 {
-		// Last resort: align with the current tail of ParamTypes (may be incomplete at saturation).
-		for i := 0; i < len(paramNames) && i < len(f.ParamTypes); i++ {
-			declTypes = append(declTypes, f.ParamTypes[i])
-		}
-	}
 
-	// ---- Print parameter types (declared + resolved) ----
-	fmt.Println("Oracle parameter types:")
-	n := len(paramNames)
-	if len(declTypes) < n {
-		n = len(declTypes)
-	}
-	for i := 0; i < n; i++ {
-		decl := declTypes[i]
-		resolved := ip.resolveType(decl, f.Env)
-		fmt.Printf("  %s: %s (resolved: %s)\n",
-			paramNames[i], FormatSExpr(decl), FormatSExpr(resolved))
-	}
+	// Final TASK with the current call's input
+	bld.WriteString("TASK:\n\n")
+	bld.WriteString(taskLine + "\n\n")
+	bld.WriteString("INPUT:\n\n")
+	bld.WriteString(toJSON(input) + "\n\n")
+	bld.WriteString("OUTPUT:\n")
 
-	// ---- Return type (declared + runtime nullable) ----
-	rtDecl := f.ReturnType
-	rtRuntime := ensureNullableUnlessAny(rtDecl)
-	fmt.Printf("Oracle return type: %s (runtime: %s)\n",
-		FormatSExpr(rtDecl), FormatSExpr(rtRuntime))
+	return bld.String()
+}
 
-	// ---- Arguments: values in declared order ----
-	fmt.Println("Oracle arguments:")
-	for _, name := range paramNames {
-		if v, ok := ctx.Arg(name); ok {
-			fmt.Printf("  %s = %s\n", name, FormatValue(v))
-		} else {
-			fmt.Printf("  %s = <unbound>\n", name)
-		}
+// --------- helpers --------------------
+
+// Build a map type S from parameter names and declared types.
+func mapTypeFromParams(names []string, types []S) S {
+	m := S{"map"}
+	for i := 0; i < len(names) && i < len(types); i++ {
+		m = append(m, S{"pair!", S{"str", names[i]}, types[i]})
 	}
+	return m
+}
 
-	// ---- Examples ----
-	fmt.Println("Oracle examples:")
-	for _, ex := range f.Examples {
+// Box current call arguments (from ctx) into a map Value conforming to the input map type.
+func valueMapFromArgs(ctx CallCtx, names []string) Value {
+	entries := make(map[string]Value, len(names))
+	keys := make([]string, 0, len(names))
+	for _, name := range names {
+		v, _ := ctx.Arg(name) // if missing, leave zero value (omitted)
+		entries[name] = v
+		keys = append(keys, name)
+	}
+	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: map[string]string{}, Keys: keys}}
+}
+
+// Box examples: each example is [inVal, outVal] where inVal can be tuple/array or map.
+// We normalize to maps: input → map[name]=..., output → map{"output": outVal}.
+func boxExamplesAsMaps(exs []Value, names []string) []Value {
+	out := make([]Value, 0, len(exs))
+	for _, ex := range exs {
 		if ex.Tag != VTArray {
 			continue
 		}
-		xs := ex.Data.([]Value)
-		if len(xs) != 2 {
+		pair := ex.Data.([]Value)
+		if len(pair) != 2 {
 			continue
 		}
-		fmt.Printf("  IN  = %s\n", FormatValue(xs[0]))
-		fmt.Printf("  OUT = %s\n", FormatValue(xs[1]))
-	}
+		inV, outV := pair[0], pair[1]
 
-	// ---- Conforming return (stub) ----
-	out := ip.defaultValueForType(rtRuntime, f.Env)
-	if !ip.isType(out, rtRuntime, f.Env) {
-		return Null
+		// Normalize input to a map value using param order
+		inMap := map[string]Value{}
+		keys := []string{}
+		if inV.Tag == VTArray {
+			xs := inV.Data.([]Value)
+			for i := 0; i < len(xs) && i < len(names); i++ {
+				inMap[names[i]] = xs[i]
+				keys = append(keys, names[i])
+			}
+		} else if inV.Tag == VTMap {
+			mo := inV.Data.(*MapObject)
+			for _, k := range mo.Keys {
+				inMap[k] = mo.Entries[k]
+				keys = append(keys, k)
+			}
+		} else {
+			// Single-arg case: use first name
+			if len(names) > 0 {
+				inMap[names[0]] = inV
+				keys = append(keys, names[0])
+			}
+		}
+		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, KeyAnn: map[string]string{}, Keys: keys}}
+
+		outVal := Value{Tag: VTMap, Data: &MapObject{
+			Entries: map[string]Value{"output": outV},
+			KeyAnn:  map[string]string{},
+			Keys:    []string{"output"},
+		}}
+
+		// Store as a 2-tuple [inputMap, outputMap]
+		out = append(out, Arr([]Value{inVal, outVal}))
 	}
 	return out
 }

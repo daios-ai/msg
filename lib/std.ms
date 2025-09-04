@@ -531,9 +531,9 @@ end
 #
 # Backends install their executor here via `oracleInstall`. Until installed,
 # calling an oracle returns an annotated null.
-# Args: _prompt: Str, _inType: Type, _outTypeNullable: Type, _examples: [Any]
+# Args: _prompt: Str
 # Returns: Str?
-let __oracle_execute = fun(_prompt: Str, _inType: Type, _outTypeNullable: Type, _examples: [Any]) -> Str? do
+let __oracle_execute = fun(_prompt: Str) -> Str? do
 	error("oracle backend not configured")
 end
 
@@ -549,7 +549,7 @@ let _oracleInstalled = false
 # Rebinds `__oracle_execute` to the provided function.
 # Args: exec: (Str -> Type -> Type -> [Any] -> Str?)
 # Returns: Null
-let oracleInstall = fun(exec: (Str -> Type -> Type -> [Any] -> Str?)) -> Null do
+let oracleInstall = fun(exec: Str -> Str?) -> Null do
 	__oracle_execute = exec
 	_oracleInstalled = true
 	null
@@ -612,3 +612,6 @@ let oracleCheck = fun(name: Str) -> {}? do
 		error("Oracle failed: " + str(r.error))
 	end
 end
+
+llm.useBackend("openai")
+llm.useModel("gpt-4o-mini")

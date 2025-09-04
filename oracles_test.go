@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"unicode"
 )
 
 // --- helpers specific to these oracle tests ----------------------------------
@@ -12,14 +11,12 @@ import (
 // Installs a fake __oracle_execute that returns the provided raw string
 // (or an annotated null when raw == "").
 // Registered in Core and hoisted to Global (execOracle looks in Global).
+// NOTE: In the current engine, __oracle_execute takes only (prompt: Str) -> Str | Null.
 func registerFakeOracle(ip *Interpreter, raw string) {
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
 			{Name: "prompt", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}}, // engine passes T? here
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
 		},
 		S{"unop", "?", S{"id", "Str"}}, // Str? (executor may return null on transport failure)
 		func(_ *Interpreter, ctx CallCtx) Value {
@@ -34,62 +31,25 @@ func registerFakeOracle(ip *Interpreter, raw string) {
 	}
 }
 
-// Like registerFakeOracle, but the fake inspects outType to ensure the engine
-// passes a *nullable* success type for non-Any, and leaves Any unwrapped.
-// Returns BOXED JSON `{"output":{"ok":true}}` on success, otherwise annotated null with reason.
-func registerAssertingFakeOracle(ip *Interpreter) {
+// Variant that also captures the prompt string into *outPrompt.
+func registerFakeOracleWithCapture(ip *Interpreter, raw string, outPrompt *string) {
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
 			{Name: "prompt", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}}, // engine passes T? for non-Any
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
 		},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			otV := ctx.MustArg("outType")
-			if otV.Tag != VTType {
-				return annotNull("outType is not a Type")
-			}
-
-			// Use the type AST → canonical string (no <type: ...> wrapper).
-			var otText string
-			switch tv := otV.Data.(type) {
-			case *TypeValue:
-				otText = strings.TrimSpace(FormatType(tv.Ast))
-			case S:
-				otText = strings.TrimSpace(FormatType(tv))
-			default:
-				// Fallback (shouldn't happen): strip wrappers if any.
-				otText = strings.TrimSpace(FormatValue(otV))
-				otText = strings.TrimPrefix(otText, "<type:")
-				otText = strings.TrimSuffix(otText, ">")
-				otText = strings.TrimSpace(otText)
-			}
-
-			// Case: Any must stay unwrapped by the engine; we still return boxed JSON.
-			if otText == "Any" {
-				return Str(`{"output":{"ok":true}}`)
-			}
-
-			// Non-Any must be nullable (end with '?')
-			if !strings.HasSuffix(otText, "?") {
-				return annotNull("outType was not nullable")
-			}
-			base := strings.TrimSpace(strings.TrimSuffix(otText, "?"))
-
-			switch base {
-			case "Str":
-				return Str(`{"output":"ok"}`)
-			default:
-				// If the declared success type is the object {ok!: Bool}, return that shape.
-				if strings.Contains(base, "ok!: Bool") {
-					return Str(`{"output":{"ok":true}}`)
+			// capture the prompt for inspection in tests
+			if outPrompt != nil {
+				if p, ok := ctx.Arg("prompt"); ok && p.Tag == VTStr {
+					*outPrompt = p.Data.(string)
 				}
-				// Fallback for other types: still boxed & valid under T?
-				return Str(`{"output":null}`)
 			}
+			if raw == "" {
+				return annotNull("fake backend: empty")
+			}
+			return Str(raw)
 		},
 	)
 	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
@@ -118,70 +78,31 @@ func registerJSONParse(ip *Interpreter) {
 	}
 }
 
-// Simple prompt hook that echoes the outType textual form into the prompt.
-func registerBuildPromptEchoOutType(ip *Interpreter) {
-	ip.RegisterNative(
-		"__oracle_build_prompt",
-		[]ParamSpec{
-			{Name: "instruction", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}},
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
-		},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ot := ctx.MustArg("outType")
-			return Str(strings.TrimSpace(FormatValue(ot)))
-		},
-	)
-	if v, err := ip.Core.Get("__oracle_build_prompt"); err == nil {
-		ip.Global.Define("__oracle_build_prompt", v)
-	}
-}
-
-// Fake executor that returns count of *validated* examples it received.
-// It returns BOXED JSON `{"output":"ok"}` on success.
-func registerCountingExecutor(ip *Interpreter) {
-	ip.RegisterNative(
-		"__oracle_execute",
-		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}},
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
-		},
-		S{"unop", "?", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ex := ctx.MustArg("examples")
-			if ex.Tag != VTArray {
-				return annotNull("examples not array")
-			}
-			n := len(ex.Data.([]Value))
-			_ = n // we don’t surface it, the tests only validate length via separate helper
-			return Str(`{"output":"ok"}`)
-		},
-	)
-	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
-		ip.Global.Define("__oracle_execute", v)
-	}
-}
-
 // --- tiny assertions ---------------------------------------------------------
 
-func wantNullAnnotContains(t *testing.T, v Value, substr string) {
-	t.Helper()
-	if v.Tag != VTNull {
-		t.Fatalf("got %v, want annotated Null", v)
+// Count example TASK blocks in a prompt (excludes the final TASK).
+// Heuristic: fallback prompt renders one "TASK:" per example plus one final.
+// So (#TASK occurrences - 1) == #examples.
+func countExamplesInPrompt(prompt string) int {
+	if prompt == "" {
+		return 0
 	}
-	if !strings.Contains(v.Annot, substr) {
-		t.Fatalf("annot %q does not contain %q", v.Annot, substr)
+	n := strings.Count(prompt, "\nTASK:\n\n")
+	if n > 0 {
+		return n - 1
 	}
+	// Resilient fallback.
+	n = strings.Count(prompt, "TASK:\n\n")
+	if n > 0 {
+		return n - 1
+	}
+	return 0
 }
 
 // --- tests -------------------------------------------------------------------
 
 func Test_Oracle_StrSuccess(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
 
@@ -197,11 +118,10 @@ func Test_Oracle_StrSuccess(t *testing.T) {
 }
 
 func Test_Oracle_JSONSuccess_Object(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"name":"Marie Curie"}}`)
 
-	// Pull the field via MindScript to keep the test simple & stable.
 	v, err := ip.EvalSource(`
 		let scientist = oracle() -> {name!: Str}
 		scientist().name
@@ -213,7 +133,7 @@ func Test_Oracle_JSONSuccess_Object(t *testing.T) {
 }
 
 func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `not-json`)
 
@@ -224,11 +144,11 @@ func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantNullAnnotContains(t, v, "not valid JSON")
+	wantAnnotatedNullContains(t, v, "not valid JSON")
 }
 
 func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"ok":true}`)
 
@@ -239,71 +159,28 @@ func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantNullAnnotContains(t, v, "did not match the declared return type")
+	wantAnnotatedNullContains(t, v, "did not match the declared return type")
 }
 
-func Test_Oracle_PromptUsesNonNullSuccessType(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerBuildPromptEchoOutType(ip)
+func Test_Oracle_NullableBehavior_For_NonAny(t *testing.T) {
+	ip := NewInterpreter()
 	registerJSONParse(ip)
-	registerFakeOracle(ip, `{"output":{"name":"X"}}`)
+	registerFakeOracle(ip, `{"output": null}`)
 
-	// outType echoed into prompt should be NON-null success type, i.e., "{name!: Str}"
-	_, err := ip.EvalSource(`
-		let g = oracle() -> {name!: Str}
-		g()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	got := ip.LastOraclePrompt()
-	compact := func(s string) string {
-		var b strings.Builder
-		for _, r := range s {
-			if !unicode.IsSpace(r) {
-				b.WriteRune(r)
-			}
-		}
-		return b.String()
-	}
-	if compact(got) != compact("<type: { name!: Str }>") {
-		t.Fatalf("prompt outType = %q, want %q", got, "<type: { name!: Str }>")
-	}
-}
-
-func Test_Oracle_ExecutorReceivesNullableOutType(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerAssertingFakeOracle(ip)
-
-	// Case 1: Any stays unwrapped (executor accepts "Any").
-	v1, err := ip.EvalSource(`
-		let a = oracle() -> Any
-		a()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	if v1.Tag == VTNull && v1.Annot != "" {
-		t.Fatalf("executor rejected outType for Any: %v", v1.Annot)
-	}
-
-	// Case 2: Str is wrapped to Str? (executor requires nullable; returns boxed JSON).
-	v2, err := ip.EvalSource(`
+	v, err := ip.EvalSource(`
 		let b = oracle() -> Str
 		b()
 	`)
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	// Just ensure not Null.
-	if v2.Tag == VTNull {
-		t.Fatalf("executor rejected outType for Str?: %v", v2.Annot)
+	if v.Tag != VTNull || v.Annot != "" {
+		t.Fatalf("want plain null (accepted under Str?), got: %v (annot=%q)", v, v.Annot)
 	}
 }
 
 func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"wrong":42}}`)
 
@@ -314,11 +191,11 @@ func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantAnnotatedNullContains(t, v, "type") // centralized type mismatch → annotated null
+	wantAnnotatedNullContains(t, v, "declared return type")
 }
 
 func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"foo":123}}`)
 
@@ -329,11 +206,11 @@ func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantInt(t, v, 123) // Any accepts whatever JSON parses to
+	wantInt(t, v, 123)
 }
 
 func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```json\n{\"output\":{\"name\":\"Rosalind Franklin\"}}\n```")
 
@@ -348,15 +225,11 @@ func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
 }
 
 func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
-	// Simulate transport failure: executor returns annotated null
+	ip := NewInterpreter()
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
 			{Name: "prompt", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}},
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
 		},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value { return annotNull("network down") },
@@ -375,14 +248,12 @@ func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
 	wantAnnotatedNullContains(t, v, "network down")
 }
 
-func Test_Oracle_OutType_Passed_Is_Nullable_For_NonAny(t *testing.T) {
-	ip, _ := NewRuntime()
+func Test_Oracle_ObjectResult_Parsed_OK(t *testing.T) {
+	ip := NewInterpreter()
 	registerJSONParse(ip)
-	registerAssertingFakeOracle(ip) // asserts outType is nullable when not Any
+	registerFakeOracle(ip, `{"output":{"ok":true}}`)
 
 	v, err := ip.EvalSource(`
-		## Backend checks that outType is nullable (T?)
-		## Return BOXED JSON {"output":{"ok": true}} so we can validate value too.
 		let s = oracle() -> {ok!: Bool}
 		s().ok
 	`)
@@ -393,14 +264,13 @@ func Test_Oracle_OutType_Passed_Is_Nullable_For_NonAny(t *testing.T) {
 }
 
 func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip := NewInterpreter()
 	registerJSONParse(ip)
-	// Fake checks Any is not wrapped; if fine, returns BOXED {"output":{"ok":true}}
-	registerAssertingFakeOracle(ip)
+	registerFakeOracle(ip, `{"output":{"ok":true}}`)
 
 	v, err := ip.EvalSource(`
 		let a = oracle() -> Any
-		## Backend returns {"output":{"ok": true}}; engine should parse because return type isn't Str.
+		## Backend returns {"output":{"ok": true}}; Any accepts the parsed map.
 		a().ok
 	`)
 	if err != nil {
@@ -409,38 +279,185 @@ func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
 	wantBool(t, v, true)
 }
 
-// Fake that inspects the "examples" argument and returns "ok" if it looks right.
-func registerExamplesAssertingOracle(ip *Interpreter, wantLen int) {
-	ip.RegisterNative(
-		"__oracle_execute",
-		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
-			{Name: "inType", Type: S{"id", "Type"}},
-			{Name: "outType", Type: S{"id", "Type"}},
-			{Name: "examples", Type: S{"array", S{"id", "Any"}}},
-		},
-		S{"unop", "?", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			ex := ctx.MustArg("examples")
-			if ex.Tag != VTArray {
-				return annotNull("examples not array")
-			}
-			arr := ex.Data.([]Value)
-			if len(arr) != wantLen {
-				return annotNull("wrong examples length")
-			}
-			// Optional: verify each item is a 2-tuple [input, output]
-			for _, it := range arr {
-				if it.Tag != VTArray || len(it.Data.([]Value)) != 2 {
-					return annotNull("example is not [input, output]")
-				}
-			}
-			return Str(`{"output":"ok"}`)
-		},
-	)
-	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
-		ip.Global.Define("__oracle_execute", v)
+// --- examples handling via captured prompt -----------------------------------
+
+func Test_Oracle_Examples_Present_In_Prompt(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		let ex = [
+			[0, "zero"],
+			[1, "one"],
+			[2, "two"]
+		]
+		let number2word = oracle(n: Int) -> Str from ex
+		number2word(5)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
 	}
+	wantStr(t, v, "ok")
+
+	if got := countExamplesInPrompt(lastPrompt); got != 3 {
+		t.Fatalf("want 3 examples in prompt, got %d\n\nPROMPT:\n%s", got, lastPrompt)
+	}
+}
+
+func Test_Oracle_Examples_From_Variable_Expr_In_Prompt(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+        let ex = [
+            [0, "zero"],
+            [1, "one"],
+            [2, "two"]
+        ]
+        let number2word = oracle(n: Int) -> Str from ex
+        number2word(5)
+    `)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	if got := countExamplesInPrompt(lastPrompt); got != 3 {
+		t.Fatalf("want 3 examples in prompt, got %d\n\nPROMPT:\n%s", got, lastPrompt)
+	}
+}
+
+func Test_Oracle_Examples_From_Expression_In_Prompt(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+        let a = [[0,"zero"]]
+        let b = [[1,"one"]]
+        let number2word = oracle(n: Int) -> Str from (a + b)
+        number2word(7)
+    `)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	if got := countExamplesInPrompt(lastPrompt); got != 2 {
+		t.Fatalf("want 2 examples in prompt, got %d\n\nPROMPT:\n%s", got, lastPrompt)
+	}
+}
+
+// --- fenced / null literal edge cases ---------------------------------------
+
+func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Katherine Johnson")
+}
+
+func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
+
+	v, err := ip.EvalSource(`
+		let greet = oracle() -> Str
+		greet()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Hello, world!")
+}
+
+func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
+	ip := NewInterpreter()
+	registerFakeOracle(ip, "null") // executor returns the literal string "null"
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "returned null")
+}
+
+func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "this is not json at all")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "valid JSON")
+}
+
+func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
+	ip := NewInterpreter()
+	registerFakeOracle(ip, "null")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "returned null")
+}
+
+// Already had a transport error test; add one more variant: backend returns empty -> annotated null
+func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
+	ip := NewInterpreter()
+	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
+
+	v, err := ip.EvalSource(`
+		let s = oracle() -> Str
+		s()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "fake backend")
+}
+
+// -----------------------------------------------------------------------------
+// New tests focusing on arity/type errors at call sites (hard errors).
+// -----------------------------------------------------------------------------
+
+func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
+	ip := NewInterpreter()
+	// Backend won't be reached if params fail type-checking (engine enforces)
+	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
+
+	// Wrong type for first parameter (expects Int) → CONTRACT VIOLATION ⇒ HARD ERROR
+	_, err := ip.EvalSource(`
+		let f = oracle(a: Int, b: Str) -> Str
+		f("not-int", "ok")
+	`)
+	wantHardErrorContains(t, err, "type mismatch")
 }
 
 func wantHardErrorContains(t *testing.T, err error, substr string) {
@@ -458,442 +475,122 @@ func wantHardErrorContains(t *testing.T, err error, substr string) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// New tests
-// -----------------------------------------------------------------------------
+// --- multi-input + type aliases (with schema descriptions) -------------------
 
-func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
-	ip, _ := NewRuntime()
-	// Backend won't be reached if params fail type-checking (engine enforces)
-	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
+func Test_Oracle_MultiParam_With_Aliases_Success_And_Prompt(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
 
-	// Wrong type for first parameter (expects Int) → CONTRACT VIOLATION ⇒ HARD ERROR
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ready"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		# A user record.
+		let User = type {name!: Str, age: Int}
+
+		# Hobbies.
+		let Hobbies = type [Str]
+
+		# Status of execution.
+		let Status = type Enum["ready", "running", "done"]
+
+		let decide = oracle(u: User, h: Hobbies) -> Status
+		decide({name: "Ada", age: 36}, ["math", "poetry"]) == "ready"
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Oracle returned "ready", which is valid Status → expression should be true.
+	wantBool(t, v, true)
+
+	// Prompt should include both inputs rendered and schema descriptions from annotations.
+	if !strings.Contains(lastPrompt, `"name": "Ada"`) || !strings.Contains(lastPrompt, `"age": 36`) {
+		t.Fatalf("prompt missing user input fields:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"math"`) || !strings.Contains(lastPrompt, `"poetry"`) {
+		t.Fatalf("prompt missing hobbies input:\n%s", lastPrompt)
+	}
+	// Descriptions must be present in the INPUT/OUTPUT JSON SCHEMA blocks.
+	if !strings.Contains(lastPrompt, `"description": "A user record."`) {
+		t.Fatalf("missing User description in schema:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"description": "Hobbies."`) {
+		t.Fatalf("missing Hobbies description in schema:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"description": "Status of execution."`) {
+		t.Fatalf("missing Status description in schema:\n%s", lastPrompt)
+	}
+}
+
+func Test_Oracle_TypeAlias_In_ReturnType_NullableOperationally(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+
+	var lastPrompt string
+	// Backend returns null → allowed at runtime as T? (operationally nullable).
+	registerFakeOracleWithCapture(ip, `{"output": null}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		# Status of execution.
+		let Status = type Enum["ready", "running", "done"]
+
+		let query = oracle() -> Status
+		query()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Should be plain (unannotated) null under Status?
+	if v.Tag != VTNull || v.Annot != "" {
+		t.Fatalf("want plain null (accepted under Status?), got %v (annot=%q)", v, v.Annot)
+	}
+	// Output schema should carry alias description.
+	if !strings.Contains(lastPrompt, `"description": "Status of execution."`) {
+		t.Fatalf("missing Status description in output schema:\n%s", lastPrompt)
+	}
+}
+
+func Test_Oracle_Alias_ArrayParam_Success_And_Prompt(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		# Hobbies.
+		let Hobbies = type [Str]
+
+		let summarize = oracle(h: Hobbies) -> Str
+		summarize(["skiing", "reading"])
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	// Prompt should show the array inputs and the alias description.
+	if !strings.Contains(lastPrompt, `"skiing"`) || !strings.Contains(lastPrompt, `"reading"`) {
+		t.Fatalf("prompt missing hobbies values:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"description": "Hobbies."`) {
+		t.Fatalf("missing Hobbies description in schema:\n%s", lastPrompt)
+	}
+}
+
+func Test_Oracle_Alias_Param_WrongShape_HardError(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"ignored"}`) // should not be reached
+
 	_, err := ip.EvalSource(`
-		let f = oracle(a: Int, b: Str) -> Str
-		f("not-int", "ok")
+		# A user record.
+		let User = type {name!: Str, age: Int}
+
+		let f = oracle(u: User) -> Str
+		# Wrong shape: name is Int (should be Str).
+		f({name: 123, age: 5})
 	`)
+	// Structural type check at call-site should fail.
 	wantHardErrorContains(t, err, "type mismatch")
-}
-
-func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist().name
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "Katherine Johnson")
-}
-
-func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
-
-	v, err := ip.EvalSource(`
-		let greet = oracle() -> Str
-		greet()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "Hello, world!")
-}
-
-func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerFakeOracle(ip, "null") // executor returns the literal string "null"
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> Str
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "returned null")
-}
-
-func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerFakeOracle(ip, "this is not json at all")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "valid JSON")
-}
-
-func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerFakeOracle(ip, "null")
-
-	v, err := ip.EvalSource(`
-		let scientist = oracle() -> {name!: Str}
-		scientist()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "returned null")
-}
-
-func Test_Oracle_Examples_Passed_To_Backend(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerExamplesAssertingOracle(ip, 3)
-
-	v, err := ip.EvalSource(`
-		let ex = [
-			[0, "zero"],
-			[1, "one"],
-			[2, "two"]
-		]
-		let number2word = oracle(n: Int) -> Str from ex
-		number2word(5)
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "ok")
-}
-
-func Test_Oracle_Examples_From_Variable_Expr(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerExamplesAssertingOracle(ip, 3)
-
-	v, err := ip.EvalSource(`
-        let ex = [
-            [0, "zero"],
-            [1, "one"],
-            [2, "two"]
-        ]
-        let number2word = oracle(n: Int) -> Str from ex
-        number2word(5)
-    `)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "ok")
-}
-
-func Test_Oracle_Examples_From_Expression(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerJSONParse(ip)
-	registerExamplesAssertingOracle(ip, 2)
-
-	v, err := ip.EvalSource(`
-        let a = [[0,"zero"]]
-        let b = [[1,"one"]]
-        let number2word = oracle(n: Int) -> Str from (a + b)
-        number2word(7)
-    `)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantStr(t, v, "ok")
-}
-
-// Already had a transport error test; add one more variant: backend returns empty -> annotated null
-func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
-	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
-
-	v, err := ip.EvalSource(`
-		let s = oracle() -> Str
-		s()
-	`)
-	if err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-	wantAnnotatedNullContains(t, v, "fake backend")
-}
-
-func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
-	ip, _ := NewRuntime()
-	// We don't care about the result here; we only want the prompt.
-	// Returning "null" avoids needing jsonParse in this test.
-	registerFakeOracle(ip, "null")
-
-	// Program modeled on the manual’s example.
-	src := `
-		# Example input output pairs.
-		let examples = [
-		  [{in: 9}, {out: 16}],
-		  [{in: 25}, {out: 36}],
-		  [{in: 1}, {out: 4}]
-		]
-
-		# The input number.
-		let Input = type {in!: Int}
-
-		# The output number.
-		let Output = type {out!: Int}
-
-		# Given a square number, provide the next square.
-		let square = oracle(args: Input) -> Output from examples
-
-		square({in: 144})
-	`
-	if _, err := ip.EvalSource(src); err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-
-	got := ip.LastOraclePrompt()
-	if strings.TrimSpace(got) == "" {
-		t.Fatalf("engine did not capture last oracle prompt")
-	}
-
-	// ---- Build the expected prompt exactly like the engine does ----
-
-	// Helpers (mirror oracles.go)
-	indentBlock := func(s string, n int) string {
-		pad := strings.Repeat(" ", n)
-		lines := strings.Split(s, "\n")
-		for i := range lines {
-			lines[i] = pad + lines[i]
-		}
-		return strings.Join(lines, "\n")
-	}
-	pretty := func(m map[string]any) string {
-		bs, err := json.MarshalIndent(m, "", "  ")
-		if err != nil {
-			return "{}"
-		}
-		return string(bs)
-	}
-
-	// Recreate the schemas the prompt should contain.
-	// Input inner schema: the alias itself.
-	inSchemaInner := map[string]any{
-		"type":        "object",
-		"description": "The input number.",
-		"properties": map[string]any{
-			"in": map[string]any{
-				"type": "integer",
-			},
-		},
-		"required": []any{"in"},
-	}
-
-	// Boxed output schema: {output: Output}
-	boxedOutSchema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"output": map[string]any{
-				"$ref": "#/$defs/Out",
-			},
-		},
-		"required": []any{"output"},
-		"$defs": map[string]any{
-			"Out": map[string]any{
-				"type":        "object",
-				"description": "The output number.",
-				"properties": map[string]any{
-					"out": map[string]any{
-						"type": "integer",
-					},
-				},
-				"required": []any{"out"},
-			},
-		},
-	}
-
-	// Examples and final call
-	exIn := []string{
-		`{"in": 9}`,
-		`{"in": 25}`,
-		`{"in": 1}`,
-	}
-	exOut := []string{
-		`{"output": {"out": 16}}`,
-		`{"output": {"out": 36}}`,
-		`{"output": {"out": 4}}`,
-	}
-	// With the new prompt builder, the final INPUT uses bound args if available;
-	// for a direct call, none are captured → it renders as null.
-	finalInput := `null`
-
-	var b strings.Builder
-	b.WriteString("PROMPT:\n")
-	b.WriteString("Please follow the instruction to the best of your ability:\n")
-	b.WriteString("for every input, provide an output that solves the task and\n")
-	b.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
-	b.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
-
-	b.WriteString("INPUT JSON SCHEMA:\n\n")
-	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
-	b.WriteString("\n\n")
-
-	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
-	// For output, we show the *boxed* schema directly.
-	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
-	b.WriteString("\n\n")
-
-	// Single TASK (no repetition per example)
-	b.WriteString("TASK:\n\n")
-	b.WriteString("Given a square number, provide the next square.\n\n")
-
-	// Examples as INPUT/OUTPUT pairs only (no TASK here)
-	for i := range exIn {
-		b.WriteString("INPUT:\n\n")
-		b.WriteString(exIn[i])
-		b.WriteString("\n\n")
-		b.WriteString("OUTPUT:\n\n")
-		b.WriteString(exOut[i])
-		b.WriteString("\n\n")
-	}
-
-	// Final INPUT for the current call (no extra TASK)
-	b.WriteString("INPUT:\n\n")
-	b.WriteString(finalInput)
-	b.WriteString("\n\n")
-	b.WriteString("OUTPUT:\n")
-
-	want := b.String()
-
-	if got != want {
-		// Make mismatches easy to inspect in CI logs.
-		t.Fatalf("prompt mismatch:\n--- GOT ---\n%s\n--- WANT ---\n%s", got, want)
-	}
-}
-
-func Test_Oracle_Prompt_MultiArg_BoxedSchemas_And_Examples(t *testing.T) {
-	ip, _ := NewRuntime()
-	// We only check the prompt; backend returns "null" so we don't need jsonParse.
-	registerFakeOracle(ip, "null")
-
-	// Program with a multi-parameter oracle and object-shaped examples.
-	src := `
-		# Example input/output pairs (object on the left).
-		let examples = [
-		  [{name: "Mina", age: 34, hobbies: ["climbing", "baking"]}, "OK"],
-		  [{name: "Rui",  age: 29, hobbies: ["ski"]},                 "OK"]
-		]
-
-		# An oracle with multiple input parameters (no alias type).
-		# The engine synthesizes an input object type from these params.
-		let o = oracle(name: Str, age: Int, hobbies: [Str]) -> Str from examples
-
-		o("Zed", 41, ["code", "run"])
-	`
-	if _, err := ip.EvalSource(src); err != nil {
-		t.Fatalf("EvalSource error: %v", err)
-	}
-
-	got := ip.LastOraclePrompt()
-	if strings.TrimSpace(got) == "" {
-		t.Fatalf("engine did not capture last oracle prompt")
-	}
-
-	// ---- Expected prompt ----
-
-	indentBlock := func(s string, n int) string {
-		pad := strings.Repeat(" ", n)
-		lines := strings.Split(s, "\n")
-		for i := range lines {
-			lines[i] = pad + lines[i]
-		}
-		return strings.Join(lines, "\n")
-	}
-	pretty := func(m map[string]any) string {
-		bs, err := json.MarshalIndent(m, "", "  ")
-		if err != nil {
-			return "{}"
-		}
-		return string(bs)
-	}
-
-	// Input schema is synthesized as an object with required fields.
-	inSchemaInner := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"name": map[string]any{"type": "string"},
-			"age":  map[string]any{"type": "integer"},
-			"hobbies": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string"},
-			},
-		},
-		"required": []any{"name", "age", "hobbies"},
-	}
-
-	// Boxed output schema: {"output": <Str>}
-	boxedOutSchema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"output": map[string]any{
-				"$ref": "#/$defs/Out",
-			},
-		},
-		"required": []any{"output"},
-		"$defs": map[string]any{
-			"Out": map[string]any{
-				"type": "string",
-			},
-		},
-	}
-
-	// Examples and final call
-	exIn := []string{
-		`{"name": "Mina", "age": 34, "hobbies": ["climbing", "baking"]}`,
-		`{"name": "Rui", "age": 29, "hobbies": ["ski"]}`,
-	}
-	exOut := []string{
-		`{"output": "OK"}`,
-		`{"output": "OK"}`,
-	}
-	// As with single-arg, the final INPUT renders the currently bound args.
-	// For a direct call (no partial application), nothing is captured → null.
-	finalInput := `null`
-
-	var b strings.Builder
-	b.WriteString("PROMPT:\n")
-	b.WriteString("Please follow the instruction to the best of your ability:\n")
-	b.WriteString("for every input, provide an output that solves the task and\n")
-	b.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
-	b.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
-
-	b.WriteString("INPUT JSON SCHEMA:\n\n")
-	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
-	b.WriteString("\n\n")
-
-	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
-	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
-	b.WriteString("\n\n")
-
-	// Task once (instruction is empty for this test, so we fall back to default)
-	b.WriteString("TASK:\n\n")
-	b.WriteString("Given the input, determine the output.\n\n")
-
-	for i := range exIn {
-		b.WriteString("INPUT:\n\n")
-		b.WriteString(exIn[i])
-		b.WriteString("\n\n")
-		b.WriteString("OUTPUT:\n\n")
-		b.WriteString(exOut[i])
-		b.WriteString("\n\n")
-	}
-
-	b.WriteString("INPUT:\n\n")
-	b.WriteString(finalInput)
-	b.WriteString("\n\n")
-	b.WriteString("OUTPUT:\n")
-
-	want := b.String()
-
-	if got != want {
-		t.Fatalf("prompt mismatch:\n--- GOT ---\n%s\n--- WANT ---\n%s", got, want)
-	}
 }

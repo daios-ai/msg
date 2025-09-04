@@ -275,6 +275,7 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 		}
 		return sch
 
+	// inside func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiting map[string]bool) map[string]any
 	case "id":
 		name := t[1].(string)
 		switch name {
@@ -301,7 +302,22 @@ func (ip *Interpreter) msTypeToSchema(t S, env *Env, defs map[string]any, visiti
 					}
 					if _, ok := defs[name]; !ok {
 						visiting[name] = true
-						defs[name] = ip.msTypeToSchema(typeAstFromValueData(v.Data), env, defs, visiting)
+
+						// --- NEW: preserve alias annotations into $defs ---
+						aliasAst := typeAstFromValueData(v.Data)
+						sAnnot, base := popTopAnnotIfAny(aliasAst)
+						defSch := ip.msTypeToSchema(base, env, defs, visiting)
+						// Value.Annot wins; otherwise use top-level AST annot if present and no description yet.
+						if v.Annot != "" {
+							defSch["description"] = v.Annot
+						} else if sAnnot != "" {
+							if _, exists := defSch["description"]; !exists {
+								defSch["description"] = sAnnot
+							}
+						}
+						defs[name] = defSch
+						// --- END NEW ---
+
 						delete(visiting, name)
 					}
 					return map[string]any{"$ref": "#/$defs/" + name}

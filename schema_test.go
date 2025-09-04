@@ -745,3 +745,154 @@ func Test_Schema_Annot_TopLevel_JSONDescription(t *testing.T) {
 		t.Fatalf(`"name" not found in required: %v`, req)
 	}
 }
+
+func Test_Schema_AliasDescriptions_In_Defs(t *testing.T) {
+	ip := NewInterpreter()
+	env := NewEnv(nil)
+
+	// Define aliases *as if* they were declared in MindScript with preceding # docs.
+	userAst := S{"map",
+		S{"pair!", S{"str", "name"}, S{"id", "Str"}},
+		S{"pair", S{"str", "age"}, S{"id", "Int"}},
+	}
+	hobbiesAst := S{"array", S{"id", "Str"}}
+	statusAst := S{"enum", S{"str", "ready"}, S{"str", "running"}, S{"str", "done"}}
+
+	env.Define("User", withAnnot(TypeVal(userAst), "A user record."))
+	env.Define("Hobbies", withAnnot(TypeVal(hobbiesAst), "Hobbies."))
+	env.Define("Status", withAnnot(TypeVal(statusAst), "Status of execution."))
+
+	// Ask for a schema of something that references all three aliases.
+	root := S{"map",
+		S{"pair!", S{"str", "u"}, S{"id", "User"}},
+		S{"pair!", S{"str", "h"}, S{"id", "Hobbies"}},
+		S{"pair!", S{"str", "output"}, S{"id", "Status"}},
+	}
+	got := ip.TypeValueToJSONSchema(TypeVal(root), env)
+
+	defs, ok := got["$defs"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema missing $defs: %#v", got)
+	}
+	// User
+	uDef, ok := defs["User"].(map[string]any)
+	if !ok {
+		t.Fatalf("$defs.User missing: %#v", defs)
+	}
+	if desc, _ := uDef["description"].(string); desc != "A user record." {
+		t.Fatalf("User.description = %q; want %q", desc, "A user record.")
+	}
+	// Hobbies
+	hDef, ok := defs["Hobbies"].(map[string]any)
+	if !ok {
+		t.Fatalf("$defs.Hobbies missing: %#v", defs)
+	}
+	if desc, _ := hDef["description"].(string); desc != "Hobbies." {
+		t.Fatalf("Hobbies.description = %q; want %q", desc, "Hobbies.")
+	}
+	// Status
+	sDef, ok := defs["Status"].(map[string]any)
+	if !ok {
+		t.Fatalf("$defs.Status missing: %#v", defs)
+	}
+	if desc, _ := sDef["description"].(string); desc != "Status of execution." {
+		t.Fatalf("Status.description = %q; want %q", desc, "Status of execution.")
+	}
+
+	// Ensure root uses $ref for these properties.
+	props := got["properties"].(map[string]any)
+	for _, k := range []string{"u", "h", "output"} {
+		prop := props[k].(map[string]any)
+		if _, ok := prop["$ref"]; !ok {
+			t.Fatalf("property %q should be a $ref, got %#v", k, prop)
+		}
+	}
+}
+
+func Test_Schema_MapKeyAnnotation_To_PropertyDescription(t *testing.T) {
+	ip := NewInterpreter()
+	env := NewEnv(nil)
+
+	// { #(Age in years.) age: Int }
+	typ := S{"map",
+		S{"pair",
+			S{"annot", S{"str", "Age in years."}, S{"str", "age"}},
+			S{"id", "Int"},
+		},
+	}
+	got := ip.TypeValueToJSONSchema(TypeVal(typ), env)
+	props := got["properties"].(map[string]any)
+	age := props["age"].(map[string]any)
+	if desc, _ := age["description"].(string); desc != "Age in years." {
+		t.Fatalf("property description = %q; want %q", desc, "Age in years.")
+	}
+	if typN, _ := age["type"].(string); typN != "integer" {
+		t.Fatalf("property type = %q; want %q", typN, "integer")
+	}
+}
+
+func Test_Schema_NullableAlias_AnyOf_With_Ref(t *testing.T) {
+	ip := NewInterpreter()
+	env := NewEnv(nil)
+
+	// Status alias (enum) with description.
+	statusAst := S{"enum", S{"str", "ready"}, S{"str", "running"}, S{"str", "done"}}
+	env.Define("Status", withAnnot(TypeVal(statusAst), "Status of execution."))
+
+	// Use Status? (nullable) as a field type.
+	root := S{"map",
+		S{"pair!", S{"str", "result"}, S{"unop", "?", S{"id", "Status"}}},
+	}
+	got := ip.TypeValueToJSONSchema(TypeVal(root), env)
+
+	// result should be {"anyOf":[{"$ref":"#/$defs/Status"}, {"type":"null"}]}
+	props := got["properties"].(map[string]any)
+	res := props["result"].(map[string]any)
+	anyOf, ok := res["anyOf"].([]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("nullable alias should use anyOf; got %#v", res)
+	}
+	arm0, _ := anyOf[0].(map[string]any)
+	arm1, _ := anyOf[1].(map[string]any)
+	if _, ok := arm0["$ref"]; !ok {
+		t.Fatalf("first anyOf arm should be $ref; got %#v", anyOf)
+	}
+	if typ, _ := arm1["type"].(string); typ != "null" {
+		t.Fatalf("second anyOf arm should be type:null; got %#v", anyOf)
+	}
+
+	// And $defs.Status must exist with a description.
+	defs := got["$defs"].(map[string]any)
+	sDef := defs["Status"].(map[string]any)
+	if desc, _ := sDef["description"].(string); desc != "Status of execution." {
+		t.Fatalf("Status.description = %q; want %q", desc, "Status of execution.")
+	}
+	if _, ok := sDef["enum"]; !ok {
+		t.Fatalf("Status enum missing in $defs.Status: %#v", sDef)
+	}
+}
+
+func Test_Schema_JSON_To_MS_TopLevelDescription_Preserved(t *testing.T) {
+	ip := NewInterpreter()
+
+	doc := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string"},
+		},
+		"required":    []any{"name"},
+		"description": "Top-level doc.",
+	}
+	tv := ip.JSONSchemaToTypeValue(doc)
+	if tv.Tag != VTType {
+		t.Fatalf("expected VTType, got %#v", tv)
+	}
+	if tv.Annot != "Top-level doc." {
+		t.Fatalf("top-level description not preserved, got %q", tv.Annot)
+	}
+	// quick sanity on shape
+	tS := typeSFromValue(t, tv)
+	if len(tS) == 0 || tS[0] != "map" {
+		t.Fatalf("expected a map type S, got %#v", tS)
+	}
+}

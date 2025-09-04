@@ -469,8 +469,7 @@ type Interpreter struct {
 	native    map[string]NativeImpl // registered natives
 	loadStack []string              // import guard
 
-	oracleLastPrompt string // reserved for tooling
-	currentSrc       *SourceRef
+	currentSrc *SourceRef
 
 	// Private facades implemented in private files:
 	_exec execCore
@@ -807,7 +806,6 @@ func (ip *Interpreter) Clone() *Interpreter {
 	// Fresh module cache/loader state (no sharing).
 	cl.modules = map[string]*moduleRec{}
 	cl.loadStack = nil
-	cl.oracleLastPrompt = ""
 	cl.currentSrc = nil
 
 	return cl

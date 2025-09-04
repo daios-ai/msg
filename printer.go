@@ -1337,11 +1337,13 @@ func docValueNoAnn(v Value) *Doc {
 		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
 	case VTFun:
 		if f, ok := v.Data.(*Fun); ok && f != nil {
+			// Use "oracle" label for oracle functions, otherwise "fun".
+			label := "fun"
 			if f.IsOracle {
-				inner := Concat(Text("<oracle: "), docType(f.ReturnType), Text(">"))
-				return Group(inner)
+				label = "oracle"
 			}
-			// Build `<fun: a:T -> b:U -> R>` with automatic break if needed.
+
+			// Build `<{label}: a:T -> b:U -> R>` (zero-arg becomes `_:Null`).
 			var chain []*Doc
 			if len(f.ParamTypes) == 0 {
 				chain = append(chain, Text("_:Null"))
@@ -1358,7 +1360,7 @@ func docValueNoAnn(v Value) *Doc {
 				}
 			}
 			chain = append(chain, Text(" -> "), docType(f.ReturnType))
-			return Group(Concat(Text("<fun: "), Concat(chain...), Text(">")))
+			return Group(Concat(Text("<"+label+": "), Concat(chain...), Text(">")))
 		}
 		return Text("<fun>")
 	case VTType:

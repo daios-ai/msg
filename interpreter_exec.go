@@ -53,13 +53,6 @@ func (x *execImpl) evalAST(ast S, env *Env) (Value, error) {
 	return x.ip.runTopWithSource(ast, env, false, nil)
 }
 
-// evalASTUncaught never returns an error; failures become annotated-null Values.
-// (topBlockToSameEnv is ignored; kept for API compatibility.)
-func (x *execImpl) evalASTUncaught(ast S, env *Env, _ bool) Value {
-	v, _ := x.ip.runTopWithSource(ast, env, true, nil)
-	return v
-}
-
 func (x *execImpl) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
 	return x.ip.applyArgsScoped(fn, args, callSite)
 }
@@ -84,6 +77,18 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 			switch sig := r.(type) {
 			case returnSig:
 				out, err = sig.v, nil
+			case *Error:
+				// Preserve the exact diagnostic kind & attach a SourceRef if missing.
+				if uncaught {
+					out, err = annotNull(sig.Msg), nil // SOFT path still honored
+					return
+				}
+				if sig.Src == nil {
+					sig.Src = sr
+				}
+				out = Value{} // no value on hard error
+				err = sig     // bubble as-is (Lex/Parse/Runtime/Incomplete)
+				return
 
 			case rtErr:
 				// rtErr carries msg and optional precise (src, line, col).
@@ -884,7 +889,7 @@ func (e *emitter) emitExpr(n S) {
 			absBase,
 		)
 	case "oracle":
-		e.withChild(2, func() { // child #2 is sourceExpr
+		e.withChild(2, func() {
 			// oracles don't JIT a body chunk here → no body base path
 			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
 		})

@@ -241,9 +241,9 @@ Returns: Bool`)
 
 			v, err := ip.ImportFile(pv.Data.(string), importer)
 			if err != nil {
-				// HARD: parse errors, import cycles, and module-body contract errors.
+				// HARD: preserve original diagnostic kind (Lex/Parse/Runtime/Incomplete).
 				if e, ok := err.(*Error); ok {
-					panicRt(e.Msg, e.Src, e.Line, e.Col)
+					panic(e)
 				}
 				fail(err.Error())
 			}
@@ -283,9 +283,9 @@ Returns:
 			// The loader assigns a synthetic identity "mem:<name>" internally.
 			v, err := ip.ImportCode(name, src)
 			if err != nil {
-				// HARD: parse errors; module-body contract errors.
+				// HARD: preserve original diagnostic kind (Lex/Parse/Runtime/Incomplete).
 				if e, ok := err.(*Error); ok {
-					panicRt(e.Msg, e.Src, e.Line, e.Col)
+					panic(e)
 				}
 				fail(err.Error())
 			}

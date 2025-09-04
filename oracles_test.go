@@ -710,7 +710,7 @@ func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
 		},
 	}
 
-	// Examples and final call (render like the manual)
+	// Examples and final call
 	exIn := []string{
 		`{"in": 9}`,
 		`{"in": 25}`,
@@ -721,7 +721,9 @@ func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
 		`{"output": {"out": 36}}`,
 		`{"output": {"out": 4}}`,
 	}
-	finalInput := `{"in": 144}`
+	// With the new prompt builder, the final INPUT uses bound args if available;
+	// for a direct call, none are captured → it renders as null.
+	finalInput := `null`
 
 	var b strings.Builder
 	b.WriteString("PROMPT:\n")
@@ -739,10 +741,12 @@ func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
 	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
 	b.WriteString("\n\n")
 
-	// Example blocks
+	// Single TASK (no repetition per example)
+	b.WriteString("TASK:\n\n")
+	b.WriteString("Given a square number, provide the next square.\n\n")
+
+	// Examples as INPUT/OUTPUT pairs only (no TASK here)
 	for i := range exIn {
-		b.WriteString("TASK:\n\n")
-		b.WriteString("Given a square number, provide the next square.\n\n")
 		b.WriteString("INPUT:\n\n")
 		b.WriteString(exIn[i])
 		b.WriteString("\n\n")
@@ -751,9 +755,7 @@ func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
 		b.WriteString("\n\n")
 	}
 
-	// Final task with the oracle’s instruction (from the annotation)
-	b.WriteString("TASK:\n\n")
-	b.WriteString("Given a square number, provide the next square.\n\n")
+	// Final INPUT for the current call (no extra TASK)
 	b.WriteString("INPUT:\n\n")
 	b.WriteString(finalInput)
 	b.WriteString("\n\n")
@@ -763,6 +765,135 @@ func Test_Oracle_Prompt_BoxedSchemas_And_Examples(t *testing.T) {
 
 	if got != want {
 		// Make mismatches easy to inspect in CI logs.
+		t.Fatalf("prompt mismatch:\n--- GOT ---\n%s\n--- WANT ---\n%s", got, want)
+	}
+}
+
+func Test_Oracle_Prompt_MultiArg_BoxedSchemas_And_Examples(t *testing.T) {
+	ip, _ := NewRuntime()
+	// We only check the prompt; backend returns "null" so we don't need jsonParse.
+	registerFakeOracle(ip, "null")
+
+	// Program with a multi-parameter oracle and object-shaped examples.
+	src := `
+		# Example input/output pairs (object on the left).
+		let examples = [
+		  [{name: "Mina", age: 34, hobbies: ["climbing", "baking"]}, "OK"],
+		  [{name: "Rui",  age: 29, hobbies: ["ski"]},                 "OK"]
+		]
+
+		# An oracle with multiple input parameters (no alias type).
+		# The engine synthesizes an input object type from these params.
+		let o = oracle(name: Str, age: Int, hobbies: [Str]) -> Str from examples
+
+		o("Zed", 41, ["code", "run"])
+	`
+	if _, err := ip.EvalSource(src); err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+
+	got := ip.LastOraclePrompt()
+	if strings.TrimSpace(got) == "" {
+		t.Fatalf("engine did not capture last oracle prompt")
+	}
+
+	// ---- Expected prompt ----
+
+	indentBlock := func(s string, n int) string {
+		pad := strings.Repeat(" ", n)
+		lines := strings.Split(s, "\n")
+		for i := range lines {
+			lines[i] = pad + lines[i]
+		}
+		return strings.Join(lines, "\n")
+	}
+	pretty := func(m map[string]any) string {
+		bs, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return "{}"
+		}
+		return string(bs)
+	}
+
+	// Input schema is synthesized as an object with required fields.
+	inSchemaInner := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string"},
+			"age":  map[string]any{"type": "integer"},
+			"hobbies": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+			},
+		},
+		"required": []any{"name", "age", "hobbies"},
+	}
+
+	// Boxed output schema: {"output": <Str>}
+	boxedOutSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"output": map[string]any{
+				"$ref": "#/$defs/Out",
+			},
+		},
+		"required": []any{"output"},
+		"$defs": map[string]any{
+			"Out": map[string]any{
+				"type": "string",
+			},
+		},
+	}
+
+	// Examples and final call
+	exIn := []string{
+		`{"name": "Mina", "age": 34, "hobbies": ["climbing", "baking"]}`,
+		`{"name": "Rui", "age": 29, "hobbies": ["ski"]}`,
+	}
+	exOut := []string{
+		`{"output": "OK"}`,
+		`{"output": "OK"}`,
+	}
+	// As with single-arg, the final INPUT renders the currently bound args.
+	// For a direct call (no partial application), nothing is captured → null.
+	finalInput := `null`
+
+	var b strings.Builder
+	b.WriteString("PROMPT:\n")
+	b.WriteString("Please follow the instruction to the best of your ability:\n")
+	b.WriteString("for every input, provide an output that solves the task and\n")
+	b.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
+	b.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
+
+	b.WriteString("INPUT JSON SCHEMA:\n\n")
+	b.WriteString(indentBlock(pretty(inSchemaInner), 2))
+	b.WriteString("\n\n")
+
+	b.WriteString("OUTPUT JSON SCHEMA:\n\n")
+	b.WriteString(indentBlock(pretty(boxedOutSchema), 2))
+	b.WriteString("\n\n")
+
+	// Task once (instruction is empty for this test, so we fall back to default)
+	b.WriteString("TASK:\n\n")
+	b.WriteString("Given the input, determine the output.\n\n")
+
+	for i := range exIn {
+		b.WriteString("INPUT:\n\n")
+		b.WriteString(exIn[i])
+		b.WriteString("\n\n")
+		b.WriteString("OUTPUT:\n\n")
+		b.WriteString(exOut[i])
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString("INPUT:\n\n")
+	b.WriteString(finalInput)
+	b.WriteString("\n\n")
+	b.WriteString("OUTPUT:\n")
+
+	want := b.String()
+
+	if got != want {
 		t.Fatalf("prompt mismatch:\n--- GOT ---\n%s\n--- WANT ---\n%s", got, want)
 	}
 }

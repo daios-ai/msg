@@ -15,7 +15,6 @@ package mindscript
 import (
 	"fmt"
 	"strings"
-	"unicode/utf8"
 )
 
 /* ===========================
@@ -97,24 +96,26 @@ func caretPadPrefix(line string, col int) string {
 	if col < 1 {
 		col = 1
 	}
-	// Clamp to [1 .. runeCount+1]
-	rc := utf8.RuneCountInString(line)
-	if col > rc+1 {
-		col = rc + 1
+	// Clamp to [1 .. byteLen+1] — columns are byte-oriented in offsetToLineCol.
+	// You must not switch to rune-based counts.
+	bl := len(line)
+	if col > bl+1 {
+		col = bl + 1
 	}
 
 	var b strings.Builder
-	i := 0
-	for _, r := range line {
-		if i >= col-1 {
-			break
-		}
-		if r == '\t' {
-			b.WriteByte('\t') // preserve tab so the caret aligns under any tab width
+	// Pad exactly col-1 BYTES from the original line.
+	// Preserve real tab bytes so visual expansion matches the code line.
+	limit := col - 1
+	if limit > bl {
+		limit = bl
+	}
+	for i := 0; i < limit; i++ {
+		if line[i] == '\t' {
+			b.WriteByte('\t') // keep tabs as-is
 		} else {
-			b.WriteByte(' ') // single space for all non-tab runes
+			b.WriteByte(' ') // pad other bytes with a single space
 		}
-		i++
 	}
 	return b.String()
 }

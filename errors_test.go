@@ -439,3 +439,157 @@ f(1,
 	mustContain(t, msg, "   3 |   2)")
 	mustContain(t, msg, "^")
 }
+func Test_Error_Parse_MissingRParen_CaretColumn(t *testing.T) {
+	// Single-line; missing ')' should anchor *after* the last completed node (after '1')
+	src := "f(1"
+	_, err := Pretty(src)
+	if err == nil {
+		t.Fatalf("expected parse error, got nil")
+	}
+	msg := err.Error()
+	mustHaveHeader(t, msg, "PARSE ERROR")
+	mustContain(t, msg, "   1 | f(1")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+
+	// Verify caret column == len("f(1") (no tabs here, so spaces == bytes)
+	var codeLine, caretLine string
+	for _, ln := range strings.Split(msg, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "   1 | "):
+			codeLine = strings.TrimPrefix(ln, "   1 | ")
+		case strings.HasPrefix(ln, "     | "):
+			caretLine = strings.TrimPrefix(ln, "     | ")
+		}
+	}
+	if codeLine == "" || caretLine == "" {
+		t.Fatalf("missing code/caret lines\n--- output ---\n%s", msg)
+	}
+	pad := strings.Index(caretLine, "^")
+	if pad < 0 {
+		t.Fatalf("no caret found\n--- output ---\n%s", msg)
+	}
+	if pad != len(codeLine) {
+		t.Fatalf("caret column = %d, want %d (after %q)", pad, len(codeLine), codeLine)
+	}
+}
+
+func Test_Error_Parse_UnexpectedToken_CaretAtTokenStart(t *testing.T) {
+	// "let 123" → caret at the start of the unexpected token '1' (after "let ")
+	src := "let 123"
+	_, err := Pretty(src)
+	if err == nil {
+		t.Fatalf("expected parse error, got nil")
+	}
+	msg := err.Error()
+	mustHaveHeader(t, msg, "PARSE ERROR")
+	mustContain(t, msg, "   1 | let 123")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+
+	var codeLine, caretLine string
+	for _, ln := range strings.Split(msg, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "   1 | "):
+			codeLine = strings.TrimPrefix(ln, "   1 | ")
+		case strings.HasPrefix(ln, "     | "):
+			caretLine = strings.TrimPrefix(ln, "     | ")
+		}
+	}
+	if codeLine == "" || caretLine == "" {
+		t.Fatalf("missing code/caret lines\n--- output ---\n%s", msg)
+	}
+	pad := strings.Index(caretLine, "^")
+	if pad < 0 {
+		t.Fatalf("no caret found\n--- output ---\n%s", msg)
+	}
+	// caret must sit exactly under the first byte of "123"
+	want := strings.Index(codeLine, "1")
+	if want < 0 {
+		t.Fatalf("test sanity: no '1' in code line: %q", codeLine)
+	}
+	if pad != want {
+		t.Fatalf("caret column = %d, want %d (under first digit of unexpected token)", pad, want)
+	}
+}
+
+func Test_Error_Runtime_Call_SecondArgCaret_LineAndColumn(t *testing.T) {
+	ip := NewInterpreter()
+	src := `
+let f = fun(x: Int, y: Int) -> Int do x end
+f(1, "oops")
+`
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	// Must be on the second line (the call site)
+	mustRuntimeAtLine(t, msg, 3)
+	mustContain(t, msg, `   3 | f(1, "oops")`)
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+
+	// Caret should sit under the start of the second argument (just after "f(1, ")
+	var codeLine, caretLine string
+	for _, ln := range strings.Split(msg, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "   3 | "):
+			codeLine = strings.TrimPrefix(ln, "   3 | ")
+		case strings.HasPrefix(ln, "     | "):
+			caretLine = strings.TrimPrefix(ln, "     | ")
+		}
+	}
+	if codeLine == "" || caretLine == "" {
+		t.Fatalf("missing code/caret lines\n--- output ---\n%s", msg)
+	}
+	pad := strings.Index(caretLine, "^")
+	if pad < 0 {
+		t.Fatalf("no caret found\n--- output ---\n%s", msg)
+	}
+	want := strings.Index(codeLine, `"oops"`)
+	if want < 0 {
+		t.Fatalf("test sanity: second argument not found in code line: %q", codeLine)
+	}
+	if pad != want {
+		t.Fatalf("caret column = %d, want %d (start of second argument)", pad, want)
+	}
+}
+
+func Test_Error_Runtime_TabCaret_Preserved(t *testing.T) {
+	ip := NewInterpreter()
+	// Two real tabs, then an out-of-bounds index to trigger a runtime error;
+	// caret padding must preserve the tabs (no expansion).
+	src := "\t\t[][0]"
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustHaveHeader(t, msg, "RUNTIME ERROR")
+	mustContain(t, msg, "   1 | \t\t[][0]")
+	mustContain(t, msg, "     | ")
+
+	// Ensure the caret padding begins with two tabs (byte-accurate, tab-preserving)
+	var caretLine string
+	for _, ln := range strings.Split(msg, "\n") {
+		if strings.HasPrefix(ln, "     | ") {
+			caretLine = strings.TrimPrefix(ln, "     | ")
+			break
+		}
+	}
+	if caretLine == "" {
+		t.Fatalf("missing caret line\n--- output ---\n%s", msg)
+	}
+	// Everything before '^'
+	i := strings.Index(caretLine, "^")
+	if i < 0 {
+		t.Fatalf("no caret found\n--- output ---\n%s", msg)
+	}
+	prefix := caretLine[:i]
+	if !strings.HasPrefix(prefix, "\t\t") {
+		t.Fatalf("caret padding did not preserve leading tabs; got %q", prefix)
+	}
+}

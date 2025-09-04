@@ -229,7 +229,8 @@ func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
 			if e.Src == nil {
 				e.Src = &SourceRef{Name: display, Src: src}
 			}
-			return nil, nil, fmt.Errorf("%s", FormatError(e))
+			return nil, nil, e // return structured error; pretty-print at API boundary
+
 		}
 		return nil, nil, err
 	}

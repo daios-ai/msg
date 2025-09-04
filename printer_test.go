@@ -630,7 +630,7 @@ func Test_Printer_Oracle_Rendering(t *testing.T) {
 		IsOracle:   true,
 	}
 	got := FormatValue(FunVal(f))
-	want := "<oracle: Str>"
+	want := "<oracle: _:Null -> Str>"
 	if got != want {
 		t.Fatalf("oracle rendering mismatch:\n got:  %q\n want: %q", got, want)
 	}

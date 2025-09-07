@@ -22,7 +22,7 @@ const (
 	colorReset = "\x1b[0m"
 	colorRed   = "\x1b[31m"
 	colorGreen = "\x1b[32m"
-	colorBlue  = "\x1b[34m"
+	colorBlue  = "\x1b[94m"
 )
 
 func red(s string) string   { return colorRed + s + colorReset }

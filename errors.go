@@ -15,6 +15,7 @@ package mindscript
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 /* ===========================
@@ -89,33 +90,40 @@ func diagHeader(k DiagKind) string {
 }
 
 // caretPadPrefix returns a prefix for the caret line that aligns with col (1-based)
-// on the *original* line without assuming any tab width. It preserves '\t' characters
-// and replaces every other rune with a single space, so tabs expand identically in
-// both the code line and the caret line.
+// on the original line. It preserves '\t' and emits exactly ONE pad unit per
+// *display rune* (not per byte), so multi-byte UTF-8 before the caret does not
+// cause rightward drift. Coordinates remain byte-based; alignment becomes visual.
 func caretPadPrefix(line string, col int) string {
 	if col < 1 {
 		col = 1
 	}
-	// Clamp to [1 .. byteLen+1] — columns are byte-oriented in offsetToLineCol.
-	// You must not switch to rune-based counts.
+	// Clamp to [1 .. byteLen+1] — columns are byte-oriented from offsetToLineCol.
 	bl := len(line)
 	if col > bl+1 {
 		col = bl + 1
 	}
+	limit := col - 1 // pad up to (but not including) byte offset 'limit'
 
 	var b strings.Builder
-	// Pad exactly col-1 BYTES from the original line.
-	// Preserve real tab bytes so visual expansion matches the code line.
-	limit := col - 1
-	if limit > bl {
-		limit = bl
-	}
-	for i := 0; i < limit; i++ {
+	i := 0
+	for i < limit {
+		// Preserve literal tabs so the terminal expands them consistently
 		if line[i] == '\t' {
-			b.WriteByte('\t') // keep tabs as-is
-		} else {
-			b.WriteByte(' ') // pad other bytes with a single space
+			b.WriteByte('\t')
+			i++
+			continue
 		}
+		// Decode the next rune starting at byte i.
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if r == utf8.RuneError && size == 1 {
+			// Invalid byte; advance conservatively and pad once.
+			b.WriteByte(' ')
+			i++
+			continue
+		}
+		// For any non-tab rune, emit exactly one space regardless of byte length.
+		b.WriteByte(' ')
+		i += size
 	}
 	return b.String()
 }

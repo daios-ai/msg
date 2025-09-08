@@ -184,3 +184,32 @@ func bindPostOrder(si *SpanIndex, root S, postorder []Span) {
 	}
 	walk(root, nil)
 }
+
+// wrapUnderModule adapts a body SpanIndex to the AST:
+//
+//	("module", ("str", canonName), body)
+//
+// Paths shift under child #1; we also add spans for "" (module) and "0" (name).
+func wrapUnderModule(body *SpanIndex) *SpanIndex {
+	if body == nil {
+		return nil
+	}
+	out := &SpanIndex{byPath: make(map[string]Span, len(body.byPath)+2)}
+
+	// Body root span (old path ""), reuse it for the module root as well.
+	root, _ := body.Get(nil)
+	out.byPath[""] = root // module node span
+
+	// Name node at child 0: a zero-length span at the start of the file/body.
+	out.byPath["0"] = Span{StartByte: root.StartByte, EndByte: root.StartByte}
+
+	// Shift all body paths under child 1: ""→"1", "a.b"→"1.a.b".
+	for k, sp := range body.byPath {
+		if k == "" {
+			out.byPath["1"] = sp
+		} else {
+			out.byPath["1."+k] = sp
+		}
+	}
+	return out
+}

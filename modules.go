@@ -195,12 +195,11 @@ func (m *Module) get(key string) (Value, bool) {
 //
 // Cycle detection and caching are **centralized** in nativeMakeModule so that
 // *all* entry points (AST/Code/File/inline) share identical semantics.
-func (ip *Interpreter) importWithBody(canonName string, display string, body S, src string, spans *SpanIndex) (Value, error) {
-	// Prepare SourceRef for the module source so emitter can pass the absolute
-	// body path to __make_module, and the VM can render correct carets.
+func (ip *Interpreter) importWithBody(canonName, display string, body S, src string, spans *SpanIndex) (Value, error) {
+	// Align spans with the wrapped AST: ("module", ("str", canonName), body).
 	var sr *SourceRef
 	if src != "" && spans != nil {
-		sr = &SourceRef{Name: display, Src: src, Spans: spans}
+		sr = &SourceRef{Name: display, Src: src, Spans: wrapUnderModule(spans)}
 	}
 
 	// Lower to ("module", <canonical name>, body). Name is NOT overwritten later.

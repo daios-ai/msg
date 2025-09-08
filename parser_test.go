@@ -1928,3 +1928,269 @@ func Test_Parser_Incomplete_Binary_Op_RHS_AnchoredAtOp(t *testing.T) {
 	src := "1 +"
 	checkParseInc(t, src, 1, 3, "expected expression after operator")
 }
+func Test_Parser_Array_PostAnn_IgnoresComma(t *testing.T) {
+	src := `[ 
+  1, # belongs to 1
+  2 # belongs to 2
+]`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+	arr := kid(root, 0)
+	wantTag(t, arr, "array")
+	if len(arr) != 1+2 {
+		t.Fatalf("want 2 array elems, got %d\n%s", len(arr)-1, dump(arr))
+	}
+
+	// elem 0 => ("annot","<belongs to 1>", ("int",1))
+	e0 := arr[1].(S)
+	wantTag(t, e0, "annot")
+	txt0 := e0[1].(S)[1].(string)
+	if txt0 != "<belongs to 1" {
+		t.Fatalf("elem0 annot text mismatch: %q", txt0)
+	}
+	inner0 := e0[2].(S)
+	wantTag(t, inner0, "int")
+	if inner0[1].(int64) != 1 {
+		t.Fatalf("elem0 value mismatch: %v", inner0)
+	}
+
+	// elem 1 => ("annot","<belongs to 2>", ("int",2))
+	e1 := arr[2].(S)
+	wantTag(t, e1, "annot")
+	txt1 := e1[1].(S)[1].(string)
+	if txt1 != "<belongs to 2" {
+		t.Fatalf("elem1 annot text mismatch: %q", txt1)
+	}
+	inner1 := e1[2].(S)
+	wantTag(t, inner1, "int")
+	if inner1[1].(int64) != 2 {
+		t.Fatalf("elem1 value mismatch: %v", inner1)
+	}
+}
+
+func Test_Parser_Map_PostAnn_KeyAndValue_IgnoresColonAndComma(t *testing.T) {
+	src := `{
+  a: # key annot
+     1, # value annot
+  b: 2
+}`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+	mp := kid(root, 0)
+	wantTag(t, mp, "map")
+
+	if len(mp) != 1+2 {
+		t.Fatalf("want 2 pairs, got %d\n%s", len(mp)-1, dump(mp))
+	}
+
+	// First pair
+	p0 := mp[1].(S)
+	if head(p0) != "pair" && head(p0) != "pair!" {
+		t.Fatalf("want pair, got %s\n%s", head(p0), dump(p0))
+	}
+	k0 := p0[1].(S) // key node (may be annot-wrapped)
+	// Key should be POST-annotated: ("annot", ("str","<key annot"), ("str","a"))
+	wantTag(t, k0, "annot")
+	k0txt := k0[1].(S)[1].(string)
+	if k0txt != "<key annot" {
+		t.Fatalf("key0 annot text mismatch: %q", k0txt)
+	}
+	k0inner := k0[2].(S)
+	wantTag(t, k0inner, "str")
+	if k0inner[1].(string) != "a" {
+		t.Fatalf("key0 inner mismatch: %v", k0inner)
+	}
+
+	// Value should be POST-annotated: ("annot", ("str","<value annot"), ("int",1))
+	v0 := p0[2].(S)
+	wantTag(t, v0, "annot")
+	v0txt := v0[1].(S)[1].(string)
+	if v0txt != "<value annot" {
+		t.Fatalf("val0 annot text mismatch: %q", v0txt)
+	}
+	v0inner := v0[2].(S)
+	wantTag(t, v0inner, "int")
+	if v0inner[1].(int64) != 1 {
+		t.Fatalf("val0 inner mismatch: %v", v0inner)
+	}
+
+	// Second pair is plain: key "b", value 2
+	p1 := mp[2].(S)
+	if head(p1) != "pair" && head(p1) != "pair!" {
+		t.Fatalf("want pair, got %s\n%s", head(p1), dump(p1))
+	}
+	k1 := p1[1].(S)
+	if head(k1) == "annot" {
+		t.Fatalf("unexpected annot on key1: %s", dump(k1))
+	}
+	if k1[1].(string) != "b" {
+		t.Fatalf("key1 mismatch: %v", k1)
+	}
+	v1 := p1[2].(S)
+	wantTag(t, v1, "int")
+	if v1[1].(int64) != 2 {
+		t.Fatalf("val1 mismatch: %v", v1)
+	}
+}
+
+func Test_Parser_TypeMap_PostAnn_IgnoresComma(t *testing.T) {
+	src := `type {
+  a: Int, # post on a
+  b: Str
+}`
+	root := mustParse(t, src)
+	// root: ("block", ("type", <map-ast>))
+	typ := kid(root, 0)
+	wantTag(t, typ, "type")
+	mp := kid(typ, 0)
+	wantTag(t, mp, "map")
+
+	if len(mp) != 1+2 {
+		t.Fatalf("want 2 fields, got %d\n%s", len(mp)-1, dump(mp))
+	}
+
+	// Field a should have value POST attached to Int
+	f0 := mp[1].(S)
+	k0 := f0[1].(S)
+	if head(k0) == "annot" {
+		t.Fatalf("unexpected annot on field key 'a': %s", dump(k0))
+	}
+	if k0[1].(string) != "a" {
+		t.Fatalf("field0 key mismatch: %v", k0)
+	}
+	v0 := f0[2].(S)
+	wantTag(t, v0, "annot")
+	txt := v0[1].(S)[1].(string)
+	if txt != "<post on a" {
+		t.Fatalf("field0 value annot text mismatch: %q", txt)
+	}
+	base := v0[2].(S)
+	wantTag(t, base, "id")
+	if base[1].(string) != "Int" {
+		t.Fatalf("field0 base type mismatch: %v", base)
+	}
+
+	// Field b: plain Str
+	f1 := mp[2].(S)
+	k1 := f1[1].(S)
+	if k1[1].(string) != "b" {
+		t.Fatalf("field1 key mismatch: %v", k1)
+	}
+	v1 := f1[2].(S)
+	wantTag(t, v1, "id")
+	if v1[1].(string) != "Str" {
+		t.Fatalf("field1 val mismatch: %v", v1)
+	}
+}
+
+func Test_Parser_ArrayPattern_PostAnn_IgnoresComma(t *testing.T) {
+	src := `let [x, # px
+            y] = arr`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+	// ("assign", ("decl"/pattern ...), RHS)
+	as := kid(root, 0)
+	wantTag(t, as, "assign")
+
+	pat := as[1].(S)
+	// pattern should be "darr" with two items: annot(x), y
+	wantTag(t, pat, "darr")
+	if len(pat) != 1+2 {
+		t.Fatalf("want 2 pattern items, got %d\n%s", len(pat)-1, dump(pat))
+	}
+	p0 := pat[1].(S)
+	wantTag(t, p0, "annot")
+	if p0[1].(S)[1].(string) != "<px" {
+		t.Fatalf("pattern elem0 POST text mismatch: %q", p0[1].(S)[1].(string))
+	}
+	base0 := p0[2].(S)
+	wantTag(t, base0, "decl")
+	if base0[1].(string) != "x" {
+		t.Fatalf("elem0 decl mismatch: %v", base0)
+	}
+	p1 := pat[2].(S)
+	wantTag(t, p1, "decl")
+	if p1[1].(string) != "y" {
+		t.Fatalf("elem1 decl mismatch: %v", p1)
+	}
+}
+
+func Test_Parser_ObjectPattern_PostAnn_KeyAndValue(t *testing.T) {
+	src := `let {
+  a: # key K
+     x, # val V
+  b: y
+} = m`
+	root := mustParse(t, src)
+	wantTag(t, root, "block")
+
+	as := kid(root, 0)
+	wantTag(t, as, "assign")
+
+	pat := as[1].(S)
+	wantTag(t, pat, "dobj")
+	if len(pat) != 1+2 {
+		t.Fatalf("want 2 pattern pairs, got %d\n%s", len(pat)-1, dump(pat))
+	}
+
+	// First pair: key POST on "a", value POST on decl x
+	p0 := pat[1].(S)
+	k0 := p0[1].(S)
+	wantTag(t, k0, "annot")
+	if k0[1].(S)[1].(string) != "<key K" {
+		t.Fatalf("pattern key POST text mismatch: %q", k0[1].(S)[1].(string))
+	}
+	if k0[2].(S)[1].(string) != "a" {
+		t.Fatalf("pattern key inner mismatch: %v", k0[2])
+	}
+	v0 := p0[2].(S)
+	wantTag(t, v0, "annot")
+	if v0[1].(S)[1].(string) != "<val V" {
+		t.Fatalf("pattern value POST text mismatch: %q", v0[1].(S)[1].(string))
+	}
+	base := v0[2].(S)
+	wantTag(t, base, "decl")
+	if base[1].(string) != "x" {
+		t.Fatalf("pattern value inner mismatch: %v", base)
+	}
+
+	// Second pair: plain b: y
+	p1 := pat[2].(S)
+	k1 := p1[1].(S)
+	if head(k1) == "annot" {
+		t.Fatalf("unexpected annot on second key: %s", dump(k1))
+	}
+	if k1[1].(string) != "b" {
+		t.Fatalf("second key mismatch: %v", k1)
+	}
+	v1 := p1[2].(S)
+	wantTag(t, v1, "decl")
+	if v1[1].(string) != "y" {
+		t.Fatalf("second value mismatch: %v", v1)
+	}
+}
+
+func Test_Parser_Map_PostAnn_DoesNotAttachToNextKey(t *testing.T) {
+	// Regression: a value-line POST must NOT turn into a PRE on the next key.
+	src := `{a: 1, # value post
+b: 2}`
+	root := mustParse(t, src)
+	mp := kid(root, 0)
+	wantTag(t, mp, "map")
+	if len(mp) != 1+2 {
+		t.Fatalf("want 2 pairs, got %d\n%s", len(mp)-1, dump(mp))
+	}
+	// First pair value is POST-annotated
+	p0 := mp[1].(S)
+	v0 := p0[2].(S)
+	wantTag(t, v0, "annot")
+	if v0[1].(S)[1].(string) != "<value post" {
+		t.Fatalf("first value POST text mismatch: %q", v0[1].(S)[1].(string))
+	}
+	// Second key has no PRE annotation
+	p1 := mp[2].(S)
+	k1 := p1[1].(S)
+	if head(k1) == "annot" {
+		t.Fatalf("value POST leaked to next key: %s", dump(k1))
+	}
+}

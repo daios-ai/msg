@@ -1,6 +1,6 @@
 package mindscript
 
-// introspection.go — encode/decode & reflection for runtime S-expressions ([])
+// introspection.go — encode/ decode & reflection for runtime S-expressions ([])
 //
 // FINAL SURFACE (per policy)
 // --------------------------
@@ -22,6 +22,8 @@ package mindscript
 //       - VTModule → ["module", ["str", name], ("pair", ["id", export], <ctor>)*]
 //       - Native functions → ["id", nativeName]
 //       - VTHandle/unknown → SOFT error (annotated-null)
+//     • All annotations on values (including POST markers like "<...") are
+//       preserved by wrapping the constructed node(s) with ("annot", ("str", txt), node).
 //
 //   (*Interpreter) IxReify(rt Value) (Value, error)
 //     • Decode (IxFromS) then EVALUATE (like EvalPersistent) in the host.
@@ -60,28 +62,18 @@ func IxToS(n S) Value { return ixToS_Soft(n) }
 func IxFromS(rt Value) (S, error) { return ixFromS_Strict(rt) }
 
 // IxReflect returns CONSTRUCTOR CODE as a runtime S-expression ([]).
-// See the file header for the mapping of each ValueTag to constructor nodes.
+// See the header for mapping. Preserves annotations on v and all nested values.
 func IxReflect(v Value) Value {
 	s, ok := ixConstructorS_ForValue(v)
 	if !ok {
 		return rtSoftError("cannot reflect value to constructor code")
 	}
-	node := IxToS(s) // runtime-S
-
-	if v.Annot != "" {
-		return Arr([]Value{
-			Str("annot"),
-			Arr([]Value{Str("str"), Str(v.Annot)}),
-			node,
-		})
-	}
-
-	return node
+	return IxToS(s) // S → runtime-S
 }
 
 // IxReify decodes a runtime-S program and evaluates it in this interpreter,
-// equivalent to EvalPersistent. Hard-fails if the program contains a "module"
-// capsule (no installer here), any "handle" construct, or if evaluation fails.
+// equivalent to EvalPersistent. Hard-fails if the program contains a "handle"
+// construct, or if evaluation fails. Module capsules are lowered to inline form.
 func (ip *Interpreter) IxReify(rt Value) (Value, error) {
 	ast, err := IxFromS(rt)
 	if err != nil {
@@ -105,8 +97,17 @@ func (ip *Interpreter) IxReify(rt Value) (Value, error) {
 // ========== PRIVATE ===========
 // ==============================
 
-// ---------- soft-error helper (annotated-null runtime-S) ----------
+// ---------- small shared helpers ----------
 
+// annWrapS wraps node with an ("annot", ("str", txt), node) if txt != "".
+func annWrapS(txt string, node S) S {
+	if txt == "" {
+		return node
+	}
+	return S{"annot", S{"str", txt}, node}
+}
+
+// rtSoftError produces an annotated-null runtime-S.
 func rtSoftError(msg string) Value {
 	return Arr([]Value{
 		Str("annot"),
@@ -125,25 +126,25 @@ func ixToS_Soft(n S) Value {
 	if !ok {
 		return rtSoftError("AST tag is not string")
 	}
-	arr := make([]Value, 0, len(n))
-	arr = append(arr, Str(tag))
+	out := make([]Value, 0, len(n))
+	out = append(out, Str(tag))
 	for i := 1; i < len(n); i++ {
 		switch x := n[i].(type) {
 		case S:
-			arr = append(arr, ixToS_Soft(x))
+			out = append(out, ixToS_Soft(x))
 		case string:
-			arr = append(arr, Str(x))
+			out = append(out, Str(x))
 		case int64:
-			arr = append(arr, Int(x))
+			out = append(out, Int(x))
 		case float64:
-			arr = append(arr, Num(x))
+			out = append(out, Num(x))
 		case bool:
-			arr = append(arr, Bool(x))
+			out = append(out, Bool(x))
 		default:
 			return rtSoftError(fmt.Sprintf("unsupported AST atom %T", x))
 		}
 	}
-	return Arr(arr)
+	return Arr(out)
 }
 
 // ---------- runtime-S → S (strict) ----------
@@ -188,9 +189,18 @@ func ixFromS_Strict(v Value) (S, error) {
 	return out, nil
 }
 
-// ---------- Value → constructor S (no snapshotting) ----------
+// ---------- Value → constructor S (annotation-preserving, no snapshotting) ----------
 
 func ixConstructorS_ForValue(v Value) (S, bool) {
+	// Build the unannotated node first, then wrap with v.Annot (if any).
+	node, ok := ixConstructorS_core(v)
+	if !ok {
+		return nil, false
+	}
+	return annWrapS(v.Annot, node), true
+}
+
+func ixConstructorS_core(v Value) (S, bool) {
 	switch v.Tag {
 	case VTNull:
 		return S{"null"}, true
@@ -207,7 +217,7 @@ func ixConstructorS_ForValue(v Value) (S, bool) {
 		elems := v.Data.([]Value)
 		out := S{"array"}
 		for _, e := range elems {
-			se, ok := ixConstructorS_ForValue(e)
+			se, ok := ixConstructorS_ForValue(e) // child wrapper includes its own .Annot
 			if !ok {
 				return nil, false
 			}
@@ -220,7 +230,7 @@ func ixConstructorS_ForValue(v Value) (S, bool) {
 		out := S{"map"}
 		for _, k := range mo.Keys {
 			val := mo.Entries[k]
-			ctor, ok := ixConstructorS_ForValue(val)
+			ctor, ok := ixConstructorS_ForValue(val) // preserves value annotations
 			if !ok {
 				return nil, false
 			}
@@ -229,11 +239,13 @@ func ixConstructorS_ForValue(v Value) (S, bool) {
 			if ann := mo.KeyAnn[k]; ann != "" && containsBang(ann) {
 				ptag = "pair!"
 			}
+
+			// Key node with optional docs (excluding "!") as PRE/POST annot.
 			keyNode := S{"str", k}
-			// If KeyAnn has extra docs beside "!", preserve them as a PRE annot on the key.
 			if extra := keyDocWithoutBang(mo.KeyAnn[k]); extra != "" {
-				keyNode = S{"annot", S{"str", extra}, keyNode}
+				keyNode = annWrapS(extra, keyNode)
 			}
+
 			out = append(out, S{ptag, keyNode, ctor})
 		}
 		return out, true
@@ -275,7 +287,6 @@ func ixConstructorS_ForValue(v Value) (S, bool) {
 		//    ("pair", ["id", export], <ctor>)* ]
 		name := ""
 		if m, ok := v.Data.(*Module); ok {
-			// best-effort; Module is private but in-package
 			if m != nil && m.Name != "" {
 				name = m.Name
 			}
@@ -284,7 +295,7 @@ func ixConstructorS_ForValue(v Value) (S, bool) {
 		mo := mv.Data.(*MapObject)
 		out := S{"module", S{"str", name}}
 		for _, k := range mo.Keys {
-			ctor, ok := ixConstructorS_ForValue(mo.Entries[k])
+			ctor, ok := ixConstructorS_ForValue(mo.Entries[k]) // preserves export value annotations
 			if !ok {
 				return nil, false
 			}
@@ -317,7 +328,6 @@ func keyDocWithoutBang(s string) string {
 	}
 	// If it contains "!", drop just that char and trim a trailing space.
 	if containsBang(s) {
-		// very small, allocation-friendly clean-up
 		out := make([]byte, 0, len(s))
 		for i := 0; i < len(s); i++ {
 			if s[i] != '!' {

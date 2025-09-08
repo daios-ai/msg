@@ -422,3 +422,148 @@ func Test_Introspection_IxReify_ModuleCapsule_Nested(t *testing.T) {
 		t.Fatalf("expected inner.y = 2, got %#v", y)
 	}
 }
+func wrapAnnot(node Value, txt string) Value {
+	return vArray(
+		vStr("annot"),
+		vArray(vStr("str"), vStr(txt)),
+		node,
+	)
+}
+
+// Array element POST annotation should be preserved by reflect(), and survive reify(reflect(...)).
+func Test_Introspection_ArrayElementAnnotation_PreservedInReflect(t *testing.T) {
+	// Build a runtime array value: [1, 2] with a POST annotation on element 0 ("<hi").
+	e0 := vInt(1)
+	e0.Annot = "<hi"
+	e1 := vInt(2)
+	val := Value{Tag: VTArray, Data: []Value{e0, e1}}
+
+	got := IxReflect(val)
+
+	// Expect: ["array", ["annot", ["str","<hi"], ["int",1]], ["int",2]]
+	want := vArray(
+		vStr("array"),
+		wrapAnnot(vArray(vStr("int"), vInt(1)), "<hi"),
+		vArray(vStr("int"), vInt(2)),
+	)
+	mustEqValue(t, got, want)
+}
+
+func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) {
+	// Same setup as above.
+	e0 := vInt(1)
+	e0.Annot = "<hi"
+	e1 := vInt(2)
+	val := Value{Tag: VTArray, Data: []Value{e0, e1}}
+
+	rt := IxReflect(val)
+
+	ip := NewInterpreter()
+	got, err := ip.IxReify(rt)
+	if err != nil {
+		t.Fatalf("IxReify error: %v", err)
+	}
+	if got.Tag != VTArray {
+		t.Fatalf("expected VTArray after reify, got %v", got.Tag)
+	}
+	elems := got.Data.([]Value)
+	if len(elems) != 2 {
+		t.Fatalf("expected 2 elements, got %d", len(elems))
+	}
+	if elems[0].Annot != "<hi" {
+		t.Fatalf("expected first element Annot '<hi', got %q", elems[0].Annot)
+	}
+	if elems[1].Annot != "" {
+		t.Fatalf("expected second element Annot empty, got %q", elems[1].Annot)
+	}
+}
+
+// Map key/requiredness + key/value annotations should be preserved by reflect().
+func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing.T) {
+	// Map: {
+	//   a!: 1            // required + PRE doc "kdoc"
+	//   b:  2, # <vpost  // value POST
+	// }
+	// With key annotations:
+	//   a has requiredness (!) and extra doc "kdoc"
+	//   b has POST key annotation "<kpost"
+	mo := &MapObject{
+		Keys: []string{"a", "b"},
+		Entries: map[string]Value{
+			"a": vInt(1),
+			"b": func() Value { v := vInt(2); v.Annot = "<vpost"; return v }(),
+		},
+		KeyAnn: map[string]string{
+			"a": "kdoc!",  // required (!) + extra doc "kdoc"
+			"b": "<kpost", // POST key annotation
+		},
+	}
+	val := Value{Tag: VTMap, Data: mo}
+
+	got := IxReflect(val)
+
+	// Build expected runtime-S:
+	// ["map",
+	//   ["pair!", ["annot", ["str","kdoc"], ["str","a"]], ["int",1]],
+	//   ["pair",  ["annot", ["str","<kpost"], ["str","b"]], ["annot", ["str","<vpost"], ["int",2]]]
+	// ]
+	want := vArray(
+		vStr("map"),
+		vArray(
+			vStr("pair!"),
+			wrapAnnot(vArray(vStr("str"), vStr("a")), "kdoc"),
+			vArray(vStr("int"), vInt(1)),
+		),
+		vArray(
+			vStr("pair"),
+			wrapAnnot(vArray(vStr("str"), vStr("b")), "<kpost"),
+			wrapAnnot(vArray(vStr("int"), vInt(2)), "<vpost"),
+		),
+	)
+
+	mustEqValue(t, got, want)
+}
+
+// Nested arrays/maps should propagate annotations recursively in reflect().
+func Test_Introspection_NestedContainers_AnnotationsPropagate(t *testing.T) {
+	// Value: [ { x: 1 }, 2 ] with:
+	//  - POST on key 'x' (key ann "<k")
+	//  - POST on value 1 (val ann "<v1")
+	//  - POST on outer array element 1 ("<outer")
+	innerMO := &MapObject{
+		Keys: []string{"x"},
+		Entries: map[string]Value{
+			"x": func() Value { v := vInt(1); v.Annot = "<v1"; return v }(),
+		},
+		KeyAnn: map[string]string{
+			"x": "<k", // POST on key
+		},
+	}
+	innerMap := Value{Tag: VTMap, Data: innerMO}
+	elem1 := vInt(2)
+	elem1.Annot = "<outer"
+
+	val := Value{Tag: VTArray, Data: []Value{innerMap, elem1}}
+
+	got := IxReflect(val)
+
+	// Expected:
+	// ["array",
+	//   ["map", ["pair", ["annot", ["str","<k"], ["str","x"]], ["annot", ["str","<v1"], ["int",1]]]],
+	//   ["annot", ["str","<outer"], ["int",2]]
+	// ]
+	want := vArray(
+		vStr("array"),
+		vArray(
+			vStr("map"),
+			vArray(
+				vStr("pair"),
+				wrapAnnot(vArray(vStr("str"), vStr("x")), "<k"),
+				wrapAnnot(vArray(vStr("int"), vInt(1)), "<v1"),
+			),
+		),
+		wrapAnnot(vArray(vStr("int"), vInt(2)), "<outer"),
+	)
+
+	mustEqValue(t, got, want)
+}

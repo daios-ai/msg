@@ -19,10 +19,19 @@
 //     by a leading "<" in the stored text. PRE annotations print as `# ...`
 //     lines immediately above the construct; POST annotations print as a
 //     trailing `# ...` inline comment on the same line as the construct.
-//     **Important (POST semantics):** POST annotations capture the rest of
-//     the current line and therefore *force a newline*. No tokens (commas,
-//     braces, brackets, etc.) may follow a POST on the same line. Printers
-//     account for this and avoid emitting an extra blank line before a
+//     **Important (POST semantics):**
+//     • POST captures the rest of the current line and therefore *forces a newline*.
+//     • In comma/colon separated contexts, POST attaches **after the separator**:
+//     - For comma-separated lists (arrays, enums, destructuring arrays, value arrays):
+//     the POST prints *after the comma that follows the element* (or after the
+//     element itself if it is the last one).
+//     Example:
+//     [ 1, # post
+//     2 ]
+//     - For maps/object patterns/type maps: POST on a **key** prints after the colon
+//     on the key line (`key: # post`), while POST on a **value** of a non-last
+//     entry prints after the following comma (`key: value, # post`).
+//     Printers account for this and avoid emitting an extra blank line before a
 //     closing brace/bracket.
 //     - Property names are emitted bare if they are identifier-like, otherwise
 //     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
@@ -45,7 +54,8 @@
 //     Required fields print with a trailing `!` on the key.
 //     Key/value annotations (if wrapped in "annot") are respected:
 //     PRE as header lines; POST as trailing inline comments that force a
-//     newline (see POST semantics above).
+//     newline (see POST semantics above). For **value POST** in non-last
+//     entries, the POST prints *after the following comma*.
 //     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
 //     may be scalars, arrays, or maps.
 //     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
@@ -66,7 +76,8 @@
 //     • PRE (no '<' prefix): printed as `# ...` lines before the value.
 //     • POST (with '<' prefix): printed as an inline trailing comment
 //     on the same line as the value **and forces a newline**.
-//     This applies to Value.Annot (per-value) and MapObject.KeyAnn[k] (per-key).
+//     • In comma/colon separated contexts, POST respects the same **after
+//     separator** rule as the AST printers (value POST after comma).
 //     When a POST ends the last element/entry line, the closing bracket/brace
 //     is placed on the next line without an extra blank line.
 //     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
@@ -193,6 +204,7 @@ func Standardize(src string) (string, error) {
 //     POST consumes the rest of the line and forces a newline, and containers
 //     avoid emitting an extra blank line before closing delimiters.
 //   - Annotation nodes wrap the printed construct; POST becomes trailing inline.
+//   - **POST-after-separator rule** is enforced (see file header).
 //
 // This function does not parse; it strictly formats the provided AST.
 func FormatSExpr(n S) string {
@@ -209,7 +221,8 @@ func FormatSExpr(n S) string {
 
 // FormatType renders a type S-expression into a compact, human-readable string.
 // It respects PRE (header lines) vs POST (trailing inline that forces newline)
-// in the same way as the AST/code printer.
+// in the same way as the AST/code printer, including the **POST-after-separator**
+// behavior for value POSTs in maps.
 func FormatType(t S) string {
 	doc := docType(t)
 	var b strings.Builder
@@ -229,11 +242,13 @@ func FormatType(t S) string {
 //     non-scientific output), and quoted strings.
 //   - Arrays: single-line `[ a, b, c ]` when the group fits and there are no
 //     PRE annotations forcing multi-line; otherwise multi-line with indentation.
+//     Value POST follows the **after-comma** rule.
 //   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short,
 //     with no PRE key/value annotations; else multi-line with indentation,
-//     where PRE annotations print as header lines, POST as inline trailing
-//     comments that force a newline. When the last entry ends with a POST, the
-//     closing brace is on the next line without an extra blank line.
+//     where PRE annotations print as header lines, value POST prints **after
+//     the following comma**, and key POST prints after the colon. When the last
+//     entry ends with a POST, the closing brace is on the next line without an
+//     extra blank line.
 //   - Functions: `<fun: name:T -> name2:U -> R>` (zero-arg uses `_:Null`).
 //   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
 //   - Modules: `<module: pretty-name>` when available.
@@ -597,6 +612,8 @@ func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
 //     under `key:` and valPre prints above the value.
 //   - POSTs: key POST lives on the key line (after ':'), value POST lives on
 //     the value line. Both force a newline.
+//   - NOTE: Callers may choose to *not* pass a value POST here in order to
+//     attach it **after the following comma** using the comma-aware joiner.
 func kvEntry(keyDoc *Doc, valDoc *Doc, keyPre, valPre, keyPost, valPost string) *Doc {
 	var parts []*Doc
 	// key PRE above entry
@@ -639,6 +656,37 @@ func kvEntry(keyDoc *Doc, valDoc *Doc, keyPre, valPre, keyPost, valPost string) 
 	}
 
 	return Concat(parts...)
+}
+
+/* ---------- Comma-aware joining (centralized POST-after-comma logic) ---------- */
+
+type sepItem struct {
+	main *Doc // rendered item (element or entry) without its trailing POST
+	post string
+}
+
+// joinCommaWithPost joins items with commas, printing any item's POST
+// *after the comma that follows that item*. The last item's POST (if any)
+// prints after the item (no comma). POST forces newline via annotInline.
+func joinCommaWithPost(items []sepItem) *Doc {
+	if len(items) == 0 {
+		return Concat()
+	}
+	out := make([]*Doc, 0, len(items)*3)
+	for i, it := range items {
+		out = append(out, it.main)
+		if i < len(items)-1 {
+			out = append(out, Text(","))
+			if it.post != "" {
+				out = append(out, annotInline(it.post))
+			} else {
+				out = append(out, LineDoc())
+			}
+		} else if it.post != "" {
+			out = append(out, annotInline(it.post))
+		}
+	}
+	return Concat(out...)
 }
 
 /* ---------- AST helpers: tags, shapes, precedence ---------- */
@@ -885,6 +933,29 @@ func docExprMin(n S, need int) *Doc {
 	return parenIf(need, docExpr(n), n)
 }
 
+// docExprAndTrailingPost renders n as an expression and returns any single
+// outer POST annotation's text (without '<') so the caller can attach it
+// after a following comma when needed.
+func docExprAndTrailingPost(n S) (*Doc, string) {
+	if tag(n) == "annot" {
+		txt, wrapped, pre := asAnnotAST(n)
+		if !pre {
+			return docExpr(wrapped), txt
+		}
+	}
+	return docExpr(n), ""
+}
+
+func docPatternAndTrailingPost(n S) (*Doc, string) {
+	if tag(n) == "annot" {
+		txt, wrapped, pre := asAnnotAST(n)
+		if !pre {
+			return docPattern(wrapped), txt
+		}
+	}
+	return docPattern(n), ""
+}
+
 func docExpr(n S) *Doc {
 	switch tag(n) {
 	case "id":
@@ -952,19 +1023,29 @@ func docExpr(n S) *Doc {
 
 	case "array":
 		elems := listS(n, 1)
-		var ds []*Doc
+		if len(elems) == 0 {
+			return Text("[]")
+		}
+		items := make([]sepItem, 0, len(elems))
 		for _, e := range elems {
-			ds = append(ds, docExpr(e))
+			d, post := docExprAndTrailingPost(e)
+			items = append(items, sepItem{main: d, post: post})
 		}
-		lastEnds := false
-		if len(elems) > 0 && astHasPostInline(elems[len(elems)-1]) {
-			lastEnds = true
-		}
-		return inlineOrMultiAdvanced("[", ds, "]", lastEnds)
+		inside := joinCommaWithPost(items)
+		lastEnds := items[len(items)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
 
 	case "map":
 		items := listS(n, 1)
-		var entries []*Doc
+		if len(items) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(items))
 		for _, pr := range items {
 			keyNode := pr[1].(S)
 			valNode := pr[2].(S)
@@ -978,34 +1059,40 @@ func docExpr(n S) *Doc {
 				if pre {
 					vPre = txt
 				} else {
-					vPost = txt
+					vPost = txt // defer to after-comma placement
 				}
 				valNode = wrapped
 			}
-			entry := kvEntry(idOrQuoted(key), docExpr(valNode), kPre, vPre, kPost, vPost)
-			entries = append(entries, entry)
+			entryDoc := kvEntry(idOrQuoted(key), docExpr(valNode), kPre, vPre, kPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entryDoc, post: vPost})
 		}
-		// Last element ends the line iff its value had a POST.
-		lastEnds := false
-		if len(items) > 0 {
-			last := items[len(items)-1]
-			valNode := last[2].(S)
-			if tag(valNode) == "annot" {
-				_, _, pre := asAnnotAST(valNode)
-				if !pre {
-					lastEnds = true
-				}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
 			}
-		}
-		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
+			return SoftLineDoc()
+		}())), "}"))
 
 	case "enum":
 		elems := listS(n, 1)
-		var ds []*Doc
-		for _, e := range elems {
-			ds = append(ds, docExpr(e))
+		if len(elems) == 0 {
+			return Text("Enum[]")
 		}
-		return inlineOrMulti("Enum[", ds, "]")
+		items := make([]sepItem, 0, len(elems))
+		for _, e := range elems {
+			d, post := docExprAndTrailingPost(e)
+			items = append(items, sepItem{main: d, post: post})
+		}
+		inside := joinCommaWithPost(items)
+		lastEnds := items[len(items)-1].post != ""
+		return Group(braced("Enum[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
 
 	case "decl", "darr", "dobj":
 		return docPattern(n)
@@ -1037,14 +1124,28 @@ func docPattern(n S) *Doc {
 		return Text(getId(n))
 	case "darr":
 		items := listS(n, 1)
-		var ds []*Doc
-		for _, it := range items {
-			ds = append(ds, docPattern(it))
+		if len(items) == 0 {
+			return Text("[]")
 		}
-		return inlineOrMulti("[", ds, "]")
+		joined := make([]sepItem, 0, len(items))
+		for _, it := range items {
+			d, post := docPatternAndTrailingPost(it)
+			joined = append(joined, sepItem{main: d, post: post})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
 	case "dobj":
 		items := listS(n, 1)
-		var entries []*Doc
+		if len(items) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(items))
 		for _, it := range items {
 			key, ann := unwrapKeyAST(it[1].(S))
 			kPre, kPost := splitAnnotText(ann)
@@ -1055,24 +1156,21 @@ func docPattern(n S) *Doc {
 				if pre {
 					vPre = txt
 				} else {
-					vPost = txt
+					vPost = txt // defer to comma
 				}
 				val = wrapped
 			}
-			entries = append(entries, kvEntry(idOrQuoted(key), docPattern(val), kPre, vPre, kPost, vPost))
+			entry := kvEntry(idOrQuoted(key), docPattern(val), kPre, vPre, kPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entry, post: vPost})
 		}
-		// last ends only if last value had POST
-		lastEnds := false
-		if len(items) > 0 {
-			val := items[len(items)-1][2].(S)
-			if tag(val) == "annot" {
-				_, _, pre := asAnnotAST(val)
-				if !pre {
-					lastEnds = true
-				}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
 			}
-		}
-		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
+			return SoftLineDoc()
+		}())), "}"))
 	case "annot":
 		text, wrapped, pre := asAnnotAST(n)
 		if pre {
@@ -1118,6 +1216,9 @@ func docType(t S) *Doc {
 		return Concat(Text("["), docType(elem), Text("]"))
 	case "enum":
 		elems := listS(t, 1)
+		if len(elems) == 0 {
+			return Text("Enum[]")
+		}
 		var ds []*Doc
 		for _, e := range elems {
 			ds = append(ds, docTypeLiteral(e))
@@ -1159,20 +1260,23 @@ func docType(t S) *Doc {
 		if len(fs) == 0 {
 			return Text("{}")
 		}
-		var entries []*Doc
+		joined := make([]sepItem, 0, len(fs))
 		for _, f := range fs {
 			key := idOrQuoted(f.name)
 			if f.req {
 				key = Concat(key, Text("!"))
 			}
-			entries = append(entries, kvEntry(key, docType(f.typ), f.kAnnPre, f.vAnnPre, f.kAnnPost, f.vAnnPost))
+			entry := kvEntry(key, docType(f.typ), f.kAnnPre, f.vAnnPre, f.kAnnPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entry, post: f.vAnnPost})
 		}
-		// Last ends only if last field had a value POST.
-		lastEnds := false
-		if len(fs) > 0 && fs[len(fs)-1].vAnnPost != "" {
-			lastEnds = true
-		}
-		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "}"))
 	case "binop":
 		if t[1].(string) == "->" && len(t) >= 4 {
 			params, ret := flattenArrow(t)
@@ -1211,6 +1315,9 @@ func docTypeLiteral(lit S) *Doc {
 		return Text(quoteString(getStr(lit)))
 	case "array":
 		items := listS(lit, 1)
+		if len(items) == 0 {
+			return Text("[]")
+		}
 		var ds []*Doc
 		for _, s := range items {
 			ds = append(ds, docTypeLiteral(s))
@@ -1221,12 +1328,15 @@ func docTypeLiteral(lit S) *Doc {
 		if len(items) == 0 {
 			return Text("{}")
 		}
-		var parts []*Doc
+		joined := make([]sepItem, 0, len(items))
 		for _, pr := range items {
 			k := pr[1].(S)[1].(string)
-			parts = append(parts, kvEntry(idOrQuoted(k), docTypeLiteral(pr[2].(S)), "", "", "", ""))
+			val := docTypeLiteral(pr[2].(S))
+			entry := kvEntry(idOrQuoted(k), val, "", "", "", "")
+			joined = append(joined, sepItem{main: entry, post: ""})
 		}
-		return inlineOrMulti("{", parts, "}")
+		inside := joinCommaWithPost(joined)
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, SoftLineDoc())), "}"))
 	default:
 		return Text("<lit>")
 	}
@@ -1284,32 +1394,23 @@ func docValueNoAnn(v Value) *Doc {
 		if len(xs) == 0 {
 			return Text("[]")
 		}
-		var elems []*Doc
+		joined := make([]sepItem, 0, len(xs))
 		for _, it := range xs {
 			pre, post := splitAnnotText(it.Annot)
-			d := docValueNoAnn(Value{Tag: it.Tag, Data: it.Data}) // value without its own annots
+			elemDoc := docValueNoAnn(Value{Tag: it.Tag, Data: it.Data}) // without own annots
 			if pre != "" {
-				// force element on its own line with pre above it
-				elems = append(elems, Concat(annotPre(pre), d))
-				if post != "" {
-					elems = append(elems, annotInline(post))
-				}
-			} else {
-				if post != "" {
-					elems = append(elems, Concat(d, annotInline(post)))
-				} else {
-					elems = append(elems, d)
-				}
+				elemDoc = Concat(annotPre(pre), elemDoc)
 			}
+			joined = append(joined, sepItem{main: elemDoc, post: post})
 		}
-		lastEnds := false
-		if len(xs) > 0 {
-			_, post := splitAnnotText(xs[len(xs)-1].Annot)
-			if post != "" {
-				lastEnds = true
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
 			}
-		}
-		return inlineOrMultiAdvanced("[", elems, "]", lastEnds)
+			return SoftLineDoc()
+		}())), "]"))
 	case VTMap:
 		mo := v.Data.(*MapObject)
 		keys := append([]string(nil), mo.Keys...)
@@ -1317,24 +1418,23 @@ func docValueNoAnn(v Value) *Doc {
 		if len(keys) == 0 {
 			return Text("{}")
 		}
-		var entries []*Doc
+		joined := make([]sepItem, 0, len(keys))
 		for _, k := range keys {
 			kAnn := mo.KeyAnn[k]
 			kPre, kPost := splitAnnotText(kAnn)
 			vv := mo.Entries[k]
 			vPre, vPost := splitAnnotText(vv.Annot)
-			entry := kvEntry(idOrQuoted(k), docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}), kPre, vPre, kPost, vPost)
-			entries = append(entries, entry)
+			entry := kvEntry(idOrQuoted(k), docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}), kPre, vPre, kPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entry, post: vPost})
 		}
-		lastEnds := false
-		if len(keys) > 0 {
-			lastVal := mo.Entries[keys[len(keys)-1]]
-			_, vPost := splitAnnotText(lastVal.Annot)
-			if vPost != "" {
-				lastEnds = true
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
 			}
-		}
-		return inlineOrMultiAdvanced("{", entries, "}", lastEnds)
+			return SoftLineDoc()
+		}())), "}"))
 	case VTFun:
 		if f, ok := v.Data.(*Fun); ok && f != nil {
 			// Use "oracle" label for oracle functions, otherwise "fun".

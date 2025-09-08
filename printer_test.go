@@ -713,3 +713,105 @@ func Test_Printer_Value_Type_EmptyObject_NoSpace(t *testing.T) {
 		t.Fatalf("empty object type spacing mismatch\nwant: %q\ngot:  %q", want, got)
 	}
 }
+
+// ---------- POST annotations after comma/colon ----------
+
+// Arrays (expressions): POST should render *after the comma*.
+func Test_Printer_Array_Post_After_Comma(t *testing.T) {
+	in := `let a = [1, # here
+2]`
+	want := "let a = [\n" +
+		"\t1, # here\n" +
+		"\t2\n" +
+		"]"
+	eq(t, pretty(t, in), want)
+}
+
+// Enums (expressions): same comma behavior inside Enum[...].
+func Test_Printer_Enum_Post_After_Comma(t *testing.T) {
+	in := `Enum[1, # post
+2]`
+	want := "Enum[\n" +
+		"\t1, # post\n" +
+		"\t2\n" +
+		"]"
+	eq(t, pretty(t, in), want)
+}
+
+// Maps (expressions): value POST should render *after the comma* that follows the entry.
+// Key POST should render *after the colon* on the key line.
+func Test_Printer_Map_Posts_After_Comma_And_After_Colon(t *testing.T) {
+	// Value POST after comma
+	in1 := `let a = {x: 1, # vpost
+y: 2}`
+	want1 := "let a = {\n" +
+		"\tx: 1, # vpost\n" +
+		"\ty: 2\n" +
+		"}"
+	eq(t, pretty(t, in1), want1)
+
+	// Key POST after colon; value on next line, comma after the value line
+	in2 := `let a = {x: # kpost
+1, y: 2}`
+	want2 := "let a = {\n" +
+		"\tx: # kpost\n" +
+		"\t\t1,\n" +
+		"\ty: 2\n" +
+		"}"
+	eq(t, pretty(t, in2), want2)
+}
+
+// Type maps: same rules as maps — value POST after comma; key POST after colon.
+func Test_Printer_TypeMap_Posts_After_Comma_And_After_Colon(t *testing.T) {
+	// Value POST after comma
+	in1 := `type {x: Int, # vpost
+y: Str}`
+	want1 := "type {\n" +
+		"\tx: Int, # vpost\n" +
+		"\ty: Str\n" +
+		"}"
+	eq(t, pretty(t, in1), want1)
+
+	// Key POST after colon; type value on next line, comma after that line
+	in2 := `type {x: # kpost
+Int, y: Str}`
+	want2 := "type {\n" +
+		"\tx: # kpost\n" +
+		"\t\tInt,\n" +
+		"\ty: Str\n" +
+		"}"
+	eq(t, pretty(t, in2), want2)
+}
+
+// Array destructuring patterns: POST should render *after the comma*.
+func Test_Printer_ArrayPattern_Post_After_Comma(t *testing.T) {
+	in := `let [a, # post
+b] = xs`
+	want := "let [\n" +
+		"\ta, # post\n" +
+		"\tb\n" +
+		"] = xs"
+	eq(t, pretty(t, in), want)
+}
+
+// Object destructuring patterns: value POST after comma; key POST after colon.
+func Test_Printer_ObjectPattern_Posts_After_Comma_And_After_Colon(t *testing.T) {
+	// Value POST after comma between entries
+	in1 := `let {x: p, # vpost
+y: q} = xs`
+	want1 := "let {\n" +
+		"\tx: p, # vpost\n" +
+		"\ty: q\n" +
+		"} = xs"
+	eq(t, pretty(t, in1), want1)
+
+	// Key POST after colon; pattern value on next line, comma after that line
+	in2 := `let {x: # kpost
+p, y: q} = xs`
+	want2 := "let {\n" +
+		"\tx: # kpost\n" +
+		"\t\tp,\n" +
+		"\ty: q\n" +
+		"} = xs"
+	eq(t, pretty(t, in2), want2)
+}

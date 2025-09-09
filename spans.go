@@ -213,3 +213,32 @@ func wrapUnderModule(body *SpanIndex) *SpanIndex {
 	}
 	return out
 }
+
+// rebaseSpanIndexToBase returns a new SpanIndex that contains only the entries
+// whose NodePath lie under the absolute `base` path (including the base path
+// itself). Keys are kept as **absolute** paths so they match emitter marks,
+// which already include the SourceRef.PathBase prefix.
+func rebaseSpanIndexToBase(src *SpanIndex, base NodePath) *SpanIndex {
+	if src == nil {
+		return nil
+	}
+	// Empty base → identity.
+	if len(base) == 0 {
+		// Shallow copy to keep semantics read-only and avoid accidental mutation.
+		out := &SpanIndex{byPath: make(map[string]Span, len(src.byPath))}
+		for k, v := range src.byPath {
+			out.byPath[k] = v
+		}
+		return out
+	}
+	prefix := pathKey(base)
+	// Match exact base or "base."-prefixed descendants.
+	needsDot := prefix + "."
+	out := &SpanIndex{byPath: make(map[string]Span)}
+	for k, v := range src.byPath {
+		if k == prefix || strings.HasPrefix(k, needsDot) {
+			out.byPath[k] = v
+		}
+	}
+	return out
+}

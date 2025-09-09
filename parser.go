@@ -18,94 +18,89 @@
 //   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
 //     at EOF instead of hard parse errors, suitable for REPLs.
 //
-// NEW IN THIS VERSION
-// -------------------
-// Liberal spacing inside delimiters + precise error locations **and**
-// consistent POST-annotation attachment across containers.
+// *** Code-size simplifications (this version) ***
+//  1. Single postfix dispatcher: one function handles '?', call, index, and dot.
+//  2. Single delimited-list path: arrays, call-args, params, array patterns all
+//     use the same `bracketed` + `parseCommaList` helpers.
+//  3. Centralized trailing-POST handling via `afterExprMaybePost` using the
+//     existing PRE/POST classification/merge logic.
 //
-//  1. The parser **skips NOOP tokens inside delimited constructs** so that blank
-//     lines behave like whitespace within:
-//     [ … ]  { … }  f( … )  fun( … )  a[ … ]  obj.( … )  ( … )
-//     NOOP at top level or in blocks still parses as ("noop").
+// Annotation model (lowest precedence):
+//   - PRE annotation decorates the expression to its right.
+//   - POST annotation decorates the expression to its left and can also appear
+//     after a comma or a colon (binding to the element/key/value on the left).
+//   - PRE and POST cannot stack. If both apply to the same expression, they are
+//     merged into a single PRE with text "pre\npost".
 //
-// 2) **Precise error locations:** byte-accurate carets via lexer offsets.
-//
-//   - Missing token (e.g. expected ')'): caret after the last completed node.
-//
-//   - Unexpected token present: caret at the start of that token.
-//
-//   - Interactive incomplete errors follow the same policy.
-//
-//     3. **POST annotations in containers** (arrays, maps, type maps, and
-//     destructuring patterns) correctly attach to the *preceding* element/key/
-//     value even when a **comma or colon** appears between the expression and
-//     the '#' on the same line. Concretely:
-//     [ 1, # belongs to 1
-//     2 # belongs to 2 ]
-//     { a: # belongs to key a
-//     1, # belongs to value 1
-//     b: 2 }
-//     The parser accomplishes this by:
-//
-//   - Deciding PRE vs POST while scanning left on the same line and
-//     **skipping separators ',' and ':'**.
-//
-//   - When inside containers, **absorbing trailing POST annotations** that
-//     appear *after* the separator and re-wrapping the completed element/
-//     key/value with ("annot", ("str","<text"), node).
-//
-// What the parser returns
-// -----------------------
+// Nodes & Spans
+// -------------
 // The AST is a tree of S-expressions: []any whose first element is a string tag.
-// Examples (non-exhaustive):
+// **This list is the most important reference.**
 //
 //	("block", n1, n2, ...)
-//	("id",   name)               // string
-//	("int",  int64)              // from INTEGER
-//	("num",  float64)            // from NUMBER
-//	("str",  string)             // decoded literal
-//	("bool", bool)               // from BOOLEAN
-//	("null")                     // from NULL
+//	("noop")
 //
-//	("unop", op, rhs)            // prefix "-" or "not"; postfix "?"  (op is string)
-//	("binop", op, lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or"
-//	("assign", target, value)    // "=" (right-assoc)
+// Literals & identifiers:
+//
+//	("id",   string)              // identifier (includes property names coerced to ID by lexer rules)
+//	("int",  int64)               // from INTEGER
+//	("num",  float64)             // from NUMBER
+//	("str",  string)              // decoded literal
+//	("bool", bool)                // from BOOLEAN
+//	("null")                      // from NULL
+//	("type", expr)                // from 'type' ...
+//
+// Operators / expressions:
+//
+//	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
+//	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
+//	("assign", target, value)     // "=" (right-assoc)
+//
+// Property / call / index:
 //
 //	("call", callee, arg1, arg2, ...)
-//	("get",  obj, ("str", name))                  // property: obj.name or obj."name"
-//	("idx",  obj, indexExpr)                      // obj[expr] or obj.(expr) or obj.12
+//	("get",  obj, ("str", name))             // obj.name or obj."name"
+//	("idx",  obj, indexExpr)                 // obj[expr] or obj.(expr) or obj.12
+//
+// Collections:
 //
 //	("array", e1, e2, ...)
 //	("map",   ("pair",  keyStrExpr, value)*)
-//	("map",   ("pair!", keyStrExpr, value)*)      // required-field (key! : value)
-//	("enum",  item1, item2, ...)                  // from Enum[ ... ]
+//	("map",   ("pair!", keyStrExpr, value)*) // required-field (key! : value)
+//	("enum",  item1, item2, ...)             // from Enum[ ... ]
+//
+// Functions, modules, control, loops:
 //
 //	("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
 //	("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)
 //	("module",  nameExpr, bodyBlock)
-//
 //	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)
 //	("while", cond, bodyBlock)
 //	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//	("return", value)  // value may be "null" per newline semantics
+//	("break",  value)  // value may be "null"
+//	("continue", value)// value may be "null"
 //
-//	// Declaration patterns (used by 'let' and 'for' targets):
+// Declaration patterns (used by 'let' and 'for' targets):
+//
 //	("decl", name)
 //	("darr", p1, p2, ...)
 //	("dobj", ("pair", keyStrExpr, subPattern), ...)
 //
-//	// Annotations (from '#'-blocks). POST is encoded by a leading "<" in text.
+// Annotations:
+//
 //	("annot", ("str", textOr<text>), wrappedNode)
+//	   • PRE  text stored as-is
+//	   • POST text stored with leading "<"
+//	   • PRE+POST becomes PRE with "pre\npost" (no POST stacking)
 //
-// Annotation encoding
-// -------------------
-//   - PRE annotations are stored as-is:        ("annot", ("str", "note"), expr/pattern)
-//   - POST annotations are prefixed with "<":  ("annot", ("str", "<note"), expr)
-//
-// Node spans
-// ----------
-// For tooling, the parser records byte spans (StartByte/EndByte) for each node
-// in post-order. Use ParseSExprWithSpans to receive a sidecar *SpanIndex that
-// maps each node to its original source span (see spans.go).
+// Spans
+// -----
+// The parser records byte spans (StartByte/EndByte) for every AST node in
+// post-order. Use ParseSExprWithSpans to receive a *SpanIndex that maps nodes
+// to source spans (see spans.go). When PRE wraps/merges POST we emit a span for
+// the child ("str", ...) and for the parent ("annot", ...); when merging POST
+// into PRE we *do not* emit a new node or span for an extra wrapper.
 //
 // Dependencies
 // ------------
@@ -113,20 +108,11 @@
 //   - errors.go (*Error, DiagParse, DiagIncomplete, IsIncomplete)
 //   - spans.go (Span, SpanIndex, BuildSpanIndexPostOrder)
 //
-// Whitespace-sensitive behavior consumed from the lexer
-// -----------------------------------------------------
-//   - CLROUND vs LROUND: grouping for both; only CLROUND starts a call chain.
-//   - CLSQUARE vs LSQUARE: array literal for both; only CLSQUARE is indexing.
-//   - PERIOD chains: after '.', accept ( (…), INTEGER, ID, STRING ) per rules.
-//   - Annotation PRE vs POST is line-sensitive; see classifier policy below.
-//   - NOOP: skipped like whitespace inside delimiters; parsed as ("noop") at
-//     top level and inside blocks.
-//
 // Grammar sketch (informal)
 // -------------------------
 //
 //	program      := expr* EOF
-//	exp          := prefix (postfix | infix)*
+//	expr         := prefix (postfix | infix)*
 //	prefix       := literals | ids | grouping | arrays | maps | enums
 //	              | unary ("-" | "not") expr
 //	              | "fun"    params ["->" type] block
@@ -138,18 +124,11 @@
 //	              | "while" expr block
 //	              | "let" declPattern
 //	              | annotation (PRE) expr
-//	postfix      := "?" | call | index | dot | annotation (POST)
+//	postfix      := "?" | call | index | dot
 //	call         := CLROUND [args] RROUND
 //	index        := CLSQUARE expr RSQUARE
 //	dot          := PERIOD ( LROUND expr RROUND | INTEGER | ID | STRING )
 //	infix        := right-assoc "=" | right-assoc "->" | precedence-based binary op
-//
-//	declPattern  := ID | "[" [declPattern {"," declPattern}] "]"
-//	                     | "{" [key ":" declPattern {"," key ":" declPattern}] "}"
-//	forTarget    := ["let"] (declPattern | assignable)
-//	params       := CLROUND [param {"," param}] RROUND
-//	param        := ID [":" typeExpr]
-//	block        := "do" blockBody "end"
 //
 // Precedence & associativity
 // --------------------------
@@ -163,18 +142,7 @@
 //	20         "or"
 //	15         "->"     (right-assoc)
 //	10         "="      (right-assoc; target must be id/get/idx/decl/darr/dobj)
-//
-// Errors
-// ------
-//   - HARD errors are returned as *Error with Kind=DiagParse (or DiagLex upstream).
-//   - In interactive mode (ParseSExprInteractive), unfinished constructs at EOF
-//     return *Error{Kind:DiagIncomplete}.
-//   - Error placement:
-//   - Missing token → caret after last completed node (byte-accurate).
-//   - Unexpected token present → caret at lookahead start.
-//
-// PUBLIC API
-// ----------
+//	0          (implicit) PRE/POST annotations — **lowest precedence**
 package mindscript
 
 import (
@@ -209,9 +177,9 @@ func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
 		return nil, nil, err
 	}
 	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	ast, err := p.program()
-	if err != nil {
-		return nil, nil, err
+	ast, perr := p.program()
+	if perr != nil {
+		return nil, nil, perr
 	}
 	idx := BuildSpanIndexPostOrder(ast, p.post)
 	return ast, idx, nil
@@ -246,7 +214,7 @@ type parser struct {
 	src              string
 }
 
-// --- small utilities --------------------------------------------------------
+// ───────────────────────────── basics / tokens ─────────────────────────────
 
 func (p *parser) atEnd() bool { return p.peek().Type == EOF }
 func (p *parser) peek() Token {
@@ -256,12 +224,7 @@ func (p *parser) peek() Token {
 	return p.toks[p.i]
 }
 func (p *parser) prev() Token { return p.toks[p.i-1] }
-func (p *parser) nextTokenIsOnSameLine(as Token) bool {
-	if p.atEnd() {
-		return false
-	}
-	return p.peek().Line == as.Line
-}
+
 func (p *parser) match(tt ...TokenType) bool {
 	if p.atEnd() {
 		return false
@@ -274,13 +237,25 @@ func (p *parser) match(tt ...TokenType) bool {
 	}
 	return false
 }
+
+// expect/expectClose: centralized "skip noops then need".
+func (p *parser) expect(t TokenType, msg string) (Token, error) {
+	p.skipNoops()
+	return p.need(t, msg)
+}
+func (p *parser) expectClose(t TokenType, msg string) error {
+	p.skipNoops()
+	_, err := p.need(t, msg)
+	return err
+}
+
 func (p *parser) need(t TokenType, msg string) (Token, error) {
 	if p.match(t) {
 		return p.prev(), nil
 	}
 	g := p.peek()
 	if g.Type == EOF {
-		line, col := p.afterLastPos()
+		line, col := p.posAfterLastSpan()
 		kind := DiagParse
 		if p.interactive {
 			kind = DiagIncomplete
@@ -290,6 +265,7 @@ func (p *parser) need(t TokenType, msg string) (Token, error) {
 	line, col := p.posAtByte(g.StartByte)
 	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
 }
+
 func (p *parser) posAtByte(b int) (int, int) {
 	if b < 0 {
 		g := p.peek()
@@ -305,7 +281,7 @@ func (p *parser) posAtByte(b int) (int, int) {
 	}
 	return line, b - lastNL
 }
-func (p *parser) afterLastPos() (int, int) {
+func (p *parser) posAfterLastSpan() (int, int) {
 	if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
 		endB := p.toks[p.lastSpanEndTok].EndByte
 		return p.posAtByte(endB)
@@ -314,47 +290,14 @@ func (p *parser) afterLastPos() (int, int) {
 	return g.Line, g.Col + 1
 }
 
-// --- token / precedence helpers --------------------------------------------
-
-func tokenCanEndExpr(tt TokenType) bool {
-	switch tt {
-	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
-		TYPE, ENUM,
-		RROUND, RSQUARE, RCURLY,
-		QUESTION:
-		return true
-	default:
-		return false
-	}
-}
-
-// IMPORTANT: skip separators when classifying PRE vs POST.
-func (p *parser) annotationIsPreAt(idx int) bool {
-	if idx <= 0 || idx >= len(p.toks) {
-		return true
-	}
-	ann := p.toks[idx]
-	for j := idx - 1; j >= 0; j-- {
-		t := p.toks[j]
-		if t.Line < ann.Line {
-			break
-		}
-		if t.Line == ann.Line {
-			if t.Type == COMMA || t.Type == COLON {
-				continue
-			}
-			return !tokenCanEndExpr(t.Type)
-		}
-	}
-	return true
-}
-
-func tokString(t Token) string {
+func tokText(t Token) string {
 	if s, ok := t.Literal.(string); ok {
 		return s
 	}
 	return t.Lexeme
 }
+
+// ───────────────────────────── precedence table ────────────────────────────
 
 func lbp(t TokenType) (int, bool) {
 	switch t {
@@ -378,7 +321,9 @@ func lbp(t TokenType) (int, bool) {
 	return 0, false
 }
 
-// ---- span helpers ----
+func isRightAssoc(tt TokenType) bool { return tt == ASSIGN || tt == ARROW }
+
+// ───────────────────────────── spans (helpers) ─────────────────────────────
 
 func (p *parser) emitSpanByTok(startTok, endTok int) {
 	if startTok >= 0 && endTok >= startTok &&
@@ -394,7 +339,17 @@ func (p *parser) emitSpanByTok(startTok, endTok int) {
 	p.lastSpanEndTok = endTok
 }
 
-// ---- NOOP handling ---------------------------------------------------------
+// ───────────────────────────── errors (helpers) ────────────────────────────
+
+func (p *parser) needExprAfter(tok Token, msg string) error {
+	if p.atEnd() && p.interactive {
+		line, col := p.posAtByte(tok.StartByte)
+		return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
+	}
+	return nil
+}
+
+// ───────────────────────────── NOOP handling ───────────────────────────────
 
 func (p *parser) skipNoops() {
 	for !p.atEnd() && p.peek().Type == NOOP {
@@ -402,34 +357,209 @@ func (p *parser) skipNoops() {
 	}
 }
 
-// ---- shared annotation absorption helpers ----------------------------------
+// ─────────────────────── annotations: classification/merge ─────────────────
+//
+// Centralized trailing-POST attach/merge (`afterExprMaybePost`), built atop the
+// existing PRE/POST machinery. This removes the repetitive callsites where we
+// used to do: parse → skip noops → absorbOneTrailingPostAnnot → skip noops.
 
-// absorbPostAnnotsToLeft rewraps 'base' with any number of POST annotations
-// that appear *immediately at p.i* and are classified as POST (i.e., not PRE).
-// It assumes the caller is in a context where separators (',' or ':') have
-// already been handled appropriately and where such POSTs semantically belong
-// to 'base'. Spans are widened from baseStartTok to each annotation token.
-func (p *parser) absorbPostAnnotsToLeft(base S, baseStartTok int) S {
-	for !p.atEnd() && p.peek().Type == ANNOTATION && !p.annotationIsPreAt(p.i) {
-		aTok := p.i
-		a := p.peek()
-		p.i++
-		txt := ""
-		if s, ok := a.Literal.(string); ok {
-			txt = s
-		}
-		child := L("str", "<"+txt)
-		// span for child ("str")
-		p.emitSpanByTok(aTok, aTok)
-		base = L("annot", child, base)
-		// widen to include the annotation token
-		p.emitSpanByTok(baseStartTok, aTok)
-		p.skipNoops()
+func tokenCanEndExpr(tt TokenType) bool {
+	switch tt {
+	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
+		TYPE, ENUM,
+		RROUND, RSQUARE, RCURLY,
+		QUESTION,
+		END:
+		return true
+	default:
+		return false
 	}
-	return base
 }
 
-// ---- program / expressions -------------------------------------------------
+func (p *parser) nextTokenIsOnSameLine(as Token) bool {
+	if p.atEnd() {
+		return false
+	}
+	return p.peek().Line == as.Line
+}
+
+func (p *parser) isPreAnnotationAt(idx int) bool {
+	// POST if there is an expression to the left on the same line,
+	// scanning left and skipping ',' and ':'.
+	if idx <= 0 || idx >= len(p.toks) {
+		return true
+	}
+	ann := p.toks[idx]
+	for j := idx - 1; j >= 0; j-- {
+		t := p.toks[j]
+		if t.Line < ann.Line {
+			break
+		}
+		if t.Line == ann.Line {
+			if t.Type == COMMA || t.Type == COLON {
+				continue
+			}
+			return !tokenCanEndExpr(t.Type)
+		}
+	}
+	return true
+}
+
+func isAnnot(n S) (isAnnot, isPost bool) {
+	if len(n) < 2 {
+		return false, false
+	}
+	tag, _ := n[0].(string)
+	if tag != "annot" {
+		return false, false
+	}
+	if child, ok := n[1].(S); ok && len(child) >= 2 && child[0] == "str" {
+		if s, ok := child[1].(string); ok && len(s) > 0 && s[0] == '<' {
+			return true, true
+		}
+		return true, false
+	}
+	return true, false
+}
+
+func mergePreWithPostText(preAnnot S, postTxt string) S {
+	if len(preAnnot) >= 2 {
+		if c, ok := preAnnot[1].(S); ok && len(c) >= 2 && c[0] == "str" {
+			if s, ok := c[1].(string); ok {
+				if postTxt != "" {
+					if s == "" {
+						c[1] = postTxt
+					} else {
+						c[1] = s + "\n" + postTxt
+					}
+				}
+			}
+		}
+	}
+	return preAnnot
+}
+
+// Single, centralized trailing-post attach (public helper used everywhere).
+func (p *parser) afterExprMaybePost(base S, baseStartTok int) (S, error) {
+	n, _, err := p.absorbOneTrailingPostAnnot(base, baseStartTok)
+	return n, err
+}
+
+// absorbOneTrailingPostAnnot applies at most one POST annotation to `base`.
+// Span behavior matches the original implementation.
+func (p *parser) absorbOneTrailingPostAnnot(base S, baseStartTok int) (S, bool, error) {
+	if p.atEnd() || p.peek().Type != ANNOTATION || p.isPreAnnotationAt(p.i) {
+		return base, false, nil
+	}
+	aTok := p.i
+	a := p.peek()
+	p.i++
+
+	postTxt := ""
+	if s, ok := a.Literal.(string); ok {
+		postTxt = s
+	}
+
+	// Disallow consecutive POSTs (no stacking).
+	if !p.atEnd() && p.peek().Type == ANNOTATION && !p.isPreAnnotationAt(p.i) {
+		line, col := p.posAtByte(p.peek().StartByte)
+		return nil, false, &Error{Kind: DiagParse, Line: line, Col: col, Msg: "multiple consecutive post-annotations are not allowed; combine them"}
+	}
+
+	// If base is already PRE, merge and return the same node.
+	if ok, isPost := isAnnot(base); ok && !isPost {
+		base = mergePreWithPostText(base, postTxt)
+		p.skipNoops()
+		return base, true, nil
+	}
+
+	// Normal POST: wrap once with "<postTxt"
+	child := L("str", "<"+postTxt)
+	p.emitSpanByTok(aTok, aTok) // span for the annotation "str"
+	base = L("annot", child, base)
+	p.emitSpanByTok(baseStartTok, aTok) // widen parent to include the '#'
+	p.skipNoops()
+	return base, true, nil
+}
+
+// ───────────────────────────── generic bracketed lists ─────────────────────
+//
+// NOTE: This single path is now used by arrays, call args, params, and
+// array-patterns. It replaces multiple bespoke loops and empty/closer handling.
+
+// bracketed parses a generic comma-list whose opener has just been consumed.
+func (p *parser) bracketed(
+	close TokenType,
+	parseElem func() (S, int, error),
+) ([]any, int, int, error) {
+	openTok := p.i - 1
+	p.skipNoops()
+	// Empty: []
+	if p.match(close) {
+		return nil, openTok, p.i - 1, nil
+	}
+	elems, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == close },
+		parseElem,
+	)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	p.skipNoops()
+	if _, err := p.need(close, "expected ')'"); err != nil {
+		return nil, 0, 0, err
+	}
+	return elems, openTok, p.i - 1, nil
+}
+
+// parseCommaList parses elements until isClose(peek.Type) is true.
+// It also performs the standardized "trailing POST binding" both directly
+// after the element and after a following comma (POST-after-comma binds left).
+func (p *parser) parseCommaList(
+	isClose func(TokenType) bool,
+	parseElem func() (S, int, error),
+) ([]any, error) {
+	var out []any
+	for {
+		p.skipNoops()
+		if isClose(p.peek().Type) {
+			break
+		}
+
+		elem, startTok, err := parseElem()
+		if err != nil {
+			return nil, err
+		}
+		// direct trailing POST
+		elem, err = p.afterExprMaybePost(elem, startTok)
+		if err != nil {
+			return nil, err
+		}
+
+		p.skipNoops()
+		if p.match(COMMA) {
+			// POST after comma binds to the left element
+			p.skipNoops()
+			elem, err = p.afterExprMaybePost(elem, startTok)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, elem)
+			// allow trailing comma before closer; outer loop will see closer
+			p.skipNoops()
+			if isClose(p.peek().Type) {
+				break
+			}
+			continue
+		}
+
+		out = append(out, elem)
+		break
+	}
+	return out, nil
+}
+
+// ───────────────────────────── program / blocks ────────────────────────────
 
 func (p *parser) program() (S, error) {
 	var items []any
@@ -437,6 +567,13 @@ func (p *parser) program() (S, error) {
 		e, err := p.expr(0)
 		if err != nil {
 			return nil, err
+		}
+		// absolute-lowest precedence POST at top-level too
+		startTok := p.lastSpanStartTok
+		if ne, err := p.afterExprMaybePost(e, startTok); err != nil {
+			return nil, err
+		} else {
+			e = ne
 		}
 		items = append(items, e)
 	}
@@ -456,6 +593,89 @@ func (p *parser) program() (S, error) {
 	return root, nil
 }
 
+// blockUntil parses statements until encountering any of the stop tokens.
+func (p *parser) blockUntil(stops ...TokenType) (S, error) {
+	stop := map[TokenType]bool{}
+	for _, s := range stops {
+		stop[s] = true
+	}
+	var items []any
+	startTok := p.i
+	consumedAny := false
+	for !p.atEnd() && !stop[p.peek().Type] {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		// absolute-lowest precedence POST inside blocks
+		baseStartTok := p.lastSpanStartTok
+		if ne, err := p.afterExprMaybePost(e, baseStartTok); err != nil {
+			return nil, err
+		} else {
+			e = ne
+		}
+		items = append(items, e)
+		consumedAny = true
+	}
+	node := L("block", items...)
+	if consumedAny {
+		p.emitSpanByTok(startTok, p.i-1)
+	} else {
+		p.emitSpanByTok(-1, -1)
+	}
+	return node, nil
+}
+
+func (p *parser) parseBlock(requireDo bool) (S, error) {
+	if requireDo {
+		if _, err := p.need(DO, "expected 'do'"); err != nil {
+			return nil, err
+		}
+	}
+	b, err := p.blockUntil(END)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// ───────────────────────────── tiny helpers (nodes) ────────────────────────
+
+func (p *parser) leaf(tag string, payload any, startTok int) S {
+	n := L(tag, payload)
+	p.emitSpanByTok(startTok, startTok)
+	return n
+}
+func (p *parser) leafNull(startTok int) S {
+	n := L("null")
+	p.emitSpanByTok(startTok, startTok)
+	return n
+}
+
+// Try to build a literal/id leaf. Returns (node, ok).
+func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
+	switch t.Type {
+	case ID, TYPE:
+		return p.leaf("id", tokText(t), start), true
+	case INTEGER:
+		return p.leaf("int", t.Literal, start), true
+	case NUMBER:
+		return p.leaf("num", t.Literal, start), true
+	case STRING:
+		return p.leaf("str", t.Literal, start), true
+	case BOOLEAN:
+		return p.leaf("bool", t.Literal, start), true
+	case NULL:
+		return p.leafNull(start), true
+	}
+	return nil, false
+}
+
+// ───────────────────────────── prefix / postfix / infix ────────────────────
+
 func (p *parser) expr(minBP int) (S, error) {
 	tokIndexOfThis := p.i
 	t := p.peek()
@@ -465,497 +685,285 @@ func (p *parser) expr(minBP int) (S, error) {
 	leftStartTok := tokIndexOfThis
 
 	// ---- prefix ----
-	switch t.Type {
-	case NOOP:
-		left = L("noop")
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
+	if n, ok := p.tryLiteralOrId(t, tokIndexOfThis); ok {
+		left = n
+	} else {
+		switch t.Type {
+		case NOOP:
+			left = L("noop")
+			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
 
-	case ID, TYPE:
-		left = L("id", tokString(t))
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
+		case ENUM:
+			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
+				p.i++ // consume '[' or CLSQUARE
+				// enum literal uses same array parse after '['
+				arr, err := p.arrayLiteralAfterOpen()
+				if err != nil {
+					return nil, err
+				}
+				items := make([]any, 0, len(arr)-1)
+				for i := 1; i < len(arr); i++ {
+					items = append(items, arr[i])
+				}
+				left = L("enum", items...)
+				p.emitSpanByTok(tokIndexOfThis, p.i-1)
+			} else {
+				left = p.leaf("id", tokText(t), tokIndexOfThis)
+			}
 
-	case ENUM:
-		if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
-			p.i++ // consume '[' or CLSQUARE
-			arr, err := p.arrayLiteralAfterOpen()
+		case MINUS, NOT:
+			if err := p.needExprAfter(t, "expected expression after unary operator"); err != nil {
+				return nil, err
+			}
+			r, err := p.expr(80)
 			if err != nil {
 				return nil, err
 			}
-			it := make([]any, 0, len(arr)-1)
-			for i := 1; i < len(arr); i++ {
-				it = append(it, arr[i])
+			left = L("unop", t.Lexeme, r)
+			endTok := p.lastSpanEndTok
+			if endTok < 0 {
+				endTok = tokIndexOfThis
 			}
-			left = L("enum", it...)
-			p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		} else {
-			left = L("id", tokString(t))
-			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-		}
+			p.emitSpanByTok(tokIndexOfThis, endTok)
 
-	case INTEGER:
-		left = L("int", t.Literal)
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-	case NUMBER:
-		left = L("num", t.Literal)
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-	case STRING:
-		left = L("str", t.Literal)
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-	case BOOLEAN:
-		left = L("bool", t.Literal)
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-	case NULL:
-		left = L("null")
-		p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
+		case LROUND, CLROUND:
+			inner, err := p.parseGrouping()
+			if err != nil {
+				return nil, err
+			}
+			left = inner
+			leftStartTok = tokIndexOfThis
 
-	case MINUS, NOT:
-		if p.atEnd() && p.interactive {
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after unary operator", Line: line, Col: col}
-		}
-		r, err := p.expr(80)
-		if err != nil {
-			return nil, err
-		}
-		left = L("unop", t.Lexeme, r)
-		endTok := p.lastSpanEndTok
-		if endTok < 0 {
-			endTok = tokIndexOfThis
-		}
-		leftStartTok = tokIndexOfThis
-		p.emitSpanByTok(leftStartTok, endTok)
-
-	case LROUND, CLROUND:
-		p.skipNoops()
-		inner, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		p.skipNoops()
-		if _, err := p.need(RROUND, "expected ')'"); err != nil {
-			return nil, err
-		}
-		left = inner
-		leftStartTok = tokIndexOfThis
-
-	case LSQUARE, CLSQUARE:
-		a, err := p.arrayLiteralAfterOpen()
-		if err != nil {
-			return nil, err
-		}
-		left = a
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case LCURLY:
-		p.skipNoops()
-		if p.match(RCURLY) {
-			left = L("map")
+		case LSQUARE, CLSQUARE:
+			a, err := p.arrayLiteralAfterOpen()
+			if err != nil {
+				return nil, err
+			}
+			left = a
 			p.emitSpanByTok(tokIndexOfThis, p.i-1)
 			leftStartTok = tokIndexOfThis
-		} else {
-			var pairs []any
-			for {
-				p.skipNoops()
-				pairStartTok := p.i
 
-				// key
-				k, req, err := p.keyRequired()
-				if err != nil {
-					return nil, err
+		case LCURLY:
+			mp, err := p.mapLiteralAfterOpen(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = mp
+			leftStartTok = tokIndexOfThis
+
+		case FUNCTION:
+			fn, endTok, err := p.funExpr(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = fn
+			p.emitSpanByTok(tokIndexOfThis, endTok)
+			leftStartTok = tokIndexOfThis
+
+		case ORACLE:
+			orc, endTok, err := p.oracleExpr(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = orc
+			p.emitSpanByTok(tokIndexOfThis, endTok)
+			leftStartTok = tokIndexOfThis
+
+		case MODULE:
+			if err := p.needExprAfter(t, "expected module name expression"); err != nil {
+				return nil, err
+			}
+			name, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			body, err := p.parseBlock(true)
+			if err != nil {
+				return nil, err
+			}
+			left = L("module", name, body)
+			p.emitSpanByTok(tokIndexOfThis, p.i-1)
+			leftStartTok = tokIndexOfThis
+
+		case RETURN, BREAK, CONTINUE:
+			n, err := p.parseControl(t, tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = n
+			leftStartTok = tokIndexOfThis
+
+		case IF:
+			thenIf, err := p.ifExpr()
+			if err != nil {
+				return nil, err
+			}
+			left = thenIf
+			p.emitSpanByTok(tokIndexOfThis, p.i-1)
+			leftStartTok = tokIndexOfThis
+
+		case DO:
+			body, err := p.parseBlock(false)
+			if err != nil {
+				return nil, err
+			}
+			left = body
+			leftStartTok = tokIndexOfThis
+
+		case FOR:
+			f, err := p.forExpr()
+			if err != nil {
+				return nil, err
+			}
+			left = f
+			p.emitSpanByTok(tokIndexOfThis, p.i-1)
+			leftStartTok = tokIndexOfThis
+
+		case WHILE:
+			w, err := p.whileExpr()
+			if err != nil {
+				return nil, err
+			}
+			left = w
+			p.emitSpanByTok(tokIndexOfThis, p.i-1)
+			leftStartTok = tokIndexOfThis
+
+		case LET:
+			pat, err := p.declPattern()
+			if err != nil {
+				return nil, err
+			}
+			left = pat
+			base := unwrapAnnots(pat)
+			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
+				j := p.i
+				for j < len(p.toks) && p.toks[j].Type == ANNOTATION && !p.isPreAnnotationAt(j) {
+					j++
 				}
-				keyStartTok := p.lastSpanStartTok
-
-				p.skipNoops()
-				if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-					return nil, err
-				}
-
-				// absorb POST(s) that belong to the key (appear after ':')
-				p.skipNoops()
-				k = p.absorbPostAnnotsToLeft(k, keyStartTok)
-
-				// value
-				p.skipNoops()
-				v, err := p.expr(0)
-				if err != nil {
-					return nil, err
-				}
-
-				// value may have a trailing comma with POSTs after it
-				p.skipNoops()
-				hadComma := p.match(COMMA)
-				if hadComma {
-					valStartTok := p.lastSpanStartTok
-					p.skipNoops()
-					v = p.absorbPostAnnotsToLeft(v, valStartTok)
-				}
-
-				tag := "pair"
-				if req {
-					tag = "pair!"
-				}
-				pr := L(tag, k, v)
-				endTok := p.lastSpanEndTok
-				p.emitSpanByTok(pairStartTok, endTok)
-				pairs = append(pairs, pr)
-
-				p.skipNoops()
-				if hadComma {
-					// trailing comma before '}'
-					if p.peek().Type == RCURLY {
-						break
+				if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
+					g := p.peek()
+					if p.interactive && g.Type == EOF {
+						line, col := p.posAfterLastSpan()
+						return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 					}
-					continue
+					line, col := p.posAtByte(g.StartByte)
+					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 				}
-				// no comma: this pair must be the last
-				break
 			}
-			p.skipNoops()
-			if _, err := p.need(RCURLY, "expected '}'"); err != nil {
-				return nil, err
-			}
-			left = L("map", pairs...)
-			p.emitSpanByTok(tokIndexOfThis, p.i-1)
 			leftStartTok = tokIndexOfThis
-		}
 
-	case FUNCTION:
-		params, err := p.params()
-		if err != nil {
-			return nil, err
-		}
-		var ret any = L("id", "Any")
-		if p.match(ARROW) {
-			arrowTok := p.prev()
-			if p.atEnd() && p.interactive {
-				line, col := p.posAtByte(arrowTok.StartByte)
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected return type after '->'", Line: line, Col: col}
-			}
-			r, err := p.expr(0)
-			if err != nil {
+		case TYPECONS:
+			if err := p.needExprAfter(t, "expected type expression after 'type'"); err != nil {
 				return nil, err
 			}
-			ret = r
-		}
-		body, err := p.parseBlock(true)
-		if err != nil {
-			return nil, err
-		}
-		left = L("fun", params, ret, body)
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case ORACLE:
-		params, err := p.params()
-		if err != nil {
-			return nil, err
-		}
-		var out any = L("id", "Any")
-		if p.match(ARROW) {
-			arrowTok := p.prev()
-			if p.atEnd() && p.interactive {
-				line, col := p.posAtByte(arrowTok.StartByte)
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected output type after '->'", Line: line, Col: col}
-			}
-			o, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			out = o
-		}
-		var src any = L("array")
-		if p.match(FROM) {
-			if p.atEnd() && p.interactive {
-				line, col := p.afterLastPos()
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after 'from'", Line: line, Col: col}
-			}
-			ex, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			src = ex
-		}
-		left = L("oracle", params, out, src)
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case MODULE:
-		if p.atEnd() && p.interactive {
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected module name expression", Line: line, Col: col}
-		}
-		name, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		body, err := p.parseBlock(true)
-		if err != nil {
-			return nil, err
-		}
-		left = L("module", name, body)
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case RETURN, BREAK, CONTINUE:
-		if !p.nextTokenIsOnSameLine(t) {
-			switch t.Type {
-			case RETURN:
-				left = L("return", L("null"))
-			case BREAK:
-				left = L("break", L("null"))
-			default:
-				left = L("continue", L("null"))
-			}
-			p.emitSpanByTok(-1, -1) // child
-			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis)
-			leftStartTok = tokIndexOfThis
-		} else {
 			x, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
-			switch t.Type {
-			case RETURN:
-				left = L("return", x)
-			case BREAK:
-				left = L("break", x)
-			default:
-				left = L("continue", x)
-			}
+			left = L("type", x)
 			p.emitSpanByTok(tokIndexOfThis, p.lastSpanEndTok)
 			leftStartTok = tokIndexOfThis
-		}
-
-	case IF:
-		thenIf, err := p.ifExpr()
-		if err != nil {
-			return nil, err
-		}
-		left = thenIf
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case DO:
-		body, err := p.parseBlock(false)
-		if err != nil {
-			return nil, err
-		}
-		left = body
-		leftStartTok = tokIndexOfThis
-
-	case FOR:
-		f, err := p.forExpr()
-		if err != nil {
-			return nil, err
-		}
-		left = f
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case WHILE:
-		w, err := p.whileExpr()
-		if err != nil {
-			return nil, err
-		}
-		left = w
-		p.emitSpanByTok(tokIndexOfThis, p.i-1)
-		leftStartTok = tokIndexOfThis
-
-	case LET:
-		pat, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		left = pat
-		base := unwrapAnnots(pat)
-		if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
-			j := p.i
-			for j < len(p.toks) && p.toks[j].Type == ANNOTATION && !p.annotationIsPreAt(j) {
-				j++
-			}
-			if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
-				g := p.peek()
-				if p.interactive && g.Type == EOF {
-					line, col := p.afterLastPos()
-					return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-				}
-				line, col := p.posAtByte(g.StartByte)
-				return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-			}
-		}
-		leftStartTok = tokIndexOfThis
-
-	case TYPECONS:
-		if p.atEnd() && p.interactive {
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected type expression after 'type'", Line: line, Col: col}
-		}
-		x, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		left = L("type", x)
-		p.emitSpanByTok(tokIndexOfThis, p.lastSpanEndTok)
-		leftStartTok = tokIndexOfThis
-
-	case ANNOTATION:
-		pre := p.annotationIsPreAt(p.i - 1)
-		txt := ""
-		if s, ok := t.Literal.(string); ok {
-			txt = s
-		}
-
-		if pre {
-			if !p.atEnd() && p.peek().Type == ANNOTATION && p.annotationIsPreAt(p.i) {
-				next := p.peek()
-				line, col := p.posAtByte(next.StartByte)
-				return nil, &Error{
-					Kind: DiagParse, Line: line, Col: col,
-					Msg: "multiple consecutive pre-annotations are not allowed; combine them",
-				}
-			}
-			if p.atEnd() && p.interactive {
-				line, col := p.posAtByte(t.StartByte)
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
-			}
-			p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis) // child ("str")
-			x, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			left = L("annot", L("str", txt), x)
-			p.emitSpanByTok(tokIndexOfThis, p.lastSpanEndTok)
-			leftStartTok = tokIndexOfThis
-		} else {
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: line, Col: col}
-		}
-
-	default:
-		if t.Type == EOF && p.interactive {
-			line, col := p.afterLastPos()
-			return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
-		}
-		line, col := p.posAtByte(t.StartByte)
-		return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
-	}
-
-	// ---- postfix chain ----
-	for {
-		switch p.peek().Type {
-		case QUESTION:
-			qtok := p.i
-			p.i++
-			left = L("unop", "?", left)
-			p.emitSpanByTok(leftStartTok, qtok)
-			continue
-
-		case CLROUND:
-			openTok := p.i
-			p.i++
-			var args []any
-			p.skipNoops()
-			if !p.match(RROUND) {
-				for {
-					p.skipNoops()
-					a, err := p.expr(0)
-					if err != nil {
-						return nil, err
-					}
-					args = append(args, a)
-					p.skipNoops()
-
-					if !p.match(COMMA) {
-						break
-					}
-					p.skipNoops()
-					if p.peek().Type == RROUND {
-						break
-					}
-				}
-				p.skipNoops()
-				if _, err := p.need(RROUND, "expected ')'"); err != nil {
-					return nil, err
-				}
-			}
-			left = L("call", append([]any{left}, args...)...)
-			p.emitSpanByTok(leftStartTok, p.i-1)
-			_ = openTok
-			continue
-
-		case CLSQUARE:
-			openTok := p.i
-			p.i++
-			p.skipNoops()
-			idx, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			p.skipNoops()
-			if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-				return nil, err
-			}
-			left = L("idx", left, idx)
-			p.emitSpanByTok(leftStartTok, p.i-1)
-			_ = openTok
-			continue
-
-		case PERIOD:
-			p.i++
-			if p.match(LROUND) || p.match(CLROUND) {
-				p.skipNoops()
-				ex, err := p.expr(0)
-				if err != nil {
-					return nil, err
-				}
-				p.skipNoops()
-				if _, err := p.need(RROUND, "expected ')' after computed property"); err != nil {
-					return nil, err
-				}
-				left = L("idx", left, ex)
-				p.emitSpanByTok(leftStartTok, p.i-1)
-				continue
-			}
-			if p.match(INTEGER) {
-				intTok := p.i - 1
-				intNode := L("int", p.prev().Literal)
-				p.emitSpanByTok(intTok, intTok)
-				left = L("idx", left, intNode)
-				p.emitSpanByTok(leftStartTok, intTok)
-				continue
-			}
-			if p.match(ID) || p.match(STRING) {
-				propTok := p.i - 1
-				prop := L("str", tokString(p.prev()))
-				p.emitSpanByTok(propTok, propTok)
-				left = L("get", left, prop)
-				p.emitSpanByTok(leftStartTok, propTok)
-				continue
-			}
-			g := p.peek()
-			line, col := p.posAtByte(g.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
 
 		case ANNOTATION:
-			// POST attaches to 'left'; PRE belongs to the next thing.
-			if p.annotationIsPreAt(p.i) {
-				break
-			}
-			a := p.peek()
-			aTok := p.i
-			p.i++
+			pre := p.isPreAnnotationAt(p.i - 1)
 			txt := ""
-			if s, ok := a.Literal.(string); ok {
+			if s, ok := t.Literal.(string); ok {
 				txt = s
 			}
-			child := L("str", "<"+txt)
-			p.emitSpanByTok(aTok, aTok)
-			left = L("annot", child, left)
-			p.emitSpanByTok(leftStartTok, aTok)
-			continue
+
+			if pre {
+				// forbid stacked PREs
+				if !p.atEnd() && p.peek().Type == ANNOTATION && p.isPreAnnotationAt(p.i) {
+					next := p.peek()
+					line, col := p.posAtByte(next.StartByte)
+					return nil, &Error{
+						Kind: DiagParse, Line: line, Col: col,
+						Msg: "multiple consecutive pre-annotations are not allowed; combine them",
+					}
+				}
+				// If EOF in normal mode: PRE wraps NOOP.
+				if p.atEnd() && !p.interactive {
+					p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis) // child ("str", txt)
+					p.emitSpanByTok(-1, -1)                         // ("noop")
+					node := L("annot", L("str", txt), L("noop"))
+					p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis) // parent span: just the annot text
+					left = node
+					leftStartTok = tokIndexOfThis
+					break
+				}
+				if p.atEnd() && p.interactive {
+					line, col := p.posAtByte(t.StartByte)
+					return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
+				}
+
+				// SPECIAL: PRE preceding a control form binds to the control's value.
+				saveI := p.i
+				x, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				if tag, _ := x[0].(string); tag == "return" || tag == "break" || tag == "continue" {
+					annChild := L("str", txt)
+					valueEndTok := p.lastSpanEndTok
+					p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis) // PRE text
+					// replace x's payload with annotated value (wrapping null if missing)
+					if len(x) >= 2 {
+						if val, ok := x[1].(S); ok {
+							x[1] = L("annot", annChild, val)
+						} else {
+							x[1] = L("annot", annChild, L("null"))
+						}
+					} else {
+						x = L(tag, L("annot", annChild, L("null")))
+					}
+					p.emitSpanByTok(tokIndexOfThis, valueEndTok) // annot parent
+					p.emitSpanByTok(tokIndexOfThis, valueEndTok) // control node
+					left = x
+					leftStartTok = tokIndexOfThis
+					_ = saveI
+					break
+				}
+
+				// General PRE wrap (non-control)
+				p.emitSpanByTok(tokIndexOfThis, tokIndexOfThis) // PRE child ("str", ...)
+				operand := x
+				left = L("annot", L("str", txt), operand)
+				p.emitSpanByTok(tokIndexOfThis, p.lastSpanEndTok) // annot parent
+				leftStartTok = tokIndexOfThis
+
+				// Try to absorb one immediate POST into this PRE (merge txt)
+				if nleft, _, err := p.absorbOneTrailingPostAnnot(left, tokIndexOfThis); err != nil {
+					return nil, err
+				} else {
+					left = nleft
+				}
+				return left, nil
+			}
+
+			// POST at prefix position is an error.
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: line, Col: col}
+
+		default:
+			if t.Type == EOF && p.interactive {
+				line, col := p.posAfterLastSpan()
+				return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
+			}
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
 		}
-		break
+	}
+
+	// ---- postfix chain ---- (single dispatcher now)
+	for {
+		n, ok, err := p.parseOnePostfix(left, leftStartTok)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		left = n
 	}
 
 	// ---- infix ops ----
@@ -968,8 +976,8 @@ func (p *parser) expr(minBP int) (S, error) {
 		p.i++
 
 		nextBP := bp + 1
-		if op.Type == ASSIGN || op.Type == ARROW {
-			nextBP = bp // right-assoc
+		if isRightAssoc(op.Type) {
+			nextBP = bp
 		}
 
 		if op.Type == ASSIGN && !assignable(left) {
@@ -977,9 +985,8 @@ func (p *parser) expr(minBP int) (S, error) {
 			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
 		}
 
-		if p.atEnd() && p.interactive {
-			line, col := p.posAtByte(op.StartByte)
-			return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after operator", Line: line, Col: col}
+		if err := p.needExprAfter(op, "expected expression after operator"); err != nil {
+			return nil, err
 		}
 		right, err := p.expr(nextBP)
 		if err != nil {
@@ -998,50 +1005,154 @@ func (p *parser) expr(minBP int) (S, error) {
 	return left, nil
 }
 
-// Arrays: support POST after comma: [1, #post  …]
+// parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
+func (p *parser) parseGrouping() (S, error) {
+	p.skipNoops()
+	inner, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, err := p.need(RROUND, "expected ')'"); err != nil {
+		return nil, err
+	}
+	return inner, nil
+}
+
+// ───────────────────────────── unified postfix dispatcher ──────────────────
+//
+// Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
+
+func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
+	switch p.peek().Type {
+	case QUESTION:
+		qtok := p.i
+		p.i++
+		n := L("unop", "?", left)
+		p.emitSpanByTok(leftStartTok, qtok)
+		return n, true, nil
+
+	case CLROUND:
+		p.i++
+		p.skipNoops()
+		if p.match(RROUND) {
+			n := L("call", left)
+			p.emitSpanByTok(leftStartTok, p.i-1)
+			return n, true, nil
+		}
+		args, _, closeTok, err := p.bracketed(RROUND, func() (S, int, error) {
+			p.skipNoops()
+			start := p.i
+			a, err := p.expr(0)
+			if err != nil {
+				return nil, 0, err
+			}
+			return a, start, nil
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		n := L("call", append([]any{left}, args...)...)
+		p.emitSpanByTok(leftStartTok, closeTok)
+		return n, true, nil
+
+	case CLSQUARE:
+		p.i++
+		p.skipNoops()
+		idx, err := p.expr(0)
+		if err != nil {
+			return nil, false, err
+		}
+		p.skipNoops()
+		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
+			return nil, false, err
+		}
+		n := L("idx", left, idx)
+		p.emitSpanByTok(leftStartTok, p.i-1)
+		return n, true, nil
+
+	case PERIOD:
+		p.i++ // consume '.'
+		// (expr) -> idx
+		if p.match(LROUND) || p.match(CLROUND) {
+			p.skipNoops()
+			ex, err := p.expr(0)
+			if err != nil {
+				return nil, false, err
+			}
+			p.skipNoops()
+			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
+				return nil, false, perr
+			}
+			n := L("idx", left, ex)
+			p.emitSpanByTok(leftStartTok, p.i-1)
+			return n, true, nil
+		}
+		// .<int> -> idx
+		if p.match(INTEGER) {
+			intTok := p.i - 1
+			intNode := L("int", p.prev().Literal)
+			p.emitSpanByTok(intTok, intTok)
+			n := L("idx", left, intNode)
+			p.emitSpanByTok(leftStartTok, intTok)
+			return n, true, nil
+		}
+		// .id / ."str" -> get
+		if p.match(ID) || p.match(STRING) {
+			propTok := p.i - 1
+			prop := L("str", tokText(p.prev()))
+			p.emitSpanByTok(propTok, propTok)
+			n := L("get", left, prop)
+			p.emitSpanByTok(leftStartTok, propTok)
+			return n, true, nil
+		}
+		g := p.peek()
+		line, col := p.posAtByte(g.StartByte)
+		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
+	}
+	return nil, false, nil
+}
+
+// ───────────────────────── collections / params / maps ────────────────────
+
 func (p *parser) arrayLiteralAfterOpen() (S, error) {
+	// Uses the generic bracketed+comma-list path.
 	p.skipNoops()
 	if p.match(RSQUARE) {
 		return L("array"), nil
 	}
-	var elems []any
-	for {
-		p.skipNoops()
-		elemStartTok := p.i
-		it, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		p.skipNoops()
-		if p.match(COMMA) {
-			// absorb POSTs that belong to the previous element (after comma)
+	elems, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == RSQUARE },
+		func() (S, int, error) {
 			p.skipNoops()
-			it = p.absorbPostAnnotsToLeft(it, elemStartTok)
-			elems = append(elems, it)
-			p.skipNoops()
-			if p.peek().Type == RSQUARE {
-				break
+			start := p.i
+			e, err := p.expr(0)
+			if err != nil {
+				return nil, 0, err
 			}
-			continue
-		}
-		elems = append(elems, it)
-		break
+			return e, start, nil
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
 	p.skipNoops()
-	if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-		return nil, err
+	if _, perr := p.need(RSQUARE, "expected ']'"); perr != nil {
+		return nil, perr
 	}
 	return L("array", elems...), nil
 }
 
-// Params: unchanged logic + skip NOOP within.
+// params parses (CLROUND ... RROUND) parameter pairs; POST can follow each param
+// directly or after the comma. Default type is Any. Implemented with the
+// unified delimited-list path.
 func (p *parser) params() (S, error) {
-	openTok := -1
-	if tok, err := p.need(CLROUND, "expected '(' to start parameters"); err != nil {
-		return nil, err
+	var openTok int
+	if tok, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
+		return nil, perr
 	} else {
-		_ = tok
 		openTok = p.i - 1
+		_ = tok
 	}
 	p.skipNoops()
 	if p.match(RROUND) {
@@ -1049,51 +1160,214 @@ func (p *parser) params() (S, error) {
 		p.emitSpanByTok(openTok, p.i-1)
 		return arr, nil
 	}
-	var ps []any
+
+	elems, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == RROUND },
+		func() (S, int, error) {
+			p.skipNoops()
+			idTok, err := p.need(ID, "expected parameter name")
+			if err != nil {
+				return nil, 0, err
+			}
+			idIdx := p.i - 1
+			p.emitSpanByTok(idIdx, idIdx)
+			var t any = L("id", "Any")
+			endTokForPair := idIdx
+			p.skipNoops()
+			if p.match(COLON) {
+				if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
+					return nil, 0, err
+				}
+				p.skipNoops()
+				e, err := p.expr(0)
+				if err != nil {
+					return nil, 0, err
+				}
+				t = e
+				endTokForPair = p.lastSpanEndTok
+			}
+			// span for ("pair", name, type)
+			p.emitSpanByTok(idIdx, endTokForPair)
+			return L("pair", L("id", tokText(idTok)), t), idIdx, nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, perr := p.need(RROUND, "expected ')' after parameters"); perr != nil {
+		return nil, perr
+	}
+	arr := L("array", elems...)
+	p.emitSpanByTok(openTok, p.i-1)
+	return arr, nil
+}
+
+func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
+	p.skipNoops()
+	if p.match(RCURLY) {
+		node := L("map")
+		p.emitSpanByTok(openTok, p.i-1)
+		return node, nil
+	}
+	isClose := func(tt TokenType) bool { return tt == RCURLY }
+	readKey := func() (S, int, bool, error) {
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		keyStartTok := p.lastSpanStartTok
+		// required '!' after key (map literal variant)
+		req := p.match(BANG)
+		return k, keyStartTok, req, nil
+	}
+	parseVal := func() (S, int, error) {
+		p.skipNoops()
+		start := p.i
+		v, err := p.expr(0)
+		if err != nil {
+			return nil, 0, err
+		}
+		return v, start, nil
+	}
+
+	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, perr := p.need(RCURLY, "expected '}'"); perr != nil {
+		return nil, perr
+	}
+	node := L("map", pairs...)
+	p.emitSpanByTok(openTok, p.i-1)
+	return node, nil
+}
+
+// parseKVPairs parses content inside '{' ... '}' for map literals and object
+// patterns. It reuses the centralized trailing-POST logic (after ':' and after
+// comma) via `absorbOneTrailingPostAnnot` to keep behavior identical.
+func (p *parser) parseKVPairs(
+	isClose func(TokenType) bool,
+	readKey func() (key S, keyStartTok int, required bool, err error),
+	parseValue func() (val S, valStartTok int, err error),
+) ([]any, error) {
+	var pairs []any
 	for {
 		p.skipNoops()
-		idTok, err := p.need(ID, "expected parameter name")
+		if isClose(p.peek().Type) {
+			break
+		}
+		pairStartTok := p.i
+
+		// key
+		k, keyStartTok, required, err := readKey()
 		if err != nil {
 			return nil, err
 		}
-		idIdx := p.i - 1
-		p.emitSpanByTok(idIdx, idIdx)
-		var t any = L("id", "Any")
-		endTokForPair := idIdx
-		p.skipNoops()
-		if p.match(COLON) {
-			if p.atEnd() && p.interactive {
-				line, col := p.posAtByte(idTok.StartByte)
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected type after ':'", Line: line, Col: col}
-			}
-			p.skipNoops()
-			e, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			t = e
-			endTokForPair = p.lastSpanEndTok
-		}
-		pr := L("pair", L("id", tokString(idTok)), t)
-		p.emitSpanByTok(idIdx, endTokForPair)
-		ps = append(ps, pr)
-		p.skipNoops()
 
-		if !p.match(COMMA) {
-			break
-		}
 		p.skipNoops()
-		if p.peek().Type == RROUND {
-			break
+		if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+			return nil, err
 		}
+
+		// POST that belongs to the key (appears after ':')
+		p.skipNoops()
+		if nk, _, err := p.absorbOneTrailingPostAnnot(k, keyStartTok); err != nil {
+			return nil, err
+		} else {
+			k = nk
+		}
+
+		// value
+		p.skipNoops()
+		v, vStartTok, err := parseValue()
+		if err != nil {
+			return nil, err
+		}
+		// direct value POST
+		p.skipNoops()
+		if nv, _, err := p.absorbOneTrailingPostAnnot(v, vStartTok); err != nil {
+			return nil, err
+		} else {
+			v = nv
+		}
+
+		// optional trailing comma and POST-after-comma binds to value
+		p.skipNoops()
+		hadComma := p.match(COMMA)
+		if hadComma {
+			valStartTok := p.lastSpanStartTok
+			p.skipNoops()
+			if nv, _, err := p.absorbOneTrailingPostAnnot(v, valStartTok); err != nil {
+				return nil, err
+			} else {
+				v = nv
+			}
+		}
+
+		tag := "pair"
+		if required {
+			tag = "pair!"
+		}
+		pr := L(tag, k, v)
+		endTok := p.lastSpanEndTok
+		p.emitSpanByTok(pairStartTok, endTok)
+		pairs = append(pairs, pr)
+
+		p.skipNoops()
+		if hadComma {
+			// allow trailing comma before closer
+			if isClose(p.peek().Type) {
+				break
+			}
+			continue
+		}
+		// no comma → last entry
+		break
 	}
-	p.skipNoops()
-	if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
+	return pairs, nil
+}
+
+// ─────────────────────────── control / loops / if ─────────────────────────
+
+func (p *parser) parseControl(t Token, startTok int) (S, error) {
+	if !p.nextTokenIsOnSameLine(t) {
+		var n S
+		switch t.Type {
+		case RETURN:
+			n = L("return", L("null"))
+		case BREAK:
+			n = L("break", L("null"))
+		default:
+			n = L("continue", L("null"))
+		}
+		p.emitSpanByTok(-1, -1) // child
+		p.emitSpanByTok(startTok, startTok)
+		return n, nil
+	}
+	// same line: parse value and absorb POST onto the value
+	valStartTok := p.i
+	x, err := p.expr(0)
+	if err != nil {
 		return nil, err
 	}
-	arr := L("array", ps...)
-	p.emitSpanByTok(openTok, p.i-1)
-	return arr, nil
+	if nx, _, err := p.absorbOneTrailingPostAnnot(x, valStartTok); err != nil {
+		return nil, err
+	} else {
+		x = nx
+	}
+	var n S
+	switch t.Type {
+	case RETURN:
+		n = L("return", x)
+	case BREAK:
+		n = L("break", x)
+	default:
+		n = L("continue", x)
+	}
+	p.emitSpanByTok(startTok, p.lastSpanEndTok)
+	return n, nil
 }
 
 func (p *parser) ifExpr() (S, error) {
@@ -1145,47 +1419,6 @@ func (p *parser) ifExpr() (S, error) {
 	return L("if", append(arms, elseTail...)...), nil
 }
 
-func (p *parser) parseBlock(requireDo bool) (S, error) {
-	if requireDo {
-		if _, err := p.need(DO, "expected 'do'"); err != nil {
-			return nil, err
-		}
-	}
-	b, err := p.blockUntil(END)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-func (p *parser) blockUntil(stops ...TokenType) (S, error) {
-	stop := map[TokenType]bool{}
-	for _, s := range stops {
-		stop[s] = true
-	}
-	var items []any
-	startTok := p.i
-	consumedAny := false
-	for !p.atEnd() && !stop[p.peek().Type] {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, e)
-		consumedAny = true
-	}
-	node := L("block", items...)
-	if consumedAny {
-		p.emitSpanByTok(startTok, p.i-1)
-	} else {
-		p.emitSpanByTok(-1, -1)
-	}
-	return node, nil
-}
-
 func (p *parser) forExpr() (S, error) {
 	tgt, err := p.forTarget()
 	if err != nil {
@@ -1216,6 +1449,257 @@ func (p *parser) whileExpr() (S, error) {
 	}
 	return L("while", cond, body), nil
 }
+
+// ─────────────────────────── functions / oracle ───────────────────────────
+
+func (p *parser) optionalArrowType(defaultAny any, incMsg string) (any, error) {
+	if p.match(ARROW) {
+		arrowTok := p.prev()
+		if err := p.needExprAfter(arrowTok, incMsg); err != nil {
+			return nil, err
+		}
+		r, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	return defaultAny, nil
+}
+
+func (p *parser) funExpr(openTok int) (S, int, error) {
+	params, err := p.params()
+	if err != nil {
+		return nil, 0, err
+	}
+	ret, err := p.optionalArrowType(L("id", "Any"), "expected return type after '->'")
+	if err != nil {
+		return nil, 0, err
+	}
+	body, perr := p.parseBlock(true)
+	if perr != nil {
+		return nil, 0, perr
+	}
+	node := L("fun", params, ret, body)
+	return node, p.i - 1, nil
+}
+
+func (p *parser) oracleExpr(openTok int) (S, int, error) {
+	params, err := p.params()
+	if err != nil {
+		return nil, 0, err
+	}
+	out, err := p.optionalArrowType(L("id", "Any"), "expected output type after '->'")
+	if err != nil {
+		return nil, 0, err
+	}
+	var src any = L("array")
+	if p.match(FROM) {
+		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
+			return nil, 0, err
+		}
+		ex, err := p.expr(0)
+		if err != nil {
+			return nil, 0, err
+		}
+		src = ex
+	}
+	body := L("oracle", params, out, src) // will be wrapped with spans by caller
+	return body, p.i - 1, nil
+}
+
+// ─────────────────────── declaration patterns (let/for) ───────────────────
+
+type preAnn struct {
+	txt    string
+	tokIdx int
+}
+
+func (p *parser) takeOnePreAnnotation() (preAnn, bool, error) {
+	if p.atEnd() || p.peek().Type != ANNOTATION || !p.isPreAnnotationAt(p.i) {
+		return preAnn{}, false, nil
+	}
+	tok := p.peek()
+	p.i++
+	txt := ""
+	if s, ok := tok.Literal.(string); ok {
+		txt = s
+	}
+	return preAnn{txt: txt, tokIdx: p.i - 1}, true, nil
+}
+
+func (p *parser) declPattern() (S, error) {
+	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
+		return nil, err
+	} else if ok {
+		// Allow at most one POST to merge immediately after the pattern.
+		p.emitSpanByTok(ann.tokIdx, ann.tokIdx) // child ("str", pre)
+		sub, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		// Direct trailing POST for the same pattern
+		if nsub, _, err := p.absorbOneTrailingPostAnnot(sub, p.lastSpanStartTok); err != nil {
+			return nil, err
+		} else {
+			sub = nsub
+		}
+		node := L("annot", L("str", ann.txt), sub)
+		p.emitSpanByTok(ann.tokIdx, p.lastSpanEndTok)
+		return node, nil
+	}
+
+	if p.match(ID) {
+		idTok := p.i - 1
+		decl := L("decl", tokText(p.prev()))
+		p.emitSpanByTok(idTok, idTok)
+		return decl, nil
+	}
+	if p.match(LSQUARE, CLSQUARE) {
+		return p.arrayDeclPattern()
+	}
+	if p.match(LCURLY) {
+		return p.objectDeclPattern()
+	}
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		line, col := p.posAfterLastSpan()
+		return nil, &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
+	}
+	line, col := p.posAtByte(g.StartByte)
+	return nil, &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
+}
+
+// array pattern: [p1, p2,] with POST after comma (uses generic list).
+func (p *parser) arrayDeclPattern() (S, error) {
+	openTok := p.i - 1
+	p.skipNoops()
+	if p.match(RSQUARE) {
+		node := L("darr")
+		p.emitSpanByTok(openTok, p.i-1)
+		return node, nil
+	}
+
+	parts, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == RSQUARE },
+		func() (S, int, error) {
+			p.skipNoops()
+			start := p.i
+			pt, err := p.declPattern()
+			if err != nil {
+				return nil, 0, err
+			}
+			return pt, start, nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, perr := p.need(RSQUARE, "expected ']' in array pattern"); perr != nil {
+		return nil, perr
+	}
+	node := L("darr", parts...)
+	p.emitSpanByTok(openTok, p.i-1)
+	return node, nil
+}
+
+// object pattern: {k: p, ...} with POST-after-':'/',' on key/value.
+func (p *parser) objectDeclPattern() (S, error) {
+	openTok := p.i - 1
+	p.skipNoops()
+	if p.match(RCURLY) {
+		node := L("dobj")
+		p.emitSpanByTok(openTok, p.i-1)
+		return node, nil
+	}
+
+	isClose := func(tt TokenType) bool { return tt == RCURLY }
+	readKey := func() (S, int, bool, error) {
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		return k, p.lastSpanStartTok, false, nil
+	}
+	parseVal := func() (S, int, error) {
+		p.skipNoops()
+		ptStart := p.i
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, 0, err
+		}
+		return pt, ptStart, nil
+	}
+
+	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
+	if err != nil {
+		return nil, err
+	}
+
+	p.skipNoops()
+	if _, perr := p.need(RCURLY, "expected '}' in object pattern"); perr != nil {
+		return nil, perr
+	}
+	node := L("dobj", pairs...)
+	p.emitSpanByTok(openTok, p.i-1)
+	return node, nil
+}
+
+// readKeyString allows stacked PRE-annotations (handled recursively).
+func (p *parser) readKeyString() (S, error) {
+	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
+		return nil, err
+	} else if ok {
+		p.emitSpanByTok(ann.tokIdx, ann.tokIdx)
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		node := L("annot", L("str", ann.txt), k)
+		p.emitSpanByTok(ann.tokIdx, p.lastSpanEndTok)
+		return node, nil
+	}
+
+	if p.match(STRING) {
+		leaf := L("str", p.prev().Literal)
+		p.emitSpanByTok(p.i-1, p.i-1)
+		return leaf, nil
+	}
+
+	t := p.peek()
+	if isWordLike(t.Type) {
+		p.i++
+		name := t.Lexeme
+		if s, ok := t.Literal.(string); ok {
+			name = s
+		}
+		leaf := L("str", name)
+		p.emitSpanByTok(p.i-1, p.i-1)
+		return leaf, nil
+	}
+
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		line, col := p.posAfterLastSpan()
+		return nil, &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
+	}
+	line, col := p.posAtByte(g.StartByte)
+	return nil, &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
+}
+
+func isWordLike(tt TokenType) bool {
+	switch tt {
+	case ID, TYPE, ENUM, BOOLEAN, NULL,
+		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
+		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, MODULE, FOR, IN, FROM,
+		TYPECONS:
+		return true
+	}
+	return false
+}
+
+// ───────────────────────────── for-target helpers ─────────────────────────
 
 func (p *parser) forTarget() (S, error) {
 	if p.match(LET) {
@@ -1289,227 +1773,4 @@ func unwrapAnnots(n S) S {
 		cur = inner
 	}
 	return cur
-}
-
-// ----- Declaration patterns (with optional PRE-annotation wrapper) -----
-
-func (p *parser) takeOnePreAnnotation() (preAnn, bool, error) {
-	if p.atEnd() || p.peek().Type != ANNOTATION || !p.annotationIsPreAt(p.i) {
-		return preAnn{}, false, nil
-	}
-	tok := p.peek()
-	p.i++
-	txt := ""
-	if s, ok := tok.Literal.(string); ok {
-		txt = s
-	}
-	return preAnn{txt: txt, tokIdx: p.i - 1}, true, nil
-}
-
-type preAnn struct {
-	txt    string
-	tokIdx int
-}
-
-func (p *parser) declPattern() (S, error) {
-	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
-		return nil, err
-	} else if ok {
-		p.emitSpanByTok(ann.tokIdx, ann.tokIdx)
-		sub, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		node := L("annot", L("str", ann.txt), sub)
-		p.emitSpanByTok(ann.tokIdx, p.lastSpanEndTok)
-		return node, nil
-	}
-
-	if p.match(ID) {
-		idTok := p.i - 1
-		decl := L("decl", tokString(p.prev()))
-		p.emitSpanByTok(idTok, idTok)
-		return decl, nil
-	}
-	if p.match(LSQUARE, CLSQUARE) {
-		return p.arrayDeclPattern()
-	}
-	if p.match(LCURLY) {
-		return p.objectDeclPattern()
-	}
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		line, col := p.afterLastPos()
-		return nil, &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return nil, &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-}
-
-// --- array destructuring pattern: [p1, p2,] with POST after comma ---
-func (p *parser) arrayDeclPattern() (S, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RSQUARE) {
-		node := L("darr")
-		p.emitSpanByTok(openTok, p.i-1)
-		return node, nil
-	}
-	var parts []any
-	for {
-		p.skipNoops()
-		partStartTok := p.i
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		p.skipNoops()
-
-		if p.match(COMMA) {
-			p.skipNoops()
-			pt = p.absorbPostAnnotsToLeft(pt, partStartTok)
-			parts = append(parts, pt)
-			p.skipNoops()
-			if p.peek().Type == RSQUARE {
-				break
-			}
-			continue
-		}
-		parts = append(parts, pt)
-		break
-	}
-	p.skipNoops()
-	if _, err := p.need(RSQUARE, "expected ']' in array pattern"); err != nil {
-		return nil, err
-	}
-	node := L("darr", parts...)
-	p.emitSpanByTok(openTok, p.i-1)
-	return node, nil
-}
-
-// --- object destructuring pattern: {k: p, ...} with POST-after-':'/',' ---
-func (p *parser) objectDeclPattern() (S, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RCURLY) {
-		node := L("dobj")
-		p.emitSpanByTok(openTok, p.i-1)
-		return node, nil
-	}
-	var pairs []any
-	for {
-		p.skipNoops()
-		pairStartTok := p.i
-		key, err := p.readKeyString()
-		if err != nil {
-			return nil, err
-		}
-		keyStartTok := p.lastSpanStartTok
-
-		p.skipNoops()
-		if _, err := p.need(COLON, "expected ':' after key in object pattern"); err != nil {
-			return nil, err
-		}
-
-		// key POST(s) after ':'
-		p.skipNoops()
-		key = p.absorbPostAnnotsToLeft(key, keyStartTok)
-
-		p.skipNoops()
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-
-		p.skipNoops()
-		hadComma := p.match(COMMA)
-		if hadComma {
-			valStartTok := p.lastSpanStartTok
-			p.skipNoops()
-			pt = p.absorbPostAnnotsToLeft(pt, valStartTok)
-		}
-
-		pr := L("pair", key, pt)
-		endTok := p.lastSpanEndTok
-		p.emitSpanByTok(pairStartTok, endTok)
-		pairs = append(pairs, pr)
-
-		p.skipNoops()
-		if hadComma {
-			if p.peek().Type == RCURLY {
-				break
-			}
-			continue
-		}
-		break
-	}
-	p.skipNoops()
-	if _, err := p.need(RCURLY, "expected '}' in object pattern"); err != nil {
-		return nil, err
-	}
-	node := L("dobj", pairs...)
-	p.emitSpanByTok(openTok, p.i-1)
-	return node, nil
-}
-
-// readKeyString allows stacked PRE-annotations (handled recursively).
-func (p *parser) readKeyString() (S, error) {
-	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
-		return nil, err
-	} else if ok {
-		p.emitSpanByTok(ann.tokIdx, ann.tokIdx)
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, err
-		}
-		node := L("annot", L("str", ann.txt), k)
-		p.emitSpanByTok(ann.tokIdx, p.lastSpanEndTok)
-		return node, nil
-	}
-
-	if p.match(STRING) {
-		leaf := L("str", p.prev().Literal)
-		p.emitSpanByTok(p.i-1, p.i-1)
-		return leaf, nil
-	}
-
-	t := p.peek()
-	if isWordLike(t.Type) {
-		p.i++
-		name := t.Lexeme
-		if s, ok := t.Literal.(string); ok {
-			name = s
-		}
-		leaf := L("str", name)
-		p.emitSpanByTok(p.i-1, p.i-1)
-		return leaf, nil
-	}
-
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		line, col := p.afterLastPos()
-		return nil, &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return nil, &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
-}
-
-func isWordLike(tt TokenType) bool {
-	switch tt {
-	case ID, TYPE, ENUM, BOOLEAN, NULL,
-		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
-		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, MODULE, FOR, IN, FROM,
-		TYPECONS:
-		return true
-	}
-	return false
-}
-
-func (p *parser) keyRequired() (key S, required bool, err error) {
-	k, err := p.readKeyString()
-	if err != nil {
-		return nil, false, err
-	}
-	req := p.match(BANG)
-	return k, req, nil
 }

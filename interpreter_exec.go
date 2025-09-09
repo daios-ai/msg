@@ -393,7 +393,8 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
 		return 1, 1
 	}
-	// last mark with mark.PC <= pc
+
+	// Last mark with PC <= pc
 	i := -1
 	for j := range ch.Marks {
 		if ch.Marks[j].PC <= pc {
@@ -405,10 +406,22 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 	if i < 0 {
 		return 1, 1
 	}
-	// NEW: walk backwards until a known path is found
-	for k := i; k >= 0; k-- {
-		if span, ok := sr.Spans.Get(ch.Marks[k].Path); ok {
+
+	// 1) Use THIS mark’s path; if missing, climb its ancestors.
+	p := ch.Marks[i].Path
+	for cut := len(p); cut >= 0; cut-- {
+		if span, ok := sr.Spans.Get(p[:cut]); ok {
 			return offsetToLineCol(src, span.StartByte)
+		}
+	}
+
+	// 2) Then walk earlier marks; for each, try their ancestors too.
+	for k := i - 1; k >= 0; k-- {
+		q := ch.Marks[k].Path
+		for cut := len(q); cut >= 0; cut-- {
+			if span, ok := sr.Spans.Get(q[:cut]); ok {
+				return offsetToLineCol(src, span.StartByte)
+			}
 		}
 	}
 	return 1, 1
@@ -882,8 +895,9 @@ func (e *emitter) emitExpr(n S) {
 		return
 
 	case "fun":
-		// absolute path to the body child (index 2) of this ("fun", .., .., body)
-		absBase := append(append(NodePath(nil), e.path...), 2)
+		// Absolute path to the BODY inside the Type carrier:
+		// ("fun", params, ret, ("type", body)) → child 2 is the carrier, child 0 is the body
+		absBase := append(append(NodePath(nil), e.path...), 2, 0)
 		e.emitMakeFun(
 			n[1].(S),  // params
 			n[2].(S),  // ret (may be empty)
@@ -1073,7 +1087,9 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opLoadGlobal, e.ks("__make_module"))
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.emit(opConst, e.k(TypeVal(n[2].(S))))
-		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, **body**)
+		// Absolute path to the BODY inside the Type carrier:
+		// ("module", name, ("type", body)) → child 1 is the carrier, child 0 is the body
+		absBase := append(append(NodePath(nil), e.path...), 1, 0)
 		for _, idx := range absBase {
 			e.emit(opConst, e.k(Int(int64(idx))))
 		}

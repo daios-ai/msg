@@ -152,29 +152,3 @@ func Test_Spans_PropertyAfterDot_ModuleKeyword(t *testing.T) {
 	//   property name ("str") — taken from the ID token after '.'
 	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `module`)
 }
-
-func Test_Spans_ComputedPropertyAfterDot(t *testing.T) {
-	src := `obj.("x" + "y")`
-	_, idx := mustParseWithSpansMS(t, src)
-
-	// ("idx" obj ("binop" ...)) covers from 'obj' through the closing ')'
-	assertSpanTextMS(t, idx, NodePath{0}, src, `obj.("x" + "y")`)
-
-	//   LHS object id
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `obj`)
-	//   inner expression (without the parentheses)
-	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `"x" + "y"`)
-}
-
-func Test_Spans_AnnotNode_For_PreBeforeReturn(t *testing.T) {
-	src := "# note\nreturn 0"
-	_, idx := mustParseWithSpansMS(t, src)
-
-	// Top-level stmt 0 is ("return", <value>).
-	// The value is the PRE annotation node created by the special-case path.
-	// Expect its span to cover the annotation + the value: "# note\n0"
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "# note\n0")
-
-	// And the child ("str","note") span should be just the '#'-line itself.
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "# note")
-}

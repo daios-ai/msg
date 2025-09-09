@@ -938,12 +938,11 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	var sr *SourceRef
 	if ip.currentSrc != nil {
 		// Compose any existing PathBase with the module's absolute body path.
-		composed := append(append(NodePath(nil), ip.currentSrc.PathBase...), base...)
 		sr = &SourceRef{
 			Name:     ip.currentSrc.Name,
 			Src:      ip.currentSrc.Src,
 			Spans:    ip.currentSrc.Spans, // keep full index; marks are absolute
-			PathBase: composed,
+			PathBase: append(NodePath(nil), base...),
 		}
 	}
 

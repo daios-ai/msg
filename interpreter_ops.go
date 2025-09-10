@@ -288,9 +288,9 @@ func (o *opsImpl) initCore() {
 			// Clone current SourceRef and attach base path
 			var sr *SourceRef
 			if ip.currentSrc != nil {
-				// shallow copy – Spans pointer is shared intentionally
 				cpy := *ip.currentSrc
-				cpy.PathBase = base
+				// IMPORTANT: 'base' is ABSOLUTE - overwrite.
+				cpy.PathBase = append(NodePath(nil), base...)
 				sr = &cpy
 			}
 
@@ -590,30 +590,6 @@ func syncModuleEnv(obj Value, key string, val Value) {
 ////////////////////////////////////////////////////////////////////////////////
 //                     TINY EVALUATORS (used by assignment)
 ////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) evalSimple(n S, env *Env) Value {
-	switch n[0].(string) {
-	case "id":
-		v, err := env.Get(n[1].(string))
-		if err != nil {
-			fail(err.Error())
-		}
-		return v
-	case "str":
-		return Str(n[1].(string))
-	case "int":
-		return Int(n[1].(int64))
-	case "num":
-		return Num(n[1].(float64))
-	case "bool":
-		return Bool(n[1].(bool))
-	case "null":
-		return Null
-	default:
-		fail("unsupported simple eval")
-		return Null
-	}
-}
 
 // evalFull compiles and runs a single expression in env.
 // Annotated null is turned into a runtime failure (panic(rtErr)) to align with assignment.

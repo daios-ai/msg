@@ -22,6 +22,8 @@ package mindscript
 
 import (
 	"fmt"
+	"os"
+	"sort"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -385,16 +387,51 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 //                      SOURCE MAPPING (PC → (line, col))
 ////////////////////////////////////////////////////////////////////////////////
 
+// sourcePosFromChunk maps a VM PC to (line, col) using Chunk marks and SourceRef spans.
+// When MSG_DEBUG_POS is set, it prints exhaustive diagnostics to stderr, including:
+//   - PC, chosen mark, all tried NodePaths (with ancestor climbing), hits/misses
+//   - A full dump of the SpanIndex: every path key, span [start,end), and its exact source slice
+//   - For any path hit during lookup, its source slice and computed (line,col)
 func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
+	dbg := os.Getenv("MSG_DEBUG_POS") != ""
+
 	src := ""
 	if sr != nil {
 		src = sr.Src
 	}
+
+	if dbg {
+		fmt.Fprintf(os.Stderr, "\n[posmap] =====================\n")
+		fmt.Fprintf(os.Stderr, "[posmap] pc=%d\n", pc)
+		if sr != nil {
+			fmt.Fprintf(os.Stderr, "[posmap] SourceRef ptr=%p name=%q spans=%t pathBase=%s\n",
+				sr, sr.Name, sr.Spans != nil, dbgPath(sr.PathBase))
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] SourceRef=<nil>\n")
+		}
+		if ch != nil {
+			fmt.Fprintf(os.Stderr, "[posmap] Chunk: code=%d consts=%d marks=%d\n", len(ch.Code), len(ch.Consts), len(ch.Marks))
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] Chunk=<nil>\n")
+		}
+
+		// Full span tree dump (once per call)
+		if sr != nil && sr.Spans != nil {
+			dbgDumpAllSpans(sr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] NO SPANS to dump\n")
+		}
+	}
+
+	// Fallbacks when mapping isn't possible
 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[posmap] early fallback to (1,1)\n")
+		}
 		return 1, 1
 	}
 
-	// Last mark with PC <= pc
+	// Find the last mark with PC <= pc
 	i := -1
 	for j := range ch.Marks {
 		if ch.Marks[j].PC <= pc {
@@ -403,39 +440,187 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 			break
 		}
 	}
+
+	if dbg {
+		fmt.Fprintf(os.Stderr, "[posmap] bestMarkIndex=%d (total marks=%d)\n", i, len(ch.Marks))
+		if i >= 0 {
+			// Show a small window of marks around the chosen one
+			start := i - 3
+			if start < 0 {
+				start = 0
+			}
+			end := i + 3
+			if end >= len(ch.Marks) {
+				end = len(ch.Marks) - 1
+			}
+			for k := start; k <= end && k >= 0; k++ {
+				m := ch.Marks[k]
+				cur := ""
+				if k == i {
+					cur = "  <<"
+				}
+				fmt.Fprintf(os.Stderr, "[posmap]   mark[%d]: PC=%d path=%s%s\n", k, m.PC, dbgPath(m.Path), cur)
+			}
+		}
+	}
+
 	if i < 0 {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[posmap] no mark <= pc; fallback to (1,1)\n")
+		}
 		return 1, 1
 	}
 
-	// 1) Use THIS mark’s path; if missing, climb its ancestors.
-	p := ch.Marks[i].Path
-	for cut := len(p); cut >= 0; cut-- {
-		if span, ok := sr.Spans.Get(p[:cut]); ok {
-			return offsetToLineCol(src, span.StartByte)
+	// Helper to try a path + its ancestors; on hit, print the span + snippet.
+	tryPath := func(p NodePath, label string) (int, int, bool) {
+		for cut := len(p); cut >= 0; cut-- {
+			sub := p[:cut]
+			if sp, ok := sr.Spans.Get(sub); ok {
+				line, col := offsetToLineCol(src, sp.StartByte)
+				if dbg {
+					fmt.Fprintf(os.Stderr, "[posmap] HIT  %s path=%s  span=[%d,%d)  -> line=%d col=%d\n",
+						label, dbgPath(sub), sp.StartByte, sp.EndByte, line, col)
+					// print the exact source slice for this span
+					if sp.StartByte >= 0 && sp.EndByte <= len(src) && sp.StartByte <= sp.EndByte {
+						snippet := src[sp.StartByte:sp.EndByte]
+						fmt.Fprintf(os.Stderr, "[posmap] HIT  source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n",
+							sp.StartByte, sp.EndByte, snippet)
+					} else {
+						fmt.Fprintf(os.Stderr, "[posmap] HIT  source slice out of bounds!\n")
+					}
+				}
+				return line, col, true
+			}
+			if dbg {
+				fmt.Fprintf(os.Stderr, "[posmap] MISS %s path=%s\n", label, dbgPath(sub))
+			}
 		}
+		return 1, 1, false
+	}
+
+	// 1) Use THIS mark’s path (and its ancestors).
+	if line, col, ok := tryPath(ch.Marks[i].Path, "mark"); ok {
+		return line, col
 	}
 
 	// 2) Then walk earlier marks; for each, try their ancestors too.
 	for k := i - 1; k >= 0; k-- {
-		q := ch.Marks[k].Path
-		for cut := len(q); cut >= 0; cut-- {
-			if span, ok := sr.Spans.Get(q[:cut]); ok {
-				return offsetToLineCol(src, span.StartByte)
-			}
+		if line, col, ok := tryPath(ch.Marks[k].Path, fmt.Sprintf("earlier[%d]", k)); ok {
+			return line, col
 		}
+	}
+
+	if dbg {
+		fmt.Fprintf(os.Stderr, "[posmap] all lookups failed; fallback to (1,1)\n")
 	}
 	return 1, 1
 }
 
-func (ip *Interpreter) fallbackSrc(sr *SourceRef, ast S) string {
-	if sr != nil && sr.Src != "" {
-		return sr.Src
+// dbgPath renders a NodePath for logging.
+func dbgPath(p NodePath) string {
+	if len(p) == 0 {
+		return "<root>"
 	}
-	if ast != nil {
-		return FormatSExpr(ast)
+	out := make([]byte, 0, 32)
+	for i, x := range p {
+		if i > 0 {
+			out = append(out, '.')
+		}
+		out = append(out, []byte(fmt.Sprintf("%d", x))...)
 	}
-	return ""
+	return string(out)
 }
+
+// dbgDumpAllSpans prints every entry in the SpanIndex with its path key, span range, and exact source slice.
+func dbgDumpAllSpans(sr *SourceRef) {
+	fmt.Fprintf(os.Stderr, "[posmap] ---- SPAN TREE DUMP (name=%q) ----\n", sr.Name)
+	if sr.Spans == nil {
+		fmt.Fprintf(os.Stderr, "[posmap] (no spans)\n")
+		return
+	}
+	// Collect and sort keys for stable output
+	keys := make([]string, 0, len(sr.Spans.byPath))
+	for k := range sr.Spans.byPath {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		// Sort by depth then lexicographically so parents appear before children
+		di := 0
+		for c := 0; c < len(keys[i]); c++ {
+			if keys[i][c] == '.' {
+				di++
+			}
+		}
+		dj := 0
+		for c := 0; c < len(keys[j]); c++ {
+			if keys[j][c] == '.' {
+				dj++
+			}
+		}
+		if di != dj {
+			return di < dj
+		}
+		return keys[i] < keys[j]
+	})
+	// Dump
+	for _, k := range keys {
+		sp := sr.Spans.byPath[k]
+		pathStr := k
+		if pathStr == "" {
+			pathStr = "<root>"
+		}
+		fmt.Fprintf(os.Stderr, "[posmap] span path=%s  [start=%d end=%d)\n", pathStr, sp.StartByte, sp.EndByte)
+		if sp.StartByte >= 0 && sp.EndByte <= len(sr.Src) && sp.StartByte <= sp.EndByte {
+			snippet := sr.Src[sp.StartByte:sp.EndByte]
+			fmt.Fprintf(os.Stderr, "[posmap] source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n", sp.StartByte, sp.EndByte, snippet)
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] (invalid slice bounds for this span)\n")
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[posmap] ---- END SPAN TREE ----\n")
+}
+
+// func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
+// 	src := ""
+// 	if sr != nil {
+// 		src = sr.Src
+// 	}
+// 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
+// 		return 1, 1
+// 	}
+
+// 	// Last mark with PC <= pc
+// 	i := -1
+// 	for j := range ch.Marks {
+// 		if ch.Marks[j].PC <= pc {
+// 			i = j
+// 		} else {
+// 			break
+// 		}
+// 	}
+// 	if i < 0 {
+// 		return 1, 1
+// 	}
+
+// 	// 1) Use THIS mark’s path; if missing, climb its ancestors.
+// 	p := ch.Marks[i].Path
+// 	for cut := len(p); cut >= 0; cut-- {
+// 		if span, ok := sr.Spans.Get(p[:cut]); ok {
+// 			return offsetToLineCol(src, span.StartByte)
+// 		}
+// 	}
+
+// 	// 2) Then walk earlier marks; for each, try their ancestors too.
+// 	for k := i - 1; k >= 0; k-- {
+// 		q := ch.Marks[k].Path
+// 		for cut := len(q); cut >= 0; cut-- {
+// 			if span, ok := sr.Spans.Get(q[:cut]); ok {
+// 				return offsetToLineCol(src, span.StartByte)
+// 			}
+// 		}
+// 	}
+// 	return 1, 1
+// }
 
 func offsetToLineCol(src string, off int) (int, int) {
 	if off < 0 {
@@ -703,7 +888,12 @@ func (e *emitter) emitExpr(n S) {
 			if emitted > 0 {
 				e.emit(opPop, 0)
 			}
-			idx := i - 1 // preserve original child index for source marks
+
+			// IMPORTANT: use a COMPACT child index that counts only non-noop children.
+			// This keeps emitter mark paths aligned with the SpanIndex, which does not
+			// reserve child slots for noopish nodes.
+			idx := emitted
+
 			e.withChild(idx, func() { e.emitExpr(child) })
 			emitted++
 		}
@@ -883,21 +1073,35 @@ func (e *emitter) emitExpr(n S) {
 			return
 		}
 
-		// 2) Apply arguments one-by-one, marking each CALL at that argument’s path.
+		// 2) Apply arguments one-by-one.
 		for i := 2; i < len(n); i++ {
 			argIdx := i - 1
 			e.withChild(argIdx, func() {
-				e.emitExpr(n[i].(S)) // push arg i
-				e.mark()             // << mark tied to *this argument’s* NodePath
-				e.emit(opCall, 1)    // apply exactly one argument
+				// Emit the argument; its emitExpr places a precise mark at the arg node.
+				e.emitExpr(n[i].(S))
+
+				// *** Crucial fix ***
+				// Duplicate the *argument's* last mark at the current PC so that
+				// the mapping for errors raised by the upcoming CALL resolves to
+				// the argument’s span (not the callee or some enclosing node).
+				if lm := len(e.marks); lm > 0 {
+					last := e.marks[lm-1].Path
+					// store a copy of the path; PC will be the instruction index at this point
+					e.marks = append(e.marks, PCMark{
+						PC:   e.here(),
+						Path: append(NodePath(nil), last...),
+					})
+				}
+
+				// Apply exactly one argument.
+				e.emit(opCall, 1)
 			})
 		}
 		return
 
 	case "fun":
-		// Absolute path to the BODY inside the Type carrier:
-		// ("fun", params, ret, ("type", body)) → child 2 is the carrier, child 0 is the body
-		absBase := append(append(NodePath(nil), e.path...), 2, 0)
+		// ("fun", params, ret, body) → child 2 is the body
+		absBase := append(append(NodePath(nil), e.path...), 2)
 		e.emitMakeFun(
 			n[1].(S),  // params
 			n[2].(S),  // ret (may be empty)
@@ -1087,9 +1291,8 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opLoadGlobal, e.ks("__make_module"))
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.emit(opConst, e.k(TypeVal(n[2].(S))))
-		// Absolute path to the BODY inside the Type carrier:
-		// ("module", name, ("type", body)) → child 1 is the carrier, child 0 is the body
-		absBase := append(append(NodePath(nil), e.path...), 1, 0)
+		// Body is child #1 in ("module", name, body)
+		absBase := append(append(NodePath(nil), e.path...), 1)
 		for _, idx := range absBase {
 			e.emit(opConst, e.k(Int(int64(idx))))
 		}
@@ -1128,6 +1331,25 @@ func (e *emitter) emitExpr(n S) {
 			e.emit(opCall, 2)
 			e.emit(opCall, 2)
 			return
+		}
+
+		// LVALUE-AWARE: #(doc) subj  where subj ∈ {id, get, idx}
+		// Lower to: __assign_set(Type(subj), __annotate(doc, subj))
+		if len(subj) > 0 {
+			switch subj[0].(string) {
+			case "id", "get", "idx":
+				e.emit(opLoadGlobal, e.ks("__assign_set"))
+				e.emit(opConst, e.k(TypeVal(subj)))
+				// Build RHS: __annotate(doc, subj)
+				e.emit(opLoadGlobal, e.ks("__annotate"))
+				e.emit(opConst, e.k(Str(text)))
+				e.withChild(1, func() { e.emitExpr(subj) })
+				e.emit(opCall, 2)
+				// Attribute assignment errors (e.g., bad target/index) to the subject.
+				e.withChild(1, func() { e.mark() })
+				e.emit(opCall, 2)
+				return
+			}
 		}
 
 		// #(doc) (let x)  ==>  let x = #(doc) null

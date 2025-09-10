@@ -1232,25 +1232,12 @@ func Test_Interpreter_Annot_On_Reassign_Persists_On_Binding(t *testing.T) {
 	}
 }
 
-func Test_Interpreter_Annot_On_Expression_Does_NotMutate_Binding(t *testing.T) {
+func Test_Interpreter_Annot_On_LValue_Id_Persists(t *testing.T) {
 	ip := NewInterpreter()
-
-	mustEvalPersistent(t, ip, "let z = 5")
-
-	// annotated expression result should NOT change z in env
-	r := mustEvalPersistent(t, ip, "# temp note\nz")
-	if r.Tag != VTInt || r.Data.(int64) != 5 {
-		t.Fatalf("expected annotated expression to evaluate to 5, got %#v", r)
-	}
-	if got, want := r.Annot, "temp note"; got != want {
-		t.Fatalf("annotation not present on expression result: got %q want %q", got, want)
-	}
-
-	// z in env remains unannotated
-	v := mustEvalPersistent(t, ip, "z")
-	if v.Annot != "" {
-		t.Fatalf("binding was mutated by annotated expression (should not): got %q", v.Annot)
-	}
+	mustEvalPersistent(t, ip, `let a = "x"`)
+	mustEvalPersistent(t, ip, "# temp note\na")
+	got := mustEvalPersistent(t, ip, "a")
+	wantStrWithAnnot(t, got, "x", "temp note")
 }
 
 func Test_Interpreter_Identity_Preserves_Annotation(t *testing.T) {
@@ -1750,9 +1737,69 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 // 	wantErrContains(t, err, "at 1:7")
 // }
 
-// func Test_Interpreter_RuntimeErr_Map_Index_MissingKey_Shows_Index_Site(t *testing.T) {
-// 	err := evalSrcExpectError(t, `{a:1}["b"]`)
-// 	wantErrContains(t, err, `unknown key "b"`)
-// 	// "[..." starts at col 6 in `{a:1}["b"]` → 1:6
-// 	wantErrContains(t, err, "at 1:7")
-// }
+//	func Test_Interpreter_RuntimeErr_Map_Index_MissingKey_Shows_Index_Site(t *testing.T) {
+//		err := evalSrcExpectError(t, `{a:1}["b"]`)
+//		wantErrContains(t, err, `unknown key "b"`)
+//		// "[..." starts at col 6 in `{a:1}["b"]` → 1:6
+//		wantErrContains(t, err, "at 1:7")
+//	}
+func Test_Interpreter_Annot_LValue_Id_Persists(t *testing.T) {
+	ip := NewInterpreter()
+	// seed a
+	mustEvalPersistent(t, ip, "let a")
+	mustEvalPersistent(t, ip, "a = (8 + 5) * 4") // 52
+	// annotate the lvalue read
+	mustEvalPersistent(t, ip, "# note\na")
+	// verify it persisted on the binding
+	v := mustEvalPersistent(t, ip, "a")
+	if v.Tag != VTInt || v.Data.(int64) != 52 || v.Annot != "note" {
+		t.Fatalf("want a == 52 annotated 'note', got %#v", v)
+	}
+}
+
+func Test_Interpreter_Annot_LValue_Get_Persists_On_Map_Field(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, `let o = {"k": "v"}`)
+	// annotate property get
+	mustEvalPersistent(t, ip, "# key-doc\no.k")
+	// verify the map entry now carries the note
+	v := mustEvalPersistent(t, ip, "o.k")
+	wantStrWithAnnot(t, v, "v", "key-doc")
+}
+
+func Test_Interpreter_Annot_LValue_Idx_Persists_On_Array_Slot(t *testing.T) {
+	ip := NewInterpreter()
+	mustEvalPersistent(t, ip, "let xs = [10, 20]")
+	// annotate element at index 1
+	mustEvalPersistent(t, ip, "# hot\nxs[1]")
+	// verify it persisted
+	v := mustEvalPersistent(t, ip, "xs[1]")
+	if v.Tag != VTInt || v.Data.(int64) != 20 || v.Annot != "hot" {
+		t.Fatalf("want xs[1] == 20 annotated 'hot', got %#v", v)
+	}
+}
+
+func Test_Interpreter_Annot_NonLValue_Remains_Pure(t *testing.T) {
+	// Pre-annotation over a pure rvalue should just decorate the result.
+	v := evalSrc(t, "# temp\n(8 + 5)")
+	if v.Tag != VTInt || v.Data.(int64) != 13 || v.Annot != "temp" {
+		t.Fatalf("want 13 annotated 'temp', got %#v", v)
+	}
+}
+
+func Test_Interpreter_Annot_Decl_And_Assign_Still_Work(t *testing.T) {
+	ip := NewInterpreter()
+	// Annotated declaration → a = #(doc) null
+	mustEvalPersistent(t, ip, "# doc\nlet a")
+	va := mustEvalPersistent(t, ip, "a")
+	if va.Tag != VTNull || va.Annot != "doc" {
+		t.Fatalf("want a == null annotated 'doc', got %#v", va)
+	}
+
+	// Annotated assignment → a = #(note) 1
+	mustEvalPersistent(t, ip, "# note\na = 1")
+	va = mustEvalPersistent(t, ip, "a")
+	if va.Tag != VTInt || va.Data.(int64) != 1 || va.Annot != "note" {
+		t.Fatalf("want a == 1 annotated 'note', got %#v", va)
+	}
+}

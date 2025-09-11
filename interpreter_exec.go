@@ -892,20 +892,21 @@ func (e *emitter) emitExpr(n S) {
 			e.markChild(1)
 			jf := e.here()
 			e.emit(opJumpIfFalse, 0)
-			if op == "and" {
-				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
-			} else { // or
-				jend := e.here()
-				e.emit(opJump, 0)
-				lrhs := e.here()
-				e.patch(jf, lrhs)
-				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
-				lend := e.here()
-				e.patch(jend, lend)
-				return
+
+			// unified AND/OR short-circuit
+			pre := func() { e.withChild(2, func() { e.emitExpr(n[3].(S)) }) } // RHS
+			post := func() { e.emit(opConst, e.k(Bool(false))) }              // const false
+			if op == "or" {
+				pre, post = func() { e.emit(opConst, e.k(Bool(true))) }, pre // const true, then RHS
 			}
+			pre()
+			jend := e.here()
+			e.emit(opJump, 0)
+			lother := e.here()
+			e.patch(jf, lother)
+			post()
 			lend := e.here()
-			e.patch(jf, lend)
+			e.patch(jend, lend)
 			return
 		}
 		a, b := n[2].(S), n[3].(S)
@@ -1256,11 +1257,15 @@ func (e *emitter) emitExpr(n S) {
 			return
 		}
 
-		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx}
+		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx,decl}
 		if len(subj) > 0 {
 			switch subj[0].(string) {
-			case "id", "get", "idx":
-				e.emit(opLoadGlobal, e.ks("__assign_set"))
+			case "decl", "id", "get", "idx":
+				opName := "__assign_set"
+				if subj[0].(string) == "decl" {
+					opName = "__assign_def"
+				}
+				e.emit(opLoadGlobal, e.ks(opName))
 				e.emit(opConst, e.k(TypeVal(subj)))
 				e.emit(opLoadGlobal, e.ks("__annotate"))
 				e.emit(opConst, e.k(Str(text)))

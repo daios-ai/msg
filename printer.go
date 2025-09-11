@@ -116,6 +116,26 @@
 // ----------------------------
 //   - Indentation uses **tabs** only (gofmt-style).
 //   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
+//
+// Canonicalizations & Omissions (parser ↔ printer contract)
+// ---------------------------------------------------------
+// These are deliberate simplifications made by the parser and normalized by
+// the printer; users may not see certain syntactic sugar re-emitted:
+//   - Param types default to `Any` and are not printed (e.g., `fun(x)` not `x: Any`).
+//   - Function return type defaults to `Any` and is not printed (`fun(...) do ... end`
+//     without `-> Any`).
+//   - `oracle(...)` without `from` carries an empty default source; `from …` is omitted.
+//   - Bare `return` / `break` / `continue` carry an implicit `null` value and print
+//     as the bare keyword (no `null`).
+//   - Redundant parentheses are removed; only minimal parentheses are emitted.
+//   - Calls print with no space before '(' (canonical `f(x)` form).
+//   - Property indices written as `obj.(expr)` or `obj.12` are printed canonically
+//     as `obj[expr]` / `obj[12]`.
+//   - Trailing commas in arrays/maps/parameter lists are dropped in output.
+//   - Map keys that are identifier-like print without quotes; others are quoted.
+//   - **Expression maps** ignore the required marker `!` at runtime; the printer
+//     therefore **drops `!` in value maps** (e.g., `{ id!: 1 }` → `{ id: 1 }`).
+//     (Type maps still print required keys as `key!`.)
 package mindscript
 
 import (

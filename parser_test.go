@@ -1582,3 +1582,33 @@ func Test_Parser_Annot_TrailingPRE_WrapsNOOP(t *testing.T) {
 	}
 	wantTag(t, wrapped, "noop")
 }
+
+func Test_Parser_Return_Null_When_ImmediateEnd(t *testing.T) {
+	root := mustParse(t, `do return end`)
+	blk := first(root)
+	wantTag(t, blk, "block")
+	stmt := kid(blk, 0)
+	wantTag(t, stmt, "return")
+	val := kid(stmt, 0)
+	wantTag(t, val, "null")
+}
+
+func Test_Parser_Break_Null_When_ImmediateEnd(t *testing.T) {
+	root := mustParse(t, `do break end`)
+	blk := first(root)
+	wantTag(t, blk, "block")
+	stmt := kid(blk, 0)
+	wantTag(t, stmt, "break")
+	val := kid(stmt, 0)
+	wantTag(t, val, "null")
+}
+
+func Test_Parser_Continue_Null_When_ImmediateEnd(t *testing.T) {
+	root := mustParse(t, `do continue end`)
+	blk := first(root)
+	wantTag(t, blk, "block")
+	stmt := kid(blk, 0)
+	wantTag(t, stmt, "continue")
+	val := kid(stmt, 0)
+	wantTag(t, val, "null")
+}

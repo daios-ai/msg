@@ -1274,19 +1274,28 @@ func (p *parser) parseKVPairs(
 // ───────────────────────── control / loops / if ───────────────────────────
 
 func (p *parser) parseControl(t Token, startTok int) (S, error) {
-	if !p.nextTokenIsOnSameLine(t) {
-		var n S
-		switch t.Type {
-		case RETURN:
-			n = p.mk("return", startTok, startTok, p.mkLeaf("null", -1))
-		case BREAK:
-			n = p.mk("break", startTok, startTok, p.mkLeaf("null", -1))
-		default:
-			n = p.mk("continue", startTok, startTok, p.mkLeaf("null", -1))
-		}
-		return n, nil
+	// tag: "return" | "break" | "continue"
+	tag := "return"
+	switch t.Type {
+	case BREAK:
+		tag = "break"
+	case CONTINUE:
+		tag = "continue"
 	}
-	// same line: parse value + absorb POST on the value
+
+	// Newline after the control word → no value (Null).
+	if !p.nextTokenIsOnSameLine(t) {
+		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
+	}
+
+	p.skipNoops()
+	// Same line but next token can't start a value → also Null.
+	switch p.peek().Type {
+	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
+		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
+	}
+
+	// Parse value and absorb a single trailing POST annotation.
 	valStartTok := p.i
 	x, err := p.expr(0)
 	if err != nil {
@@ -1297,14 +1306,7 @@ func (p *parser) parseControl(t Token, startTok int) (S, error) {
 	} else {
 		x = nx
 	}
-	switch t.Type {
-	case RETURN:
-		return p.mk("return", startTok, p.lastSpanEndTok, x), nil
-	case BREAK:
-		return p.mk("break", startTok, p.lastSpanEndTok, x), nil
-	default:
-		return p.mk("continue", startTok, p.lastSpanEndTok, x), nil
-	}
+	return p.mk(tag, startTok, p.lastSpanEndTok, x), nil
 }
 
 func (p *parser) ifExpr() (S, error) {

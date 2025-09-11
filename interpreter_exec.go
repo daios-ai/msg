@@ -1,23 +1,66 @@
 // interpreter_exec.go — PRIVATE: execution & call engine for MindScript.
-// - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
-//   runs on the VM, and **bubbles unified hard errors (*Error) without formatting**.
-// - Implements function application, currying, and native-call scoping.
-// - No exported identifiers here. The public facade lives in interpreter.go.
+//   - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
+//     runs on the VM, and **bubbles unified hard errors (*Error) without formatting**.
+//   - Implements function application, currying, and native-call scoping.
+//   - No exported identifiers here. The public facade lives in interpreter.go.
 //
-// Error policy (post-refactor):
-//   • Soft errors → annotated-null Values (never returned as Go errors).
-//   • Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; no pretty printing here.
-//     Pretty printing happens only at the public API surface (see interpreter.go / errors.go).
+// ──────────────────────────────────────────────────────────────────────────────
+// MARKING PLAN (PRECISE CARETS)
+// =============================
 //
-// Concurrency & isolates (minimal, Lua-style):
-//   • A single Interpreter instance is **not** re-entrant. For parallelism,
-//     call (*Interpreter).Clone() and run the clone in another goroutine.
-//   • This file keeps per-interpreter mutable state (e.g., currentSrc) confined
-//     to the instance. Using clones ensures there are no data races.
+// We make runtime caret locations precise and predictable by aligning VM marks
+// with parser spans.
 //
-// Emitter placement:
-//   The emitter is defined here and obtained via newEmitter(ip, sr).
-
+// Invariants
+// ----------
+//  1. **1:1 Node ↔ Span (parser)** — the parser records exactly one Span per AST
+//     node (every subexpression has a node and a span).
+//  2. **1:1 Node ↔ Mark (emitter)** — the emitter records **exactly one** PCMark
+//     for every AST node it emits code for. (Nodes that truly produce no code do
+//     not get a mark unless they are direct failure targets.)
+//  3. **Monotonic marks** — marks are appended in bytecode order with PC=here().
+//  4. **No late parent marks** — once we place a child’s mark immediately before
+//     a failure-prone instruction, we must not emit a parent/sibling mark before
+//     that instruction executes.
+//  5. **Correct PathBase** — chunks compiled for function bodies / module bodies
+//     carry a SourceRef whose PathBase points at the body’s absolute AST path,
+//     so marks inside map to the right spans.
+//
+// Placement Rules (authoritative)
+// -------------------------------
+//   - **Identifiers**: mark the identifier node **right before** opLoadGlobal.
+//   - **Unary** (-, not): mark the operand **right before** the opcode.
+//   - **Binary** (-,*,/,%, <,<=,>,>=, ==, !=): emit LHS, then RHS; mark the **RHS**
+//     **right before** the arithmetic/compare opcode (or before the builtin CALL
+//     for '+', which lowers to __plus).
+//   - **Calls**: evaluate callee (no mark). For each argument:
+//     1) emit arg code
+//     2) mark the **arg node** **right before** `opCall 1`
+//     3) emit `opCall 1`
+//     For zero-arg call: mark the **callee** right before `opCall 0`.
+//   - **Property** (`obj.name`): emit obj, mark the **property token** right before
+//     `opGetProp`.
+//   - **Index** (`obj[idx]`): emit obj then idx; mark the **idx node** right before
+//     `opGetIdx`.
+//   - **if / while gates**: mark the **tested condition node** right before
+//     `opJumpIfFalse`.
+//   - **Blocks**: never emit a parent mark between a child’s mark and its failing
+//     instruction. No extra block-level mark is needed. **Important:** child
+//     paths must use the **original AST child index** (do not compact after
+//     skipping noopish children), to keep NodePath ↔ Span alignment.
+//   - **Annotations**: attribute errors to the **subject** node (not the wrapper).
+//     For `#(doc) (lhs = rhs)`, we mark the **LHS** before the assignment call.
+//   - **for**: the iterator expression is marked once at the `__to_iter(iterExpr)`
+//     call site. We do not duplicate a mark at the loop head.
+//
+// NOTE: These rules ensure that the VM’s “last mark with PC ≤ failingPC” picks
+// the blameworthy child.
+//
+// Error policy (unchanged)
+// ------------------------
+//   - Soft errors → annotated-null Values.
+//   - Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; formatting only
+//     at the public API surface.
 package mindscript
 
 import (
@@ -40,13 +83,13 @@ func newExec(ip *Interpreter) execCore { return &execImpl{ip: ip} }
 func (x *execImpl) evalSource(src string, env *Env) (Value, error) {
 	ast, spans, err := ParseSExprWithSpans(src)
 	if err != nil {
-		// Attach SourceRef if missing; do not format.
 		if e, ok := err.(*Error); ok && e.Src == nil {
 			e.Src = &SourceRef{Name: "<main>", Src: src, Spans: spans}
 		}
 		return Value{}, err
 	}
-	return x.ip.runTopWithSource(ast, env, false, &SourceRef{Name: "<main>", Src: src, Spans: spans})
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	return x.ip.runTopWithSource(ast, env, false, sr)
 }
 
 // evalAST evaluates an AST in the provided env.
@@ -70,83 +113,56 @@ func (x *execImpl) funMeta(fn Value) (Callable, bool) {
 //                      CORE EXECUTION PLUMBING (PRIVATE)
 ////////////////////////////////////////////////////////////////////////////////
 
-// runTopWithSource compiles+executes AST with error surfacing.
-// If uncaught is true, runtime failures become annotated-null Values.
-// Otherwise, hard failures bubble as *Error (no formatting).
 func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
+
+	// DEBUG: Quick global sanity check (preview first 10 post-order bindings)
+	_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
+
 	defer func() {
 		if r := recover(); r != nil {
 			switch sig := r.(type) {
 			case returnSig:
 				out, err = sig.v, nil
 			case *Error:
-				// Preserve the exact diagnostic kind & attach a SourceRef if missing.
 				if uncaught {
-					out, err = annotNull(sig.Msg), nil // SOFT path still honored
+					out, err = annotNull(sig.Msg), nil
 					return
 				}
 				if sig.Src == nil {
 					sig.Src = sr
 				}
-				out = Value{} // no value on hard error
-				err = sig     // bubble as-is (Lex/Parse/Runtime/Incomplete)
-				return
-
+				err = sig
+				out = Value{}
 			case rtErr:
-				// rtErr carries msg and optional precise (src, line, col).
-				// If position is missing, map PC → (line, col) using current chunk/source.
 				srcRef := sig.src
 				if srcRef == nil {
 					srcRef = sr
 				}
 				line, col := sig.line, sig.col
 				if line <= 0 || col <= 0 {
-					// Best-effort mapping from current ip.currentSrc.
 					line, col = ip.sourcePosFromChunk(nil, srcRef, 0)
 				}
 				if uncaught {
-					out, err = errNull(sig.msg), nil // SOFT: annotated-null flows out
+					out, err = errNull(sig.msg), nil
 					return
 				}
-				err = &Error{
-					Kind: DiagRuntime,
-					Msg:  sig.msg,
-					Src:  srcRef,
-					Line: line,
-					Col:  col,
-				}
+				err = &Error{Kind: DiagRuntime, Msg: sig.msg, Src: srcRef, Line: line, Col: col}
 				out = Value{}
-
 			case error:
-				// Unknown panic error → treat as runtime hard error.
 				if uncaught {
-					out, err = annotNull(sig.Error()), nil // SOFT
+					out, err = annotNull(sig.Error()), nil
 					return
 				}
 				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = &Error{
-					Kind: DiagRuntime,
-					Msg:  sig.Error(),
-					Src:  sr,
-					Line: line,
-					Col:  col,
-				}
+				err = &Error{Kind: DiagRuntime, Msg: sig.Error(), Src: sr, Line: line, Col: col}
 				out = Value{}
-
 			default:
-				// Non-error panic payload.
 				if uncaught {
-					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil // SOFT
+					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil
 					return
 				}
 				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = &Error{
-					Kind: DiagRuntime,
-					Msg:  fmt.Sprintf("runtime panic: %v", r),
-					Src:  sr,
-					Line: line,
-					Col:  col,
-				}
+				err = &Error{Kind: DiagRuntime, Msg: fmt.Sprintf("runtime panic: %v", r), Src: sr, Line: line, Col: col}
 				out = Value{}
 			}
 		}
@@ -161,57 +177,37 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 	switch res.status {
 	case vmOK, vmReturn:
 		return res.value, nil
-
 	case vmRuntimeError:
-		// Value contains the message in Annot. Hard error unless uncaught.
 		if uncaught {
-			return res.value, nil // SOFT: annotated-null flows out
+			return res.value, nil
 		}
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
 		msg := res.value.Annot
 		if msg == "" {
 			msg = "runtime error"
 		}
-		return Value{}, &Error{
-			Kind: DiagRuntime,
-			Msg:  msg,
-			Src:  ch.Src,
-			Line: line,
-			Col:  col,
-		}
-
+		return Value{}, &Error{Kind: DiagRuntime, Msg: msg, Src: ch.Src, Line: line, Col: col}
 	default:
 		if uncaught {
-			return errNull("unknown VM status"), nil // SOFT
+			return errNull("unknown VM status"), nil
 		}
 		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		return Value{}, &Error{
-			Kind: DiagRuntime,
-			Msg:  "unknown VM status",
-			Src:  ch.Src,
-			Line: line,
-			Col:  col,
-		}
+		return Value{}, &Error{Kind: DiagRuntime, Msg: "unknown VM status", Src: ch.Src, Line: line, Col: col}
 	}
 }
 
 // Build a one-off top-level function body and ensure it is compiled.
 func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
-	f := &Fun{
-		ReturnType: S{"id", "Any"},
-		Body:       ast,
-		Src:        sr,
-	}
+	f := &Fun{ReturnType: S{"id", "Any"}, Body: ast, Src: sr}
 	ip.ensureChunkWithSource(f, sr)
 	return f.Chunk
 }
 
 func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
-	// Native functions and oracles are not JIT-compiled here.
 	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
 		return
 	}
-	em := newEmitter(ip, sr) // private emitter
+	em := newEmitter(ip, sr)
 	em.emitFunBody(f.Body)
 	ch := em.chunk()
 	ch.Src = sr
@@ -228,7 +224,6 @@ func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Va
 	}
 	f := fn.Data.(*Fun)
 
-	// Zero-arg application.
 	if len(args) == 0 {
 		switch len(f.Params) {
 		case 0:
@@ -246,7 +241,6 @@ func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Va
 	cur := fn
 	for i := 0; i < len(args); i++ {
 		cur = ip.applyOneScoped(cur, args[i], callSite)
-		// If more args left but the intermediate result isn't a function → too many args.
 		if i < len(args)-1 && cur.Tag != VTFun {
 			fail("too many arguments")
 		}
@@ -260,7 +254,6 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 	}
 	f := fnVal.Data.(*Fun)
 
-	// Already saturated → execute, then keep applying to the result (currying chains).
 	if len(f.Params) == 0 {
 		res := ip.execFunBodyScoped(fnVal, callSite)
 		if res.Tag != VTFun {
@@ -269,17 +262,13 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		return ip.applyOneScoped(res, arg, callSite)
 	}
 
-	// Type check against the next parameter.
 	paramName := f.Params[0]
 	paramType := f.ParamTypes[0]
 	if !ip.isType(arg, paramType, f.Env) {
 		fail(fmt.Sprintf("type mismatch in parameter '%s'", paramName))
 	}
 
-	// Bind argument into a fresh call env.
 	parent := f.Env
-	// For natives, if we're being called from a site with a concrete scope, prefer that
-	// as the parent for argument bindings when the closure env is nil or Core.
 	if f.NativeName != "" && callSite != nil {
 		if f.Env == nil || f.Env == ip.Core {
 			parent = callSite
@@ -288,7 +277,6 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 	callEnv := NewEnv(parent)
 	callEnv.Define(paramName, arg)
 
-	// More params left → return partially-applied closure.
 	if len(f.Params) > 1 {
 		return FunVal(&Fun{
 			Params:     append([]string{}, f.Params[1:]...),
@@ -305,7 +293,6 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		})
 	}
 
-	// Last arg supplied → execute.
 	execFun := &Fun{
 		Params:     nil,
 		ParamTypes: append([]S(nil), f.ParamTypes...),
@@ -320,7 +307,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		Src:        f.Src,
 	}
 	execVal := FunVal(execFun)
-	execVal.Annot = fnVal.Annot // keep doc
+	execVal.Annot = fnVal.Annot
 	return ip.execFunBodyScoped(execVal, callSite)
 }
 
@@ -330,13 +317,12 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 	}
 	f := funVal.Data.(*Fun)
 
-	// Native fast path
 	if f.NativeName != "" {
 		impl, ok := ip.native[f.NativeName]
 		if !ok {
 			fail(fmt.Sprintf("unknown native %q", f.NativeName))
 		}
-		scope := withScope(f.Env, callSite) // where side effects land
+		scope := withScope(f.Env, callSite)
 		prev := ip.currentSrc
 		if f.Src != nil {
 			ip.currentSrc = f.Src
@@ -349,14 +335,12 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 		return res
 	}
 
-	// Oracles are handled elsewhere (private oracle impl lives in ops or a separate file).
 	if f.IsOracle {
-		scope := withScope(f.Env, callSite)          // where effects should land
-		ctx := &callCtx{argEnv: f.Env, scope: scope} // access to bound args + scope
+		scope := withScope(f.Env, callSite)
+		ctx := &callCtx{argEnv: f.Env, scope: scope}
 		return ip.execOracle(funVal, ctx)
 	}
 
-	// User-defined function
 	ip.ensureChunkWithSource(f, f.Src)
 	prev := ip.currentSrc
 	if f.Src != nil {
@@ -368,13 +352,11 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 	switch res.status {
 	case vmOK, vmReturn:
 		if !ip.isType(res.value, f.ReturnType, f.Env) {
-			// Map the mismatch to the return expression location.
 			line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
 			panicRt("return type mismatch", f.Src, line, col)
 		}
 		return res.value
 	case vmRuntimeError:
-		// Map PC→(line,col) against the callee's own chunk/source and bubble up
 		line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
 		panicRt(res.value.Annot, f.Src, line, col)
 		return errNull("unreachable")
@@ -387,11 +369,6 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 //                      SOURCE MAPPING (PC → (line, col))
 ////////////////////////////////////////////////////////////////////////////////
 
-// sourcePosFromChunk maps a VM PC to (line, col) using Chunk marks and SourceRef spans.
-// When MSG_DEBUG_POS is set, it prints exhaustive diagnostics to stderr, including:
-//   - PC, chosen mark, all tried NodePaths (with ancestor climbing), hits/misses
-//   - A full dump of the SpanIndex: every path key, span [start,end), and its exact source slice
-//   - For any path hit during lookup, its source slice and computed (line,col)
 func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
 	dbg := os.Getenv("MSG_DEBUG_POS") != ""
 
@@ -415,7 +392,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 			fmt.Fprintf(os.Stderr, "[posmap] Chunk=<nil>\n")
 		}
 
-		// Full span tree dump (once per call)
 		if sr != nil && sr.Spans != nil {
 			dbgDumpAllSpans(sr)
 		} else {
@@ -423,7 +399,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 		}
 	}
 
-	// Fallbacks when mapping isn't possible
 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
 		if dbg {
 			fmt.Fprintf(os.Stderr, "[posmap] early fallback to (1,1)\n")
@@ -431,7 +406,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 		return 1, 1
 	}
 
-	// Find the last mark with PC <= pc
 	i := -1
 	for j := range ch.Marks {
 		if ch.Marks[j].PC <= pc {
@@ -444,7 +418,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 	if dbg {
 		fmt.Fprintf(os.Stderr, "[posmap] bestMarkIndex=%d (total marks=%d)\n", i, len(ch.Marks))
 		if i >= 0 {
-			// Show a small window of marks around the chosen one
 			start := i - 3
 			if start < 0 {
 				start = 0
@@ -471,7 +444,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 		return 1, 1
 	}
 
-	// Helper to try a path + its ancestors; on hit, print the span + snippet.
 	tryPath := func(p NodePath, label string) (int, int, bool) {
 		for cut := len(p); cut >= 0; cut-- {
 			sub := p[:cut]
@@ -480,7 +452,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 				if dbg {
 					fmt.Fprintf(os.Stderr, "[posmap] HIT  %s path=%s  span=[%d,%d)  -> line=%d col=%d\n",
 						label, dbgPath(sub), sp.StartByte, sp.EndByte, line, col)
-					// print the exact source slice for this span
 					if sp.StartByte >= 0 && sp.EndByte <= len(src) && sp.StartByte <= sp.EndByte {
 						snippet := src[sp.StartByte:sp.EndByte]
 						fmt.Fprintf(os.Stderr, "[posmap] HIT  source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n",
@@ -498,12 +469,10 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 		return 1, 1, false
 	}
 
-	// 1) Use THIS mark’s path (and its ancestors).
 	if line, col, ok := tryPath(ch.Marks[i].Path, "mark"); ok {
 		return line, col
 	}
 
-	// 2) Then walk earlier marks; for each, try their ancestors too.
 	for k := i - 1; k >= 0; k-- {
 		if line, col, ok := tryPath(ch.Marks[k].Path, fmt.Sprintf("earlier[%d]", k)); ok {
 			return line, col
@@ -516,7 +485,6 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 	return 1, 1
 }
 
-// dbgPath renders a NodePath for logging.
 func dbgPath(p NodePath) string {
 	if len(p) == 0 {
 		return "<root>"
@@ -531,27 +499,23 @@ func dbgPath(p NodePath) string {
 	return string(out)
 }
 
-// dbgDumpAllSpans prints every entry in the SpanIndex with its path key, span range, and exact source slice.
 func dbgDumpAllSpans(sr *SourceRef) {
 	fmt.Fprintf(os.Stderr, "[posmap] ---- SPAN TREE DUMP (name=%q) ----\n", sr.Name)
 	if sr.Spans == nil {
 		fmt.Fprintf(os.Stderr, "[posmap] (no spans)\n")
 		return
 	}
-	// Collect and sort keys for stable output
 	keys := make([]string, 0, len(sr.Spans.byPath))
 	for k := range sr.Spans.byPath {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		// Sort by depth then lexicographically so parents appear before children
-		di := 0
+		di, dj := 0, 0
 		for c := 0; c < len(keys[i]); c++ {
 			if keys[i][c] == '.' {
 				di++
 			}
 		}
-		dj := 0
 		for c := 0; c < len(keys[j]); c++ {
 			if keys[j][c] == '.' {
 				dj++
@@ -562,7 +526,6 @@ func dbgDumpAllSpans(sr *SourceRef) {
 		}
 		return keys[i] < keys[j]
 	})
-	// Dump
 	for _, k := range keys {
 		sp := sr.Spans.byPath[k]
 		pathStr := k
@@ -580,47 +543,14 @@ func dbgDumpAllSpans(sr *SourceRef) {
 	fmt.Fprintf(os.Stderr, "[posmap] ---- END SPAN TREE ----\n")
 }
 
-// func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
-// 	src := ""
-// 	if sr != nil {
-// 		src = sr.Src
-// 	}
-// 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
-// 		return 1, 1
-// 	}
-
-// 	// Last mark with PC <= pc
-// 	i := -1
-// 	for j := range ch.Marks {
-// 		if ch.Marks[j].PC <= pc {
-// 			i = j
-// 		} else {
-// 			break
-// 		}
-// 	}
-// 	if i < 0 {
-// 		return 1, 1
-// 	}
-
-// 	// 1) Use THIS mark’s path; if missing, climb its ancestors.
-// 	p := ch.Marks[i].Path
-// 	for cut := len(p); cut >= 0; cut-- {
-// 		if span, ok := sr.Spans.Get(p[:cut]); ok {
-// 			return offsetToLineCol(src, span.StartByte)
-// 		}
-// 	}
-
-// 	// 2) Then walk earlier marks; for each, try their ancestors too.
-// 	for k := i - 1; k >= 0; k-- {
-// 		q := ch.Marks[k].Path
-// 		for cut := len(q); cut >= 0; cut-- {
-// 			if span, ok := sr.Spans.Get(q[:cut]); ok {
-// 				return offsetToLineCol(src, span.StartByte)
-// 			}
-// 		}
-// 	}
-// 	return 1, 1
-// }
+// withScope returns override if non-nil (use the call-site env for effects),
+// otherwise it returns parent (the function's closure env).
+func withScope(parent, override *Env) *Env {
+	if override != nil {
+		return override
+	}
+	return parent
+}
 
 func offsetToLineCol(src string, off int) (int, int) {
 	if off < 0 {
@@ -663,8 +593,8 @@ func (c *funCallable) Doc() string      { return c.doc }
 func (c *funCallable) ClosureEnv() *Env { return c.f.Env }
 
 type callCtx struct {
-	argEnv *Env // holds bound arguments
-	scope  *Env // where side effects should land (program/call-site env)
+	argEnv *Env
+	scope  *Env
 }
 
 func (c *callCtx) Arg(name string) (Value, bool) { v, err := c.argEnv.Get(name); return v, err == nil }
@@ -678,17 +608,6 @@ func (c *callCtx) MustArg(name string) Value {
 func (c *callCtx) Env() *Env { return c.scope }
 
 ////////////////////////////////////////////////////////////////////////////////
-//                                 HELPERS
-////////////////////////////////////////////////////////////////////////////////
-
-func withScope(parent, override *Env) *Env {
-	if override != nil {
-		return override
-	}
-	return parent
-}
-
-////////////////////////////////////////////////////////////////////////////////
 //                             EMITTER (AST → BYTECODE)
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -696,7 +615,7 @@ type emitter struct {
 	ip        *Interpreter
 	code      []uint32
 	consts    []Value
-	ctrlStack []ctrlCtx // generic block/loop control stack
+	ctrlStack []ctrlCtx
 
 	// Source mapping
 	src   *SourceRef
@@ -713,11 +632,39 @@ type ctrlCtx struct {
 func newEmitter(ip *Interpreter, src *SourceRef) *emitter {
 	e := &emitter{ip: ip, src: src}
 	if src != nil && len(src.PathBase) > 0 {
-		// Start marks at the absolute path of this sub-tree
 		e.path = append(e.path, src.PathBase...)
 	}
 	return e
 }
+
+// ---------------------- mark helpers (centralized) ---------------------------
+
+// Emit a mark for an absolute AST path immediately before a failure-prone opcode.
+// NOTE: Marks MUST be appended immediately before the instruction that can fail
+// because of that path. Do NOT emit any other mark until that instruction.
+func (e *emitter) markHereFor(abs NodePath) {
+	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), abs...)})
+}
+
+// Mark the current node (rare; for node-level blame).
+func (e *emitter) markSelf() { e.markHereFor(append(NodePath(nil), e.path...)) }
+
+// Mark a direct child index under the current node.
+func (e *emitter) markChild(childIdx int) {
+	e.markHereFor(append(append(NodePath(nil), e.path...), childIdx))
+}
+
+// Wrappers that enforce "mark immediately before opcode" ordering.
+func (e *emitter) emitWithMarkChild(op opcode, childIdx int, imm uint32) {
+	e.markChild(childIdx)
+	e.emit(op, imm)
+}
+func (e *emitter) callWithMarkChild(argc int, childIdx int) {
+	e.markChild(childIdx)
+	e.emit(opCall, uint32(argc))
+}
+
+// ----------------------------------------------------------------------------
 
 func (e *emitter) k(v Value) uint32 {
 	for i := range e.consts {
@@ -791,14 +738,14 @@ func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
 	e.emit(opPop, 0)
 }
 
-func (e *emitter) mark() {
-	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), e.path...)})
-}
+// Child path scaffolding
 func (e *emitter) withChild(childIdx int, f func()) {
 	e.path = append(e.path, childIdx)
 	f()
 	e.path = e.path[:len(e.path)-1]
 }
+
+// Builtin call (no automatic marks; callers place marks per plan).
 func (e *emitter) callBuiltin(name string, args ...S) {
 	e.emit(opLoadGlobal, e.ks(name))
 	for _, a := range args {
@@ -835,7 +782,6 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 	e.emit(opConst, e.k(TypeVal(bodyCarrier)))
 	e.emit(opConst, e.k(Bool(isOracle)))
 	e.emitExpr(examples)
-	// basePath: [Int]
 	for _, idx := range basePath {
 		e.emit(opConst, e.k(Int(int64(idx))))
 	}
@@ -843,20 +789,21 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 	e.emit(opCall, 7)
 }
 
-// Entry: emit whole function body and return.
 func (e *emitter) emitFunBody(body S) {
 	e.emitExpr(body)
 	e.emit(opReturn, 0)
 }
 
-// Emit an expression node.
+// Emit an expression node following the precise mark rules.
 func (e *emitter) emitExpr(n S) {
-	e.mark() // record PC → current AST node
 	if len(n) == 0 {
 		e.emit(opConst, e.k(Null))
 		return
 	}
+
 	switch n[0].(string) {
+
+	// ----- literals / ids -----
 	case "int":
 		e.emit(opConst, e.k(Int(n[1].(int64))))
 	case "num":
@@ -871,36 +818,32 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(Null))
 
 	case "id":
+		// Identifier load can fail → mark the id right before opLoadGlobal.
+		e.markSelf()
 		e.emit(opLoadGlobal, e.ks(n[1].(string)))
 
+	// ----- blocks -----
 	case "block":
+		// IMPORTANT: Use ORIGINAL child indices for NodePath; do not compact
+		// after skipping noopish nodes. Keep a separate 'emitted' counter only
+		// to decide when to pop.
 		e.pushBlockCtx()
-
-		// Skip noopish children entirely. Leave the last non-noop value on the stack;
-		// if all children are noopish, push plain Null. Guarantees callers always get a value.
 		emitted := 0
-		nAll := len(n) - 1
-		for i := 1; i <= nAll; i++ {
-			child := n[i].(S)
+		for j := 1; j < len(n); j++ {
+			child := n[j].(S)
 			if isNoopish(child) {
 				continue
 			}
 			if emitted > 0 {
 				e.emit(opPop, 0)
 			}
-
-			// IMPORTANT: use a COMPACT child index that counts only non-noop children.
-			// This keeps emitter mark paths aligned with the SpanIndex, which does not
-			// reserve child slots for noopish nodes.
-			idx := emitted
-
-			e.withChild(idx, func() { e.emitExpr(child) })
+			origIdx := j - 1 // original AST child index
+			e.withChild(origIdx, func() { e.emitExpr(child) })
 			emitted++
 		}
 		if emitted == 0 {
 			e.emit(opConst, e.k(Null))
 		}
-
 		exit := e.here()
 		ctx := e.popCtx()
 		for _, at := range ctx.breakJumps {
@@ -910,55 +853,48 @@ func (e *emitter) emitExpr(n S) {
 			e.patch(at, exit)
 		}
 
+	// ----- flow: break / continue -----
 	case "break":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		at := e.here()
 		e.emit(opJump, 0)
 		e.addBreakJump(at)
-		return
-
 	case "continue":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		at := e.here()
 		e.emit(opJump, 0)
 		e.addContJump(at)
-		return
 
+	// ----- unary -----
 	case "unop":
 		op := n[1].(string)
 		if op == "?" {
 			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
 			return
 		}
-		e.withChild(1, func() { e.emitExpr(n[2].(S)); e.mark() })
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Mark operand right before opcode.
 		switch op {
 		case "not":
-			e.emit(opNot, 0)
+			e.emitWithMarkChild(opNot, 1, 0)
 		case "-":
-			e.emit(opNeg, 0)
+			e.emitWithMarkChild(opNeg, 1, 0)
 		default:
 			e.emit(opConst, e.k(errNull("unknown unary op")))
 		}
 
+	// ----- binary -----
 	case "binop":
 		op := n[1].(string)
 		if op == "and" || op == "or" {
-			e.withChild(1, func() { e.emitExpr(n[2].(S)); e.mark() })
+			// Short-circuit: mark tested subexpr at the gate.
+			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+			e.markChild(1)
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
 			if op == "and" {
-				jf := e.here()
-				e.emit(opJumpIfFalse, 0)
 				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
-				jend := e.here()
-				e.emit(opJump, 0)
-				lfalse := e.here()
-				e.emit(opConst, e.k(Bool(false)))
-				lend := e.here()
-				e.patch(jf, lfalse)
-				e.patch(jend, lend)
-			} else {
-				jf := e.here() // Jump if LHS is false → evaluate RHS
-				e.emit(opJumpIfFalse, 0)
-				e.emit(opConst, e.k(Bool(true)))
+			} else { // or
 				jend := e.here()
 				e.emit(opJump, 0)
 				lrhs := e.here()
@@ -966,37 +902,68 @@ func (e *emitter) emitExpr(n S) {
 				e.withChild(2, func() { e.emitExpr(n[3].(S)) })
 				lend := e.here()
 				e.patch(jend, lend)
+				return
 			}
+			lend := e.here()
+			e.patch(jf, lend)
 			return
 		}
 		a, b := n[2].(S), n[3].(S)
 		switch op {
 		case "==":
-			e.emitBinaryOpAB(a, b, opEq)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			// Comparisons rarely fail, but we still enforce the "mark RHS before op" rule.
+			e.emitWithMarkChild(opEq, 2, 0)
 		case "!=":
-			e.emitBinaryOpAB(a, b, opNe)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opNe, 2, 0)
 		case "+":
-			e.emitBinaryBuiltinAB("__plus", a, b)
+			// Lower to builtin __plus; blame RHS.
+			e.emit(opLoadGlobal, e.ks("__plus"))
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.callWithMarkChild(2, 2)
 		case "-":
-			e.emitBinaryOpAB(a, b, opSub)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opSub, 2, 0)
 		case "*":
-			e.emitBinaryOpAB(a, b, opMul)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opMul, 2, 0)
 		case "/":
-			e.emitBinaryOpAB(a, b, opDiv)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			// divide-by-zero etc. blame RHS
+			e.emitWithMarkChild(opDiv, 2, 0)
 		case "%":
-			e.emitBinaryOpAB(a, b, opMod)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			// modulo-by-zero blame RHS
+			e.emitWithMarkChild(opMod, 2, 0)
 		case "<":
-			e.emitBinaryOpAB(a, b, opLt)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opLt, 2, 0)
 		case "<=":
-			e.emitBinaryOpAB(a, b, opLe)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opLe, 2, 0)
 		case ">":
-			e.emitBinaryOpAB(a, b, opGt)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opGt, 2, 0)
 		case ">=":
-			e.emitBinaryOpAB(a, b, opGe)
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opGe, 2, 0)
 		default:
 			e.emit(opConst, e.k(errNull("unsupported operator")))
 		}
 
+	// ----- assignment -----
 	case "assign":
 		lhs := n[1].(S)
 		opName := "__assign_set"
@@ -1007,15 +974,13 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opLoadGlobal, e.ks(opName))
 		e.emit(opConst, e.k(TypeVal(lhs)))
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-		// Attribute assignment errors (e.g., bad target/index) to the LHS.
-		e.withChild(0, func() {
-			e.mark()
-		})
-		e.emit(opCall, 2)
+		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
+		e.callWithMarkChild(2, 0)
 
-	case "decl": // let x → define null
+	case "decl":
 		e.callBuiltin("__assign_def", S{"type", n}, S{"null"})
 
+	// ----- arrays / maps -----
 	case "array":
 		for i := 1; i < len(n); i++ {
 			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
@@ -1032,101 +997,62 @@ func (e *emitter) emitExpr(n S) {
 		}
 		e.emit(opLoadGlobal, e.ks("__map_from"))
 		for i := 1; i < len(keys); i++ {
-			// child i-1 is the ("pair", key, val)
-			e.withChild(i-1, func() { // visit ("pair", key, val)
-				e.withChild(0, func() { // key path inside the pair
-					e.emitExpr(keys[i].(S))
-				})
-			})
+			e.withChild(i-1, func() { e.withChild(0, func() { e.emitExpr(keys[i].(S)) }) })
 		}
 		e.emit(opMakeArr, uint32(len(keys)-1))
 		for i := 1; i < len(vals); i++ {
-			e.withChild(i-1, func() {
-				e.withChild(1, func() { // value path inside the pair
-					e.emitExpr(vals[i].(S))
-				})
-			})
+			e.withChild(i-1, func() { e.withChild(1, func() { e.emitExpr(vals[i].(S)) }) })
 		}
 		e.emit(opMakeArr, uint32(len(vals)-1))
 		e.emit(opCall, 2)
 
+	// ----- property / index -----
 	case "get":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		e.withChild(1, func() { e.mark() })
-		e.emit(opGetProp, e.ks(n[2].(S)[1].(string)))
+		// Blame the property token (child #1) right before opGetProp.
+		e.emitWithMarkChild(opGetProp, 1, e.ks(n[2].(S)[1].(string)))
 
 	case "idx":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-		e.withChild(1, func() { e.mark() })
-		e.emit(opGetIdx, 0)
+		// Blame the index expression (child #1) right before opGetIdx.
+		e.emitWithMarkChild(opGetIdx, 1, 0)
 
+	// ----- call -----
 	case "call":
-		// 1) Evaluate callee once; it stays on the stack for the first application.
+		// Evaluate callee once.
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 
 		argc := len(n) - 2
 		if argc == 0 {
-			// Zero-arg call: keep a single call-site mark (status quo).
-			e.mark() // maps to the whole call node path
-			e.emit(opCall, 0)
+			// Zero-arg call: blame callee right before CALL 0.
+			e.callWithMarkChild(0, 0)
 			return
 		}
-
-		// 2) Apply arguments one-by-one.
+		// Apply args one by one; blame each arg before its CALL 1.
 		for i := 2; i < len(n); i++ {
 			argIdx := i - 1
-			e.withChild(argIdx, func() {
-				// Emit the argument; its emitExpr places a precise mark at the arg node.
-				e.emitExpr(n[i].(S))
-
-				// *** Crucial fix ***
-				// Duplicate the *argument's* last mark at the current PC so that
-				// the mapping for errors raised by the upcoming CALL resolves to
-				// the argument’s span (not the callee or some enclosing node).
-				if lm := len(e.marks); lm > 0 {
-					last := e.marks[lm-1].Path
-					// store a copy of the path; PC will be the instruction index at this point
-					e.marks = append(e.marks, PCMark{
-						PC:   e.here(),
-						Path: append(NodePath(nil), last...),
-					})
-				}
-
-				// Apply exactly one argument.
-				e.emit(opCall, 1)
-			})
+			e.withChild(argIdx, func() { e.emitExpr(n[i].(S)) })
+			e.callWithMarkChild(1, argIdx)
 		}
 		return
 
+	// ----- fun / oracle -----
 	case "fun":
-		// ("fun", params, ret, body) → child 2 is the body
+		// ("fun", params, ret, body) → body child index is 2
 		absBase := append(append(NodePath(nil), e.path...), 2)
-		e.emitMakeFun(
-			n[1].(S),  // params
-			n[2].(S),  // ret (may be empty)
-			n[3].(S),  // body carrier (type AST)
-			false,     // isOracle
-			S{"null"}, // examples
-			absBase,
-		)
+		e.emitMakeFun(n[1].(S), n[2].(S), n[3].(S), false, S{"null"}, absBase)
 	case "oracle":
 		e.withChild(2, func() {
-			// oracles don't JIT a body chunk here → no body base path
-			e.emitMakeFun(
-				n[1].(S),
-				n[2].(S),
-				S{"oracle"},
-				true,
-				n[3].(S),
-				nil,
-			)
+			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
 		})
 
+	// ----- return -----
 	case "return":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.emit(opReturn, 0)
 
+	// ----- if -----
 	case "if":
 		arms := n[1:]
 		jends := []int{}
@@ -1141,13 +1067,15 @@ func (e *emitter) emitExpr(n S) {
 			limit--
 		}
 		for i := 0; i < limit; i++ {
-			p := arms[i].(S)
-			e.withChild(i, func() {
-				e.withChild(0, func() { e.emitExpr(p[1].(S)); e.mark() }) // cond
-			})
+			p := arms[i].(S) // ("pair", cond, thenBlock)
+			// Emit condition; mark the condition node (pair child #0) at the gate.
+			e.withChild(i, func() { e.withChild(0, func() { e.emitExpr(p[1].(S)) }) })
+			condAbs := append(append(NodePath(nil), e.path...), i, 0)
+			e.markHereFor(condAbs)
 			jf := e.here()
 			e.emit(opJumpIfFalse, 0)
-			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) }) // then
+
+			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) })
 			jend := e.here()
 			e.emit(opJump, 0)
 			jends = append(jends, jend)
@@ -1163,6 +1091,7 @@ func (e *emitter) emitExpr(n S) {
 			e.patch(at, tail)
 		}
 
+	// ----- while -----
 	case "while":
 		cond := n[1].(S)
 		body := n[2].(S)
@@ -1172,20 +1101,16 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opPop, 0)
 
 		head := e.here()
-		// Mark at the loop condition for precise boolean type errors.
-		e.withChild(0, func() {
-			e.emitExpr(cond)
-			e.mark()
-		})
+		e.withChild(0, func() { e.emitExpr(cond) })
+		// Mark the condition node right before the gate.
+		e.markChild(0)
 		jf := e.here()
 		e.emit(opJumpIfFalse, 0)
 
 		e.preloadAssignToLast(lastName)
-
 		e.pushLoopCtx()
 		e.withChild(1, func() { e.emitExpr(body) })
 		loopCtx := e.popCtx()
-
 		e.saveLastAndJumpHead(head)
 
 		lcont := e.here()
@@ -1203,43 +1128,43 @@ func (e *emitter) emitExpr(n S) {
 
 		e.emit(opLoadGlobal, e.ks(lastName))
 
+	// ----- for -----
 	case "for":
 		target := n[1].(S)
 		iterExpr := n[2].(S)
 		body := n[3].(S)
 
 		iterName := fmt.Sprintf("$iter_%d", e.here())
-		// Define iterator variable: __assign_def(Type(decl iterName), __to_iter(iterExpr))
 		e.emit(opLoadGlobal, e.ks("__assign_def"))
 		e.emitExpr(S{"type", S{"decl", iterName}})
 
-		// Build value: __to_iter(iterExpr), attributing marks to child #1 (iterExpr)
+		// __to_iter(iterExpr); mark the iterExpr (child #1) at this call site.
 		e.emit(opLoadGlobal, e.ks("__to_iter"))
 		e.withChild(1, func() { e.emitExpr(iterExpr) })
-		e.mark()          // mark the __to_iter call site
-		e.emit(opCall, 1) // __to_iter(iterExpr)
-		e.emit(opCall, 2) // assign_def(TypeDecl, iterator)
-		e.emit(opPop, 0)  // discard __assign_def return value
+		e.callWithMarkChild(1, 1) // __to_iter(iterExpr)
+		e.emit(opCall, 2)         // assign_def(TypeDecl, iterator)
+		e.emit(opPop, 0)
 
 		tmpName := fmt.Sprintf("$tmp_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
-		e.emit(opPop, 0) // discard __assign_def return value
+		e.emit(opPop, 0)
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
 		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
-		e.emit(opPop, 0) // discard __assign_def return value
+		e.emit(opPop, 0)
 
 		head := e.here()
 
+		// tmp = iter(Null) — do NOT re-mark iterExpr here to preserve 1:1 mark rule.
 		e.emit(opLoadGlobal, e.ks("__assign_set"))
 		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
 		e.emit(opLoadGlobal, e.ks(iterName))
 		e.emit(opConst, e.k(Null))
-		e.withChild(1, func() { e.mark() })
-		e.emit(opCall, 1)
-		e.emit(opCall, 2)
-		e.emit(opPop, 0) // discard __assign_set return value
+		e.emit(opCall, 1) // iter(Null)
+		e.emit(opCall, 2) // assign_set(Type(tmp), result)
+		e.emit(opPop, 0)
 
+		// gate: __iter_should_stop(tmp)
 		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
 		e.emit(opLoadGlobal, e.ks(tmpName))
 		e.emit(opCall, 1)
@@ -1258,7 +1183,6 @@ func (e *emitter) emitExpr(n S) {
 		case "decl", "darr", "dobj", "annot":
 			assignName = "__assign_def"
 		}
-		// Attribute the body emission to child #2
 		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
 		e.emit(opPop, 0)
 
@@ -1283,28 +1207,27 @@ func (e *emitter) emitExpr(n S) {
 
 		e.emit(opLoadGlobal, e.ks(lastName))
 
+	// ----- type / module / annot -----
 	case "type":
 		e.emit(opConst, e.k(TypeVal(n[1].(S))))
 
 	case "module":
-		// Lower to: __make_module(nameValue, Type(bodyAst), basePathArray)
+		// Lower to: __make_module(nameExpr, Type(bodyAst), basePathArray)
 		e.emit(opLoadGlobal, e.ks("__make_module"))
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 		e.emit(opConst, e.k(TypeVal(n[2].(S))))
-		// Body is child #1 in ("module", name, body)
-		absBase := append(append(NodePath(nil), e.path...), 1)
+		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, body) → body at child #1
 		for _, idx := range absBase {
 			e.emit(opConst, e.k(Int(int64(idx))))
 		}
 		e.emit(opMakeArr, uint32(len(absBase)))
-		e.mark()
+		// The call itself is not expected to fail at the callsite; no mark needed.
 		e.emit(opCall, 3)
 
 	case "annot":
 		text := n[1].(S)[1].(string)
 		subj := n[2].(S)
 
-		// Lone PRE annotation over a blank line is a no-op: produce Null, no side effects.
 		if isNoopish(subj) {
 			e.emit(opConst, e.k(Null))
 			return
@@ -1323,53 +1246,36 @@ func (e *emitter) emitExpr(n S) {
 			e.emit(opConst, e.k(TypeVal(lhs)))
 			e.emit(opLoadGlobal, e.ks("__annotate"))
 			e.emit(opConst, e.k(Str(text)))
-			e.withChild(1, func() { // go into ("assign", lhs, rhs)
-				e.withChild(1, func() { // child #1 inside assign = rhs
-					e.emitExpr(rhs)
-				})
-			})
-			e.emit(opCall, 2)
-			e.emit(opCall, 2)
+			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
+			e.emit(opCall, 2) // __annotate
+			// Attribute assignment errors to LHS (annot child #1 = assign, its child #0 = lhs).
+			lhsAbs := append(append(NodePath(nil), e.path...), 1, 0)
+			e.markHereFor(lhsAbs)
+			e.emit(opCall, 2) // __assign_*
 			return
 		}
 
-		// LVALUE-AWARE: #(doc) subj  where subj ∈ {id, get, idx}
-		// Lower to: __assign_set(Type(subj), __annotate(doc, subj))
+		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx}
 		if len(subj) > 0 {
 			switch subj[0].(string) {
 			case "id", "get", "idx":
 				e.emit(opLoadGlobal, e.ks("__assign_set"))
 				e.emit(opConst, e.k(TypeVal(subj)))
-				// Build RHS: __annotate(doc, subj)
 				e.emit(opLoadGlobal, e.ks("__annotate"))
 				e.emit(opConst, e.k(Str(text)))
-				e.withChild(1, func() { e.emitExpr(subj) })
+				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS
 				e.emit(opCall, 2)
-				// Attribute assignment errors (e.g., bad target/index) to the subject.
-				e.withChild(1, func() { e.mark() })
+				// Attribute to subject itself.
+				e.markChild(1)
 				e.emit(opCall, 2)
 				return
 			}
 		}
 
-		// #(doc) (let x)  ==>  let x = #(doc) null
-		if len(subj) > 0 && subj[0].(string) == "decl" {
-			e.emit(opLoadGlobal, e.ks("__assign_def"))
-			e.emit(opConst, e.k(TypeVal(subj)))
-			e.emit(opLoadGlobal, e.ks("__annotate"))
-			e.emit(opConst, e.k(Str(text)))
-			e.emit(opConst, e.k(Null))
-			e.emit(opCall, 2)
-			e.emit(opCall, 2)
-			return
-		}
-
 		// default: #(doc) expr  ==>  __annotate(doc, expr)
 		e.emit(opLoadGlobal, e.ks("__annotate"))
 		e.emit(opConst, e.k(Str(text)))
-		e.withChild(1, func() { // child #1 of ("annot", text, subj)
-			e.emitExpr(subj)
-		})
+		e.withChild(1, func() { e.emitExpr(subj) })
 		e.emit(opCall, 2)
 
 	default:
@@ -1377,24 +1283,4 @@ func (e *emitter) emitExpr(n S) {
 	}
 }
 
-func (e *emitter) emitBinaryOpAB(a, b S, op opcode) {
-	e.withChild(1, func() { e.emitExpr(a) })
-	e.withChild(2, func() { e.emitExpr(b); e.mark() })
-	e.emit(op, 0)
-}
-func (e *emitter) emitBinaryBuiltinAB(name string, a, b S) {
-	e.emit(opLoadGlobal, e.ks(name))
-	e.withChild(1, func() { e.emitExpr(a) })
-	e.withChild(2, func() { e.emitExpr(b) })
-	e.emit(opCall, 2)
-}
-
-// Private panic signaling & null helpers are defined in interpreter_ops.go:
-//   - type returnSig struct{ v Value }
-//   - type rtErr struct{ msg string; src *SourceRef; line, col int }
-//   - func fail(msg string)
-//   - func panicRt(msg string, src *SourceRef, line, col int)
-//   - func errNull(msg string) Value
-//   - func annotNull(msg string) Value
-//   - func withAnnot(v Value, ann string) Value
-// These are shared by exec/ops files within the package.
+// Private panic/null helpers live in interpreter_ops.go.

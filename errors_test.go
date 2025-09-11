@@ -593,3 +593,108 @@ func Test_Error_Runtime_TabCaret_Preserved(t *testing.T) {
 		t.Fatalf("caret padding did not preserve leading tabs; got %q", prefix)
 	}
 }
+
+func Test_Errors_Module_IfAssert_Typed_CondLine(t *testing.T) {
+	// Repro from M1: inside a module, the failing caret for `if assert(x)` should
+	// land on the line with the condition (line 3 here).
+	src := `let M1 = module "M1" do
+  let f = fun(x: Any) do
+    if assert(x) then 1 else 0 end
+  end
+end
+M1.f(0)`
+
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustHaveHeader(t, msg, "RUNTIME ERROR")
+	mustRuntimeAtLine(t, msg, 3)
+	mustContain(t, msg, "   3 |     if assert(x) then 1 else 0 end")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_Module_IfAssert_Typed_CondLine_WithEarlierDef(t *testing.T) {
+	// Repro from M2: same as above, but with an earlier definition in the module.
+	src := `let M2 = module "M2" do
+  let noop = fun() do 0 end
+
+  let f = fun(x: Any) do
+    if assert(x) then 1 else 0 end
+  end
+end
+M2.f(0)`
+
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustHaveHeader(t, msg, "RUNTIME ERROR")
+	// The failing caret still points to the `if assert(x)` line (line 5).
+	mustRuntimeAtLine(t, msg, 5)
+	mustContain(t, msg, "   5 |     if assert(x) then 1 else 0 end")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_Module_CallArgMark_Typed_SecondArgLine(t *testing.T) {
+	// Repro from M3 (typed): assert(true, x); with x=0 the *second* call fails
+	// ("not a function"), caret should be on the assert-call line (line 5).
+	src := `let M3 = module "M3" do
+  let noop = fun() do 0 end
+
+  let f = fun(x: Any) do
+    assert(true, x)
+  end
+end
+M3.f(0)`
+
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustHaveHeader(t, msg, "RUNTIME ERROR")
+	mustRuntimeAtLine(t, msg, 5)
+	// We also assert the specific failure mode to ensure we marked arg#2.
+	mustContain(t, msg, "not a function")
+	mustContain(t, msg, "   5 |     assert(true, x)")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}
+
+func Test_Errors_Module_CallArgMark_Untyped_SecondArgLine(t *testing.T) {
+	// Repro from M3P (untyped): same as above but without the explicit Any.
+	// Ensures the synthetic/real type node unification doesn’t shift spans.
+	src := `let M3P = module "M3P" do
+    let noop = fun() do 0 end
+    
+    let f = fun(x) do
+        assert(true, x)
+    end
+end
+M3P.f(0)`
+
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(src)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	msg := err.Error()
+
+	mustHaveHeader(t, msg, "RUNTIME ERROR")
+	mustRuntimeAtLine(t, msg, 5)
+	mustContain(t, msg, "not a function")
+	mustContain(t, msg, "   5 |         assert(true, x)")
+	mustContain(t, msg, "     | ")
+	mustContain(t, msg, "^")
+}

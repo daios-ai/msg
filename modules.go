@@ -195,27 +195,64 @@ func (m *Module) get(key string) (Value, bool) {
 //
 // Cycle detection and caching are **centralized** in nativeMakeModule so that
 // *all* entry points (AST/Code/File/inline) share identical semantics.
+// modules.go: importWithBody
+
 func (ip *Interpreter) importWithBody(canonName, display string, body S, src string, spans *SpanIndex) (Value, error) {
-	// Align spans with the wrapped AST: ("module", ("str", canonName), body).
 	var sr *SourceRef
 	if src != "" && spans != nil {
-		sr = &SourceRef{Name: display, Src: src, Spans: wrapUnderModule(spans)}
+		// ⬇️ use the parser-faithful wrapper
+		wrapped := wrapUnderModuleLikeParser(body, spans, canonName)
+		sr = &SourceRef{Name: display, Src: src, Spans: wrapped}
 	}
 
-	// Lower to ("module", <canonical name>, body). Name is NOT overwritten later.
 	modAst := S{"module", S{"str", canonName}, body}
-
-	// Evaluate in an env that sees Core + natives, with proper VM entry.
 	env := NewEnv(ip.Core)
 	env.SealParentWrites()
-	v, err := ip.runTopWithSource(modAst, env, false, sr)
-	if err != nil {
-		return Null, err // hard runtime/parse errors with carets
+	return ip.runTopWithSource(modAst, env, false, sr)
+}
+
+// modules.go
+
+// New signature: we need the body AST to walk it in post-order.
+func wrapUnderModuleLikeParser(bodyAST S, bodyIdx *SpanIndex, canonName string) *SpanIndex {
+	if bodyIdx == nil {
+		return nil
 	}
-	if v.Tag != VTModule {
-		return Null, fmt.Errorf("internal error: expected module value")
+
+	// Build ("module", ("str", canonName), body) for a faithful traversal shape.
+	mod := S{"module", S{"str", canonName}, bodyAST}
+
+	// Body root span drives module extents.
+	bodyRoot, _ := bodyIdx.Get(nil)
+
+	// Synthesize a zero-width name span at the body's start (best available anchor).
+	nameSpan := Span{StartByte: bodyRoot.StartByte, EndByte: bodyRoot.StartByte}
+	modSpan := Span{StartByte: bodyRoot.StartByte, EndByte: bodyRoot.EndByte}
+
+	// Gather body spans in post-order by walking the *body AST* and querying bodyIdx.
+	post := make([]Span, 0, 2+len(bodyIdx.byPath)) // rough capacity
+	var walk func(n S, path NodePath)
+	walk = func(n S, path NodePath) {
+		for i := 1; i < len(n); i++ {
+			if c, ok := n[i].(S); ok {
+				walk(c, append(path, i-1))
+			}
+		}
+		if sp, ok := bodyIdx.Get(path); ok {
+			post = append(post, sp)
+		} else {
+			// If a node lacks a span (shouldn’t happen from the parser), keep cardinality.
+			post = append(post, Span{})
+		}
 	}
-	return v, nil
+
+	// Post-order for the wrapper: [name] + [body subtree] + [module]
+	post = append(post, nameSpan)
+	walk(bodyAST, nil)
+	post = append(post, modSpan)
+
+	// Rebuild a fresh index, exactly like the parser would for `mod`.
+	return BuildSpanIndexPostOrder(mod, post)
 }
 
 // parseSourceWithSpans parses src into an S-expr AST + spans and wraps errors

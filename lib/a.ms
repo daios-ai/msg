@@ -1,3 +1,5 @@
-let f = fun(x: Any) do
-  if assert(x) then 1 else 0 end
-end
+    let g = fun(x) do
+        # note
+    
+        assert(x)
+    end

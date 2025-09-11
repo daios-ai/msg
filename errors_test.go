@@ -698,3 +698,48 @@ M3P.f(0)`
 	mustContain(t, msg, "     | ")
 	mustContain(t, msg, "^")
 }
+
+func countNodes(n S) int {
+	if n == nil || len(n) == 0 {
+		return 0
+	}
+	c := 1 // count this node
+	for i := 1; i < len(n); i++ {
+		if ch, ok := n[i].(S); ok {
+			c += countNodes(ch)
+		}
+	}
+	return c
+}
+
+func Test_Errors_Oracle_From_NoDupSpans(t *testing.T) {
+	src := `let o = oracle(x) -> Any from [(1 + 2)]`
+	ast, idx, err := ParseSExprWithSpans(src)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if ast == nil || idx == nil {
+		t.Fatalf("expected ast and spans")
+	}
+	nodes := countNodes(ast)
+	spans := len(idx.byPath) // same package; access is fine
+	if nodes != spans {
+		t.Fatalf("oracle-with-FROM: nodes (%d) != spans (%d); possible duplicate placeholder span", nodes, spans)
+	}
+}
+
+func Test_Errors_Oracle_NoFrom_SpansMatch(t *testing.T) {
+	src := `let o = oracle(x) -> Any`
+	ast, idx, err := ParseSExprWithSpans(src)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if ast == nil || idx == nil {
+		t.Fatalf("expected ast and spans")
+	}
+	nodes := countNodes(ast)
+	spans := len(idx.byPath)
+	if nodes != spans {
+		t.Fatalf("oracle-without-FROM: nodes (%d) != spans (%d)", nodes, spans)
+	}
+}

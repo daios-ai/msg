@@ -1428,7 +1428,7 @@ func (p *parser) oracleExpr(openTok int) (S, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	var src any = p.mk("array", -1, -1) // empty array with placeholder span
+	var src any
 	if p.match(FROM) {
 		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
 			return nil, 0, err
@@ -1438,6 +1438,8 @@ func (p *parser) oracleExpr(openTok int) (S, int, error) {
 			return nil, 0, err
 		}
 		src = ex
+	} else {
+		src = p.mk("array", -1, -1) // build only when needed
 	}
 	body := p.mk("oracle", openTok, p.i-1, params, out, src)
 	return body, p.i - 1, nil

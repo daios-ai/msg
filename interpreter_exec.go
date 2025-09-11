@@ -1050,6 +1050,7 @@ func (e *emitter) emitExpr(n S) {
 	// ----- return -----
 	case "return":
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.markSelf()
 		e.emit(opReturn, 0)
 
 	// ----- if -----

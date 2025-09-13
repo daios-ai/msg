@@ -618,4 +618,4 @@ end
 
 
 llm.useBackend("openai")
-llm.useModel("gpt-4o-mini")
+llm.useModel("chatgpt-4o-latest")

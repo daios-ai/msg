@@ -117,6 +117,12 @@
 //   - Indentation uses **tabs** only (gofmt-style).
 //   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
 //
+// Requiredness in value maps
+// --------------------------
+// The printer never emits required fields ("pair!") in **expression/value maps**:
+// requiredness is a **type-level** concept only. If the AST carried "pair!" in a
+// value map (e.g., via parser sugar), it is dropped in the printed code.
+//
 // Canonicalizations & Omissions (parser ↔ printer contract)
 // ---------------------------------------------------------
 // These are deliberate simplifications made by the parser and normalized by

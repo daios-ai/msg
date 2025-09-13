@@ -139,7 +139,7 @@ let _openai = do
 			baseUrl: baseUrl,
 			model: model,
 			apiKey: apiKey,
-			options: {"temperature": 0}
+			options: {"temperature": 0.5}
 		},
 
 		# List models (best-effort). Requires API key.

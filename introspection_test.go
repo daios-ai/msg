@@ -126,32 +126,30 @@ func Test_Introspection_ScalarsAndNegatives(t *testing.T) {
 	}
 }
 
-func Test_Introspection_ArrayMap_WithRequirednessAndKeyAnn(t *testing.T) {
+func Test_Introspection_ArrayMap_WithKeyAnn_NoRequirednessInValues(t *testing.T) {
+	// Value maps never carry requiredness; '!' in KeyAnn is dropped by IxReflect.
 	mo := &MapObject{
 		Entries: map[string]Value{},
 		KeyAnn:  map[string]string{},
 		Keys:    []string{},
 	}
-	// insertion order: a, b
 	mo.Keys = append(mo.Keys, "a")
 	mo.Entries["a"] = vInt(1)
-	mo.KeyAnn["a"] = "!" // required
+	mo.KeyAnn["a"] = "!" // should NOT produce pair!
 
 	mo.Keys = append(mo.Keys, "b")
 	mo.Entries["b"] = vStr("x")
-	mo.KeyAnn["b"] = "doc for b" // plain doc
+	mo.KeyAnn["b"] = "doc for b" // preserved as PRE key annot
 
-	mv := Value{Tag: VTMap, Data: mo}
-
-	got := IxReflect(mv) // constructor code → to runtime-S via IxToS
+	got := IxReflect(Value{Tag: VTMap, Data: mo})
 	want := vArray(
 		vStr("map"),
-		// pair! for required
-		vArray(vStr("pair!"),
+		// "a" is a plain pair (no requiredness in value maps)
+		vArray(vStr("pair"),
 			vArray(vStr("str"), vStr("a")),
 			vArray(vStr("int"), vInt(1)),
 		),
-		// pair with annotated key for docs
+		// "b" has PRE key doc
 		vArray(vStr("pair"),
 			vArray(vStr("annot"),
 				vArray(vStr("str"), vStr("doc for b")),
@@ -240,10 +238,8 @@ func TestIxReify_SimpleProgram_Evaluates(t *testing.T) {
 
 func TestIxReify_Rejects_Handle(t *testing.T) {
 	ip := NewInterpreter()
-
-	rtHandle := vArray(vStr("handle"))
-	_, err := ip.IxReify(rtHandle)
-	mustErr(t, err)
+	_, err := ip.IxReify(vArray(vStr("handle")))
+	mustErr(t, err) // validator soft; IxReify escalates to hard error
 }
 
 func TestRoundTrip_ToS_FromS(t *testing.T) {
@@ -271,7 +267,7 @@ func ixMustCtorS(v Value) S {
 	}
 	return s
 }
-func Test_Introspection_IxReflect_ModuleCapsule(t *testing.T) {
+func Test_Introspection_IxReflect_Module_Canonical(t *testing.T) {
 	ip := NewInterpreter()
 
 	// Build a simple module via source, then reflect it.
@@ -288,55 +284,60 @@ end`
 
 	got := IxReflect(v)
 
-	// Expect a module capsule:
-	// ["module", ["str","Refl"], ("pair", ["id","a"], ["int",1])]
+	// Expect CANONICAL inline form:
+	// ["module", ["str","Refl"],
+	//   ["block",
+	//     ["assign", ["decl","a"], ["int",1]]
+	//   ]
+	// ]
 	want := vArray(
 		vStr("module"),
 		vArray(vStr("str"), vStr("Refl")),
 		vArray(
-			vStr("pair"),
-			vArray(vStr("id"), vStr("a")),
-			vArray(vStr("int"), vInt(1)),
+			vStr("block"),
+			vArray(
+				vStr("assign"),
+				vArray(vStr("decl"), vStr("a")),
+				vArray(vStr("int"), vInt(1)),
+			),
 		),
 	)
+
 	mustEqValue(t, got, want)
 }
 
-func Test_Introspection_IxReify_ModuleCapsule_LowersAndCaches(t *testing.T) {
+func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
 	ip := NewInterpreter()
 
-	// Register a native "tick" that increments ip.Global["counter"] and returns the new value.
+	// Native "tick" increments Global["counter"].
 	ip.Global.Define("counter", vInt(0))
 	ip.RegisterNative(
 		"tick",
 		[]ParamSpec{},
 		S{"id", "Int"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			// read
-			cv, err := ip.Global.Get("counter")
-			if err != nil {
-				ip.Global.Define("counter", vInt(0))
-				cv = vInt(0)
-			}
+			cv, _ := ip.Global.Get("counter")
 			n := cv.Data.(int64) + 1
-			_ = ip.Global.Set("counter", vInt(n)) // Set must succeed (binding exists)
+			_ = ip.Global.Set("counter", vInt(n))
 			return vInt(n)
 		},
 	)
 
-	// Capsule:
-	// ["module", ["str","M"], ("pair", ["id","x"], ["call", ["id","tick"]])]
+	// Canonical module form:
+	// ["module", ["str","M"], ["block", ["assign", ["decl","x"], ["call", ["id","tick"]]]]]
 	rt := vArray(
 		vStr("module"),
 		vArray(vStr("str"), vStr("M")),
 		vArray(
-			vStr("pair"),
-			vArray(vStr("id"), vStr("x")),
-			vArray(vStr("call"), vArray(vStr("id"), vStr("tick"))),
+			vStr("block"),
+			vArray(
+				vStr("assign"),
+				vArray(vStr("decl"), vStr("x")),
+				vArray(vStr("call"), vArray(vStr("id"), vStr("tick"))),
+			),
 		),
 	)
 
-	// First reify: should execute body (tick once), produce a VTModule with x = 1.
 	v1, err := ip.IxReify(rt)
 	if err != nil {
 		t.Fatalf("IxReify failed: %v", err)
@@ -344,15 +345,8 @@ func Test_Introspection_IxReify_ModuleCapsule_LowersAndCaches(t *testing.T) {
 	if v1.Tag != VTModule {
 		t.Fatalf("expected VTModule, got %v", v1.Tag)
 	}
-	mv1 := AsMapValue(v1)
-	if mv1.Tag != VTMap {
-		t.Fatalf("AsMapValue should coerce module to map, got %v", mv1.Tag)
-	}
-	mo1 := mv1.Data.(*MapObject)
-	x1, ok := mo1.Entries["x"]
-	if !ok {
-		t.Fatalf("expected export 'x'")
-	}
+	mv1 := AsMapValue(v1).Data.(*MapObject)
+	x1 := mv1.Entries["x"]
 	if x1.Tag != VTInt || x1.Data.(int64) != 1 {
 		t.Fatalf("expected x=1, got %#v", x1)
 	}
@@ -361,7 +355,7 @@ func Test_Introspection_IxReify_ModuleCapsule_LowersAndCaches(t *testing.T) {
 		t.Fatalf("expected counter=1 after first install, got %v", cv1)
 	}
 
-	// Second reify of the SAME capsule: must hit cache (no second tick).
+	// Reify again → should hit cache (counter unchanged).
 	v2, err := ip.IxReify(rt)
 	if err != nil {
 		t.Fatalf("IxReify failed on second install: %v", err)
@@ -369,11 +363,8 @@ func Test_Introspection_IxReify_ModuleCapsule_LowersAndCaches(t *testing.T) {
 	if v2.Tag != VTModule {
 		t.Fatalf("expected VTModule, got %v", v2.Tag)
 	}
-	// Same Module pointer proves the cache was used.
-	m1 := v1.Data.(*Module)
-	m2 := v2.Data.(*Module)
-	if m1 != m2 {
-		t.Fatalf("expected cached module pointer; got different instances")
+	if v1.Data.(*Module) != v2.Data.(*Module) {
+		t.Fatalf("expected cached module pointer")
 	}
 	cv2, _ := ip.Global.Get("counter")
 	if cv2.Data.(int64) != 1 {
@@ -381,23 +372,29 @@ func Test_Introspection_IxReify_ModuleCapsule_LowersAndCaches(t *testing.T) {
 	}
 }
 
-func Test_Introspection_IxReify_ModuleCapsule_Nested(t *testing.T) {
+func Test_Introspection_IxReify_Module_Nested_Canonical_Form(t *testing.T) {
 	ip := NewInterpreter()
 
-	// Outer capsule exports "sub" which itself is a module capsule "Inner" exporting y=2.
+	// Outer canonical exporting sub = (lowered inner module).
 	rt := vArray(
 		vStr("module"),
 		vArray(vStr("str"), vStr("Outer")),
 		vArray(
-			vStr("pair"),
-			vArray(vStr("id"), vStr("sub")),
+			vStr("block"),
 			vArray(
-				vStr("module"),
-				vArray(vStr("str"), vStr("Inner")),
+				vStr("assign"),
+				vArray(vStr("decl"), vStr("sub")),
 				vArray(
-					vStr("pair"),
-					vArray(vStr("id"), vStr("y")),
-					vArray(vStr("int"), vInt(2)),
+					vStr("module"),
+					vArray(vStr("str"), vStr("Inner")),
+					vArray(
+						vStr("block"),
+						vArray(
+							vStr("assign"),
+							vArray(vStr("decl"), vStr("y")),
+							vArray(vStr("int"), vInt(2)),
+						),
+					),
 				),
 			),
 		),
@@ -410,18 +407,18 @@ func Test_Introspection_IxReify_ModuleCapsule_Nested(t *testing.T) {
 	if v.Tag != VTModule {
 		t.Fatalf("expected VTModule for outer, got %v", v.Tag)
 	}
-
 	outer := AsMapValue(v).Data.(*MapObject)
-	sub, ok := outer.Entries["sub"]
-	if !ok || sub.Tag != VTModule {
+	sub := outer.Entries["sub"]
+	if sub.Tag != VTModule {
 		t.Fatalf("expected outer.sub to be a module, got %#v", sub)
 	}
 	inner := AsMapValue(sub).Data.(*MapObject)
-	y, ok := inner.Entries["y"]
-	if !ok || y.Tag != VTInt || y.Data.(int64) != 2 {
+	y := inner.Entries["y"]
+	if y.Tag != VTInt || y.Data.(int64) != 2 {
 		t.Fatalf("expected inner.y = 2, got %#v", y)
 	}
 }
+
 func wrapAnnot(node Value, txt string) Value {
 	return vArray(
 		vStr("annot"),
@@ -480,13 +477,7 @@ func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) 
 
 // Map key/requiredness + key/value annotations should be preserved by reflect().
 func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing.T) {
-	// Map: {
-	//   a!: 1            // required + PRE doc "kdoc"
-	//   b:  2, # <vpost  // value POST
-	// }
-	// With key annotations:
-	//   a has requiredness (!) and extra doc "kdoc"
-	//   b has POST key annotation "<kpost"
+	// Value map with key PRE doc and key/value POST; no requiredness.
 	mo := &MapObject{
 		Keys: []string{"a", "b"},
 		Entries: map[string]Value{
@@ -494,23 +485,16 @@ func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing
 			"b": func() Value { v := vInt(2); v.Annot = "<vpost"; return v }(),
 		},
 		KeyAnn: map[string]string{
-			"a": "kdoc!",  // required (!) + extra doc "kdoc"
-			"b": "<kpost", // POST key annotation
+			"a": "kdoc",   // PRE key doc only (no '!')
+			"b": "<kpost", // POST key annot
 		},
 	}
-	val := Value{Tag: VTMap, Data: mo}
+	got := IxReflect(Value{Tag: VTMap, Data: mo})
 
-	got := IxReflect(val)
-
-	// Build expected runtime-S:
-	// ["map",
-	//   ["pair!", ["annot", ["str","kdoc"], ["str","a"]], ["int",1]],
-	//   ["pair",  ["annot", ["str","<kpost"], ["str","b"]], ["annot", ["str","<vpost"], ["int",2]]]
-	// ]
 	want := vArray(
 		vStr("map"),
 		vArray(
-			vStr("pair!"),
+			vStr("pair"),
 			wrapAnnot(vArray(vStr("str"), vStr("a")), "kdoc"),
 			vArray(vStr("int"), vInt(1)),
 		),
@@ -520,7 +504,6 @@ func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing
 			wrapAnnot(vArray(vStr("int"), vInt(2)), "<vpost"),
 		),
 	)
-
 	mustEqValue(t, got, want)
 }
 
@@ -566,4 +549,219 @@ func Test_Introspection_NestedContainers_AnnotationsPropagate(t *testing.T) {
 	)
 
 	mustEqValue(t, got, want)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// IxFromS (strict decode) & IxToS (soft encode)
+// ────────────────────────────────────────────────────────────────────────────
+
+func Test_Introspection_IxFromS_HardErrors_OnBadShapes(t *testing.T) {
+	// non-array root
+	if _, err := IxFromS(Str("x")); err == nil {
+		t.Fatalf("want error for non-array root")
+	}
+	// empty node
+	if _, err := IxFromS(Arr(nil)); err == nil {
+		t.Fatalf("want error for empty node")
+	}
+	// non-string tag
+	if _, err := IxFromS(vArray(vInt(1))); err == nil {
+		t.Fatalf("want error for non-string tag")
+	}
+	// unsupported scalar kind in payload (VTNull is not allowed as scalar)
+	if _, err := IxFromS(vArray(vStr("int"), Null)); err == nil {
+		t.Fatalf("want error for unsupported scalar kind")
+	}
+}
+
+func Test_Introspection_IxToS_SoftError_DeepInside(t *testing.T) {
+	// Unsupported atom nested inside array → annotated-null soft error
+	bad := S{"array", S{"int", int64(1)}, int32(7)}
+	rt := IxToS(bad)
+	top := rt.Data.([]Value)
+	if rt.Tag != VTArray || len(top) != 3 || top[0].Data.(string) != "annot" {
+		t.Fatalf("expected annotated-null soft error, got %#v", rt)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// IxReflect coverage (oracle, defaults, annotations, types)
+// ────────────────────────────────────────────────────────────────────────────
+
+func Test_Introspection_Reflect_Oracle(t *testing.T) {
+	f := &Fun{
+		IsOracle:   true,
+		Params:     []string{"q"},
+		ParamTypes: []S{S{"id", "Str"}},
+		ReturnType: S{"id", "Str"},
+		Body:       S{"id", "source"},
+	}
+	got := IxReflect(FunVal(f))
+	want := vArray(
+		vStr("oracle"),
+		vArray(vStr("array"),
+			vArray(vStr("pair"), vArray(vStr("id"), vStr("q")), vArray(vStr("id"), vStr("Str"))),
+		),
+		vArray(vStr("id"), vStr("Str")),
+		vArray(vStr("id"), vStr("source")),
+	)
+	mustEqValue(t, got, want)
+}
+
+func Test_Introspection_Reflect_Fun_DefaultsToAny(t *testing.T) {
+	f := &Fun{
+		Params: []string{"x"}, // no ParamTypes/ReturnType set
+		Body:   S{"block"},
+	}
+	got := IxReflect(FunVal(f))
+	// param "x: Any", return Any
+	if got.Tag != VTArray {
+		t.Fatalf("unexpected shape")
+	}
+	arr := got.Data.([]Value)
+	if arr[0].Data.(string) != "fun" {
+		t.Fatalf("want fun, got %#v", got)
+	}
+	params := arr[1]
+	ret := arr[2]
+	mustEqValue(t,
+		params,
+		vArray(vStr("array"), vArray(vStr("pair"), vArray(vStr("id"), vStr("x")), vArray(vStr("id"), vStr("Any")))),
+	)
+	mustEqValue(t, ret, vArray(vStr("id"), vStr("Any")))
+}
+
+func Test_Introspection_Reflect_Annotation_OnScalar(t *testing.T) {
+	v := vInt(1)
+	v.Annot = "<p"
+	got := IxReflect(v)
+	want := vArray(
+		vStr("annot"),
+		vArray(vStr("str"), vStr("<p")),
+		vArray(vStr("int"), vInt(1)),
+	)
+	mustEqValue(t, got, want)
+}
+
+func Test_Introspection_Reflect_Annotation_OnFunAndModule(t *testing.T) {
+	// Function annotation
+	f := FunVal(&Fun{Body: S{"block"}})
+	f.Annot = "pre"
+	gotF := IxReflect(f)
+	if gotF.Data.([]Value)[0].Data.(string) != "annot" {
+		t.Fatalf("function reflect should wrap in annot, got %#v", gotF)
+	}
+
+	// Module annotation
+	ip := NewInterpreter()
+	mv, _ := ip.EvalPersistentSource(`module "M" do end`)
+	mv.Annot = "<post"
+	gotM := IxReflect(mv)
+	if gotM.Data.([]Value)[0].Data.(string) != "annot" {
+		t.Fatalf("module reflect should wrap in annot, got %#v", gotM)
+	}
+}
+
+func Test_Introspection_Reflect_Type_WithEnum(t *testing.T) {
+	tv := TypeVal(S{"enum", S{"int", int64(1)}, S{"str", "a"}})
+	got := IxReflect(tv)
+	want := vArray(
+		vStr("type"),
+		vArray(
+			vStr("enum"),
+			vArray(vStr("int"), vInt(1)),
+			vArray(vStr("str"), vStr("a")),
+		),
+	)
+	mustEqValue(t, got, want)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// IxValidateS (semantic validator) — spot checks
+// ────────────────────────────────────────────────────────────────────────────
+
+func Test_Introspection_Validate_Success_EmptyErrors(t *testing.T) {
+	errs := IxValidateS(S{"binop", "+", S{"int", int64(1)}, S{"int", int64(2)}})
+	if errs.Tag != VTArray || len(errs.Data.([]Value)) != 0 {
+		t.Fatalf("expected no errors, got %#v", errs)
+	}
+}
+
+func Test_Introspection_Validate_ValueMap_ForbidsPairBang(t *testing.T) {
+	errs := IxValidateS(S{"map", S{"pair!", S{"str", "x"}, S{"int", int64(1)}}})
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected an error for pair! in value map")
+	}
+}
+
+func Test_Introspection_Validate_Annot_NotNestable(t *testing.T) {
+	bad := S{"annot", S{"str", "x"}, S{"annot", S{"str", "y"}, S{"int", int64(1)}}}
+	errs := IxValidateS(bad)
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected E_ANNOT_NESTED")
+	}
+}
+
+func Test_Introspection_Validate_AssignableLHS(t *testing.T) {
+	errs := IxValidateS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}})
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected E_ASSIGN_TARGET")
+	}
+}
+
+func Test_Introspection_Validate_ControlArity(t *testing.T) {
+	errs := IxValidateS(S{"return"}) // arity != 2
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected arity error for return")
+	}
+}
+
+func Test_Introspection_Validate_OracleSource_MustBeExpr(t *testing.T) {
+	errs := IxValidateS(S{"oracle", S{"array"}, S{"id", "Any"}, S{"block"}})
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected E_ORACLE_SRC_NOT_EXPR")
+	}
+}
+
+func Test_Introspection_Validate_IfElse_Shape(t *testing.T) {
+	// else must be a block
+	errs := IxValidateS(S{
+		"if",
+		S{"pair", S{"bool", true}, S{"block"}},
+		S{"int", int64(1)},
+	})
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected E_EXPECT_BLOCK for else")
+	}
+}
+
+func Test_Introspection_Validate_EnumMembers_AreExprs(t *testing.T) {
+	// validate inside a type node
+	errs := IxValidateS(S{"type", S{"enum", S{"block"}}})
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected E_ENUM_EXPR")
+	}
+}
+
+func Test_Introspection_Validate_Handle_Forbidden(t *testing.T) {
+	errs := IxValidateS(S{"handle"})
+	if len(errs.Data.([]Value)) == 0 {
+		t.Fatalf("expected E_HANDLE_FORBIDDEN")
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Validation-vs-Reify separation (validator reports, reify hard-fails)
+// ────────────────────────────────────────────────────────────────────────────
+
+func Test_Introspection_ValidateReports_ReifyHardFails(t *testing.T) {
+	// Non-assignable LHS is invalid and should also fail at evaluation.
+	rt := IxToS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}})
+	if len(IxValidateS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}}).Data.([]Value)) == 0 {
+		t.Fatalf("expected validator errors")
+	}
+	ip := NewInterpreter()
+	if _, err := ip.IxReify(rt); err == nil {
+		t.Fatalf("expected hard failure in IxReify")
+	}
 }

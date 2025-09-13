@@ -212,7 +212,7 @@ For (arrays, maps, modules, host iterables):
 ]
 ```
 
-`return` / `break` / `continue` carry values (default `["null"]`):
+`return` / `break` / `continue` requires exactly one value (use `["null"]` for empty):
 
 ```json
 ["block",

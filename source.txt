@@ -1,1034 +1,663 @@
-=== BEGIN FILE: introspection.go ===
+=== BEGIN PUBLIC SECTION OF FILE: lexer.go ===
+// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
+// MindScript language. It converts a source string into a linear stream of
+// tokens with accurate source positions and rich literal decoding.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-LEVEL OVERVIEW
+//
+// The lexer scans left→right and emits Token values, always ending with EOF.
+// Each token carries:
+//   - Type     — a TokenType enum
+//   - Lexeme   — the exact source slice (verbatim characters from the input)
+//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
+//   - Line/Col — 1-based line and 0-based column of the token’s *start*
+//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
+//
+// Whitespace-sensitive delimiters:
+//
+//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
+//	whether there is immediate whitespace before the delimiter:
+//
+//	  '('  → LROUND  if there IS preceding whitespace
+//	         CLROUND if there is NO preceding whitespace
+//	  '['  → LSQUARE if there IS preceding whitespace
+//	         CLSQUARE if there is NO preceding whitespace
+//
+// Consequences (user-facing syntax):
+//   - Calls and parameter lists require NO space before '(':
+//     f(x)           // call: uses CLROUND
+//     fun(x: T)      // function params: uses CLROUND
+//     oracle(x: T)   // oracle params: uses CLROUND
+//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
+//     parameter list; the parser will error.
+//   - Indexing requires NO space before '[':
+//     arr[i]         // indexing: uses CLSQUARE
+//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
+//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
+//     CLROUND participates in call/juxtaposition chains.
+//
+// The '.' character is context-sensitive:
+//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
+//     produced.
+//   - Otherwise it is PERIOD (typically for property access).
+//
+// IDENTIFIERS & KEYWORDS
+//
+//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
+//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
+//	After a PERIOD, both identifiers *and* quoted strings are treated as
+//	property names and forced to ID (even if the text is a keyword). This allows:
+//	    obj."then"   // ID with Literal="then"
+//	    obj.then     // ID with Literal="then"
+//
+// LITERALS
+//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
+//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
+//     bytes in the lexeme are validated and decoded.
+//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
+//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
+//   - BOOLEAN — “true” or “false” (Literal: bool).
+//   - NULL    — “null” (Literal: nil).
+//
+// ANNOTATIONS
+//   - Hash-line annotations: one or more consecutive lines where, after optional
+//     indentation, the first non-space is '#'. The leading '#' (and at most one
+//     optional following space) are stripped; lines are joined with '\n', and a
+//     single ANNOTATION token is emitted. A blank/non-# line ends the block.
+//
+// ERRORS (start-of-token anchoring)
+//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
+//     reported as *Error* with precise location anchored to the **start** of the
+//     offending token (the token that is being scanned).
+//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
+//     strings produce *IncompleteError* (still anchored to the token start).
+//
+// OUTPUT
+//   - Scan returns the full token slice *including* the terminal EOF token.
+//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
+//     includes the quotes and escapes), while Literal carries the decoded value.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// FILE ORGANIZATION
+//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
+//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
+//
+// The PUBLIC API docs below are intentionally exhaustive so the behavior is
+// understandable without reading the implementation.
+//
+// ──────────────────────────────────────────────────────────────────────────────
 package mindscript
 
-// introspection.go — encode/decode, reflection, and validation for runtime S-expressions ([])
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// TokenType is the enumeration of all token kinds the lexer can emit.
+// Most names are self-explanatory; groups are listed for clarity.
 //
-// FINAL SURFACE (per policy)
-// --------------------------
-//   IxToS(ast S) Value
-//     • Convert internal AST (S) → runtime-S Value (VTArray with leading VTStr).
-//     • If encoding encounters an unsupported atom, returns a SOFT error as
-//       annotated-null: ["annot", ["str", <msg>], ["null"]].
+// Special:
 //
-//   IxFromS(rt Value) (S, error)
-//     • Strictly decodes runtime-S shape → AST (S) only.
-//     • On malformed/unsupported shapes, returns a HARD error (no partial S).
-//     • Does **not** perform semantic validation (use IxValidate for that).
+//	EOF     — end-of-file sentinel (always the final token)
+//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
 //
-//   IxReflect(v Value) Value
-//     • Return CONSTRUCTOR CODE as runtime-S (a program AST-in-[] that, when
-//       evaluated, rebuilds v). Always emits **canonical modules**:
-//       ["module", ["str", name], ["block", ("assign", ("decl", k), ctor)*]].
-//       - Scalars/arrays/maps → literal nodes
-//       - VTType → ["type", <typeAst>]
-//       - Fun/oracle → ["fun"/"oracle", params, ret/out, body]
-//       - Native functions → ["id", nativeName]
-//       - VTHandle/unknown → SOFT error (annotated-null)
-//     • All annotations are preserved by wrapping constructed node(s) with
-//       ["annot", ["str", txt], node].
+// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
 //
-//   IxValidateS(s S) Value
-//     • Strict **semantic validator** for *canonical* S-programs.
-//     • Returns a **VTArray of VTMap error objects**; **empty array means success**.
-//     • **Enums:** validator accepts **arbitrary expression** members (not just literals).
-//       During evaluation (e.g. via IxReify), those expressions must evaluate to
-//       **literal** values; consequently, the runtime type system (types.go) treats
-//       enums as sets of literals.
+//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
+//	RROUND            — ')'
+//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
+//	RSQUARE           — ']'
+//	LCURLY, RCURLY    — '{', '}'
+//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
 //
-//   (*Interpreter) IxReify(rt Value) (Value, error)
-//     • Decodes (IxFromS) then **evaluates** (like EvalPersistent).
-//     • **No validation is performed** here — call IxValidateS first if needed.
-//     • HARD-fails on decode or evaluation failures.
+// Operators:
 //
-// DESIGN NOTES
+//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
+//	ASSIGN                      — '='
+//	EQ, NEQ                     — '==', '!='
+//	LESS, LESS_EQ               — '<',  '<='
+//	GREATER, GREATER_EQ         — '>',  '>='
+//	BANG                        — '!' (used by the language in object/type literals)
+//	ARROW                       — '->'
+//
+// Literals & identifiers:
+//
+//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
+//
+// Keywords (produced when the identifier text equals these words, except when
+// forced to an ID after PERIOD/property access):
+//
+//	AND, OR, NOT,
+//	LET, DO, END, RETURN, BREAK, CONTINUE,
+//	IF, THEN, ELIF, ELSE,
+//	FUNCTION, ORACLE, MODULE,
+//	FOR, IN, FROM, WHILE,
+//	TYPECONS, TYPE, ENUM
+//
+// Annotation:
+//
+//	ANNOTATION — emitted for multi-line blocks starting with '#'.
+type TokenType int
+
+const (
+	// Special
+	EOF TokenType = iota
+	ILLEGAL
+
+	// Punctuation
+	LROUND   // "(" when preceded by whitespace
+	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
+	RROUND   // ")"
+	LSQUARE  // "["
+	CLSQUARE // "[" when not preceded by whitespace (index-close)
+	RSQUARE  // "]"
+	LCURLY   // "{"
+	RCURLY   // "}"
+	COLON    // ":"
+	COMMA    // ","
+	PERIOD   // "."
+	QUESTION // "?"
+
+	// Operators
+	PLUS
+	MINUS
+	MULT
+	DIV
+	MOD
+	ASSIGN // "="
+	EQ     // "=="
+	NEQ    // "!="
+	LESS
+	LESS_EQ
+	GREATER
+	GREATER_EQ
+	BANG  // "!" (required-field marker in object/type literals)
+	ARROW // "->"
+
+	// Literals & identifiers
+	ID
+	STRING
+	INTEGER
+	NUMBER
+	BOOLEAN
+	NULL
+
+	// Keywords
+	AND
+	OR
+	NOT
+	LET
+	DO
+	END
+	RETURN
+	BREAK
+	CONTINUE
+	IF
+	THEN
+	ELIF
+	ELSE
+	FUNCTION
+	ORACLE
+	MODULE
+	FOR
+	IN
+	FROM
+	WHILE
+	TYPECONS
+	TYPE
+	ENUM
+
+	// Annotation token (from lines starting with '#')
+	ANNOTATION
+	NOOP
+)
+
+// Token is a single lexical unit produced by the lexer.
+//
+// Fields:
+//
+//	Type    — the TokenType kind.
+//	Lexeme  — the exact source slice comprising the token (verbatim, including
+//	          quotes for strings, escape sequences, etc.).
+//	Literal — a decoded value for literal tokens:
+//	          • STRING  → Go string with escapes and surrogate pairs resolved
+//	          • INTEGER → int64
+//	          • NUMBER  → float64
+//	          • BOOLEAN → bool
+//	          • NULL    → nil
+//	          Non-literal tokens usually carry nil or an unmodified string
+//	          (keywords may store their text; property IDs store the property name).
+//	Line    — 1-based line number at which this token starts.
+//	Col     — 0-based column index at which this token starts.
+//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
+type Token struct {
+	Type      TokenType
+	Lexeme    string
+	Literal   interface{}
+	Line      int
+	Col       int
+	StartByte int
+	EndByte   int
+}
+
+// HARD errors produced by the lexer use the unified *Error type defined in
+// errors.go. See DiagLex and DiagIncomplete.
+//
+// In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
+// when input ends inside an unterminated construct (e.g., string literal).
+//
+// **Error locations:** All lexing errors (both hard and incomplete) are anchored
+// to the **start of the offending token** (the token whose scanning raised
+// the error). This makes diagnostics stable and easy to map to spans.
+
+// Lexer is a streaming tokenizer for MindScript.
+//
+// Construction:
+//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
+//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
+//     produce IncompleteError.
+//
+// Semantics:
+//   - Scan() returns the full token slice including EOF. It never panics for
+//     malformed input; instead it returns (nil, error).
+//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
+//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
+//     either preceding whitespace *or* the previous token cannot be a left operand.
+//     Otherwise '.' is PERIOD used for property access.
+//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
+//     even if it matches a keyword.
+//
+// Positioning:
+//   - Line numbers are 1-based; column indices are 0-based.
+//   - A token’s position is captured at the start of scanning that token.
+type Lexer struct {
+	// public type with no exported fields; use constructors + Scan()
+	src    string
+	start  int // start index of current token
+	cur    int // current index
+	line   int // 1-based
+	col    int // 0-based column within line
+	tokens []Token
+
+	// precise token start position
+	tokStartLine int
+	tokStartCol  int
+
+	// interactive mode: produce IncompleteError for unterminated constructs at EOF
+	interactive bool
+}
+
+// NewLexer creates a new lexer for the given source in normal mode.
+func NewLexer(src string) *Lexer {
+	return &Lexer{
+		src: src,
+		// very rough guess to reduce reslices on big files
+		tokens: make([]Token, 0, len(src)/4),
+		line:   1,
+		col:    0,
+	}
+}
+
+// NewLexerInteractive creates a lexer in interactive mode.
+// Unterminated strings return IncompleteError at EOF, allowing REPLs to request more input.
+func NewLexerInteractive(src string) *Lexer {
+	return &Lexer{
+		src:         src,
+		tokens:      make([]Token, 0, len(src)/4),
+		line:        1,
+		col:         0,
+		interactive: true,
+	}
+}
+
+// Scan tokenizes the entire source string and returns the resulting slice of
+// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
+//
+// Error behavior summary:
+//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
+//   - Interactive mode: returns *IncompleteError at EOF if a construct is
+//     unterminated; other issues still return *LexError.
+//
+// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
+// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
+func (l *Lexer) Scan() ([]Token, error) {
+	for {
+		tok, err := l.scanToken()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Type == EOF {
+			return l.tokens, nil
+		}
+	}
+}
+
+=== END PUBLIC SECTION FOR FILE: lexer.go ===
+
+=== BEGIN PUBLIC SECTION OF FILE: parser.go ===
+// parser.go — Pratt parser for MindScript that produces compact S-expressions.
+//
+// OVERVIEW
+// --------
+// This module implements the newline-aware Pratt parser for the MindScript
+// language. It consumes the token stream produced by the *whitespace-sensitive*
+// lexer (see lexer.go) and builds a compact, Lisp-style S-expression (AST).
+//
+// Design goals:
+//   - Keep the grammar readable via precedence rules (Pratt parser).
+//   - Encode the AST in a tiny, serialisable structure (S-expressions).
+//   - Respect whitespace-sensitive signals emitted by the lexer:
+//   - '(' can be LROUND or CLROUND; only CLROUND participates in calls.
+//   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
+//   - '.' is PERIOD unless it started a number in the lexer.
+//   - multi-line '#' annotations become ANNOTATION tokens.
+//   - blank-line runs may be emitted as NOOP tokens.
+//   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
+//     at EOF instead of hard parse errors, suitable for REPLs.
+//
+// Annotation model (lowest precedence):
+//   - PRE annotation decorates the expression to its right.
+//   - POST annotation decorates the expression to its left and can also appear
+//     after a comma or a colon (binding to the element/key/value on the left).
+//   - PRE and POST cannot stack. If both apply to the same expression, they are
+//     merged into a single PRE with text "pre\npost".
+//
+// Nodes & Spans
+// -------------
+// The AST is a tree of S-expressions: []any whose first element is a string tag.
+// **This list is the most important reference.**
+//
+//	("block", n1, n2, ...)
+//	("noop")
+//
+// Literals & identifiers:
+//
+//	("id",   string)              // identifier (includes property names coerced to ID by lexer rules)
+//	("int",  int64)               // from INTEGER
+//	("num",  float64)             // from NUMBER
+//	("str",  string)              // decoded literal
+//	("bool", bool)                // from BOOLEAN
+//	("null")                      // from NULL
+//	("type", expr)                // from 'type' ...
+//
+// Operators / expressions:
+//
+//	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
+//	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
+//	("assign", target, value)     // "=" (right-assoc)
+//
+// Property / call / index:
+//
+//	("call", callee, arg1, arg2, ...)
+//	("get",  obj, ("str", name))             // obj.name or obj."name"
+//	("idx",  obj, indexExpr)                 // obj[expr] or obj.(expr) or obj.12
+//
+// Collections:
+//
+//	("array", e1, e2, ...)
+//	("map",   ("pair",  keyStrExpr, value)*)
+//	("map",   ("pair!", keyStrExpr, value)*) // required-field (key! : value)
+//	("enum",  item1, item2, ...)             // from Enum[ ... ]
+//
+// Functions, modules, control, loops:
+//
+//	("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
+//	("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)
+//	("module",  nameExpr, bodyBlock)
+//	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)
+//	("while", cond, bodyBlock)
+//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//	("return", value)  // value may be "null" per newline semantics
+//	("break",  value)  // value may be "null"
+//	("continue", value)// value may be "null"
+//
+// Declaration patterns (used by 'let' and 'for' targets):
+//
+//	("decl", name)
+//	("darr", p1, p2, ...)
+//	("dobj", ("pair", keyStrExpr, subPattern), ...)
+//
+// Annotations:
+//
+//	("annot", ("str", textOr<text>), wrappedNode)
+//	   • PRE  text stored as-is
+//	   • POST text stored with leading "<"
+//	   • PRE+POST becomes PRE with "pre\npost" (no POST stacking)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SPAN EMISSION INVARIANT (CRITICAL)
+// ----------------------------------
+// **This file now centralizes AST construction and span emission.**
+//
+//   - Every AST node is constructed through `mk*` helpers that *atomically*
+//     append exactly one span for that node.
+//   - Spans are appended in strict **post-order** of the final AST (children
+//     first, then parent), left-to-right among siblings.
+//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule:
+//     child's span first, then the wrapper's span.
+//   - Nodes that are synthesized with no concrete tokens (e.g. default type
+//     `Any`) still receive a placeholder `Span{}` via `mk*` (using tok=-1).
+//   - The root block’s span is appended last.
+//
+// The helpers in this file enforce the invariant mechanically at every construct.
+//
+// Dependencies
 // ------------
-// • Encoding is non-throwing; decoding is strict; validation is strict for the
-//   *canonical (sugar-free)* runtime grammar (no parser sugar).
-// • Value maps must NEVER contain "pair!" (requiredness is type-only).
-// • Oracle 4th child is always an **expression** (not a block).
-// • **Enums:** Members in canonical runtime S may be **expressions**; at evaluation
-//   time they must produce **literal** values (null/bool/int/num/str/array/map). The
-//   runtime type system (types.go) therefore operates on **literal** members only.
-// • **Annotations are not nestable** in canonical runtime S.
-// • Modules are always canonicalized (i.e. lowered) in runtime S.
-// • Negative numbers encode directly as ["int",-2]/["num",-1.5].
-//
-// Dependencies: parser.go (type S), interpreter.go (Value API), types.go (type ASTs).
-//
-// Tabs for indentation per project rules.
+//   - lexer.go
+//   - errors.go (*Error, DiagParse, DiagIncomplete, IsIncomplete)
+//   - spans.go (Span, SpanIndex, BuildSpanIndexPostOrder)
+package mindscript
 
 import (
 	"fmt"
+	"strings"
 )
 
-// ==============================
-// ========== PUBLIC ============
-// ==============================
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
 
-// IxToS converts an internal AST node (S) into a runtime S-expression ([]).
-// Soft-fails with an annotated-null runtime-S if an unsupported atom is found.
-func IxToS(n S) Value { return ixToS_Soft(n) }
+type S = []any
 
-// IxFromS validates a runtime S-expression ([]) and converts it back to S.
-// Hard-fails on malformed shapes or unsupported scalar kinds.
-func IxFromS(rt Value) (S, error) { return ixFromS_Strict(rt) }
+func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
 
-// IxReflect returns CONSTRUCTOR CODE as a runtime S-expression ([]).
-// See the header for mapping. Preserves annotations on v and all nested values.
-// Modules are emitted in **canonical** form only.
-func IxReflect(v Value) Value {
-	s, ok := ixConstructorS_ForValue(v)
-	if !ok {
-		return rtSoftError("cannot reflect value to constructor code")
-	}
-	return IxToS(s) // S → runtime-S
-}
-
-// IxValidateS validates a S program.
-// Returns a VTArray of VTMap error objects; empty array means success (no errors).
-func IxValidateS(s S) Value {
-	return ValidateCanonicalS(s)
-}
-
-// IxReify decodes a runtime-S program and evaluates it in this interpreter.
-// **No validation is performed here** — call IxValidateS first if validation is required.
-// HARD-fails on decode or evaluation failures (per interpreter semantics).
-func (ip *Interpreter) IxReify(rt Value) (Value, error) {
-	ast, err := IxFromS(rt)
+// ParseSExpr parses a complete MindScript source string and returns its AST.
+func ParseSExpr(src string) (S, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
 	if err != nil {
-		return Value{}, err
+		return nil, err
 	}
-	// Evaluate in Global (same as EvalPersistent).
-	return ip.EvalPersistent(ast)
+	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	return p.program()
 }
 
-//// END_OF_PUBLIC
-
-// ==============================
-// ========== PRIVATE ===========
-// ==============================
-
-// ---------- small shared helpers ----------
-
-// annWrapS wraps node with an ["annot", ["str", txt], node] if txt != "".
-func annWrapS(txt string, node S) S {
-	if txt == "" {
-		return node
+// ParseSExprWithSpans parses like ParseSExpr and also returns a *SpanIndex,
+// with spans recorded in strict post-order per the invariant.
+func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, nil, err
 	}
-	return S{"annot", S{"str", txt}, node}
+	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	ast, perr := p.program()
+	if perr != nil {
+		return nil, nil, perr
+	}
+	idx := BuildSpanIndexPostOrder(ast, p.post)
+	return ast, idx, nil
 }
 
-// rtSoftError produces an annotated-null runtime-S.
-func rtSoftError(msg string) Value {
-	return Arr([]Value{
-		Str("annot"),
-		Arr([]Value{Str("str"), Str(msg)}),
-		Arr([]Value{Str("null")}),
-	})
+// ParseSExprInteractive parses in REPL-friendly mode.
+// Unterminated constructs at EOF produce *Error{Kind:DiagIncomplete}.
+func ParseSExprInteractive(src string) (S, error) {
+	lex := NewLexerInteractive(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	return p.program()
 }
 
-// ---------- S → runtime-S (soft) ----------
+=== END PUBLIC SECTION FOR FILE: parser.go ===
 
-func ixToS_Soft(n S) Value {
-	if len(n) == 0 {
-		return annotNull("empty AST node")
-	}
-	tag, ok := n[0].(string)
-	if !ok {
-		return rtSoftError("AST tag is not string")
-	}
-	out := make([]Value, 0, len(n))
-	out = append(out, Str(tag))
-	for i := 1; i < len(n); i++ {
-		switch x := n[i].(type) {
-		case S:
-			out = append(out, ixToS_Soft(x))
-		case string:
-			out = append(out, Str(x))
-		case int64:
-			out = append(out, Int(x))
-		case float64:
-			out = append(out, Num(x))
-		case bool:
-			out = append(out, Bool(x))
-		default:
-			return rtSoftError(fmt.Sprintf("unsupported AST atom %T", x))
-		}
-	}
-	return Arr(out)
-}
-
-// ---------- runtime-S → S (strict shape) ----------
-
-func ixFromS_Strict(v Value) (S, error) {
-	if v.Tag != VTArray {
-		return nil, fmt.Errorf("expected VTArray, got %v", v.Tag)
-	}
-	xs := v.Data.([]Value)
-	if len(xs) == 0 {
-		return nil, fmt.Errorf("empty node (missing tag)")
-	}
-	if xs[0].Tag != VTStr {
-		return nil, fmt.Errorf("node[0] must be VTStr tag, got %v", xs[0].Tag)
-	}
-	tag := xs[0].Data.(string)
-
-	out := make(S, 0, len(xs))
-	out = append(out, tag)
-
-	for i := 1; i < len(xs); i++ {
-		c := xs[i]
-		switch c.Tag {
-		case VTArray:
-			sub, err := ixFromS_Strict(c)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, sub)
-		case VTStr:
-			out = append(out, c.Data.(string))
-		case VTInt:
-			out = append(out, c.Data.(int64))
-		case VTNum:
-			out = append(out, c.Data.(float64))
-		case VTBool:
-			out = append(out, c.Data.(bool))
-		default:
-			return nil, fmt.Errorf("unsupported scalar tag %v", c.Tag)
-		}
-	}
-	return out, nil
-}
-
-// ---------- Value → constructor S (annotation-preserving, canonical modules) ----------
-
-func ixConstructorS_ForValue(v Value) (S, bool) {
-	node, ok := ixConstructorS_core(v)
-	if !ok {
-		return nil, false
-	}
-	return annWrapS(v.Annot, node), true
-}
-
-func ixConstructorS_core(v Value) (S, bool) {
-	switch v.Tag {
-	case VTNull:
-		return S{"null"}, true
-	case VTBool:
-		return S{"bool", v.Data.(bool)}, true
-	case VTInt:
-		return S{"int", v.Data.(int64)}, true
-	case VTNum:
-		return S{"num", v.Data.(float64)}, true
-	case VTStr:
-		return S{"str", v.Data.(string)}, true
-
-	case VTArray:
-		elems := v.Data.([]Value)
-		out := S{"array"}
-		for _, e := range elems {
-			se, ok := ixConstructorS_ForValue(e)
-			if !ok {
-				return nil, false
-			}
-			out = append(out, se)
-		}
-		return out, true
-
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		out := S{"map"}
-		for _, k := range mo.Keys {
-			val := mo.Entries[k]
-			ctor, ok := ixConstructorS_ForValue(val)
-			if !ok {
-				return nil, false
-			}
-			// Requiredness policy: value maps never carry "pair!" (type-only).
-			// We pass through any key docs (minus a lone "!") as PRE/POST annot.
-			keyNode := S{"str", k}
-			if extra := keyDocWithoutBang(mo.KeyAnn[k]); extra != "" {
-				keyNode = annWrapS(extra, keyNode)
-			}
-			out = append(out, S{"pair", keyNode, ctor})
-		}
-		return out, true
-
-	case VTFun:
-		f := v.Data.(*Fun)
-		if f.NativeName != "" {
-			return S{"id", f.NativeName}, true
-		}
-		par := S{"array"}
-		for i, name := range f.Params {
-			var t S
-			if i < len(f.ParamTypes) && f.ParamTypes[i] != nil {
-				t = f.ParamTypes[i]
-			} else {
-				t = S{"id", "Any"}
-			}
-			par = append(par, S{"pair", S{"id", name}, t})
-		}
-		ret := f.ReturnType
-		if ret == nil {
-			ret = S{"id", "Any"}
-		}
-		if f.IsOracle {
-			return S{"oracle", par, ret, f.Body}, true // sourceExpr is an expression
-		}
-		return S{"fun", par, ret, f.Body}, true
-
-	case VTType:
-		tv := v.Data.(*TypeValue)
-		return S{"type", tv.Ast}, true
-
-	case VTModule:
-		name := ""
-		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
-			name = m.Name
-		}
-		mv := AsMapValue(v)        // normalize exports
-		mo := mv.Data.(*MapObject) // map view of module
-		body := S{"block"}         // lowered: block of assigns
-		for _, k := range mo.Keys {
-			ctor, ok := ixConstructorS_ForValue(mo.Entries[k])
-			if !ok {
-				return nil, false
-			}
-			body = append(body, S{"assign", S{"decl", k}, ctor})
-		}
-		return S{"module", S{"str", name}, body}, true
-
-	case VTHandle:
-		return nil, false
-
-	default:
-		return nil, false
-	}
-}
-
-func containsBang(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '!' {
-			return true
-		}
-	}
-	return false
-}
-
-func keyDocWithoutBang(s string) string {
-	// Strip a lone "!" (requiredness marker). Preserve any other docs.
-	if s == "!" {
-		return ""
-	}
-	if containsBang(s) {
-		out := make([]byte, 0, len(s))
-		for i := 0; i < len(s); i++ {
-			if s[i] != '!' {
-				out = append(out, s[i])
-			}
-		}
-		// trim trailing space
-		if n := len(out); n > 0 && out[n-1] == ' ' {
-			out = out[:n-1]
-		}
-		return string(out)
-	}
-	return s
-}
-
-// ==============================
-// ========== VALIDATOR =========
-// ==============================
+=== BEGIN PUBLIC SECTION OF FILE: spans.go ===
+// spans.go — Sidecar spans for MindScript ASTs (S-expressions)
 //
-// ValidateCanonicalS enforces the canonical runtime grammar on S (not runtime-S).
-// Robustness goals:
-//   - Accepts hand-built S: checks arity, tag names, and **payload kinds**
-//     (e.g., ["int", <int64>], ["num", <float64>], ["str", <string>], etc.).
-//   - Distinguishes value vs type contexts; value maps must use "pair" (no "pair!"),
-//     type maps may use "pair!".
-//   - Enum members are **arbitrary expressions** (validated as exprs), not just literals.
-//   - Returns VTArray of VTMap error objects with keys: path!, code!, message!, got!, expect!.
-//     Empty array means "valid".
-func ValidateCanonicalS(s S) Value {
-	errs := []Value{} // VTMap errors
+// WHAT THIS MODULE DOES
+// =====================
+// This module provides a tiny, non-invasive mechanism to associate **source-code
+// byte spans** with nodes of a MindScript AST (encoded as the S-expression type
+// `S` from parser.go) **without modifying the AST itself**.
+//
+// The spans are modeled as half-open byte intervals `[StartByte, EndByte)`
+// relative to the original UTF-8 source. Line/column coordinates are intentionally
+// omitted here to keep the structure minimal; callers can derive them on demand
+// from the original source text.
+//
+// HOW SPANS ARE ASSOCIATED TO NODES
+// =================================
+// We use a *sidecar* structure (`SpanIndex`) keyed by a stable, structural
+// address called a **NodePath**. A `NodePath` is a slice of child indexes
+// into the AST tree: e.g. `[]int{0,2,1}` means “root’s 0th child → its 2nd
+// child → its 1st child”. Paths are defined against the S-expression shape
+// where a node is `[]any{tagString, child0, child1, ...}` — i.e. the first
+// element is the string tag, and child index 0 refers to the element at
+// S[1], child index 1 refers to S[2], etc.
+//
+// This file does **not** compute spans itself. Instead, the parser (or any
+// external producer) records one `Span` per AST node in **post-order**
+// (children before parent) while constructing or inspecting the tree, and
+// then calls `BuildSpanIndexPostOrder(ast, spans)` to bind those spans to
+// concrete paths via a deterministic walk of the AST in the same order.
+//
+// The result is a `SpanIndex` you can query with a `NodePath` to retrieve
+// the associated byte interval in the original source.
+//
+// DEPENDENCIES ON OTHER FILES
+// ===========================
+// • parser.go
+//   - Defines the S-expression node type alias `type S = []any`.
+//   - Produces the AST that this module indexes.
+//   - (Optional instrumentation) While parsing, record a `Span` per finished
+//     node in **post-order** (children first, then the node) using the token
+//     byte spans collected by the lexer.
+//
+// • lexer.go
+//   - Tokens should carry precise byte offsets (`StartByte`/`EndByte`) so that
+//     the parser can compute node spans as:
+//     node.StartByte = firstToken.StartByte
+//     node.EndByte   = lastToken.EndByte
+//
+// PERFORMANCE & CONCURRENCY
+// =========================
+// Building an index is O(n) in the number of AST nodes. `SpanIndex` is
+// read-only after construction and safe to share for concurrent reads.
+// Memory usage is one map entry per node (string key per `NodePath`).
+//
+// PUBLIC VS PRIVATE LAYOUT
+// ========================
+// The file is split into a PUBLIC API (types and functions you call) and a
+// PRIVATE section (helpers and internal details). The PUBLIC API is fully
+// documented so its behavior is understandable without reading the PRIVATE
+// code.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+package mindscript
 
-	// ---- small helpers (local, no bloat) -----------------------------------
+import (
+	"strconv"
+	"strings"
+)
 
-	push := func(path, code, msg, got, expect string) {
-		errs = append(errs, Map(map[string]Value{
-			"path":    Str(path),
-			"code":    Str(code),
-			"message": Str(msg),
-			"got":     Str(got),
-			"expect":  Str(expect),
-		}))
-	}
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
 
-	tagOf := func(n any) string {
-		if ss, ok := n.(S); ok && len(ss) > 0 {
-			if t, ok := ss[0].(string); ok && t != "" {
-				return t
-			}
-		}
-		return "<node>"
-	}
-	arity := func(n S) string { return fmt.Sprintf("%d", len(n)) }
-
-	fmtIdx := func(base, tag string, i int) string {
-		if base == "" || base == "/" {
-			return fmt.Sprintf("/%s[%d]", tag, i)
-		}
-		return fmt.Sprintf("%s/%s[%d]", base, tag, i)
-	}
-
-	expectNode := func(s string) string { return s } // readability
-
-	// Payload-kind checks for hand-built S
-	checkScalarPayload := func(path string, n S, want string) {
-		ok := false
-		switch want {
-		case "str":
-			ok = len(n) == 2
-			if ok {
-				_, ok = n[1].(string)
-			}
-		case "int":
-			ok = len(n) == 2
-			if ok {
-				_, ok = n[1].(int64)
-			}
-		case "num":
-			ok = len(n) == 2
-			if ok {
-				_, ok = n[1].(float64)
-			}
-		case "bool":
-			ok = len(n) == 2
-			if ok {
-				_, ok = n[1].(bool)
-			}
-		case "id":
-			ok = len(n) == 2
-			if ok {
-				_, ok = n[1].(string)
-			}
-		default:
-			ok = true
-		}
-		if !ok {
-			push(path, "E_PAYLOAD_KIND", "invalid payload kind for "+n[0].(string),
-				arity(n)+"/"+fmt.Sprintf("%T", n[1]), want+" payload")
-		}
-	}
-
-	// ["annot", ["str", text], node]; forbid nested annot child
-	checkAnnot := func(n S, path string) bool {
-		if len(n) != 3 {
-			push(path, "E_ANNOT_ARITY", "annotation must have 3 items", arity(n), `["annot",["str",text],node]`)
-			return false
-		}
-		strNode, ok := n[1].(S)
-		if !ok || len(strNode) != 2 || tagOf(strNode) != "str" {
-			push(path+"/annot[1]", "E_ANNOT_TEXT", "annotation text must be a string node", tagOf(n[1]), `["str",text]`)
-			return false
-		}
-		if child, ok := n[2].(S); ok && tagOf(child) == "annot" {
-			push(path+"/annot[2]", "E_ANNOT_NESTED", "nested annotations are not allowed", "annot", "node")
-			return false
-		}
-		return true
-	}
-
-	// Assignable LHS (value context)
-	assignableS := func(n S) bool {
-		if len(n) > 0 && tagOf(n) == "annot" && len(n) == 3 {
-			if inner, ok := n[2].(S); ok {
-				n = inner
-			}
-		}
-		if len(n) == 0 {
-			return false
-		}
-		switch tagOf(n) {
-		case "id", "get", "idx", "decl", "darr", "dobj":
-			return true
-		default:
-			return false
-		}
-	}
-
-	// Expression-ness (block is not an expr)
-	isExpr := func(n S) bool { return len(n) > 0 && tagOf(n) != "block" }
-
-	// Types used in fun/oracle/type nodes
-	var walkType func(S, string)
-
-	// Parameter list (for fun/oracle)
-	checkParams := func(arr S, path string) {
-		if len(arr) == 0 || tagOf(arr) != "array" {
-			push(path, "E_PARAMS_ARRAY", "params must be an array node", tagOf(arr), expectNode(`["array", ...]`))
-			return
-		}
-		for i := 1; i < len(arr); i++ {
-			pi, ok := arr[i].(S)
-			pPath := fmtIdx(path, "param", i-1)
-			if !ok || len(pi) != 3 || tagOf(pi) != "pair" {
-				push(pPath, "E_PARAM_PAIR", "param must be a pair(name, type)", tagOf(arr[i]), `["pair",["id",name],Type]`)
-				continue
-			}
-			idn, ok := pi[1].(S)
-			if !ok || tagOf(idn) != "id" {
-				push(pPath+"/name", "E_PARAM_NAME", "param name must be an id node", tagOf(pi[1]), `["id",name]`)
-			} else {
-				checkScalarPayload(pPath+"/name", idn, "id")
-			}
-			if tt, ok := pi[2].(S); ok {
-				walkType(tt, pPath+"/type")
-			} else {
-				push(pPath+"/type", "E_NODE_SHAPE", "type must be a node", fmt.Sprintf("%T", pi[2]), "node")
-			}
-		}
-	}
-
-	// Main walkers ------------------------------------------------------------
-
-	var walk func(S, string, bool)
-
-	// Type walker (structural)
-	walkType = func(t S, path string) {
-		if len(t) == 0 {
-			push(path, "E_EMPTY_NODE", "empty type node", "", "tagged node")
-			return
-		}
-		switch tagOf(t) {
-		case "id":
-			checkScalarPayload(path, t, "id")
-
-		case "unop":
-			if len(t) != 3 || t[1] != "?" {
-				push(path, "E_TYPE_UNOP", "only nullable ('?') is supported", tagOf(t), `["unop","?",T]`)
-				return
-			}
-			if sub, ok := t[2].(S); ok {
-				walkType(sub, path+`/?`)
-			} else {
-				push(path+`/?`, "E_NODE_SHAPE", "type must be a node", fmt.Sprintf("%T", t[2]), "node")
-			}
-
-		case "array":
-			// Canonical: exactly one element type (["array", T])
-			if len(t) != 2 {
-				push(path, "E_TYPE_ARRAY_ELEM_ARITY", "array type requires exactly one element type", arity(t), "2")
-				return
-			}
-			if sub, ok := t[1].(S); ok {
-				walkType(sub, path+"/array")
-			} else {
-				push(path+"/array", "E_NODE_SHAPE", "element type must be a node", fmt.Sprintf("%T", t[1]), "node")
-			}
-
-		case "map":
-			for i := 1; i < len(t); i++ {
-				p, ok := t[i].(S)
-				idx := fmtIdx(path, "map", i-1)
-				if !ok || len(p) != 3 {
-					push(idx, "E_PAIR_SHAPE", "type field must be a triple", arity(p), "3")
-					continue
-				}
-				ptag := tagOf(p)
-				if ptag != "pair" && ptag != "pair!" {
-					push(idx, "E_PAIR_TAG", "type map entries must be 'pair' or 'pair!'", ptag, "pair|pair!")
-					continue
-				}
-				key, ok := p[1].(S)
-				if !ok || (tagOf(key) != "str" && tagOf(key) != "annot") {
-					push(idx+"/key", "E_KEY_SHAPE", "field key must be a string (optionally annotated)", tagOf(p[1]), `["str",k] or ["annot",...]`)
-					continue
-				}
-				// annotated key → unwrap and re-check
-				if tagOf(key) == "annot" {
-					if !checkAnnot(key, idx+"/key") {
-						continue
-					}
-					key = key[2].(S)
-				}
-				if tagOf(key) != "str" {
-					push(idx+"/key", "E_KEY_STR", "annotated key must wrap a string node", tagOf(key), `["str",k]`)
-					continue
-				}
-				checkScalarPayload(idx+"/key", key, "str")
-
-				// field type
-				if tt, ok := p[2].(S); ok {
-					walkType(tt, idx+"/type")
-				} else {
-					push(idx+"/type", "E_NODE_SHAPE", "field type must be a node", fmt.Sprintf("%T", p[2]), "node")
-				}
-			}
-
-		case "enum":
-			// NEW: enum members are arbitrary **expressions**, validated as exprs.
-			for i := 1; i < len(t); i++ {
-				member, ok := t[i].(S)
-				mPath := fmtIdx(path, "enum", i-1)
-				if !ok {
-					push(mPath, "E_NODE_SHAPE", "enum member must be a node", fmt.Sprintf("%T", t[i]), "node")
-					continue
-				}
-				// Must be an expression (not a block)
-				if !isExpr(member) {
-					push(mPath, "E_ENUM_EXPR", "enum member must be an expression node", tagOf(member), "expr")
-					continue
-				}
-				walk(member, mPath, false)
-			}
-
-		case "binop":
-			if len(t) != 4 || t[1] != "->" {
-				push(path, "E_TYPE_BINOP", "function type must be ['binop','->',A,B]", tagOf(t), `["binop","->",A,B]`)
-				return
-			}
-			if a, ok := t[2].(S); ok {
-				walkType(a, path+"/->/A")
-			} else {
-				push(path+"/->/A", "E_NODE_SHAPE", "A must be a type node", fmt.Sprintf("%T", t[2]), "node")
-			}
-			if b, ok := t[3].(S); ok {
-				walkType(b, path+"/->/B")
-			} else {
-				push(path+"/->/B", "E_NODE_SHAPE", "B must be a type node", fmt.Sprintf("%T", t[3]), "node")
-			}
-
-		case "annot":
-			if !checkAnnot(t, path) {
-				return
-			}
-			if sub, ok := t[2].(S); ok {
-				walkType(sub, path+"/annot[2]")
-			} else {
-				push(path+"/annot[2]", "E_NODE_SHAPE", "annotated child must be a node", fmt.Sprintf("%T", t[2]), "node")
-			}
-
-		default:
-			push(path, "E_UNKNOWN_TYPE_TAG", "unknown type tag", tagOf(t), "known type tag")
-		}
-	}
-
-	// Value/expression walker
-	walk = func(n S, path string, inType bool) {
-		if len(n) == 0 {
-			push(path, "E_EMPTY_NODE", "empty node", "", "tagged node")
-			return
-		}
-		tag := tagOf(n)
-
-		// Disallow "handle" in canonical runtime S
-		if tag == "handle" {
-			push(path, "E_HANDLE_FORBIDDEN", "'handle' constructs are not allowed", "handle", "n/a")
-			return
-		}
-
-		switch tag {
-		// ---- scalars & ids (payload-kind robust checks) ----
-		case "null":
-			if len(n) != 1 {
-				push(path, "E_ARITY", "null takes no payload", arity(n), "1")
-			}
-		case "bool":
-			checkScalarPayload(path, n, "bool")
-		case "int":
-			checkScalarPayload(path, n, "int")
-		case "num":
-			checkScalarPayload(path, n, "num")
-		case "str":
-			checkScalarPayload(path, n, "str")
-		case "id":
-			checkScalarPayload(path, n, "id")
-
-		// ---- wrappers ----
-		case "annot":
-			if !checkAnnot(n, path) {
-				return
-			}
-			if child, ok := n[2].(S); ok {
-				walk(child, path+"/annot[2]", inType)
-			} else {
-				push(path+"/annot[2]", "E_NODE_SHAPE", "annotated child must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-
-		// ---- containers ----
-		case "array":
-			for i := 1; i < len(n); i++ {
-				sub, ok := n[i].(S)
-				if !ok {
-					push(fmtIdx(path, "array", i-1), "E_NODE_SHAPE", "array element must be a node", fmt.Sprintf("%T", n[i]), "node")
-					continue
-				}
-				walk(sub, fmtIdx(path, "array", i-1), inType)
-			}
-
-		case "map":
-			for i := 1; i < len(n); i++ {
-				p, ok := n[i].(S)
-				idx := fmtIdx(path, "map", i-1)
-				if !ok || len(p) != 3 {
-					push(idx, "E_PAIR_SHAPE", "map entry must be a triple", arity(p), "3")
-					continue
-				}
-				ptag := tagOf(p)
-				if inType {
-					if ptag != "pair" && ptag != "pair!" {
-						push(idx, "E_PAIR_TAG", "type map entries must be 'pair' or 'pair!'", ptag, "pair|pair!")
-						continue
-					}
-				} else {
-					if ptag != "pair" {
-						push(idx, "E_VALUE_MAP_REQUIREDNESS", "required fields ('pair!') are only allowed in TYPE maps", ptag, "pair")
-						continue
-					}
-				}
-				key, ok := p[1].(S)
-				if !ok || (tagOf(key) != "str" && tagOf(key) != "annot") {
-					push(idx+"/key", "E_KEY_SHAPE", "key must be a string (optionally annotated)", tagOf(p[1]), `["str",k] or ["annot",...]`)
-					continue
-				}
-				if tagOf(key) == "annot" {
-					if !checkAnnot(key, idx+"/key") {
-						continue
-					}
-					key = key[2].(S)
-				}
-				if tagOf(key) != "str" {
-					push(idx+"/key", "E_KEY_STR", "annotated key must wrap a string node", tagOf(key), `["str",k]`)
-					continue
-				}
-				checkScalarPayload(idx+"/key", key, "str")
-
-				val, ok := p[2].(S)
-				if !ok {
-					push(idx+"/val", "E_NODE_SHAPE", "value must be a node", fmt.Sprintf("%T", p[2]), "node")
-					continue
-				}
-				walk(val, idx+"/val", inType)
-			}
-
-		// ---- calls / access / ops ----
-		case "call":
-			if len(n) < 2 {
-				push(path, "E_ARITY", "call requires at least callee", arity(n), ">=2")
-				return
-			}
-			if c, ok := n[1].(S); ok {
-				walk(c, path+"/call[0]", inType)
-			} else {
-				push(path+"/call[0]", "E_NODE_SHAPE", "callee must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-			for i := 2; i < len(n); i++ {
-				if a, ok := n[i].(S); ok {
-					walk(a, fmtIdx(path, "call", i-2), inType)
-				} else {
-					push(fmtIdx(path, "call", i-2), "E_NODE_SHAPE", "argument must be a node", fmt.Sprintf("%T", n[i]), "node")
-				}
-			}
-
-		case "get":
-			if len(n) != 3 {
-				push(path, "E_ARITY", "get requires 2 children", arity(n), "3")
-				return
-			}
-			if obj, ok := n[1].(S); ok {
-				walk(obj, path+"/get/obj", inType)
-			} else {
-				push(path+"/get/obj", "E_NODE_SHAPE", "object must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-			prop, ok := n[2].(S)
-			if !ok || tagOf(prop) != "str" {
-				push(path+"/get/prop", "E_PROP_STR", "property name must be a string node", tagOf(n[2]), `["str",name]`)
-				return
-			}
-			checkScalarPayload(path+"/get/prop", prop, "str")
-
-		case "idx":
-			if len(n) != 3 {
-				push(path, "E_ARITY", "idx requires 2 children", arity(n), "3")
-				return
-			}
-			if obj, ok := n[1].(S); ok {
-				walk(obj, path+"/idx/obj", inType)
-			} else {
-				push(path+"/idx/obj", "E_NODE_SHAPE", "object must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-			if ix, ok := n[2].(S); ok {
-				walk(ix, path+"/idx/ix", inType)
-			} else {
-				push(path+"/idx/ix", "E_NODE_SHAPE", "index must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-
-		case "unop":
-			if len(n) != 3 {
-				push(path, "E_ARITY", "unop requires op and rhs", arity(n), "3")
-				return
-			}
-			if rhs, ok := n[2].(S); ok {
-				walk(rhs, path+"/unop/rhs", inType)
-			} else {
-				push(path+"/unop/rhs", "E_NODE_SHAPE", "rhs must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-
-		case "binop":
-			if len(n) != 4 {
-				push(path, "E_ARITY", "binop requires op, lhs, rhs", arity(n), "4")
-				return
-			}
-			if l, ok := n[2].(S); ok {
-				walk(l, path+"/binop/lhs", inType)
-			} else {
-				push(path+"/binop/lhs", "E_NODE_SHAPE", "lhs must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-			if r, ok := n[3].(S); ok {
-				walk(r, path+"/binop/rhs", inType)
-			} else {
-				push(path+"/binop/rhs", "E_NODE_SHAPE", "rhs must be a node", fmt.Sprintf("%T", n[3]), "node")
-			}
-
-		case "assign":
-			if len(n) != 3 {
-				push(path, "E_ARITY", "assign requires target and value", arity(n), "3")
-				return
-			}
-			if !assignableS(n[1].(S)) {
-				push(path+"/assign/lhs", "E_ASSIGN_TARGET", "invalid assignment target", tagOf(n[1]), "id|get|idx|decl|darr|dobj")
-			}
-			if rhs, ok := n[2].(S); ok {
-				walk(rhs, path+"/assign/rhs", inType)
-			} else {
-				push(path+"/assign/rhs", "E_NODE_SHAPE", "rhs must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-
-		// ---- patterns ----
-		case "decl":
-			checkScalarPayload(path, n, "id")
-		case "darr":
-			for i := 1; i < len(n); i++ {
-				sub, ok := n[i].(S)
-				if !ok {
-					push(fmtIdx(path, "darr", i-1), "E_NODE_SHAPE", "array pattern element must be a node", fmt.Sprintf("%T", n[i]), "node")
-					continue
-				}
-				walk(sub, fmtIdx(path, "darr", i-1), inType)
-			}
-		case "dobj":
-			for i := 1; i < len(n); i++ {
-				p, ok := n[i].(S)
-				idx := fmtIdx(path, "dobj", i-1)
-				if !ok || len(p) != 3 || tagOf(p) != "pair" {
-					push(idx, "E_PAIR_SHAPE", "object pattern entries must be pair triples", tagOf(p), `["pair", keyStr, subPattern]`)
-					continue
-				}
-				key, ok := p[1].(S)
-				if !ok || (tagOf(key) != "str" && tagOf(key) != "annot") {
-					push(idx+"/key", "E_KEY_SHAPE", "key must be a string (optionally annotated)", tagOf(p[1]), `["str",k] or ["annot",...]`)
-					continue
-				}
-				if tagOf(key) == "annot" {
-					if !checkAnnot(key, idx+"/key") {
-						continue
-					}
-					key = key[2].(S)
-				}
-				if tagOf(key) != "str" {
-					push(idx+"/key", "E_KEY_STR", "annotated key must wrap a string node", tagOf(key), `["str",k]`)
-				} else {
-					checkScalarPayload(idx+"/key", key, "str")
-				}
-				if sub, ok := p[2].(S); ok {
-					walk(sub, idx+"/val", inType)
-				} else {
-					push(idx+"/val", "E_NODE_SHAPE", "subpattern must be a node", fmt.Sprintf("%T", p[2]), "node")
-				}
-			}
-
-		// ---- statements / blocks ----
-		case "block":
-			for i := 1; i < len(n); i++ {
-				sub, ok := n[i].(S)
-				if !ok {
-					push(fmtIdx(path, "block", i-1), "E_NODE_SHAPE", "block child must be a node", fmt.Sprintf("%T", n[i]), "node")
-					continue
-				}
-				walk(sub, fmtIdx(path, "block", i-1), inType)
-			}
-
-		case "return", "break", "continue":
-			if len(n) != 2 {
-				push(path, "E_ARITY", tag+` requires exactly one payload (use ["null"] for empty)`, arity(n), "2")
-				return
-			}
-			if arg, ok := n[1].(S); ok {
-				walk(arg, path+"/"+tag+"/arg", inType)
-			} else {
-				push(path+"/"+tag+"/arg", "E_NODE_SHAPE", "argument must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-
-		case "if":
-			if len(n) < 2 {
-				push(path, "E_ARITY", "if requires at least one arm", arity(n), ">=2")
-				return
-			}
-			for i := 1; i < len(n); i++ {
-				arm, ok := n[i].(S)
-				aPath := fmtIdx(path, "if", i-1)
-				if !ok || len(arm) == 0 {
-					push(aPath, "E_NODE_SHAPE", "if arm must be a node", tagOf(arm), "pair|block")
-					continue
-				}
-				// all but last → pair(cond, block)
-				if i < len(n)-1 || (i == len(n)-1 && tagOf(arm) == "pair") {
-					if len(arm) != 3 || tagOf(arm) != "pair" {
-						push(aPath, "E_IF_ARM", "if arm must be a pair(cond, block)", tagOf(arm), "pair")
-						continue
-					}
-					if c, ok := arm[1].(S); ok {
-						walk(c, aPath+"/cond", inType)
-					} else {
-						push(aPath+"/cond", "E_NODE_SHAPE", "cond must be a node", fmt.Sprintf("%T", arm[1]), "node")
-					}
-					tb, ok := arm[2].(S)
-					if !ok || tagOf(tb) != "block" {
-						push(aPath+"/then", "E_EXPECT_BLOCK", "then arm must be a block", tagOf(arm[2]), "block")
-						continue
-					}
-					walk(tb, aPath+"/then", inType)
-				} else {
-					// last may be else block
-					if tagOf(arm) != "block" {
-						push(aPath+"/else", "E_EXPECT_BLOCK", "else arm must be a block", tagOf(arm), "block")
-						continue
-					}
-					walk(arm, aPath+"/else", inType)
-				}
-			}
-
-		case "while":
-			if len(n) != 3 {
-				push(path, "E_ARITY", "while requires cond and body", arity(n), "3")
-				return
-			}
-			if c, ok := n[1].(S); ok {
-				walk(c, path+"/while/cond", inType)
-			} else {
-				push(path+"/while/cond", "E_NODE_SHAPE", "cond must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-			b, ok := n[2].(S)
-			if !ok || tagOf(b) != "block" {
-				push(path+"/while/body", "E_EXPECT_BLOCK", "while body must be a block", tagOf(n[2]), "block")
-				return
-			}
-			walk(b, path+"/while/body", inType)
-
-		case "for":
-			if len(n) != 4 {
-				push(path, "E_ARITY", "for requires target, iter, body", arity(n), "4")
-				return
-			}
-			if t, ok := n[1].(S); ok {
-				walk(t, path+"/for/target", inType)
-			} else {
-				push(path+"/for/target", "E_NODE_SHAPE", "target must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-			if it, ok := n[2].(S); ok {
-				walk(it, path+"/for/iter", inType)
-			} else {
-				push(path+"/for/iter", "E_NODE_SHAPE", "iter must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-			b, ok := n[3].(S)
-			if !ok || tagOf(b) != "block" {
-				push(path+"/for/body", "E_EXPECT_BLOCK", "for body must be a block", tagOf(n[3]), "block")
-				return
-			}
-			walk(b, path+"/for/body", inType)
-
-		case "fun":
-			if len(n) != 4 {
-				push(path, "E_ARITY", "fun requires params, retType, body", arity(n), "4")
-				return
-			}
-			if ps, ok := n[1].(S); ok {
-				checkParams(ps, path+"/fun/params")
-			} else {
-				push(path+"/fun/params", "E_NODE_SHAPE", "params must be an array node", fmt.Sprintf("%T", n[1]), `["array", ...]`)
-			}
-			if rt, ok := n[2].(S); ok {
-				walkType(rt, path+"/fun/ret")
-			} else {
-				push(path+"/fun/ret", "E_NODE_SHAPE", "return type must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-			b, ok := n[3].(S)
-			if !ok || tagOf(b) != "block" {
-				push(path+"/fun/body", "E_EXPECT_BLOCK", "fun body must be a block", tagOf(n[3]), "block")
-				return
-			}
-			walk(b, path+"/fun/body", inType)
-
-		case "oracle":
-			if len(n) != 4 {
-				push(path, "E_ARITY", "oracle requires params, outType, sourceExpr", arity(n), "4")
-				return
-			}
-			if ps, ok := n[1].(S); ok {
-				checkParams(ps, path+"/oracle/params")
-			} else {
-				push(path+"/oracle/params", "E_NODE_SHAPE", "params must be an array node", fmt.Sprintf("%T", n[1]), `["array", ...]`)
-			}
-			if ot, ok := n[2].(S); ok {
-				walkType(ot, path+"/oracle/out")
-			} else {
-				push(path+"/oracle/out", "E_NODE_SHAPE", "output type must be a node", fmt.Sprintf("%T", n[2]), "node")
-			}
-			src, ok := n[3].(S)
-			if !ok || !isExpr(src) {
-				push(path+"/oracle/src", "E_ORACLE_SRC_NOT_EXPR", "oracle source must be an expression", tagOf(n[3]), "expr")
-				return
-			}
-			walk(src, path+"/oracle/src", inType)
-
-		case "module":
-			if len(n) != 3 {
-				push(path, "E_ARITY", "module requires nameExpr and bodyBlock", arity(n), "3")
-				return
-			}
-			if name, ok := n[1].(S); ok {
-				walk(name, path+"/module/name", inType)
-			} else {
-				push(path+"/module/name", "E_NODE_SHAPE", "name must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-			b, ok := n[2].(S)
-			if !ok || tagOf(b) != "block" {
-				push(path+"/module/body", "E_EXPECT_BLOCK", "module body must be a block", tagOf(n[2]), "block")
-				return
-			}
-			walk(b, path+"/module/body", inType)
-
-		case "type":
-			if len(n) != 2 {
-				push(path, "E_ARITY", "type requires one child", arity(n), "2")
-				return
-			}
-			if tt, ok := n[1].(S); ok {
-				walkType(tt, path+"/type")
-			} else {
-				push(path+"/type", "E_NODE_SHAPE", "type must be a node", fmt.Sprintf("%T", n[1]), "node")
-			}
-
-		default:
-			push(path, "E_UNKNOWN_TAG", "unknown tag", tag, "known tag")
-		}
-	}
-
-	// Run and return
-	walk(s, "/", false)
-	return Arr(errs)
+// Span represents a half-open byte interval [StartByte, EndByte) in the original
+// source text. Offsets are counted in bytes from the start of the UTF-8 source.
+// EndByte is exclusive.
+//
+// Line/column coordinates are not stored here to keep Span minimal; if you need
+// them, compute (line, col) from the original source using your preferred mapping.
+type Span struct {
+	StartByte int // inclusive
+	EndByte   int // exclusive
 }
-=== END FILE: introspection.go ===
+
+// NodePath is a stable structural address into an S-expression AST.
+// Each integer selects a child in the node's children array:
+//
+//	path element k  → child at S[k+1] (since S[0] is the string tag).
+//
+// Example:
+//
+//	// ("call", callee, arg0, arg1)
+//	//  tag   ^      ^ child0 ^ child1
+//	//  S[0]        S[1]      S[2]     S[3]
+//	path []int{0}   → callee
+//	path []int{2}   → arg1
+type NodePath []int
+
+// SpanIndex stores a sidecar mapping from NodePath → Span for an AST.
+// It is read-only after construction. Use Get to retrieve spans by path.
+//
+// Typical construction flow (performed by the parser or a post-pass):
+//  1. Walk/construct the AST while recording one Span per node in post-order.
+//  2. Call BuildSpanIndexPostOrder(ast, postorderSpans) to bind spans to paths.
+//  3. Query with si.Get(path) wherever you need source intervals.
+type SpanIndex struct {
+	byPath map[string]Span
+}
+
+// Get returns the span associated with the given path, if present.
+// The boolean is false if the path is unknown or the index is nil.
+//
+// A SpanIndex may be partial (e.g., producer skipped some nodes). In that case
+// only the recorded nodes will resolve to spans.
+func (si *SpanIndex) Get(p NodePath) (Span, bool) {
+	if si == nil {
+		return Span{}, false
+	}
+	sp, ok := si.byPath[pathKey(p)]
+	return sp, ok
+}
+
+// BuildSpanIndexPostOrder constructs a SpanIndex by walking the AST in
+// **post-order** (children before parent) and binding each visited node to
+// the next span from the provided `postorder` slice.
+//
+// Contract:
+//   - The `postorder` slice must list exactly one Span for each node in `root`
+//     in post-order. If it is longer, extras are ignored; if shorter, remaining
+//     nodes are left unindexed (Get will return (Span{}, false) for them).
+//   - The resulting index is read-only and safe for concurrent reads.
+//
+// Complexity: O(n) time and O(n) space where n is the number of AST nodes.
+//
+// Example usage (parser instrumentation idea):
+//
+//	// During parse, for each finished node (after parsing children):
+//	//   spans = append(spans, Span{StartByte:firstTok.StartByte, EndByte:lastTok.EndByte})
+//	idx := BuildSpanIndexPostOrder(ast, spans)
+//	sp, ok := idx.Get(NodePath{0,2}) // lookup "child 0's child 2"
+func BuildSpanIndexPostOrder(root S, postorder []Span) *SpanIndex {
+	si := &SpanIndex{byPath: make(map[string]Span, len(postorder))}
+	bindPostOrder(si, root, postorder)
+	return si
+}
+
+=== END PUBLIC SECTION FOR FILE: spans.go ===
 

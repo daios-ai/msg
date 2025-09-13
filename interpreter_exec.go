@@ -265,7 +265,10 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 	paramName := f.Params[0]
 	paramType := f.ParamTypes[0]
 	if !ip.isType(arg, paramType, f.Env) {
-		fail(fmt.Sprintf("type mismatch in parameter '%s'", paramName))
+		exp := FormatType(ip.resolveType(paramType, f.Env))
+		got := FormatType(ip.ValueToType(arg, f.Env))
+		fail(fmt.Sprintf("type mismatch in parameter '%s': expected %s, got %s",
+			paramName, exp, got))
 	}
 
 	parent := f.Env
@@ -330,7 +333,9 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
 		ip.currentSrc = prev
 		if !ip.isType(res, f.ReturnType, f.Env) {
-			fail("return type mismatch")
+			exp := FormatType(ip.resolveType(f.ReturnType, f.Env))
+			got := FormatType(ip.ValueToType(res, f.Env))
+			fail(fmt.Sprintf("return type mismatch: expected %s, got %s", exp, got))
 		}
 		return res
 	}
@@ -352,8 +357,10 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 	switch res.status {
 	case vmOK, vmReturn:
 		if !ip.isType(res.value, f.ReturnType, f.Env) {
+			exp := FormatType(ip.resolveType(f.ReturnType, f.Env))
+			got := FormatType(ip.ValueToType(res.value, f.Env))
 			line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
-			panicRt("return type mismatch", f.Src, line, col)
+			panicRt(fmt.Sprintf("return type mismatch: expected %s, got %s", exp, got), f.Src, line, col)
 		}
 		return res.value
 	case vmRuntimeError:

@@ -782,13 +782,11 @@ func parenIf(need int, d *Doc, n S) *Doc {
 	return d
 }
 
-// AST helper: does this node carry a top-level POST annotation?
-func astHasPostInline(n S) bool {
-	if tag(n) == "annot" {
-		_, _, pre := asAnnotAST(n)
-		return !pre
+func parenIfLE(need int, d *Doc, n S) *Doc {
+	if exprPrec(n) <= need {
+		return Concat(Text("("), d, Text(")"))
 	}
-	return false
+	return d
 }
 
 /* ---------- AST → Doc ---------- */
@@ -1016,11 +1014,23 @@ func docExpr(n S) *Doc {
 
 	case "binop":
 		op, l, r := n[1].(string), n[2].(S), n[3].(S)
-		my := 60
+		my, right := 60, false
 		if pr, ok := binPrec[op]; ok {
-			my = pr.p
+			my, right = pr.p, pr.right
 		}
-		return Concat(docExprMin(l, my), Text(" "+op+" "), docExprMin(r, my))
+		// Associativity-aware parentheses:
+		//  - right-assoc:  paren LEFT if prec(left) <= my; RIGHT if prec(right) < my
+		//  - left-assoc:   paren LEFT if prec(left) <  my; RIGHT if prec(right) <= my
+		lDoc := docExpr(l)
+		rDoc := docExpr(r)
+		if right {
+			lDoc = parenIfLE(my, lDoc, l) // inclusive on left
+			rDoc = parenIf(my, rDoc, r)   // exclusive on right
+		} else {
+			lDoc = parenIf(my, lDoc, l)   // exclusive on left
+			rDoc = parenIfLE(my, rDoc, r) // inclusive on right
+		}
+		return Concat(lDoc, Text(" "+op+" "), rDoc)
 
 	case "assign":
 		l, r := n[1].(S), n[2].(S)

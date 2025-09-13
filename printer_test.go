@@ -815,3 +815,12 @@ p, y: q} = xs`
 		"} = xs"
 	eq(t, pretty(t, in2), want2)
 }
+
+func Test_Printer_FunctionType_Parentheses(t *testing.T) {
+	in := `fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do end`
+	want := `
+fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do
+
+end`
+	eq(t, pretty(t, in), want)
+}

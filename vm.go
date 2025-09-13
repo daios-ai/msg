@@ -42,7 +42,8 @@
 //   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
 //   - Env (lexical chain) for resolving globals
 //   - Interpreter methods: deepEqual, applyArgsScoped
-//   - Negative array indices wrap (Python-like): i := (i%len + len) % len
+//   - Negative array indices count from the end (Python-like -1 is last, -len is first),
+//     but indices < -len (and ≥ len) are out of bounds.
 //   - Property access on maps/modules; index access on arrays/maps
 //   - Numeric ops preserve integers where possible; division/mod guard zero;
 //     string relational comparisons are supported for <, <=, >, >=.
@@ -459,7 +460,7 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res v
 				}
 				i := int(idx.Data.(int64))
 				if i < 0 {
-					i = (i%len(xs) + len(xs)) % len(xs)
+					i = len(xs) + i // -1 -> last, -len -> 0
 				}
 				if i < 0 || i >= len(xs) {
 					return m.fail("array index out of range")

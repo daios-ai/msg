@@ -1,663 +1,1878 @@
-=== BEGIN PUBLIC SECTION OF FILE: lexer.go ===
-// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
-// MindScript language. It converts a source string into a linear stream of
-// tokens with accurate source positions and rich literal decoding.
+=== BEGIN FILE: interpreter_exec.go ===
+// interpreter_exec.go — PRIVATE: execution & call engine for MindScript.
+//   - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
+//     runs on the VM, and **bubbles unified hard errors (*Error) without formatting**.
+//   - Implements function application, currying, and native-call scoping.
+//   - No exported identifiers here. The public facade lives in interpreter.go.
 //
 // ──────────────────────────────────────────────────────────────────────────────
-// HIGH-LEVEL OVERVIEW
+// MARKING PLAN (PRECISE CARETS)
+// =============================
 //
-// The lexer scans left→right and emits Token values, always ending with EOF.
-// Each token carries:
-//   - Type     — a TokenType enum
-//   - Lexeme   — the exact source slice (verbatim characters from the input)
-//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
-//   - Line/Col — 1-based line and 0-based column of the token’s *start*
-//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
+// We make runtime caret locations precise and predictable by aligning VM marks
+// with parser spans.
 //
-// Whitespace-sensitive delimiters:
+// Invariants
+// ----------
+//  1. **1:1 Node ↔ Span (parser)** — the parser records exactly one Span per AST
+//     node (every subexpression has a node and a span).
+//  2. **1:1 Node ↔ Mark (emitter)** — the emitter records **exactly one** PCMark
+//     for every AST node it emits code for. (Nodes that truly produce no code do
+//     not get a mark unless they are direct failure targets.)
+//  3. **Monotonic marks** — marks are appended in bytecode order with PC=here().
+//  4. **No late parent marks** — once we place a child’s mark immediately before
+//     a failure-prone instruction, we must not emit a parent/sibling mark before
+//     that instruction executes.
+//  5. **Correct PathBase** — chunks compiled for function bodies / module bodies
+//     carry a SourceRef whose PathBase points at the body’s absolute AST path,
+//     so marks inside map to the right spans.
 //
-//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
-//	whether there is immediate whitespace before the delimiter:
+// Placement Rules (authoritative)
+// -------------------------------
+//   - **Identifiers**: mark the identifier node **right before** opLoadGlobal.
+//   - **Unary** (-, not): mark the operand **right before** the opcode.
+//   - **Binary** (-,*,/,%, <,<=,>,>=, ==, !=): emit LHS, then RHS; mark the **RHS**
+//     **right before** the arithmetic/compare opcode (or before the builtin CALL
+//     for '+', which lowers to __plus).
+//   - **Calls**: evaluate callee (no mark). For each argument:
+//     1) emit arg code
+//     2) mark the **arg node** **right before** `opCall 1`
+//     3) emit `opCall 1`
+//     For zero-arg call: mark the **callee** right before `opCall 0`.
+//   - **Property** (`obj.name`): emit obj, mark the **property token** right before
+//     `opGetProp`.
+//   - **Index** (`obj[idx]`): emit obj then idx; mark the **idx node** right before
+//     `opGetIdx`.
+//   - **if / while gates**: mark the **tested condition node** right before
+//     `opJumpIfFalse`.
+//   - **Blocks**: never emit a parent mark between a child’s mark and its failing
+//     instruction. No extra block-level mark is needed. **Important:** child
+//     paths must use the **original AST child index** (do not compact after
+//     skipping noopish children), to keep NodePath ↔ Span alignment.
+//   - **Annotations**: attribute errors to the **subject** node (not the wrapper).
+//     For `#(doc) (lhs = rhs)`, we mark the **LHS** before the assignment call.
+//   - **for**: the iterator expression is marked once at the `__to_iter(iterExpr)`
+//     call site. We do not duplicate a mark at the loop head.
 //
-//	  '('  → LROUND  if there IS preceding whitespace
-//	         CLROUND if there is NO preceding whitespace
-//	  '['  → LSQUARE if there IS preceding whitespace
-//	         CLSQUARE if there is NO preceding whitespace
+// NOTE: These rules ensure that the VM’s “last mark with PC ≤ failingPC” picks
+// the blameworthy child.
 //
-// Consequences (user-facing syntax):
-//   - Calls and parameter lists require NO space before '(':
-//     f(x)           // call: uses CLROUND
-//     fun(x: T)      // function params: uses CLROUND
-//     oracle(x: T)   // oracle params: uses CLROUND
-//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
-//     parameter list; the parser will error.
-//   - Indexing requires NO space before '[':
-//     arr[i]         // indexing: uses CLSQUARE
-//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
-//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
-//     CLROUND participates in call/juxtaposition chains.
-//
-// The '.' character is context-sensitive:
-//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
-//     produced.
-//   - Otherwise it is PERIOD (typically for property access).
-//
-// IDENTIFIERS & KEYWORDS
-//
-//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
-//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
-//	After a PERIOD, both identifiers *and* quoted strings are treated as
-//	property names and forced to ID (even if the text is a keyword). This allows:
-//	    obj."then"   // ID with Literal="then"
-//	    obj.then     // ID with Literal="then"
-//
-// LITERALS
-//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
-//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
-//     bytes in the lexeme are validated and decoded.
-//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
-//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
-//   - BOOLEAN — “true” or “false” (Literal: bool).
-//   - NULL    — “null” (Literal: nil).
-//
-// ANNOTATIONS
-//   - Hash-line annotations: one or more consecutive lines where, after optional
-//     indentation, the first non-space is '#'. The leading '#' (and at most one
-//     optional following space) are stripped; lines are joined with '\n', and a
-//     single ANNOTATION token is emitted. A blank/non-# line ends the block.
-//
-// ERRORS (start-of-token anchoring)
-//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
-//     reported as *Error* with precise location anchored to the **start** of the
-//     offending token (the token that is being scanned).
-//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings produce *IncompleteError* (still anchored to the token start).
-//
-// OUTPUT
-//   - Scan returns the full token slice *including* the terminal EOF token.
-//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
-//     includes the quotes and escapes), while Literal carries the decoded value.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-//
-// FILE ORGANIZATION
-//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
-//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
-//
-// The PUBLIC API docs below are intentionally exhaustive so the behavior is
-// understandable without reading the implementation.
-//
-// ──────────────────────────────────────────────────────────────────────────────
+// Error policy (unchanged)
+// ------------------------
+//   - Soft errors → annotated-null Values.
+//   - Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; formatting only
+//     at the public API surface.
 package mindscript
 
 import (
-	"errors"
 	"fmt"
-	"strconv"
-	"strings"
-	"unicode/utf16"
-	"unicode/utf8"
+	"os"
+	"sort"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-//                               PUBLIC API
+//                          PRIVATE EXEC FACADE (to API)
 ////////////////////////////////////////////////////////////////////////////////
 
-// TokenType is the enumeration of all token kinds the lexer can emit.
-// Most names are self-explanatory; groups are listed for clarity.
-//
-// Special:
-//
-//	EOF     — end-of-file sentinel (always the final token)
-//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
-//
-// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
-//
-//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
-//	RROUND            — ')'
-//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
-//	RSQUARE           — ']'
-//	LCURLY, RCURLY    — '{', '}'
-//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
-//
-// Operators:
-//
-//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
-//	ASSIGN                      — '='
-//	EQ, NEQ                     — '==', '!='
-//	LESS, LESS_EQ               — '<',  '<='
-//	GREATER, GREATER_EQ         — '>',  '>='
-//	BANG                        — '!' (used by the language in object/type literals)
-//	ARROW                       — '->'
-//
-// Literals & identifiers:
-//
-//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
-//
-// Keywords (produced when the identifier text equals these words, except when
-// forced to an ID after PERIOD/property access):
-//
-//	AND, OR, NOT,
-//	LET, DO, END, RETURN, BREAK, CONTINUE,
-//	IF, THEN, ELIF, ELSE,
-//	FUNCTION, ORACLE, MODULE,
-//	FOR, IN, FROM, WHILE,
-//	TYPECONS, TYPE, ENUM
-//
-// Annotation:
-//
-//	ANNOTATION — emitted for multi-line blocks starting with '#'.
-type TokenType int
+type execImpl struct{ ip *Interpreter }
 
-const (
-	// Special
-	EOF TokenType = iota
-	ILLEGAL
+func newExec(ip *Interpreter) execCore { return &execImpl{ip: ip} }
 
-	// Punctuation
-	LROUND   // "(" when preceded by whitespace
-	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
-	RROUND   // ")"
-	LSQUARE  // "["
-	CLSQUARE // "[" when not preceded by whitespace (index-close)
-	RSQUARE  // "]"
-	LCURLY   // "{"
-	RCURLY   // "}"
-	COLON    // ":"
-	COMMA    // ","
-	PERIOD   // "."
-	QUESTION // "?"
-
-	// Operators
-	PLUS
-	MINUS
-	MULT
-	DIV
-	MOD
-	ASSIGN // "="
-	EQ     // "=="
-	NEQ    // "!="
-	LESS
-	LESS_EQ
-	GREATER
-	GREATER_EQ
-	BANG  // "!" (required-field marker in object/type literals)
-	ARROW // "->"
-
-	// Literals & identifiers
-	ID
-	STRING
-	INTEGER
-	NUMBER
-	BOOLEAN
-	NULL
-
-	// Keywords
-	AND
-	OR
-	NOT
-	LET
-	DO
-	END
-	RETURN
-	BREAK
-	CONTINUE
-	IF
-	THEN
-	ELIF
-	ELSE
-	FUNCTION
-	ORACLE
-	MODULE
-	FOR
-	IN
-	FROM
-	WHILE
-	TYPECONS
-	TYPE
-	ENUM
-
-	// Annotation token (from lines starting with '#')
-	ANNOTATION
-	NOOP
-)
-
-// Token is a single lexical unit produced by the lexer.
-//
-// Fields:
-//
-//	Type    — the TokenType kind.
-//	Lexeme  — the exact source slice comprising the token (verbatim, including
-//	          quotes for strings, escape sequences, etc.).
-//	Literal — a decoded value for literal tokens:
-//	          • STRING  → Go string with escapes and surrogate pairs resolved
-//	          • INTEGER → int64
-//	          • NUMBER  → float64
-//	          • BOOLEAN → bool
-//	          • NULL    → nil
-//	          Non-literal tokens usually carry nil or an unmodified string
-//	          (keywords may store their text; property IDs store the property name).
-//	Line    — 1-based line number at which this token starts.
-//	Col     — 0-based column index at which this token starts.
-//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
-type Token struct {
-	Type      TokenType
-	Lexeme    string
-	Literal   interface{}
-	Line      int
-	Col       int
-	StartByte int
-	EndByte   int
-}
-
-// HARD errors produced by the lexer use the unified *Error type defined in
-// errors.go. See DiagLex and DiagIncomplete.
-//
-// In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
-// when input ends inside an unterminated construct (e.g., string literal).
-//
-// **Error locations:** All lexing errors (both hard and incomplete) are anchored
-// to the **start of the offending token** (the token whose scanning raised
-// the error). This makes diagnostics stable and easy to map to spans.
-
-// Lexer is a streaming tokenizer for MindScript.
-//
-// Construction:
-//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
-//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
-//     produce IncompleteError.
-//
-// Semantics:
-//   - Scan() returns the full token slice including EOF. It never panics for
-//     malformed input; instead it returns (nil, error).
-//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
-//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
-//     either preceding whitespace *or* the previous token cannot be a left operand.
-//     Otherwise '.' is PERIOD used for property access.
-//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
-//     even if it matches a keyword.
-//
-// Positioning:
-//   - Line numbers are 1-based; column indices are 0-based.
-//   - A token’s position is captured at the start of scanning that token.
-type Lexer struct {
-	// public type with no exported fields; use constructors + Scan()
-	src    string
-	start  int // start index of current token
-	cur    int // current index
-	line   int // 1-based
-	col    int // 0-based column within line
-	tokens []Token
-
-	// precise token start position
-	tokStartLine int
-	tokStartCol  int
-
-	// interactive mode: produce IncompleteError for unterminated constructs at EOF
-	interactive bool
-}
-
-// NewLexer creates a new lexer for the given source in normal mode.
-func NewLexer(src string) *Lexer {
-	return &Lexer{
-		src: src,
-		// very rough guess to reduce reslices on big files
-		tokens: make([]Token, 0, len(src)/4),
-		line:   1,
-		col:    0,
-	}
-}
-
-// NewLexerInteractive creates a lexer in interactive mode.
-// Unterminated strings return IncompleteError at EOF, allowing REPLs to request more input.
-func NewLexerInteractive(src string) *Lexer {
-	return &Lexer{
-		src:         src,
-		tokens:      make([]Token, 0, len(src)/4),
-		line:        1,
-		col:         0,
-		interactive: true,
-	}
-}
-
-// Scan tokenizes the entire source string and returns the resulting slice of
-// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
-//
-// Error behavior summary:
-//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
-//   - Interactive mode: returns *IncompleteError at EOF if a construct is
-//     unterminated; other issues still return *LexError.
-//
-// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
-// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
-func (l *Lexer) Scan() ([]Token, error) {
-	for {
-		tok, err := l.scanToken()
-		if err != nil {
-			return nil, err
+// evalSource parses + evaluates in the provided env (fresh or persistent).
+// Returns Value on success; on hard failure returns a *Error with Src attached.
+// No pretty printing here.
+func (x *execImpl) evalSource(src string, env *Env) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok && e.Src == nil {
+			e.Src = &SourceRef{Name: "<main>", Src: src, Spans: spans}
 		}
-		if tok.Type == EOF {
-			return l.tokens, nil
+		return Value{}, err
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	return x.ip.runTopWithSource(ast, env, false, sr)
+}
+
+// evalAST evaluates an AST in the provided env.
+// No pretty printing here.
+func (x *execImpl) evalAST(ast S, env *Env) (Value, error) {
+	return x.ip.runTopWithSource(ast, env, false, nil)
+}
+
+func (x *execImpl) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	return x.ip.applyArgsScoped(fn, args, callSite)
+}
+
+func (x *execImpl) funMeta(fn Value) (Callable, bool) {
+	if fn.Tag != VTFun {
+		return nil, false
+	}
+	return &funCallable{f: fn.Data.(*Fun), doc: fn.Annot}, true
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                      CORE EXECUTION PLUMBING (PRIVATE)
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
+
+	// DEBUG: Quick global sanity check (preview first 10 post-order bindings)
+	_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
+
+	defer func() {
+		if r := recover(); r != nil {
+			switch sig := r.(type) {
+			case returnSig:
+				out, err = sig.v, nil
+			case *Error:
+				if uncaught {
+					out, err = annotNull(sig.Msg), nil
+					return
+				}
+				if sig.Src == nil {
+					sig.Src = sr
+				}
+				err = sig
+				out = Value{}
+			case rtErr:
+				srcRef := sig.src
+				if srcRef == nil {
+					srcRef = sr
+				}
+				line, col := sig.line, sig.col
+				if line <= 0 || col <= 0 {
+					line, col = ip.sourcePosFromChunk(nil, srcRef, 0)
+				}
+				if uncaught {
+					out, err = errNull(sig.msg), nil
+					return
+				}
+				err = &Error{Kind: DiagRuntime, Msg: sig.msg, Src: srcRef, Line: line, Col: col}
+				out = Value{}
+			case error:
+				if uncaught {
+					out, err = annotNull(sig.Error()), nil
+					return
+				}
+				line, col := ip.sourcePosFromChunk(nil, sr, 0)
+				err = &Error{Kind: DiagRuntime, Msg: sig.Error(), Src: sr, Line: line, Col: col}
+				out = Value{}
+			default:
+				if uncaught {
+					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil
+					return
+				}
+				line, col := ip.sourcePosFromChunk(nil, sr, 0)
+				err = &Error{Kind: DiagRuntime, Msg: fmt.Sprintf("runtime panic: %v", r), Src: sr, Line: line, Col: col}
+				out = Value{}
+			}
+		}
+	}()
+
+	ch := ip.jitTop(ast, sr)
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
+	res := ip.runChunk(ch, env, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		return res.value, nil
+	case vmRuntimeError:
+		if uncaught {
+			return res.value, nil
+		}
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		msg := res.value.Annot
+		if msg == "" {
+			msg = "runtime error"
+		}
+		return Value{}, &Error{Kind: DiagRuntime, Msg: msg, Src: ch.Src, Line: line, Col: col}
+	default:
+		if uncaught {
+			return errNull("unknown VM status"), nil
+		}
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		return Value{}, &Error{Kind: DiagRuntime, Msg: "unknown VM status", Src: ch.Src, Line: line, Col: col}
+	}
+}
+
+// Build a one-off top-level function body and ensure it is compiled.
+func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
+	f := &Fun{ReturnType: S{"id", "Any"}, Body: ast, Src: sr}
+	ip.ensureChunkWithSource(f, sr)
+	return f.Chunk
+}
+
+func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
+	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
+		return
+	}
+	em := newEmitter(ip, sr)
+	em.emitFunBody(f.Body)
+	ch := em.chunk()
+	ch.Src = sr
+	f.Chunk = ch
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                    CALL ENGINE: APPLY / CURRY / EXECUTE
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	if fn.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fn.Data.(*Fun)
+
+	if len(args) == 0 {
+		switch len(f.Params) {
+		case 0:
+			return ip.execFunBodyScoped(fn, callSite)
+		case 1:
+			if ip.isType(Null, f.ParamTypes[0], f.Env) {
+				return ip.applyOneScoped(fn, Null, callSite)
+			}
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		default:
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
 		}
 	}
+
+	cur := fn
+	for i := 0; i < len(args); i++ {
+		cur = ip.applyOneScoped(cur, args[i], callSite)
+		if i < len(args)-1 && cur.Tag != VTFun {
+			fail("too many arguments")
+		}
+	}
+	return cur
 }
 
-=== END PUBLIC SECTION FOR FILE: lexer.go ===
+func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Value {
+	if fnVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fnVal.Data.(*Fun)
 
-=== BEGIN PUBLIC SECTION OF FILE: parser.go ===
-// parser.go — Pratt parser for MindScript that produces compact S-expressions.
+	if len(f.Params) == 0 {
+		res := ip.execFunBodyScoped(fnVal, callSite)
+		if res.Tag != VTFun {
+			fail("too many arguments")
+		}
+		return ip.applyOneScoped(res, arg, callSite)
+	}
+
+	paramName := f.Params[0]
+	paramType := f.ParamTypes[0]
+	if !ip.isType(arg, paramType, f.Env) {
+		fail(fmt.Sprintf("type mismatch in parameter '%s'", paramName))
+	}
+
+	parent := f.Env
+	if f.NativeName != "" && callSite != nil {
+		if f.Env == nil || f.Env == ip.Core {
+			parent = callSite
+		}
+	}
+	callEnv := NewEnv(parent)
+	callEnv.Define(paramName, arg)
+
+	if len(f.Params) > 1 {
+		return FunVal(&Fun{
+			Params:     append([]string{}, f.Params[1:]...),
+			ParamTypes: append([]S{}, f.ParamTypes[1:]...),
+			ReturnType: f.ReturnType,
+			Body:       f.Body,
+			Env:        callEnv,
+			HiddenNull: f.HiddenNull,
+			Chunk:      f.Chunk,
+			NativeName: f.NativeName,
+			Src:        f.Src,
+			IsOracle:   f.IsOracle,
+			Examples:   append([]Value(nil), f.Examples...),
+		})
+	}
+
+	execFun := &Fun{
+		Params:     nil,
+		ParamTypes: append([]S(nil), f.ParamTypes...),
+		ReturnType: f.ReturnType,
+		Body:       f.Body,
+		Env:        callEnv,
+		HiddenNull: f.HiddenNull,
+		Chunk:      f.Chunk,
+		NativeName: f.NativeName,
+		IsOracle:   f.IsOracle,
+		Examples:   f.Examples,
+		Src:        f.Src,
+	}
+	execVal := FunVal(execFun)
+	execVal.Annot = fnVal.Annot
+	return ip.execFunBodyScoped(execVal, callSite)
+}
+
+func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
+	if funVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := funVal.Data.(*Fun)
+
+	if f.NativeName != "" {
+		impl, ok := ip.native[f.NativeName]
+		if !ok {
+			fail(fmt.Sprintf("unknown native %q", f.NativeName))
+		}
+		scope := withScope(f.Env, callSite)
+		prev := ip.currentSrc
+		if f.Src != nil {
+			ip.currentSrc = f.Src
+		}
+		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
+		ip.currentSrc = prev
+		if !ip.isType(res, f.ReturnType, f.Env) {
+			fail("return type mismatch")
+		}
+		return res
+	}
+
+	if f.IsOracle {
+		scope := withScope(f.Env, callSite)
+		ctx := &callCtx{argEnv: f.Env, scope: scope}
+		return ip.execOracle(funVal, ctx)
+	}
+
+	ip.ensureChunkWithSource(f, f.Src)
+	prev := ip.currentSrc
+	if f.Src != nil {
+		ip.currentSrc = f.Src
+	}
+	res := ip.runChunk(f.Chunk, f.Env, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		if !ip.isType(res.value, f.ReturnType, f.Env) {
+			line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
+			panicRt("return type mismatch", f.Src, line, col)
+		}
+		return res.value
+	case vmRuntimeError:
+		line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
+		panicRt(res.value.Annot, f.Src, line, col)
+		return errNull("unreachable")
+	default:
+		return errNull("unknown VM status")
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                      SOURCE MAPPING (PC → (line, col))
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
+	dbg := os.Getenv("MSG_DEBUG_POS") != ""
+
+	src := ""
+	if sr != nil {
+		src = sr.Src
+	}
+
+	if dbg {
+		fmt.Fprintf(os.Stderr, "\n[posmap] =====================\n")
+		fmt.Fprintf(os.Stderr, "[posmap] pc=%d\n", pc)
+		if sr != nil {
+			fmt.Fprintf(os.Stderr, "[posmap] SourceRef ptr=%p name=%q spans=%t pathBase=%s\n",
+				sr, sr.Name, sr.Spans != nil, dbgPath(sr.PathBase))
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] SourceRef=<nil>\n")
+		}
+		if ch != nil {
+			fmt.Fprintf(os.Stderr, "[posmap] Chunk: code=%d consts=%d marks=%d\n", len(ch.Code), len(ch.Consts), len(ch.Marks))
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] Chunk=<nil>\n")
+		}
+
+		if sr != nil && sr.Spans != nil {
+			dbgDumpAllSpans(sr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] NO SPANS to dump\n")
+		}
+	}
+
+	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[posmap] early fallback to (1,1)\n")
+		}
+		return 1, 1
+	}
+
+	i := -1
+	for j := range ch.Marks {
+		if ch.Marks[j].PC <= pc {
+			i = j
+		} else {
+			break
+		}
+	}
+
+	if dbg {
+		fmt.Fprintf(os.Stderr, "[posmap] bestMarkIndex=%d (total marks=%d)\n", i, len(ch.Marks))
+		if i >= 0 {
+			start := i - 3
+			if start < 0 {
+				start = 0
+			}
+			end := i + 3
+			if end >= len(ch.Marks) {
+				end = len(ch.Marks) - 1
+			}
+			for k := start; k <= end && k >= 0; k++ {
+				m := ch.Marks[k]
+				cur := ""
+				if k == i {
+					cur = "  <<"
+				}
+				fmt.Fprintf(os.Stderr, "[posmap]   mark[%d]: PC=%d path=%s%s\n", k, m.PC, dbgPath(m.Path), cur)
+			}
+		}
+	}
+
+	if i < 0 {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[posmap] no mark <= pc; fallback to (1,1)\n")
+		}
+		return 1, 1
+	}
+
+	tryPath := func(p NodePath, label string) (int, int, bool) {
+		for cut := len(p); cut >= 0; cut-- {
+			sub := p[:cut]
+			if sp, ok := sr.Spans.Get(sub); ok {
+				line, col := offsetToLineCol(src, sp.StartByte)
+				if dbg {
+					fmt.Fprintf(os.Stderr, "[posmap] HIT  %s path=%s  span=[%d,%d)  -> line=%d col=%d\n",
+						label, dbgPath(sub), sp.StartByte, sp.EndByte, line, col)
+					if sp.StartByte >= 0 && sp.EndByte <= len(src) && sp.StartByte <= sp.EndByte {
+						snippet := src[sp.StartByte:sp.EndByte]
+						fmt.Fprintf(os.Stderr, "[posmap] HIT  source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n",
+							sp.StartByte, sp.EndByte, snippet)
+					} else {
+						fmt.Fprintf(os.Stderr, "[posmap] HIT  source slice out of bounds!\n")
+					}
+				}
+				return line, col, true
+			}
+			if dbg {
+				fmt.Fprintf(os.Stderr, "[posmap] MISS %s path=%s\n", label, dbgPath(sub))
+			}
+		}
+		return 1, 1, false
+	}
+
+	if line, col, ok := tryPath(ch.Marks[i].Path, "mark"); ok {
+		return line, col
+	}
+
+	for k := i - 1; k >= 0; k-- {
+		if line, col, ok := tryPath(ch.Marks[k].Path, fmt.Sprintf("earlier[%d]", k)); ok {
+			return line, col
+		}
+	}
+
+	if dbg {
+		fmt.Fprintf(os.Stderr, "[posmap] all lookups failed; fallback to (1,1)\n")
+	}
+	return 1, 1
+}
+
+func dbgPath(p NodePath) string {
+	if len(p) == 0 {
+		return "<root>"
+	}
+	out := make([]byte, 0, 32)
+	for i, x := range p {
+		if i > 0 {
+			out = append(out, '.')
+		}
+		out = append(out, []byte(fmt.Sprintf("%d", x))...)
+	}
+	return string(out)
+}
+
+func dbgDumpAllSpans(sr *SourceRef) {
+	fmt.Fprintf(os.Stderr, "[posmap] ---- SPAN TREE DUMP (name=%q) ----\n", sr.Name)
+	if sr.Spans == nil {
+		fmt.Fprintf(os.Stderr, "[posmap] (no spans)\n")
+		return
+	}
+	keys := make([]string, 0, len(sr.Spans.byPath))
+	for k := range sr.Spans.byPath {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		di, dj := 0, 0
+		for c := 0; c < len(keys[i]); c++ {
+			if keys[i][c] == '.' {
+				di++
+			}
+		}
+		for c := 0; c < len(keys[j]); c++ {
+			if keys[j][c] == '.' {
+				dj++
+			}
+		}
+		if di != dj {
+			return di < dj
+		}
+		return keys[i] < keys[j]
+	})
+	for _, k := range keys {
+		sp := sr.Spans.byPath[k]
+		pathStr := k
+		if pathStr == "" {
+			pathStr = "<root>"
+		}
+		fmt.Fprintf(os.Stderr, "[posmap] span path=%s  [start=%d end=%d)\n", pathStr, sp.StartByte, sp.EndByte)
+		if sp.StartByte >= 0 && sp.EndByte <= len(sr.Src) && sp.StartByte <= sp.EndByte {
+			snippet := sr.Src[sp.StartByte:sp.EndByte]
+			fmt.Fprintf(os.Stderr, "[posmap] source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n", sp.StartByte, sp.EndByte, snippet)
+		} else {
+			fmt.Fprintf(os.Stderr, "[posmap] (invalid slice bounds for this span)\n")
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[posmap] ---- END SPAN TREE ----\n")
+}
+
+// withScope returns override if non-nil (use the call-site env for effects),
+// otherwise it returns parent (the function's closure env).
+func withScope(parent, override *Env) *Env {
+	if override != nil {
+		return override
+	}
+	return parent
+}
+
+func offsetToLineCol(src string, off int) (int, int) {
+	if off < 0 {
+		return 1, 1
+	}
+	line, col := 1, 1
+	i := 0
+	for i < len(src) && i < off {
+		if src[i] == '\n' {
+			line++
+			col = 1
+			i++
+			continue
+		}
+		col++
+		i++
+	}
+	return line, col
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                 PRIVATE ADAPTERS: Callable / CallCtx impls
+////////////////////////////////////////////////////////////////////////////////
+
+type funCallable struct {
+	f   *Fun
+	doc string
+}
+
+func (c *funCallable) Arity() int { return len(c.f.Params) }
+func (c *funCallable) ParamSpecs() []ParamSpec {
+	ps := make([]ParamSpec, len(c.f.Params))
+	for i := range c.f.Params {
+		ps[i] = ParamSpec{Name: c.f.Params[i], Type: c.f.ParamTypes[i]}
+	}
+	return ps
+}
+func (c *funCallable) ReturnType() S    { return c.f.ReturnType }
+func (c *funCallable) Doc() string      { return c.doc }
+func (c *funCallable) ClosureEnv() *Env { return c.f.Env }
+
+type callCtx struct {
+	argEnv *Env
+	scope  *Env
+}
+
+func (c *callCtx) Arg(name string) (Value, bool) { v, err := c.argEnv.Get(name); return v, err == nil }
+func (c *callCtx) MustArg(name string) Value {
+	if v, ok := c.Arg(name); ok {
+		return v
+	}
+	fail("missing argument: " + name)
+	return Null
+}
+func (c *callCtx) Env() *Env { return c.scope }
+
+////////////////////////////////////////////////////////////////////////////////
+//                             EMITTER (AST → BYTECODE)
+////////////////////////////////////////////////////////////////////////////////
+
+type emitter struct {
+	ip        *Interpreter
+	code      []uint32
+	consts    []Value
+	ctrlStack []ctrlCtx
+
+	// Source mapping
+	src   *SourceRef
+	marks []PCMark
+	path  NodePath
+}
+
+type ctrlCtx struct {
+	isLoop     bool
+	breakJumps []int
+	contJumps  []int
+}
+
+func newEmitter(ip *Interpreter, src *SourceRef) *emitter {
+	e := &emitter{ip: ip, src: src}
+	if src != nil && len(src.PathBase) > 0 {
+		e.path = append(e.path, src.PathBase...)
+	}
+	return e
+}
+
+// ---------------------- mark helpers (centralized) ---------------------------
+
+// Emit a mark for an absolute AST path immediately before a failure-prone opcode.
+// NOTE: Marks MUST be appended immediately before the instruction that can fail
+// because of that path. Do NOT emit any other mark until that instruction.
+func (e *emitter) markHereFor(abs NodePath) {
+	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), abs...)})
+}
+
+// Mark the current node (rare; for node-level blame).
+func (e *emitter) markSelf() { e.markHereFor(append(NodePath(nil), e.path...)) }
+
+// Mark a direct child index under the current node.
+func (e *emitter) markChild(childIdx int) {
+	e.markHereFor(append(append(NodePath(nil), e.path...), childIdx))
+}
+
+// Wrappers that enforce "mark immediately before opcode" ordering.
+func (e *emitter) emitWithMarkChild(op opcode, childIdx int, imm uint32) {
+	e.markChild(childIdx)
+	e.emit(op, imm)
+}
+func (e *emitter) callWithMarkChild(argc int, childIdx int) {
+	e.markChild(childIdx)
+	e.emit(opCall, uint32(argc))
+}
+
+// ----------------------------------------------------------------------------
+
+func (e *emitter) k(v Value) uint32 {
+	for i := range e.consts {
+		if e.ip.deepEqual(e.consts[i], v) {
+			return uint32(i)
+		}
+	}
+	e.consts = append(e.consts, v)
+	return uint32(len(e.consts) - 1)
+}
+func (e *emitter) ks(s string) uint32         { return e.k(Str(s)) }
+func (e *emitter) emit(op opcode, imm uint32) { e.code = append(e.code, pack(op, imm)) }
+func (e *emitter) patch(at int, to int)       { e.code[at] = pack(uop(e.code[at]), uint32(to)) }
+func (e *emitter) here() int                  { return len(e.code) }
+func (e *emitter) chunk() *Chunk {
+	return &Chunk{Code: e.code, Consts: e.consts, Marks: e.marks, Src: e.src}
+}
+
+func (e *emitter) pushBlockCtx() { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: false}) }
+func (e *emitter) pushLoopCtx()  { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: true}) }
+func (e *emitter) popCtx() ctrlCtx {
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	e.ctrlStack = e.ctrlStack[:i]
+	return c
+}
+func (e *emitter) addBreakJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.breakJumps = append(c.breakJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.breakJumps = append(c.breakJumps, at)
+	e.ctrlStack[i] = c
+}
+func (e *emitter) addContJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.contJumps = append(c.contJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.contJumps = append(c.contJumps, at)
+	e.ctrlStack[i] = c
+}
+
+// helpers for loops/blocks persisting "last" value
+func (e *emitter) preloadAssignToLast(lastName string) {
+	e.emit(opLoadGlobal, e.ks("__assign_set"))
+	e.emit(opConst, e.k(TypeVal(S{"id", lastName})))
+}
+func (e *emitter) saveLastAndJumpHead(head int) {
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+	e.emit(opJump, uint32(head))
+}
+func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
+	for _, at := range jumps {
+		e.patch(at, gate)
+	}
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+}
+
+// Child path scaffolding
+func (e *emitter) withChild(childIdx int, f func()) {
+	e.path = append(e.path, childIdx)
+	f()
+	e.path = e.path[:len(e.path)-1]
+}
+
+// Builtin call (no automatic marks; callers place marks per plan).
+func (e *emitter) callBuiltin(name string, args ...S) {
+	e.emit(opLoadGlobal, e.ks(name))
+	for _, a := range args {
+		e.emitExpr(a)
+	}
+	e.emit(opCall, uint32(len(args)))
+}
+
+func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S, basePath NodePath) {
+	namesArr := make([]Value, 0, max(0, len(params)-1))
+	typesArr := make([]Value, 0, max(0, len(params)-1))
+	for i := 1; i < len(params); i++ {
+		p := params[i].(S)
+		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+		t := p[2].(S)
+		if len(t) == 0 {
+			t = S{"id", "Any"}
+		}
+		typesArr = append(typesArr, TypeVal(t))
+	}
+	if len(retT) == 0 {
+		retT = S{"id", "Any"}
+	}
+	e.emit(opLoadGlobal, e.ks("__make_fun"))
+	for _, v := range namesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(namesArr)))
+	for _, v := range typesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(typesArr)))
+	e.emit(opConst, e.k(TypeVal(retT)))
+	e.emit(opConst, e.k(TypeVal(bodyCarrier)))
+	e.emit(opConst, e.k(Bool(isOracle)))
+	e.emitExpr(examples)
+	for _, idx := range basePath {
+		e.emit(opConst, e.k(Int(int64(idx))))
+	}
+	e.emit(opMakeArr, uint32(len(basePath)))
+	e.emit(opCall, 7)
+}
+
+func (e *emitter) emitFunBody(body S) {
+	e.emitExpr(body)
+	e.emit(opReturn, 0)
+}
+
+// Emit an expression node following the precise mark rules.
+func (e *emitter) emitExpr(n S) {
+	if len(n) == 0 {
+		e.emit(opConst, e.k(Null))
+		return
+	}
+
+	switch n[0].(string) {
+
+	// ----- literals / ids -----
+	case "int":
+		e.emit(opConst, e.k(Int(n[1].(int64))))
+	case "num":
+		e.emit(opConst, e.k(Num(n[1].(float64))))
+	case "str":
+		e.emit(opConst, e.k(Str(n[1].(string))))
+	case "bool":
+		e.emit(opConst, e.k(Bool(n[1].(bool))))
+	case "noop":
+		e.emit(opConst, e.k(Null))
+	case "null":
+		e.emit(opConst, e.k(Null))
+
+	case "id":
+		// Identifier load can fail → mark the id right before opLoadGlobal.
+		e.markSelf()
+		e.emit(opLoadGlobal, e.ks(n[1].(string)))
+
+	// ----- blocks -----
+	case "block":
+		// IMPORTANT: Use ORIGINAL child indices for NodePath; do not compact
+		// after skipping noopish nodes. Keep a separate 'emitted' counter only
+		// to decide when to pop.
+		e.pushBlockCtx()
+		emitted := 0
+		for j := 1; j < len(n); j++ {
+			child := n[j].(S)
+			if isNoopish(child) {
+				continue
+			}
+			if emitted > 0 {
+				e.emit(opPop, 0)
+			}
+			origIdx := j - 1 // original AST child index
+			e.withChild(origIdx, func() { e.emitExpr(child) })
+			emitted++
+		}
+		if emitted == 0 {
+			e.emit(opConst, e.k(Null))
+		}
+		exit := e.here()
+		ctx := e.popCtx()
+		for _, at := range ctx.breakJumps {
+			e.patch(at, exit)
+		}
+		for _, at := range ctx.contJumps {
+			e.patch(at, exit)
+		}
+
+	// ----- flow: break / continue -----
+	case "break":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addBreakJump(at)
+	case "continue":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addContJump(at)
+
+	// ----- unary -----
+	case "unop":
+		op := n[1].(string)
+		if op == "?" {
+			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
+			return
+		}
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Mark operand right before opcode.
+		switch op {
+		case "not":
+			e.emitWithMarkChild(opNot, 1, 0)
+		case "-":
+			e.emitWithMarkChild(opNeg, 1, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unknown unary op")))
+		}
+
+	// ----- binary -----
+	case "binop":
+		op := n[1].(string)
+		if op == "and" || op == "or" {
+			// Short-circuit: mark tested subexpr at the gate.
+			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+			e.markChild(1)
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
+
+			// unified AND/OR short-circuit
+			pre := func() { e.withChild(2, func() { e.emitExpr(n[3].(S)) }) } // RHS
+			post := func() { e.emit(opConst, e.k(Bool(false))) }              // const false
+			if op == "or" {
+				pre, post = func() { e.emit(opConst, e.k(Bool(true))) }, pre // const true, then RHS
+			}
+			pre()
+			jend := e.here()
+			e.emit(opJump, 0)
+			lother := e.here()
+			e.patch(jf, lother)
+			post()
+			lend := e.here()
+			e.patch(jend, lend)
+			return
+		}
+		a, b := n[2].(S), n[3].(S)
+		switch op {
+		case "==":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			// Comparisons rarely fail, but we still enforce the "mark RHS before op" rule.
+			e.emitWithMarkChild(opEq, 2, 0)
+		case "!=":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opNe, 2, 0)
+		case "+":
+			// Lower to builtin __plus; blame RHS.
+			e.emit(opLoadGlobal, e.ks("__plus"))
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.callWithMarkChild(2, 2)
+		case "-":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opSub, 2, 0)
+		case "*":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opMul, 2, 0)
+		case "/":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			// divide-by-zero etc. blame RHS
+			e.emitWithMarkChild(opDiv, 2, 0)
+		case "%":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			// modulo-by-zero blame RHS
+			e.emitWithMarkChild(opMod, 2, 0)
+		case "<":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opLt, 2, 0)
+		case "<=":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opLe, 2, 0)
+		case ">":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opGt, 2, 0)
+		case ">=":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opGe, 2, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unsupported operator")))
+		}
+
+	// ----- assignment -----
+	case "assign":
+		lhs := n[1].(S)
+		opName := "__assign_set"
+		switch lhs[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			opName = "__assign_def"
+		}
+		e.emit(opLoadGlobal, e.ks(opName))
+		e.emit(opConst, e.k(TypeVal(lhs)))
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
+		e.callWithMarkChild(2, 0)
+
+	case "decl":
+		e.callBuiltin("__assign_def", S{"type", n}, S{"null"})
+
+	// ----- arrays / maps -----
+	case "array":
+		for i := 1; i < len(n); i++ {
+			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
+		}
+		e.emit(opMakeArr, uint32(len(n)-1))
+
+	case "map":
+		keys := S{"array"}
+		vals := S{"array"}
+		for i := 1; i < len(n); i++ {
+			p := n[i].(S)
+			keys = append(keys, p[1].(S))
+			vals = append(vals, p[2].(S))
+		}
+		e.emit(opLoadGlobal, e.ks("__map_from"))
+		for i := 1; i < len(keys); i++ {
+			e.withChild(i-1, func() { e.withChild(0, func() { e.emitExpr(keys[i].(S)) }) })
+		}
+		e.emit(opMakeArr, uint32(len(keys)-1))
+		for i := 1; i < len(vals); i++ {
+			e.withChild(i-1, func() { e.withChild(1, func() { e.emitExpr(vals[i].(S)) }) })
+		}
+		e.emit(opMakeArr, uint32(len(vals)-1))
+		e.emit(opCall, 2)
+
+	// ----- property / index -----
+	case "get":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		// Blame the property token (child #1) right before opGetProp.
+		e.emitWithMarkChild(opGetProp, 1, e.ks(n[2].(S)[1].(string)))
+
+	case "idx":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Blame the index expression (child #1) right before opGetIdx.
+		e.emitWithMarkChild(opGetIdx, 1, 0)
+
+	// ----- call -----
+	case "call":
+		// Evaluate callee once.
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+
+		argc := len(n) - 2
+		if argc == 0 {
+			// Zero-arg call: blame callee right before CALL 0.
+			e.callWithMarkChild(0, 0)
+			return
+		}
+		// Apply args one by one; blame each arg before its CALL 1.
+		for i := 2; i < len(n); i++ {
+			argIdx := i - 1
+			e.withChild(argIdx, func() { e.emitExpr(n[i].(S)) })
+			e.callWithMarkChild(1, argIdx)
+		}
+		return
+
+	// ----- fun / oracle -----
+	case "fun":
+		// ("fun", params, ret, body) → body child index is 2
+		absBase := append(append(NodePath(nil), e.path...), 2)
+		e.emitMakeFun(n[1].(S), n[2].(S), n[3].(S), false, S{"null"}, absBase)
+	case "oracle":
+		e.withChild(2, func() {
+			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
+		})
+
+	// ----- return -----
+	case "return":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.markSelf()
+		e.emit(opReturn, 0)
+
+	// ----- if -----
+	case "if":
+		arms := n[1:]
+		jends := []int{}
+		hasElse := false
+		if len(arms) > 0 {
+			if last, ok := arms[len(arms)-1].(S); ok && last[0].(string) == "block" {
+				hasElse = true
+			}
+		}
+		limit := len(arms)
+		if hasElse {
+			limit--
+		}
+		for i := 0; i < limit; i++ {
+			p := arms[i].(S) // ("pair", cond, thenBlock)
+			// Emit condition; mark the condition node (pair child #0) at the gate.
+			e.withChild(i, func() { e.withChild(0, func() { e.emitExpr(p[1].(S)) }) })
+			condAbs := append(append(NodePath(nil), e.path...), i, 0)
+			e.markHereFor(condAbs)
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
+
+			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) })
+			jend := e.here()
+			e.emit(opJump, 0)
+			jends = append(jends, jend)
+			e.patch(jf, e.here())
+		}
+		if hasElse {
+			e.withChild(len(arms)-1, func() { e.emitExpr(arms[len(arms)-1].(S)) })
+		} else {
+			e.emit(opConst, e.k(Null))
+		}
+		tail := e.here()
+		for _, at := range jends {
+			e.patch(at, tail)
+		}
+
+	// ----- while -----
+	case "while":
+		cond := n[1].(S)
+		body := n[2].(S)
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.emit(opPop, 0)
+
+		head := e.here()
+		e.withChild(0, func() { e.emitExpr(cond) })
+		// Mark the condition node right before the gate.
+		e.markChild(0)
+		jf := e.here()
+		e.emit(opJumpIfFalse, 0)
+
+		e.preloadAssignToLast(lastName)
+		e.pushLoopCtx()
+		e.withChild(1, func() { e.emitExpr(body) })
+		loopCtx := e.popCtx()
+		e.saveLastAndJumpHead(head)
+
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
+		e.emit(opJump, uint32(head))
+
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		end := e.here()
+		e.patch(jf, end)
+		e.patch(jEnd, end)
+
+		e.emit(opLoadGlobal, e.ks(lastName))
+
+	// ----- for -----
+	case "for":
+		target := n[1].(S)
+		iterExpr := n[2].(S)
+		body := n[3].(S)
+
+		iterName := fmt.Sprintf("$iter_%d", e.here())
+		e.emit(opLoadGlobal, e.ks("__assign_def"))
+		e.emitExpr(S{"type", S{"decl", iterName}})
+
+		// __to_iter(iterExpr); mark the iterExpr (child #1) at this call site.
+		e.emit(opLoadGlobal, e.ks("__to_iter"))
+		e.withChild(1, func() { e.emitExpr(iterExpr) })
+		e.callWithMarkChild(1, 1) // __to_iter(iterExpr)
+		e.emit(opCall, 2)         // assign_def(TypeDecl, iterator)
+		e.emit(opPop, 0)
+
+		tmpName := fmt.Sprintf("$tmp_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+		e.emit(opPop, 0)
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.emit(opPop, 0)
+
+		head := e.here()
+
+		// tmp = iter(Null) — do NOT re-mark iterExpr here to preserve 1:1 mark rule.
+		e.emit(opLoadGlobal, e.ks("__assign_set"))
+		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
+		e.emit(opLoadGlobal, e.ks(iterName))
+		e.emit(opConst, e.k(Null))
+		e.emit(opCall, 1) // iter(Null)
+		e.emit(opCall, 2) // assign_set(Type(tmp), result)
+		e.emit(opPop, 0)
+
+		// gate: __iter_should_stop(tmp)
+		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
+		e.emit(opLoadGlobal, e.ks(tmpName))
+		e.emit(opCall, 1)
+		jBody := e.here()
+		e.emit(opJumpIfFalse, 0)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		bodyStart := e.here()
+		e.patch(jBody, bodyStart)
+
+		e.preloadAssignToLast(lastName)
+
+		assignName := "__assign_set"
+		switch target[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			assignName = "__assign_def"
+		}
+		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
+		e.emit(opPop, 0)
+
+		e.pushLoopCtx()
+		e.withChild(2, func() { e.emitExpr(body) })
+		loopCtx := e.popCtx()
+
+		e.saveLastAndJumpHead(head)
+
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
+		e.emit(opJump, uint32(head))
+
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jToEnd := e.here()
+		e.emit(opJump, 0)
+
+		end := e.here()
+		e.patch(jEnd, end)
+		e.patch(jToEnd, end)
+
+		e.emit(opLoadGlobal, e.ks(lastName))
+
+	// ----- type / module / annot -----
+	case "type":
+		e.emit(opConst, e.k(TypeVal(n[1].(S))))
+
+	case "module":
+		// Lower to: __make_module(nameExpr, Type(bodyAst), basePathArray)
+		e.emit(opLoadGlobal, e.ks("__make_module"))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.emit(opConst, e.k(TypeVal(n[2].(S))))
+		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, body) → body at child #1
+		for _, idx := range absBase {
+			e.emit(opConst, e.k(Int(int64(idx))))
+		}
+		e.emit(opMakeArr, uint32(len(absBase)))
+		// The call itself is not expected to fail at the callsite; no mark needed.
+		e.emit(opCall, 3)
+
+	case "annot":
+		text := n[1].(S)[1].(string)
+		subj := n[2].(S)
+
+		if isNoopish(subj) {
+			e.emit(opConst, e.k(Null))
+			return
+		}
+
+		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
+		if len(subj) > 0 && subj[0].(string) == "assign" {
+			lhs := subj[1].(S)
+			rhs := subj[2].(S)
+			opName := "__assign_set"
+			switch lhs[0].(string) {
+			case "decl", "darr", "dobj", "annot":
+				opName = "__assign_def"
+			}
+			e.emit(opLoadGlobal, e.ks(opName))
+			e.emit(opConst, e.k(TypeVal(lhs)))
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
+			e.emit(opCall, 2) // __annotate
+			// Attribute assignment errors to LHS (annot child #1 = assign, its child #0 = lhs).
+			lhsAbs := append(append(NodePath(nil), e.path...), 1, 0)
+			e.markHereFor(lhsAbs)
+			e.emit(opCall, 2) // __assign_*
+			return
+		}
+
+		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx,decl}
+		if len(subj) > 0 {
+			switch subj[0].(string) {
+			case "decl", "id", "get", "idx":
+				opName := "__assign_set"
+				if subj[0].(string) == "decl" {
+					opName = "__assign_def"
+				}
+				e.emit(opLoadGlobal, e.ks(opName))
+				e.emit(opConst, e.k(TypeVal(subj)))
+				e.emit(opLoadGlobal, e.ks("__annotate"))
+				e.emit(opConst, e.k(Str(text)))
+				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS
+				e.emit(opCall, 2)
+				// Attribute to subject itself.
+				e.markChild(1)
+				e.emit(opCall, 2)
+				return
+			}
+		}
+
+		// default: #(doc) expr  ==>  __annotate(doc, expr)
+		e.emit(opLoadGlobal, e.ks("__annotate"))
+		e.emit(opConst, e.k(Str(text)))
+		e.withChild(1, func() { e.emitExpr(subj) })
+		e.emit(opCall, 2)
+
+	default:
+		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
+	}
+}
+
+// Private panic/null helpers live in interpreter_ops.go.
+=== END FILE: interpreter_exec.go ===
+
+=== BEGIN FILE: vm.go ===
+// vm.go: minimal bytecode virtual machine for MindScript.
 //
 // OVERVIEW
 // --------
-// This module implements the newline-aware Pratt parser for the MindScript
-// language. It consumes the token stream produced by the *whitespace-sensitive*
-// lexer (see lexer.go) and builds a compact, Lisp-style S-expression (AST).
+// This file implements a compact, goroutine-safe-by-isolation, stack-based VM
+// that executes MindScript bytecode ("Chunk") and returns a result Value.
+// The VM is *internal to the package*: it exposes only the Chunk container;
+// everything else (opcodes, instruction encoding, VM loop) is private.
 //
-// Design goals:
-//   - Keep the grammar readable via precedence rules (Pratt parser).
-//   - Encode the AST in a tiny, serialisable structure (S-expressions).
-//   - Respect whitespace-sensitive signals emitted by the lexer:
-//   - '(' can be LROUND or CLROUND; only CLROUND participates in calls.
-//   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
-//   - '.' is PERIOD unless it started a number in the lexer.
-//   - multi-line '#' annotations become ANNOTATION tokens.
-//   - blank-line runs may be emitted as NOOP tokens.
-//   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
-//     at EOF instead of hard parse errors, suitable for REPLs.
+// Concurrency model (Lua-style isolates)
+// -------------------------------------
+//   - A single *Interpreter is **not re-entrant**. Do not invoke its methods from
+//     multiple goroutines at the same time.
+//   - For parallelism, create multiple *Interpreter instances (or use Clone if
+//     provided) and run each in its own goroutine. Each instance maintains its own
+//     Core/Global envs, module cache, current source tracking, and VM state.
+//   - This file has no package-level mutable state; all VM state is per-run and
+//     per-Interpreter. As long as an Interpreter isn't shared concurrently, there
+//     are no data races here.
+//   - Host natives may spin goroutines, but they must not touch a *shared*
+//     Interpreter/Env concurrently. Use isolated instances to run work in parallel.
 //
-// Annotation model (lowest precedence):
-//   - PRE annotation decorates the expression to its right.
-//   - POST annotation decorates the expression to its left and can also appear
-//     after a comma or a colon (binding to the element/key/value on the left).
-//   - PRE and POST cannot stack. If both apply to the same expression, they are
-//     merged into a single PRE with text "pre\npost".
+// Execution model
+//   - The interpreter (see interpreter.go) lowers S-expr AST into a Chunk using
+//     a small emitter. This VM then executes that Chunk in a given lexical Env.
+//   - The VM keeps the public engine surface stable by delegating CALL to
+//     Interpreter.Apply semantics via a private helper (applyArgsScoped). That
+//     preserves currying, native dispatch, type checks, and call-site scoping.
+//   - Runtime errors inside the VM are reported as annotated null Values and
+//     surfaced via a vmRuntimeError status to the interpreter. The vmResult also
+//     carries the instruction PC where the error occurred so the interpreter can
+//     map it back to a source (line, col) using Chunk.Marks and SourceRef.
 //
-// Nodes & Spans
-// -------------
-// The AST is a tree of S-expressions: []any whose first element is a string tag.
-// **This list is the most important reference.**
+// Instruction encoding (private)
+//   - 32-bit instruction: [ opcode:8 | imm:24 ].
+//   - Opcodes cover constants/globals, stack ops, property/index access,
+//     arithmetic/compare/unary, control flow, and calls.
+//   - The emitter constructs instruction words via `pack`. Decoding uses `uop`
+//     and `uimm`. These are all private to the package.
 //
-//	("block", n1, n2, ...)
-//	("noop")
+// Data & semantics used by the VM
+//   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
+//   - Env (lexical chain) for resolving globals
+//   - Interpreter methods: deepEqual, applyArgsScoped
+//   - Negative array indices wrap (Python-like): i := (i%len + len) % len
+//   - Property access on maps/modules; index access on arrays/maps
+//   - Numeric ops preserve integers where possible; division/mod guard zero;
+//     string relational comparisons are supported for <, <=, >, >=.
+//   - Control flow: Return yields vmReturn with a Value; fallthrough yields vmOK.
 //
-// Literals & identifiers:
+// DEPENDENCIES (other files)
+// --------------------------
+// • interpreter.go
+//   - Value/ValueTag/Null/Arr/Bool/Int/Num, MapObject, Env
+//   - (ip *Interpreter).deepEqual, (ip *Interpreter).applyArgsScoped
+//   - errNull, isNumber, toFloat helpers
 //
-//	("id",   string)              // identifier (includes property names coerced to ID by lexer rules)
-//	("int",  int64)               // from INTEGER
-//	("num",  float64)             // from NUMBER
-//	("str",  string)              // decoded literal
-//	("bool", bool)                // from BOOLEAN
-//	("null")                      // from NULL
-//	("type", expr)                // from 'type' ...
+// • modules.go (not shown here)
+//   - Module type and (m *Module).get(name) (used for VTModule property lookups)
 //
-// Operators / expressions:
+// • parser.go / lexer.go (indirect; produce AST for the emitter that targets this VM)
+// • types.go (indirect; equality of types via deepEqual resolution)
 //
-//	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
-//	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
-//	("assign", target, value)     // "=" (right-assoc)
-//
-// Property / call / index:
-//
-//	("call", callee, arg1, arg2, ...)
-//	("get",  obj, ("str", name))             // obj.name or obj."name"
-//	("idx",  obj, indexExpr)                 // obj[expr] or obj.(expr) or obj.12
-//
-// Collections:
-//
-//	("array", e1, e2, ...)
-//	("map",   ("pair",  keyStrExpr, value)*)
-//	("map",   ("pair!", keyStrExpr, value)*) // required-field (key! : value)
-//	("enum",  item1, item2, ...)             // from Enum[ ... ]
-//
-// Functions, modules, control, loops:
-//
-//	("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
-//	("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)
-//	("module",  nameExpr, bodyBlock)
-//	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)
-//	("while", cond, bodyBlock)
-//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
-//	("return", value)  // value may be "null" per newline semantics
-//	("break",  value)  // value may be "null"
-//	("continue", value)// value may be "null"
-//
-// Declaration patterns (used by 'let' and 'for' targets):
-//
-//	("decl", name)
-//	("darr", p1, p2, ...)
-//	("dobj", ("pair", keyStrExpr, subPattern), ...)
-//
-// Annotations:
-//
-//	("annot", ("str", textOr<text>), wrappedNode)
-//	   • PRE  text stored as-is
-//	   • POST text stored with leading "<"
-//	   • PRE+POST becomes PRE with "pre\npost" (no POST stacking)
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// SPAN EMISSION INVARIANT (CRITICAL)
-// ----------------------------------
-// **This file now centralizes AST construction and span emission.**
-//
-//   - Every AST node is constructed through `mk*` helpers that *atomically*
-//     append exactly one span for that node.
-//   - Spans are appended in strict **post-order** of the final AST (children
-//     first, then parent), left-to-right among siblings.
-//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule:
-//     child's span first, then the wrapper's span.
-//   - Nodes that are synthesized with no concrete tokens (e.g. default type
-//     `Any`) still receive a placeholder `Span{}` via `mk*` (using tok=-1).
-//   - The root block’s span is appended last.
-//
-// The helpers in this file enforce the invariant mechanically at every construct.
-//
-// Dependencies
-// ------------
-//   - lexer.go
-//   - errors.go (*Error, DiagParse, DiagIncomplete, IsIncomplete)
-//   - spans.go (Span, SpanIndex, BuildSpanIndexPostOrder)
+// PUBLIC vs PRIVATE
+// -----------------
+// PUBLIC  : Chunk (bytecode container) — the only stable surface exported here.
+// PRIVATE : opcodes, instruction packing, VM loop/state, vmResult/status, helpers.
 package mindscript
 
 import (
 	"fmt"
-	"strings"
+	"math"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-//                                  PUBLIC API
+//                                   PUBLIC API
 ////////////////////////////////////////////////////////////////////////////////
 
-type S = []any
-
-func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
-
-// ParseSExpr parses a complete MindScript source string and returns its AST.
-func ParseSExpr(src string) (S, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, err
-	}
-	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
+// SourceRef attaches source text and an optional SpanIndex to bytecode.
+type SourceRef struct {
+	Name     string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
+	Src      string     // full text
+	Spans    *SpanIndex // may be nil when unknown
+	PathBase NodePath   // optional absolute prefix for marks emitted in this chunk
 }
 
-// ParseSExprWithSpans parses like ParseSExpr and also returns a *SpanIndex,
-// with spans recorded in strict post-order per the invariant.
-func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, nil, err
-	}
-	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	ast, perr := p.program()
-	if perr != nil {
-		return nil, nil, perr
-	}
-	idx := BuildSpanIndexPostOrder(ast, p.post)
-	return ast, idx, nil
+// PCMark associates an instruction index with an AST node path.
+type PCMark struct {
+	PC   int
+	Path NodePath
 }
 
-// ParseSExprInteractive parses in REPL-friendly mode.
-// Unterminated constructs at EOF produce *Error{Kind:DiagIncomplete}.
-func ParseSExprInteractive(src string) (S, error) {
-	lex := NewLexerInteractive(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, err
-	}
-	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
+// Chunk is an immutable bytecode container executed by the VM.
+//
+// Layout:
+//
+//	Code   — instruction stream; each instruction is a 32-bit word where the
+//	         high 8 bits encode the opcode and the low 24 bits hold an unsigned
+//	         immediate (operand). The encoding details are private to the VM.
+//	Consts — constant pool referenced by instructions (e.g., opConst pushes
+//	         Consts[k], opLoadGlobal/opGetProp carry string names as VTStr).
+//	Src    — optional source reference (used for caret-runtime errors).
+//	Marks  — PC→AST path marks for mapping instructions back to source spans.
+//
+// Producer & consumer:
+//   - Produced by the internal emitter (see interpreter.go) from an S-expr AST.
+//   - Consumed only by the VM entry (private) to execute code in an Env.
+//
+// Stability contract:
+//   - The existence of Chunk and its fields is stable for code that needs to
+//     hand bytecode across subsystems within this package. The instruction set
+//     and encoding are *not* public API.
+type Chunk struct {
+	Code   []uint32
+	Consts []Value
+	Src    *SourceRef
+	Marks  []PCMark
 }
 
-=== END PUBLIC SECTION FOR FILE: parser.go ===
+//// END_OF_PUBLIC
 
-=== BEGIN PUBLIC SECTION OF FILE: spans.go ===
-// spans.go — Sidecar spans for MindScript ASTs (S-expressions)
-//
-// WHAT THIS MODULE DOES
-// =====================
-// This module provides a tiny, non-invasive mechanism to associate **source-code
-// byte spans** with nodes of a MindScript AST (encoded as the S-expression type
-// `S` from parser.go) **without modifying the AST itself**.
-//
-// The spans are modeled as half-open byte intervals `[StartByte, EndByte)`
-// relative to the original UTF-8 source. Line/column coordinates are intentionally
-// omitted here to keep the structure minimal; callers can derive them on demand
-// from the original source text.
-//
-// HOW SPANS ARE ASSOCIATED TO NODES
-// =================================
-// We use a *sidecar* structure (`SpanIndex`) keyed by a stable, structural
-// address called a **NodePath**. A `NodePath` is a slice of child indexes
-// into the AST tree: e.g. `[]int{0,2,1}` means “root’s 0th child → its 2nd
-// child → its 1st child”. Paths are defined against the S-expression shape
-// where a node is `[]any{tagString, child0, child1, ...}` — i.e. the first
-// element is the string tag, and child index 0 refers to the element at
-// S[1], child index 1 refers to S[2], etc.
-//
-// This file does **not** compute spans itself. Instead, the parser (or any
-// external producer) records one `Span` per AST node in **post-order**
-// (children before parent) while constructing or inspecting the tree, and
-// then calls `BuildSpanIndexPostOrder(ast, spans)` to bind those spans to
-// concrete paths via a deterministic walk of the AST in the same order.
-//
-// The result is a `SpanIndex` you can query with a `NodePath` to retrieve
-// the associated byte interval in the original source.
-//
-// DEPENDENCIES ON OTHER FILES
-// ===========================
-// • parser.go
-//   - Defines the S-expression node type alias `type S = []any`.
-//   - Produces the AST that this module indexes.
-//   - (Optional instrumentation) While parsing, record a `Span` per finished
-//     node in **post-order** (children first, then the node) using the token
-//     byte spans collected by the lexer.
-//
-// • lexer.go
-//   - Tokens should carry precise byte offsets (`StartByte`/`EndByte`) so that
-//     the parser can compute node spans as:
-//     node.StartByte = firstToken.StartByte
-//     node.EndByte   = lastToken.EndByte
-//
-// PERFORMANCE & CONCURRENCY
-// =========================
-// Building an index is O(n) in the number of AST nodes. `SpanIndex` is
-// read-only after construction and safe to share for concurrent reads.
-// Memory usage is one map entry per node (string key per `NodePath`).
-//
-// PUBLIC VS PRIVATE LAYOUT
-// ========================
-// The file is split into a PUBLIC API (types and functions you call) and a
-// PRIVATE section (helpers and internal details). The PUBLIC API is fully
-// documented so its behavior is understandable without reading the PRIVATE
-// code.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-package mindscript
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
 
-import (
-	"strconv"
-	"strings"
+/************* Instruction encoding (private) *************/
+
+type opcode uint8
+
+const (
+	opNop opcode = iota
+
+	// constants & globals
+	opConst      // push consts[k]
+	opLoadGlobal // push Env[name];  imm = const index (name as VTStr)
+
+	// stack/values
+	opMakeArr // pop N → array; imm = N
+	opPop     // pop and discard top of stack
+
+	// property & index
+	opGetProp // obj.get(name);   imm = const index (name as VTStr)
+	opGetIdx  // pop idx,obj → push obj[idx]
+
+	// arithmetic / compare / unary
+	opSub
+	opMul
+	opDiv
+	opMod
+	opEq
+	opNe
+	opLt
+	opLe
+	opGt
+	opGe
+	opNeg
+	opNot
+
+	// control flow
+	opJump        // ip = imm
+	opJumpIfFalse // pop cond; if false => ip = imm
+	opReturn      // pop v; signal Return with v
+
+	// calls/closures
+	opCall // argc = imm; pops argc args then callee; pushes result
 )
 
-////////////////////////////////////////////////////////////////////////////////
-//                                  PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
+// pack/unpack helpers
+func pack(op opcode, imm uint32) uint32 { return uint32(op)<<24 | (imm & 0xFFFFFF) }
+func uop(i uint32) opcode               { return opcode(i >> 24) }
+func uimm(i uint32) uint32              { return i & 0xFFFFFF }
 
-// Span represents a half-open byte interval [StartByte, EndByte) in the original
-// source text. Offsets are counted in bytes from the start of the UTF-8 source.
-// EndByte is exclusive.
-//
-// Line/column coordinates are not stored here to keep Span minimal; if you need
-// them, compute (line, col) from the original source using your preferred mapping.
-type Span struct {
-	StartByte int // inclusive
-	EndByte   int // exclusive
-}
-
-// NodePath is a stable structural address into an S-expression AST.
-// Each integer selects a child in the node's children array:
-//
-//	path element k  → child at S[k+1] (since S[0] is the string tag).
-//
-// Example:
-//
-//	// ("call", callee, arg0, arg1)
-//	//  tag   ^      ^ child0 ^ child1
-//	//  S[0]        S[1]      S[2]     S[3]
-//	path []int{0}   → callee
-//	path []int{2}   → arg1
-type NodePath []int
-
-// SpanIndex stores a sidecar mapping from NodePath → Span for an AST.
-// It is read-only after construction. Use Get to retrieve spans by path.
-//
-// Typical construction flow (performed by the parser or a post-pass):
-//  1. Walk/construct the AST while recording one Span per node in post-order.
-//  2. Call BuildSpanIndexPostOrder(ast, postorderSpans) to bind spans to paths.
-//  3. Query with si.Get(path) wherever you need source intervals.
-type SpanIndex struct {
-	byPath map[string]Span
-}
-
-// Get returns the span associated with the given path, if present.
-// The boolean is false if the path is unknown or the index is nil.
-//
-// A SpanIndex may be partial (e.g., producer skipped some nodes). In that case
-// only the recorded nodes will resolve to spans.
-func (si *SpanIndex) Get(p NodePath) (Span, bool) {
-	if si == nil {
-		return Span{}, false
+// unwrap a VTMap to *MapObject (nil if not a map)
+func asMap(v Value) *MapObject {
+	if v.Tag != VTMap {
+		return nil
 	}
-	sp, ok := si.byPath[pathKey(p)]
-	return sp, ok
+	return v.Data.(*MapObject)
 }
 
-// BuildSpanIndexPostOrder constructs a SpanIndex by walking the AST in
-// **post-order** (children before parent) and binding each visited node to
-// the next span from the provided `postorder` slice.
-//
-// Contract:
-//   - The `postorder` slice must list exactly one Span for each node in `root`
-//     in post-order. If it is longer, extras are ignored; if shorter, remaining
-//     nodes are left unindexed (Get will return (Span{}, false) for them).
-//   - The resulting index is read-only and safe for concurrent reads.
-//
-// Complexity: O(n) time and O(n) space where n is the number of AST nodes.
-//
-// Example usage (parser instrumentation idea):
-//
-//	// During parse, for each finished node (after parsing children):
-//	//   spans = append(spans, Span{StartByte:firstTok.StartByte, EndByte:lastTok.EndByte})
-//	idx := BuildSpanIndexPostOrder(ast, spans)
-//	sp, ok := idx.Get(NodePath{0,2}) // lookup "child 0's child 2"
-func BuildSpanIndexPostOrder(root S, postorder []Span) *SpanIndex {
-	si := &SpanIndex{byPath: make(map[string]Span, len(postorder))}
-	bindPostOrder(si, root, postorder)
-	return si
+/************* VM status/result (private) *************/
+
+type vmStatus int
+
+const (
+	vmOK vmStatus = iota
+	vmReturn
+	vmRuntimeError
+)
+
+type vmResult struct {
+	status vmStatus
+	value  Value
+	pc     int // instruction index where the status was produced (best-effort)
 }
 
-=== END PUBLIC SECTION FOR FILE: spans.go ===
+/************* VM state & helpers (private) *************/
+
+type vm struct {
+	ip    *Interpreter
+	chunk *Chunk
+	env   *Env
+	stack []Value
+	sp    int
+	iptr  int
+}
+
+func (m *vm) push(v Value) {
+	if m.sp >= len(m.stack) {
+		newCap := len(m.stack) * 2
+		if newCap == 0 {
+			newCap = 16
+		}
+		ns := make([]Value, newCap)
+		copy(ns, m.stack)
+		m.stack = ns
+	}
+	m.stack[m.sp] = v
+	m.sp++
+}
+
+func (m *vm) pop() Value {
+	if m.sp == 0 {
+		return errNull("stack underflow")
+	}
+	m.sp--
+	return m.stack[m.sp]
+}
+
+func (m *vm) top() Value {
+	if m.sp == 0 {
+		return Null
+	}
+	return m.stack[m.sp-1]
+}
+
+// fail returns a vmRuntimeError with the PC set to the currently executing
+// instruction (iptr-1, since iptr has advanced past the fetched instruction).
+func (m *vm) fail(msg string) vmResult {
+	return vmResult{status: vmRuntimeError, value: errNull(msg), pc: m.iptr - 1}
+}
+
+// Numeric helpers (mirror interpreter semantics)
+func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
+	// numbers
+	if isNumber(a) && isNumber(b) {
+		lf, rf := toFloat(a), toFloat(b)
+		bothInt := a.Tag == VTInt && b.Tag == VTInt
+		switch op {
+		case opSub:
+			if bothInt {
+				return Int(a.Data.(int64) - b.Data.(int64)), nil
+			}
+			return Num(lf - rf), nil
+		case opMul:
+			if bothInt {
+				return Int(a.Data.(int64) * b.Data.(int64)), nil
+			}
+			return Num(lf * rf), nil
+		case opDiv:
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("division by zero")
+				return Null, &res
+			}
+			if bothInt {
+				return Int(a.Data.(int64) / b.Data.(int64)), nil
+			}
+			return Num(lf / rf), nil
+		case opMod:
+			// guard zero (match division error text)
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("modulo by zero")
+				return Null, &res
+			}
+			if bothInt {
+				return Int(a.Data.(int64) % b.Data.(int64)), nil
+			}
+			return Num(math.Mod(lf, rf)), nil
+		case opLt:
+			if bothInt {
+				return Bool(a.Data.(int64) < b.Data.(int64)), nil
+			}
+			return Bool(lf < rf), nil
+		case opLe:
+			if bothInt {
+				return Bool(a.Data.(int64) <= b.Data.(int64)), nil
+			}
+			return Bool(lf <= rf), nil
+		case opGt:
+			if bothInt {
+				return Bool(a.Data.(int64) > b.Data.(int64)), nil
+			}
+			return Bool(lf > rf), nil
+		case opGe:
+			if bothInt {
+				return Bool(a.Data.(int64) >= b.Data.(int64)), nil
+			}
+			return Bool(lf >= rf), nil
+		}
+	}
+
+	// string comparisons
+	if a.Tag == VTStr && b.Tag == VTStr {
+		as, bs := a.Data.(string), b.Data.(string)
+		switch op {
+		case opLt:
+			return Bool(as < bs), nil
+		case opLe:
+			return Bool(as <= bs), nil
+		case opGt:
+			return Bool(as > bs), nil
+		case opGe:
+			return Bool(as >= bs), nil
+		}
+	}
+	res := m.fail("bad numeric operator")
+	return Value{}, &res
+}
+
+/************* VM entry point (private) *************/
+
+// runChunk executes a bytecode Chunk in the provided environment.
+// It implements the full instruction set and returns:
+//   - vmOK           with the top-of-stack (or Null) if the program fell through,
+//   - vmReturn       with the explicit return value,
+//   - vmRuntimeError with an annotated-null explaining the error, plus a PC.
+//
+// Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
+// currying, native dispatch, type checks, and call-site scoping.
+//
+// Concurrency: this method uses the *Interpreter instance* provided on the vm.
+// Do not call it concurrently on the same Interpreter from multiple goroutines.
+func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
+	m := &vm{
+		ip:    ip,
+		chunk: chunk,
+		// evaluate in the provided environment (global-chain root for this run)
+		env:   env,
+		stack: make([]Value, 0, initStackCap),
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			// Structured inner-source error? Re-throw so the outer trampoline can
+			// surface it with the callee's SourceRef and exact (line,col).
+			if e, ok := r.(rtErr); ok {
+				if e.src != nil && e.line > 0 && e.col > 0 {
+					panic(e) // propagate structured inner-caret error
+				}
+				res.status = vmRuntimeError
+				res.value = annotNull(e.msg)
+				res.pc = m.iptr - 1
+				return
+			}
+			panic(r) // rethrow non-runtime panics
+		}
+	}()
+
+	code := chunk.Code
+	consts := chunk.Consts
+
+	for m.iptr < len(code) {
+		raw := code[m.iptr]
+		m.iptr++
+		opc := uop(raw)
+		imm := uimm(raw)
+
+		switch opc {
+
+		case opNop:
+			// no-op
+
+		// ---- constants & globals ----
+		case opConst:
+			if int(imm) >= len(consts) {
+				return m.fail("const index out of range")
+			}
+			m.push(consts[imm])
+
+		case opLoadGlobal:
+			if int(imm) >= len(consts) {
+				return m.fail("name index out of range")
+			}
+			k := consts[imm]
+			if k.Tag != VTStr {
+				return m.fail("global name must be string const")
+			}
+			v, err := m.env.Get(k.Data.(string))
+			if err != nil {
+				return m.fail(err.Error())
+			}
+			m.push(v)
+
+		// ---- arrays ----
+		case opMakeArr:
+			n := int(imm)
+			if n < 0 || n > m.sp {
+				return m.fail("bad array length")
+			}
+			start := m.sp - n
+			elems := make([]Value, n)
+			copy(elems, m.stack[start:m.sp])
+			m.sp = start
+			m.push(Arr(elems))
+
+		// ---- pop value from stack ----
+		case opPop:
+			if m.sp == 0 {
+				return m.fail("pop on empty stack")
+			}
+			m.sp--
+
+		// ---- properties / indices ----
+		case opGetProp:
+			if int(imm) >= len(consts) {
+				return m.fail("name index out of range")
+			}
+			k := consts[imm]
+			if k.Tag != VTStr {
+				return m.fail("property name must be string const")
+			}
+			obj := m.pop()
+			key := k.Data.(string)
+
+			// Map lookup: use MapObject entries (annotation on keys is meta)
+			if obj.Tag == VTMap {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("property get requires map or module with string key")
+				}
+				if v, ok := mo.Entries[key]; ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown property %q", key))
+			}
+
+			// Module export lookup
+			if obj.Tag == VTModule {
+				mod := obj.Data.(*Module)
+				if v, ok := mod.get(key); ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown property %q on module", key))
+			}
+
+			return m.fail("property get requires map or module with string key")
+
+		case opGetIdx:
+			idx := m.pop()
+			obj := m.pop()
+
+			// array[int]
+			if obj.Tag == VTArray && idx.Tag == VTInt {
+				xs := obj.Data.([]Value)
+				if len(xs) == 0 {
+					return m.fail("index on empty array")
+				}
+				i := int(idx.Data.(int64))
+				if i < 0 {
+					i = (i%len(xs) + len(xs)) % len(xs)
+				}
+				if i < 0 || i >= len(xs) {
+					return m.fail("array index out of range")
+				}
+				m.push(xs[i])
+				break
+			}
+
+			// map[string]
+			if obj.Tag == VTMap && idx.Tag == VTStr {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("index requires array[int] or map[string]")
+				}
+				k := idx.Data.(string)
+				if v, ok := mo.Entries[k]; ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown key %q", k))
+			}
+
+			return m.fail("index requires array[int] or map[string]")
+
+		// ---- arithmetic / compare / unary ----
+		case opSub, opMul, opDiv, opMod, opLt, opLe, opGt, opGe:
+			b := m.pop()
+			a := m.pop()
+			if out, failRes := m.binNum(opc, a, b); failRes != nil {
+				return *failRes
+			} else {
+				m.push(out)
+			}
+
+		case opEq, opNe:
+			b := m.pop()
+			a := m.pop()
+			eq := m.ip.deepEqual(a, b)
+			if opc == opEq {
+				m.push(Bool(eq))
+			} else {
+				m.push(Bool(!eq))
+			}
+
+		case opNeg:
+			x := m.pop()
+			switch x.Tag {
+			case VTInt:
+				m.push(Int(-x.Data.(int64)))
+			case VTNum:
+				m.push(Num(-x.Data.(float64)))
+			default:
+				return m.fail("unary - expects number")
+			}
+
+		case opNot:
+			x := m.pop()
+			if x.Tag != VTBool {
+				return m.fail("not expects boolean")
+			}
+			m.push(Bool(!x.Data.(bool)))
+
+		// ---- control flow ----
+		case opJump:
+			m.iptr = int(imm)
+
+		case opJumpIfFalse:
+			cond := m.pop()
+			if cond.Tag != VTBool {
+				return m.fail("condition must be boolean")
+			}
+			if !cond.Data.(bool) {
+				m.iptr = int(imm)
+			}
+
+		case opReturn:
+			var v Value = Null
+			if m.sp > 0 {
+				v = m.pop()
+			}
+			return vmResult{status: vmReturn, value: v, pc: m.iptr - 1}
+
+		// ---- calls ----
+		case opCall:
+			nargs := int(imm)
+
+			// Stack layout (top on the right):
+			// [..., callee, arg1, ..., argN]
+			calleeIdx := m.sp - nargs - 1
+			if calleeIdx < 0 {
+				return m.fail("stack underflow in call")
+			}
+			callee := m.stack[calleeIdx]
+
+			// Collect args in order
+			args := make([]Value, nargs)
+			copy(args, m.stack[calleeIdx+1:m.sp])
+
+			// Pop callee + args
+			m.sp = calleeIdx
+			m.stack = m.stack[:m.sp]
+
+			// Use current frame env as the call-site (for natives & closures)
+			res := m.ip.applyArgsScoped(callee, args, m.env)
+
+			// Push result
+			m.push(res)
+
+		default:
+			return m.fail("unknown opcode")
+		}
+	}
+
+	if m.sp == 0 {
+		return vmResult{status: vmOK, value: Null, pc: m.iptr - 1}
+	}
+	return vmResult{status: vmOK, value: m.top(), pc: m.iptr - 1}
+}
+=== END FILE: vm.go ===
 

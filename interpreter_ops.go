@@ -504,7 +504,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 			i := int(idx.Data.(int64))
 			if i < 0 {
-				i = (i%len(xs) + len(xs)) % len(xs)
+				i = len(xs) + i // -1 -> last, -len -> 0
 			}
 			if i < 0 || i >= len(xs) {
 				fail("array index out of range")

@@ -1803,3 +1803,35 @@ func Test_Interpreter_Annot_Decl_And_Assign_Still_Work(t *testing.T) {
 		t.Fatalf("want a == 1 annotated 'note', got %#v", va)
 	}
 }
+
+func Test_Interpreter_Array_NegativeIndexing_OOB(t *testing.T) {
+	// Valid negatives within range
+	wantInt(t, evalSrc(t, "([1,2,3])[-1]"), 3) // last
+	wantInt(t, evalSrc(t, "([1,2,3])[-3]"), 1) // first
+
+	// OOB both ways
+	err := evalSrcExpectError(t, "([1,2,3])[-4]")
+	wantErrContains(t, err, "array index out of range")
+
+	err = evalSrcExpectError(t, "([1,2,3])[3]")
+	wantErrContains(t, err, "array index out of range")
+}
+
+func Test_Interpreter_Array_Assignment_NegativeIndexing_OOB(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Setup and a valid negative write
+	v := mustEvalPersistent(t, ip, "let a = [10,20,30]\n a[-1] = 99\n a")
+	if v.Tag != VTArray || len(v.Data.([]Value)) != 3 {
+		t.Fatalf("want array len 3, got %#v", v)
+	}
+	wantInt(t, v.Data.([]Value)[2], 99)
+
+	// OOB negative write
+	err := evalPersistentExpectError(t, ip, "a[-4] = 1")
+	wantErrContains(t, err, "array index out of range")
+
+	// OOB positive write
+	err = evalPersistentExpectError(t, ip, "a[3] = 1")
+	wantErrContains(t, err, "array index out of range")
+}

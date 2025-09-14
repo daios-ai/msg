@@ -1320,6 +1320,11 @@ func docType(t S) *Doc {
 			for _, p := range params {
 				ps = append(ps, docType(p))
 			}
+			// Single-arg function types don’t need tuple parens.
+			if len(ps) == 1 {
+				return Concat(ps[0], Text(" -> "), docType(ret))
+			}
+			// Two or more params: keep (A, B, ...) -> R
 			return Concat(Text("("), Join(Text(", "), ps), Text(") -> "), docType(ret))
 		}
 		return Text("<binop>")
@@ -1479,7 +1484,9 @@ func docValueNoAnn(v Value) *Doc {
 				label = "oracle"
 			}
 
-			// Build `<{label}: a:T -> b:U -> R>` (zero-arg becomes `_:Null`).
+			// Build `<{label}: a:T -> b:U -> R>`; when a param type is itself a
+			// function type (… -> …), wrap *that type* in parens to avoid
+			// ambiguity with the outer arrow chain.
 			var chain []*Doc
 			if len(f.ParamTypes) == 0 {
 				chain = append(chain, Text("_:Null"))
@@ -1492,7 +1499,13 @@ func docValueNoAnn(v Value) *Doc {
 					if i < len(f.Params) && f.Params[i] != "" {
 						name = f.Params[i]
 					}
-					chain = append(chain, Text(name), Text(":"), docType(f.ParamTypes[i]))
+					pt := f.ParamTypes[i]
+					td := docType(pt)
+					// If param type is a function type, parenthesize the whole type.
+					if len(pt) >= 4 && pt[0] == "binop" && pt[1] == "->" {
+						td = Concat(Text("("), td, Text(")"))
+					}
+					chain = append(chain, Text(name), Text(":"), td)
 				}
 			}
 			chain = append(chain, Text(" -> "), docType(f.ReturnType))

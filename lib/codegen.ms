@@ -1,4 +1,5 @@
 
+# ------ Coding Oracle ----------------------------------
 
 let _genManual = fun() do
 	let ROOT = osEnv("MSGPATH")
@@ -172,22 +173,29 @@ let _genExamples = [
     ],
 ]
 
-##
-# 
-##
-
-let gen = fun(spec: Str) -> Any do
-    let g = _genOracle(spec)
-    let validation = astValidate(g)
-    print(validation)
-    if validation != [] then
-        return noteSet(validation[0].message, null)  
-    end
-    return astEval(g)
-end
+let _genOracle = oracle(spec: Str) -> []? from _genExamples
 let _genComment = (
 	"Write a JSON-MindScript anonymous function or oracle for the requested behavior."
 	+ "\n\n"
 	+ _genManual
 )
-gen = noteSet(_genComment, gen)
+_genOracle = noteSet(_genComment, _genOracle)
+
+# ------ Public ----------------------------------
+
+# Generate a function/oracle given a specification.
+#
+# Args: 
+# - spec:Str A description of the desired behavior. 
+#
+# Return:
+# - A function or oracle.
+let gen = fun(spec: Str) -> Any do
+    let g = _genOracle(spec)
+    let validation = astValidate(g)
+    if validation != [] then
+        return noteSet(validation[0].message, null)  
+    end
+    return astEval(g)
+end
+

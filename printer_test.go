@@ -656,7 +656,7 @@ func Test_FormatType_Basics(t *testing.T) {
 	T := S{"binop", "->", S{"array", S{"id", "Int"}}, S{"id", "Str"}}
 	opt := S{"unop", "?", T}
 	got := FormatType(opt)
-	want := `([Int]) -> Str?`
+	want := `[Int] -> Str?`
 	if norm(got) != norm(want) {
 		t.Fatalf("FormatType mismatch\nwant: %q\ngot:  %q", want, got)
 	}
@@ -823,4 +823,37 @@ fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do
 
 end`
 	eq(t, pretty(t, in), want)
+}
+
+func Test_Printer_FunValue_FunctionTypeParam_Parens(t *testing.T) {
+	// <fun: f:(Any -> Any) -> it:(Null -> Any) -> Null -> Any>
+	f := &Fun{
+		Params: []string{"f", "it"},
+		ParamTypes: []S{
+			{"binop", "->", S{"id", "Any"}, S{"id", "Any"}},
+			{"binop", "->", S{"id", "Null"}, S{"id", "Any"}},
+		},
+		ReturnType: S{"binop", "->", S{"id", "Null"}, S{"id", "Any"}},
+	}
+	got := FormatValue(Value{Tag: VTFun, Data: f})
+	want := "<fun: f:(Any -> Any) -> it:(Null -> Any) -> Null -> Any>"
+	if strings.TrimSpace(got) != want {
+		t.Fatalf("fun render mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func Test_Printer_Type_Arrow_SingleVsMultiArg(t *testing.T) {
+	// Single-arg: no tuple parens
+	single := S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}
+	if got, want := FormatType(single), "Int -> Int"; strings.TrimSpace(got) != want {
+		t.Fatalf("single-arg func type mismatch: got %q want %q", got, want)
+	}
+	// Two-arg (right-assoc A -> (B -> R)): prints as (A, B) -> R
+	double := S{"binop", "->",
+		S{"id", "Int"},
+		S{"binop", "->", S{"id", "Str"}, S{"id", "Bool"}},
+	}
+	if got, want := FormatType(double), "(Int, Str) -> Bool"; strings.TrimSpace(got) != want {
+		t.Fatalf("multi-arg func type mismatch: got %q want %q", got, want)
+	}
 }

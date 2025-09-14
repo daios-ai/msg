@@ -1,6 +1,6 @@
 # MindScript Language Manual (Human-Oriented)
 
-MindScript is a concise, expression-oriented language with a clean surface syntax, structural types, first-class functions, and rich annotations. This manual presents the **human** (plain) MindScript syntax and semantics—free of machine-only encodings.
+MindScript is a compact, expression-oriented language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that actually guides oracles) while keeping syntax clean and readable.
 
 ---
 
@@ -163,6 +163,14 @@ let x = 1
 x = 2
 ```
 
+There are no named declarations. Functions, types, modules, etc. are all
+anonymous and need to be bound to a variable for later reference.
+```
+let f = fun() do true end
+let T = type {name: Str}
+let m = module "m" do ... end
+```
+
 ---
 
 ## 7) Control Flow
@@ -212,7 +220,7 @@ When iterating a map, the loop yields `[key, value]` pairs:
 
 ```mindscript
 for [k, v] in { a: 1, b: 2 } do
-	write(STDOUT, sprintf("%s=%d\n", k, v))
+	write(STDOUT, sprintf("%s=%d\n", [k, v]))
 end
 ```
 
@@ -284,7 +292,7 @@ end
 ```
 
 * Outer bindings aren’t visible unless passed in explicitly.
-* Exports are visible via property access: `m.area(3.0)`.
+* Values are visible via property access: `m.area(3.0)`.
 * Modules print as `<module: name>` in value formatting when available.
 
 ---
@@ -334,151 +342,180 @@ Guidelines:
 
 ## 12) Standard Library (Practical Reference)
 
-Below are common operations. Types use MindScript notation; `?` = nullable (soft possible).
-
 ### Constants & Handles
 
-* `PI: Num`, `E: Num`
-* `STDIN / STDOUT / STDERR`
+* `E: 2.718281828459045` — Euler's number e.
+* `PI: 3.141592653589793` — Mathematical constant π.
+* `STDERR: <handle: file>` — Writable handle for the process standard error.
+* `STDIN: <handle: file>` — Readable handle for the process standard input.
+* `STDOUT: <handle: file>` — Writable handle for the process standard output.
 
-```mindscript
-write(STDOUT, "Hello\n")
-```
+### Introspection, Types & Runtime
 
-### Introspection & Environment
+* `snapshot: <fun: _:Null -> {}>` — Return a map snapshot of the visible environment (including built-ins).
+* `typeOf: <fun: x:Any -> Type>` — Return the dynamic Type of a value.
+* `isType: <fun: x:Any -> T:Type -> Bool>` — Check whether a value conforms to a Type.
+* `isSubtype: <fun: A:Type -> B:Type -> Bool>` — Structural subtype test: A <: B.
 
-* `bindings(currentOnly?: Bool) -> { Str: Any }`
-* `snapshot() -> { Str: Any }` (deep)
-* `typeOf(x: Any) -> Type`
-* `isType(x: Any) -> (Type -> Bool)`
-* `isSubtype(A: Type) -> (B: Type -> Bool)`
+### AST & Code Reflection
 
-```mindscript
-typeOf(7)      # => Int
-```
+* `astParse: <fun: src:Str -> [Any]?>` — Parse source code into runtime-S (VTArray).
+* `astValidate: <fun: ast:[Any] -> [Any]>` — Validate a runtime-S AST.
+* `astEval: <fun: ast:[Any] -> Any>` — Evaluate a runtime-S AST in the caller's scope.
+* `astFormat: <fun: ast:[Any] -> Str?>` — Format a runtime-S AST into stable source.
+* `reflect: <fun: val:Any -> [Any]?>` — Reflect a value into constructor code (runtime-S).
+* `reify: <fun: rt:[Any] -> Any>` — Decode and evaluate constructor code (runtime-S).
+* `formatCode: <fun: src:Str -> Str?>` — Format source code.
+* `formatValue: <fun: x:Any -> Str>` — Render a runtime value (with annotations).
 
-### AST, Reflection, Codecs
+### Serialization, Schemas & Encoding
 
-* `astParse(src: Str) -> [Any]?` (annot-null on parse error)
-* `astEval(ast: [Any]) -> Any`
-* `reflect(x: Any) -> [Any]`
-* `reify(program: [Any]) -> Any`
-* `jsonParse(s: Str) -> Any`
-* `jsonStringify(x: Any) -> Str?` (annot-null if not encodable)
-* `base64Encode/Decode : Str -> Str / Str -> Str?`
-* `hexEncode/Decode : Str -> Str / Str -> Str?`
-* `gzipCompress/Decompress : Str -> Str / Str -> Str?`
+* `jsonParse: <fun: s:Str -> Any>` — Parse a JSON string into MindScript values.
+* `jsonStringify: <fun: x:Any -> Str?>` — Serialize a value to a compact JSON string.
+* `jsonSchemaToType: <fun: schema:Any -> Type?>` — Convert a JSON Schema object to a MindScript Type.
+* `jsonSchemaStringToType: <fun: src:Str -> Type>` — Parse a JSON Schema string and convert it to a MindScript Type.
+* `typeToJSONSchema: <fun: t:Type -> Any>` — Convert a MindScript Type to a JSON Schema object.
+* `typeStringToJSONSchema: <fun: src:Str -> Any>` — Parse a MindScript type string and convert it to JSON Schema.
+* `base64Encode: <fun: x:Str -> Str>` — Base64-encode bytes from a string.
+* `base64Decode: <fun: s:Str -> Str?>` — Decode a standard Base64 string.
+* `hexEncode: <fun: x:Str -> Str>` — Hex-encode bytes to a lowercase hexadecimal string.
+* `hexDecode: <fun: s:Str -> Str?>` — Decode a hexadecimal string.
+* `gzipCompress: <fun: data:Str -> Str>` — Compress data using gzip (default level).
+* `gzipDecompress: <fun: data:Str -> Str?>` — Decompress a gzip payload.
 
-```mindscript
-jsonStringify({ k: 1 })  # => "{\"k\":1}"
-```
+### Conversion & Length
 
-### URL & HTTP
-
-* `urlParse(s: Str) -> { scheme!:Str, host!:Str, port: Int, path!:Str, query!:Str, fragment: Str }?`
-* `urlBuild(components: { ... }) -> Str`
-* `urlQueryParse(s: Str) -> { Str: [Str] }?`
-* `urlQueryString(m: { Str: [Str] }) -> Str`
-* `http(req: { method:Str, url:Str, headers:{Str:Str}, body:Str, ... }) -> { status!:Int, statusText:Str, headers!:{Str:Str}, body!:Str, url:Str, proto:Str, durationMs: Int }?`
-* `httpStream(req: { ... }) -> { bodyH!: Any }?`
-
-```mindscript
-let u = urlParse("https://example.com/a?b=1")
-if u == null then return null # <invalid url> end
-u.host
-```
-
-### Filesystem & OS
-
-* `cwd() -> Str?`
-* `chdir(path: Str) -> Bool`
-* `open(path: Str)("r"|"w"|"a"|"rw") -> Any?`
-* `readFile(path: Str) -> Str?`
-* `writeFile(path: Str)(content: Str) -> Int?`
-* `remove/rename/mkdir : Str -> Bool / Str -> (Str -> Bool) / Str -> Bool`
-* `dirList(path: Str) -> [Str]?`
-* `stat(path: Str) -> { ... }?`
-* `pathBase/Dir/Ext/Clean : Str -> Str`
-* `pathJoin(parts: [Str]) -> Str`
-* `osEnv(name: Str) -> Str?`
-* `osSetEnv(name: Str)(value: Str?) -> Bool`
-
-### Handles I/O
-
-* `readAll(h: Any) -> Str?`
-* `readN(h: Any)(n: Int) -> Str?`
-* `readLine(h: Any) -> Str?`
-* `write(h: Any)(s: Str) -> Int?`
-* `flush/close : Any -> Bool / Any -> Bool`
-
-### Networking
-
-* `netListen(addr: Str) -> Any?`
-* `netAccept(listener: Any) -> Any?`
-* `netConnect(addr: Str) -> Any?`
-
-### Processes & Execution
-
-* `exec(argv: [Str])({ env: {Str:Str}, cwd: Str }) -> { status!:Int, stdout!:Str, stderr!:Str }?`
-* `exit(code: Int?) -> Null`
-* `fail(msg: Str?) -> Null`  # **hard error**
-* `try(x: Any) -> { ok: Bool, value: Any, error: Str? }`
-
-```mindscript
-try(fail("boom"))  # => { ok: false, value: null, error: "boom" }
-```
-
-### Concurrency & Timers
-
-* `chanOpen/chanClose : () -> Any / Any -> Bool`
-* `chanSend/chanRecv : Any -> (Any -> Bool) / Any -> Any?`
-* `chanTrySend/chanTryRecv : Any -> (Any -> Bool) / Any -> Any?`
-* `ticker(ms: Int) -> Any`
-* `timerAfter(ms: Int) -> Any`
-* `sleep(ms: Int) -> Null`
-* `nowMillis/nowNanos : () -> Int`
-
-### Math
-
-* `sin/cos/tan/sqrt/pow/log/exp : Num -> Num`
-* `randFloat() -> Num`   # in \[0,1)
-* `randInt(n: Int) -> Int`   # in \[0,n)
-* `seedRand(seed: Int) -> Null`
-* `randBytes(n: Int) -> Str?`
+* `bool: <fun: x:Any -> Bool>` — Convert to Bool using common "truthiness" rules.
+* `int: <fun: x:Any -> Int?>` — Convert to Int when possible; otherwise return null.
+* `num: <fun: x:Any -> Num?>` — Convert to Num when possible; otherwise return null.
+* `str: <fun: x:Any -> Str?>` — Stringify a value.
+* `len: <fun: x:Any -> Int?>` — Length of a value.
 
 ### Strings & Text
 
-* `str(x: Any) -> Str?`
-* `toLower/toUpper/strip/lstrip/rstrip : Str -> Str`
-* `substr(s: Str)(start: Int)(len: Int) -> Str`
-* `split(s: Str)(sep: Str) -> [Str]`   # empty sep splits by code point
-* `join(xs: [Str])(sep: Str) -> Str`
-* `match(s: Str)(pattern: Str) -> [Str]`   # RE2
-* `replace(s: Str)(pattern: Str)(with: Str) -> Str`
-* `sprintf/printf/formatCode/formatValue`
+* `join: <fun: xs:[Str] -> sep:Str -> Str>` — Join strings with a separator.
+* `split: <fun: s:Str -> sep:Str -> [Str]>` — Split a string on a separator (no regex).
+* `match: <fun: pattern:Str -> string:Str -> [Str]>` — Find all non-overlapping matches of a regex.
+* `replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str>` — Replace all non-overlapping regex matches.
+* `sprintf: <fun: fmt:Str -> args:[Any] -> Str?>` — Format a string with printf-style verbs.
+* `printf: <fun: fmt:Str -> args:[Any] -> Str?>` — Print a formatted string to standard output.
+* `substr: <fun: s:Str -> i:Int -> j:Int -> Str>` — Unicode-safe substring by rune index.
+* `toLower: <fun: s:Str -> Str>` — Lowercase conversion (Unicode aware).
+* `toUpper: <fun: s:Str -> Str>` — Uppercase conversion (Unicode aware).
+* `strip: <fun: s:Str -> Str>` — Remove leading and trailing whitespace (Unicode).
+* `lstrip: <fun: s:Str -> Str>` — Remove leading whitespace (Unicode).
+* `rstrip: <fun: s:Str -> Str>` — Remove trailing whitespace (Unicode).
+* `noteGet: <fun: x:Any -> Str?>` — Get the annotation attached to a value, if any.
+* `noteSet: <fun: text:Str -> value:Any -> Any>` — Attach or replace an annotation on a value.
 
-### Conversion, Length, Maps
+### Math
 
-* `int/num/bool : Any -> Int / Num / Bool`
-* `len(x: Any) -> Int`   # arrays (# elems), maps (# keys), strings (runes)
-* `clone(x: Any) -> Any` # deep for arrays/maps
-* `mapHas(m: {Str:Any})(k: Str) -> Bool`
-* `mapDelete(m: {Str:Any})(k: Str) -> Bool`
+* `sin: <fun: x:Num -> Num>` — Sine of an angle in radians.
+* `cos: <fun: x:Num -> Num>` — Cosine of an angle in radians.
+* `tan: <fun: x:Num -> Num>` — Tangent of an angle in radians.
+* `sqrt: <fun: x:Num -> Num>` — Square root.
+* `pow: <fun: base:Num -> exp:Num -> Num>` — Power: base^exp.
+* `exp: <fun: x:Num -> Num>` — Exponential function e^x.
+* `log: <fun: x:Num -> Num>` — Natural logarithm (base e).
 
-### Importing & Schemas
+### Randomness & Cryptography
 
-* `import(path: Str) -> Any?`
-* `importCode(path: Str) -> Any?`
-* `jsonSchemaToType(schema: Any) -> Type?`
-* `jsonSchemaStringToType(s: Str) -> Type?`
-* `typeToJSONSchema(t: Type) -> Any?`
-* `typeStringToJSONSchema(s: Str) -> Any?`
+* `seedRand: <fun: n:Int -> Null>` — Seed the pseudo-random number generator.
+* `randFloat: <fun: _:Null -> Num>` — Uniform random number in \[0.0, 1.0).
+* `randInt: <fun: n:Int -> Int>` — Uniform random integer in \[0, n).
+* `randBytes: <fun: n:Int -> Str?>` — Uniform cryptographically secure random bytes.
+* `sha256: <fun: x:Str -> Str>` — SHA-256 digest (raw bytes).
+* `hmacSha256: <fun: key:Str -> msg:Str -> Str>` — HMAC-SHA256 authentication tag (raw bytes).
+* `ctEqual: <fun: a:Str -> b:Str -> Bool>` — Constant-time equality for byte strings.
 
-### Cryptography
+### Time & Scheduling
 
-* `sha256(s: Str) -> Str`      # 32 raw bytes in string container
-* `hmacSha256(key: Str)(msg: Str) -> Str`
-* `ctEqual(a: Str)(b: Str) -> Bool`
+* `dateNow: <fun: _:Null -> {}>` — Current local date/time components.
+* `nowMillis: <fun: _:Null -> Int>` — Current wall-clock time in milliseconds since the Unix epoch.
+* `nowNanos: <fun: _:Null -> Int>` — Current wall-clock time in nanoseconds since the Unix epoch.
+* `sleep: <fun: ms:Int -> Null>` — Pause execution for a number of milliseconds.
+* `ticker: <fun: ms:Int -> Any>` — Emit periodic ticks on a channel until closed.
+* `timerAfter: <fun: ms:Int -> Any>` — Emit one tick after a delay, then close.
+* `timeFormatRFC3339: <fun: millis:Int -> Str>` — Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
+* `timeParseRFC3339: <fun: s:Str -> Int?>` — Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
+
+### Channels (CSP-style)
+
+* `chanOpen: <fun: cap:Int? -> Any>` — Create a new channel (buffered when cap>0).
+* `chanClose: <fun: c:Any -> Null>` — Close a channel (idempotent).
+* `chanSend: <fun: c:Any -> x:Any -> Null>` — Send a value on a channel (blocking).
+* `chanRecv: <fun: c:Any -> Any>` — Receive a value from a channel (blocking).
+* `chanTrySend: <fun: c:Any -> x:Any -> Bool>` — Attempt a non-blocking send on a channel.
+* `chanTryRecv: <fun: c:Any -> {}>` — Attempt a non-blocking receive from a channel.
+
+### Processes & Concurrency
+
+* `procSpawn: <fun: f:Any -> Any>` — Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
+* `procCancel: <fun: p:Any -> Null>` — Request cooperative cancellation of a process (best effort).
+* `procJoin: <fun: p:Any -> Any>` — Wait for a process to finish and return its result.
+* `procJoinAll: <fun: ps:[Any] -> [Any]>` — Wait for all processes to finish and return their results in order.
+* `procJoinAny: <fun: ps:[Any] -> {}>` — Wait for any process to finish; return its index and value.
+* `try: <fun: f:Any -> {}>` — Run a function and capture hard failures.
+
+### Processes & System Exec
+
+* `exec: }?>` — Run an external program.
+* `exit: <fun: code:Int? -> Null>` — Terminate the current process with an optional status code.
+
+### Files, Paths & OS
+
+* `cwd: <fun: _:Null -> Str?>` — Get the current working directory.
+* `chdir: <fun: path:Str -> Bool>` — Change the current working directory.
+* `dirList: <fun: path:Str -> [Str]?>` — List directory entries as an array of names.
+* `mkdir: <fun: path:Str -> Bool>` — Create a directory (creating parents as needed).
+* `open: <fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Any>` — Open a file and return a handle.
+* `readAll: <fun: h:Any -> Str?>` — Read all remaining bytes from a handle.
+* `readN: <fun: h:Any -> n:Int -> Str?>` — Read up to n bytes from a handle.
+* `readLine: <fun: h:Any -> Str?>` — Read one line from a handle (without the trailing newline).
+* `write: <fun: h:Any -> s:Str -> Int?>` — Write a string to a file or network handle.
+* `flush: <fun: h:Any -> Bool>` — Flush buffered output for a handle.
+* `close: <fun: h:Any -> Bool>` — Close a file, network connection, or listener handle.
+* `readFile: <fun: path:Str -> Str?>` — Read an entire file into a string.
+* `writeFile: <fun: path:Str -> data:Str -> Int?>` — Write a string to a file (overwriting if it exists).
+* `remove: <fun: path:Str -> Bool>` — Delete a file or an empty directory.
+* `rename: <fun: old:Str -> new:Str -> Bool>` — Rename (move) a file or directory.
+* `stat: <fun: path:Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?>` — File status (like ls -l metadata).
+* `pathBase: <fun: path:Str -> Str>` — Return the last element of a path (OS-specific).
+* `pathDir: <fun: path:Str -> Str>` — Return all but the last element of a path.
+* `pathExt: <fun: path:Str -> Str>` — Return the file extension (including the leading dot), or "" if none.
+* `pathClean: <fun: path:Str -> Str>` — Clean a path by applying lexical simplifications.
+* `pathJoin: <fun: parts:[Str] -> Str>` — Join path elements using the OS-specific separator.
+* `tempDir: <fun: _:Null -> Str>` — Return the system temporary directory.
+
+### Environment & Modules
+
+* `osEnv: <fun: name:Str -> Str?>` — Read an environment variable.
+* `osSetEnv: <fun: name:Str -> value:Str? -> Bool>` — Set or unset an environment variable.
+* `import: <fun: path:Str -> Any>` — Load a module from filesystem or HTTP(S).
+* `importCode: <fun: name:Str -> src:Str -> Any>` — Evaluate source text as a module in memory.
+
+### Networking & HTTP
+
+* `netListen: <fun: addr:Str -> Any>` — Listen on a TCP address "host\:port".
+* `netAccept: <fun: l:Any -> Any>` — Accept one TCP connection from a listener.
+* `netConnect: <fun: addr:Str -> Any>` — Open a TCP connection to "host\:port".
+* `http: }?>` — Make an HTTP request (buffered).
+* `httpStream: }?>` — Make an HTTP request (streaming).
+* `urlParse: <fun: s:Str -> {}?>` — Parse a URL into components.
+* `urlBuild: <fun: u:{} -> Str>` — Build a URL string from components.
+* `urlQueryParse: <fun: s:Str -> {}?>` — Parse a URL query string into a map.
+* `urlQueryString: <fun: q:{} -> Str>` — Serialize a query map to 'application/x-www-form-urlencoded'.
+
+### Data Structures & Utilities
+
+* `clone: <fun: x:Any -> Any>` — Clone a value (deep-copy).
+* `mapHas: <fun: obj:{} -> key:Str -> Bool>` — Return true if a key exists in a map.
+* `mapDelete: <fun: obj:{} -> key:Str -> {}>` — Delete a property from a map (in place).
+
+---
+
+If you want, I can splice this into the full manual (replacing the old §12), or generate a one-page cheatsheet of just the built-ins by category.
+
 
 ---
 
@@ -557,7 +594,7 @@ end
 
 ```mindscript
 for [k, v] in { a: 1, b: 2 } do
-	printf("%s=%d\n", k, v)
+	printf("%s=%d\n", [k, v])
 end
 ```
 
@@ -635,8 +672,8 @@ break "done"
 continue
 
 # Types
-type Pair = { left!: Int, right!: Int }
-type F = (Int, Num) -> Str
+let Pair = type { left!: Int, right!: Int }
+let F = type Int -> Num -> Str
 
 # Annotations
 # PRE above

@@ -1,7 +1,9 @@
 
 # JSON-MindScript Manual
 
-**MindScript** is a machine-readable, JSON-formatted, S-expressions language. Every construct is an expression. Every source file is **strict JSON**.
+**JSON-MindScript** is a machine-readable, JSON-formatted, S-expressions language. Every construct is an expression. Every source file is **strict JSON**.
+
+**JSON-MindScript** is a language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that actually guides oracles).
 
 ---
 
@@ -558,7 +560,6 @@ Below are brief, task-oriented descriptions you can code against. Return types f
 
 ### Introspection & Environment
 
-* **bindings : (Bool?) → Map** — Visible name→value snapshot; pass `true` for current frame only; otherwise merged view. Read-only, shallow.
 * **snapshot : Null → Map** — Deep, shadow-aware map of all visible bindings (incl. Core). Per-key annotations mirror source values.
 * **typeOf : Any → Type** — Dynamic type tag of a value.
 * **isType : Any → (Type → Bool)** — Predicate: does value conform to a type?

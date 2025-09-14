@@ -1,254 +1,123 @@
-E: <type: Num> — Euler's number e.
-PI: <type: Num> — Mathematical constant π.
-STDERR: <type: Any> — Writable handle for the process standard error.
-STDIN: <type: Any> — Readable handle for the process standard input.
-STDOUT: <type: Any> — Writable handle for the process standard output.
-assert: <type: Bool -> Bool> — Assert that a condition holds.
-astEval: <type: [Any] -> Any> — Evaluate a runtime-S AST in the caller's scope.
-astFormat: <type: [Any] -> Str?> — Format a runtime-S AST into stable source.
-astParse: <type: Str -> [Any]?> — Parse source code into runtime-S (VTArray).
-astValidate: <type: [Any] -> [Any]> — Validate a runtime-S AST.
-base64Decode: <type: Str -> Str?> — Decode a standard Base64 string.
-base64Encode: <type: Str -> Str> — Base64-encode bytes from a string.
-bool: <type: Any -> Bool> — Convert to Bool using common "truthiness" rules.
-chanClose: <type: Any -> Null> — Close a channel (idempotent).
-chanOpen: <type: Int? -> Any> — Create a new channel (buffered when cap>0).
-chanRecv: <type: Any -> Any> — Receive a value from a channel (blocking).
-chanSend: <type: (Any, Any) -> Null> — Send a value on a channel (blocking).
-chanTryRecv: <type: Any -> {}> — Attempt a non-blocking receive from a channel.
-chanTrySend: <type: (Any, Any) -> Bool> — Attempt a non-blocking send on a channel.
-chdir: <type: Str -> Bool> — Change the current working directory.
-clone: <type: Any -> Any> — Clone a value (deep-copy).
-close: <type: Any -> Bool> — Close a file, network connection, or listener handle.
-codeImport: <type: (Str, Str) -> {}> — Create an importer from a code string.
-cos: <type: Num -> Num> — Cosine of an angle in radians.
-ctEqual: <type: (Str, Str) -> Bool> — Constant-time equality for byte strings.
-cwd: <type: Str?> — Get the current working directory.
-dateNow: <type: {}> — Current local date/time components.
-delProp: <type: ({}, Str) -> {}> — Delete a property from a map.
-dir: <type: {} -> [Str]> — Directory listing of visible fields/functions.
-dirList: <type: Str -> [Str]?> — List directory entries as an array of names.
-error: <type: Str -> Null> — Produce an annotated null (soft error).
-exec: <type: ([Str], {cwd: Str, env: {}, stdin: Str}?) -> {
-	status!: Int,
-	stderr!: Str,
-	stdout!: Str
-}?> — Run an external program.
-exit: <type: Int? -> Null> — Terminate the current process with an optional status code.
-exp: <type: Num -> Num> — Exponential function e^x.
-fail: <type: Str? -> Null> — Fail: throw a runtime error (hard fault).
-filter: <type: (Any -> Bool, Null -> Any?, Null) -> Any?> — Filter an iterator (lazy predicate).
-flush: <type: Any -> Bool> — Flush buffered output for a handle.
-formatCode: <type: Str -> Str?> — Format source code.
-formatValue: <type: Any -> Str> — Render a runtime value (with annotations).
-getProp: <type: ({}, Str) -> Any> — Get a property value.
-gzipCompress: <type: Str -> Str> — Compress data using gzip (default level).
-gzipDecompress: <type: Str -> Str?> — Decompress a gzip payload.
-hasKey: <type: ({}, Str) -> Bool> — Whether a key exists in a map.
-hexDecode: <type: Str -> Str?> — Decode a hexadecimal string.
-hexEncode: <type: Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
-hmacSha256: <type: (Str, Str) -> Str> — HMAC-SHA256 authentication tag (raw bytes).
-http: <type: {
-	body: Str,
-	bodyH: Any,
-	headers: {},
-	method: Str,
-	timeoutMs: Int,
-	url!: Str
-} -> {
-	body: Str,
-	bodyH: Any,
-	durationMs: Int,
-	headers!: {},
-	proto: Str,
-	status!: Int,
-	statusText: Str,
-	url: Str
-}?> — Make an HTTP request (buffered).
-httpGet: <type: Str -> Str?> — Simple HTTP GET helper.
-httpStream: <type: {
-	body: Str,
-	bodyH: Any,
-	headers: {},
-	method: Str,
-	timeoutMs: Int,
-	url!: Str
-} -> {
-	body: Str,
-	bodyH: Any,
-	durationMs: Int,
-	headers!: {},
-	proto: Str,
-	status!: Int,
-	statusText: Str,
-	url: Str
-}?> — Make an HTTP request (streaming).
-import: <type: Str -> Any> — Load a module from filesystem or HTTP(S).
-importCode: <type: (Str, Str) -> Any> — Evaluate source text as a module in memory.
-importUrl: <type: Str -> {}?> — Import a module from a URL.
-int: <type: Any -> Int?> — Convert to Int when possible; otherwise return null.
-isSubtype: <type: (Type, Type) -> Bool> — Structural subtype test: A <: B.
-isType: <type: (Any, Type) -> Bool> — Check whether a value conforms to a Type.
-iter: <type: (Any, Null) -> Any?> — Turn arrays into (Null -> Any?) iterators; pass iterators through unchanged.
-join: <type: ([Str], Str) -> Str> — Join strings with a separator.
-jsonParse: <type: Str -> Any> — Parse a JSON string into MindScript values.
-jsonSchema: <type: Type -> Str?> — Render a JSON Schema for a Type.
-jsonSchemaStringToType: <type: Str -> Type> — Parse a JSON Schema string and convert it to a MindScript Type.
-jsonSchemaToType: <type: Any -> Type?> — Convert a JSON Schema object to a MindScript Type.
-jsonStringify: <type: Any -> Str?> — Serialize a value to a compact JSON string.
-keys: <type: ({}, Null) -> Str?> — Iterator over keys of an object.
-len: <type: Any -> Int?> — Length of a value.
-list: <type: Null -> Any? -> [Any]> — Collect an iterator into an array.
-llm: <type: {
-	_boxedSchema: Type -> {},
-	_env: (Str, Str) -> Str,
-	_err: Str -> Null,
-	_merge: ({}, {}) -> {},
-	_ollama: {
-		exec: ({}, Str) -> Str?,
-		listModels: {} -> [Str]?,
-		name: Str,
-		state: {baseUrl: Str, model: Null, options: {temperature: Num}},
-		supportsSchema: Bool
-	},
-	_openai: {
-		exec: ({}, Str) -> Str?,
-		listModels: {} -> [Str]?,
-		name: Str,
-		state: {
-			apiKey: Str,
-			baseUrl: Str,
-			model: Str,
-			options: {temperature: Num}
-		},
-		supportsSchema: Bool
-	},
-	_state: {
-		backends: {
-			ollama: {
-				exec: ({}, Str) -> Str?,
-				listModels: {} -> [Str]?,
-				name: Str,
-				state: {baseUrl: Str, model: Null, options: {temperature: Num}},
-				supportsSchema: Bool
-			},
-			openai: {
-				exec: ({}, Str) -> Str?,
-				listModels: {} -> [Str]?,
-				name: Str,
-				state: {
-					apiKey: Str,
-					baseUrl: Str,
-					model: Str,
-					options: {temperature: Num}
-				},
-				supportsSchema: Bool
-			}
-		},
-		current: Str
-	},
-	apiKey: Str,
-	auth: {} -> {}?,
-	backends: Null -> [Str],
-	baseUrl: Str,
-	exec: Str -> Str?,
-	getOptions: Null -> {},
-	model: Null,
-	models: Null -> [Str]?,
-	setOptions: {} -> {}?,
-	status: Null -> {},
-	useBackend: Str -> {}?,
-	useModel: Str -> {}?
-}> — Load the llm module (namespaced) and install its executor into the global hook.
-log: <type: Num -> Num> — Natural logarithm (base e).
-lstrip: <type: Str -> Str> — Remove leading whitespace (Unicode).
-map: <type: (Any -> Any, Null -> Any?, Null) -> Any?> — Map over an iterator (lazy transform).
-mapDelete: <type: ({}, Str) -> {}> — Delete a property from a map (in place).
-mapHas: <type: ({}, Str) -> Bool> — Return true if a key exists in a map.
-match: <type: (Str, Str) -> [Str]> — Find all non-overlapping matches of a regex.
-mkdir: <type: Str -> Bool> — Create a directory (creating parents as needed).
-mute: <type: Any -> Null> — Mute (sink) a value.
-natural: <type: (Null, Null) -> Int> — Infinite iterator: 1, 2, 3, ...
-natural0: <type: (Null, Null) -> Int> — Infinite iterator: 0, 1, 2, ...
-netAccept: <type: Any -> Any> — Accept one TCP connection from a listener.
-netConnect: <type: Str -> Any> — Open a TCP connection to "host:port".
-netListen: <type: Str -> Any> — Listen on a TCP address "host:port".
-noteGet: <type: Any -> Str?> — Get the annotation attached to a value, if any.
-noteSet: <type: (Str, Any) -> Any> — Attach or replace an annotation on a value.
-nowMillis: <type: Int> — Current wall-clock time in milliseconds since the Unix epoch.
-nowNanos: <type: Int> — Current wall-clock time in nanoseconds since the Unix epoch.
-num: <type: Any -> Num?> — Convert to Num when possible; otherwise return null.
-open: <type: (Str, Enum["r", "w", "a", "rw"]) -> Any> — Open a file and return a handle.
-oracleCheck: <type: Str -> {}?> — Run oracleHello and report status + timing.
-oracleInstall: <type: Str -> Str? -> Null> — Install a new global oracle executor.
-oracleStatus: <type: Null -> Str> — Show oracle installation status.
-osEnv: <type: Str -> Str?> — Read an environment variable.
-osSetEnv: <type: (Str, Str?) -> Bool> — Set or unset an environment variable.
-pathBase: <type: Str -> Str> — Return the last element of a path (OS-specific).
-pathClean: <type: Str -> Str> — Clean a path by applying lexical simplifications.
-pathDir: <type: Str -> Str> — Return all but the last element of a path.
-pathExt: <type: Str -> Str> — Return the file extension (including the leading dot), or "" if none.
-pathJoin: <type: [Str] -> Str> — Join path elements using the OS-specific separator.
-pop: <type: [Any] -> Any?> — Pop the last element without modifying the input array.
-pow: <type: (Num, Num) -> Num> — Power: base^exp.
-print: <type: Any -> Any> — Print a value and return it.
-printf: <type: (Str, [Any]) -> Str?> — Print a formatted string to standard output.
-println: <type: Any -> Any> — Print a value with newline and return it.
-procCancel: <type: Any -> Null> — Request cooperative cancellation of a process (best effort).
-procJoin: <type: Any -> Any> — Wait for a process to finish and return its result.
-procJoinAll: <type: [Any] -> [Any]> — Wait for all processes to finish and return their results in order.
-procJoinAny: <type: [Any] -> {}> — Wait for any process to finish; return its index and value.
-procSpawn: <type: Any -> Any> — Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
-push: <type: ([Any], Any) -> [Any]> — Push a value to the end (returns a new array).
-randBytes: <type: Int -> Str?> — Uniform cryptographically secure random bytes.
-randFloat: <type: Null -> Num> — Uniform random number in [0.0, 1.0).
-randInt: <type: Int -> Int> — Uniform random integer in [0, n).
-range: <type: (Int, Int?, Null) -> Int?> — Integer range iterator (stop exclusive; infinite if stop is null).
-readAll: <type: Any -> Str?> — Read all remaining bytes from a handle.
-readFile: <type: Str -> Str?> — Read an entire file into a string.
-readLine: <type: Any -> Str?> — Read one line from a handle (without the trailing newline).
-readN: <type: (Any, Int) -> Str?> — Read up to n bytes from a handle.
-reduce: <type: ((Any, Any) -> Any, Null -> Any?) -> Any?> — Fold an iterator with a binary function.
-reflect: <type: Any -> [Any]?> — Reflect a value into constructor code (runtime-S).
-reify: <type: [Any] -> Any> — Decode and evaluate constructor code (runtime-S).
-remove: <type: Str -> Bool> — Delete a file or an empty directory.
-rename: <type: (Str, Str) -> Bool> — Rename (move) a file or directory.
-replace: <type: (Str, Str, Str) -> Str> — Replace all non-overlapping regex matches.
-rstrip: <type: Str -> Str> — Remove trailing whitespace (Unicode).
-seedRand: <type: Int -> Null> — Seed the pseudo-random number generator.
-setProp: <type: ({}, Str, Any) -> Any> — Set a property value (returns the value).
-sha256: <type: Str -> Str> — SHA-256 digest (raw bytes).
-shift: <type: ([Any], Any) -> [Any]> — Shift a value to the front (returns a new array).
-sin: <type: Num -> Num> — Sine of an angle in radians.
-sleep: <type: Int -> Null> — Pause execution for a number of milliseconds.
-slice: <type: ([Any], Int, Int) -> [Any]> — Slice an array [s, e).
-snapshot: <type: Null -> {}> — Return a map snapshot of the visible environment (including built-ins).
-split: <type: (Str, Str) -> [Str]> — Split a string on a separator (no regex).
-sprintf: <type: (Str, [Any]) -> Str?> — Format a string with printf-style verbs.
-sqrt: <type: Num -> Num> — Square root.
-stat: <type: Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?> — File status (like ls -l metadata).
-str: <type: Any -> Str?> — Stringify a value.
-strip: <type: Str -> Str> — Remove leading and trailing whitespace (Unicode).
-substr: <type: (Str, Int, Int) -> Str> — Unicode-safe substring by rune index.
-tan: <type: Num -> Num> — Tangent of an angle in radians.
-tempDir: <type: Str> — Return the system temporary directory.
-ticker: <type: Int -> Any> — Emit periodic ticks on a channel until closed.
-timeFormatRFC3339: <type: Int -> Str> — Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
-timeParseRFC3339: <type: Str -> Int?> — Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
-timerAfter: <type: Int -> Any> — Emit one tick after a delay, then close.
-toLower: <type: Str -> Str> — Lowercase conversion (Unicode aware).
-toUpper: <type: Str -> Str> — Uppercase conversion (Unicode aware).
-try: <type: Any -> {}> — Run a function and capture hard failures.
-tsNow: <type: Null -> Int> — Current timestamp in milliseconds since the Unix epoch.
-typeOf: <type: Any -> Type> — Return the dynamic Type of a value.
-typeStringToJSONSchema: <type: Str -> Any> — Parse a MindScript type string and convert it to JSON Schema.
-typeToJSONSchema: <type: Type -> Any> — Convert a MindScript Type to a JSON Schema object.
-uid: <type: Any -> Int> — Stable-ish integer id for a value’s string form.
-unshift: <type: [Any] -> Any?> — Unshift (peek) the first element.
-urlBuild: <type: {} -> Str> — Build a URL string from components.
-urlParse: <type: Str -> {}?> — Parse a URL into components.
-urlQueryParse: <type: Str -> {}?> — Parse a URL query string into a map.
-urlQueryString: <type: {} -> Str> — Serialize a query map to 'application/x-www-form-urlencoded'.
-values: <type: ({}, Null) -> Any?> — Iterator over values of an object.
-write: <type: (Any, Str) -> Int?> — Write a string to a file or network handle.
-writeFile: <type: (Str, Str) -> Int?> — Write a string to a file (overwriting if it exists).
+E: 2.718281828459045 — Euler's number e.
+PI: 3.141592653589793 — Mathematical constant π.
+STDERR: <handle: file> — Writable handle for the process standard error.
+STDIN: <handle: file> — Readable handle for the process standard input.
+STDOUT: <handle: file> — Writable handle for the process standard output.
+astEval: <fun: ast:[Any] -> Any> — Evaluate a runtime-S AST in the caller's scope.
+astFormat: <fun: ast:[Any] -> Str?> — Format a runtime-S AST into stable source.
+astParse: <fun: src:Str -> [Any]?> — Parse source code into runtime-S (VTArray).
+astValidate: <fun: ast:[Any] -> [Any]> — Validate a runtime-S AST.
+base64Decode: <fun: s:Str -> Str?> — Decode a standard Base64 string.
+base64Encode: <fun: x:Str -> Str> — Base64-encode bytes from a string.
+bool: <fun: x:Any -> Bool> — Convert to Bool using common "truthiness" rules.
+chanClose: <fun: c:Any -> Null> — Close a channel (idempotent).
+chanOpen: <fun: cap:Int? -> Any> — Create a new channel (buffered when cap>0).
+chanRecv: <fun: c:Any -> Any> — Receive a value from a channel (blocking).
+chanSend: <fun: c:Any -> x:Any -> Null> — Send a value on a channel (blocking).
+chanTryRecv: <fun: c:Any -> {}> — Attempt a non-blocking receive from a channel.
+chanTrySend: <fun: c:Any -> x:Any -> Bool> — Attempt a non-blocking send on a channel.
+chdir: <fun: path:Str -> Bool> — Change the current working directory.
+clone: <fun: x:Any -> Any> — Clone a value (deep-copy).
+close: <fun: h:Any -> Bool> — Close a file, network connection, or listener handle.
+cos: <fun: x:Num -> Num> — Cosine of an angle in radians.
+ctEqual: <fun: a:Str -> b:Str -> Bool> — Constant-time equality for byte strings.
+cwd: <fun: _:Null -> Str?> — Get the current working directory.
+dateNow: <fun: _:Null -> {}> — Current local date/time components.
+dirList: <fun: path:Str -> [Str]?> — List directory entries as an array of names.
+exec: }?> — Run an external program.
+exit: <fun: code:Int? -> Null> — Terminate the current process with an optional status code.
+exp: <fun: x:Num -> Num> — Exponential function e^x.
+fail: <fun: message:Str? -> Null> — Fail: throw a runtime error (hard fault).
+flush: <fun: h:Any -> Bool> — Flush buffered output for a handle.
+formatCode: <fun: src:Str -> Str?> — Format source code.
+formatValue: <fun: x:Any -> Str> — Render a runtime value (with annotations).
+gzipCompress: <fun: data:Str -> Str> — Compress data using gzip (default level).
+gzipDecompress: <fun: data:Str -> Str?> — Decompress a gzip payload.
+hexDecode: <fun: s:Str -> Str?> — Decode a hexadecimal string.
+hexEncode: <fun: x:Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
+hmacSha256: <fun: key:Str -> msg:Str -> Str> — HMAC-SHA256 authentication tag (raw bytes).
+http: }?> — Make an HTTP request (buffered).
+httpStream: }?> — Make an HTTP request (streaming).
+import: <fun: path:Str -> Any> — Load a module from filesystem or HTTP(S).
+importCode: <fun: name:Str -> src:Str -> Any> — Evaluate source text as a module in memory.
+int: <fun: x:Any -> Int?> — Convert to Int when possible; otherwise return null.
+isSubtype: <fun: A:Type -> B:Type -> Bool> — Structural subtype test: A <: B.
+isType: <fun: x:Any -> T:Type -> Bool> — Check whether a value conforms to a Type.
+join: <fun: xs:[Str] -> sep:Str -> Str> — Join strings with a separator.
+jsonParse: <fun: s:Str -> Any> — Parse a JSON string into MindScript values.
+jsonSchemaStringToType: <fun: src:Str -> Type> — Parse a JSON Schema string and convert it to a MindScript Type.
+jsonSchemaToType: <fun: schema:Any -> Type?> — Convert a JSON Schema object to a MindScript Type.
+jsonStringify: <fun: x:Any -> Str?> — Serialize a value to a compact JSON string.
+len: <fun: x:Any -> Int?> — Length of a value.
+log: <fun: x:Num -> Num> — Natural logarithm (base e).
+lstrip: <fun: s:Str -> Str> — Remove leading whitespace (Unicode).
+mapDelete: <fun: obj:{} -> key:Str -> {}> — Delete a property from a map (in place).
+mapHas: <fun: obj:{} -> key:Str -> Bool> — Return true if a key exists in a map.
+match: <fun: pattern:Str -> string:Str -> [Str]> — Find all non-overlapping matches of a regex.
+mkdir: <fun: path:Str -> Bool> — Create a directory (creating parents as needed).
+netAccept: <fun: l:Any -> Any> — Accept one TCP connection from a listener.
+netConnect: <fun: addr:Str -> Any> — Open a TCP connection to "host:port".
+netListen: <fun: addr:Str -> Any> — Listen on a TCP address "host:port".
+noteGet: <fun: x:Any -> Str?> — Get the annotation attached to a value, if any.
+noteSet: <fun: text:Str -> value:Any -> Any> — Attach or replace an annotation on a value.
+nowMillis: <fun: _:Null -> Int> — Current wall-clock time in milliseconds since the Unix epoch.
+nowNanos: <fun: _:Null -> Int> — Current wall-clock time in nanoseconds since the Unix epoch.
+num: <fun: x:Any -> Num?> — Convert to Num when possible; otherwise return null.
+open: <fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Any> — Open a file and return a handle.
+osEnv: <fun: name:Str -> Str?> — Read an environment variable.
+osSetEnv: <fun: name:Str -> value:Str? -> Bool> — Set or unset an environment variable.
+pathBase: <fun: path:Str -> Str> — Return the last element of a path (OS-specific).
+pathClean: <fun: path:Str -> Str> — Clean a path by applying lexical simplifications.
+pathDir: <fun: path:Str -> Str> — Return all but the last element of a path.
+pathExt: <fun: path:Str -> Str> — Return the file extension (including the leading dot), or "" if none.
+pathJoin: <fun: parts:[Str] -> Str> — Join path elements using the OS-specific separator.
+pow: <fun: base:Num -> exp:Num -> Num> — Power: base^exp.
+printf: <fun: fmt:Str -> args:[Any] -> Str?> — Print a formatted string to standard output.
+procCancel: <fun: p:Any -> Null> — Request cooperative cancellation of a process (best effort).
+procJoin: <fun: p:Any -> Any> — Wait for a process to finish and return its result.
+procJoinAll: <fun: ps:[Any] -> [Any]> — Wait for all processes to finish and return their results in order.
+procJoinAny: <fun: ps:[Any] -> {}> — Wait for any process to finish; return its index and value.
+procSpawn: <fun: f:Any -> Any> — Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.
+randBytes: <fun: n:Int -> Str?> — Uniform cryptographically secure random bytes.
+randFloat: <fun: _:Null -> Num> — Uniform random number in [0.0, 1.0).
+randInt: <fun: n:Int -> Int> — Uniform random integer in [0, n).
+readAll: <fun: h:Any -> Str?> — Read all remaining bytes from a handle.
+readFile: <fun: path:Str -> Str?> — Read an entire file into a string.
+readLine: <fun: h:Any -> Str?> — Read one line from a handle (without the trailing newline).
+readN: <fun: h:Any -> n:Int -> Str?> — Read up to n bytes from a handle.
+reflect: <fun: val:Any -> [Any]?> — Reflect a value into constructor code (runtime-S).
+reify: <fun: rt:[Any] -> Any> — Decode and evaluate constructor code (runtime-S).
+remove: <fun: path:Str -> Bool> — Delete a file or an empty directory.
+rename: <fun: old:Str -> new:Str -> Bool> — Rename (move) a file or directory.
+replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str> — Replace all non-overlapping regex matches.
+rstrip: <fun: s:Str -> Str> — Remove trailing whitespace (Unicode).
+seedRand: <fun: n:Int -> Null> — Seed the pseudo-random number generator.
+sha256: <fun: x:Str -> Str> — SHA-256 digest (raw bytes).
+sin: <fun: x:Num -> Num> — Sine of an angle in radians.
+sleep: <fun: ms:Int -> Null> — Pause execution for a number of milliseconds.
+snapshot: <fun: _:Null -> {}> — Return a map snapshot of the visible environment (including built-ins).
+split: <fun: s:Str -> sep:Str -> [Str]> — Split a string on a separator (no regex).
+sprintf: <fun: fmt:Str -> args:[Any] -> Str?> — Format a string with printf-style verbs.
+sqrt: <fun: x:Num -> Num> — Square root.
+stat: <fun: path:Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?> — File status (like ls -l metadata).
+str: <fun: x:Any -> Str?> — Stringify a value.
+strip: <fun: s:Str -> Str> — Remove leading and trailing whitespace (Unicode).
+substr: <fun: s:Str -> i:Int -> j:Int -> Str> — Unicode-safe substring by rune index.
+tan: <fun: x:Num -> Num> — Tangent of an angle in radians.
+tempDir: <fun: _:Null -> Str> — Return the system temporary directory.
+ticker: <fun: ms:Int -> Any> — Emit periodic ticks on a channel until closed.
+timeFormatRFC3339: <fun: millis:Int -> Str> — Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
+timeParseRFC3339: <fun: s:Str -> Int?> — Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
+timerAfter: <fun: ms:Int -> Any> — Emit one tick after a delay, then close.
+toLower: <fun: s:Str -> Str> — Lowercase conversion (Unicode aware).
+toUpper: <fun: s:Str -> Str> — Uppercase conversion (Unicode aware).
+try: <fun: f:Any -> {}> — Run a function and capture hard failures.
+typeOf: <fun: x:Any -> Type> — Return the dynamic Type of a value.
+typeStringToJSONSchema: <fun: src:Str -> Any> — Parse a MindScript type string and convert it to JSON Schema.
+typeToJSONSchema: <fun: t:Type -> Any> — Convert a MindScript Type to a JSON Schema object.
+urlBuild: <fun: u:{} -> Str> — Build a URL string from components.
+urlParse: <fun: s:Str -> {}?> — Parse a URL into components.
+urlQueryParse: <fun: s:Str -> {}?> — Parse a URL query string into a map.
+urlQueryString: <fun: q:{} -> Str> — Serialize a query map to 'application/x-www-form-urlencoded'.
+write: <fun: h:Any -> s:Str -> Int?> — Write a string to a file or network handle.
+writeFile: <fun: path:Str -> data:Str -> Int?> — Write a string to a file (overwriting if it exists).

@@ -630,3 +630,70 @@ func Test_Types_ValueToType_Module_Inference(t *testing.T) {
 		t.Fatalf("expected field n: Int (optional), got: %#v", fn)
 	}
 }
+func Test_Types_IsType_Map_FieldAnnotations_Single(t *testing.T) {
+	ip := newIP()
+
+	// Value with one field
+	val := evalWithIP(t, ip, `{root: "."}`)
+
+	// Type whose field type is annotated (annotation should be ignored)
+	ts := typeS(t, ip, `{root:
+# directory to search
+Str}`)
+
+	if !ip.isType(val, ts, ip.Global) {
+		t.Fatalf("expected {root:\".\"} to match annotated type {root: #(doc) Str}")
+	}
+}
+
+func Test_Types_IsType_Map_FieldAnnotations_Combo(t *testing.T) {
+	ip := newIP()
+
+	// Three values with increasing fields present
+	v0 := evalWithIP(t, ip, `{}`)
+	v1 := evalWithIP(t, ip, `{root: "."}`)
+	v2 := evalWithIP(t, ip, `{root: ".", parallel: true, quiet: false}`)
+
+	// Type with all-optional fields whose inner types are annotated
+	ts := typeS(t, ip, `{
+  root:
+# root directory (default ".")
+  Str,
+  parallel:
+# reserved; currently ignored
+  Bool,
+  quiet:
+# suppress discovery logs
+  Bool
+}`)
+
+	for i, v := range []Value{v0, v1, v2} {
+		if !ip.isType(v, ts, ip.Global) {
+			t.Fatalf("case %d: expected value to conform to annotated opts type", i)
+		}
+	}
+}
+
+func Test_Types_Subtype_And_Unify_AnnotationTransparent(t *testing.T) {
+	ip := newIP()
+
+	// Same shape; left has annotation on field type, right does not.
+	a := typeS(t, ip, `{x:
+# doc
+Int}`)
+	b := typeS(t, ip, `{x: Int}`)
+
+	// Subtyping should treat annotations as no-ops (both directions).
+	if !ip.isSubtype(a, b, ip.Global) {
+		t.Fatalf("expected annotated a <: b")
+	}
+	if !ip.isSubtype(b, a, ip.Global) {
+		t.Fatalf("expected b <: annotated a")
+	}
+
+	// Unification should also drop annotations (result == unannotated shape).
+	u := ip.unifyTypes(a, b, ip.Global)
+	if !equalS(u, b) {
+		t.Fatalf("expected unify(a,b) to equal unannotated type; got %v", u)
+	}
+}

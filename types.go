@@ -84,6 +84,22 @@ package mindscript
 // Helpers
 // -----------------------------
 
+// stripAnnot unwraps annotation wrappers inside type ASTs:
+//
+//	("annot", ("str", doc), T)  =>  T
+//
+// It repeats until the outer node is not "annot".
+func stripAnnot(t S) S {
+	for len(t) >= 3 {
+		tag, ok := t[0].(string)
+		if !ok || tag != "annot" {
+			break
+		}
+		t = t[2].(S)
+	}
+	return t
+}
+
 func isBuiltinTypeName(name string) bool {
 	switch name {
 	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
@@ -117,7 +133,7 @@ func mapTypeFields(t S) map[string]objField {
 		}
 		k := keyNode[1].(string)
 		required := ptag == "pair!"
-		fs[k] = objField{required: required, typ: p[2].(S)}
+		fs[k] = objField{required: required, typ: stripAnnot(p[2].(S))}
 	}
 	return fs
 }
@@ -370,9 +386,11 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 // -----------------------------
 
 func (ip *Interpreter) resolveType(t S, env *Env) S {
+	t = stripAnnot(t)
 	seen := map[string]bool{}
 	var go1 func(S, *Env) S
 	go1 = func(x S, e *Env) S {
+		t = stripAnnot(t)
 		if len(x) == 0 {
 			return x
 		}
@@ -438,9 +456,13 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 // -----------------------------
 
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	t = ip.resolveType(t, env)
+	t = stripAnnot(ip.resolveType(t, env))
 	if len(t) == 0 {
 		return false
+	}
+	// Defensive: tolerate stray annotations if they sneak past.
+	if t[0].(string) == "annot" {
+		return ip.isType(v, t[2].(S), env)
 	}
 
 	// Treat modules structurally as maps during type checks.
@@ -546,8 +568,8 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 // -----------------------------
 
 func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
-	a = ip.resolveType(a, env)
-	b = ip.resolveType(b, env)
+	a = stripAnnot(ip.resolveType(a, env))
+	b = stripAnnot(ip.resolveType(b, env))
 
 	if equalS(a, b) {
 		return true
@@ -667,8 +689,8 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 // -----------------------------
 
 func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
-	t1 = ip.resolveType(t1, env)
-	t2 = ip.resolveType(t2, env)
+	t1 = stripAnnot(ip.resolveType(t1, env))
+	t2 = stripAnnot(ip.resolveType(t2, env))
 
 	// Any absorbs
 	if isId(t1, "Any") {

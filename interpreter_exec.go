@@ -281,7 +281,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 	callEnv.Define(paramName, arg)
 
 	if len(f.Params) > 1 {
-		return FunVal(&Fun{
+		next := FunVal(&Fun{
 			Params:     append([]string{}, f.Params[1:]...),
 			ParamTypes: append([]S{}, f.ParamTypes[1:]...),
 			ReturnType: f.ReturnType,
@@ -294,6 +294,8 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 			IsOracle:   f.IsOracle,
 			Examples:   append([]Value(nil), f.Examples...),
 		})
+		next.Annot = fnVal.Annot
+		return next
 	}
 
 	execFun := &Fun{

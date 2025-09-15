@@ -594,3 +594,76 @@ func Test_Oracle_Alias_Param_WrongShape_HardError(t *testing.T) {
 	// Structural type check at call-site should fail.
 	wantHardErrorContains(t, err, "type mismatch")
 }
+func Test_Oracles_TaskLine_UsesAnnotation_StraightCall(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+
+	var gotPrompt string
+	registerFakeOracleWithCapture(ip, `{"output": 6}`, &gotPrompt)
+
+	v, err := ip.EvalSource(`
+		# add two numbers
+		let add = oracle(n: Int, m: Int) -> Int
+		add(2, 4)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v.Tag != VTInt || v.Data.(int64) != 6 {
+		t.Fatalf("want Int(6), got: %v", v)
+	}
+
+	if gotPrompt == "" {
+		t.Fatalf("did not capture prompt")
+	}
+
+	// TASK must reflect the annotation (not the fallback).
+	if !strings.Contains(gotPrompt, "\nTASK:\n\nadd two numbers\n\n") {
+		t.Fatalf("TASK line did not use annotation; prompt was:\n%s", gotPrompt)
+	}
+	if strings.Contains(gotPrompt, "Given the input, determine the output.") {
+		t.Fatalf("fallback TASK line was used; prompt was:\n%s", gotPrompt)
+	}
+
+	// No examples provided → no example TASK blocks.
+	if n := countExamplesInPrompt(gotPrompt); n != 0 {
+		t.Fatalf("expected 0 example TASK blocks, got %d", n)
+	}
+}
+
+func Test_Oracles_TaskLine_UsesAnnotation_CurriedCall(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+
+	var gotPrompt string
+	registerFakeOracleWithCapture(ip, `{"output": 6}`, &gotPrompt)
+
+	v, err := ip.EvalSource(`
+		# add two numbers
+		let add = oracle(n: Int, m: Int) -> Int
+		add(2)(4)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v.Tag != VTInt || v.Data.(int64) != 6 {
+		t.Fatalf("want Int(6), got: %v", v)
+	}
+
+	if gotPrompt == "" {
+		t.Fatalf("did not capture prompt")
+	}
+
+	// Ensure annotation survives currying and appears in the TASK line.
+	if !strings.Contains(gotPrompt, "\nTASK:\n\nadd two numbers\n\n") {
+		t.Fatalf("TASK line did not use annotation after currying; prompt was:\n%s", gotPrompt)
+	}
+	if strings.Contains(gotPrompt, "Given the input, determine the output.") {
+		t.Fatalf("fallback TASK line was used after currying; prompt was:\n%s", gotPrompt)
+	}
+
+	// No examples provided → no example TASK blocks.
+	if n := countExamplesInPrompt(gotPrompt); n != 0 {
+		t.Fatalf("expected 0 example TASK blocks, got %d", n)
+	}
+}

@@ -192,6 +192,9 @@ _genOracle = noteSet(_genComment, _genOracle)
 # - A function or oracle.
 let gen = fun(spec: Str) -> Any do
     let g = _genOracle(spec)
+	if g == null then
+		return g
+	end
     let validation = astValidate(g)
     if validation != [] then
         return noteSet(validation[0].message, null)  

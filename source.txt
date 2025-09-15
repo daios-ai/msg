@@ -1,873 +1,454 @@
-=== BEGIN FILE: types.go ===
-// types.go: runtime type & schema system for MindScript.
+=== BEGIN FILE: oracles.go ===
+// oracles.go — Oracle execution & prompt building (PUBLIC API + PRIVATE impl)
 //
-// IMPLEMENTATION-ONLY FILE
-// ------------------------
-// This file contains the *private implementation* of the type engine used by
-// the public methods on *Interpreter* that live in interpreter.go:
+// WHAT THIS FILE DOES
+// ===================
+// MindScript “oracles” are functions whose execution is delegated to an external
+// backend (e.g., an LLM). When an oracle is called at runtime, the interpreter:
 //
-//	ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
+//  1. Builds a **prompt** that captures:
+//     • the oracle’s instruction (taken from the function Value’s .Annot),
+//     • the declared input type (parameter 0) and declared *success* return type,
+//     • optional example pairs [input, output] for few-shot guidance,
+//     • the current call’s concrete input,
+//     and records that prompt internally (for debugging and testing).
 //
-// Those exported methods are thin wrappers that delegate to the lower-case
-// functions defined here: resolveType, isType, isSubtype, unifyTypes,
-// valueToTypeS (plus helpers like litToValue/equalS).
+//  2. Calls a pluggable backend hook in user space:
+//     __oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any])
+//     which must return either:
+//     • Str — raw JSON (no fences) shaped like {"output": <value>}, or
+//     • Null — to signal failure.
+//     The interpreter parses the JSON via the host-provided global function
+//     jsonParse : Str -> Any (from the standard library).
 //
-// Goals / design (practical, JSON-friendly, duck-typed):
+//  3. Validates the extracted value against the oracle’s **operational** return
+//     type, which is the declared success type widened to **nullable** (`T?`).
+//     On mismatch or parse failure, an *annotated null* Value is returned.
 //
-// OVERVIEW
-// --------
-// This file implements MindScript’s *runtime* type system. Types are represented
-// as S-expressions (the same light-weight shape the parser produces) and remain
-// entirely structural. The system is designed for practical, JSON-friendly
-// validation and inference:
+// PUBLIC API SURFACE (this file)
+// ------------------------------
+//   - LastOraclePrompt() string
+//     Returns the most recent prompt string that the interpreter constructed for
+//     an oracle call during this process. Useful for testing, logging, and REPL
+//     inspection. Returns "" if no oracle has run yet. Read-only; does not
+//     trigger execution.
 //
-//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
-//     {name:"Raffa"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
-//     Arrays unify element types conservatively; objects are “open-world”.
-//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
-//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
-//   - Arrays are covariant in element type.
-//   - Objects require that all *required* fields of `B` exist, with compatible
-//     types, and *requiredness cannot be relaxed*.
-//   - Extra fields on values are allowed (open-world).
-//   - Functions use parameter contravariance and return covariance.
-//   - `Int <: Num`, and `T?` means nullable.
-//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
-//     inference (e.g., arrays with mixed contents).
-//   - `ResolveType(T, env)` resolves identifiers bound to `VTType` in `env`,
-//     with cycle protection and resolution using the alias’s own environment.
-//   - Enums are finite sets of *literal* values (null/bool/int/num/str/array/map).
-//     Their typing, subtyping, and unification follow intuitive set semantics.
-//   - **Modules:** Runtime values tagged `VTModule` are treated as **maps** for
-//     all type-checking and inference purposes (they normalize via `AsMapValue`).
+// Everything else in this file is **private** implementation that the public
+// interpreter uses internally when executing oracle functions (see Interpreter
+// in interpreter.go). Public callers never need to invoke those directly.
 //
-// TYPE SYNTAX (as S)
-// ------------------
-//
-//	("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
-//	("unop","?", T)                                // nullable T?
-//	("array", T)                                   // homogeneous arrays
-//	("map", ("pair" | "pair!", ("str",k), T) ...)  // object schema; "pair!" = required
-//	("enum", literalS, ...)                        // finite set of literal values
-//	("binop","->", A, B)                           // function A -> B (right-assoc)
-//
-// DEPENDENCIES (other files)
+// DEPENDENCIES (OTHER FILES)
 // --------------------------
-// • parser.go
-//   - `type S = []any`  (S-expression node type)
-//
 // • interpreter.go
-//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
-//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
-//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
-//   - Environments: `Env` with `Get/Set/Define`
-//   - `type Interpreter` (receiver for public API methods)
+//   - type Interpreter (fields: Global, oracleLastPrompt, etc.)
+//   - Value model (Value, ValueTag, constructors like Str/Arr/Map, Fun, Env)
+//   - Thin call/eval surface (*Interpreter.Apply, resolveType, isType, etc.)
+//   - Annotated-null helpers (annotNull), SourceRef handling.
 //
-// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
+// • types.go
+//   - Type S-expressions and helpers (mapTypeFields, equalS, litToValue).
 //
-// PUBLIC VS PRIVATE
-// -----------------
-// PUBLIC  : Nothing.
+// • schema.go
+//   - (*Interpreter) TypeValueToJSONSchema(...) to render JSON Schema for types.
 //
-// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
+// • std/lib.ms (MindScript standard library in user space)
+//   - jsonParse : Str -> Any  — required for parsing model JSON.
 //
-//	isSubtype, unifyTypes, valueToTypeS, literal conversion,
-//	structural S-equality, and field extraction.
+// • Runtime hooks (user space, optional/required):
+//   - REQUIRED:  __oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
+//   - OPTIONAL:  __oracle_build_prompt(instruction: Str, inType: Type, outType: Type, examples: [Any]) -> Str
+//
+// NOTE
+// ----
+// Oracles are **operationally nullable**: a declared return type T is validated
+// as T? at runtime. The backend must produce boxed JSON {"output": <value>}.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// PUBLIC API
+// ──────────────────────────────────────────────────────────────────────────────
 package mindscript
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+/* ===========================
+   PUBLIC
+   =========================== */
 
 //// END_OF_PUBLIC
 
-////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
+/* ===========================
+   PRIVATE IMPLEMENTATION
+   =========================== */
 
-// -----------------------------
-// Helpers
-// -----------------------------
-
-func isBuiltinTypeName(name string) bool {
-	switch name {
-	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
-		return true
-	default:
-		return false
+// execOracle is the primary oracle call engine used by the interpreter when an
+// oracle function is invoked. It builds the prompt, calls the backend hook,
+// parses & validates, and returns a nullable Value (success or annotated failure).
+func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
+	if funVal.Tag != VTFun {
+		return annotNull("oracle: not a function")
 	}
-}
+	f := funVal.Data.(*Fun)
 
-func isId(t S, name string) bool {
-	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
-}
-
-// ("map", ("pair"| "pair!", ("str",k), T)...)
-type objField struct {
-	required bool
-	typ      S
-}
-
-func mapTypeFields(t S) map[string]objField {
-	fs := map[string]objField{}
-	for i := 1; i < len(t); i++ {
-		p := t[i].(S)
-		if len(p) < 3 {
-			continue
+	// Recover declared signature from hidden closure bindings.
+	var paramNames []string
+	var declTypes []S
+	if f.Env != nil {
+		if nv, err := f.Env.Get("$__sig_names"); err == nil && nv.Tag == VTArray {
+			for _, v := range nv.Data.([]Value) {
+				if v.Tag == VTStr {
+					paramNames = append(paramNames, v.Data.(string))
+				}
+			}
 		}
-		ptag := p[0].(string) // "pair" or "pair!"
-		keyNode := p[1].(S)   // ("str", k)
-		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-			continue
+		if tv, err := f.Env.Get("$__sig_types"); err == nil && tv.Tag == VTArray {
+			for _, v := range tv.Data.([]Value) {
+				if v.Tag == VTType {
+					if tvv, ok := v.Data.(*TypeValue); ok {
+						declTypes = append(declTypes, tvv.Ast)
+					}
+				}
+			}
 		}
-		k := keyNode[1].(string)
-		required := ptag == "pair!"
-		fs[k] = objField{required: required, typ: p[2].(S)}
-	}
-	return fs
-}
-
-// Structural equality for S-exprs (no fmt, no allocs).
-func equalS(a, b S) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	if len(a) == 0 {
-		return true
 	}
 
-	ta, ok := a[0].(string)
+	// Build runtime boxes and the prompt.
+	inArgsVal := valueMapFromArgs(ctx, paramNames) // VTMap holding current call args
+
+	inTypesVal := Arr(func() []Value {
+		arr := make([]Value, len(declTypes))
+		for i := range declTypes {
+			arr[i] = TypeVal(declTypes[i])
+		}
+		return arr
+	}())
+
+	// Boxed output type: {"output": T}, where T is the declared success type (non-nullable here).
+	outBoxTypeS := S{"map", S{"pair!", S{"str", "output"}, stripNullable(f.ReturnType)}}
+
+	exPairs := boxExamplesAsMaps(f.Examples, paramNames)
+	examplesVal := Arr(exPairs)
+
+	instructionVal := Str(strings.TrimSpace(funVal.Annot))
+
+	// Build prompt text (prefers user hook when available) and record it.
+	prompt := ip.buildOraclePrompt(
+		instructionVal,
+		inArgsVal,
+		inTypesVal,
+		TypeVal(outBoxTypeS),
+		examplesVal,
+		f.Env,
+	)
+
+	// Locate executor hook.
+	hook, err := ip.Global.Get("__oracle_execute")
+	if err != nil || hook.Tag != VTFun {
+		return annotNull("oracle backend not configured (define __oracle_execute)")
+	}
+	res := ip.Apply(hook, []Value{Str(prompt)})
+
+	// Backend can signal failure with null.
+	if res.Tag == VTNull {
+		return res
+	}
+	if res.Tag != VTStr {
+		return annotNull("oracle executor must return Str (raw model output) or null")
+	}
+
+	// Parse returned JSON and validate it matches {"output": T?}.
+	raw := strings.TrimSpace(res.Data.(string))
+	raw = unwrapFenced(raw) // tolerate accidental ```json fences
+
+	parsed, perr := ip.callGlobal1("jsonParse", Str(raw))
+	if perr != "" {
+		if raw == "null" {
+			return annotNull("oracle returned null")
+		}
+		return annotNull("oracle output was not valid JSON")
+	}
+	if parsed.Tag != VTMap {
+		return annotNull("oracle output did not match the declared return type")
+	}
+	mo := parsed.Data.(*MapObject)
+	outVal, ok := mo.Entries["output"]
 	if !ok {
-		return false
-	}
-	tb, ok := b[0].(string)
-	if !ok || ta != tb {
-		return false
+		return annotNull("oracle output did not match the declared return type")
 	}
 
-	// Order-insensitive equality for maps: compare by field name/required/type.
-	if ta == "map" {
-		fa := mapTypeFields(a)
-		fb := mapTypeFields(b)
-		if len(fa) != len(fb) {
-			return false
-		}
-		for k, va := range fa {
-			vb, ok := fb[k]
-			if !ok || va.required != vb.required || !equalS(va.typ, vb.typ) {
-				return false
-			}
-		}
-		return true
+	// Validate against operationally nullable return type (T?).
+	outTNullable := ensureNullableUnlessAny(f.ReturnType)
+	if !ip.isType(outVal, outTNullable, f.Env) {
+		return annotNull("oracle output did not match the declared return type")
 	}
+	return outVal
+}
 
-	// Order-insensitive equality for enums: set comparison on literal S-exprs.
-	if ta == "enum" {
-		if len(a) != len(b) { // quick length check
-			return false
-		}
-	outer:
-		for i := 1; i < len(a); i++ {
-			for j := 1; j < len(b); j++ {
-				if equalS(a[i].(S), b[j].(S)) {
-					continue outer
+// buildOraclePrompt builds the prompt from Value-boxed parts.
+// instruction: Str
+// input:       Any (VTMap of call arguments)
+// inTypes:     [Type] (declared param types, in order)
+// outType:     Type   (boxed {"output": T})
+// examples:    [Any]  (each item is [inputMap, outputMap] or {"input":..,"output":..})
+func (ip *Interpreter) buildOraclePrompt(
+	instruction Value,
+	input Value,
+	inTypes Value,
+	outType Value,
+	examples Value,
+	env *Env,
+) string {
+	// Derive input map type S from (names, declared types).
+	names := []string{}
+	if input.Tag == VTMap {
+		mo := input.Data.(*MapObject)
+		names = append(names, mo.Keys...)
+		// for _, k := range mo.Keys {
+		// 	names = append(names, k)
+		// }
+	}
+	declTypes := []S{}
+	if inTypes.Tag == VTArray {
+		for _, v := range inTypes.Data.([]Value) {
+			if v.Tag == VTType {
+				if tv, ok := v.Data.(*TypeValue); ok {
+					declTypes = append(declTypes, tv.Ast)
 				}
 			}
-			return false
-		}
-		return true
-	}
-
-	for i := 1; i < len(a); i++ {
-		if !equalNode(a[i], b[i]) {
-			return false
 		}
 	}
-	return true
-}
+	inMapTypeS := mapTypeFromParams(names, declTypes)
 
-// Compares two S nodes or scalars used inside S.
-func equalNode(x, y any) bool {
-	switch xv := x.(type) {
-	case []any: // covers S too
-		yv, ok := y.([]any)
-		if !ok {
-			return false
+	// Pretty-print schemas.
+	toSchemaString := func(tv Value) string {
+		s := ip.TypeValueToJSONSchema(tv, env)
+		b, err := json.MarshalIndent(s, "", "  ")
+		if err != nil {
+			return "{}"
 		}
-		return equalS(xv, yv)
-	case string:
-		ys, ok := y.(string)
-		return ok && xv == ys
-	case int64:
-		yi, ok := y.(int64)
-		return ok && xv == yi
-	case float64:
-		yf, ok := y.(float64)
-		return ok && xv == yf
-	case bool:
-		yb, ok := y.(bool)
-		return ok && xv == yb
-	default:
-		return x == y
+		return string(b)
 	}
-}
+	inputSchema := toSchemaString(TypeVal(inMapTypeS))
+	outputSchema := toSchemaString(outType)
 
-// Deep equality on Values for the literal space used by enums
-// (null/bool/int/num/str/array/map). Named *Lit* to avoid confusion with
-// (*Interpreter).deepEqual used elsewhere.
-func deepEqualLit(a, b Value) bool {
-	if a.Tag != b.Tag {
-		return false
+	// JSON stringifier (with spaces after ":" and ",").
+	toJSON := func(v Value) string {
+		j, err := valueToGoJSON(v)
+		if err != nil {
+			return "null"
+		}
+		b, err := json.Marshal(j)
+		if err != nil {
+			return "null"
+		}
+		s := string(b)
+		s = strings.ReplaceAll(s, ":", ": ")
+		s = strings.ReplaceAll(s, ",", ", ")
+		return s
 	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray:
-		ax := a.Data.([]Value)
-		bx := b.Data.([]Value)
-		if len(ax) != len(bx) {
-			return false
-		}
-		for i := range ax {
-			if !deepEqualLit(ax[i], bx[i]) {
-				return false
-			}
-		}
-		return true
-	case VTMap:
-		am := a.Data.(*MapObject)
-		bm := b.Data.(*MapObject)
-		if len(am.Entries) != len(bm.Entries) {
-			return false
-		}
-		for k, av := range am.Entries {
-			bv, ok := bm.Entries[k]
-			if !ok || !deepEqualLit(av, bv) {
-				return false
-			}
-		}
-		return true
-	default:
-		// Not expected for enum literals
-		return false
+
+	var bld strings.Builder
+
+	// Header & guidance.
+	bld.WriteString("PROMPT:\n")
+	bld.WriteString("Please follow the instruction to the best of your ability:\n")
+	bld.WriteString("for every input, provide an output that solves the task and\n")
+	bld.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
+	bld.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
+
+	// Schemas.
+	bld.WriteString("INPUT JSON SCHEMA:\n\n")
+	bld.WriteString(indentBlock(inputSchema, 2))
+	bld.WriteString("\n\n")
+
+	bld.WriteString("OUTPUT JSON SCHEMA:\n\n")
+	bld.WriteString(indentBlock(outputSchema, 2))
+	bld.WriteString("\n\n")
+
+	// Instruction / task line.
+	taskLine := "Given the input, determine the output."
+	if instruction.Tag == VTStr && strings.TrimSpace(instruction.Data.(string)) != "" {
+		taskLine = strings.TrimSpace(instruction.Data.(string))
 	}
-}
 
-// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
-// Allowed forms: null/bool/int/num/str/array/map with literal children.
-// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
-func (ip *Interpreter) litToValue(lit S) (Value, bool) {
-	if len(lit) == 0 {
-		return Null, false
-	}
-	switch lit[0].(string) {
-	case "null":
-		return Null, true
-	case "bool":
-		return Bool(lit[1].(bool)), true
-	case "int":
-		return Int(lit[1].(int64)), true
-	case "num":
-		return Num(lit[1].(float64)), true
-	case "str":
-		return Str(lit[1].(string)), true
-	case "array":
-		out := make([]Value, 0, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			v, ok := ip.litToValue(lit[i].(S))
-			if !ok {
-				return Null, false
-			}
-			out = append(out, v)
-		}
-		return Arr(out), true
-	case "map":
-		m := make(map[string]Value, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			p := lit[i].(S)
-			if len(p) < 3 {
-				return Null, false
-			}
-			keyNode := p[1].(S)
-			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-				return Null, false
-			}
-			k := keyNode[1].(string)
-			v, ok := ip.litToValue(p[2].(S))
-			if !ok {
-				return Null, false
-			}
-			m[k] = v
-		}
-		return Map(m), true
-	default:
-		return Null, false
-	}
-}
-
-// -----------------------------
-// Value → Type inference (typeOf-like behavior)
-// -----------------------------
-
-func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
-	switch v.Tag {
-	case VTNull:
-		return S{"id", "Null"}
-	case VTBool:
-		return S{"id", "Bool"}
-	case VTInt:
-		return S{"id", "Int"}
-	case VTNum:
-		return S{"id", "Num"}
-	case VTStr:
-		return S{"id", "Str"}
-
-	case VTArray:
-		xs := v.Data.([]Value)
-		if len(xs) == 0 {
-			return S{"array", S{"id", "Any"}}
-		}
-		elem := ip.valueToTypeS(xs[0], env)
-		for i := 1; i < len(xs); i++ {
-			elem = ip.unifyTypes(elem, ip.valueToTypeS(xs[i], env), env)
-		}
-		return S{"array", elem}
-
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		out := S{"map"}
-		// For a single observed map, infer optional fields (no required).
-		for k, vv := range mo.Entries {
-			out = append(out, S{"pair", S{"str", k}, ip.valueToTypeS(vv, env)})
-		}
-		return out
-
-	case VTModule:
-		// Treat modules structurally as maps.
-		return ip.valueToTypeS(AsMapValue(v), env)
-
-	case VTFun:
-		f := v.Data.(*Fun)
-		t := f.ReturnType
-		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-			t = S{"binop", "->", f.ParamTypes[i], t}
-		}
-		return t
-
-	case VTType:
-		return S{"id", "Type"}
-
-	default:
-		return S{"id", "Any"}
-	}
-}
-
-// -----------------------------
-// Alias resolution for types
-// -----------------------------
-
-func (ip *Interpreter) resolveType(t S, env *Env) S {
-	seen := map[string]bool{}
-	var go1 func(S, *Env) S
-	go1 = func(x S, e *Env) S {
-		if len(x) == 0 {
-			return x
-		}
-		switch x[0].(string) {
-		case "id":
-			name := x[1].(string)
-			if isBuiltinTypeName(name) {
-				return x
-			}
-			if seen[name] {
-				return x // guard cycles
-			}
-			if e != nil {
-				if v, err := e.Get(name); err == nil && v.Tag == VTType {
-					tv := v.Data.(*TypeValue)
-					seen[name] = true
-					defer func() { delete(seen, name) }()
-					// recurse with the alias's own env (not the caller's env)
-					return go1(tv.Ast, tv.Env)
+	// Examples.
+	if examples.Tag == VTArray {
+		for _, ex := range examples.Data.([]Value) {
+			var inVal, outVal Value
+			switch ex.Tag {
+			case VTArray:
+				pair := ex.Data.([]Value)
+				if len(pair) != 2 {
+					continue
 				}
-			}
-			return x
-		case "unop":
-			if len(x) >= 3 && x[1].(string) == "?" {
-				return S{"unop", "?", go1(x[2].(S), e)}
-			}
-			return x
-		case "array":
-			if len(x) == 2 {
-				return S{"array", go1(x[1].(S), e)}
-			}
-			out := S{"array"}
-			for i := 1; i < len(x); i++ {
-				out = append(out, go1(x[i].(S), e))
-			}
-			return out
-		case "map":
-			out := S{"map"}
-			for i := 1; i < len(x); i++ {
-				p := x[i].(S)
-				ttag := p[0].(string)
-				key := p[1].(S)
-				typ := go1(p[2].(S), e)
-				out = append(out, S{ttag, key, typ})
-			}
-			return out
-		case "enum":
-			return x
-		case "binop":
-			if len(x) >= 4 && x[1].(string) == "->" {
-				return S{"binop", "->", go1(x[2].(S), e), go1(x[3].(S), e)}
-			}
-			return x
-		default:
-			return x
-		}
-	}
-	return go1(t, env)
-}
-
-// -----------------------------
-// Runtime type checking
-// -----------------------------
-
-func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	t = ip.resolveType(t, env)
-	if len(t) == 0 {
-		return false
-	}
-
-	// Treat modules structurally as maps during type checks.
-	v = AsMapValue(v)
-
-	switch t[0].(string) {
-	case "id":
-		switch t[1].(string) {
-		case "Any":
-			return true
-		case "Null":
-			return v.Tag == VTNull
-		case "Bool":
-			return v.Tag == VTBool
-		case "Int":
-			return v.Tag == VTInt
-		case "Num":
-			return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
-		case "Str":
-			return v.Tag == VTStr
-		case "Type":
-			return v.Tag == VTType
-		default:
-			return false
-		}
-
-	case "unop":
-		if t[1].(string) != "?" {
-			return false
-		}
-		if v.Tag == VTNull {
-			return true
-		}
-		return ip.isType(v, t[2].(S), env)
-
-	case "array":
-		if v.Tag != VTArray {
-			return false
-		}
-		// If no element type provided, treat as [Any]
-		elemT := S{"id", "Any"}
-		if len(t) == 2 {
-			elemT = t[1].(S)
-		}
-		for _, elem := range v.Data.([]Value) {
-			if !ip.isType(elem, elemT, env) {
-				return false
-			}
-		}
-		return true
-
-	case "map":
-		if v.Tag != VTMap {
-			return false
-		}
-		fs := mapTypeFields(t)
-		mo := v.Data.(*MapObject)
-		for name, f := range fs {
-			val, ok := mo.Entries[name]
-			if !ok {
-				if f.required {
-					return false
-				}
+				inVal, outVal = pair[0], pair[1]
+			case VTMap:
+				mo := ex.Data.(*MapObject)
+				inVal = mo.Entries["input"]
+				outVal = mo.Entries["output"]
+			default:
 				continue
 			}
-			if !ip.isType(val, f.typ, env) {
-				return false
-			}
-		}
-		return true
 
-	case "enum":
-		// Deeply equal to one of the literal values
-		for i := 1; i < len(t); i++ {
-			lv, ok := ip.litToValue(t[i].(S))
-			if !ok {
-				continue
-			}
-			if deepEqualLit(lv, v) {
-				return true
-			}
+			bld.WriteString("TASK:\n\n")
+			bld.WriteString(taskLine + "\n\n")
+			bld.WriteString("INPUT:\n\n")
+			bld.WriteString(toJSON(inVal) + "\n\n")
+			bld.WriteString("OUTPUT:\n\n")
+			bld.WriteString(toJSON(outVal) + "\n\n")
 		}
-		return false
-
-	case "binop":
-		if t[1].(string) != "->" || v.Tag != VTFun {
-			return false
-		}
-		// value's function type
-		f := v.Data.(*Fun)
-		ft := f.ReturnType
-		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-			ft = S{"binop", "->", f.ParamTypes[i], ft}
-		}
-		return ip.isSubtype(ft, t, env)
 	}
 
-	return false
+	// Final TASK with current call's input.
+	bld.WriteString("TASK:\n\n")
+	bld.WriteString(taskLine + "\n\n")
+	bld.WriteString("INPUT:\n\n")
+	bld.WriteString(toJSON(input) + "\n\n")
+	bld.WriteString("OUTPUT:\n")
+
+	return bld.String()
 }
 
-// -----------------------------
-// Structural subtyping  t1 <: t2
-// -----------------------------
+// ------------- Helpers -----------------------------------
 
-func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
-	a = ip.resolveType(a, env)
-	b = ip.resolveType(b, env)
-
-	if equalS(a, b) {
-		return true
+// Build a map type S from parameter names and declared types.
+func mapTypeFromParams(names []string, types []S) S {
+	m := S{"map"}
+	for i := 0; i < len(names) && i < len(types); i++ {
+		m = append(m, S{"pair!", S{"str", names[i]}, types[i]})
 	}
-
-	isOpt := func(t S) bool { return len(t) >= 2 && t[0].(string) == "unop" && t[1].(string) == "?" }
-	unwrapOpt := func(t S) S { return t[2].(S) }
-
-	// Top
-	if b[0].(string) == "id" && b[1].(string) == "Any" {
-		return true
-	}
-	// Optional RHS
-	if isOpt(b) {
-		inner := unwrapOpt(b)
-		if ip.isSubtype(a, inner, env) {
-			return true
-		}
-		if a[0].(string) == "id" && a[1].(string) == "Null" {
-			return true
-		}
-	}
-	// Int <: Num
-	if a[0].(string) == "id" && a[1].(string) == "Int" &&
-		b[0].(string) == "id" && b[1].(string) == "Num" {
-		return true
-	}
-	// A? <: B?  iff  A <: B
-	if isOpt(a) && isOpt(b) {
-		return ip.isSubtype(unwrapOpt(a), unwrapOpt(b), env)
-	}
-	// Identical primitive IDs
-	if a[0].(string) == "id" && b[0].(string) == "id" {
-		return a[1].(string) == b[1].(string)
-	}
-
-	// Arrays: elementwise covariance
-	if a[0].(string) == "array" && b[0].(string) == "array" {
-		elemA := S{"id", "Any"}
-		if len(a) == 2 {
-			elemA = a[1].(S)
-		}
-		elemB := S{"id", "Any"}
-		if len(b) == 2 {
-			elemB = b[1].(S)
-		}
-		return ip.isSubtype(elemA, elemB, env)
-	}
-
-	// Maps: must provide all required fields of b with compatible types,
-	// and cannot relax requiredness.
-	if a[0].(string) == "map" && b[0].(string) == "map" {
-		reqB := mapTypeFields(b)
-		haveA := mapTypeFields(a)
-		for name, fb := range reqB {
-			fa, ok := haveA[name]
-			if !ok {
-				if fb.required {
-					return false
-				}
-				continue
-			}
-			if fb.required && !fa.required {
-				return false
-			}
-			if !ip.isSubtype(fa.typ, fb.typ, env) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Enums:
-	// 1) Enum ⊆ Enum by literal inclusion (structural equality on literal S)
-	if a[0].(string) == "enum" && b[0].(string) == "enum" {
-		for i := 1; i < len(a); i++ {
-			found := false
-			for j := 1; j < len(b); j++ {
-				if equalS(a[i].(S), b[j].(S)) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	}
-	// 2) Enum <: T if every member conforms to T
-	if a[0].(string) == "enum" {
-		for i := 1; i < len(a); i++ {
-			lv, ok := ip.litToValue(a[i].(S))
-			if !ok || !ip.isType(lv, b, env) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Functions: param contravariant, return covariant (right-assoc)
-	if a[0].(string) == "binop" && a[1].(string) == "->" &&
-		b[0].(string) == "binop" && b[1].(string) == "->" {
-		aParam, aRest := a[2].(S), a[3].(S)
-		bParam, bRest := b[2].(S), b[3].(S)
-		if !ip.isSubtype(bParam, aParam, env) { // contra
-			return false
-		}
-		return ip.isSubtype(aRest, bRest, env) // co (right)
-	}
-
-	return false
+	return m
 }
 
-// -----------------------------
-// Unification (least common supertype)
-// -----------------------------
+// Box current call arguments (from ctx) into a map Value conforming to the input map type.
+func valueMapFromArgs(ctx CallCtx, names []string) Value {
+	entries := make(map[string]Value, len(names))
+	keys := make([]string, 0, len(names))
+	for _, name := range names {
+		v, _ := ctx.Arg(name) // if missing, omit/zero-value
+		entries[name] = v
+		keys = append(keys, name)
+	}
+	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: map[string]string{}, Keys: keys}}
+}
 
-func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
-	t1 = ip.resolveType(t1, env)
-	t2 = ip.resolveType(t2, env)
+// Box examples: each example is [inVal, outVal]; normalize to maps:
+// input → map[name]=..., output → {"output": outVal}.
+func boxExamplesAsMaps(exs []Value, names []string) []Value {
+	out := make([]Value, 0, len(exs))
+	for _, ex := range exs {
+		if ex.Tag != VTArray {
+			continue
+		}
+		pair := ex.Data.([]Value)
+		if len(pair) != 2 {
+			continue
+		}
+		inV, outV := pair[0], pair[1]
 
-	// Any absorbs
-	if isId(t1, "Any") {
-		return t1
-	}
-	if isId(t2, "Any") {
-		return t2
-	}
-
-	// ---- Null / Nullable ----
-	if isId(t1, "Null") && isId(t2, "Null") {
-		return t1
-	}
-	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
-		return t2
-	}
-	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
-		return t1
-	}
-	if isId(t1, "Null") {
-		return S{"unop", "?", t2}
-	}
-	if isId(t2, "Null") {
-		return S{"unop", "?", t1}
-	}
-
-	// Nullable normalization
-	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
-	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
-	if isOpt1 && isOpt2 {
-		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt1 {
-		u := ip.unifyTypes(t1[2].(S), t2, env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt2 {
-		u := ip.unifyTypes(t1, t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-
-	// ---- Primitives (incl. Int ⊔ Num = Num) ----
-	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
-		n1 := t1[1].(string)
-		n2 := t2[1].(string)
-		if n1 == n2 {
-			return t1
-		}
-		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
-			return S{"id", "Num"}
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Arrays ----
-	if t1[0].(string) == "array" && t2[0].(string) == "array" {
-		e1 := S{"id", "Any"}
-		e2 := S{"id", "Any"}
-		if len(t1) == 2 {
-			e1 = t1[1].(S)
-		}
-		if len(t2) == 2 {
-			e2 = t2[1].(S)
-		}
-		elem := ip.unifyTypes(e1, e2, env)
-		return S{"array", elem}
-	}
-	if t1[0].(string) == "array" || t2[0].(string) == "array" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Maps: fieldwise unify; required OR ----
-	if t1[0].(string) == "map" && t2[0].(string) == "map" {
-		f1 := mapTypeFields(t1)
-		f2 := mapTypeFields(t2)
-		keys := map[string]struct{}{}
-		for k := range f1 {
-			keys[k] = struct{}{}
-		}
-		for k := range f2 {
-			keys[k] = struct{}{}
-		}
-		out := S{"map"}
-		for k := range keys {
-			s1, ok1 := f1[k]
-			s2, ok2 := f2[k]
-			switch {
-			case ok1 && ok2:
-				ut := ip.unifyTypes(s1.typ, s2.typ, env)
-				req := s1.required || s2.required
-				tag := "pair"
-				if req {
-					tag = "pair!"
-				}
-				out = append(out, S{tag, S{"str", k}, ut})
-			case ok1 && !ok2:
-				out = append(out, S{"pair", S{"str", k}, s1.typ})
-			case !ok1 && ok2:
-				out = append(out, S{"pair", S{"str", k}, s2.typ})
+		// Normalize input to a map using param order.
+		inMap := map[string]Value{}
+		keys := []string{}
+		if inV.Tag == VTArray {
+			xs := inV.Data.([]Value)
+			for i := 0; i < len(xs) && i < len(names); i++ {
+				inMap[names[i]] = xs[i]
+				keys = append(keys, names[i])
 			}
-		}
-		return out
-	}
-	if t1[0].(string) == "map" || t2[0].(string) == "map" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Enums ----
-	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
-		union := S{"enum"}
-		seen := func(x S) bool {
-			for i := 1; i < len(union); i++ {
-				if equalS(union[i].(S), x) {
-					return true
-				}
+		} else if inV.Tag == VTMap {
+			mo := inV.Data.(*MapObject)
+			for _, k := range mo.Keys {
+				inMap[k] = mo.Entries[k]
+				keys = append(keys, k)
 			}
-			return false
-		}
-		for i := 1; i < len(t1); i++ {
-			x := t1[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		for i := 1; i < len(t2); i++ {
-			x := t2[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		return union
-	}
-	// enum ⊔ Type → Type if all members fit; else Any
-	if t1[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t1); i++ {
-			lv, ok := ip.litToValue(t1[i].(S))
-			if !ok || !ip.isType(lv, t2, env) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return t2
-		}
-		return S{"id", "Any"}
-	}
-	if t2[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t2); i++ {
-			lv, ok := ip.litToValue(t2[i].(S))
-			if !ok || !ip.isType(lv, t1, env) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return t1
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Functions: pointwise ----
-	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
-		// f1 = A1 -> B1, f2 = A2 -> B2
-		a1, b1 := t1[2].(S), t1[3].(S)
-		a2, b2 := t2[2].(S), t2[3].(S)
-
-		// Param GLB (contravariant):
-		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
-		var param S
-		if ip.isSubtype(a1, a2, env) {
-			param = a1
-		} else if ip.isSubtype(a2, a1, env) {
-			param = a2
 		} else {
-			return S{"id", "Any"}
+			// Single-arg case: use first name if available.
+			if len(names) > 0 {
+				inMap[names[0]] = inV
+				keys = append(keys, names[0])
+			}
 		}
+		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, KeyAnn: map[string]string{}, Keys: keys}}
 
-		// Return LUB (covariant):
-		ret := ip.unifyTypes(b1, b2, env)
-		return S{"binop", "->", param, ret}
-	}
-	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
-		return S{"id", "Any"}
-	}
+		outVal := Value{Tag: VTMap, Data: &MapObject{
+			Entries: map[string]Value{"output": outV},
+			KeyAnn:  map[string]string{},
+			Keys:    []string{"output"},
+		}}
 
-	return S{"id", "Any"}
+		out = append(out, Arr([]Value{inVal, outVal}))
+	}
+	return out
 }
-=== END FILE: types.go ===
+
+// indentBlock prefixes each line with n spaces (prompt formatting).
+func indentBlock(s string, n int) string {
+	pad := strings.Repeat(" ", n)
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = pad + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Nullable helpers and small utilities.
+
+func ensureNullableUnlessAny(t S) S {
+	if isAnyType(t) || isNullable(t) {
+		return t
+	}
+	return S{"unop", "?", t}
+}
+func isAnyType(t S) bool  { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
+func isNullable(t S) bool { return len(t) >= 3 && t[0] == "unop" && t[1] == "?" }
+func stripNullable(t S) S {
+	for isNullable(t) {
+		t = t[2].(S)
+	}
+	return t
+}
+func unwrapFenced(s string) string {
+	if strings.HasPrefix(s, "```") {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[i+1:]
+		} else {
+			return s
+		}
+		if j := strings.LastIndex(s, "```"); j >= 0 {
+			s = s[:j]
+		}
+		s = strings.TrimSpace(s)
+	}
+	return s
+}
+
+// callGlobal1 invokes a global unary function by name and traps runtime errors,
+// returning the value and a non-empty error string when a failure is produced.
+func (ip *Interpreter) callGlobal1(name string, arg Value) (v Value, errStr string) {
+	fn, err := ip.Global.Get(name)
+	if err != nil || fn.Tag != VTFun {
+		v = annotNull(name + " is not available; load the standard library")
+		errStr = "missing"
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			switch e := r.(type) {
+			case rtErr:
+				v = annotNull(e.msg)
+			default:
+				v = annotNull("runtime error")
+			}
+			errStr = v.Annot
+		}
+	}()
+	v = ip.Apply(fn, []Value{arg})
+	if v.Tag == VTNull && v.Annot != "" {
+		errStr = v.Annot
+	}
+	return
+}
+=== END FILE: oracles.go ===
 

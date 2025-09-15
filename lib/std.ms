@@ -449,10 +449,10 @@ let _oracleInstalled = false
 # Rebinds `__oracle_execute` to the provided function.
 # Args: exec: (Str -> Str?)
 # Returns: Null
-let oracleInstall = fun(exec: Str -> Str?) -> Null do
+let oracleInstall = fun(exec: Str -> Str?) -> Bool do
 	__oracle_execute = exec
 	_oracleInstalled = true
-	null
+	true
 end
 
 # Show oracle installation status.
@@ -464,23 +464,62 @@ let oracleStatus = fun(_: Null) -> Str do
 	if _oracleInstalled then "oracle: installed" else "oracle: not installed" end
 end
 
-# Quick oracle health check (real call if installed).
-#
-# Runs a minimal oracle end-to-end. On success, returns { ok:true, ms }.
-# On failure or if not installed, returns an annotated null.
-# Args: _: Null
-# Returns: { ok: Bool, ms: Int }?
+# Quick oracle health check (real call, tiny).
+# Success: { ok:true, ms }; failure/not installed: annotated null.
 let oracleHealth = fun(_: Null) -> {}? do
-	if not _oracleInstalled then
-		return error("oracle not installed")
-	end
-	# Minimal oracle to exercise the path.
-	let _ping = oracle(_: Null) -> Str from [[null, "pong"]]
+	if not _oracleInstalled then return error("oracle not installed") end
+
+	let ping = oracle(msg: Str) -> Str
 	let t0 = nowMillis()
-	let r = try(fun(_: Null) -> Any do _ping(null) end)
-	let t1 = nowMillis()
-	if r.ok then { ok: true, ms: t1 - t0 } else error("oracle failed: " + str(r.error)) end
+	let out = ping("ping")
+	let dt = nowMillis() - t0
+	if out == null then return out end
+	if out == "pong" then return { ok: true, ms: dt } end
+
+	let j = jsonParse(out)
+	if j != null and mapHas(j, "output") and j.output == "pong" then
+		return { ok: true, ms: dt }
+	end
+
+	error("pong mismatch")
 end
+
+# ---- Prompt tap (diagnostics) ----
+
+# Most recent oracle prompt captured for diagnostics.
+# Type: Str?
+let _oracleLastPrompt = null
+
+# Rolling log of oracle prompts captured for diagnostics.
+# Type: [Str]
+let _oraclePromptLog = []
+
+# Install an oracle executor that records each prompt before forwarding.
+# Args: exec: (Str -> Str?)  # underlying executor
+# Return: Bool               # true on install
+let oracleInstallWithTap = fun(exec: Str -> Str?) -> Bool do
+	oracleInstall(fun(p: Str) -> Str? do
+		_oracleLastPrompt = p
+		_oraclePromptLog = _oraclePromptLog + [p]
+		exec(p)
+	end)
+	true
+end
+
+# Return the most recently recorded oracle prompt (if any).
+# Args: _: Null (ignored)
+# Return: Str?
+let oracleLastPrompt = fun(_: Null) -> Str? do
+	_oracleLastPrompt
+end
+
+# Return the full recorded oracle prompt log.
+# Args: _: Null (ignored)
+# Return: [Str]
+let oraclePromptLog = fun(_: Null) -> [Str] do
+	_oraclePromptLog
+end
+
 
 ## -----------------------------
 ## LLM backend bootstrap (installed in prelude)

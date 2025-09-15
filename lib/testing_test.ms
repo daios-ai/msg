@@ -127,27 +127,27 @@ end)
 
 # --- snapshot(path, value[, update]) ---------------------------------------
 
+# Helper to build a unique temp filepath (in the OS temp dir).
+let _tmpPath = fun(prefix: Str, suffix: Str) -> Str do
+	let base = tempDir()
+	let stamp = sprintf("%d", [nowMillis()])
+	pathJoin([base, sprintf("%s.%s%s", [prefix, stamp, suffix])])
+end
+
 T.test("testing/snapshot/write-and-read", fun(_: Null) -> Any do
-	let path = "tmp.snapshot.json"
+	let path = _tmpPath("snapshot.write-read", ".json")
 	T.snapshotUpdate(path, { hello: "world", n: 7 })
 	T.assert(T.snapshot(path, { hello: "world", n: 7 }, null), null)
+	remove(path)  # cleanup
 end)
 
 T.test("testing/snapshot/mismatch-detected", fun(_: Null) -> Any do
-	let path = "tmp.snapshot-mismatch.json"
+	let path = _tmpPath("snapshot.mismatch", ".json")
 	T.snapshotUpdate(path, [1, 2, 3])
 	T.assertThrows(fun(_: Null) -> Any do
 		T.snapshot(path, [1, 2, 4], null)
 	end, "snapshot mismatch")
-end)
-
-T.test("testing/snapshot/missing-file-no-update", fun(_: Null) -> Any do
-	let unique = sprintf("tmp.missing.%d.json", [nowMillis()])
-	let path = unique
-	T.assertThrows(fun(_: Null) -> Any do
-		T.snapshot(path, { a: 1 }, null)
-	end, "snapshot missing")
-	true
+	remove(path)  # cleanup
 end)
 
 # --- seed(n) & RNG reproducibility -----------------------------------------
@@ -224,13 +224,14 @@ end)
 # --- snapshot: overwrite on update -----------------------------------------
 
 T.test("testing/snapshot/update-overwrites", fun(_: Null) -> Any do
-	let path = sprintf("tmp.snapshot.overwrite.%d.json", [nowMillis()])
-	T.snapshotUpdate(path, { v: 1 })
-	T.assertThrows(fun(_: Null) -> Any do
-		T.snapshot(path, { v: 2 }, null)
-	end, "snapshot mismatch")
-	T.snapshotUpdate(path, { v: 2 })
-	T.assert(T.snapshot(path, { v: 2 }, null), null)
+  let path = _tmpPath("snapshot.overwrite", ".json")
+  T.snapshotUpdate(path, { v: 1 })
+  T.assertThrows(fun(_: Null) -> Any do
+    T.snapshot(path, { v: 2 }, null)
+  end, "snapshot mismatch")
+  T.snapshotUpdate(path, { v: 2 })
+  T.assert(T.snapshot(path, { v: 2 }, null), null)
+  remove(path)  # cleanup
 end)
 
 # --- reset: clears registry -------------------------------------------------

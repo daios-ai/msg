@@ -541,6 +541,7 @@ Guidelines:
   xs[-1]     # => 20
   ```
 * Maps are open-world; unknown keys are allowed and simply absent.
+  Map addition merges: `{a: 0, b: 1} + {a: 1, c: 2}` => `{a: 1, b: 1, c: 2}`
 
 **Access**
 

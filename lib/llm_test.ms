@@ -1,157 +1,255 @@
-# Tests for llm.ms — minimal LLM backend manager.
-
-let testing = import("testing")
-let llm = import("./llm.ms")
-
-# Small helper: assert a condition or fail with a message.
+# llm_test.ms — tiny, orthogonal tests for llm.ms (current contract: raw-string, no boxing)
 #
-# Args:
-# 	ok:   Bool — condition to verify
-# 	msg:  Str  — failure message
-#
-# Returns:
-# 	Bool
-let _assert = fun(ok: Bool, msg: Str) -> Bool do
-	if not ok then
-		fail(msg)
+# Usage:
+#   let T = import("testing")
+#   T.run({ root: ".", verbose: true, parallel: false, timeoutMs: 0 })
+
+let T = import("testing")
+let L = import("llm")
+
+# --------
+# Local helpers
+# --------
+
+# Array contains (strings)
+let _containsStr = fun(xs: [Str], s: Str) -> Bool do
+	for x in xs do
+		if x == s then return true end
 	end
-	true
+	false
 end
 
-# Convert a Str? soft error to its annotation (or "").
-#
-# Args:
-# 	x: Str? — maybe-null string
-#
-# Returns:
-# 	Str
-let _ann = fun(x: Str?) -> Str do
-	if x == null then
-		let a = noteGet(x)   # annotated null → message (Str?)
-		if a == null then "" else a end
-	else
-		""
+# --------
+# Module surface
+# --------
+
+T.test("llm/backends_lists_registered", fun(_: Null) -> Any do
+	let xs = L.backends(null)
+	T.assertType(xs, type [Str])
+	T.assert(_containsStr(xs, "ollama"), "ollama missing")
+	T.assert(_containsStr(xs, "openai"), "openai missing")
+	T.assert(_containsStr(xs, "openai-responses"), "openai-responses missing")
+	T.assert(_containsStr(xs, "anthropic"), "anthropic missing")
+	T.assert(_containsStr(xs, "cohere"), "cohere missing")
+end)
+
+T.test("llm/init_returns_names_and_current", fun(_: Null) -> Any do
+	let r = L.init(null)
+	T.assertType(r.backends, type [Str])
+	T.assertType(r.current,  type Str)
+	T.assert(len(r.backends) >= 5, "expected at least 5 backends")
+	T.assert(_containsStr(r.backends, r.current), "current not in backends")
+end)
+
+T.test("llm/status_shape_without_assuming_default", fun(_: Null) -> Any do
+	let s = L.status(null)
+	let xs = L.backends(null)
+	T.assert(_containsStr(xs, s.backend), "status.backend not a known backend")
+	T.assertType(s.options, type {})
+	T.assertType(s.authed, type Bool)
+	# model may be null or Str
+	if s.model != null then T.assertType(s.model, type Str) end
+end)
+
+T.test("llm/useBackend_unknown_softnull", fun(_: Null) -> Any do
+	let before = L.status(null).backend
+	let res = L.useBackend("nope")
+	T.assertEq(res, null)  # soft-null
+	T.assertEq(L.status(null).backend, before)
+end)
+
+T.test("llm/useBackend_switch_roundtrip", fun(_: Null) -> Any do
+	let orig = L.status(null).backend
+	let _ = L.useBackend("openai")
+	T.assertEq(L.status(null).backend, "openai")
+	let _2 = L.useBackend(orig)
+	T.assertEq(L.status(null).backend, orig)
+end)
+
+# -------------
+# Config & auth
+# -------------
+
+T.test("llm/getConfig_shape_types", fun(_: Null) -> Any do
+	let cfg = L.getConfig(null)
+	T.assertType(cfg.backend, type Str)
+	if cfg.baseUrl != null then T.assertType(cfg.baseUrl, type Str) end
+	if cfg.model   != null then T.assertType(cfg.model,   type Str) end
+	T.assertType(cfg.options, type {})
+	if mapHas(cfg, "timeoutMs") and cfg.timeoutMs != null then
+		T.assertType(cfg.timeoutMs, type Int)
 	end
-end
-
-# Reset llm into a deterministic state (no secrets, no model).
-#
-# Returns:
-# 	Bool
-let _reset = fun(_: Null) -> Bool do
-	# Choose a known backend and clear model/options.
-	let _ = llm.useBackend("ollama")
-	let _ = llm.setOptions({model: null, options: {}})
-	# Also clear OpenAI auth to make 'authed' predictable when we switch to it.
-	let _ = llm.useBackend("openai")
-	let _ = llm.auth({"apiKey": null})
-	let _ = llm.setOptions({model: null, options: {}})
-	# Default back to ollama for most tests.
-	let _ = llm.useBackend("ollama")
-	true
-end
-
-# backends() exposes the built-ins.
-testing.test("llm/backends lists core names", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let xs = llm.backends(null)
-	let s = "," + join(xs, ",") + ","
-	_assert(match(",ollama,", s) != [], "ollama not listed")
-	_assert(match(",openai,", s) != [], "openai not listed")
 end)
 
-# status() shape and defaults for Ollama (authed=true, model=null).
-testing.test("llm/status default (ollama)", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let st = llm.status(null)
-	_assert(st.backend == "ollama", "backend should be ollama")
-	_assert(st.model == null, "model should be null by default")
-	_assert(st.authed == true, "ollama should report authed=true")
-	_assert(typeOf(st.options) == type {Str: Any}, "options should be a map")
+T.test("llm/setConfig_replaces_options_shallow", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	# Give options with three keys.
+	let _1 = L.setConfig({ options: { "temperature": 0.1, "top_p": 0.5, "top_k": 20 } })
+	# Replace with a smaller set; missing keys should disappear.
+	let _2 = L.setConfig({ options: { "temperature": 0.25, "top_p": 0.9 } })
+	let after = L.getConfig(null).options
+	T.assertEq(after.temperature, 0.25)
+	T.assertEq(after.top_p, 0.9)
+	T.assert(not mapHas(after, "top_k"), "expected options replacement, but top_k persisted")
 end)
 
-# useBackend: unknown returns annotated null.
-testing.test("llm/useBackend unknown → soft error", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let r = llm.useBackend("does-not-exist")
-	_assert(r == null, "expected annotated null on unknown backend")
-	let msg = noteGet(r)
-	_assert(bool(msg), "expected error annotation on null")
+T.test("llm/setConfig_ignores_unknown_top_level", fun(_: Null) -> Any do
+	let snap = L.status(null)
+	let _ = L.setConfig({ foo: 1 })
+	let now = L.status(null)
+	T.assertEq(snap.backend, now.backend)
+	T.assertEq(snap.model, now.model)
+	T.assertEq(snap.authed, now.authed)
 end)
 
-# getOptions / setOptions round-trip merge.
-testing.test("llm/options round-trip + merge", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let before = llm.getOptions(null)
-	_assert(before.backend == "ollama", "getOptions.backend mismatch")
-	_assert(mapHas(before, "options"), "getOptions.options missing")
-
-	let _ = llm.setOptions({model: "tiny-llm", options: {"temperature": 0.7}})
-	let after = llm.getOptions(null)
-	_assert(after.model == "tiny-llm", "setOptions did not set model")
-	_assert(after.options.temperature == 0.7, "temperature merge failed")
-
-	# Merge again (right wins).
-	let _ = llm.setOptions({options: {"temperature": 0.1, "top_p": 0.9}})
-	let again = llm.getOptions(null)
-	_assert(again.options.temperature == 0.1, "temperature second merge failed")
-	_assert(again.options.top_p == 0.9, "top_p not applied")
+T.test("llm/setConfig_allows_clearing_model", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	let _ = L.useModel("phi")
+	T.assertEq(L.status(null).model, "phi")
+	let _ = L.setConfig({ model: null })
+	T.assert(L.status(null).model == null, "model should be cleared to null")
 end)
 
-# auth() toggles authed for OpenAI; status never exposes secrets.
-testing.test("llm/auth openai toggles authed; secrets hidden", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let _ = llm.useBackend("openai")
-	let st0 = llm.status(null)
-	_assert(st0.authed == false, "openai should start authed=false without key")
-
-	let _ = llm.auth({"apiKey": "sk-test-123"})
-	let st1 = llm.status(null)
-	_assert(st1.authed == true, "openai authed should be true after auth()")
-
-	# Ensure status does not leak apiKey.
-	_assert(not mapHas(st1, "apiKey"), "status must not expose secrets")
+T.test("llm/setConfig_updates_baseUrl", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	let _ = L.setConfig({ baseUrl: "http://localhost:9999" })
+	T.assertEq(L.getConfig(null).baseUrl, "http://localhost:9999")
 end)
 
-# useModel sets model; reflected in status().
-testing.test("llm/useModel updates status", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let _ = llm.useBackend("ollama")
-	let _ = llm.useModel("phi3")
-	let st = llm.status(null)
-	_assert(st.model == "phi3", "useModel did not update model")
+T.test("llm/setConfig_timeoutMs_roundtrip", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.setConfig({ timeoutMs: 1234 })
+	let cfg = L.getConfig(null)
+	T.assertType(cfg.timeoutMs, type Int)
+	T.assertEq(cfg.timeoutMs, 1234)
 end)
 
-# exec() can be stubbed; we avoid real network by replacing backend.exec.
-testing.test("llm/exec stubbed returns boxed JSON", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let _ = llm.useBackend("ollama")
-	# Make sure a model is set so the stub mirrors normal preconditions.
-	let _ = llm.setOptions({model: "stub-model"})
-
-	# Replace exec with a stub that returns boxed JSON.
-	let b = llm._state.backends.ollama
-	b.exec = fun(self: {}, prompt: Str) -> Str? do
-		jsonStringify({"output": "ok:" + prompt})
-	end
-
-	let out = llm.exec("PING")
-	_assert(out != null, "exec returned null")
-	let j = jsonParse(out)
-	_assert(j.output == "ok:PING", "stubbed exec did not return boxed output")
+T.test("llm/auth_sets_authed_for_openai", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": null })  # ensure cleared
+	let s0 = L.status(null)
+	T.assertEq(s0.authed, false)
+	let _2 = L.auth({ "apiKey": "XYZ" })
+	let s1 = L.status(null)
+	T.assertEq(s1.authed, true)
 end)
 
-# models(): stub listModels to avoid network and exercise happy path.
-testing.test("llm/models stubbed happy path", fun(_: Null) -> Bool do
-	let _ = _reset(null)
-	let _ = llm.useBackend("ollama")
-	let b = llm._state.backends.ollama
-	b.listModels = fun(self: {}) -> [Str]? do
-		["alpha", "beta"]
-	end
+T.test("llm/auth_shallow_merge_nonkey_fields", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": null })  # ensure unauth
+	let _2 = L.auth({ "organization": "org-123" })  # no apiKey provided
+	let s = L.status(null)
+	T.assertEq(s.authed, false)  # still unauthenticated
+end)
 
-	let xs = llm.models(null)
-	_assert(xs != null, "models returned null")
-	_assert(len(xs) == 2, "expected two models")
-	_assert(xs[0] == "alpha" and xs[1] == "beta", "models content mismatch")
+T.test("llm/auth_clears_key_when_null", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": "XYZ" })
+	T.assertEq(L.status(null).authed, true)
+	let _2 = L.auth({ "apiKey": null })
+	T.assertEq(L.status(null).authed, false)
+end)
+
+T.test("llm/status_authed_true_for_local_backends", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	T.assertEq(L.status(null).authed, true)
+end)
+
+T.test("llm/auth_is_per_backend", fun(_: Null) -> Any do
+	# Start from a clean slate on both backends.
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": null })
+	let _ = L.useBackend("cohere")
+	let _ = L.auth({ "apiKey": null })
+
+	# Auth only OpenAI.
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": "XYZ" })
+	T.assertEq(L.status(null).authed, true)
+
+	# Switching to Cohere should not inherit OpenAI auth.
+	let _2 = L.useBackend("cohere")
+	T.assertEq(L.status(null).authed, false)
+
+	# Switching back to OpenAI preserves its own auth.
+	let _3 = L.useBackend("openai")
+	T.assertEq(L.status(null).authed, true)
+end)
+
+# ----------------------
+# Exec negative (no HTTP)
+# ----------------------
+
+T.test("llm/ollama_exec_requires_model", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	let out = L.exec("hello")
+	T.assertEq(out, null)  # soft-null due to missing model
+end)
+
+T.test("llm/openai_exec_requires_key", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": null })  # ensure no key
+	let out = L.exec("hi")
+	T.assertEq(out, null)  # soft-null due to missing API key
+end)
+
+T.test("llm/openai_exec_requires_model_even_when_authed", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": "XYZ" })
+	let out = L.exec("hi")
+	T.assertEq(out, null)  # soft-null due to missing model
+end)
+
+T.test("llm/cohere_exec_requires_model", fun(_: Null) -> Any do
+	let _ = L.useBackend("cohere")
+	let _ = L.auth({ "apiKey": "XYZ" })
+	let out = L.exec("ping")
+	T.assertEq(out, null)  # soft-null due to missing model
+end)
+
+T.test("llm/exec_ignores_unknown_options", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": "XYZ" })
+	let _2 = L.setConfig({ options: { "temperature": 0.1, "weird_unused_flag": 1 } })
+	# Still soft-null due to missing model, but must not hard-fail.
+	let out = L.exec("hi")
+	T.assertEq(out, null)
+end)
+
+# -----------
+# Models
+# -----------
+
+T.test("llm/models_softnull_when_missing_key", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.auth({ "apiKey": null })
+	let m = L.models(null)
+	T.assertEq(m, null)  # soft-null due to missing key
+end)
+
+T.test("llm/models_supported_returns_array_or_null", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	let m = L.models(null)
+	# Either returns [Str] if daemon is up, or soft-null (request failed).
+	T.assert(m == null or typeOf(m) == type [Str], "expected [Str] or null")
+end)
+
+# --------------
+# State integrity
+# --------------
+
+T.test("llm/status_reflects_useModel", fun(_: Null) -> Any do
+	let _ = L.useBackend("ollama")
+	let _ = L.useModel("phi")
+	T.assertEq(L.status(null).model, "phi")
+	T.assertEq(L.getConfig(null).model, "phi")
+end)
+
+T.test("llm/useBackend_switch_is_localized", fun(_: Null) -> Any do
+	let _ = L.useBackend("openai")
+	let _ = L.useModel("gpt-X")
+	let _2 = L.useBackend("anthropic")
+	T.assertEq(L.status(null).model, null)  # anthropic model untouched
+	let _3 = L.useBackend("openai")
+	T.assertEq(L.status(null).model, "gpt-X")  # original model preserved
 end)

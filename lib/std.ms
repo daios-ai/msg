@@ -431,6 +431,8 @@ end
 #
 # Backends install their executor here via `oracleInstall`.
 # Until installed, oracle calls should return an annotated null via this hook.
+# Once installed, this function is supposed to return a JSON string containing
+# a value `x` boxed as `{output: x}`.
 # Args: prompt: Str
 # Returns: Str?
 let __oracle_execute = fun(prompt: Str) -> Str? do
@@ -529,6 +531,7 @@ end
 #
 # Adjust these defaults to match your environment; they can be overridden later.
 let llm = import("llm")
+llm.init()
 oracleInstall(llm.exec)
 llm.useBackend("openai")
 llm.useModel("chatgpt-4o-latest")

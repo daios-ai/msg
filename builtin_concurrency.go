@@ -190,7 +190,16 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return HandleVal("proc", pr)
 		},
 	)
-	setBuiltinDoc(ip, "procSpawn", `Run a function concurrently in an isolated process. Use procJoin/procCancel/procJoinAll/procJoinAny.`)
+	setBuiltinDoc(ip, "procSpawn", `Run a function concurrently in an isolated process (clone of the current interpreter).
+
+The function's closure environment is deep-snapshotted into the child isolate.
+Results are retrieved via procJoin. Cancellation is cooperative; see procCancel.
+
+Params:
+	f: Fun
+
+Returns:
+	Any   # proc handle (opaque)`)
 
 	// procJoin(p) -> Any
 	ip.RegisterNative(
@@ -203,7 +212,13 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return pr.result
 		},
 	)
-	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.`)
+	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.
+
+Params:
+	p: Any   # proc handle
+
+Returns:
+	Any`)
 
 	// procCancel(p) -> Null (best-effort)
 	ip.RegisterNative(
@@ -220,7 +235,38 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process (best effort).`)
+	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process (best effort).
+
+Note: user code must opt in to observe cancellation (see procCancelled).
+
+Params:
+	p: Any   # proc handle
+
+Returns:
+	Null`)
+
+	// procCancelled(p) -> Bool
+	ip.RegisterNative(
+		"procCancelled",
+		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		S{"id", "Bool"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			pr := asHandle(ctx.MustArg("p"), "proc").Data.(*procState)
+			select {
+			case <-pr.cancel:
+				return Bool(true)
+			default:
+				return Bool(false)
+			}
+		},
+	)
+	setBuiltinDoc(ip, "procCancelled", `Check whether cancellation was requested for a process.
+
+Params:
+	p: Any   # proc handle
+
+Returns:
+	Bool`)
 
 	// procJoinAll(ps:[proc]) -> [Any]
 	ip.RegisterNative(
@@ -238,13 +284,19 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return Arr(out)
 		},
 	)
-	setBuiltinDoc(ip, "procJoinAll", `Wait for all processes to finish and return their results in order.`)
+	setBuiltinDoc(ip, "procJoinAll", `Wait for all processes to finish and return their results in order.
+
+Params:
+	ps: [Any]   # list of proc handles
+
+Returns:
+	[Any]`)
 
 	// procJoinAny(ps:[proc]) -> { index:Int, value:Any }
 	ip.RegisterNative(
 		"procJoinAny",
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
-		S{"map"},
+		S{"unop", "?", S{"map"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			ps := ctx.MustArg("ps").Data.([]Value)
 			if len(ps) == 0 {
@@ -271,7 +323,16 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return Value{Tag: VTMap, Data: mo}
 		},
 	)
-	setBuiltinDoc(ip, "procJoinAny", `Wait for any process to finish; return its index and value.`)
+	setBuiltinDoc(ip, "procJoinAny", `Wait for any process to finish; return its index and value.
+
+Params:
+	ps: [Any]   # list of proc handles (non-empty)
+
+Returns:
+	{ index: Int, value: Any }
+
+Errors:
+	annotated Null when ps is empty`)
 
 	// ------------------ Channels ------------------
 
@@ -281,6 +342,10 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			capacity := int64(0)
+			if v, ok := ctx.Arg("cap"); ok && v.Tag == VTStr {
+				// defensive: wrong type still flows to fail below; keep IsType enforcing
+				fail("chanOpen: cap must be Int?")
+			}
 			if v, ok := ctx.Arg("cap"); ok && v.Tag == VTInt {
 				capacity = v.Data.(int64)
 				if capacity < 0 {
@@ -290,7 +355,15 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return HandleVal("chan", &chanBox{ch: make(chan Value, int(capacity))})
 		},
 	)
-	setBuiltinDoc(ip, "chanOpen", `Create a new channel (buffered when cap>0).`)
+	setBuiltinDoc(ip, "chanOpen", `Create a new channel for Values.
+
+When cap > 0, the channel is buffered.
+
+Params:
+	cap: Int?   # capacity (default 0)
+
+Returns:
+	Any   # channel handle (opaque)`)
 
 	ip.RegisterNative(
 		"chanSend",
@@ -302,7 +375,14 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "chanSend", `Send a value on a channel (blocking).`)
+	setBuiltinDoc(ip, "chanSend", `Send a value on a channel (blocking).
+
+Params:
+	c: Any   # channel handle
+	x: Any
+
+Returns:
+	Null`)
 
 	ip.RegisterNative(
 		"chanRecv",
@@ -317,7 +397,16 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel (blocking).`)
+	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel (blocking).
+
+Params:
+	c: Any   # channel handle
+
+Returns:
+	Any
+
+Errors:
+	annotated Null with message "channel closed" if the channel is closed and empty`)
 
 	ip.RegisterNative(
 		"chanTrySend",
@@ -334,7 +423,14 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			}
 		},
 	)
-	setBuiltinDoc(ip, "chanTrySend", `Attempt a non-blocking send on a channel.`)
+	setBuiltinDoc(ip, "chanTrySend", `Attempt a non-blocking send on a channel.
+
+Params:
+	c: Any   # channel handle
+	x: Any
+
+Returns:
+	Bool   # true if sent, false if would block`)
 
 	ip.RegisterNative(
 		"chanTryRecv",
@@ -350,6 +446,7 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			select {
 			case v, ok := <-cb.ch:
 				if !ok {
+					// Non-blocking completed; communicate closed via annotated Null.
 					out.Entries["ok"] = Bool(true)
 					out.Entries["value"] = annotNull("channel closed")
 				} else {
@@ -363,7 +460,17 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return Value{Tag: VTMap, Data: out}
 		},
 	)
-	setBuiltinDoc(ip, "chanTryRecv", `Attempt a non-blocking receive from a channel.`)
+	setBuiltinDoc(ip, "chanTryRecv", `Attempt a non-blocking receive from a channel.
+
+If a value is immediately available, returns {ok:true, value:V}.
+If the channel is closed and empty, returns {ok:true, value: <annotated null "channel closed">}.
+If no value is available and the channel is open, returns {ok:false, value:null}.
+
+Params:
+	c: Any   # channel handle
+
+Returns:
+	{ ok: Bool, value: Any }`)
 
 	ip.RegisterNative(
 		"chanClose",
@@ -375,7 +482,13 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "chanClose", `Close a channel (idempotent).`)
+	setBuiltinDoc(ip, "chanClose", `Close a channel (idempotent). Further sends fail; tryRecv reports closed.
+
+Params:
+	c: Any   # channel handle
+
+Returns:
+	Null`)
 
 	// ------------------ Timers ------------------
 
@@ -398,7 +511,18 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return HandleVal("chan", cb)
 		},
 	)
-	setBuiltinDoc(ip, "timerAfter", `Emit one tick after a delay, then close.`)
+	setBuiltinDoc(ip, "timerAfter", `Create a channel that emits one tick after a delay, then closes.
+
+The tick payload is the Unix timestamp in milliseconds (Int).
+
+Params:
+	ms: Int   # delay in milliseconds (>= 0)
+
+Returns:
+	Any   # channel handle
+
+Errors:
+	annotated Null if ms < 0`)
 
 	ip.RegisterNative(
 		"ticker",
@@ -414,6 +538,7 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 				tk := time.NewTicker(time.Duration(ms) * time.Millisecond)
 				defer tk.Stop()
 				for t := range tk.C {
+					// Stop when consumer closes the channel.
 					if !safeSend(cb.ch, Int(t.UnixMilli())) {
 						return
 					}
@@ -422,5 +547,17 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return HandleVal("chan", cb)
 		},
 	)
-	setBuiltinDoc(ip, "ticker", `Emit periodic ticks on a channel until closed.`)
+	setBuiltinDoc(ip, "ticker", `Create a channel that emits periodic ticks until closed by the consumer.
+
+The tick payload is the Unix timestamp in milliseconds (Int).
+Call chanClose on the returned channel to stop the ticker goroutine.
+
+Params:
+	ms: Int   # period in milliseconds (> 0)
+
+Returns:
+	Any   # channel handle
+
+Errors:
+	annotated Null if ms <= 0`)
 }

@@ -395,3 +395,147 @@ procJoin(p)
 		t.Fatalf("procCancel/procJoin unexpected result: %#v", out)
 	}
 }
+
+// 1) chanTryRecv on empty, unbuffered → {ok:false, value:null}
+func Test_Builtin_Concurrency_TryRecv_OnEmptyUnbuffered(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let c = chanOpen()
+chanTryRecv(c)
+	`)
+	m := mustMap(t, v)
+	okv, _ := mget(m, "ok")
+	valv, _ := mget(m, "value")
+	if okv.Tag != VTBool || okv.Data.(bool) != false {
+		t.Fatalf("ok should be false on empty channel, got %#v", okv)
+	}
+	if valv.Tag != VTNull || valv.Annot != "" {
+		t.Fatalf("value should be bare null, got %#v", valv)
+	}
+}
+
+// 2) chanClose is idempotent
+func Test_Builtin_Concurrency_ChanClose_Idempotent(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let c = chanOpen()
+chanClose(c)
+chanClose(c)
+42
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 42 {
+		t.Fatalf("second chanClose should be a no-op, got %#v", v)
+	}
+}
+
+// 3) chanOpen type validation (wrong types → hard error)
+func Test_Builtin_Concurrency_ChanOpen_TypeValidation(t *testing.T) {
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(`chanOpen("1")`)
+	wantErr(t, err)
+	_, err = ip.EvalSource(`chanOpen(1.5)`)
+	wantErr(t, err)
+}
+
+// 4) procSpawn argument validation (non-function → hard error)
+func Test_Builtin_Concurrency_ProcSpawn_ArgValidation(t *testing.T) {
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(`procSpawn(123)`)
+	wantErr(t, err)
+}
+
+// 5) procJoinAll([]) → []
+func Test_Builtin_Concurrency_ProcJoinAll_Empty(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `procJoinAll([])`)
+	if v.Tag != VTArray || len(v.Data.([]Value)) != 0 {
+		t.Fatalf("procJoinAll([]) should return empty array, got %#v", v)
+	}
+}
+
+// 6) procJoinAny([]) → annotated null ("empty list")
+func Test_Builtin_Concurrency_ProcJoinAny_Empty(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `procJoinAny([])`)
+	wantAnnotatedContains(t, v, "empty list")
+}
+
+// 7) timerAfter(0) emits one tick immediately, then closed
+func Test_Builtin_Concurrency_TimerAfter_Zero(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let c = timerAfter(0)
+let first = chanRecv(c)
+let second = chanRecv(c)
+{ first: first, second: second }
+	`)
+	m := mustMap(t, v)
+	first, _ := mget(m, "first")
+	second, _ := mget(m, "second")
+	if first.Tag != VTInt {
+		t.Fatalf("first tick should be Int millis, got %#v", first)
+	}
+	wantAnnotatedContains(t, second, "channel closed")
+}
+
+// 8) ticker invalid ms (0 and negative) → hard errors
+func Test_Builtin_Concurrency_Ticker_InvalidArgs(t *testing.T) {
+	ip, _ := NewRuntime()
+	_, err := ip.EvalSource(`ticker(0)`)
+	wantErrContains(t, err, "must be > 0")
+	_, err = ip.EvalSource(`ticker(-5)`)
+	wantErrContains(t, err, "must be > 0")
+}
+
+// 9) chanTryRecv after close with buffered data
+func Test_Builtin_Concurrency_TryRecv_AfterCloseWithBufferedData(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let c = chanOpen(1)
+chanSend(c, "x")
+chanClose(c)
+let r1 = chanTryRecv(c)   # should get "x"
+let r2 = chanTryRecv(c)   # channel closed
+{ r1: r1, r2: r2 }
+	`)
+	m := mustMap(t, v)
+
+	r1 := mustMap(t, m.Entries["r1"])
+	ok1, _ := mget(r1, "ok")
+	val1, _ := mget(r1, "value")
+	if ok1.Tag != VTBool || ok1.Data.(bool) != true {
+		t.Fatalf("r1.ok expected true, got %#v", ok1)
+	}
+	if val1.Tag != VTStr || val1.Data.(string) != "x" {
+		t.Fatalf("r1.value expected 'x', got %#v", val1)
+	}
+
+	r2 := mustMap(t, m.Entries["r2"])
+	ok2, _ := mget(r2, "ok")
+	val2, _ := mget(r2, "value")
+	if ok2.Tag != VTBool || ok2.Data.(bool) != true {
+		t.Fatalf("r2.ok expected true (closed channel), got %#v", ok2)
+	}
+	wantAnnotatedContains(t, val2, "channel closed")
+}
+
+// 10) procJoinAny single element
+func Test_Builtin_Concurrency_ProcJoinAny_Single(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+let p = procSpawn(fun() -> Int do 123 end)
+procJoinAny([p])
+	`)
+	if v.Tag != VTMap {
+		t.Fatalf("procJoinAny should return {index:Int, value:Any}, got %#v", v)
+	}
+	m := v.Data.(*MapObject)
+	idx, _ := mget(m, "index")
+	val, _ := mget(m, "value")
+	if idx.Tag != VTInt || idx.Data.(int64) != 0 {
+		t.Fatalf("index should be 0, got %#v", idx)
+	}
+	if val.Tag != VTInt || val.Data.(int64) != 123 {
+		t.Fatalf("value should be 123, got %#v", val)
+	}
+}

@@ -73,7 +73,7 @@ Returns:
 			{Name: "name", Type: S{"id", "Str"}},
 			{Name: "value", Type: S{"unop", "?", S{"id", "Str"}}}, // Str? (null = unset)
 		},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			name := ctx.MustArg("name").Data.(string)
 			v, ok := ctx.Arg("value")
@@ -99,7 +99,7 @@ Params:
 	value: Str?  # null → unset
 
 Returns:
-	Bool (annotated null on OS error)`)
+	Bool? (annotated null on OS error)`)
 
 	// stat(path) -> { isDir!:Bool, size!:Int, modTimeMillis!:Int, mode!:Int }?
 	ip.RegisterNative(
@@ -143,7 +143,7 @@ Returns:
 	ip.RegisterNative(
 		"mkdir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			p := ctx.MustArg("path").Data.(string)
 			// Create intermediate directories for practicality.
@@ -159,7 +159,7 @@ Params:
 	path: Str
 
 Returns:
-	Bool (annotated null on error)`)
+	Bool? (annotated null on error)`)
 
 	ip.RegisterNative(
 		"rename",
@@ -167,7 +167,7 @@ Returns:
 			{Name: "old", Type: S{"id", "Str"}},
 			{Name: "new", Type: S{"id", "Str"}},
 		},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			oldP := ctx.MustArg("old").Data.(string)
 			newP := ctx.MustArg("new").Data.(string)
@@ -184,12 +184,12 @@ Params:
 	new: Str
 
 Returns:
-	Bool (annotated null on error)`)
+	Bool? (annotated null on error)`)
 
 	ip.RegisterNative(
 		"remove",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			p := ctx.MustArg("path").Data.(string)
 			// Be conservative: don't remove recursively.
@@ -205,7 +205,7 @@ Params:
 	path: Str
 
 Returns:
-	Bool (annotated null on error). Note: fails for non-empty directories.`)
+	Bool? (annotated null on error). Note: fails for non-empty directories.`)
 
 	ip.RegisterNative(
 		"cwd",
@@ -227,7 +227,7 @@ Returns:
 	ip.RegisterNative(
 		"chdir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			p := ctx.MustArg("path").Data.(string)
 			if err := os.Chdir(p); err != nil {
@@ -242,7 +242,7 @@ Params:
 	path: Str
 
 Returns:
-	Bool (annotated null on error)`)
+	Bool? (annotated null on error)`)
 
 	ip.RegisterNative(
 		"tempDir",
@@ -271,7 +271,7 @@ func registerIOBuiltins(ip *Interpreter) {
 		case "a":
 			flag = os.O_WRONLY | os.O_CREATE | os.O_APPEND
 		case "rw":
-			flag = os.O_RDWR | os.O_CREATE
+			flag = os.O_RDWR | os.O_CREATE // read/write, no truncate
 		default:
 			return nil, fmt.Errorf("invalid mode %q", mode)
 		}
@@ -299,7 +299,6 @@ func registerIOBuiltins(ip *Interpreter) {
 		case "file":
 			fh := h.Data.(*fileH)
 			if !fh.hasR {
-				// Contractual misuse: file not opened for reading.
 				fail("not readable")
 			}
 			return fh.rb, "file"
@@ -307,7 +306,6 @@ func registerIOBuiltins(ip *Interpreter) {
 			nh := h.Data.(*netConnH)
 			return nh.rb, "net"
 		default:
-			// Contractual: wrong handle kind.
 			fail("unsupported handle for read")
 			return nil, ""
 		}
@@ -318,7 +316,6 @@ func registerIOBuiltins(ip *Interpreter) {
 		case "file":
 			fh := h.Data.(*fileH)
 			if !fh.hasW {
-				// Contractual misuse: file not opened for writing.
 				fail("not writable")
 			}
 			return fh.wb, "file"
@@ -326,7 +323,6 @@ func registerIOBuiltins(ip *Interpreter) {
 			nh := h.Data.(*netConnH)
 			return nh.wb, "net"
 		default:
-			// Contractual: wrong handle kind.
 			fail("unsupported handle for write")
 			return nil, ""
 		}
@@ -375,19 +371,18 @@ func registerIOBuiltins(ip *Interpreter) {
 			{Name: "path", Type: S{"id", "Str"}},
 			{Name: "mode", Type: S{"enum", S{"str", "r"}, S{"str", "w"}, S{"str", "a"}, S{"str", "rw"}}},
 		},
-		S{"id", "Any"},
+		S{"unop", "?", S{"id", "Any"}}, // Any?
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.MustArg("path")
 			mv := ctx.MustArg("mode")
 			if pv.Tag != VTStr {
-				fail("open expects path: Str") // contractual
+				fail("open expects path: Str")
 			}
 			if mv.Tag != VTStr {
-				fail("open expects mode: Str") // contractual
+				fail("open expects mode: Str")
 			}
 			h, err := openFile(pv.Data.(string), mv.Data.(string))
 			if err != nil {
-				// soft (e.g., permission denied / not found)
 				return annotNull(err.Error())
 			}
 			return HandleVal("file", h)
@@ -399,7 +394,7 @@ Modes:
 	"r"  — read-only
 	"w"  — write (truncate or create)
 	"a"  — append (create if needed)
-	"rw" — read/write (create if needed)
+	"rw" — read/write (create if needed; does not truncate)
 
 Params:
 	path: Str
@@ -409,11 +404,11 @@ Returns:
 	file handle usable with read*/write/flush/close,
 	or null (annotated) on I/O failure.`)
 
-	// close(h: Any) -> Bool
+	// close(h: Any) -> Bool?
 	ip.RegisterNative(
 		"close",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(ip *Interpreter, ctx CallCtx) Value {
 			h := asHandle(ctx.MustArg("h"), "")
 			var errMsg string
@@ -451,10 +446,10 @@ Returns:
 				}
 
 			default:
-				fail("unsupported handle for close") // contractual
+				fail("unsupported handle for close")
 			}
 			if errMsg != "" {
-				return annotNull(errMsg) // soft
+				return annotNull(errMsg)
 			}
 			return Bool(true)
 		},
@@ -466,7 +461,7 @@ Never closes STDIN/STDOUT/STDERR; they are only flushed.
 Returns annotated null on I/O failure; hard-errors on misuse.
 
 Returns:
-	Bool`)
+	Bool?`)
 
 	ip.RegisterNative(
 		"readAll",
@@ -476,7 +471,7 @@ Returns:
 			rb, _ := getReader(ctx.MustArg("h"))
 			b, err := io.ReadAll(rb)
 			if err != nil {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			return Str(string(b))
 		},
@@ -495,12 +490,12 @@ Returns null (annotated) on I/O error.`)
 			nv := ctx.MustArg("n")
 			n := int(nv.Data.(int64))
 			if n < 0 {
-				fail("readN expects n >= 0") // contractual
+				fail("readN expects n >= 0")
 			}
 			buf := make([]byte, n)
 			k, err := io.ReadFull(rb, buf)
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			return Str(string(buf[:k]))
 		},
@@ -521,7 +516,7 @@ Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 				return Null
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			// Trim trailing newline(s) (handle CRLF and LF)
 			return Str(strings.TrimRight(s, "\r\n"))
@@ -540,7 +535,7 @@ Returns null at EOF. Returns null (annotated) on I/O error.`)
 			sv := ctx.MustArg("s")
 			n, err := wb.WriteString(sv.Data.(string))
 			if err != nil {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			return Int(int64(n))
 		},
@@ -553,11 +548,11 @@ Output is buffered; call flush to ensure delivery.`)
 	ip.RegisterNative(
 		"flush",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
-		S{"id", "Bool"},
+		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(ip *Interpreter, ctx CallCtx) Value {
 			wb, _ := getWriter(ctx.MustArg("h"))
 			if err := wb.Flush(); err != nil {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			return Bool(true)
 		},
@@ -568,7 +563,7 @@ Ensures written data is visible to readers/peers.
 Returns annotated null on I/O error.
 
 Returns:
-	Bool`)
+	Bool?`)
 
 	ip.RegisterNative(
 		"readFile",
@@ -578,7 +573,7 @@ Returns:
 			pv := ctx.MustArg("path")
 			b, err := os.ReadFile(pv.Data.(string))
 			if err != nil {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			return Str(string(b))
 		},
@@ -600,7 +595,7 @@ Returns:
 			dv := ctx.MustArg("data")
 			data := dv.Data.(string)
 			if err := os.WriteFile(pv.Data.(string), []byte(data), 0o644); err != nil {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			return Int(int64(len(data)))
 		},
@@ -618,7 +613,7 @@ Returns the number of bytes written as Int, or null (annotated) on I/O error.`)
 			pv := ctx.MustArg("path")
 			ents, err := os.ReadDir(pv.Data.(string))
 			if err != nil {
-				return annotNull(err.Error()) // soft
+				return annotNull(err.Error())
 			}
 			out := make([]Value, 0, len(ents))
 			for _, e := range ents {
@@ -651,8 +646,8 @@ Returns:
 				goArgs[i] = fmtArgFromValue(as[i])
 			}
 			out := fmt.Sprintf(f, goArgs...)
-			// Optional: treat fmt anomalies as soft error (Go emits "%!" markers)
-			if strings.Contains(out, "%!") {
+			// Simple, low-false-positive heuristic: Go emits patterns like "%!(EXPLAINER=...)".
+			if strings.Contains(out, "%!(") {
 				return annotNull("sprintf: format/arg mismatch")
 			}
 			return Str(out)
@@ -671,6 +666,7 @@ Returns:
 	Str? — the formatted string, or null (annotated) on format/arg mismatch.`)
 
 	// printf(fmt: Str, args: [Any]) -> Str?
+	// NOTE: Writes through the same buffered STDOUT handle used by write/flush to avoid interleaving.
 	ip.RegisterNative(
 		"printf",
 		[]ParamSpec{
@@ -686,15 +682,26 @@ Returns:
 				goArgs[i] = fmtArgFromValue(as[i])
 			}
 			out := fmt.Sprintf(f, goArgs...)
-			if _, err := fmt.Print(out); err != nil {
-				return annotNull("printf: " + err.Error()) // soft error
+			if strings.Contains(out, "%!(") {
+				return annotNull("printf: format/arg mismatch")
+			}
+			// Write via the same buffered writer as STDOUT to keep ordering sane.
+			if stdoutH.wb == nil {
+				return annotNull("printf: stdout not writable")
+			}
+			if _, err := stdoutH.wb.WriteString(out); err != nil {
+				return annotNull("printf: " + err.Error())
+			}
+			if err := stdoutH.wb.Flush(); err != nil {
+				return annotNull("printf: " + err.Error())
 			}
 			return Str(out)
 		},
 	)
 	setBuiltinDoc(ip, "printf", `Print a formatted string to standard output.
 
-Convenience over sprintf + stdout. Caller controls newlines:
+Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
+Caller controls newlines:
 	printf("%s = %v\n", ["x", 42])
 
 Params:
@@ -710,7 +717,6 @@ Returns:
 func fmtArgFromValue(v Value) any {
 	switch v.Tag {
 	case VTStr:
-		// Let %s work naturally and avoid extra quotes that Value.String() would add.
 		return v.Data.(string)
 	case VTInt:
 		return v.Data.(int64)
@@ -719,7 +725,6 @@ func fmtArgFromValue(v Value) any {
 	case VTBool:
 		return v.Data.(bool)
 	case VTNull:
-		// Friendlier than nil/%!s(<nil>): prints "null" with %s and "null" with %v too.
 		return "null"
 	default:
 		// For arrays/maps/functions/types/handles/modules, defer to Value.String().

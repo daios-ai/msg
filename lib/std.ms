@@ -1,26 +1,41 @@
 ## std.ms
 ## Minimal standard library implemented in MindScript on top of builtins.
 ##
-
 ## === MINDSCRIPT CODE CONVENTION
 ##
-## 1) Naming conventions are like Go/JS:
-##    - Functions and variables: camelCase
-##    - Types: PascalCase
-##    - Constants: SCREAMING_SNAKE_CASE
-##    - Modules: (prefer single-word) snake_case
-##    - Private names start with _underscore.
-## 2) Errors come in two levels, Go-like:
-##    - fail(msg) for contractual errors (hard fails) that cause a runtime
-##      error: e.g. type mismatch, too many arguments, etc.
-##      The try function can be used to catch errors.
-##    - null with error annotations denote soft errors, e.g. file not found,
-##      connection not open, etc. Function returning errors have a nullable
-##      type.
-## 3) Functions should have annotations like Python docstrings. First line
-##   is a brief summary, then blank line, then detailed description with
-##   explanation of arguments and return type. It should be concise, but complete.
-## 4) Tabs for indentation.
+## 1) Naming
+##	Functions/vars: camelCase; Types: PascalCase; Consts: SCREAMING_SNAKE_CASE;
+##	Modules: snake_case; Private: _prefix.
+##
+## 2) Errors
+##	Soft errors: use nullable returns (T?); return `null  # <reason>`.
+##	Any? = Any → do NOT use Any for maybes; pick a concrete T.
+##	Hard errors: `fail(msg)` only for invariants/programmer bugs or unrecoverable state.
+##	Catch hard errors with `try`; prefer soft errors for expected conditions.
+##	Caller check idiom:
+##	```
+##		let v = parseX(s)
+##		if v == null then return null  # <invalid input> end
+##		use(v)
+##	```
+##	Add brief, grep-able slugs: `<not found>`, `<timeout: 200ms>`.
+##
+## 3) Function docs (PRE)
+##	First line: short summary. Then blank line. Then Args/Returns/Soft-fail notes.
+##	Example:
+##	```
+##		# Parse URL string.
+##		#
+##		# Args: s: Str
+##		# Returns: {…}? (null on <invalid url>)
+##		fun parseUrl(s: Str) -> { scheme!:Str, host!:Str, port:Int, path!:Str, query!:Str, fragment:Str }? do
+##			let u = urlParse(s); if u == null then return null  # <invalid url> end; u
+##		end
+##	```
+##
+## 4) Formatting
+##	Tabs for indentation. POST forces newline and follows after-separator rule.
+##	Canonical output ends with exactly one trailing newline.
 
 ## -----------------------------
 ## Error/Assert
@@ -42,28 +57,6 @@ end
 # Returns: Bool
 let assert = fun(cond: Bool) -> Bool do
 	if cond then true else fail("assertion failed") end
-end
-
-## -----------------------------
-## Frame bindings
-## -----------------------------
-
-# Current frame bindings (shallow copy).
-#
-# Returns a map of variables bound in the *current* scope only.
-# Args: _: Null (ignored)
-# Returns: {}
-let locals = fun(_: Null) -> {} do
-	bindings(true)
-end
-
-# All visible bindings (merged from current frame outward).
-#
-# Returns a map where inner scopes shadow outer ones.
-# Args: _: Null (ignored)
-# Returns: {}
-let scope = fun(_: Null) -> {} do
-	bindings(false)
 end
 
 ## -----------------------------
@@ -91,61 +84,6 @@ let println = fun(x: Any) -> Any do
 end
 
 ## -----------------------------
-## Time & randomness
-## -----------------------------
-
-# Current timestamp in milliseconds since the Unix epoch.
-#
-# Thin wrapper over native `nowMillis()`.
-# Args: _: Null (ignored)
-# Returns: Int
-let tsNow = fun(_: Null) -> Int do
-	nowMillis()
-end
-
-# Random float uniformly in [0, 1).
-#
-# Thin wrapper over native `randFloat()`.
-# Args: _: Null (ignored)
-# Returns: Num
-let random = fun(_: Null) -> Num do
-	randFloat()
-end
-
-
-## -----------------------------
-## Tiny internal helpers
-## -----------------------------
-
-# Build a JSON array incrementally (string-backed buffer).
-#
-# Returns an object with:
-#   - push(x: Any)  -> Null
-#   - build(_: Null)-> [Any]
-# Useful to avoid repeated array reallocations.
-# Args: (none)
-# Returns: { push:(Any -> Null), build:(Null -> [Any]) }
-let _arrayBuilder = fun() -> {push:(Any -> Null), build:(Null -> [Any])} do
-	let buf = "["
-	let first = true
-	let push = fun(x: Any) -> Null do
-		if first then
-			buf = buf + jsonStringify(x)
-			first = false
-			null
-		else
-			buf = buf + "," + jsonStringify(x)
-			null
-		end
-	end
-	let build = fun(_: Null) -> [Any] do
-		jsonParse(buf + "]")
-	end
-	{ push: push, build: build }
-end
-
-
-## -----------------------------
 ## Iterators
 ## -----------------------------
 
@@ -154,7 +92,7 @@ end
 # Produces a thunk `(Null -> Int)` that increments on each call.
 # Args: _: Null (ignored)
 # Returns: (Null -> Int)
-let natural0 = fun(_: Null) -> (Null -> Int) do
+let naturals0 = fun(_: Null) -> (Null -> Int) do
 	let i = 0
 	fun(_: Null) -> Int do
 		let v = i
@@ -168,7 +106,7 @@ end
 # Produces a thunk `(Null -> Int)` that starts at 1.
 # Args: _: Null (ignored)
 # Returns: (Null -> Int)
-let natural = fun(_: Null) -> (Null -> Int) do
+let naturals = fun(_: Null) -> (Null -> Int) do
 	let i = 1
 	fun(_: Null) -> Int do
 		let v = i
@@ -199,9 +137,12 @@ let range = fun(start: Int, stop: Int?) -> (Null -> Int?) do
 	end
 end
 
-# Turn arrays into (Null -> Any?) iterators; pass iterators through unchanged.
+# Turn arrays or maps into (Null -> Any?) iterators; pass iterators through unchanged.
 #
-# If `v` is `[Any]`, returns a thunk yielding items then null; otherwise assumes `v` is already an iterator.
+# - [Any]      → yields elements
+# - {}         → yields [key, value] pairs
+# - (Null->?)  → returned as-is
+# Else: hard error.
 # Args: v: Any
 # Returns: (Null -> Any?)
 let iter = fun(v: Any) -> (Null -> Any?) do
@@ -217,8 +158,25 @@ let iter = fun(v: Any) -> (Null -> Any?) do
 				null
 			end
 		end
-	else
+	elif isType(v, type {}) then
+		let kvs = []
+		for let [k, val] in v do
+			kvs = kvs + [[k, val]]
+		end
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(kvs) then
+				let p = kvs[i]
+				i = i + 1
+				p
+			else
+				null
+			end
+		end
+	elif isType(v, type (Null) -> Any?) then
 		v
+	else
+		fail("iter: expected array, map, or iterator")
 	end
 end
 
@@ -228,13 +186,13 @@ end
 # Args: it: (Null -> Any?)
 # Returns: [Any]
 let list = fun(it: (Null -> Any?)) -> [Any] do
-	let b = _arrayBuilder()
-	for _ in natural0(null) do
+	let out = []
+	for _ in naturals0(null) do
 		let x = it(null)
 		if x == null then break(null) end
-		b.push(x)
+		out = out + [x]
 	end
-	b.build(null)
+	out
 end
 
 # Map over an iterator (lazy transform).
@@ -256,7 +214,7 @@ end
 # Returns: (Null -> Any?)
 let filter = fun(cond: (Any -> Bool), it: (Null -> Any?)) -> (Null -> Any?) do
 	fun(_: Null) -> Any? do
-		for _ in natural0(null) do
+		for _ in naturals0(null) do
 			let x = it(null)
 			if x == null then break(null) end
 			if cond(x) then return(x) end
@@ -276,7 +234,7 @@ let reduce = fun(f: (Any -> Any -> Any), it: (Null -> Any?)) -> Any? do
 		null
 	else
 		let acc = first
-		for _ in natural0(null) do
+		for _ in naturals0(null) do
 			let x = it(null)
 			if x == null then break(null) end
 			acc = f(acc, x)
@@ -284,7 +242,6 @@ let reduce = fun(f: (Any -> Any -> Any), it: (Null -> Any?)) -> Any? do
 		acc
 	end
 end
-
 
 ## -----------------------------
 ## Arrays
@@ -296,11 +253,11 @@ end
 # Args: xs: [Any], s: Int, e: Int
 # Returns: [Any]
 let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
-	let b = _arrayBuilder()
+	let out = []
 	for i in range(s, e) do
-		b.push(xs[i])
+		out = out + [xs[i]]
 	end
-	b.build(null)
+	out
 end
 
 # Push a value to the end (returns a new array).
@@ -308,10 +265,7 @@ end
 # Args: xs: [Any], v: Any
 # Returns: [Any]
 let push = fun(xs: [Any], v: Any) -> [Any] do
-	let b = _arrayBuilder()
-	for x in iter(xs) do b.push(x) end
-	b.push(v)
-	b.build(null)
+	xs + [v]
 end
 
 # Pop the last element without modifying the input array.
@@ -329,10 +283,7 @@ end
 # Args: xs: [Any], v: Any
 # Returns: [Any]
 let shift = fun(xs: [Any], v: Any) -> [Any] do
-	let b = _arrayBuilder()
-	b.push(v)
-	for x in iter(xs) do b.push(x) end
-	b.build(null)
+	[v] + xs
 end
 
 # Unshift (peek) the first element.
@@ -343,51 +294,16 @@ let unshift = fun(xs: [Any]) -> Any? do
 	if len(xs) == 0 then null else xs[0] end
 end
 
-
 ## -----------------------------
 ## Objects (maps)
 ## -----------------------------
-
-# Delete a property from a map.
-#
-# Returns the updated object.
-# Args: obj: {}, prop: Str
-# Returns: {}
-let delProp = fun(obj: {}, prop: Str) -> {} do
-	mapDelete(obj, prop)
-end
-
-# Whether a key exists in a map.
-#
-# Args: obj: {}, key: Str
-# Returns: Bool
-let hasKey = fun(obj: {}, key: Str) -> Bool do
-	mapHas(obj, key)
-end
-
-# Get a property value.
-#
-# Args: obj: {}, key: Str
-# Returns: Any
-let getProp = fun(obj: {}, key: Str) -> Any do
-	obj[key]
-end
-
-# Set a property value (returns the value).
-#
-# Args: obj: {}, key: Str, value: Any
-# Returns: Any
-let setProp = fun(obj: {}, key: Str, value: Any) -> Any do
-	obj[key] = value
-	value
-end
 
 # Iterator over keys of an object.
 #
 # Args: obj: {}
 # Returns: (Null -> Str?)
 let keys = fun(obj: {}) -> (Null -> Str?) do
-	let it = iter(obj)
+	let it = iter(obj)  # yields [k, v]
 	fun(_: Null) -> Str? do
 		let pair = it(null)
 		if pair == null then null else pair[0] end
@@ -410,7 +326,8 @@ end
 #
 # For maps: returns keys not starting with "_".
 # For modules: returns exported names (not starting with "_"), or [] if unavailable.
-# Args: x: Any
+# If a value has a PRE note, the first line is attached as an annotation to the key.
+# Args: x: {}
 # Returns: [Str]
 let dir = fun(x: {}) -> [Str] do
 	let out = []
@@ -424,17 +341,8 @@ let dir = fun(x: {}) -> [Str] do
 			out = out + [k]
 		end
 	end
+	out
 end
-
-# List function names of an object (if supported).
-#
-# Placeholder: requires native function detection support.
-# Args: _obj: {}
-# Returns: [Str]?
-let dirFun = fun(_obj: {}) -> [Str]? do
-	error("dirFun is not implemented in stdlib; requires native function detection")
-end
-
 
 ## -----------------------------
 ## Importing / modules
@@ -461,55 +369,47 @@ let importUrl = fun(url: Str) -> {}? do
 	if r.ok then r.value else error("import failed: " + str(r.error)) end
 end
 
-
-## -----------------------------
-## Networking
-## -----------------------------
-
-# Simple HTTP GET helper.
-#
-# Performs a GET and returns the response body on HTTP 200; otherwise an annotated null.
-# Args: url: Str
-# Returns: Str?
-let httpGet = fun(url: Str) -> Str? do
-	let r = http({ "url": url, "method": "GET" })
-	if r.status == 200 then
-		r.body
-	else
-		error("http: GET " + url + " → HTTP " + str(r.status))
-	end
-end
-
-
-## -----------------------------
-## Schemas
-## -----------------------------
-
-# Render a JSON Schema for a Type.
-#
-# Uses native `typeToJSONSchema` and serializes to a string.
-# Args: t: Type
-# Returns: Str?
-let jsonSchema = fun(t: Type) -> Str? do
-	let r = try(fun() do typeToJSONSchema(t) end)
-	if r.ok then jsonStringify(r.value) else error("jsonSchema: missing native bridge") end
-end
-
-
 ## -----------------------------
 ## Misc
 ## -----------------------------
 
-# Stable-ish integer id for a value’s string form.
+# Stable-ish integer id for a value’s content.
 #
-# Implements a simple DJB2-like hash over `str(value)`.
+# Hashes the UTF-8 bytes of `str(value)` via sha256, then folds over the hex string
+# with a DJB2-like accumulator for a compact Int.
 # Args: value: Any
 # Returns: Int
 let uid = fun(value: Any) -> Int do
-	let s = str(value)
+	let hx = hexEncode(sha256(str(value)))
 	let h = 5381
-	for ch in split(s, "") do
-		h = ((h * 33) + len(ch))
+	let n = len(hx)
+	let i = 0
+
+	let hexVal = fun(c: Str) -> Int do
+		if c == "0" then 0
+		elif c == "1" then 1
+		elif c == "2" then 2
+		elif c == "3" then 3
+		elif c == "4" then 4
+		elif c == "5" then 5
+		elif c == "6" then 6
+		elif c == "7" then 7
+		elif c == "8" then 8
+		elif c == "9" then 9
+		elif c == "a" or c == "A" then 10
+		elif c == "b" or c == "B" then 11
+		elif c == "c" or c == "C" then 12
+		elif c == "d" or c == "D" then 13
+		elif c == "e" or c == "E" then 14
+		elif c == "f" or c == "F" then 15
+		else 0
+		end
+	end
+
+	while i < n do
+		let nib = substr(hx, i, i + 1)
+		h = (h * 33) + hexVal(nib)
+		i = i + 1
 	end
 	h
 end
@@ -524,16 +424,16 @@ let mute = fun(_: Any) -> Null do
 end
 
 ## -----------------------------
-## Oracle hook (owned by prelude/Core)
+## Oracle hook (prelude-owned, minimal)
 ## -----------------------------
 
 # Global oracle execution hook.
 #
-# Backends install their executor here via `oracleInstall`. Until installed,
-# calling an oracle returns an annotated null.
-# Args: _prompt: Str
+# Backends install their executor here via `oracleInstall`.
+# Until installed, oracle calls should return an annotated null via this hook.
+# Args: prompt: Str
 # Returns: Str?
-let __oracle_execute = fun(_prompt: Str) -> Str? do
+let __oracle_execute = fun(prompt: Str) -> Str? do
 	error("oracle backend not configured")
 end
 
@@ -547,7 +447,7 @@ let _oracleInstalled = false
 # Install a new global oracle executor.
 #
 # Rebinds `__oracle_execute` to the provided function.
-# Args: exec: (Str -> Type -> Type -> [Any] -> Str?)
+# Args: exec: (Str -> Str?)
 # Returns: Null
 let oracleInstall = fun(exec: Str -> Str?) -> Null do
 	__oracle_execute = exec
@@ -564,58 +464,32 @@ let oracleStatus = fun(_: Null) -> Str do
 	if _oracleInstalled then "oracle: installed" else "oracle: not installed" end
 end
 
-
-## -----------------------------
-## LLM backend bootstrap
-## -----------------------------
-
-# Load the llm module (namespaced) and install its executor into the global hook.
+# Quick oracle health check (real call if installed).
 #
-# The `llm` module manages backends/models/options; this merely wires it to oracles.
-# Args: (module import side effects)
-# Returns: (installs __oracle_execute)
-let llm = import("llm")
-oracleInstall(llm.exec)
-
-
-## -----------------------------
-## Standard oracle sanity check (real call)
-## -----------------------------
-
-# Say hello in a surprising, playful one-liner.
-#
-# Produces a short, delightful greeting that directly addresses the given name.
-# Single sentence, 6–14 words, plain text (no code fences). Emoji allowed.
-# Runs the full oracle path: prompt build → backend exec → JSON boxing → type-check.
-# Args: name: Str
-# Returns: Str
-let _hello = oracle(name: Str) -> Str from [
-	["Ada", "Surprise, Ada — you just unlocked bonus sunshine today! ☀️"],
-	["Sam", "Plot twist, Sam: today you’re the main character! 🎬"]
-]
-
-# Run oracleHello and report status + timing.
-#
-# On success, returns { ok:true, backend, model, ms, value }.
-# On failure, returns an annotated null describing the problem.
-# Args: name: Str
-# Returns: { ok: Bool, backend: Str, model: Str?, ms: Int, value: Str }?
-let oracleCheck = fun(name: Str) -> {}? do
-	let st = llm.status(null)
-	let t0 = tsNow(null)
-	let r = try(fun() do _hello(name) end)
-	let t1 = tsNow(null)
-
-	if r.ok then
-		{ ok: true, backend: st.backend, model: st.model, ms: t1 - t0, value: r.value }
-	else
-		error("Oracle failed: " + str(r.error))
+# Runs a minimal oracle end-to-end. On success, returns { ok:true, ms }.
+# On failure or if not installed, returns an annotated null.
+# Args: _: Null
+# Returns: { ok: Bool, ms: Int }?
+let oracleHealth = fun(_: Null) -> {}? do
+	if not _oracleInstalled then
+		return error("oracle not installed")
 	end
+	# Minimal oracle to exercise the path.
+	let _ping = oracle(_: Null) -> Str from [[null, "pong"]]
+	let t0 = nowMillis()
+	let r = try(fun(_: Null) -> Any do _ping(null) end)
+	let t1 = nowMillis()
+	if r.ok then { ok: true, ms: t1 - t0 } else error("oracle failed: " + str(r.error)) end
 end
 
+## -----------------------------
+## LLM backend bootstrap (installed in prelude)
+## -----------------------------
 
-
-
-
+# Load the llm module, install its executor, and select a default backend/model.
+#
+# Adjust these defaults to match your environment; they can be overridden later.
+let llm = import("llm")
+oracleInstall(llm.exec)
 llm.useBackend("openai")
 llm.useModel("chatgpt-4o-latest")

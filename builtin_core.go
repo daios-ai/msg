@@ -31,10 +31,11 @@ Returns:
   Null (never returns)`)
 
 	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
+	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
 	ip.RegisterNative(
 		"try",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"map"}, // returns a map with ok/value/error
+		S{"map"}, // lax: a map with ok/value/error
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.MustArg("f")
 			if fv.Tag != VTFun {
@@ -47,30 +48,41 @@ Returns:
 				"error": Null,
 			})
 
-			var hardErr error
+			var pretty string
 			var res Value
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						switch sig := r.(type) {
+						case *Error:
+							// We have a full engine error: format with carets.
+							pretty = FormatError(sig)
 						case rtErr:
-							hardErr = fmt.Errorf("%s", sig.msg)
+							// Structured runtime error from inside the VM/native.
+							// If we have source info, synthesize *Error and format; else use raw msg.
+							if sig.src != nil && sig.line > 0 && sig.col > 0 {
+								e := &Error{Kind: DiagRuntime, Msg: sig.msg, Src: sig.src, Line: sig.line, Col: sig.col}
+								pretty = FormatError(e)
+							} else {
+								pretty = sig.msg
+							}
 						default:
-							hardErr = fmt.Errorf("runtime panic: %v", r)
+							pretty = fmt.Sprintf("runtime panic: %v", r)
 						}
 					}
 				}()
 				res = ip.Call0(fv)
 			}()
 
-			if hardErr != nil {
+			// If we recovered, 'pretty' is set — treat as failure.
+			if pretty != "" {
 				out.Data.(*MapObject).Entries["ok"] = Bool(false)
-				out.Data.(*MapObject).Entries["error"] = Str(hardErr.Error())
+				out.Data.(*MapObject).Entries["error"] = Str(pretty)
 				out.Data.(*MapObject).Entries["value"] = Null
 				return out
 			}
 
-			// treat annotated-null as failure-with-message (soft)
+			// Treat annotated-null as soft failure (keep existing behavior).
 			if res.Tag == VTNull && res.Annot != "" {
 				out.Data.(*MapObject).Entries["ok"] = Bool(false)
 				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
@@ -78,7 +90,7 @@ Returns:
 				return out
 			}
 
-			// success
+			// Success.
 			out.Data.(*MapObject).Entries["ok"] = Bool(true)
 			out.Data.(*MapObject).Entries["error"] = Null
 			out.Data.(*MapObject).Entries["value"] = res

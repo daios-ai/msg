@@ -531,7 +531,9 @@ end
 #
 # Adjust these defaults to match your environment; they can be overridden later.
 let llm = import("llm")
-llm.init()
+
+# llm.init()
+
 oracleInstall(llm.exec)
 llm.useBackend("openai")
 llm.useModel("chatgpt-4o-latest")

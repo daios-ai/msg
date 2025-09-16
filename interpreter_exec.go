@@ -65,8 +65,6 @@ package mindscript
 
 import (
 	"fmt"
-	"os"
-	"sort"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -115,8 +113,10 @@ func (x *execImpl) funMeta(fn Value) (Callable, bool) {
 
 func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
 
-	// DEBUG: Quick global sanity check (preview first 10 post-order bindings)
-	_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
+	// Debug spans.
+	if DebuggingMode {
+		_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -379,42 +379,22 @@ func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
 ////////////////////////////////////////////////////////////////////////////////
 
 func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
-	dbg := os.Getenv("MSG_DEBUG_POS") != ""
+	// Single debug hook
+	if DebuggingMode {
+		dumpSourcePosDebug(ch, sr, pc)
+	}
 
 	src := ""
 	if sr != nil {
 		src = sr.Src
 	}
 
-	if dbg {
-		fmt.Fprintf(os.Stderr, "\n[posmap] =====================\n")
-		fmt.Fprintf(os.Stderr, "[posmap] pc=%d\n", pc)
-		if sr != nil {
-			fmt.Fprintf(os.Stderr, "[posmap] SourceRef ptr=%p name=%q spans=%t pathBase=%s\n",
-				sr, sr.Name, sr.Spans != nil, dbgPath(sr.PathBase))
-		} else {
-			fmt.Fprintf(os.Stderr, "[posmap] SourceRef=<nil>\n")
-		}
-		if ch != nil {
-			fmt.Fprintf(os.Stderr, "[posmap] Chunk: code=%d consts=%d marks=%d\n", len(ch.Code), len(ch.Consts), len(ch.Marks))
-		} else {
-			fmt.Fprintf(os.Stderr, "[posmap] Chunk=<nil>\n")
-		}
-
-		if sr != nil && sr.Spans != nil {
-			dbgDumpAllSpans(sr)
-		} else {
-			fmt.Fprintf(os.Stderr, "[posmap] NO SPANS to dump\n")
-		}
-	}
-
+	// Early fallback if we don't have enough info
 	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
-		if dbg {
-			fmt.Fprintf(os.Stderr, "[posmap] early fallback to (1,1)\n")
-		}
 		return 1, 1
 	}
 
+	// Pick the last mark with PC <= failing PC
 	i := -1
 	for j := range ch.Marks {
 		if ch.Marks[j].PC <= pc {
@@ -423,133 +403,34 @@ func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int
 			break
 		}
 	}
-
-	if dbg {
-		fmt.Fprintf(os.Stderr, "[posmap] bestMarkIndex=%d (total marks=%d)\n", i, len(ch.Marks))
-		if i >= 0 {
-			start := i - 3
-			if start < 0 {
-				start = 0
-			}
-			end := i + 3
-			if end >= len(ch.Marks) {
-				end = len(ch.Marks) - 1
-			}
-			for k := start; k <= end && k >= 0; k++ {
-				m := ch.Marks[k]
-				cur := ""
-				if k == i {
-					cur = "  <<"
-				}
-				fmt.Fprintf(os.Stderr, "[posmap]   mark[%d]: PC=%d path=%s%s\n", k, m.PC, dbgPath(m.Path), cur)
-			}
-		}
-	}
-
 	if i < 0 {
-		if dbg {
-			fmt.Fprintf(os.Stderr, "[posmap] no mark <= pc; fallback to (1,1)\n")
-		}
 		return 1, 1
 	}
 
-	tryPath := func(p NodePath, label string) (int, int, bool) {
+	tryPath := func(p NodePath) (int, int, bool) {
 		for cut := len(p); cut >= 0; cut-- {
 			sub := p[:cut]
 			if sp, ok := sr.Spans.Get(sub); ok {
 				line, col := offsetToLineCol(src, sp.StartByte)
-				if dbg {
-					fmt.Fprintf(os.Stderr, "[posmap] HIT  %s path=%s  span=[%d,%d)  -> line=%d col=%d\n",
-						label, dbgPath(sub), sp.StartByte, sp.EndByte, line, col)
-					if sp.StartByte >= 0 && sp.EndByte <= len(src) && sp.StartByte <= sp.EndByte {
-						snippet := src[sp.StartByte:sp.EndByte]
-						fmt.Fprintf(os.Stderr, "[posmap] HIT  source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n",
-							sp.StartByte, sp.EndByte, snippet)
-					} else {
-						fmt.Fprintf(os.Stderr, "[posmap] HIT  source slice out of bounds!\n")
-					}
-				}
 				return line, col, true
-			}
-			if dbg {
-				fmt.Fprintf(os.Stderr, "[posmap] MISS %s path=%s\n", label, dbgPath(sub))
 			}
 		}
 		return 1, 1, false
 	}
 
-	if line, col, ok := tryPath(ch.Marks[i].Path, "mark"); ok {
+	// Try the best mark's path
+	if line, col, ok := tryPath(ch.Marks[i].Path); ok {
 		return line, col
 	}
 
+	// Walk earlier marks backwards
 	for k := i - 1; k >= 0; k-- {
-		if line, col, ok := tryPath(ch.Marks[k].Path, fmt.Sprintf("earlier[%d]", k)); ok {
+		if line, col, ok := tryPath(ch.Marks[k].Path); ok {
 			return line, col
 		}
 	}
 
-	if dbg {
-		fmt.Fprintf(os.Stderr, "[posmap] all lookups failed; fallback to (1,1)\n")
-	}
 	return 1, 1
-}
-
-func dbgPath(p NodePath) string {
-	if len(p) == 0 {
-		return "<root>"
-	}
-	out := make([]byte, 0, 32)
-	for i, x := range p {
-		if i > 0 {
-			out = append(out, '.')
-		}
-		out = append(out, []byte(fmt.Sprintf("%d", x))...)
-	}
-	return string(out)
-}
-
-func dbgDumpAllSpans(sr *SourceRef) {
-	fmt.Fprintf(os.Stderr, "[posmap] ---- SPAN TREE DUMP (name=%q) ----\n", sr.Name)
-	if sr.Spans == nil {
-		fmt.Fprintf(os.Stderr, "[posmap] (no spans)\n")
-		return
-	}
-	keys := make([]string, 0, len(sr.Spans.byPath))
-	for k := range sr.Spans.byPath {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		di, dj := 0, 0
-		for c := 0; c < len(keys[i]); c++ {
-			if keys[i][c] == '.' {
-				di++
-			}
-		}
-		for c := 0; c < len(keys[j]); c++ {
-			if keys[j][c] == '.' {
-				dj++
-			}
-		}
-		if di != dj {
-			return di < dj
-		}
-		return keys[i] < keys[j]
-	})
-	for _, k := range keys {
-		sp := sr.Spans.byPath[k]
-		pathStr := k
-		if pathStr == "" {
-			pathStr = "<root>"
-		}
-		fmt.Fprintf(os.Stderr, "[posmap] span path=%s  [start=%d end=%d)\n", pathStr, sp.StartByte, sp.EndByte)
-		if sp.StartByte >= 0 && sp.EndByte <= len(sr.Src) && sp.StartByte <= sp.EndByte {
-			snippet := sr.Src[sp.StartByte:sp.EndByte]
-			fmt.Fprintf(os.Stderr, "[posmap] source[%d:%d]:\n-----8<-----\n%s\n----->8-----\n", sp.StartByte, sp.EndByte, snippet)
-		} else {
-			fmt.Fprintf(os.Stderr, "[posmap] (invalid slice bounds for this span)\n")
-		}
-	}
-	fmt.Fprintf(os.Stderr, "[posmap] ---- END SPAN TREE ----\n")
 }
 
 // withScope returns override if non-nil (use the call-site env for effects),

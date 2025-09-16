@@ -29,10 +29,9 @@ func red(s string) string   { return colorRed + s + colorReset }
 func green(s string) string { return colorGreen + s + colorReset }
 func blue(s string) string  { return colorBlue + s + colorReset }
 
-// splitInlineComment finds the first unquoted '#' that looks like an inline
-// comment (e.g. " # post"). It ignores '#' inside double-quoted strings and
-// respects backslash escapes. It returns the left/code part and the right/comment
-// part (starting at '#'). If no comment is found, ok=false.
+// splitInlineComment finds the first unquoted '#' (preceded by space/tab) that
+// looks like an inline comment. It ignores '#' inside double-quoted strings and
+// respects backslash escapes. Returns left/code and right/comment (starting at '#').
 func splitInlineComment(line string) (left, comment string, ok bool) {
 	inStr := false
 	for i := 0; i < len(line); i++ {
@@ -40,7 +39,6 @@ func splitInlineComment(line string) (left, comment string, ok bool) {
 
 		if inStr {
 			if c == '\\' {
-				// Skip the escaped byte (safe for our quoted-ASCII printer).
 				if i+1 < len(line) {
 					i++
 				}
@@ -56,7 +54,6 @@ func splitInlineComment(line string) (left, comment string, ok bool) {
 		case '"':
 			inStr = true
 		case '#':
-			// Treat as inline comment only if preceded by space/tab (matches our printer " # ...").
 			if i > 0 && (line[i-1] == ' ' || line[i-1] == '\t') {
 				return line[:i], line[i:], true
 			}
@@ -66,7 +63,7 @@ func splitInlineComment(line string) (left, comment string, ok bool) {
 }
 
 // Colorize a formatted value:
-//   - Lines whose first non-space char is '#' (PRE) → whole line green.
+//   - Lines whose first non-space char is '#' → whole line green.
 //   - Other non-empty lines: if they contain an unquoted inline '#' → left blue, trailing comment green.
 //   - Otherwise → whole line blue.
 //
@@ -76,7 +73,7 @@ func colorizeValue(val string) string {
 	for i, ln := range lines {
 		trimLeft := strings.TrimLeft(ln, " \t")
 		if strings.HasPrefix(trimLeft, "#") {
-			lines[i] = green(ln) // PRE header line
+			lines[i] = green(ln)
 			continue
 		}
 		if strings.TrimSpace(ln) == "" {
@@ -92,94 +89,153 @@ func colorizeValue(val string) string {
 }
 
 const (
-	appName     = "mindscript"
+	appName     = "msg"
 	historyFile = ".mindscript_history"
 	promptMain  = "==> "
 	promptCont  = "... "
-	banner      = "MindScript REPL — Ctrl+C to cancel input, Ctrl+D to exit. Type :help for commands."
+	banner      = "MindScript REPL — Ctrl+C cancels input, Ctrl+D exits. Type :help for commands."
 	helpText    = `
 REPL commands:
   :help            Show this help
   :quit / :exit    Exit the REPL
-  :load <file>     Load & execute a file into the current session
-  :fmt [code]      Pretty-print code (multiline if no code provided)
-  :pretty [code]   Alias for :fmt
-  :reset           Reset the interpreter (new empty global scope)
 `
 )
 
-// ---- main ------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
 
 func main() {
-	// Compute an exit code, but call os.Exit only once, after all defers ran.
-	code := 0
-	defer func() {
-		os.Exit(code)
-	}()
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
 
-	var evalStr string
-	flag.StringVar(&evalStr, "e", "", "Evaluate the given MindScript snippet and exit")
-	flag.Parse()
-
-	args := flag.Args()
-
-	switch {
-	case evalStr != "":
-		code = runEvalString(evalStr)
-	case len(args) > 0:
-		code = runFile(args[0])
+	cmd := os.Args[1]
+	switch cmd {
+	case "run":
+		os.Exit(cmdRun(os.Args[2:]))
+	case "repl":
+		os.Exit(cmdRepl(os.Args[2:]))
+	case "fmt":
+		os.Exit(cmdFmt(os.Args[2:]))
+	case "test":
+		os.Exit(cmdTest(os.Args[2:]))
+	case "get":
+		os.Exit(cmdGet(os.Args[2:]))
+	case "-h", "--help", "help":
+		usage()
+		os.Exit(0)
 	default:
-		code = runREPL()
+		fmt.Fprintf(os.Stderr, "%s: unknown command %q\n", appName, cmd)
+		usage()
+		os.Exit(2)
 	}
 }
 
-// ---- file & string modes ---------------------------------------------------
+func usage() {
+	fmt.Printf(`MindScript CLI
 
-func runFile(path string) int {
-	// File mode: keep colors OFF (library default).
-	src, err := os.ReadFile(path)
+Usage:
+  %s run <file.ms> [--] [args...]         Run a script (argv via runtime.argv)
+  %s repl                                 Start the REPL
+  %s fmt [--check] [path ...]             Format file(s) or tree(s) canonically
+  %s test [path] [-p] [-v] [-timeout <ms>]  Run tests (default root=".")
+  %s get <module>@<version?>              Install a third-party module (stub)
+
+`, appName, appName, appName, appName, appName)
+}
+
+// -----------------------------------------------------------------------------
+// run
+// -----------------------------------------------------------------------------
+
+func cmdRun(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: %s run <file.ms> [--] [args...]\n", appName)
+		return 2
+	}
+
+	// Split script path and argv (after optional "--")
+	file := args[0]
+	argv := []string{}
+	if len(args) > 1 {
+		sep := -1
+		for i, a := range args[1:] {
+			if a == "--" {
+				sep = i + 1
+				break
+			}
+		}
+		if sep >= 0 {
+			argv = args[1+sep:]
+		} else {
+			argv = args[1:]
+		}
+	}
+
+	src, err := os.ReadFile(file)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: cannot read %s: %v\n", appName, path, err)
+		fmt.Fprintf(os.Stderr, "%s: cannot read %s: %v\n", appName, file, err)
 		return 1
 	}
 
-	ip, err := mindscript.NewRuntime()
+	ip, rtErr := mindscript.NewRuntime()
+	if rtErr != nil {
+		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
+		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
+		return 1
+	}
+
+	// Build AST so we can evaluate in a custom environment (fresh child with runtime map)
+	ast, perr := mindscript.ParseSExpr(string(src))
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, perr.Error()) // already pretty-printed
+		return 1
+	}
+
+	child := mindscript.NewEnv(ip.Global)
+	rt := &mindscript.MapObject{
+		Entries: map[string]mindscript.Value{
+			"isEntry": mindscript.Bool(true),
+			"path":    mindscript.Str(fileAbsOrOrig(file)),
+			"argv":    mindscript.Arr(strSliceToVals(argv)),
+		},
+		KeyAnn: map[string]string{},
+		Keys:   []string{"isEntry", "path", "argv"},
+	}
+	child.Define("runtime", mindscript.Value{Tag: mindscript.VTMap, Data: rt})
+
+	val, err := ip.EvalAST(ast, child)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
-		fmt.Fprintf(os.Stderr, "Perhaps the environment variable %s is undefined?\n", mindscript.MindScriptPath)
-		os.Exit(1)
-	}
-
-	v, err := ip.EvalSource(string(src))
-	if err != nil {
-		// Parse/Lex errors are already pretty-printed by the library.
-		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
 		return 1
 	}
-	fmt.Println(mindscript.FormatValue(v))
+	// Plain pretty output in file mode (no REPL color accents)
+	fmt.Println(mindscript.FormatValue(val))
 	return 0
 }
 
-func runEvalString(code string) int {
-	// -e mode: keep colors OFF (library default).
-	ip, _ := mindscript.NewRuntime()
-	v, err := ip.EvalSource(code)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
-		fmt.Fprintf(os.Stderr, "Perhaps the environment variable %s is undefined?\n", mindscript.MindScriptPath)
-		return 1
+func fileAbsOrOrig(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
 	}
-	fmt.Println(mindscript.FormatValue(v))
-	return 0
+	return p
 }
 
-// ---- REPL ------------------------------------------------------------------
+func strSliceToVals(xs []string) []mindscript.Value {
+	out := make([]mindscript.Value, 0, len(xs))
+	for _, s := range xs {
+		out = append(out, mindscript.Str(s))
+	}
+	return out
+}
 
-// exitCoder is a loose interface to catch a runtime "exit" sentinel panic.
-type exitCoder interface{ ExitCode() int }
-type codeGetter interface{ Code() int }
+// -----------------------------------------------------------------------------
+// repl
+// -----------------------------------------------------------------------------
 
-func runREPL() (ret int) {
+func cmdRepl(_ []string) (ret int) {
 	fmt.Println(banner)
 
 	home, _ := os.UserHomeDir()
@@ -202,29 +258,9 @@ func runREPL() (ret int) {
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigc)
 	go func() {
-		s := <-sigc
-		_ = s
-		// Best-effort: close liner to restore terminal settings,
-		// then exit with a conventional code (130 for SIGINT).
+		<-sigc
 		ln.Close()
 		os.Exit(130)
-	}()
-
-	// Catch a potential "exit sentinel" panic so we can exit with a code
-	// *after* ln.Close() runs.
-	defer func() {
-		if r := recover(); r != nil {
-			switch x := r.(type) {
-			case exitCoder:
-				ret = x.ExitCode()
-			case codeGetter:
-				ret = x.Code()
-			case int:
-				ret = x
-			default:
-				panic(r) // not an exit sentinel → rethrow
-			}
-		}
 	}()
 
 	// Load history (best-effort)
@@ -233,9 +269,9 @@ func runREPL() (ret int) {
 		_ = f.Close()
 	}
 
-	ip, err := mindscript.NewRuntime()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, red(err.Error()))
+	ip, rtErr := mindscript.NewRuntime()
+	if rtErr != nil {
+		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
 		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
 		return 1
 	}
@@ -248,10 +284,15 @@ func runREPL() (ret int) {
 			break
 		}
 
-		// REPL commands (prefixed with ':')
+		// Minimal REPL commands
 		if strings.HasPrefix(strings.TrimSpace(code), ":") {
-			if done := handleReplCommand(ip, ln, code); done {
-				break
+			switch strings.TrimSpace(strings.ToLower(code)) {
+			case ":help":
+				fmt.Print(helpText)
+			case ":quit", ":exit":
+				return 0
+			default:
+				fmt.Printf("unknown command. Type :help for help.\n")
 			}
 			continue
 		}
@@ -276,79 +317,8 @@ func runREPL() (ret int) {
 	return 0
 }
 
-// ---- REPL helpers ----------------------------------------------------------
-
-// handleReplCommand handles :help, :quit, :load, :type, :reset, :fmt
-func handleReplCommand(ip *mindscript.Interpreter, ln *liner.State, line string) (exit bool) {
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return false
-	}
-	cmd := strings.ToLower(fields[0])
-
-	switch cmd {
-	case ":help":
-		fmt.Print(helpText)
-
-	case ":quit", ":exit":
-		return true
-
-	case ":reset":
-		newIP, err := mindscript.NewRuntime()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, red(err.Error()))
-			fmt.Fprintln(os.Stderr, "reset aborted; keeping current interpreter.")
-			break
-		}
-		*ip = *newIP
-		fmt.Println("interpreter reset.")
-
-	case ":load":
-		if len(fields) < 2 {
-			fmt.Println("usage: :load <file>")
-			return false
-		}
-		path := fields[1]
-		src, err := os.ReadFile(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", red(fmt.Sprintf("cannot read %s: %v", path, err)))
-			return false
-		}
-		if v, err := ip.EvalPersistentSource(string(src)); err != nil {
-			fmt.Fprintln(os.Stderr, red(err.Error()))
-		} else {
-			// Print last value
-			fmt.Println(mindscript.FormatValue(v))
-			ln.AppendHistory(fmt.Sprintf(":load %s", path))
-		}
-
-	case ":fmt", ":pretty":
-		// Inline snippet?
-		inline := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
-		if inline != "" {
-			runFormat(inline)
-			return false
-		}
-		// Otherwise, capture multiline snippet
-		code, ok := readByParseProbe(ln, "fmt> ", "... ")
-		if !ok {
-			fmt.Println() // Ctrl+D
-			return false
-		}
-		if strings.TrimSpace(code) == "" {
-			return false
-		}
-		runFormat(code)
-
-	default:
-		fmt.Printf("unknown command. Type :help for help.\n")
-	}
-	return false
-}
-
-// readByParseProbe reads one or more lines until the parser
-// accepts the current buffer as a complete program, or returns early
-// if the parser reports a non-recoverable error.
+// readByParseProbe reads one or more lines until the parser accepts the buffer
+// as a complete program, or returns early if the parser reports a non-recoverable error.
 func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 	var b strings.Builder
 
@@ -374,13 +344,10 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 		b.WriteString(line)
 
 		src := b.String()
-		// Use the interactive parser: it reports need-more-input cases via IncompleteError.
 		_, perr := mindscript.ParseSExprInteractive(src)
 		if perr == nil {
-			// Complete and valid.
 			return src, true
 		}
-		// Keep reading only when the parser/lexer signalled an interactive incompleteness.
 		if mindscript.IsIncomplete(perr) {
 			continue
 		}
@@ -389,16 +356,158 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 	}
 }
 
-// stripStrings is retained only for endsWithOpenAnnotation helper if you keep it;
-// otherwise you can delete it from the CLI (we no longer use bracket heuristics).
+// -----------------------------------------------------------------------------
+// fmt
+// -----------------------------------------------------------------------------
 
-// ---- pretty printing -------------------------------------------------------
-
-func runFormat(src string) {
-	formatted, err := mindscript.Pretty(src)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, red(err.Error()))
-		return
+func cmdFmt(args []string) int {
+	fs := flag.NewFlagSet("fmt", flag.ContinueOnError)
+	check := fs.Bool("check", false, "check format; exit 1 if any file would change")
+	_ = fs.Parse(args)
+	paths := fs.Args()
+	if len(paths) == 0 {
+		paths = []string{"."}
 	}
-	fmt.Println(formatted)
+
+	ip, rtErr := mindscript.NewRuntime()
+	if rtErr != nil {
+		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
+		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
+		return 1
+	}
+
+	call := func(code string) (mindscript.Value, error) {
+		return ip.EvalPersistentSource(code)
+	}
+
+	if *check {
+		var bad int64 = 0
+		for _, p := range paths {
+			info, err := os.Stat(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
+				return 1
+			}
+			if !info.IsDir() {
+				v, err := call(fmt.Sprintf(`import("canon").checkFile(%q)`, p))
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err.Error())
+					return 1
+				}
+				if v.Tag == mindscript.VTBool && !v.Data.(bool) {
+					fmt.Println(p)
+					bad++
+				}
+				continue
+			}
+			// dir: get file list and check each
+			vlist, err := call(fmt.Sprintf(`import("canon").files(%q)`, p))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err.Error())
+				return 1
+			}
+			if vlist.Tag != mindscript.VTArray {
+				continue
+			}
+			for _, ev := range vlist.Data.([]mindscript.Value) {
+				if ev.Tag != mindscript.VTStr {
+					continue
+				}
+				f := ev.Data.(string)
+				vok, err := call(fmt.Sprintf(`import("canon").checkFile(%q)`, f))
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err.Error())
+					return 1
+				}
+				if vok.Tag == mindscript.VTBool && !vok.Data.(bool) {
+					fmt.Println(f)
+					bad++
+				}
+			}
+		}
+		if bad > 0 {
+			return 1
+		}
+		return 0
+	}
+
+	// Write mode: file → formatFile; dir → formatTree
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
+			return 1
+		}
+		if info.IsDir() {
+			if _, err := ip.EvalPersistentSource(fmt.Sprintf(`import("canon").formatTree(%q)`, p)); err != nil {
+				fmt.Fprintln(os.Stderr, err.Error())
+				return 1
+			}
+		} else {
+			if _, err := ip.EvalPersistentSource(fmt.Sprintf(`import("canon").formatFile(%q)`, p)); err != nil {
+				fmt.Fprintln(os.Stderr, err.Error())
+				return 1
+			}
+		}
+	}
+	return 0
+}
+
+// -----------------------------------------------------------------------------
+// test
+// -----------------------------------------------------------------------------
+
+func cmdTest(args []string) int {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	path := fs.String("root", ".", "root directory to search")
+	par := fs.Bool("p", false, "run tests in parallel")
+	verb := fs.Bool("v", false, "verbose output (per-test RUN/PASS/FAIL)")
+	toMS := fs.Int("timeout", 0, "per-test timeout in ms (<=0 disables)")
+	_ = fs.Parse(args)
+
+	// If user passed a bare path as first arg, accept it like `go test ./...`
+	rem := fs.Args()
+	if len(rem) > 0 && *path == "." {
+		*path = rem[0]
+	}
+
+	ip, rtErr := mindscript.NewRuntime()
+	if rtErr != nil {
+		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
+		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
+		return 1
+	}
+
+	code := fmt.Sprintf(`import("testing").run({
+  root: %q,
+  parallel: %v,
+  verbose: %v,
+  timeoutMs: %d
+})`, *path, *par, *verb, *toMS)
+
+	v, err := ip.EvalPersistentSource(code)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 1
+	}
+	// Assume testing.run returns Bool (true if all passed).
+	if v.Tag == mindscript.VTBool && v.Data.(bool) {
+		return 0
+	}
+	return 1
+}
+
+// -----------------------------------------------------------------------------
+// get (stub)
+// -----------------------------------------------------------------------------
+
+func cmdGet(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: %s get <module>@<version?>\n", appName)
+		return 2
+	}
+	spec := args[0]
+	fmt.Printf("Installing %s ... (stub)\n", spec)
+	fmt.Printf("Downloaded to %s (not really yet)\n", filepath.Join(os.Getenv("HOME"), ".msg", "modules"))
+	return 0
 }

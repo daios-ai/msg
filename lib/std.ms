@@ -276,48 +276,6 @@ let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
 	out
 end
 
-# Push a value to the end (returns a new array).
-# 
-# Args: xs: [Any], v: Any
-# Returns: [Any]
-let push = fun(xs: [Any], v) -> [Any] do
-	xs + [v]
-end
-
-# Pop the last element without modifying the input array.
-# 
-# Args: xs: [Any]
-# Returns: Any?
-let pop = fun(xs: [Any]) -> Any? do
-	let n = len(xs)
-	if n == 0 then
-		null
-	else
-		xs[n - 1]
-	end
-end
-
-# Shift a value to the front (returns a new array).
-# 
-# Places `v` at the head and appends all items of `xs`.
-# Args: xs: [Any], v: Any
-# Returns: [Any]
-let shift = fun(xs: [Any], v) -> [Any] do
-	[v] + xs
-end
-
-# Unshift (peek) the first element.
-# 
-# Args: xs: [Any]
-# Returns: Any?
-let unshift = fun(xs: [Any]) -> Any? do
-	if len(xs) == 0 then
-		null
-	else
-		xs[0]
-	end
-end
-
 # # -----------------------------
 # # Objects (maps)
 # # -----------------------------

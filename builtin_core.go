@@ -8,6 +8,7 @@ import (
 // ---- core built-ins ----------------------------------------------------
 
 func registerCoreBuiltins(ip *Interpreter) {
+	// fail(message?: Str) -> Null (never returns; hard runtime error)
 	ip.RegisterNative(
 		"fail",
 		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
@@ -30,17 +31,13 @@ Params:
 Returns:
   Null (never returns)`)
 
-	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
-	// try(f: () -> Any) -> { ok: Bool, value: Any, error: Str? }
+	// try(f: (Null -> Any)) -> { ok: Bool, value: Any, error: Str? }
 	ip.RegisterNative(
 		"try",
-		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "f", Type: S{"binop", "->", S{"id", "Null"}, S{"id", "Any"}}}},
 		S{"map"}, // lax: a map with ok/value/error
 		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
-			if fv.Tag != VTFun {
-				fail("try expects a function") // contractual → hard error
-			}
+			fv := ctx.MustArg("f") // type-checked by runtime to be (Null -> Any)
 
 			out := Map(map[string]Value{
 				"ok":    Bool(false),
@@ -55,11 +52,10 @@ Returns:
 					if r := recover(); r != nil {
 						switch sig := r.(type) {
 						case *Error:
-							// We have a full engine error: format with carets.
+							// Engine error: format with carets.
 							pretty = FormatError(sig)
 						case rtErr:
-							// Structured runtime error from inside the VM/native.
-							// If we have source info, synthesize *Error and format; else use raw msg.
+							// Structured runtime error from VM/native.
 							if sig.src != nil && sig.line > 0 && sig.col > 0 {
 								e := &Error{Kind: DiagRuntime, Msg: sig.msg, Src: sig.src, Line: sig.line, Col: sig.col}
 								pretty = FormatError(e)
@@ -82,7 +78,7 @@ Returns:
 				return out
 			}
 
-			// Treat annotated-null as soft failure (keep existing behavior).
+			// Treat annotated-null as soft failure.
 			if res.Tag == VTNull && res.Annot != "" {
 				out.Data.(*MapObject).Entries["ok"] = Bool(false)
 				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
@@ -97,7 +93,10 @@ Returns:
 			return out
 		},
 	)
-	setBuiltinDoc(ip, "try", `Run a function and capture hard failures.
+	setBuiltinDoc(ip, "try", `Run a zero-arg function and capture hard failures.
+
+Signature:
+  try(f: (Null -> Any)) -> { ok: Bool, value: Any, error: Str? }
 
 Returns:
   { ok: Bool, value: Any, error: Str? }
@@ -107,6 +106,7 @@ Notes:
   • If the function returns an annotated null, ok=false and error is that annotation.
   • On success, ok=true and value is the function's result.`)
 
+	// clone(x: Any) -> Any
 	ip.RegisterNative(
 		"clone",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
@@ -143,14 +143,13 @@ Behavior:
   • Captures a flattened view of the current frame and its parents (Core included).
   • Inner bindings shadow outer ones.
   • Values are deep-copied where applicable (arrays/maps preserve order & per-key annotations).
-  • Each entry's per-key annotation is taken from the variable's Value.Annot.
- 
+  • Variable annotations are preserved on the **values themselves** (KeyAnn is not used).
 
 Params:
   _: Null
 
 Returns:
-  {} — map of { name: value } with per-key annotations`)
+  {} — map of { name: value }`)
 
 	// typeOf(x: Any) -> Type
 	ip.RegisterNative(
@@ -172,6 +171,7 @@ Params:
 
 Returns: Type`)
 
+	// isType(x: Any, T: Type) -> Bool
 	ip.RegisterNative(
 		"isType",
 		[]ParamSpec{
@@ -183,7 +183,7 @@ Returns: Type`)
 			x := ctx.MustArg("x")
 			Tv := ctx.MustArg("T")
 			if Tv.Tag != VTType {
-				fail("isType expects a Type as second argument") // contractual → hard
+				fail("isType expects a Type as second argument")
 			}
 			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
 		},
@@ -208,7 +208,7 @@ Returns: Bool`)
 			Av := ctx.MustArg("A")
 			Bv := ctx.MustArg("B")
 			if Av.Tag != VTType || Bv.Tag != VTType {
-				fail("isSubtype expects Types as both arguments") // contractual → hard
+				fail("isSubtype expects Types as both arguments")
 			}
 			A := ip.resolveTypeValue(Av, ctx.Env())
 			B := ip.resolveTypeValue(Bv, ctx.Env())
@@ -241,7 +241,7 @@ Returns: Bool`)
 			// Use the current importer identity when available (enables relative resolution).
 			importer := ""
 			if n := len(ip.loadStack); n > 0 {
-				importer = ip.loadStack[n-1] // canonical identity of the importing module
+				importer = ip.loadStack[n-1]
 			} else if ip.currentSrc != nil && ip.currentSrc.Name != "" {
 				importer = ip.currentSrc.Name
 			}
@@ -323,7 +323,7 @@ Returns:
 			v := ctx.MustArg("obj")
 			k := ctx.MustArg("key").Data.(string)
 			if v.Tag != VTMap {
-				fail("mapHas expects a map") // contractual → hard
+				fail("mapHas expects a map")
 			}
 			mo := v.Data.(*MapObject)
 			_, ok := mo.Entries[k]
@@ -348,7 +348,7 @@ Returns:
 			v := ctx.MustArg("obj")
 			k := ctx.MustArg("key").Data.(string)
 			if v.Tag != VTMap {
-				fail("mapDelete expects a map") // contractual → hard
+				fail("mapDelete expects a map")
 			}
 			mo := v.Data.(*MapObject)
 			if _, ok := mo.Entries[k]; !ok {
@@ -379,6 +379,119 @@ Params:
 
 Returns:
   {} — the same map value`)
+
+	// --- Arrays: push/unshift/pop/shift (mutating) ------------------------
+
+	// push(arr: [Any], v: Any) -> [Any]
+	ip.RegisterNative(
+		"push",
+		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}, {Name: "v", Type: S{"id", "Any"}}},
+		S{"array", S{"id", "Any"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			a := ctx.MustArg("arr")
+			if a.Tag != VTArray {
+				fail("push expects array")
+			}
+			xs := a.Data.([]Value)
+			xs = append(xs, ctx.MustArg("v"))
+			a.Data = xs
+			return a
+		},
+	)
+	setBuiltinDoc(ip, "push", `Append an element to an array (in place).
+
+Params:
+  arr: [Any] — array to mutate
+  v:   Any   — element to append
+
+Returns:
+  [Any] — the same array (mutated)`)
+
+	// unshift(arr: [Any], v: Any) -> [Any]
+	ip.RegisterNative(
+		"unshift",
+		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}, {Name: "v", Type: S{"id", "Any"}}},
+		S{"array", S{"id", "Any"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			a := ctx.MustArg("arr")
+			if a.Tag != VTArray {
+				fail("unshift expects array")
+			}
+			xs := a.Data.([]Value)
+			v := ctx.MustArg("v")
+			xs = append([]Value{v}, xs...)
+			a.Data = xs
+			return a
+		},
+	)
+	setBuiltinDoc(ip, "unshift", `Prepend an element to an array (in place).
+
+Params:
+  arr: [Any] — array to mutate
+  v:   Any   — element to prepend
+
+Returns:
+  [Any] — the same array (mutated)`)
+
+	// pop(arr: [Any]) -> Any   (HARD error on empty)
+	ip.RegisterNative(
+		"pop",
+		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			a := ctx.MustArg("arr")
+			if a.Tag != VTArray {
+				fail("pop expects array")
+			}
+			xs := a.Data.([]Value)
+			if len(xs) == 0 {
+				fail("pop on empty array")
+			}
+			v := xs[len(xs)-1]
+			a.Data = xs[:len(xs)-1]
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "pop", `Remove and return the last element of an array.
+
+Errors:
+  • Throws a runtime error if the array is empty.
+
+Params:
+  arr: [Any] — array to mutate
+
+Returns:
+  Any — the removed element`)
+
+	// shift(arr: [Any]) -> Any   (HARD error on empty)
+	ip.RegisterNative(
+		"shift",
+		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			a := ctx.MustArg("arr")
+			if a.Tag != VTArray {
+				fail("shift expects array")
+			}
+			xs := a.Data.([]Value)
+			if len(xs) == 0 {
+				fail("shift on empty array")
+			}
+			v := xs[0]
+			a.Data = xs[1:]
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "shift", `Remove and return the first element of an array.
+
+Errors:
+  • Throws a runtime error if the array is empty.
+
+Params:
+  arr: [Any] — array to mutate
+
+Returns:
+  Any — the removed element`)
 }
 
 // --- Deep copy & snapshot for isolated worlds --------------------------------
@@ -427,13 +540,15 @@ func cloneValue(v Value) Value {
 }
 
 // snapshotVisibleEnvAsMap flattens the current env and parents (nearest wins)
-// into a deterministic, ordered map. **Does not mix value and key annotations**:
-// - Entries[name] = cloned value (with its Value.Annot preserved on the value)
-// - KeyAnn[name] remains empty (env has no separate key-annotation source)
-// - Keys ordered inner→outer; names sorted within each frame for stability.
+// into a deterministic, ordered map.
+//
+// Annotations: we do NOT mix key-annotations with value annotations.
+//   - Entries[name] = cloned value (with Value.Annot preserved ON THE VALUE)
+//   - KeyAnn[name] remains empty
+//   - Keys ordered inner→outer; names sorted within each frame for stability.
 func snapshotVisibleEnvAsMap(e *Env) Value {
 	entries := map[string]Value{}
-	keyAnn := map[string]string{} // intentionally left empty; no mixing with value annotations
+	keyAnn := map[string]string{} // intentionally left empty
 	var order []string
 
 	for cur := e; cur != nil; cur = cur.parent {

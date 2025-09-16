@@ -104,7 +104,7 @@ func registerCastBuiltins(ip *Interpreter) {
 			s := ctx.MustArg("src").Data.(string)
 			out, err := Pretty(s)
 			if err != nil {
-				return annotNull("pretty: " + err.Error())
+				return annotNull(err.Error())
 			}
 			return Str(out)
 		},

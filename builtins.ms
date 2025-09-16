@@ -7,7 +7,9 @@ do
 	# Collect names (skip leading "_")
 	let names = []
 	for [k, _] in env do
-		if len(k) > 0 and substr(k, 0, 1) == "_" then continue end
+		if len(k) > 0 and substr(k, 0, 1) == "_" then
+			continue
+		end
 		names = names + [k]
 	end
 
@@ -26,8 +28,12 @@ do
 	end
 
 	# Helpers
-	let _trim = fun(s: Str) -> Str do strip(s) end
-	let _rstrip = fun(s: Str) -> Str do rstrip(s) end
+	let _trim = fun(s: Str) -> Str do
+		strip(s)
+	end
+	let _rstrip = fun(s: Str) -> Str do
+		rstrip(s)
+	end
 	let _startsWith = fun(s: Str, p: Str) -> Bool do
 		len(s) >= len(p) and substr(s, 0, len(p)) == p
 	end
@@ -46,10 +52,11 @@ do
 			for raw in split(fv, "\n") do
 				let line = _trim(raw)
 				if _startsWith(line, "#") then
-					doc =
-						if _startsWith(line, "# ") then _rstrip(substr(line, 2, len(line) - 2))
-						else _rstrip(substr(line, 1, len(line) - 1))
-						end
+					doc = if _startsWith(line, "# ") then
+						_rstrip(substr(line, 2, len(line) - 2))
+					else
+						_rstrip(substr(line, 1, len(line) - 1))
+					end
 					break
 				end
 			end
@@ -73,7 +80,11 @@ do
 		# Fallback if formatValue returned null/empty (rare)
 		if sig == "" then
 			let t = str(typeOf(v))
-			sig = if t != null then t else "<type: Any>" end
+			sig = if t != null then
+				t
+			else
+				"<type: Any>"
+			end
 		end
 
 		let line = sprintf("%s: %s — %s", [name, sig, doc])

@@ -6,7 +6,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"strings"
+	"regexp"
 	"testing"
 )
 
@@ -78,16 +78,23 @@ func Test_Builtin_Misc_str_basic_and_fallback(t *testing.T) {
 		t.Fatalf("str(null) => 'null', got %#v", s)
 	}
 
-	// Arrays/maps now use the pretty-printer (not JSON)
-	if s := evalWithIP(t, ip, `str([1, 2])`); s.Tag != VTStr || s.Data.(string) != "[1,2]" {
-		t.Fatalf(`str([1,2]) => "[1,2]", got %#v`, s)
+	// Arrays/maps now use the pretty-printer (not JSON).
+	// Canonical printer includes a space after the comma.
+	if s := evalWithIP(t, ip, `str([1, 2])`); s.Tag != VTStr || s.Data.(string) != "[1, 2]" {
+		t.Fatalf(`str([1,2]) => "[1, 2]", got %#v`, s)
 	}
+
 	s := evalWithIP(t, ip, `str({a:1, b:2})`)
 	if s.Tag != VTStr {
 		t.Fatalf(`str({a:1,b:2}) should return Str, got %#v`, s)
 	}
 	got := s.Data.(string)
-	if !(strings.HasPrefix(got, "{") && strings.Contains(got, "\"a\":1") && strings.Contains(got, "\"b\":2") && strings.HasSuffix(got, "}")) {
+
+	// Pretty-printer format is implementation-defined; assert the essentials:
+	// - starts with '{' and ends with '}'
+	// - contains the pairs a/1 and b/2 in order (spacing/quotes may vary)
+	re := regexp.MustCompile(`(?s)^\{.*a.*1.*b.*2.*\}$`)
+	if !re.MatchString(got) {
 		t.Fatalf(`str({a:1,b:2}) => pretty map string, got %q`, got)
 	}
 }
@@ -120,15 +127,15 @@ func Test_Builtin_Misc_int_num_bool_len(t *testing.T) {
 		t.Fatalf(`num("nope") => null, got %#v`, v)
 	}
 
-	// bool truthiness — use a block (no ';') to define f then use it.
+	// bool — functions are unsupported: should return annotated null (soft error).
 	vfun := evalWithIP(t, ip, `
 		do
 			let f = fun() do 0 end
 			bool(f)
 		end
 	`)
-	if vfun.Tag != VTBool || vfun.Data.(bool) != true {
-		t.Fatalf("bool(fun) => true, got %#v", vfun)
+	if vfun.Tag != VTNull || vfun.Annot == "" {
+		t.Fatalf("bool(fun) => annotated null, got %#v", vfun)
 	}
 
 	// falsey cases

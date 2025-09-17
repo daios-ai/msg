@@ -2,7 +2,6 @@
 package mindscript
 
 import (
-	"encoding/json"
 	"math"
 	"math/rand"
 	"os"
@@ -144,36 +143,28 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
-			if v.Tag == VTStr {
-				return v // return as-is
+			// Normalize modules to maps so they print as their map view.
+			in := AsMapValue(ctx.MustArg("x"))
+			// Functions, types, and handles are intentionally not printable.
+			switch in.Tag {
+			case VTFun, VTType, VTHandle:
+				return annotNull("str: unsupported type")
 			}
-			gv, err := valueToGoJSON(v)
-			if err != nil {
-				return annotNull("str: " + err.Error())
-			}
-			b, err := json.Marshal(gv)
-			if err != nil {
-				return annotNull("str: " + err.Error())
-			}
-			return Str(string(b))
+			// Strip annotations recursively before printing.
+			clean := stripAnnDeep(in)
+			// Delegate to the pretty printer.
+			return Str(FormatValue(clean))
 		},
 	)
-	setBuiltinDoc(ip, "str", `Stringify a value.
+	setBuiltinDoc(ip, "str", `Convert to string if possible; otherwise err.
 
-Rules:
-	• Str stays as-is
-	• Null → "null"
-	• Bool → "true"/"false"
-	• Int/Num → decimal representation
-	• Arrays/Maps → JSON text (best-effort; falls back to debug form if not encodable)
-	• Functions/Modules/Handles/Types → readable debug form
+Converts values of type Null, Bool, Int, Num, Str, [...], and {...}.
 
 Params:
 	x: Any
 
 Returns:
-	Str`)
+	Str?`)
 
 	ip.RegisterNative(
 		"int",
@@ -201,12 +192,12 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise return null.
+	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise errs.
 
 Rules:
 	• Int → Int
 	• Num → truncated toward zero
-	• Bool → 1/0
+	• Bool → 1 or 0
 	• Str → parsed base-10 integer, or null on failure
 	• Others → null
 
@@ -242,12 +233,12 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise return null.
+	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise errs.
 
 Rules:
 	• Num → Num
 	• Int → floating-point value
-	• Bool → 1.0/0.0
+	• Bool → 1.0 or 0.0
 	• Str → parsed as float64, or null on failure
 	• Others → null
 
@@ -260,7 +251,7 @@ Returns:
 	ip.RegisterNative(
 		"bool",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Bool"}, // not optional; implementation never returns null
+		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			v := ctx.MustArg("x")
 			switch v.Tag {
@@ -279,11 +270,11 @@ Returns:
 			case VTMap:
 				return Bool(len(v.Data.(*MapObject).Entries) > 0)
 			default:
-				return Bool(true) // functions, modules, handles, types → truthy
+				return annotNull("unsupported type, cannot convert to bool")
 			}
 		},
 	)
-	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules.
+	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules; otherwise errs.
 
 Falsey:
 	• null
@@ -293,13 +284,13 @@ Falsey:
 	• {} (empty map)
 
 Truthy:
-	• everything else (including functions, modules, handles, types)
+	• Any other value for Int, Num, [...], and {...}.
 
 Params:
 	x: Any
 
 Returns:
-	Bool`)
+	Bool?`)
 
 	ip.RegisterNative(
 		"len",
@@ -455,4 +446,42 @@ Params:
 
 Returns:
 	Null (never returns; process exits)`)
+}
+
+// stripAnnDeep removes annotations from a value recursively.
+//   - Clears Value.Annot on all nodes.
+//   - For arrays, deep-copies elements with annotations stripped.
+//   - For maps, deep-copies entries (annotations stripped), preserves key order (Keys),
+//     and clears KeyAnn entirely.
+func stripAnnDeep(v Value) Value {
+	// Always drop the annotation on this node.
+	v.Annot = ""
+	switch v.Tag {
+	case VTArray:
+		ao := v.Data.(*ArrayObject)
+		elems := make([]Value, len(ao.Elems))
+		for i := range ao.Elems {
+			elems[i] = stripAnnDeep(ao.Elems[i])
+		}
+		return Arr(elems) // Arr() builds a fresh ArrayObject
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		cpE := make(map[string]Value, len(mo.Entries))
+		for k, vv := range mo.Entries {
+			cpE[k] = stripAnnDeep(vv)
+		}
+		cpK := make([]string, len(mo.Keys))
+		copy(cpK, mo.Keys)
+		return Value{
+			Tag: VTMap,
+			Data: &MapObject{
+				Entries: cpE,
+				KeyAnn:  map[string]string{}, // drop per-key annotations
+				Keys:    cpK,                 // preserve insertion order
+			},
+		}
+	default:
+		// Primitives, modules already normalized via AsMapValue, etc.
+		return v
+	}
 }

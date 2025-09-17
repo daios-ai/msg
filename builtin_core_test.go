@@ -280,3 +280,85 @@ func Test_Builtin_Core_module_let_shadow_builtin_ok(t *testing.T) {
 		t.Fatalf("builtin import should remain usable: %v", err)
 	}
 }
+
+func Test_Builtin_Core_push_smoke(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+		let a = [1]
+		push(a, 2)
+		a
+	`)
+	if v.Tag != VTArray {
+		t.Fatalf("expected array, got %#v", v)
+	}
+	elems := v.Data.(*ArrayObject).Elems
+	if len(elems) != 2 || elems[0].Data.(int64) != 1 || elems[1].Data.(int64) != 2 {
+		t.Fatalf("push should yield [1,2], got %#v", elems)
+	}
+}
+
+func Test_Builtin_Core_unshift_smoke(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+		let a = [2]
+		unshift(a, 1)
+		a
+	`)
+	if v.Tag != VTArray {
+		t.Fatalf("expected array, got %#v", v)
+	}
+	elems := v.Data.(*ArrayObject).Elems
+	if len(elems) != 2 || elems[0].Data.(int64) != 1 || elems[1].Data.(int64) != 2 {
+		t.Fatalf("unshift should yield [1,2], got %#v", elems)
+	}
+}
+
+func Test_Builtin_Core_pop_smoke_and_contract(t *testing.T) {
+	ip, _ := NewRuntime()
+	// normal pop
+	v := evalWithIP(t, ip, `
+		let a = [10, 20]
+		let x = pop(a)
+		[x, a]
+	`)
+	if v.Tag != VTArray {
+		t.Fatalf("expected outer array, got %#v", v)
+	}
+	out := v.Data.(*ArrayObject).Elems
+	if out[0].Tag != VTInt || out[0].Data.(int64) != 20 {
+		t.Fatalf("pop should return 20, got %#v", out[0])
+	}
+	arr := out[1]
+	elems := arr.Data.(*ArrayObject).Elems
+	if len(elems) != 1 || elems[0].Data.(int64) != 10 {
+		t.Fatalf("array after pop should be [10], got %#v", elems)
+	}
+	// contractual error on empty
+	_, err := ip.EvalSource(`pop([])`)
+	wantErrContains(t, err, "pop on empty array")
+}
+
+func Test_Builtin_Core_shift_smoke_and_contract(t *testing.T) {
+	ip, _ := NewRuntime()
+	// normal shift
+	v := evalWithIP(t, ip, `
+		let a = [10, 20]
+		let x = shift(a)
+		[x, a]
+	`)
+	if v.Tag != VTArray {
+		t.Fatalf("expected outer array, got %#v", v)
+	}
+	out := v.Data.(*ArrayObject).Elems
+	if out[0].Tag != VTInt || out[0].Data.(int64) != 10 {
+		t.Fatalf("shift should return 10, got %#v", out[0])
+	}
+	arr := out[1]
+	elems := arr.Data.(*ArrayObject).Elems
+	if len(elems) != 1 || elems[0].Data.(int64) != 20 {
+		t.Fatalf("array after shift should be [20], got %#v", elems)
+	}
+	// contractual error on empty
+	_, err := ip.EvalSource(`shift([])`)
+	wantErrContains(t, err, "shift on empty array")
+}

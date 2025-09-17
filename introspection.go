@@ -634,6 +634,10 @@ func ValidateCanonicalS(s S) Value {
 			if len(n) != 1 {
 				push(path, "E_ARITY", "null takes no payload", arity(n), "1")
 			}
+		case "noop":
+			if len(n) != 1 {
+				push(path, "E_ARITY", "noop takes no payload", arity(n), "1")
+			}
 		case "bool":
 			checkScalarPayload(path, n, "bool")
 		case "int":

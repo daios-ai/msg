@@ -57,7 +57,7 @@ func mustErr(t *testing.T, err error) {
 
 // ---------- tests ----------
 
-func TestIxToS_SoftErrorOnUnsupportedAtom(t *testing.T) {
+func Test_Introspection_IxToS_SoftErrorOnUnsupportedAtom(t *testing.T) {
 	// Construct an AST S with an unsupported atom (int32).
 	bad := S{"block", S{"int", int64(1)}, int32(7)}
 	got := IxToS(bad)
@@ -76,7 +76,7 @@ func TestIxToS_SoftErrorOnUnsupportedAtom(t *testing.T) {
 	mustEqValue(t, nullNode, wantNull)
 }
 
-func TestIxFromS_NoValidation_IxReifyHardFails(t *testing.T) {
+func Test_Introspection_IxFromS_NoValidation_IxReifyHardFails(t *testing.T) {
 	// Malformed runtime-S: ["array", ["int", ["weird"]]]
 	rt := Arr([]Value{
 		Str("array"),
@@ -764,5 +764,58 @@ func Test_Introspection_ValidateReports_ReifyHardFails(t *testing.T) {
 	ip := NewInterpreter()
 	if _, err := ip.IxReify(rt); err == nil {
 		t.Fatalf("expected hard failure in IxReify")
+	}
+}
+
+func Test_Introspection_Noop_RoundTrip_EncodeDecode(t *testing.T) {
+	ast := S{"noop"}
+
+	// Encode S -> runtime-S
+	rt := IxToS(ast)
+	want := vArray(vStr("noop"))
+	mustEqValue(t, rt, want)
+
+	// Decode runtime-S -> S
+	back, err := IxFromS(rt)
+	if err != nil {
+		t.Fatalf("IxFromS failed for noop: %v", err)
+	}
+	if len(back) != 1 || back[0] != "noop" {
+		t.Fatalf("roundtrip mismatch; got %v, want %v", back, ast)
+	}
+}
+
+func Test_Introspection_Noop_Validate_Solo(t *testing.T) {
+	// ValidateCanonicalS should accept ["noop"] as a valid expression/stmt.
+	errs := IxValidateS(S{"noop"})
+	if errs.Tag != VTArray {
+		t.Fatalf("expected VTArray of errors, got %v", errs.Tag)
+	}
+	if n := len(errs.Data.(*ArrayObject).Elems); n != 0 {
+		t.Fatalf("expected zero validation errors for noop, got %d", n)
+	}
+}
+
+func Test_Introspection_Noop_Validate_Annotated(t *testing.T) {
+	// #(doc) noop is valid; no nested annot allowed, but single level is fine.
+	s := S{"annot", S{"str", "doc"}, S{"noop"}}
+	errs := IxValidateS(s)
+	if errs.Tag != VTArray {
+		t.Fatalf("expected VTArray of errors, got %v", errs.Tag)
+	}
+	if n := len(errs.Data.(*ArrayObject).Elems); n != 0 {
+		t.Fatalf("expected zero validation errors for annotated noop, got %d", n)
+	}
+}
+
+func Test_Introspection_Noop_Validate_BadArity(t *testing.T) {
+	// ["noop", "extra"] should be rejected (noop takes no payload).
+	s := S{"noop", "extra"}
+	errs := IxValidateS(s)
+	if errs.Tag != VTArray {
+		t.Fatalf("expected VTArray of errors, got %v", errs.Tag)
+	}
+	if n := len(errs.Data.(*ArrayObject).Elems); n == 0 {
+		t.Fatalf("expected at least one validation error for bad-arity noop")
 	}
 }

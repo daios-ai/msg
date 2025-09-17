@@ -98,24 +98,28 @@ chanRecv(c)
 	wantAnnotatedContains(t, v2, "channel closed")
 }
 
-func Test_Builtin_Concurrency_SendOnClosed_HardError(t *testing.T) {
+func Test_Builtin_Concurrency_SendOnClosed_NoHardError(t *testing.T) {
 	ip, _ := NewRuntime()
 
-	// chanTrySend after close must be a hard error (send on closed).
+	// chanTrySend after close should NOT be a hard error.
 	_, err := ip.EvalSource(`
 let c = chanOpen()
 chanClose(c)
 chanTrySend(c, 1)
 	`)
-	wantErr(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	// chanSend after close must be a hard error as well.
+	// chanSend after close should NOT be a hard error either (it returns Null(err)).
 	_, err = ip.EvalSource(`
 let c = chanOpen()
 chanClose(c)
 chanSend(c, 1)
 	`)
-	wantErr(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func Test_Builtin_Concurrency_ChanOpen_NegativeCap_HardError(t *testing.T) {

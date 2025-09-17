@@ -153,7 +153,7 @@ let _ollama = {
 		if not mapHas(j, "response") or j.response == null then
 			return _err("ollama: missing response")
 		end
-		str(j.response)
+		j.response
 	end
 }
 
@@ -271,7 +271,7 @@ let _openai = {
 		if not mapHas(j, "choices") or len(j.choices) == 0 or not mapHas(j.choices[0], "message") or not mapHas(j.choices[0].message, "content") or j.choices[0].message.content == null then
 			return _err("openai: missing content")
 		end
-		str(j.choices[0].message.content)
+		j.choices[0].message.content
 	end
 }
 
@@ -398,7 +398,7 @@ let _openai_responses = {
 		if text == null then
 			return _err("openai-responses: missing content")
 		end
-		str(text)
+		text
 	end
 }
 
@@ -517,7 +517,7 @@ let _anthropic = {
 		if not mapHas(j, "content") or len(j.content) == 0 or not mapHas(j.content[0], "text") or j.content[0].text == null then
 			return _err("anthropic: missing content")
 		end
-		str(j.content[0].text)
+		j.content[0].text
 	end
 }
 
@@ -627,10 +627,10 @@ let _cohere = {
 			return _err("cohere: bad JSON from server")
 		end
 		if mapHas(j, "text") and j.text != null then
-			return str(j.text)
+			return j.text
 		end
 		if mapHas(j, "message") and mapHas(j.message, "content") and j.message.content != null then
-			return str(j.message.content)
+			return j.message.content
 		end
 		_err("cohere: missing content")
 	end

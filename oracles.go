@@ -24,22 +24,14 @@
 //     type, which is the declared success type widened to **nullable** (`T?`).
 //     On mismatch or parse failure, an *annotated null* Value is returned.
 //
-// PUBLIC API SURFACE (this file)
-// ------------------------------
-//   - LastOraclePrompt() string
-//     Returns the most recent prompt string that the interpreter constructed for
-//     an oracle call during this process. Useful for testing, logging, and REPL
-//     inspection. Returns "" if no oracle has run yet. Read-only; does not
-//     trigger execution.
-//
-// Everything else in this file is **private** implementation that the public
+// Everything in this file is **private** implementation that the public
 // interpreter uses internally when executing oracle functions (see Interpreter
 // in interpreter.go). Public callers never need to invoke those directly.
 //
 // DEPENDENCIES (OTHER FILES)
 // --------------------------
 // • interpreter.go
-//   - type Interpreter (fields: Global, oracleLastPrompt, etc.)
+//   - type Interpreter (fields: Global, etc.)
 //   - Value model (Value, ValueTag, constructors like Str/Arr/Map, Fun, Env)
 //   - Thin call/eval surface (*Interpreter.Apply, resolveType, isType, etc.)
 //   - Annotated-null helpers (annotNull), SourceRef handling.
@@ -54,7 +46,7 @@
 //   - jsonParse : Str -> Any  — required for parsing model JSON.
 //
 // • Runtime hooks (user space, optional/required):
-//   - REQUIRED:  __oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any]) -> Str | Null
+//   - REQUIRED:  __oracle_execute(prompt: Str) -> Str | Null
 //   - OPTIONAL:  __oracle_build_prompt(instruction: Str, inType: Type, outType: Type, examples: [Any]) -> Str
 //
 // NOTE

@@ -516,9 +516,9 @@ end
 # Type: Str?
 let _oracleLastPrompt = null
 
-# Rolling log of oracle prompts captured for diagnostics.
-# Type: [Str]
-let _oraclePromptLog = []
+# Rolling log of oracle prompts and outputs captured for diagnostics.
+# Type: [[Str, Str]]
+let _oracleLog = []
 
 # Install an oracle executor that records each prompt before forwarding.
 # Args: exec: (Str -> Str?)  # underlying executor
@@ -526,8 +526,9 @@ let _oraclePromptLog = []
 let oracleInstallWithTap = fun(exec: Str -> Str?) -> Bool do
 	oracleInstall(fun(p: Str) -> Str? do
 		_oracleLastPrompt = p
-		_oraclePromptLog = _oraclePromptLog + [p]
-		exec(p)
+		let out = exec(p)
+		push(_oracleLog, [p, out])
+		out
 	end)
 	true
 end
@@ -539,11 +540,11 @@ let oracleLastPrompt = fun(_: Null) -> Str? do
 	_oracleLastPrompt
 end
 
-# Return the full recorded oracle prompt log.
+# Return the full recorded oracle prompt/output log.
 # Args: _: Null (ignored)
-# Return: [Str]
-let oraclePromptLog = fun(_: Null) -> [Str] do
-	_oraclePromptLog
+# Return: [[Str, Str]]
+let oracleLog = fun(_: Null) -> [[Str, Str]] do
+	_oracleLog
 end
 
 # # -----------------------------

@@ -1,6 +1,6 @@
 # MindScript Language Manual (Human-Oriented)
 
-MindScript is a compact, expression-oriented language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that actually guides oracles) while keeping syntax clean and readable.
+MindScript is a compact, expression-oriented language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that guides oracles) while keeping syntax clean and readable.
 
 ---
 
@@ -11,8 +11,8 @@ MindScript is a compact, expression-oriented language for two kinds of computati
 * **Structural types are first-class.** Types can be named, passed around, and introspected.
 * **Two kinds of failure.**
 
-  * **Hard errors** abort execution (`fail`), catchable via `try`.
-  * **Soft errors** are ordinary values annotated with a reason, typically using `null` of a nullable type (`T?`), with an attached trailing comment.
+  * **Errors** are ordinary values: idiomatically return `null` of a nullable type (`T?`) with a **POST** annotation that explains the reason.
+  * **Panics** abort evaluation (lexer/parser/runtime error). Use `try` to recover. Panics are rare and should be avoided.
 
 ---
 
@@ -28,8 +28,7 @@ MindScript is a compact, expression-oriented language for two kinds of computati
 MindScript uses a single, unified comment system that also carries metadata:
 
 * **PRE annotations (header comments)**: one or more lines starting with `#` immediately **above** the construct they describe.
-* **POST annotations (inline trailing)**: ` # …` placed at the **end** of the line for a construct.
-  POST **forces a newline** after it.
+* **POST annotations (inline trailing)**: ` # …` placed at the **end** of the line for a construct. POST **forces a newline** after it.
 
 **After-separator rule (important):**
 
@@ -66,7 +65,7 @@ MindScript uses a single, unified comment system that also carries metadata:
 Primitive scalars:
 
 * `null`, `true`, `false`
-* Integers (unbounded in spec; implementations may use 64-bit): `0`, `-7`
+* Integers (**int64**): `0`, `-7`
 * Numbers (float64): `2.0`, `1e-3`
 * Strings: `"hello\nworld"`
 
@@ -114,7 +113,7 @@ type Verb = Enum[ "GET", "POST" ]
 ### 5.1 Precedence (high → low)
 
 * Calls / indexing / property: `f(x)`, `a[i]`, `obj.field`
-* Unary: `-x`, `not x`, type-nullable constructor prints as `T?`
+* Unary: `-x`, `not x`
 * Binary arithmetic: `* / %`, then `+ -`
 * Comparisons: `< <= > >=`
 * Equality: `== !=` (deep for arrays/maps; number equality by value; `2 == 2.0` is true)
@@ -123,8 +122,8 @@ type Verb = Enum[ "GET", "POST" ]
 
 **Rules**
 
-* **Relational ops** only compare **number–number** (mixing `Int`/`Num` allowed) or **string–string**; other mixes are **hard errors**.
-* Arithmetic promotes as needed; `/` yields a floating result.
+* **Relational ops** only compare **number–number** (mixing `Int`/`Num` allowed) or **string–string**; other mixes **panic**.
+* Arithmetic promotion happens **only when at least one operand is `Num`**; `/` yields a floating result (`Num`).
 * `%` follows the dividend sign.
 
 **Examples**
@@ -156,7 +155,7 @@ Identifiers: `x`, `_tmp`, `Name_2`
   let { name: n, age: a } = { name: "Ada" }  # n="Ada", a=null
   ```
 
-**Update** assigns to l-values (`name`, `obj.field`, `arr[i]`). Updating an unbound name is a **hard error**:
+**Update** assigns to l-values (`name`, `obj.field`, `arr[i]`). Updating an unbound name **panics**:
 
 ```mindscript
 let x = 1
@@ -165,11 +164,18 @@ x = 2
 
 There are no named declarations. Functions, types, modules, etc. are all
 anonymous and need to be bound to a variable for later reference.
-```
+
+```mindscript
 let f = fun() do true end
 let T = type {name: Str}
 let m = module "m" do ... end
 ```
+
+**Sugar (surface syntax only):**
+
+* Omitted parameter types and return types default to `Any`.
+* Calling with no arguments `f()` lowers to `f(null)`.
+* Omitted payloads for `return` / `break` / `continue` lower to `null`.
 
 ---
 
@@ -249,17 +255,17 @@ fun(n: Int) -> Int do
 end
 ```
 
-* Parameter types and return types should be explicit in public APIs.
+* Parameter and return types should be explicit in public APIs.
 * Omissions default to `Any` in the surface grammar but are **not** printed by canonical formatters:
 
   * `fun(x) do ... end` means `x: Any`
   * `-> Any` may be omitted when returning `Any`
 * Calls are **curried** semantically, but the surface form is standard calls: `f(a)(b)` is allowed; `f(a, b)` is conventional.
-* The **actual** returned value must conform to the declared return type; otherwise **hard error**.
+* The **actual** returned value must conform to the declared return type; otherwise the runtime **panics**.
 
 ### 8.2 Oracles (typed generative calls)
 
-An oracle behaves like a function with **typed inputs** and an **uncertain** output: calls never hard-fail; instead they produce a value of `R?`.
+An oracle behaves like a function with **typed inputs** and an **uncertain** output: calls never panic; instead they produce a value of `R?`.
 
 ```mindscript
 # Pick a primary color.
@@ -269,11 +275,11 @@ oracle() -> Enum[ "red", "green", "blue" ]
 
 **Calling rules**
 
-* Argument arity/types are checked **strictly** (hard errors on mismatch).
+* Argument arity/types are checked **strictly** (panic on mismatch).
 * Output is treated as `R?`:
 
   * If the generated candidate conforms to `R`, it’s returned.
-  * Otherwise or if unavailable, you get a **soft** `null` with a trailing POST reason.
+  * Otherwise or if unavailable, you get `null` with a trailing POST reason.
 
 ---
 
@@ -293,23 +299,24 @@ end
 
 * Outer bindings aren’t visible unless passed in explicitly.
 * Values are visible via property access: `m.area(3.0)`.
+* After load, a module behaves like a map of exports **and is writable**: property sets overwrite exports.
 * Modules print as `<module: name>` in value formatting when available.
 
 ---
 
-## 10) Annotations & Soft Errors
+## 10) Annotations & Errors
 
-Annotations are your single, unified mechanism for documentation and soft signaling.
+Annotations are your single, unified mechanism for documentation and error signaling.
 
 * **PRE**: lines beginning with `#` immediately above the construct/value.
 * **POST**: trailing ` # …` that forces a newline and obeys the **after-separator** rule.
 
-Soft failures are represented as **nullable types** returning `null` with a POST:
+**Idiomatic errors** are represented as **nullable types** returning `null` with a POST:
 
 ```mindscript
 # Factorial with input check.
 # Args: n:Int
-# Return: Int? (annot-null if n < 0)
+# Return: Int?  # returns null # <negative input> on bad input
 fun(n: Int) -> Int? do
 	if n < 0 then
 		return null # <negative input>
@@ -324,23 +331,27 @@ fun(n: Int) -> Int? do
 end
 ```
 
+**Panics** are exceptional (lexer/parser/runtime) and abort execution. Use `try` to recover (see §12).
+
 Guidelines:
 
-* Prefer `T?` + annotated `null` over throwing for expected/uncertain conditions.
+* Prefer `T?` + annotated `null` over panicking for expected/uncertain conditions.
 * Keep POST short and actionable. PRE is for human docs.
+* **Annotations are ignored** for equality and subtyping.
 
 ---
 
 ## 11) Equality, Comparison, Truthiness
 
-* `==` / `!=` are **deep** for arrays and maps (map key order ignored).
-  Numbers compare by value (`2 == 2.0` is true).
-* `< <= > >=` only allow **number–number** or **string–string**; other mixes are **hard errors**.
-* Booleans are **not** implicitly coerced from numbers/strings in these operators; use explicit conversion helpers if needed.
+* `==` / `!=` are **deep** for arrays and maps (map key order ignored). Numbers compare by value (`2 == 2.0` is true). **Annotations are ignored**.
+* `< <= > >=` only allow **number–number** or **string–string**; other mixes **panic**.
+* Boolean operators `and`/`or` require booleans (no implicit coercion). Use `bool(x)` to convert with truthiness rules (see §12).
 
 ---
 
 ## 12) Standard Library (Practical Reference)
+
+Types below use MindScript notation; `?` indicates a nullable (error-capable) result.
 
 ### Constants & Handles
 
@@ -350,13 +361,13 @@ Guidelines:
 * `STDIN: <handle: file>` — Readable standard input.
 * `STDOUT: <handle: file>` — Writable standard output.
 
-### Core runtime & assertions
+### Core runtime & diagnostics
 
-* `assert: <fun: cond:Bool -> Bool>` — Hard-fail if `cond` is false; returns true otherwise.
-* `fail: <fun: message:Str? -> Null>` — Hard error.
-* `error: <fun: msg:Str -> Null>` — **Soft** error (returns `null` with annotation).
+* `assert: <fun: cond:Bool -> Bool>` — Panic if `cond` is false; returns true otherwise.
+* `fail: <fun: message:Str? -> Null>` — Panic with optional message.
+* `error: <fun: msg:Str -> Null>` — Return `null` with POST annotation `# <msg>` (convenience helper).
 * `print: <fun: x:Any -> Any>` / `println: <fun: x:Any -> Any>` — Print (with/without newline) and return `x`.
-* `try: <fun: f:Any -> {}>` — Capture hard failures. **Shape:** `{ ok!: Bool, value: Any, error: Str }`.
+* `try: <fun: f:Any -> {}>` — Capture panics. **Shape:** `{ ok!: Bool, value: Any, error: Str? }`.
 
 ### Introspection, Types & Reflection
 
@@ -389,11 +400,15 @@ Guidelines:
 
 ### Conversion & Length
 
-* `bool: <fun: x:Any -> Bool>`
-* `int: <fun: x:Any -> Int?>`
-* `num: <fun: x:Any -> Num?>`
-* `str: <fun: x:Any -> Str?>`
-* `len: <fun: x:Any -> Int?>`
+* `bool: <fun: x:Any -> Bool?>` — Convert using **truthiness**:
+
+  * **Falsey:** `null`, `0`, `0.0`, `""`, `[]`, `{}`
+  * **Truthy:** any other value
+  * Returns `null` # <reason> if not convertible.
+* `int:  <fun: x:Any -> Int?>`
+* `num:  <fun: x:Any -> Num?>`
+* `str:  <fun: x:Any -> Str?>`
+* `len:  <fun: x:Any -> Int?>` — Arrays (# elems), maps (# keys), strings (runes); error if not sized.
 
 ### Strings & Text
 
@@ -402,7 +417,7 @@ Guidelines:
 * `match: <fun: pattern:Str -> string:Str -> [Str]>`
 * `replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str>`
 * `sprintf: <fun: fmt:Str -> args:[Any] -> Str?>`
-* `printf: <fun: fmt:Str -> args:[Any] -> Str?>`
+* `printf:  <fun: fmt:Str -> args:[Any] -> Str?>`
 * `substr: <fun: s:Str -> i:Int -> j:Int -> Str>`
 * `toLower: <fun: s:Str -> Str>` / `toUpper: <fun: s:Str -> Str>`
 * `strip: <fun: s:Str -> Str>` / `lstrip: <fun: s:Str -> Str>` / `rstrip: <fun: s:Str -> Str>`
@@ -434,105 +449,121 @@ Guidelines:
 
 ### Channels (CSP-style)
 
-* `chanOpen: <fun: cap:Int? -> Any>`
-* `chanClose: <fun: c:Any -> Null>`
-* `chanSend: <fun: c:Any -> x:Any -> Null>`
-* `chanRecv: <fun: c:Any -> Any>`
-* `chanTrySend: <fun: c:Any -> x:Any -> Bool>`
-* `chanTryRecv: <fun: c:Any -> {}>` — Non-blocking receive result.
+* `chanOpen:   <fun: cap:Int? -> Any>`
+* `chanClose:  <fun: c:Any -> Null>`
+* `chanSend:   <fun: c:Any -> x:Any -> Null>`
+* `chanRecv:   <fun: c:Any -> Any>`
+* `chanTrySend:<fun: c:Any -> x:Any -> Bool>`
+* `chanTryRecv:<fun: c:Any -> {}>` — Non-blocking receive result.
 
 ### Iterators & Sequences
 
-* `iter: <fun: v:Any -> Null -> Any?>` — Arrays/maps → iterator; iterators pass through.
-* `map: <fun: f:(Any -> Any) -> it:(Null -> Any?) -> Null -> Any?>`
+* `iter:   <fun: v:Any -> Null -> Any?>` — Arrays/maps → iterator; iterators pass through.
+
+* `map:    <fun: f:(Any -> Any) -> it:(Null -> Any?) -> Null -> Any?>`
+
 * `filter: <fun: cond:(Any -> Bool) -> it:(Null -> Any?) -> Null -> Any?>`
+
 * `reduce: <fun: f:((Any, Any) -> Any) -> it:(Null -> Any?) -> Any?>`
-* `list: <fun: it:(Null -> Any?) -> [Any]>` — Collect.
-* `range: <fun: start:Int -> stop:Int? -> Null -> Int?>` — `[start, stop)`; infinite if `stop=null`.
-* `naturals: <fun: _:Null -> Null -> Int>` — 1, 2, 3, …
+
+* `list:   <fun: it:(Null -> Any?) -> [Any]>` — Collect.
+
+* `range:     <fun: start:Int -> stop:Int? -> Null -> Int?>` — `[start, stop)`; infinite if `stop=null`.
+
+* `naturals:  <fun: _:Null -> Null -> Int>` — 1, 2, 3, …
+
 * `naturals0: <fun: _:Null -> Null -> Int>` — 0, 1, 2, …
-* `keys: <fun: obj:{} -> Null -> Str?>` — Iterate keys.
+
+* `keys:   <fun: obj:{} -> Null -> Str?>` — Iterate keys.
+
 * `values: <fun: obj:{} -> Null -> Any?>` — Iterate values.
 
-### Arrays (helpers)
+### Arrays (helpers; **in-place** where noted)
 
-* `push: <fun: xs:[Any] -> v:Any -> [Any]>` — Returns new array.
-* `pop: <fun: xs:[Any] -> Any?>` — Last element (no mutation).
-* `shift: <fun: xs:[Any] -> v:Any -> [Any]>` — Prepend (returns new array).
-* `unshift: <fun: xs:[Any] -> Any?>` — First element (peek).
-* `slice: <fun: xs:[Any] -> s:Int -> e:Int -> [Any]>`
+* `push: <fun: arr:[Any] -> v:Any -> [Any]>`
+  Append an element **in place**. Returns the **same array** (mutated).
+
+* `pop: <fun: arr:[Any] -> Any>`
+  Remove and return the **last** element. **Panics** if the array is empty.
+
+* `shift: <fun: arr:[Any] -> Any>`
+  Remove and return the **first** element. **Panics** if the array is empty.
+
+* `unshift: <fun: arr:[Any] -> v:Any -> [Any]>`
+  Prepend an element **in place**. Returns the **same array** (mutated).
+
+* `slice: <fun: xs:[Any] -> s:Int -> e:Int -> [Any]>` — Non-mutating half-open slice.
 
 ### Maps (helpers)
 
-* `mapDelete: <fun: obj:{} -> key:Str -> {}>` — Delete a property from a map (in place).
-* `mapHas: <fun: obj:{} -> key:Str -> Bool>` — Return true if a key exists in a map.
+* `mapDelete: <fun: obj:{} -> key:Str -> {}>` — Delete a property **in place**. Preserves key order and per-key annotations. Returns the **same map**.
+* `mapHas:    <fun: obj:{} -> key:Str -> Bool>` — Return true if a key exists in a map.
 
 ### Processes & Concurrency
 
-* `procSpawn: <fun: f:Any -> Any>` — Run in isolated process.
-* `procCancel: <fun: p:Any -> Null>`
-* `procCancelled: <fun: p:Any -> Bool>`
-* `procJoin: <fun: p:Any -> Any>`
+* `procSpawn:   <fun: f:Any -> Any>` — Run in isolated process.
+* `procCancel:  <fun: p:Any -> Null>`
+* `procCancelled:<fun: p:Any -> Bool>`
+* `procJoin:    <fun: p:Any -> Any>`
 * `procJoinAll: <fun: ps:[Any] -> [Any]>`
 * `procJoinAny: <fun: ps:[Any] -> {}?>` — `{ index!: Int, value: Any }` when available.
 
 ### Files, Paths & OS
 
-* `cwd: <fun: _:Null -> Str?>`
-* `chdir: <fun: path:Str -> Bool?>`
-* `dirList: <fun: path:Str -> [Str]?>`
-* `mkdir: <fun: path:Str -> Bool?>`
-* `open: <fun: path:Str -> mode:Enum["r","w","a","rw"] -> Any?>`
-* `readAll: <fun: h:Any -> Str?>`
-* `readN: <fun: h:Any -> n:Int -> Str?>`
+* `cwd:    <fun: _:Null -> Str?>`
+* `chdir:  <fun: path:Str -> Bool?>`
+* `dirList:<fun: path:Str -> [Str]?>`
+* `mkdir:  <fun: path:Str -> Bool?>`
+* `open:   <fun: path:Str -> mode:Enum["r","w","a","rw"] -> Any?>`
+* `readAll:  <fun: h:Any -> Str?>`
+* `readN:    <fun: h:Any -> n:Int -> Str?>`
 * `readLine: <fun: h:Any -> Str?>`
-* `write: <fun: h:Any -> s:Str -> Int?>`
-* `flush: <fun: h:Any -> Bool?>`
-* `close: <fun: h:Any -> Bool?>`
+* `write:    <fun: h:Any -> s:Str -> Int?>`
+* `flush:    <fun: h:Any -> Bool?>`
+* `close:    <fun: h:Any -> Bool?>`
 * `readFile: <fun: path:Str -> Str?>`
-* `writeFile: <fun: path:Str -> data:Str -> Int?>`
-* `remove: <fun: path:Str -> Bool?>`
-* `rename: <fun: old:Str -> new:Str -> Bool?>`
-* `stat: <fun: path:Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?>`
+* `writeFile:<fun: path:Str -> data:Str -> Int?>`
+* `remove:   <fun: path:Str -> Bool?>`
+* `rename:   <fun: old:Str -> new:Str -> Bool?>`
+* `stat:     <fun: path:Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?>`
 * `pathBase | pathDir | pathExt | pathClean | pathJoin`
-* `tempDir: <fun: _:Null -> Str>`
+* `tempDir:  <fun: _:Null -> Str>`
 
 ### Environment & Modules
 
-* `osEnv: <fun: name:Str -> Str?>`
-* `osSetEnv: <fun: name:Str -> value:Str? -> Bool?>`
-* `import: <fun: path:Str -> Any>`
-* `importCode: <fun: name:Str -> src:Str -> Any>`
-* `codeImport: <fun: code:Str -> Str -> {}>` — Create importer from code string.
+* `osEnv:     <fun: name:Str -> Str?>`
+* `osSetEnv:  <fun: name:Str -> value:Str? -> Bool?>`
+* `import:    <fun: path:Str -> Any>`
+* `importCode:<fun: name:Str -> src:Str -> Any>`
+* `codeImport:<fun: code:Str -> Str -> {}>` — Create importer from code string.
 * `importUrl: <fun: url:Str -> {}?>` — Import module from URL.
 
 ### Networking & HTTP
 
-* `netListen: <fun: addr:Str -> Any>`
-* `netAccept: <fun: l:Any -> Any>`
+* `netListen:  <fun: addr:Str -> Any>`
+* `netAccept:  <fun: l:Any -> Any>`
 * `netConnect: <fun: addr:Str -> Any>`
-* `urlParse: <fun: s:Str -> {}?>`
-* `urlBuild: <fun: u:{} -> Str>`
-* `urlQueryParse: <fun: s:Str -> {}?>`
+* `urlParse:       <fun: s:Str -> {}?>`
+* `urlBuild:       <fun: u:{} -> Str>`
+* `urlQueryParse:  <fun: s:Str -> {}?>`
 * `urlQueryString: <fun: q:{} -> Str>`
-* `http: <?>` / `httpStream: <?>` / `exec: <?>` — **Implementation-defined**; wire types left unspecified in this spec.
+* `http:       <?>` / `httpStream: <?>` / `exec: <?>` — Implementation-defined I/O; wire types left unspecified here.
 
 ### Oracles (installation)
 
 * `oracleInstall: <fun: exec:(Str -> Str?) -> Null>` — Install global oracle executor.
-* `oracleHealth: <fun: _:Null -> {}?>` — Probe executor.
-* `oracleStatus: <fun: _:Null -> Str>` — Status string.
+* `oracleHealth:  <fun: _:Null -> {}?>` — Probe executor.
+* `oracleStatus:  <fun: _:Null -> Str>` — Status string.
 * `llm: <module: llm>` — LLM module entrypoint (executor + default backend selection).
 
 ### Misc
 
-* `mute: <fun: _:Any -> Null>` — Sink a value (ignore).
+* `mute:  <fun: _:Any -> Null>` — Sink a value (ignore).
 * `clone: <fun: x:Any -> Any>` — Clone a value (deep-copy).
-
 
 ---
 
-## 13) Collections & Iteration Details
+## 13) Collections & Access Semantics
 
 * Arrays are 0-based; negative indices count from the end:
 
@@ -540,8 +571,7 @@ Guidelines:
   let xs = [10, 20]
   xs[-1]     # => 20
   ```
-* Maps are open-world; unknown keys are allowed and simply absent.
-  Map addition merges: `{a: 0, b: 1} + {a: 1, c: 2}` => `{a: 1, b: 1, c: 2}`
+* Maps are open-world; unknown keys are allowed and simply absent from the value until set. Map addition merges: `{a: 0, b: 1} + {a: 1, c: 2}` => `{a: 1, b: 1, c: 2}`
 
 **Access**
 
@@ -551,7 +581,7 @@ arr[i]           # 0-based, negative from end
 map["k"]         # explicit string key
 ```
 
-Missing map keys or array out-of-bounds yield **soft** annotated null if the implementation chooses to surface it; idiomatic code uses `T?` and checks.
+**Missing key / out-of-bounds:** **panic**. Use `mapHas`, bounds checks, or safe wrappers to avoid panics when absence is expected.
 
 ---
 
@@ -571,13 +601,13 @@ Missing map keys or array out-of-bounds yield **soft** annotated null if the imp
 
 ---
 
-## 15) Error Handling
+## 15) Failure Handling (Errors vs Panics)
 
-* Use **hard errors** (`fail`) for programmer mistakes or non-recoverable conditions. Catch with `try`.
-* Use **soft errors** (nullable types + annotations) when uncertainty or absence is expected.
+* Use **errors** (`T?` + POST-annotated `null`) for expected/uncertain conditions.
+* Reserve **panics** for programmer mistakes or unrecoverable runtime conditions (type/arity violations, out-of-bounds, missing key without check, invalid comparisons, use of unbound names, etc.). Panics can be caught with `try`.
 
 ```mindscript
-# Extract host from URL; soft-null if invalid.
+# Extract host from URL; returns error (null) if invalid.
 fun host(url: Str) -> Str? do
 	let u = urlParse(url)
 	if u == null then
@@ -585,6 +615,12 @@ fun host(url: Str) -> Str? do
 	end
 	u.host
 end
+
+# Recovering from a panic:
+let r = try(fun() do
+	fail("boom")
+end)
+# r == { ok: false, value: null, error: "boom" }
 ```
 
 ---
@@ -635,7 +671,7 @@ let msg =
 ### 16.5 Oracle with typed output
 
 ```mindscript
-# Choose a color (may soft-fail).
+# Choose a color (may return error/null).
 oracle() -> Enum[ "red", "green", "blue" ]
 
 let c = chooseColor()
@@ -650,9 +686,10 @@ end
 
 ## 17) Design Guidelines
 
-* **Public APIs**: declare explicit parameter and return types. Use `T?` only when soft errors are possible. Avoid exposing raw `null` in public contracts.
+* **Public APIs**: declare explicit parameter and return types. Use `T?` only when an error/null is a legitimate outcome. Avoid exposing raw `null` without a type contract.
 * **Annotations**: use PRE for docs; use concise POST for machine-readable signals and pipeline logs.
 * **Canonicalization**: omit default `: Any` parameters and `-> Any` returns in source; formatters remove redundant parens and trailing commas, normalize quoting, and sort map keys in type/value printers for stability.
+* **Avoid panics** in library code; prefer returning `null` with a clear POST reason.
 
 ---
 
@@ -667,13 +704,14 @@ x = x + 1
 let xs = [1, 2, 3]
 let m  = { name: "Ada", age: 36 }
 
-# Access
+# Access (panics on missing key / OOB)
 xs[0]; xs[-1]
 m.name; m["not-ident"]
 
-# Functions
+# Functions (types optional; default Any)
 fun inc(n: Int) -> Int do n + 1 end
 inc(41)
+inc()   # lowers to inc(null)
 
 # Control
 if cond then A() elif other then B() else C() end
@@ -681,17 +719,24 @@ while test() do step() end
 for x in xs do use(x) end
 
 # Return/break/continue
-return
+return          # lowers to return null
 break "done"
-continue
+continue        # lowers to continue null
 
 # Types
 let Pair = type { left!: Int, right!: Int }
 let F = type Int -> Num -> Str
 
+# Oracles
+oracle getColor() -> Enum["red","green","blue"]
+
 # Annotations
 # PRE above
 value # POST here forces newline
+
+# Errors vs Panics
+return null # <reason>     # error (preferred for expected absence)
+fail("boom")               # panic (rare; recoverable via try)
 ```
 
 ---

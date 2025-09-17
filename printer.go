@@ -1431,7 +1431,7 @@ func docValueNoAnn(v Value) *Doc {
 	case VTStr:
 		return Text(quoteString(v.Data.(string)))
 	case VTArray:
-		xs := v.Data.([]Value)
+		xs := v.Data.(*ArrayObject).Elems
 		if len(xs) == 0 {
 			return Text("[]")
 		}

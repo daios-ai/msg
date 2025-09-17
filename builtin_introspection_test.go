@@ -196,7 +196,7 @@ func Test_Builtin_Introspection_Annotations_ReflectReify_Preserve(t *testing.T) 
 	if v.Tag != VTArray {
 		t.Fatalf("expected array of notes, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	want := []string{"A", "A", "B", "B"}
 	for i := range want {
 		if xs[i].Tag != VTStr || xs[i].Data.(string) != want[i] {
@@ -292,7 +292,7 @@ func Test_Builtin_Introspection_Reflect_Functions_ScriptedAndNativeDefaults(t *t
 func Test_Builtin_Introspection_Reflect_Oracle_SourceIsExpr(t *testing.T) {
 	ip, _ := NewRuntime()
 	// Use a literal so reflection doesn't try to evaluate a free var.
-	rt := evalWithIP(t, ip, `reflect(oracle(x: Int) -> Int from 42)`)
+	rt := evalWithIP(t, ip, `reflect(oracle(x: Int) -> Int from [[1,1]])`)
 	s, err := IxFromS(rt)
 	if err != nil {
 		t.Fatalf("IxFromS(oracle) failed: %v", err)
@@ -332,7 +332,7 @@ func Test_Builtin_Introspection_Validator_NestedAnnot_Rejected(t *testing.T) {
 		t.Fatalf("validator must return array, got %#v", errs)
 	}
 	found := false
-	for _, e := range errs.Data.([]Value) {
+	for _, e := range errs.Data.(*ArrayObject).Elems {
 		if e.Tag == VTMap {
 			m := e.Data.(*MapObject).Entries
 			if c, ok := m["code"]; ok && c.Tag == VTStr && c.Data.(string) == "E_ANNOT_NESTED" {
@@ -353,7 +353,7 @@ func Test_Builtin_Introspection_Validator_Enum_MemberExprOK(t *testing.T) {
 		S{"binop", "+", S{"int", int64(1)}, S{"int", int64(2)}},
 	}}
 	errs := IxValidateS(ty)
-	if errs.Tag != VTArray || len(errs.Data.([]Value)) != 0 {
+	if errs.Tag != VTArray || len(errs.Data.(*ArrayObject).Elems) != 0 {
 		t.Fatalf("enum with expression member should validate (no errors), got %#v", errs)
 	}
 }

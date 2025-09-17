@@ -35,7 +35,7 @@ func Test_Builtin_Misc_rand_seed_and_randInt_deterministic(t *testing.T) {
 				[a, b]
 			end
 		`)
-		xs := v.Data.([]Value)
+		xs := v.Data.(*ArrayObject).Elems
 		return xs[0].Data.(int64), xs[1].Data.(int64)
 	}
 

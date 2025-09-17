@@ -159,7 +159,7 @@ Returns:
 		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			xs := ctx.MustArg("xs").Data.([]Value)
+			xs := ctx.MustArg("xs").Data.(*ArrayObject).Elems
 			sep := ctx.MustArg("sep").Data.(string)
 			strs := make([]string, len(xs))
 			for i := range xs {

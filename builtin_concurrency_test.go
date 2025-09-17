@@ -212,7 +212,7 @@ procJoinAll([p1, p2, p3])
 	if v.Tag != VTArray {
 		t.Fatalf("procJoinAll should return [Any], got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	if len(xs) != 3 {
 		t.Fatalf("want 3 results, got %d", len(xs))
 	}
@@ -236,7 +236,7 @@ procJoinAll(ps)
 	if v.Tag != VTArray {
 		t.Fatalf("procJoinAll should return [Any], got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	if len(xs) != 2 {
 		t.Fatalf("want 2 results, got %d", len(xs))
 	}
@@ -448,7 +448,7 @@ func Test_Builtin_Concurrency_ProcSpawn_ArgValidation(t *testing.T) {
 func Test_Builtin_Concurrency_ProcJoinAll_Empty(t *testing.T) {
 	ip, _ := NewRuntime()
 	v := evalWithIP(t, ip, `procJoinAll([])`)
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 0 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 0 {
 		t.Fatalf("procJoinAll([]) should return empty array, got %#v", v)
 	}
 }

@@ -275,7 +275,7 @@ Returns:
 			case VTStr:
 				return Bool(v.Data.(string) != "")
 			case VTArray:
-				return Bool(len(v.Data.([]Value)) > 0)
+				return Bool(len(v.Data.(*ArrayObject).Elems) > 0)
 			case VTMap:
 				return Bool(len(v.Data.(*MapObject).Entries) > 0)
 			default:
@@ -309,7 +309,7 @@ Returns:
 			x := AsMapValue(ctx.MustArg("x"))
 			switch x.Tag {
 			case VTArray:
-				return Int(int64(len(x.Data.([]Value))))
+				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
 			case VTMap:
 				mo := x.Data.(*MapObject)
 				// Use ordered keys length to reflect object “length”

@@ -130,6 +130,15 @@ func wantErrContains(t *testing.T, err error, substr string) {
 	}
 }
 
+// elems returns the array elements (failing the test if v is not an array).
+func elems(t *testing.T, v Value) []Value {
+	t.Helper()
+	if v.Tag != VTArray {
+		t.Fatalf("want array, got %#v", v)
+	}
+	return v.Data.(*ArrayObject).Elems
+}
+
 // --- tests -----------------------------------------------------------------
 
 func Test_Interpreter_Literals(t *testing.T) {
@@ -160,11 +169,11 @@ func Test_Interpreter_Arrays_Indexing_Including_Negative(t *testing.T) {
 	wantInt(t, evalSrc(t, "([1,2,3])[-1]"), 3)
 	// concatenation
 	v := evalSrc(t, "[1] + [2,3]")
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 3 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 3 {
 		t.Fatalf("want array len 3, got %#v", v)
 	}
-	wantInt(t, v.Data.([]Value)[0], 1)
-	wantInt(t, v.Data.([]Value)[2], 3)
+	wantInt(t, v.Data.(*ArrayObject).Elems[0], 1)
+	wantInt(t, v.Data.(*ArrayObject).Elems[2], 3)
 }
 
 func Test_Interpreter_Maps_Get_Set(t *testing.T) {
@@ -197,7 +206,7 @@ func Test_Interpreter_Map_Merge_And_Array_Concat(t *testing.T) {
 
 	// array concat
 	v := evalSrc(t, `[1,2] + [3]`)
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 3 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 3 {
 		t.Fatalf("want array len 3, got %#v", v)
 	}
 }
@@ -489,11 +498,11 @@ let {a: [x, y, z]} = {a: [1]}
 [z, y]
 `)
 	arr := v
-	if arr.Tag != VTArray || len(arr.Data.([]Value)) != 2 {
+	if arr.Tag != VTArray || len(arr.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want array of 2, got %#v", v)
 	}
-	wantAnnotatedNullContains(t, arr.Data.([]Value)[0], "array pattern") // z
-	wantAnnotatedNullContains(t, arr.Data.([]Value)[1], "array pattern") // y
+	wantAnnotatedNullContains(t, arr.Data.(*ArrayObject).Elems[0], "array pattern") // z
+	wantAnnotatedNullContains(t, arr.Data.(*ArrayObject).Elems[1], "array pattern") // y
 }
 
 func Test_Interpreter_Let_ObjectDestructuring_WithAnnotations(t *testing.T) {
@@ -527,7 +536,7 @@ end
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	arr := v.Data.([]Value)
+	arr := v.Data.(*ArrayObject).Elems
 	want := []int64{1, 2, 3}
 	for i, w := range want {
 		if arr[i].Tag != VTInt || arr[i].Data.(int64) != w {
@@ -596,7 +605,7 @@ end
 	if v.Tag != VTArray {
 		t.Fatalf("want array result, got %#v", v)
 	}
-	arr := v.Data.([]Value)
+	arr := v.Data.(*ArrayObject).Elems
 	if len(arr) != 4 {
 		t.Fatalf("want 4 elements, got %d (%#v)", len(arr), v)
 	}
@@ -690,7 +699,7 @@ end
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	arr := v.Data.([]Value)
+	arr := v.Data.(*ArrayObject).Elems
 	if len(arr) != 2 {
 		t.Fatalf("want 2 elements, got %d (%#v)", len(arr), v)
 	}
@@ -713,7 +722,7 @@ end
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	arr := v.Data.([]Value)
+	arr := v.Data.(*ArrayObject).Elems
 	if len(arr) != 4 {
 		t.Fatalf("want 4 elements, got %d (%#v)", len(arr), v)
 	}
@@ -965,7 +974,7 @@ let o = {if: 1, else: 2, for: 3, type: 4, Enum: 5, enum: 6, Int: 7, Str: 8, true
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	want := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 	if len(xs) != len(want) {
 		t.Fatalf("want %d items, got %d", len(want), len(xs))
@@ -997,7 +1006,7 @@ available:
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	// name: "Mo" (no annotation on the value)
 	wantStr(t, xs[0], "Mo")
 	// age: 47
@@ -1019,7 +1028,7 @@ let {
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	wantStr(t, xs[0], "Ana")
 	wantInt(t, xs[1], 33)
 }
@@ -1036,10 +1045,10 @@ let {
 [y]
 `
 	v := evalSrc(t, src)
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 1 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 1 {
 		t.Fatalf("want single-element array, got %#v", v)
 	}
-	vy := v.Data.([]Value)[0]
+	vy := v.Data.(*ArrayObject).Elems[0]
 	if !isAnnotatedNull(vy) {
 		t.Fatalf("want annotated null for missing 'age', got %#v", vy)
 	}
@@ -1066,7 +1075,7 @@ k3:
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	wantInt(t, xs[0], 1)
 	wantInt(t, xs[1], 2)
 	wantStrWithAnnot(t, xs[2], "v", "val")
@@ -1082,7 +1091,7 @@ let { if: a, Enum: b, Int: c, true: d, null: e } = { if: 1, Enum: 2, Int: 3, tru
 	if v.Tag != VTArray {
 		t.Fatalf("want array, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	want := []int64{1, 2, 3, 4, 5}
 	for i, w := range want {
 		if xs[i].Tag != VTInt || xs[i].Data.(int64) != w {
@@ -1108,7 +1117,7 @@ let c = it(null)
 [a[0], a[1], b[0], b[1], c[0], c[1]]
 `
 	v := evalSrc(t, src)
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	wantStrAnn(t, xs[0], "name", "the name")
 	wantStr(t, xs[1], "Mo")
 	wantStrAnn(t, xs[2], "age", "the age")
@@ -1180,7 +1189,7 @@ let arr =
 arr
 `
 	v := evalSrc(t, src)
-	pair := v.Data.([]Value)
+	pair := v.Data.(*ArrayObject).Elems
 	wantStrAnn(t, pair[0], "k", "B")
 	wantInt(t, pair[1], 9)
 }
@@ -1487,11 +1496,11 @@ for let [k, v] in {a: 1, b: 2} do
   [k, v]
 end
 `)
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 2 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want [key, value], got %#v", v)
 	}
-	wantStr(t, v.Data.([]Value)[0], "b")
-	wantInt(t, v.Data.([]Value)[1], 2)
+	wantStr(t, v.Data.(*ArrayObject).Elems[0], "b")
+	wantInt(t, v.Data.(*ArrayObject).Elems[1], 2)
 }
 
 func Test_Interpreter_For_Target_Binding_Persists(t *testing.T) {
@@ -1537,11 +1546,11 @@ r = while i < 6 do
 end
 [r, i]
 `)
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 2 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want [r, i], got %#v", v)
 	}
-	wantInt(t, v.Data.([]Value)[0], 7)
-	wantInt(t, v.Data.([]Value)[1], 7)
+	wantInt(t, v.Data.(*ArrayObject).Elems[0], 7)
+	wantInt(t, v.Data.(*ArrayObject).Elems[1], 7)
 }
 
 func Test_Interpreter_While_Zero_Iterations_Yields_Null(t *testing.T) {
@@ -1572,16 +1581,16 @@ while i < 5 do
 end
 [acc, i]
 `)
-	if v1.Tag != VTArray || len(v1.Data.([]Value)) != 2 {
+	if v1.Tag != VTArray || len(v1.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want [acc, i], got %#v", v1)
 	}
-	acc := v1.Data.([]Value)[0]
-	if acc.Tag != VTArray || len(acc.Data.([]Value)) != 2 {
+	acc := v1.Data.(*ArrayObject).Elems[0]
+	if acc.Tag != VTArray || len(acc.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want acc [2,4], got %#v", acc)
 	}
-	wantInt(t, acc.Data.([]Value)[0], 2)
-	wantInt(t, acc.Data.([]Value)[1], 4)
-	wantInt(t, v1.Data.([]Value)[1], 5)
+	wantInt(t, acc.Data.(*ArrayObject).Elems[0], 2)
+	wantInt(t, acc.Data.(*ArrayObject).Elems[1], 4)
+	wantInt(t, v1.Data.(*ArrayObject).Elems[1], 5)
 
 	v2 := evalSrc(t, `
 let i
@@ -1597,11 +1606,11 @@ r = while true do
 end
 [r, i]
 `)
-	if v2.Tag != VTArray || len(v2.Data.([]Value)) != 2 {
+	if v2.Tag != VTArray || len(v2.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want [r, i], got %#v", v2)
 	}
-	wantInt(t, v2.Data.([]Value)[0], 30)
-	wantInt(t, v2.Data.([]Value)[1], 3)
+	wantInt(t, v2.Data.(*ArrayObject).Elems[0], 30)
+	wantInt(t, v2.Data.(*ArrayObject).Elems[1], 3)
 }
 
 func Test_Interpreter_While_WithPreAnnotation(t *testing.T) {
@@ -1822,10 +1831,10 @@ func Test_Interpreter_Array_Assignment_NegativeIndexing_OOB(t *testing.T) {
 
 	// Setup and a valid negative write
 	v := mustEvalPersistent(t, ip, "let a = [10,20,30]\n a[-1] = 99\n a")
-	if v.Tag != VTArray || len(v.Data.([]Value)) != 3 {
+	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 3 {
 		t.Fatalf("want array len 3, got %#v", v)
 	}
-	wantInt(t, v.Data.([]Value)[2], 99)
+	wantInt(t, v.Data.(*ArrayObject).Elems[2], 99)
 
 	// OOB negative write
 	err := evalPersistentExpectError(t, ip, "a[-4] = 1")

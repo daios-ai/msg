@@ -24,8 +24,8 @@ func valueDeepEqual(a, b Value) bool {
 	case VTBool, VTInt, VTNum, VTStr:
 		return reflect.DeepEqual(a.Data, b.Data)
 	case VTArray:
-		ax := a.Data.([]Value)
-		bx := b.Data.([]Value)
+		ax := a.Data.(*ArrayObject).Elems
+		bx := b.Data.(*ArrayObject).Elems
 		if len(ax) != len(bx) {
 			return false
 		}
@@ -66,7 +66,7 @@ func TestIxToS_SoftErrorOnUnsupportedAtom(t *testing.T) {
 	if got.Tag != VTArray {
 		t.Fatalf("expected VTArray, got %v", got.Tag)
 	}
-	top := got.Data.([]Value)
+	top := got.Data.(*ArrayObject).Elems
 	if len(top) != 3 || top[0].Tag != VTStr || top[0].Data.(string) != "annot" {
 		t.Fatalf("expected annotated-null; got %#v", got)
 	}
@@ -213,7 +213,7 @@ func Test_Introspection_Handle_SoftError(t *testing.T) {
 	h := Value{Tag: VTHandle, Data: "opaque"}
 	got := IxReflect(h)
 	// We only assert it's an annotated-null soft error.
-	top := got.Data.([]Value)
+	top := got.Data.(*ArrayObject).Elems
 	if len(top) != 3 || top[0].Data.(string) != "annot" {
 		t.Fatalf("expected annotated-null for handle; got %#v", got)
 	}
@@ -267,6 +267,7 @@ func ixMustCtorS(v Value) S {
 	}
 	return s
 }
+
 func Test_Introspection_IxReflect_Module_Canonical(t *testing.T) {
 	ip := NewInterpreter()
 
@@ -433,7 +434,7 @@ func Test_Introspection_ArrayElementAnnotation_PreservedInReflect(t *testing.T) 
 	e0 := vInt(1)
 	e0.Annot = "<hi"
 	e1 := vInt(2)
-	val := Value{Tag: VTArray, Data: []Value{e0, e1}}
+	val := Arr([]Value{e0, e1})
 
 	got := IxReflect(val)
 
@@ -451,7 +452,7 @@ func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) 
 	e0 := vInt(1)
 	e0.Annot = "<hi"
 	e1 := vInt(2)
-	val := Value{Tag: VTArray, Data: []Value{e0, e1}}
+	val := Arr([]Value{e0, e1})
 
 	rt := IxReflect(val)
 
@@ -463,7 +464,7 @@ func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) 
 	if got.Tag != VTArray {
 		t.Fatalf("expected VTArray after reify, got %v", got.Tag)
 	}
-	elems := got.Data.([]Value)
+	elems := got.Data.(*ArrayObject).Elems
 	if len(elems) != 2 {
 		t.Fatalf("expected 2 elements, got %d", len(elems))
 	}
@@ -526,7 +527,7 @@ func Test_Introspection_NestedContainers_AnnotationsPropagate(t *testing.T) {
 	elem1 := vInt(2)
 	elem1.Annot = "<outer"
 
-	val := Value{Tag: VTArray, Data: []Value{innerMap, elem1}}
+	val := Arr([]Value{innerMap, elem1})
 
 	got := IxReflect(val)
 
@@ -578,7 +579,7 @@ func Test_Introspection_IxToS_SoftError_DeepInside(t *testing.T) {
 	// Unsupported atom nested inside array → annotated-null soft error
 	bad := S{"array", S{"int", int64(1)}, int32(7)}
 	rt := IxToS(bad)
-	top := rt.Data.([]Value)
+	top := rt.Data.(*ArrayObject).Elems
 	if rt.Tag != VTArray || len(top) != 3 || top[0].Data.(string) != "annot" {
 		t.Fatalf("expected annotated-null soft error, got %#v", rt)
 	}
@@ -618,7 +619,7 @@ func Test_Introspection_Reflect_Fun_DefaultsToAny(t *testing.T) {
 	if got.Tag != VTArray {
 		t.Fatalf("unexpected shape")
 	}
-	arr := got.Data.([]Value)
+	arr := got.Data.(*ArrayObject).Elems
 	if arr[0].Data.(string) != "fun" {
 		t.Fatalf("want fun, got %#v", got)
 	}
@@ -648,7 +649,7 @@ func Test_Introspection_Reflect_Annotation_OnFunAndModule(t *testing.T) {
 	f := FunVal(&Fun{Body: S{"block"}})
 	f.Annot = "pre"
 	gotF := IxReflect(f)
-	if gotF.Data.([]Value)[0].Data.(string) != "annot" {
+	if gotF.Data.(*ArrayObject).Elems[0].Data.(string) != "annot" {
 		t.Fatalf("function reflect should wrap in annot, got %#v", gotF)
 	}
 
@@ -657,7 +658,7 @@ func Test_Introspection_Reflect_Annotation_OnFunAndModule(t *testing.T) {
 	mv, _ := ip.EvalPersistentSource(`module "M" do end`)
 	mv.Annot = "<post"
 	gotM := IxReflect(mv)
-	if gotM.Data.([]Value)[0].Data.(string) != "annot" {
+	if gotM.Data.(*ArrayObject).Elems[0].Data.(string) != "annot" {
 		t.Fatalf("module reflect should wrap in annot, got %#v", gotM)
 	}
 }
@@ -682,14 +683,14 @@ func Test_Introspection_Reflect_Type_WithEnum(t *testing.T) {
 
 func Test_Introspection_Validate_Success_EmptyErrors(t *testing.T) {
 	errs := IxValidateS(S{"binop", "+", S{"int", int64(1)}, S{"int", int64(2)}})
-	if errs.Tag != VTArray || len(errs.Data.([]Value)) != 0 {
+	if errs.Tag != VTArray || len(errs.Data.(*ArrayObject).Elems) != 0 {
 		t.Fatalf("expected no errors, got %#v", errs)
 	}
 }
 
 func Test_Introspection_Validate_ValueMap_ForbidsPairBang(t *testing.T) {
 	errs := IxValidateS(S{"map", S{"pair!", S{"str", "x"}, S{"int", int64(1)}}})
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected an error for pair! in value map")
 	}
 }
@@ -697,28 +698,28 @@ func Test_Introspection_Validate_ValueMap_ForbidsPairBang(t *testing.T) {
 func Test_Introspection_Validate_Annot_NotNestable(t *testing.T) {
 	bad := S{"annot", S{"str", "x"}, S{"annot", S{"str", "y"}, S{"int", int64(1)}}}
 	errs := IxValidateS(bad)
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected E_ANNOT_NESTED")
 	}
 }
 
 func Test_Introspection_Validate_AssignableLHS(t *testing.T) {
 	errs := IxValidateS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}})
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected E_ASSIGN_TARGET")
 	}
 }
 
 func Test_Introspection_Validate_ControlArity(t *testing.T) {
 	errs := IxValidateS(S{"return"}) // arity != 2
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected arity error for return")
 	}
 }
 
 func Test_Introspection_Validate_OracleSource_MustBeExpr(t *testing.T) {
 	errs := IxValidateS(S{"oracle", S{"array"}, S{"id", "Any"}, S{"block"}})
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected E_ORACLE_SRC_NOT_EXPR")
 	}
 }
@@ -730,7 +731,7 @@ func Test_Introspection_Validate_IfElse_Shape(t *testing.T) {
 		S{"pair", S{"bool", true}, S{"block"}},
 		S{"int", int64(1)},
 	})
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected E_EXPECT_BLOCK for else")
 	}
 }
@@ -738,14 +739,14 @@ func Test_Introspection_Validate_IfElse_Shape(t *testing.T) {
 func Test_Introspection_Validate_EnumMembers_AreExprs(t *testing.T) {
 	// validate inside a type node
 	errs := IxValidateS(S{"type", S{"enum", S{"block"}}})
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected E_ENUM_EXPR")
 	}
 }
 
 func Test_Introspection_Validate_Handle_Forbidden(t *testing.T) {
 	errs := IxValidateS(S{"handle"})
-	if len(errs.Data.([]Value)) == 0 {
+	if len(errs.Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected E_HANDLE_FORBIDDEN")
 	}
 }
@@ -757,7 +758,7 @@ func Test_Introspection_Validate_Handle_Forbidden(t *testing.T) {
 func Test_Introspection_ValidateReports_ReifyHardFails(t *testing.T) {
 	// Non-assignable LHS is invalid and should also fail at evaluation.
 	rt := IxToS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}})
-	if len(IxValidateS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}}).Data.([]Value)) == 0 {
+	if len(IxValidateS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}}).Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected validator errors")
 	}
 	ip := NewInterpreter()

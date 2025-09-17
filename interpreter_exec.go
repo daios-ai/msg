@@ -292,7 +292,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 			NativeName: f.NativeName,
 			Src:        f.Src,
 			IsOracle:   f.IsOracle,
-			Examples:   append([]Value(nil), f.Examples...),
+			Examples:   f.Examples,
 		})
 		next.Annot = fnVal.Annot
 		return next

@@ -163,7 +163,7 @@ func ixFromS_Strict(v Value) (S, error) {
 	if v.Tag != VTArray {
 		return nil, fmt.Errorf("expected VTArray, got %v", v.Tag)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	if len(xs) == 0 {
 		return nil, fmt.Errorf("empty node (missing tag)")
 	}
@@ -223,7 +223,7 @@ func ixConstructorS_core(v Value) (S, bool) {
 		return S{"str", v.Data.(string)}, true
 
 	case VTArray:
-		elems := v.Data.([]Value)
+		elems := v.Data.(*ArrayObject).Elems
 		out := S{"array"}
 		for _, e := range elems {
 			se, ok := ixConstructorS_ForValue(e)

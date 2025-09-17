@@ -392,9 +392,8 @@ Returns:
 			if a.Tag != VTArray {
 				fail("push expects array")
 			}
-			xs := a.Data.([]Value)
-			xs = append(xs, ctx.MustArg("v"))
-			a.Data = xs
+			ao := a.Data.(*ArrayObject)
+			ao.Elems = append(ao.Elems, ctx.MustArg("v"))
 			return a
 		},
 	)
@@ -417,10 +416,9 @@ Returns:
 			if a.Tag != VTArray {
 				fail("unshift expects array")
 			}
-			xs := a.Data.([]Value)
+			ao := a.Data.(*ArrayObject)
 			v := ctx.MustArg("v")
-			xs = append([]Value{v}, xs...)
-			a.Data = xs
+			ao.Elems = append([]Value{v}, ao.Elems...)
 			return a
 		},
 	)
@@ -443,12 +441,12 @@ Returns:
 			if a.Tag != VTArray {
 				fail("pop expects array")
 			}
-			xs := a.Data.([]Value)
-			if len(xs) == 0 {
+			ao := a.Data.(*ArrayObject)
+			if len(ao.Elems) == 0 {
 				fail("pop on empty array")
 			}
-			v := xs[len(xs)-1]
-			a.Data = xs[:len(xs)-1]
+			v := ao.Elems[len(ao.Elems)-1]
+			ao.Elems = ao.Elems[:len(ao.Elems)-1]
 			return v
 		},
 	)
@@ -473,12 +471,12 @@ Returns:
 			if a.Tag != VTArray {
 				fail("shift expects array")
 			}
-			xs := a.Data.([]Value)
-			if len(xs) == 0 {
+			ao := a.Data.(*ArrayObject)
+			if len(ao.Elems) == 0 {
 				fail("shift on empty array")
 			}
-			v := xs[0]
-			a.Data = xs[1:]
+			v := ao.Elems[0]
+			ao.Elems = ao.Elems[1:]
 			return v
 		},
 	)
@@ -504,10 +502,10 @@ func cloneValue(v Value) Value {
 		return v
 
 	case VTArray:
-		xs := v.Data.([]Value)
-		cp := make([]Value, len(xs))
-		for i := range xs {
-			cp[i] = cloneValue(xs[i])
+		ao := v.Data.(*ArrayObject)
+		cp := make([]Value, len(ao.Elems))
+		for i := range ao.Elems {
+			cp[i] = cloneValue(ao.Elems[i])
 		}
 		out := Arr(cp)
 		out.Annot = v.Annot // preserve array-level annotation

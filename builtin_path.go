@@ -30,7 +30,7 @@ func registerPathBuiltins(ip *Interpreter) {
 			if pv.Tag != VTArray {
 				fail("pathJoin: parts must be [Str]")
 			}
-			items := pv.Data.([]Value)
+			items := pv.Data.(*ArrayObject).Elems
 			elems := make([]string, 0, len(items))
 			for i, v := range items {
 				if v.Tag != VTStr {

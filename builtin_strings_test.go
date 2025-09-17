@@ -74,7 +74,7 @@ func Test_Builtin_Strings_Split_Empty_And_NotFound(t *testing.T) {
 	if runes.Tag != VTArray {
 		t.Fatalf("split should return array, got %#v", runes)
 	}
-	rs := runes.Data.([]Value)
+	rs := runes.Data.(*ArrayObject).Elems
 	// Expect exactly the code points, no empty strings at the ends.
 	if len(rs) != 2 ||
 		rs[0].Tag != VTStr || rs[0].Data.(string) != "h" ||
@@ -83,8 +83,8 @@ func Test_Builtin_Strings_Split_Empty_And_NotFound(t *testing.T) {
 	}
 
 	none := m["none"]
-	if none.Tag != VTArray || len(none.Data.([]Value)) != 1 ||
-		none.Data.([]Value)[0].Data.(string) != "abc" {
+	if none.Tag != VTArray || len(none.Data.(*ArrayObject).Elems) != 1 ||
+		none.Data.(*ArrayObject).Elems[0].Data.(string) != "abc" {
 		t.Fatalf(`split on absent sep should return ["abc"], got %#v`, none)
 	}
 }
@@ -134,7 +134,7 @@ func Test_Builtin_Strings_Regex_Match_And_Replace(t *testing.T) {
 	if vm.Tag != VTArray {
 		t.Fatalf("match should return array, got %#v", vm)
 	}
-	xs := vm.Data.([]Value)
+	xs := vm.Data.(*ArrayObject).Elems
 	if len(xs) != 2 || xs[0].Tag != VTStr || xs[1].Tag != VTStr ||
 		xs[0].Data.(string) != "a" || xs[1].Data.(string) != "bc" {
 		t.Fatalf("match results wrong: %#v", vm)
@@ -186,7 +186,7 @@ func Test_Builtin_Strings_Smoke_Combined(t *testing.T) {
 	if m["st"].Data.(string) != "x" || m["ls"].Data.(string) != "x  " || m["rs"].Data.(string) != "x" {
 		t.Fatalf("strip/lstrip/rstrip failed: st=%#v ls=%#v rs=%#v", m["st"], m["ls"], m["rs"])
 	}
-	if sp := m["sp"]; sp.Tag != VTArray || len(sp.Data.([]Value)) != 3 {
+	if sp := m["sp"]; sp.Tag != VTArray || len(sp.Data.(*ArrayObject).Elems) != 3 {
 		t.Fatalf("split failed: %#v", sp)
 	}
 	if m["jn"].Data.(string) != "a-b-c" {

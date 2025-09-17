@@ -226,7 +226,7 @@ func valueToGoJSON(v Value) (any, error) {
 	case VTStr:
 		return v.Data.(string), nil
 	case VTArray:
-		xs := v.Data.([]Value)
+		xs := v.Data.(*ArrayObject).Elems
 		out := make([]any, len(xs))
 		for i := range xs {
 			el, err := valueToGoJSON(xs[i])

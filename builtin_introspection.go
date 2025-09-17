@@ -31,7 +31,7 @@ func softFirstValidationError(errs Value) Value {
 	if errs.Tag != VTArray {
 		return annotNull(`Validation error at /: invalid validator output (E_INTERNAL)`)
 	}
-	items := errs.Data.([]Value)
+	items := errs.Data.(*ArrayObject).Elems
 	if len(items) == 0 {
 		return annotNull(`Validation error at /: (empty) (E_INTERNAL)`)
 	}
@@ -82,7 +82,7 @@ func decodeAndValidate(av Value) (S, Value) {
 	if err != nil {
 		return nil, annotNull(err.Error())
 	}
-	if verrs := IxValidateS(sexpr); verrs.Tag == VTArray && len(verrs.Data.([]Value)) > 0 {
+	if verrs := IxValidateS(sexpr); verrs.Tag == VTArray && len(verrs.Data.(*ArrayObject).Elems) > 0 {
 		return nil, softFirstValidationError(verrs)
 	}
 	return sexpr, Null

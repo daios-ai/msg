@@ -11,7 +11,7 @@ func arrStrs(t *testing.T, v Value) []string {
 	if v.Tag != VTArray {
 		t.Fatalf("expected array, got %#v", v)
 	}
-	xs := v.Data.([]Value)
+	xs := v.Data.(*ArrayObject).Elems
 	out := make([]string, len(xs))
 	for i, it := range xs {
 		if it.Tag != VTStr {

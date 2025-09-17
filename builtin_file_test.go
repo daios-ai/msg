@@ -48,7 +48,7 @@ func mustArray(t *testing.T, v Value) []Value {
 	if v.Tag != VTArray {
 		t.Fatalf("expected array; got %#v", v)
 	}
-	return v.Data.([]Value)
+	return v.Data.(*ArrayObject).Elems
 }
 
 func contains(xs []string, s string) bool {

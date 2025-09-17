@@ -158,7 +158,7 @@ const (
 	VTInt                    // int64
 	VTNum                    // float64
 	VTStr                    // string
-	VTArray                  // []Value
+	VTArray                  // *ArrayObject
 	VTMap                    // *MapObject (ordered map)
 	VTFun                    // *Fun (closure; native or user-defined)
 	VTType                   // *TypeValue (type AST + definition env)
@@ -182,6 +182,12 @@ type Value struct {
 	Tag   ValueTag
 	Data  interface{}
 	Annot string
+}
+
+// ArrayObject gives arrays reference semantics (like MapObject), so mutations
+// (push/pop/shift/unshift/index-assign) are observed by all aliases.
+type ArrayObject struct {
+	Elems []Value
 }
 
 // Handle is the single opaque/userdata-like carrier (Lua-style).
@@ -210,7 +216,7 @@ func (v Value) String() string {
 	case VTStr:
 		return fmt.Sprintf("%q", v.Data.(string))
 	case VTArray:
-		return fmt.Sprintf("<array len=%d>", len(v.Data.([]Value)))
+		return fmt.Sprintf("<array len=%d>", len(v.Data.(*ArrayObject).Elems))
 	case VTMap:
 		return "<map>"
 	case VTFun:
@@ -232,7 +238,7 @@ func Bool(b bool) Value    { return Value{Tag: VTBool, Data: b} }
 func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
 func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
 func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
-func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: xs} }
+func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: &ArrayObject{Elems: xs}} }
 
 // MapObject is an ordered map preserving insertion order and per-key annotations.
 //
@@ -314,8 +320,8 @@ type Fun struct {
 	Chunk      *Chunk // JIT result (from vm.go) — internal use only
 	NativeName string // non-empty for registered natives
 
-	IsOracle bool    // oracle marker
-	Examples []Value // optional examples for tooling
+	IsOracle bool  // oracle marker
+	Examples Value // VTArray of [input, output] pairs, or Null when none
 
 	Src *SourceRef // source metadata (optional)
 }
@@ -791,7 +797,7 @@ func (ip *Interpreter) Clone() *Interpreter {
 			Chunk:      nil,           // no JIT chunk for natives
 			NativeName: of.NativeName,
 			IsOracle:   of.IsOracle,
-			Examples:   append([]Value(nil), of.Examples...),
+			Examples:   of.Examples,
 			HiddenNull: of.HiddenNull,
 			Src:        of.Src, // optional; safe to share for diagnostics
 		}

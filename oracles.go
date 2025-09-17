@@ -96,14 +96,14 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	var declTypes []S
 	if f.Env != nil {
 		if nv, err := f.Env.Get("$__sig_names"); err == nil && nv.Tag == VTArray {
-			for _, v := range nv.Data.([]Value) {
+			for _, v := range nv.Data.(*ArrayObject).Elems {
 				if v.Tag == VTStr {
 					paramNames = append(paramNames, v.Data.(string))
 				}
 			}
 		}
 		if tv, err := f.Env.Get("$__sig_types"); err == nil && tv.Tag == VTArray {
-			for _, v := range tv.Data.([]Value) {
+			for _, v := range tv.Data.(*ArrayObject).Elems {
 				if v.Tag == VTType {
 					if tvv, ok := v.Data.(*TypeValue); ok {
 						declTypes = append(declTypes, tvv.Ast)
@@ -210,7 +210,7 @@ func (ip *Interpreter) buildOraclePrompt(
 	}
 	declTypes := []S{}
 	if inTypes.Tag == VTArray {
-		for _, v := range inTypes.Data.([]Value) {
+		for _, v := range inTypes.Data.(*ArrayObject).Elems {
 			if v.Tag == VTType {
 				if tv, ok := v.Data.(*TypeValue); ok {
 					declTypes = append(declTypes, tv.Ast)
@@ -274,22 +274,15 @@ func (ip *Interpreter) buildOraclePrompt(
 
 	// Examples.
 	if examples.Tag == VTArray {
-		for _, ex := range examples.Data.([]Value) {
-			var inVal, outVal Value
-			switch ex.Tag {
-			case VTArray:
-				pair := ex.Data.([]Value)
-				if len(pair) != 2 {
-					continue
-				}
-				inVal, outVal = pair[0], pair[1]
-			case VTMap:
-				mo := ex.Data.(*MapObject)
-				inVal = mo.Entries["input"]
-				outVal = mo.Entries["output"]
-			default:
+		for _, ex := range examples.Data.(*ArrayObject).Elems {
+			if ex.Tag != VTArray {
 				continue
 			}
+			pair := ex.Data.(*ArrayObject).Elems
+			if len(pair) != 2 {
+				continue
+			}
+			inVal, outVal := pair[0], pair[1]
 
 			bld.WriteString("TASK:\n\n")
 			bld.WriteString(taskLine + "\n\n")
@@ -333,15 +326,19 @@ func valueMapFromArgs(ctx CallCtx, names []string) Value {
 	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: map[string]string{}, Keys: keys}}
 }
 
-// Box examples: each example is [inVal, outVal]; normalize to maps:
+// Box examples: each example is [inVal, outVal]; normalize to maps for prompt rendering:
 // input → map[name]=..., output → {"output": outVal}.
-func boxExamplesAsMaps(exs []Value, names []string) []Value {
-	out := make([]Value, 0, len(exs))
-	for _, ex := range exs {
+// Accepts a VTArray of pairs (or Null → returns empty).
+func boxExamplesAsMaps(exs Value, names []string) []Value {
+	out := []Value{}
+	if exs.Tag != VTArray {
+		return out
+	}
+	for _, ex := range exs.Data.(*ArrayObject).Elems {
 		if ex.Tag != VTArray {
 			continue
 		}
-		pair := ex.Data.([]Value)
+		pair := ex.Data.(*ArrayObject).Elems
 		if len(pair) != 2 {
 			continue
 		}
@@ -351,16 +348,10 @@ func boxExamplesAsMaps(exs []Value, names []string) []Value {
 		inMap := map[string]Value{}
 		keys := []string{}
 		if inV.Tag == VTArray {
-			xs := inV.Data.([]Value)
+			xs := inV.Data.(*ArrayObject).Elems
 			for i := 0; i < len(xs) && i < len(names); i++ {
 				inMap[names[i]] = xs[i]
 				keys = append(keys, names[i])
-			}
-		} else if inV.Tag == VTMap {
-			mo := inV.Data.(*MapObject)
-			for _, k := range mo.Keys {
-				inMap[k] = mo.Entries[k]
-				keys = append(keys, k)
 			}
 		} else {
 			// Single-arg case: use first name if available.

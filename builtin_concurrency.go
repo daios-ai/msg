@@ -19,7 +19,11 @@ type chanBox struct {
 }
 
 func safeSend(ch chan Value, v Value) (ok bool) {
-	defer func() { _ = recover() }()
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
 	ch <- v
 	return true
 }
@@ -62,7 +66,7 @@ func deepCloneValue(ctx *cloneCtx, v Value, targetCore *Env) Value {
 		return v
 
 	case VTArray:
-		src := v.Data.([]Value)
+		src := v.Data.(*ArrayObject).Elems
 		cp := make([]Value, len(src))
 		for i := range src {
 			cp[i] = deepCloneValue(ctx, src[i], targetCore)
@@ -113,7 +117,7 @@ func deepCloneValue(ctx *cloneCtx, v Value, targetCore *Env) Value {
 			Chunk:      f.Chunk,
 			NativeName: f.NativeName,
 			IsOracle:   f.IsOracle,
-			Examples:   append([]Value(nil), f.Examples...),
+			Examples:   deepCloneValue(ctx, f.Examples, targetCore),
 			Src:        f.Src,
 		}
 		ctx.seenFun[f] = nf
@@ -161,7 +165,7 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 				Chunk:      orig.Chunk,
 				NativeName: orig.NativeName,
 				IsOracle:   orig.IsOracle,
-				Examples:   append([]Value(nil), orig.Examples...),
+				Examples:   deepCloneValue(cc, orig.Examples, child.Core),
 				Src:        orig.Src,
 			}
 			execVal := FunVal(work)
@@ -274,7 +278,7 @@ Returns:
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
 		S{"array", S{"id", "Any"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ps := ctx.MustArg("ps").Data.([]Value)
+			ps := ctx.MustArg("ps").Data.(*ArrayObject).Elems
 			out := make([]Value, len(ps))
 			for i, p := range ps {
 				pr := asHandle(p, "proc").Data.(*procState)
@@ -298,7 +302,7 @@ Returns:
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
 		S{"unop", "?", S{"map"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ps := ctx.MustArg("ps").Data.([]Value)
+			ps := ctx.MustArg("ps").Data.(*ArrayObject).Elems
 			if len(ps) == 0 {
 				return errNull("procJoinAny: empty list")
 			}

@@ -640,7 +640,7 @@ Returns:
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			f := ctx.MustArg("fmt").Data.(string)
-			as := ctx.MustArg("args").Data.([]Value)
+			as := ctx.MustArg("args").Data.(*ArrayObject).Elems
 			goArgs := make([]any, len(as))
 			for i := range as {
 				goArgs[i] = fmtArgFromValue(as[i])
@@ -676,7 +676,7 @@ Returns:
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
 			f := ctx.MustArg("fmt").Data.(string)
-			as := ctx.MustArg("args").Data.([]Value)
+			as := ctx.MustArg("args").Data.(*ArrayObject).Elems
 			goArgs := make([]any, len(as))
 			for i := range as {
 				goArgs[i] = fmtArgFromValue(as[i])

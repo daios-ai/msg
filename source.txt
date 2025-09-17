@@ -1,1453 +1,708 @@
-=== BEGIN FILE: data/msplain.md ===
-# MindScript Language Manual (Human-Oriented)
+=== BEGIN FILE: builtin_introspection.go ===
+// ast_introspection_builtins.go
+//
+// Builtins surfaced:
+//  1. noteGet(x: Any) -> Str?
+//  2. noteSet(text: Str, value: Any) -> Any
+//  3. astParse(src: Str) -> []                 // error on lex/parse failure
+//  4. astEval(ast: []) -> Any                  // Decode → Validate → Eval; errors on validation/eval failures
+//  5. astFormat(ast: []) -> Str                // Decode → Validate → Format; soft error on invalid
+//  6. astValidate(ast: []) -> [ {path!:Str, code!:Str, message!:Str, got!:Str, expect!:Str} ]
+//  7. reflect(val: Any) -> []                  // constructor code; soft error on unreflectable values
+//  8. reify(rt: []) -> Any?                    // Decode → Validate → EvalPersistent; soft errors on decode/validate/eval
+//
+// Conventions:
+//   - Functions are camelCase; docs are docstring-style (first line, blank, details).
+//   - Uses public API only; hard errors via fail(...).
+//   - No panic shield: unexpected panics bubble up (by request).
+//   - Tabs for indentation.
+//   - All errors are null with an error message as an annotation except when there is a critical error (e.g. runtime error)
+package mindscript
 
-MindScript is a compact, expression-oriented language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that actually guides oracles) while keeping syntax clean and readable.
+import (
+	"strconv"
+)
 
----
+// ---- internal helpers ------------------------------------------------------
 
-## 1) Core Ideas
-
-* **Everything is an expression.** Blocks, conditionals, loops, and declarations evaluate to a value (often the last subexpression).
-* **Strict left-to-right evaluation.** Receivers, operands, and arguments are evaluated left to right.
-* **Structural types are first-class.** Types can be named, passed around, and introspected.
-* **Two kinds of failure.**
-
-  * **Hard errors** abort execution (`fail`), catchable via `try`.
-  * **Soft errors** are ordinary values annotated with a reason, typically using `null` of a nullable type (`T?`), with an attached trailing comment.
-
----
-
-## 2) Lexical Conventions
-
-### 2.1 Whitespace & indentation
-
-* Indentation uses **tabs** (not spaces) for canonical formatting.
-* Canonicalized output ends with exactly **one** trailing newline.
-
-### 2.2 Comments & annotations
-
-MindScript uses a single, unified comment system that also carries metadata:
-
-* **PRE annotations (header comments)**: one or more lines starting with `#` immediately **above** the construct they describe.
-* **POST annotations (inline trailing)**: ` # …` placed at the **end** of the line for a construct.
-  POST **forces a newline** after it.
-
-**After-separator rule (important):**
-
-* In comma/colon separated lists (arrays, enums, destructuring arrays, value arrays), a POST attached to an element is printed **after the comma that follows that element** (or after the element itself, if it’s the last one).
-* In **maps and object patterns/types**:
-
-  * A **key POST** appears on the key line **after the colon**: `key: # post`
-  * A **value POST** in a non-last entry appears **after the following comma**: `key: value, # post`
-
-**Examples**
-
-```mindscript
-# PRE describes the next value
-[ 1, 2, 3 ] # POST explains this array
-
-[ 1, # POST belongs to 1 and goes after the comma
-  2 ]
-
-{
-	key: # POST on key after colon
-	42
+// softFirstValidationError converts IxValidateS's VTArray of error maps into
+// a single annotated-null encapsulating ONLY the first error (for callers that
+// want a single soft error: astEval/astFormat/reify).
+func softFirstValidationError(errs Value) Value {
+	if errs.Tag != VTArray {
+		return annotNull(`Validation error at /: invalid validator output (E_INTERNAL)`)
+	}
+	items := errs.Data.(*ArrayObject).Elems
+	if len(items) == 0 {
+		return annotNull(`Validation error at /: (empty) (E_INTERNAL)`)
+	}
+	first := items[0]
+	if first.Tag != VTMap {
+		return annotNull(`Validation error at /: invalid error entry (E_INTERNAL)`)
+	}
+	m := first.Data.(*MapObject).Entries
+	get := func(k string) string {
+		if v, ok := m[k]; ok && v.Tag == VTStr {
+			return v.Data.(string)
+		}
+		return ""
+	}
+	path := get("path")
+	code := get("code")
+	msg := get("message")
+	got := get("got")
+	exp := get("expect")
+	detail := `(` + strconv.Quote(code) +
+		`, got:` + strconv.Quote(got) +
+		`, expect:` + strconv.Quote(exp) + `)`
+	return annotNull(`Validation error at ` + path + `: ` + msg + ` ` + detail)
 }
 
-{
-	a: 1, # POST for 'a' after the comma
-	b: 2
+// valShapeErrors builds the **array-of-error-objects** shape for astValidate()
+// when the packed runtime-S cannot be decoded.
+func valShapeErrors(detail string) Value {
+	return Arr([]Value{
+		Map(map[string]Value{
+			"path":    Str("/"),
+			"code":    Str("E_RUNTIME_SHAPE"),
+			"message": Str("invalid runtime-S"),
+			"got":     Str(detail),
+			"expect":  Str("[]"),
+		}),
+	})
 }
-```
 
----
-
-## 3) Values
-
-Primitive scalars:
-
-* `null`, `true`, `false`
-* Integers (unbounded in spec; implementations may use 64-bit): `0`, `-7`
-* Numbers (float64): `2.0`, `1e-3`
-* Strings: `"hello\nworld"`
-
-Composite:
-
-* Arrays: `[a, b, c]`
-* Maps: `{ key: value, "not-ident": 1 }`
-  Map keys that look like identifiers are bare; otherwise they are quoted.
-
----
-
-## 4) Types (Structural and First-Class)
-
-Base types: `Any | Null | Bool | Int | Num | Str | Type`
-Nullable: `T?`
-Arrays: `[T]`
-Open maps (string keys): `{ field!: T, other: U }` — `!` marks **required** fields; others are optional.
-Enums (literal sets): `Enum[ lit1, lit2, ... ]` where literals can be scalars, arrays, or maps.
-Functions & oracles: `(A, B) -> R` (right-associative; `(A) -> (B) -> R` flattens to `(A, B) -> R`).
-
-**Subtyping (informal):**
-
-* `Int <: Num`
-* `T?` matches `null` or `T`
-* Arrays covariant by element type
-* Maps fieldwise; requiredness can only become **more** required (not less)
-* Enums by member subset
-* Functions/oracles: parameters **contravariant**, return **covariant**
-* `Any` is top
-
-**Examples**
-
-```mindscript
-type Ints = [Int]
-type Person = { name!: Str, age: Int }
-type Method = (Str, Num) -> Bool
-type MaybeText = Str?
-type Verb = Enum[ "GET", "POST" ]
-```
-
----
-
-## 5) Expressions & Operators
-
-### 5.1 Precedence (high → low)
-
-* Calls / indexing / property: `f(x)`, `a[i]`, `obj.field`
-* Unary: `-x`, `not x`, type-nullable constructor prints as `T?`
-* Binary arithmetic: `* / %`, then `+ -`
-* Comparisons: `< <= > >=`
-* Equality: `== !=` (deep for arrays/maps; number equality by value; `2 == 2.0` is true)
-* Boolean: `and`, then `or`
-* Assignment (`=`) is an expression with low precedence (rarely used in nested exprs; prefer statements).
-
-**Rules**
-
-* **Relational ops** only compare **number–number** (mixing `Int`/`Num` allowed) or **string–string**; other mixes are **hard errors**.
-* Arithmetic promotes as needed; `/` yields a floating result.
-* `%` follows the dividend sign.
-
-**Examples**
-
-```mindscript
-2 + 2.5
-not (a < 3 and b == 0)
-x = y + 1
-obj.field[0].sub(42)
-```
-
----
-
-## 6) Variables, Patterns & Assignment
-
-Identifiers: `x`, `_tmp`, `Name_2`
-
-**Declaration** uses `let` with a **pattern**:
-
-* Single name: `let x = 10`
-* Array destructuring (missing entries bind to `null`; extra items ignored unless matched):
-
-  ```mindscript
-  let [a, b] = [1, 2, 3]   # a=1, b=2
-  ```
-* Object destructuring (missing keys bind to `null`):
-
-  ```mindscript
-  let { name: n, age: a } = { name: "Ada" }  # n="Ada", a=null
-  ```
-
-**Update** assigns to l-values (`name`, `obj.field`, `arr[i]`). Updating an unbound name is a **hard error**:
-
-```mindscript
-let x = 1
-x = 2
-```
-
-There are no named declarations. Functions, types, modules, etc. are all
-anonymous and need to be bound to a variable for later reference.
-```
-let f = fun() do true end
-let T = type {name: Str}
-let m = module "m" do ... end
-```
-
----
-
-## 7) Control Flow
-
-### 7.1 Blocks
-
-A block returns the last subexpression (or `null` if empty):
-
-```mindscript
-do
-	1
-	2
-end   # => 2
-```
-
-### 7.2 If / elif / else
-
-```mindscript
-if cond then
-	doSomething()
-elif other then
-	handleOther()
-else
-	default()
-end
-```
-
-### 7.3 While
-
-```mindscript
-while i < 10 do
-	i = i + 1
-end
-```
-
-### 7.4 For (arrays, maps, modules, host iterables)
-
-```mindscript
-let sum = 0
-for x in [1, 2, 3] do
-	sum = sum + x
-end
-sum
-```
-
-When iterating a map, the loop yields `[key, value]` pairs:
-
-```mindscript
-for [k, v] in { a: 1, b: 2 } do
-	write(STDOUT, sprintf("%s=%d\n", [k, v]))
-end
-```
-
-### 7.5 Early exits
-
-`return expr`, `break expr`, `continue [expr]` — each carries a value; `null` payload prints as the bare keyword:
-
-```mindscript
-while true do
-	break "done"
-end
-```
-
----
-
-## 8) Functions & Oracles
-
-### 8.1 Functions
-
-```mindscript
-# Increment an Int by 1.
-# Args: n:Int
-# Return: Int
-fun(n: Int) -> Int do
-	n + 1
-end
-```
-
-* Parameter types and return types should be explicit in public APIs.
-* Omissions default to `Any` in the surface grammar but are **not** printed by canonical formatters:
-
-  * `fun(x) do ... end` means `x: Any`
-  * `-> Any` may be omitted when returning `Any`
-* Calls are **curried** semantically, but the surface form is standard calls: `f(a)(b)` is allowed; `f(a, b)` is conventional.
-* The **actual** returned value must conform to the declared return type; otherwise **hard error**.
-
-### 8.2 Oracles (typed generative calls)
-
-An oracle behaves like a function with **typed inputs** and an **uncertain** output: calls never hard-fail; instead they produce a value of `R?`.
-
-```mindscript
-# Pick a primary color.
-# Return: Enum[ "red", "green", "blue" ]?
-oracle() -> Enum[ "red", "green", "blue" ]
-```
-
-**Calling rules**
-
-* Argument arity/types are checked **strictly** (hard errors on mismatch).
-* Output is treated as `R?`:
-
-  * If the generated candidate conforms to `R`, it’s returned.
-  * Otherwise or if unavailable, you get a **soft** `null` with a trailing POST reason.
-
----
-
-## 9) Modules
-
-Modules encapsulate a namespace and evaluate to a **module value** (iterable like a map of exports).
-
-```mindscript
-module "mathx" do
-	let PI2 = 2.0 * PI
-
-	fun area(r: Num) -> Num do
-		PI * r * r
-	end
-end
-```
-
-* Outer bindings aren’t visible unless passed in explicitly.
-* Values are visible via property access: `m.area(3.0)`.
-* Modules print as `<module: name>` in value formatting when available.
-
----
-
-## 10) Annotations & Soft Errors
-
-Annotations are your single, unified mechanism for documentation and soft signaling.
-
-* **PRE**: lines beginning with `#` immediately above the construct/value.
-* **POST**: trailing ` # …` that forces a newline and obeys the **after-separator** rule.
-
-Soft failures are represented as **nullable types** returning `null` with a POST:
-
-```mindscript
-# Factorial with input check.
-# Args: n:Int
-# Return: Int? (annot-null if n < 0)
-fun(n: Int) -> Int? do
-	if n < 0 then
-		return null # <negative input>
-	end
-	let res = 1
-	let i = 2
-	while i <= n do
-		res = res * i
-		i = i + 1
-	end
-	res
-end
-```
-
-Guidelines:
-
-* Prefer `T?` + annotated `null` over throwing for expected/uncertain conditions.
-* Keep POST short and actionable. PRE is for human docs.
-
----
-
-## 11) Equality, Comparison, Truthiness
-
-* `==` / `!=` are **deep** for arrays and maps (map key order ignored).
-  Numbers compare by value (`2 == 2.0` is true).
-* `< <= > >=` only allow **number–number** or **string–string**; other mixes are **hard errors**.
-* Booleans are **not** implicitly coerced from numbers/strings in these operators; use explicit conversion helpers if needed.
-
----
-
-## 12) Standard Library (Practical Reference)
-
-### Constants & Handles
-
-* `E: 2.718281828459045` — Euler’s number.
-* `PI: 3.141592653589793` — π.
-* `STDERR: <handle: file>` — Writable standard error.
-* `STDIN: <handle: file>` — Readable standard input.
-* `STDOUT: <handle: file>` — Writable standard output.
-
-### Core runtime & assertions
-
-* `assert: <fun: cond:Bool -> Bool>` — Hard-fail if `cond` is false; returns true otherwise.
-* `fail: <fun: message:Str? -> Null>` — Hard error.
-* `error: <fun: msg:Str -> Null>` — **Soft** error (returns `null` with annotation).
-* `print: <fun: x:Any -> Any>` / `println: <fun: x:Any -> Any>` — Print (with/without newline) and return `x`.
-* `try: <fun: f:Any -> {}>` — Capture hard failures. **Shape:** `{ ok!: Bool, value: Any, error: Str }`.
-
-### Introspection, Types & Reflection
-
-* `snapshot: <fun: _:Null -> {}>` — Map snapshot of visible env.
-* `typeOf: <fun: x:Any -> Type>`
-* `isType: <fun: x:Any -> T:Type -> Bool>`
-* `isSubtype: <fun: A:Type -> B:Type -> Bool>`
-* `formatValue: <fun: x:Any -> Str>`
-* `formatCode: <fun: src:Str -> Str?>`
-* `reflect: <fun: val:Any -> [Any]?>`
-* `reify: <fun: rt:[Any] -> Any>`
-* `astParse: <fun: src:Str -> [Any]?>`
-* `astValidate: <fun: ast:[Any] -> [Any]>`
-* `astEval: <fun: ast:[Any] -> Any>`
-* `astFormat: <fun: ast:[Any] -> Str?>`
-* `dir: <fun: x:{} -> [Str]>` — Field/function names on an object.
-* `uid: <fun: value:Any -> Int>` — Stable-ish content id.
-
-### Serialization, Schemas & Encoding
-
-* `jsonParse: <fun: s:Str -> Any>`
-* `jsonStringify: <fun: x:Any -> Str?>`
-* `jsonSchemaToType: <fun: schema:Any -> Type?>`
-* `jsonSchemaStringToType: <fun: src:Str -> Type>`
-* `typeToJSONSchema: <fun: t:Type -> Any>`
-* `typeStringToJSONSchema: <fun: src:Str -> Any>`
-* `base64Encode: <fun: x:Str -> Str>` / `base64Decode: <fun: s:Str -> Str?>`
-* `hexEncode: <fun: x:Str -> Str>` / `hexDecode: <fun: s:Str -> Str?>`
-* `gzipCompress: <fun: data:Str -> Str>` / `gzipDecompress: <fun: data:Str -> Str?>`
-
-### Conversion & Length
-
-* `bool: <fun: x:Any -> Bool>`
-* `int: <fun: x:Any -> Int?>`
-* `num: <fun: x:Any -> Num?>`
-* `str: <fun: x:Any -> Str?>`
-* `len: <fun: x:Any -> Int?>`
-
-### Strings & Text
-
-* `join: <fun: xs:[Str] -> sep:Str -> Str>`
-* `split: <fun: s:Str -> sep:Str -> [Str]>`
-* `match: <fun: pattern:Str -> string:Str -> [Str]>`
-* `replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str>`
-* `sprintf: <fun: fmt:Str -> args:[Any] -> Str?>`
-* `printf: <fun: fmt:Str -> args:[Any] -> Str?>`
-* `substr: <fun: s:Str -> i:Int -> j:Int -> Str>`
-* `toLower: <fun: s:Str -> Str>` / `toUpper: <fun: s:Str -> Str>`
-* `strip: <fun: s:Str -> Str>` / `lstrip: <fun: s:Str -> Str>` / `rstrip: <fun: s:Str -> Str>`
-* `noteGet: <fun: x:Any -> Str?>` / `noteSet: <fun: text:Str -> value:Any -> Any>`
-
-### Math
-
-* `sin | cos | tan | sqrt | exp | log | pow` — Standard float math.
-
-### Randomness & Crypto
-
-* `seedRand: <fun: n:Int -> Null>`
-* `randFloat: <fun: _:Null -> Num>`
-* `randInt: <fun: n:Int -> Int>`
-* `randBytes: <fun: n:Int -> Str?>`
-* `sha256: <fun: x:Str -> Str>`
-* `hmacSha256: <fun: key:Str -> msg:Str -> Str>`
-* `ctEqual: <fun: a:Str -> b:Str -> Bool>`
-
-### Time & Scheduling
-
-* `dateNow: <fun: _:Null -> {}>`
-* `nowMillis: <fun: _:Null -> Int>` / `nowNanos: <fun: _:Null -> Int>`
-* `sleep: <fun: ms:Int -> Null>`
-* `ticker: <fun: ms:Int -> Any>` — Periodic ticks on a channel.
-* `timerAfter: <fun: ms:Int -> Any>` — One tick after delay.
-* `timeFormatRFC3339: <fun: millis:Int -> Str>`
-* `timeParseRFC3339: <fun: s:Str -> Int?>`
-
-### Channels (CSP-style)
-
-* `chanOpen: <fun: cap:Int? -> Any>`
-* `chanClose: <fun: c:Any -> Null>`
-* `chanSend: <fun: c:Any -> x:Any -> Null>`
-* `chanRecv: <fun: c:Any -> Any>`
-* `chanTrySend: <fun: c:Any -> x:Any -> Bool>`
-* `chanTryRecv: <fun: c:Any -> {}>` — Non-blocking receive result.
-
-### Iterators & Sequences
-
-* `iter: <fun: v:Any -> Null -> Any?>` — Arrays/maps → iterator; iterators pass through.
-* `map: <fun: f:(Any -> Any) -> it:(Null -> Any?) -> Null -> Any?>`
-* `filter: <fun: cond:(Any -> Bool) -> it:(Null -> Any?) -> Null -> Any?>`
-* `reduce: <fun: f:((Any, Any) -> Any) -> it:(Null -> Any?) -> Any?>`
-* `list: <fun: it:(Null -> Any?) -> [Any]>` — Collect.
-* `range: <fun: start:Int -> stop:Int? -> Null -> Int?>` — `[start, stop)`; infinite if `stop=null`.
-* `naturals: <fun: _:Null -> Null -> Int>` — 1, 2, 3, …
-* `naturals0: <fun: _:Null -> Null -> Int>` — 0, 1, 2, …
-* `keys: <fun: obj:{} -> Null -> Str?>` — Iterate keys.
-* `values: <fun: obj:{} -> Null -> Any?>` — Iterate values.
-
-### Arrays (helpers)
-
-* `push: <fun: xs:[Any] -> v:Any -> [Any]>` — Returns new array.
-* `pop: <fun: xs:[Any] -> Any?>` — Last element (no mutation).
-* `shift: <fun: xs:[Any] -> v:Any -> [Any]>` — Prepend (returns new array).
-* `unshift: <fun: xs:[Any] -> Any?>` — First element (peek).
-* `slice: <fun: xs:[Any] -> s:Int -> e:Int -> [Any]>`
-
-### Maps (helpers)
-
-* `mapDelete: <fun: obj:{} -> key:Str -> {}>` — Delete a property from a map (in place).
-* `mapHas: <fun: obj:{} -> key:Str -> Bool>` — Return true if a key exists in a map.
-
-### Processes & Concurrency
-
-* `procSpawn: <fun: f:Any -> Any>` — Run in isolated process.
-* `procCancel: <fun: p:Any -> Null>`
-* `procCancelled: <fun: p:Any -> Bool>`
-* `procJoin: <fun: p:Any -> Any>`
-* `procJoinAll: <fun: ps:[Any] -> [Any]>`
-* `procJoinAny: <fun: ps:[Any] -> {}?>` — `{ index!: Int, value: Any }` when available.
-
-### Files, Paths & OS
-
-* `cwd: <fun: _:Null -> Str?>`
-* `chdir: <fun: path:Str -> Bool?>`
-* `dirList: <fun: path:Str -> [Str]?>`
-* `mkdir: <fun: path:Str -> Bool?>`
-* `open: <fun: path:Str -> mode:Enum["r","w","a","rw"] -> Any?>`
-* `readAll: <fun: h:Any -> Str?>`
-* `readN: <fun: h:Any -> n:Int -> Str?>`
-* `readLine: <fun: h:Any -> Str?>`
-* `write: <fun: h:Any -> s:Str -> Int?>`
-* `flush: <fun: h:Any -> Bool?>`
-* `close: <fun: h:Any -> Bool?>`
-* `readFile: <fun: path:Str -> Str?>`
-* `writeFile: <fun: path:Str -> data:Str -> Int?>`
-* `remove: <fun: path:Str -> Bool?>`
-* `rename: <fun: old:Str -> new:Str -> Bool?>`
-* `stat: <fun: path:Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?>`
-* `pathBase | pathDir | pathExt | pathClean | pathJoin`
-* `tempDir: <fun: _:Null -> Str>`
-
-### Environment & Modules
-
-* `osEnv: <fun: name:Str -> Str?>`
-* `osSetEnv: <fun: name:Str -> value:Str? -> Bool?>`
-* `import: <fun: path:Str -> Any>`
-* `importCode: <fun: name:Str -> src:Str -> Any>`
-* `codeImport: <fun: code:Str -> Str -> {}>` — Create importer from code string.
-* `importUrl: <fun: url:Str -> {}?>` — Import module from URL.
-
-### Networking & HTTP
-
-* `netListen: <fun: addr:Str -> Any>`
-* `netAccept: <fun: l:Any -> Any>`
-* `netConnect: <fun: addr:Str -> Any>`
-* `urlParse: <fun: s:Str -> {}?>`
-* `urlBuild: <fun: u:{} -> Str>`
-* `urlQueryParse: <fun: s:Str -> {}?>`
-* `urlQueryString: <fun: q:{} -> Str>`
-* `http: <?>` / `httpStream: <?>` / `exec: <?>` — **Implementation-defined**; wire types left unspecified in this spec.
-
-### Oracles (installation)
-
-* `oracleInstall: <fun: exec:(Str -> Str?) -> Null>` — Install global oracle executor.
-* `oracleHealth: <fun: _:Null -> {}?>` — Probe executor.
-* `oracleStatus: <fun: _:Null -> Str>` — Status string.
-* `llm: <module: llm>` — LLM module entrypoint (executor + default backend selection).
-
-### Misc
-
-* `mute: <fun: _:Any -> Null>` — Sink a value (ignore).
-* `clone: <fun: x:Any -> Any>` — Clone a value (deep-copy).
-
-
----
-
-## 13) Collections & Iteration Details
-
-* Arrays are 0-based; negative indices count from the end:
-
-  ```mindscript
-  let xs = [10, 20]
-  xs[-1]     # => 20
-  ```
-* Maps are open-world; unknown keys are allowed and simply absent.
-  Map addition merges: `{a: 0, b: 1} + {a: 1, c: 2}` => `{a: 1, b: 1, c: 2}`
-
-**Access**
-
-```mindscript
-obj.field        # property (quoted if needed)
-arr[i]           # 0-based, negative from end
-map["k"]         # explicit string key
-```
-
-Missing map keys or array out-of-bounds yield **soft** annotated null if the implementation chooses to surface it; idiomatic code uses `T?` and checks.
-
----
-
-## 14) Formatting Policy (Pretty & Standard)
-
-* Minimal parentheses based on fixed precedence.
-* No space before `(` in calls and parameter lists (`f(x)`, `fun(x)`).
-* Control keywords render without parens:
-
-  ```
-  return expr
-  break
-  continue
-  ```
-* Arrays/maps prefer single-line if they fit a width budget; otherwise multi-line with indentation.
-* When a POST ends the **last** element/entry line, the closing `]`/`}` appears on the **next line** and no extra blank line is inserted.
-
----
-
-## 15) Error Handling
-
-* Use **hard errors** (`fail`) for programmer mistakes or non-recoverable conditions. Catch with `try`.
-* Use **soft errors** (nullable types + annotations) when uncertainty or absence is expected.
-
-```mindscript
-# Extract host from URL; soft-null if invalid.
-fun host(url: Str) -> Str? do
-	let u = urlParse(url)
-	if u == null then
-		return null # <invalid url>
-	end
-	u.host
-end
-```
-
----
-
-## 16) Worked Examples
-
-### 16.1 Sum array
-
-```mindscript
-# Sum an array of Ints.
-fun sum(xs: [Int]) -> Int do
-	let acc = 0
-	for x in xs do
-		acc = acc + x
-	end
-	acc
-end
-```
-
-### 16.2 Map iteration with destructuring
-
-```mindscript
-for [k, v] in { a: 1, b: 2 } do
-	printf("%s=%d\n", [k, v])
-end
-```
-
-### 16.3 Destructuring patterns
-
-```mindscript
-let [a, b] = [1, 2, 3]   # a=1, b=2
-let { name: n, age: a } = { name: "Ada" }  # n="Ada", a=null
-```
-
-### 16.4 If / elif / else as an expression
-
-```mindscript
-let msg =
-	if ok then
-		"yes"
-	elif maybe then
-		"maybe"
-	else
-		"no"
-	end
-```
-
-### 16.5 Oracle with typed output
-
-```mindscript
-# Choose a color (may soft-fail).
-oracle() -> Enum[ "red", "green", "blue" ]
-
-let c = chooseColor()
-if c == null then
-	"no color" # <oracle unavailable>
-else
-	c
-end
-```
-
----
-
-## 17) Design Guidelines
-
-* **Public APIs**: declare explicit parameter and return types. Use `T?` only when soft errors are possible. Avoid exposing raw `null` in public contracts.
-* **Annotations**: use PRE for docs; use concise POST for machine-readable signals and pipeline logs.
-* **Canonicalization**: omit default `: Any` parameters and `-> Any` returns in source; formatters remove redundant parens and trailing commas, normalize quoting, and sort map keys in type/value printers for stability.
-
----
-
-## 18) Quick Reference (Cheat Sheet)
-
-```mindscript
-# Declaration & assignment
-let x = 1
-x = x + 1
-
-# Arrays & maps
-let xs = [1, 2, 3]
-let m  = { name: "Ada", age: 36 }
-
-# Access
-xs[0]; xs[-1]
-m.name; m["not-ident"]
-
-# Functions
-fun inc(n: Int) -> Int do n + 1 end
-inc(41)
-
-# Control
-if cond then A() elif other then B() else C() end
-while test() do step() end
-for x in xs do use(x) end
-
-# Return/break/continue
-return
-break "done"
-continue
-
-# Types
-let Pair = type { left!: Int, right!: Int }
-let F = type Int -> Num -> Str
-
-# Annotations
-# PRE above
-value # POST here forces newline
-```
-
----
-
-**End of Manual.**
-=== END FILE: data/msplain.md ===
-
-=== BEGIN FILE: data/msjson.md ===
-
-# JSON-MindScript Manual
-
-**JSON-MindScript** is a machine-readable, JSON-formatted, S-expressions language. Every construct is an expression. Every source file is **strict JSON**.
-
-**JSON-MindScript** is a language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that actually guides oracles).
-
----
-
-## Parsing Rule (Non-negotiable)
-
-* Sources must be **pure JSON**. No `//…`, `/*…*/`, `#…`, trailing commas, or JSON5/JSONC features.
-* Implementations must reject invalid JSON **before** evaluation.
-
-**Self-test:** your file should pass a vanilla JSON parser (e.g., `jq -e .`).
-
-**Negative (invalid) examples — do not copy:**
-
-**N-1**
-
-```json
-["array",
-  /* first guess */ ["int", 1],
-  ["int", 2]
-]
-```
-
-**N-2**
-
-```json
-["map",
-  ["pair", ["str","name"], ["str","Ada"]], 
-]
-```
-
----
-
-## Core Values & Evaluation
-
-**Tagged values:**
-`["null"]`, `["bool", true|false]`, `["int", <int64>]`, `["num", <float64>]`, `["str", <string>]`
-Arrays: `["array", v1, v2, ...]`
-Maps: `["map", ["pair", ["str","k"], v], ...]`
-Functions: `["fun", paramsArray, retTypeOrAny, bodyBlock]`
-Oracles: `["oracle", paramsArray, retType, optsMap?]` (§12)
-Modules: `["module", nameExpr, bodyBlock]`
-Types (first-class): `["type", typeExpr]`
-Annotations: `["annot", ["str", textOr<text>], value]` (§10)
-
-**Evaluation order:** strict left→right for receivers, operands, and arguments.
-**Equality & comparison:** deep for arrays/maps (map key order ignored). Numbers compare by value (`2 == 2.0`). Relational `< <= > >=` only **number–number** (Int and Num mix OK) or **string–string**; other mixes are **hard errors**. Annotations are ignored.
-
-**Errors:**
-Hard: `fail(msg)` aborts; catch with `["call","try", expr]`.
-Soft: annotated null → `["annot", ["str","<reason>"], ["null"]]`.
-
-**Examples**
-
-```json
-["int", 4]
-```
-
-```json
-["array", ["int",1], ["int",2], ["int",3]]
-```
-
-```json
-["map", ["pair", ["str","name"], ["str","Ada"]]]
-```
-
-```json
-["binop","==", ["int",2], ["num",2.0]]
-```
-
----
-
-## Operators & Access
-
-**Unary:** `["unop","-", x]`, `["unop","not", x]`, `["unop","?", T]` (nullable type constructor).
-**Binary:** arithmetic `+ - * / %` (numeric promotion; `%` follows dividend sign), comparisons, `== !=`, boolean `and`/`or` (short-circuit; booleans only).
-
-**Access & call:**
-Property: `["get", obj, ["str","name"]]`
-Index array: `["idx", arr, i]` (0-based; negative counts from end)
-Index map: `["idx", map, ["str","k"]]` (missing ⇒ soft annotated null)
-Call: `["call", callee, a1, ...]` (L→R evaluation)
-
-**Examples**
-
-```json
-["binop","+", ["int",2], ["num",2.5]]
-```
-
-```json
-["binop","and", ["bool", false], ["call", ["id","expensive"]]]
-```
-
-```json
-["idx", ["array", ["int",10], ["int",20]], ["int",1]]
-```
-
-```json
-["idx", ["map", ["pair", ["str","a"], ["int",1]]], ["str","b"]]
-```
-
-```json
-["call", ["id","sqrt"], ["num",9.0]]
-```
-
----
-
-## Collections
-
-Arrays: 0-based; negative indices count backward.
-Maps: string keys; later duplicates overwrite; **open-world** (unknown keys allowed).
-
-**Examples**
-
-```json
-["idx", ["array", ["int",1], ["int",2], ["int",3]], ["int",-1]]
-```
-
-```json
-["idx",
-  ["map",
-    ["pair", ["str","x"], ["int",1]],
-    ["pair", ["str","x"], ["int",2]]
-  ],
-  ["str","x"]
-]
-```
-
----
-
-## Variables & Assignment (Patterns)
-
-Identifiers: `["id","name"]`.
-
-Patterns:
-`["decl","x"]` | `["darr", p1, p2, ...]` | `["dobj", ["pair", ["str","k"], subPattern], ...]`
-
-* **Bind**: target is a pattern → introduces names.
-* **Update**: target is l-value (`"id"|"get"|"idx"`) → updates existing; missing binding ⇒ **hard**.
-* **Destructuring**: missing entries bind `["null"]`; extra array items ignored unless matched.
-
-**Examples**
-
-```json
-["assign", ["decl","x"], ["int",10]]
-```
-
-```json
-["block",
-  ["assign", ["decl","x"], ["int",1]],
-  ["assign", ["id","x"], ["int",2]],
-  ["id","x"]
-]
-```
-
-```json
-["assign", ["darr", ["decl","a"], ["decl","b"]], ["array", ["int",1], ["int",2], ["int",3]]]
-```
-
-```json
-["assign",
-  ["dobj",
-    ["pair", ["str","name"], ["decl","n"]],
-    ["pair", ["str","age"],  ["decl","a"]]
-  ],
-  ["map", ["pair", ["str","name"], ["str","Ada"]]]
-]
-```
-
----
-
-## Control Flow
-
-Block returns last value (or `["null"]` if empty):
-
-```json
-["block", ["int",1], ["int",2]]
-```
-
-If / elif / else:
-
-```json
-["if",
-  ["pair", ["bool", false], ["block", ["str","no"]]],
-  ["block", ["str","yes"]]
-]
-```
-
-While:
-
-```json
-["block",
-  ["assign", ["decl","i"], ["int",0]],
-  ["while", ["binop","<", ["id","i"], ["int",3]],
-    ["block", ["assign", ["id","i"], ["binop","+", ["id","i"], ["int",1]]]]
-  ],
-  ["id","i"]
-]
-```
-
-For (arrays, maps, modules, host iterables):
-
-```json
-["block",
-  ["assign", ["decl","sum"], ["int",0]],
-  ["for", ["decl","x"], ["array", ["int",1], ["int",2], ["int",3]],
-    ["block", ["assign", ["id","sum"], ["binop","+", ["id","sum"], ["id","x"]]]]
-  ],
-  ["id","sum"]
-]
-```
-
-`return` / `break` / `continue` requires exactly one value (use `["null"]` for empty):
-
-```json
-["block",
-  ["while", ["bool", true],
-    ["block",
-      ["break", ["str","done"]]
-    ]
-  ]
-]
-```
-
----
-
-## Types (Structural, First-Class)
-
-Base IDs: `Any | Null | Bool | Int | Num | Str | Type`
-Nullable: `["unop","?", T]` (`T?`)
-Arrays: `["array", T]`
-Maps (open): `["map", ["pair" | "pair!", ["str","k"], T] ...]` — `pair!` = required
-Enums: `["enum", lit1, lit2, ...]`
-Functions/Oracles: `["binop","->", A, B]` (right-assoc)
-
-**Typing & subtyping:**
-`Any` top; `Int <: Num`; `T?` matches `["null"]` or `T`.
-Arrays covariant; maps fieldwise (requiredness only becomes **more** required, not less); enums by member subset.
-Functions/oracles: **params contravariant**, **returns covariant**.
-**LUB (⊔):** `Any` absorbs; `Int ⊔ Num = Num`; arrays elementwise; maps fieldwise (required OR); enums union; functions/oracles pointwise (param GLB, return LUB), else `Any`.
-
-**Examples**
-
-```json
-["type", ["id","Int"]]
-```
-
-```json
-["type", ["array", ["unop","?", ["id","Str"]]]]
-```
-
-```json
-["type",
-  ["map",
-    ["pair!", ["str","name"], ["id","Str"]],
-    ["pair",  ["str","age"],  ["id","Int"]]
-  ]
-]
-```
-
-```json
-["type", ["enum", ["str","GET"], ["str","POST"]]]
-```
-
----
-
-## Functions & Calls
-
-Form:
-
-```json
-["fun",
-  ["array", ["pair", ["id","name"], typeOrAny], ...],
-  retTypeOrAny,
-  bodyBlock]
-```
-
-Rules:
-
-* Each argument must be a **subtype** of its parameter.
-* The **actual returned value** must be a subtype of the declared return type.
-* Violations are **hard** errors.
-* Calls are **curried**.
-
-Docstrings: wrap public functions with `["annot", "...", fun]`.
-
-**Examples**
-
-```json
-["assign", ["decl","inc"],
-  ["annot", ["str","Increment an Int by 1.\n\nArgs: n:Int\nReturn: Int"],
-    ["fun",
-      ["array", ["pair", ["id","n"], ["id","Int"]]],
-      ["id","Int"],
-      ["block", ["binop","+", ["id","n"], ["int",1]]]
-    ]
-  ]
-]
-```
-
-```json
-["call", ["id","inc"], ["int",41]]
-```
-
-```json
-["call", ["id","inc"], ["num",2.5]]
-```
-
----
-
-## Modules
-
-`["module", nameExpr, bodyBlock]` yields a module value.
-
-* Behaves like a **map** for typing/iteration; `get`/assignment reflect exports.
-* **Encapsulation:** module body has its own namespace; outer bindings aren’t visible unless passed in.
-* Module types normalize to map types.
-
-**Example**
-
-```json
-["block",
-  ["assign", ["decl","M"],
-    ["module", ["str","M"],
-      ["block",
-        ["assign", ["decl","x"], ["int",12]],
-        ["assign", ["decl","id"],
-          ["fun", ["array", ["pair", ["id","y"], ["id","Any"]]], ["id","Any"], ["block", ["id","y"]]]
-        ]
-      ]
-    ]
-  ],
-  ["get", ["id","M"], ["str","x"]]
-]
-```
-
----
-
-## Iteration
-
-* `["for", pOrLval, iterable, body]` over arrays (elements), maps (yields `["array", ["str",k], v]`), modules (exported bindings), host iterables (may soft-end via annotated null).
-* `["while", cond, body]`. Loop value is last evaluated expression; `break`/`continue` carry values.
-
-**Example (map iteration)**
-
-```json
-["for", ["darr", ["decl","k"], ["decl","v"]],
-  ["map", ["pair", ["str","a"], ["str","1"]]],
-  ["block", ["id","k"]]
-]
-```
-
----
-
-## Annotations & Comments
-
-Only legal way to add comments/metadata and to encode **soft errors**.
-
-Form: `["annot", ["str","text" or "<text>"], value]`
-
-* `"text"` = human docs (pre)
-* `"<text>"` = machine-generated metadata (post), e.g., soft error reason
-
-Semantics: evaluates `value`, returns its exact result and type; annotations ignored for equality/subtyping.
-
-**Soft error example**
-
-```json
-["annot", ["str","<not found>"], ["null"]]
-```
-
-**Placement cookbook**
-
-* Assignment RHS:
-
-```json
-["assign", ["decl","x"], ["annot", ["str","counter"], ["int",1]]]
-```
-
-* Function docstring:
-
-```json
-["annot", ["str","Greet.\n\nArgs: name:Str\nReturn: Str"],
-  ["fun",
-    ["array", ["pair", ["id","name"], ["id","Str"]]],
-    ["id","Str"],
-    ["block", ["call", ["id","sprintf"], ["str","Hello, %s"], ["id","name"]]]
-  ]
-]
-```
-
-* Return value:
-
-```json
-["return", ["annot", ["str","fast path"], ["id","result"]]]
-```
-
-* Call (side effect):
-
-```json
-["annot", ["str","log greeting"], ["call", ["id","write"], ["id","STDOUT"], ["str","Hello"]]]
-```
-
----
-
-## Standard Library Convention
-
-* Prefer **soft failures** (`T?` + annotated nulls) when uncertainty/availability is expected.
-* Use `["call","try", expr]` to capture **hard** failures as `{ ok: Bool, value: Any, error: Str? }`.
-* Public APIs should avoid exposing raw `["null"]`.
-
-**Example**
-
-```json
-["call", ["id","try"], ["call", ["id","fail"], ["str","boom"]]]
-```
-
----
-
-## Oracles (Typed Generative Calls)
-
-Value form:
-
-```json
-["oracle",
-  ["array", ["pair", ["id","name"], type], ...],
-  retType,
-  ["map",
-    ["pair", ["str","doc"], ["str","..."]],
-    ["pair", ["str","examples"], ["array",
-      ["array", inputArray1, output1]
-    ]]
-  ]?]
-```
-
-Calling rules:
-
-* Parameter arity/types are **hard-checked**.
-* Output is treated as `R?` at the boundary:
-
-  * If generated candidate conforms to `R`, return it.
-  * Otherwise/unavailable ⇒ annotated null (soft). Output never hard-fails.
-
-**Example**
-
-```json
-["block",
-  ["assign", ["decl","chooseColor"],
-    ["oracle",
-      ["array"],
-      ["type", ["enum", ["str","red"], ["str","green"], ["str","blue"]]],
-      ["map", ["pair", ["str","doc"], ["str","Pick a primary color."]]]
-    ]
-  ],
-  ["call", ["id","chooseColor"]]
-]
-```
-
----
-
-## Conformant Illustrations
-
-**Missing key ⇒ soft**
-
-```json
-["idx", ["map", ["pair", ["str","a"], ["int",1]]], ["str","b"]]
-```
-
-**Required/optional type**
-
-```json
-["type",
-  ["map",
-    ["pair!", ["str","id"], ["id","Int"]],
-    ["pair",  ["str","name"], ["id","Str"]]
-  ]
-]
-```
-
-**Strict function check**
-
-```json
-["call",
-  ["fun",
-    ["array", ["pair", ["id","n"], ["id","Int"]]],
-    ["id","Int"],
-    ["block", ["binop","+", ["id","n"], ["int",1]]]
-  ],
-  ["num", 2.5]
-]
-```
-
-**Short-circuit boolean**
-
-```json
-["binop","and", ["bool", false], ["call", ["id","f"]]]
-```
-
-**Encapsulated module**
-
-```json
-["block",
-  ["assign", ["decl","x"], ["int",10]],
-  ["module", ["str","M"],
-    ["block",
-      ["assign", ["decl","x"], ["int",12]]
-    ]
-  ]
-]
-```
-
----
-
-## Simplifying Assumptions
-
-* Omitted types default to `Any` (discouraged for public APIs).
-* Numeric promotion; `/` may yield `Num`; `%` follows dividend sign.
-* Maps are open-world; requiredness is **type-only**.
-* Missing map key / array OOB ⇒ **soft** annotated null.
-* Cross-type comparisons (except Int/Num numeric) ⇒ **hard**.
-* Annotations never affect typing/equality.
-* Modules act like maps for typing/iteration; get/set reflect exports; namespaces are encapsulated.
-* Oracles: inputs hard-checked; outputs treated as `R?`.
-
-**Example**
-
-```json
-["binop","/", ["int",1], ["int",2]]
-```
-
----
-
-## Code Conventions
-
-* Naming: modules `snake_case`; funcs/vars `camelCase`; types `PascalCase`; consts `SCREAMING_SNAKE_CASE`; private `_prefix`.
-* Docs: each public function has a concise docstring `annot` (one-line summary; blank line; args/return; soft-error notes).
-* Types: public functions declare explicit param & return types; use `T?` only where soft errors are possible.
-* Indentation: tabs (style).
-* No “void”: every expression yields a value; avoid exposing raw `["null"]`.
-* JSON hygiene: no comments, no trailing commas, no JSONC/JSON5.
-
----
-
-## 16) Built-in Functions (Practical Reference)
-
-Below are brief, task-oriented descriptions you can code against. Return types follow MindScript type notation; `?` = nullable (soft failure possible).
-
-### Constants & Handles
-
-* **PI, E : Num** — Math constants.
-* **STDIN / STDOUT / STDERR : Any** — Standard stream handles (read/write with I/O funcs).
-
-```json
-["call", ["id","write"], ["id","STDOUT"], ["str","Hello\n"]]
-```
-
-### Introspection & Environment
-
-* **snapshot : Null → Map** — Deep, shadow-aware map of all visible bindings (incl. Core). Per-key annotations mirror source values.
-* **typeOf : Any → Type** — Dynamic type tag of a value.
-* **isType : Any → (Type → Bool)** — Predicate: does value conform to a type?
-* **isSubtype : Type → (Type → Bool)** — Predicate on types.
-
-```json
-["call", ["id","typeOf"], ["int",7]]
-```
-
-### AST, Reflection, Codecs
-
-* **astParse : Str → Array** — Parse MindScript source to runtime-S AST; annot-null on lex/parse error.
-* **astEval : Array → Any** — Evaluate runtime-S AST in caller scope (effects occur there).
-* **reflect : Any → Array** — Constructor program that rebuilds the value.
-* **reify : Array → Any** — Validate & evaluate constructor program in persistent env.
-* **jsonParse : Str → Any** — JSON text → values (Null/Bool/Int/Num/Str/\[Any]/{Str\:Any}).
-* **jsonStringify : Any → Str?** — Value → compact JSON; annot-null if not encodable (e.g., cyclic or non-JSON types).
-* **base64Encode/Decode : Str → Str / Str → Str?** — Raw bytes in `Str`.
-* **hexEncode/Decode : Str → Str / Str → Str?**
-* **gzipCompress/Decompress : Str → Str / Str → Str?**
-
-```json
-["call", ["id","jsonStringify"], ["map", ["pair", ["str","k"], ["int",1]]]]
-```
-
-### URL & HTTP
-
-* **urlParse : Str → Map?** — Returns `{ scheme!, host!, port?, path!, query!, fragment? }` or annot-null if invalid.
-* **urlBuild : Map → Str** — Components → URL.
-* **urlQueryParse : Str → Map?** — `"a=1&b=2&b=3"` → `{ "a":["1"], "b":["2","3"] }`.
-* **urlQueryString : Map → Str** — Map → percent-encoded query (no leading `?`).
-* **http : Map → Map?** — Buffered fetch. Input keys: `method`, `url`, `headers`, `body`, timeouts, etc. Returns `{ status!, statusText, headers!, body!, url, proto, durationMs }` or annot-null on network/IO error.
-* **httpStream : Map → Map?** — Streaming variant; returns `{ bodyH! }` handle on success.
-
-```json
-["call", ["id","urlParse"], ["str","https://example.com/a?b=1"]]
-```
-
-### Filesystem & OS
-
-* **cwd : Null → Str?** — Current directory; annot-null if unavailable.
-* **chdir : Str → Bool** — Change current directory.
-* **open : Str → (Enum("r","w","a","rw") → Any)** — Open file; yields handle or annot-null on failure.
-* **readFile : Str → Str?** — Entire file content.
-* **writeFile : Str → (Str → Int?)** — Write content; returns bytes written or annot-null.
-* **remove / rename / mkdir : Str → Bool / Str→(Str→Bool) / Str→Bool** — Basic FS ops.
-* **dirList : Str → \[Str]?** — Directory entries.
-* **stat : Str → Map?** — Common metadata.
-* **pathBase / pathDir / pathExt / pathClean : Str → Str** — Path utilities.
-* **pathJoin : \[Str] → Str** — Join with platform separator.
-* **osEnv / osSetEnv : Str → Str? / Str → (Str? → Bool)** — Get/set env vars.
-
-```json
-["call", ["id","pathJoin"], ["array", ["str","/tmp"], ["str","file.txt"]]]
-```
-
-### Handles I/O
-
-* **readAll : Any → Str?** — Read remaining bytes from a readable handle.
-* **readN : Any → (Int → Str?)** — Read N bytes.
-* **readLine : Any → Str?** — Read a line; annot-null at EOF.
-* **write : Any → (Str → Int?)** — Write bytes; returns bytes written or annot-null.
-* **flush / close : Any → Bool / Bool** — Flush or close (never closes stdio).
-
-```json
-["call", ["id","readLine"], ["id","STDIN"]]
-```
-
-### Networking (basic)
-
-* **netListen : Str → Any?** — Start listener (e.g., `"tcp:127.0.0.1:8080"`).
-* **netAccept : Any → Any?** — Accept a connection.
-* **netConnect : Str → Any?** — Connect to address.
-
-### Processes & Execution
-
-* **exec : \[Str] → (Map? → Map?)** — Run external command with optional `{ env, cwd }`; returns `{ status!, stdout!, stderr! }` or annot-null if spawn fails.
-* **exit : Int? → Null** — Terminate process with optional code.
-* **fail : Str? → Null** — Hard error (throws).
-* **try : Any → Map** — Capture hard fail: `{ ok: Bool, value: Any, error: Str? }`.
-* **procSpawn / procJoin / procCancel / procJoinAll / procJoinAny** — Concurrent subprocess control (as originally specified).
-
-```json
-["call", ["id","try"], ["call", ["id","fail"], ["str","nope"]]]
-```
-
-### Concurrency & Timers
-
-* **chanOpen / chanClose : Null→Any / Any→Bool** — Open/close channel.
-* **chanSend / chanRecv : Any→(Any→Bool) / Any→Any?** — Send/receive (non-blocking variants `chanTrySend/chanTryRecv` return Bool/Any?).
-* **ticker : Int → Any** — Periodic tick handle (ms).
-* **timerAfter : Int → Any** — One-shot tick handle (ms).
-* **sleep : Int → Null** — Block for milliseconds.
-* **nowMillis / nowNanos : Null → Int** — Time since epoch.
-
-```json
-["call", ["id","nowMillis"], ["null"]]
-```
-
-### Math
-
-* **sin / cos / tan / sqrt / pow / log / exp : Num → Num (or curried)** — Standard math.
-* **randFloat : Null → Num** — Uniform in \[0,1).
-* **randInt : Int → Int** — Uniform integer in \[0,n).
-* **seedRand : Int → Null** — Seed PRNG.
-* **randBytes : Int → Str?** — Random bytes.
-
-```json
-["call", ["id","randInt"], ["int",10]]
-```
-
-### Strings & Text
-
-* **str : Any → Str?** — Convert to string or annot-null if not encodable.
-* **toLower / toUpper / strip / lstrip / rstrip : Str → Str** — Case/whitespace utilities.
-* **substr : Str → (Int → (Int → Str))** — Rune-indexed, clamped.
-* **split : Str → (Str → \[Str])** — Empty separator splits by code point.
-* **join : \[Str] → (Str → Str)** — Join with delimiter.
-* **match : Str → (Str → \[Str])** — RE2 full-string or find-matches; returns matches (no groups).
-* **replace : Str → (Str → (Str → Str))** — Regex or literal replace depending on pattern.
-* **sprintf / printf / formatCode / formatValue** — Formatting helpers.
-
-```json
-["call", ["id","sprintf"], ["str","%s %d"], ["str","v"], ["int",3]]
-```
-
-### Conversion, Length, Maps
-
-* **int / num / bool : Any → Int/Num/Bool** — Coercions (bool uses common truthiness).
-* **len : Any → Int** — Length: arrays (# elems), maps (# keys), strings (runes).
-* **clone : Any → Any** — Deep copy arrays/maps; scalars by identity.
-* **mapHas : Map → (Str → Bool)** — Key presence.
-* **mapDelete : Map → (Str → Bool)** — Remove key; returns success.
-
-```json
-["call", ["id","len"], ["str","🙂"]]
-```
-
-### Importing & Schemas
-
-* **import / importCode : Str → Any?** — Load value or code; annot-null on failure (e.g., not found).
-* **jsonSchemaToType / jsonSchemaStringToType : Any/Str → Type?** — Convert JSON Schema → MindScript Type.
-* **typeToJSONSchema / typeStringToJSONSchema : Type/Str → Any?** — Convert Type → JSON Schema.
-
-```json
-["call", ["id","import"], ["str","./lib.ms.json"]]
-```
-
-### Cryptography
-
-* **sha256 : Str → Str** — 32-byte digest (raw bytes in `Str`).
-* **hmacSha256 : Str → (Str → Str)** — MAC (raw bytes).
-* **ctEqual : Str → (Str → Bool)** — Constant-time equality.
-
-```json
-["call", ["id","ctEqual"], ["call", ["id","sha256"], ["str","a"]], ["call", ["id","sha256"], ["str","a"]]]
-```
-
----
-
-### Appendix — Commenting Cheatsheet (Bad → Good)
-
-Bad:
-
-```json
-["assign", ["decl","x"], ["int",1]]
-```
-
-Good:
-
-```json
-["assign", ["decl","x"], ["annot", ["str","counter"], ["int",1]]]
-```
-
-Bad:
-
-```json
-["return", ["id","result"]]
-```
-
-Good:
-
-```json
-["return", ["annot", ["str","fast path"], ["id","result"]]]
-```
-
-=== END FILE: data/msjson.md ===
+// decodeAndValidate: [] → S → IxValidateS.
+// Returns (S, Null) on success; otherwise (nil, annotated-null) with the first error.
+// Used by astEval/astFormat/reify (not by astValidate).
+func decodeAndValidate(av Value) (S, Value) {
+	if av.Tag != VTArray {
+		return nil, annotNull("expected []")
+	}
+	sexpr, err := IxFromS(av)
+	if err != nil {
+		return nil, annotNull(err.Error())
+	}
+	if verrs := IxValidateS(sexpr); verrs.Tag == VTArray && len(verrs.Data.(*ArrayObject).Elems) > 0 {
+		return nil, softFirstValidationError(verrs)
+	}
+	return sexpr, Null
+}
+
+// ---- registration -----------------------------------------------------------
+
+func registerIntrospectionBuiltins(ip *Interpreter) {
+	// noteGet(x: Any) -> Str?
+	ip.RegisterNative(
+		"noteGet",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.MustArg("x")
+			if v.Annot == "" {
+				return Null
+			}
+			return Str(v.Annot)
+		},
+	)
+	setBuiltinDoc(ip, "noteGet", `Get the annotation attached to a value, if any.
+
+Params:
+	x: Any — any runtime value
+Returns:
+	Str? — the annotation string, or null if not present
+Notes:
+	• See also: noteSet(text, value) to attach annotations programmatically.`)
+
+	// noteSet(text: Str, value: Any) -> Any
+	ip.RegisterNative(
+		"noteSet",
+		[]ParamSpec{
+			{Name: "text", Type: S{"id", "Str"}},
+			{Name: "value", Type: S{"id", "Any"}},
+		},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			text := ctx.MustArg("text").Data.(string)
+			v := ctx.MustArg("value")
+			v.Annot = text
+			return v
+		},
+	)
+	setBuiltinDoc(ip, "noteSet", `Attach or replace an annotation on a value.
+
+Params:
+	text: Str  — annotation text to attach
+	value: Any — value to annotate
+Returns:
+	Any — the same value with its annotation set to text
+Notes:
+	• This does not deep-copy arrays/maps; underlying data is shared.
+	• Annotations never affect equality but are rendered by printers.`)
+
+	// astParse(src: Str) -> []
+	ip.RegisterNative(
+		"astParse",
+		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"array"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			arg := ctx.MustArg("src")
+			if arg.Tag != VTStr {
+				fail("astParse: src must be Str")
+			}
+			src := arg.Data.(string)
+			ast, err := ParseSExpr(src)
+			if err != nil {
+				return annotNull(err.Error())
+			}
+			return IxToS(ast)
+		},
+	)
+	setBuiltinDoc(ip, "astParse", `Parse source code into runtime-S (VTArray).
+
+Params:
+	src: Str — MindScript source
+Returns:
+	[]? — a runtime-S AST (["tag", ...])
+Notes:
+	• Encoding is stable and round-trippable with astEval / reify.`)
+
+	// astEval(ast: []) -> Any
+	ip.RegisterNative(
+		"astEval",
+		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			av := ctx.MustArg("ast")
+			sexpr, soft := decodeAndValidate(av)
+			if sexpr == nil {
+				return soft
+			}
+			res, err := ip.EvalAST(sexpr, ctx.Env())
+			if err != nil {
+				return annotNull(err.Error())
+			}
+			return res
+		},
+	)
+	setBuiltinDoc(ip, "astEval", `Evaluate a runtime-S AST in the caller's scope.
+
+Params:
+	ast: [] — runtime-S AST (["tag", ...])
+Returns:
+	Any — evaluation result (or error)`)
+
+	// astFormat(ast: []) -> Str
+	ip.RegisterNative(
+		"astFormat",
+		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			av := ctx.MustArg("ast")
+			sexpr, soft := decodeAndValidate(av)
+			if sexpr == nil {
+				return soft
+			}
+			return Str(FormatSExpr(sexpr))
+		},
+	)
+	setBuiltinDoc(ip, "astFormat", `Format a runtime-S AST into stable source.
+
+Params:
+	ast: [] — runtime-S AST
+Returns:
+	Str? — formatted source (or error)`)
+
+	// astValidate(ast: []) -> [ {path!:Str, code!:Str, message!:Str, got!:Str, expect!:Str} ]
+	// Always returns an array (possibly empty). Never returns annotated-null.
+	ip.RegisterNative(
+		"astValidate",
+		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
+		S{"array"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			av := ctx.MustArg("ast")
+			// If not an array or cannot decode: return a single standardized error object.
+			if av.Tag != VTArray {
+				return valShapeErrors("expected []")
+			}
+			sexpr, err := IxFromS(av)
+			if err != nil {
+				return valShapeErrors(err.Error())
+			}
+			// IxValidateS already returns VTArray of error maps; pass it through.
+			// Empty array => success.
+			return IxValidateS(sexpr)
+		},
+	)
+	setBuiltinDoc(ip, "astValidate", `Validate a runtime-S AST.
+
+Params:
+  ast: [] — runtime-S AST
+Returns:
+  [ {path!:Str, code!:Str, message!:Str, got!:Str, expect!:Str} ]
+    • Empty array on success.
+    • On failure, one or more error objects. (Shape/decode errors produce one entry with code "E_RUNTIME_SHAPE".)`)
+
+	// reflect(val: Any) -> []
+	ip.RegisterNative(
+		"reflect",
+		[]ParamSpec{{Name: "val", Type: S{"id", "Any"}}},
+		S{"unop", "?", S{"array"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return IxReflect(ctx.MustArg("val"))
+		},
+	)
+	setBuiltinDoc(ip, "reflect", `Reflect a value into constructor code (runtime-S).
+
+Params:
+	val: Any — value to reflect
+Returns:
+	[]? — constructor code (runtime-S)
+Soft errors:
+	• Opaque handles/unknowns → annotated-null`)
+
+	// reify(rt: []) -> Any
+	ip.RegisterNative(
+		"reify",
+		[]ParamSpec{{Name: "rt", Type: S{"array"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			av := ctx.MustArg("rt")
+			sexpr, soft := decodeAndValidate(av)
+			if sexpr == nil {
+				return soft
+			}
+			val, err := ip.EvalPersistent(sexpr)
+			if err != nil {
+				return annotNull(err.Error())
+			}
+			return val
+		},
+	)
+	setBuiltinDoc(ip, "reify", `Decode and evaluate constructor code (runtime-S).
+
+Params:
+	rt: [] — constructor code produced by reflect(...) or astParse(...)
+Returns:
+	Any — constructed value`)
+}
+=== END FILE: builtin_introspection.go ===
+
+=== BEGIN FILE: builtin_introspection_test.go ===
+package mindscript
+
+import (
+	"strings"
+	"testing"
+)
+
+// ----------------------------- tests -----------------------------
+
+func Test_Builtin_Introspection_noteGet_and_noteSet(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// noteGet on unannotated value → null
+	v := evalWithIP(t, ip, `noteGet(42)`)
+	if v.Tag != VTNull {
+		t.Fatalf("noteGet(42) should be null, got %#v", v)
+	}
+
+	// noteSet attaches; noteGet returns the text; value data remains intact
+	v2 := evalWithIP(t, ip, `
+		let x = noteSet("hello", 42)
+		noteGet(x)
+	`)
+	if v2.Tag != VTStr || v2.Data.(string) != "hello" {
+		t.Fatalf("noteGet should return 'hello', got %#v", v2)
+	}
+
+	// Works for composite values too (array)
+	v3 := evalWithIP(t, ip, `
+		let x = noteSet("arr", [1,2,3])
+		noteGet(x)
+	`)
+	if v3.Tag != VTStr || v3.Data.(string) != "arr" {
+		t.Fatalf("noteGet(array) should return 'arr', got %#v", v3)
+	}
+}
+
+func Test_Builtin_Introspection_bindings_order_and_shadowing(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Force a NEW FRAME via a function so snapshot() is taken in the inner scope.
+	v := evalWithIP(t, ip, `
+		let a = 1
+		let z = 9
+
+		let inner = fun() do
+			let b = 2
+			let a = 3
+			snapshot()
+		end
+
+		inner()
+	`)
+	m := mustMap(t, v)
+
+	only := func(keys []string, allowed map[string]bool) []string {
+		out := make([]string, 0, len(keys))
+		for _, k := range keys {
+			if k == "_" { // implementation detail key, skip
+				continue
+			}
+			if allowed[k] {
+				out = append(out, k)
+			}
+		}
+		return out
+	}
+
+	// snapshot(): merged (inner → outer)
+	keys := only(m.Keys, map[string]bool{"a": true, "b": true, "z": true})
+	if len(keys) != 3 || keys[0] != "a" || keys[1] != "b" || keys[2] != "z" {
+		t.Fatalf("snapshot() keys want [a b z], got %#v", keys)
+	}
+
+	// Shadowing preserved: inner 'a' should win in merged view.
+	av, ok := m.Entries["a"]
+	if !ok {
+		t.Fatalf("snapshot() missing key 'a'")
+	}
+	if av.Tag != VTInt || av.Data.(int64) != 3 {
+		t.Fatalf("snapshot().a should be 3 (inner), got %#v", av)
+	}
+}
+
+func Test_Builtin_Introspection_astParse_and_astEval_roundtrip(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Parse then eval simple expression
+	v := evalWithIP(t, ip, `
+		let ast = astParse("1 + 2")
+		astEval(ast)
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 3 {
+		t.Fatalf("astEval(astParse('1+2')) should be 3, got %#v", v)
+	}
+
+	// astParse error path returns a SOFT error (annotated null value).
+	v2 := evalWithIP(t, ip, `
+  let a = astParse("let")
+  noteGet(a)
+`)
+	if v2.Tag != VTStr || v2.Data.(string) == "" {
+		t.Fatalf("astParse error should be a soft error with a message, got %#v", v2)
+	}
+}
+
+func Test_Builtin_Introspection_astEval_operates_in_caller_scope(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// astEval should mutate caller's env (not a fresh child)
+	v := evalWithIP(t, ip, `
+		let x = 1
+		let rt = astParse("x = x + 1")
+		astEval(rt)
+		x
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 2 {
+		t.Fatalf("astEval should update caller scope; want x=2, got %#v", v)
+	}
+}
+
+func Test_Builtin_Introspection_reflect_and_reify_roundtrip(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Round-trip a composite value
+	v := evalWithIP(t, ip, `
+		let orig = {a: 1, b: [2,3]}
+		let rt   = reflect(orig)
+		let v2   = reify(rt)
+		str(orig) == str(v2)
+	`)
+	if v.Tag != VTBool || v.Data.(bool) != true {
+		t.Fatalf("reflect → reify should round-trip, got %#v", v)
+	}
+}
+
+func Test_Builtin_Introspection_reify_persistent_scope(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// reify evaluates in persistent/global scope; definition should persist
+	v := evalWithIP(t, ip, `
+		let rt = astParse("let y = 7")
+		reify(rt)
+		y
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 7 {
+		t.Fatalf("reify should install into Global; want y=7, got %#v", v)
+	}
+}
+
+func Test_Builtin_Introspection_reify_malformed_is_hard_error(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Malformed runtime-S: ["id"] (missing name) → IxReify must HARD-fail.
+	_, err := ip.EvalSource(`reify(["id"])`)
+	if err == nil {
+		t.Fatalf("expected hard error from reify on malformed runtime-S")
+	}
+	lc := strings.ToLower(err.Error())
+	if !strings.Contains(lc, "reify") && !strings.Contains(lc, "invalid") && !strings.Contains(lc, "id") {
+		t.Fatalf("unexpected error from reify: %v", err)
+	}
+}
+
+// IxToS ↔ IxFromS round-trip on hand-built S (no parsing involved).
+func Test_Builtin_Introspection_IxRoundTrip(t *testing.T) {
+	orig := S{
+		"assign",
+		S{"decl", "x"},
+		S{"array",
+			S{"int", int64(1)},
+			S{"map",
+				S{"pair", S{"str", "a"}, S{"bool", true}},
+			},
+		},
+	}
+	rt := IxToS(orig)
+	back, err := IxFromS(rt)
+	if err != nil {
+		t.Fatalf("IxFromS failed: %v", err)
+	}
+	if !equalS(orig, back) {
+		t.Fatalf("round-trip mismatch\norig=%#v\nback=%#v", orig, back)
+	}
+}
+
+// Annotation preservation through reflect/reify (container + nested).
+func Test_Builtin_Introspection_Annotations_ReflectReify_Preserve(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `
+		let v = {a: noteSet("A", [noteSet("B", 1), 2])}
+		let rt = reflect(v)
+		let w  = reify(rt)
+		[ noteGet(v.a), noteGet(w.a), noteGet(v.a[0]), noteGet(w.a[0]) ]
+	`)
+	if v.Tag != VTArray {
+		t.Fatalf("expected array of notes, got %#v", v)
+	}
+	xs := v.Data.(*ArrayObject).Elems
+	want := []string{"A", "A", "B", "B"}
+	for i := range want {
+		if xs[i].Tag != VTStr || xs[i].Data.(string) != want[i] {
+			t.Fatalf("note[%d] want %q, got %#v", i, want[i], xs[i])
+		}
+	}
+}
+
+// Canonical module lowering in reflect; reify exports.
+func Test_Builtin_Introspection_Reflect_Module_CanonicalAssigns(t *testing.T) {
+	ip, _ := NewRuntime()
+	rt := evalWithIP(t, ip, `
+		reflect(module "M" do
+			let a = 1
+			let b = 2
+		end)
+	`)
+	if rt.Tag != VTArray {
+		t.Fatalf("reflect(module) should return runtime-S array, got %#v", rt)
+	}
+	// Decode to S and assert: ["module", ["str","M"], ["block", ("assign", ...)*]]
+	s, err := IxFromS(rt)
+	if err != nil {
+		t.Fatalf("IxFromS failed: %v", err)
+	}
+	if s[0] != "module" {
+		t.Fatalf("top tag want module, got %v", s[0])
+	}
+	body := s[2].(S)
+	if body[0] != "block" {
+		t.Fatalf("module body want block, got %v", body[0])
+	}
+	hasAssign := false
+	for i := 1; i < len(body); i++ {
+		if tag := body[i].(S)[0].(string); tag == "assign" {
+			hasAssign = true
+			break
+		}
+	}
+	if !hasAssign {
+		t.Fatalf("module body should contain assign nodes")
+	}
+	// Reify and access fields
+	v := evalWithIP(t, ip, `
+		let m = reify(reflect(module "M" do let a = 1 end))
+		m.a
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 1 {
+		t.Fatalf("reified module should export a=1, got %#v", v)
+	}
+}
+
+// Function reflection: scripted vs native; defaults to Any.
+func Test_Builtin_Introspection_Reflect_Functions_ScriptedAndNativeDefaults(t *testing.T) {
+	ip, _ := NewRuntime()
+	scripted := evalWithIP(t, ip, `reflect(fun(x) do x end)`)
+	native := evalWithIP(t, ip, `reflect(str)`)
+
+	// Scripted
+	sf, err := IxFromS(scripted)
+	if err != nil {
+		t.Fatalf("IxFromS(fun) failed: %v", err)
+	}
+	if sf[0] != "fun" {
+		t.Fatalf("reflect(fun) top tag want fun, got %v", sf[0])
+	}
+	params := sf[1].(S)
+	if params[0] != "array" || len(params) != 2 {
+		t.Fatalf("params want one pair in array, got %#v", params)
+	}
+	pair := params[1].(S)
+	if pair[0] != "pair" || pair[1].(S)[0] != "id" || pair[2].(S)[0] != "id" || pair[2].(S)[1] != "Any" {
+		t.Fatalf("param should default to Any, got %#v", pair)
+	}
+	if sf[2].(S)[0] != "id" || sf[2].(S)[1] != "Any" {
+		t.Fatalf("return type should default to Any, got %#v", sf[2])
+	}
+
+	// Native may be wrapped in ["annot", ["str",doc], ["id","str"]]
+	nf, err := IxFromS(native)
+	if err != nil {
+		t.Fatalf("IxFromS(native) failed: %v", err)
+	}
+	if nf[0] == "annot" {
+		nf = nf[2].(S) // unwrap top-level annot
+	}
+	if nf[0] != "id" || nf[1] != "str" {
+		t.Fatalf(`reflect(str) want ["id","str"] (optionally wrapped in annot), got %#v`, nf)
+	}
+}
+
+// Oracle reflection: 4th child is an **expression** (not a block).
+func Test_Builtin_Introspection_Reflect_Oracle_SourceIsExpr(t *testing.T) {
+	ip, _ := NewRuntime()
+	// Use a literal so reflection doesn't try to evaluate a free var.
+	rt := evalWithIP(t, ip, `reflect(oracle(x: Int) -> Int from 42)`)
+	s, err := IxFromS(rt)
+	if err != nil {
+		t.Fatalf("IxFromS(oracle) failed: %v", err)
+	}
+	if s[0] != "oracle" {
+		t.Fatalf("top tag want oracle, got %v", s[0])
+	}
+	src := s[3].(S)
+	if src[0] == "block" {
+		t.Fatalf("oracle source must be an expression, got block")
+	}
+}
+
+// Value maps never carry requiredness ("pair!" forbidden).
+func Test_Builtin_Introspection_Reflect_Map_NoPairBang(t *testing.T) {
+	ip, _ := NewRuntime()
+	rt := evalWithIP(t, ip, `reflect({a: 1, b: 2})`)
+	s, err := IxFromS(rt)
+	if err != nil {
+		t.Fatalf("IxFromS(map) failed: %v", err)
+	}
+	if s[0] != "map" {
+		t.Fatalf("top tag want map, got %v", s[0])
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i].(S)[0] == "pair!" {
+			t.Fatalf("value map must not use 'pair!' (requiredness is type-only)")
+		}
+	}
+}
+
+// Validator: nested ["annot", ...] is rejected; code = E_ANNOT_NESTED.
+func Test_Builtin_Introspection_Validator_NestedAnnot_Rejected(t *testing.T) {
+	nested := S{"annot", S{"str", "A"}, S{"annot", S{"str", "B"}, S{"int", int64(1)}}}
+	errs := IxValidateS(nested)
+	if errs.Tag != VTArray {
+		t.Fatalf("validator must return array, got %#v", errs)
+	}
+	found := false
+	for _, e := range errs.Data.(*ArrayObject).Elems {
+		if e.Tag == VTMap {
+			m := e.Data.(*MapObject).Entries
+			if c, ok := m["code"]; ok && c.Tag == VTStr && c.Data.(string) == "E_ANNOT_NESTED" {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected E_ANNOT_NESTED in validator errors, got %#v", errs)
+	}
+}
+
+// Validator: enum members may be expressions.
+func Test_Builtin_Introspection_Validator_Enum_MemberExprOK(t *testing.T) {
+	ty := S{"type", S{"enum",
+		S{"int", int64(1)},
+		S{"binop", "+", S{"int", int64(1)}, S{"int", int64(2)}},
+	}}
+	errs := IxValidateS(ty)
+	if errs.Tag != VTArray || len(errs.Data.(*ArrayObject).Elems) != 0 {
+		t.Fatalf("enum with expression member should validate (no errors), got %#v", errs)
+	}
+}
+
+// Type/subtyping sanity check (spot checks).
+func Test_Builtin_Introspection_Types_Subtyping_Sanity(t *testing.T) {
+	ip, _ := NewRuntime()
+	is := func(a, b S) bool { return ip.IsSubtype(a, b, nil) }
+
+	// Int <: Num
+	if !is(S{"id", "Int"}, S{"id", "Num"}) {
+		t.Fatalf("Int <: Num expected")
+	}
+	// [Int] <: [Num] (covariant)
+	if !is(S{"array", S{"id", "Int"}}, S{"array", S{"id", "Num"}}) {
+		t.Fatalf("[Int] <: [Num] expected (covariant)")
+	}
+
+	// Requiredness: stronger (required) <: weaker (optional) — OK
+	a := S{"map", S{"pair!", S{"str", "k"}, S{"id", "Int"}}}
+	b := S{"map", S{"pair", S{"str", "k"}, S{"id", "Num"}}}
+	if !is(a, b) {
+		t.Fatalf(`{"k!": Int} <: {"k": Num} should hold (cannot relax on RHS)`)
+	}
+	// But the reverse should fail
+	if is(b, a) {
+		t.Fatalf(`{"k": Num} </: {"k!": Int} expected`)
+	}
+
+	// Function contra/co: (Num -> Int) <: (Int -> Num)
+	f1 := S{"binop", "->", S{"id", "Num"}, S{"id", "Int"}}
+	f2 := S{"binop", "->", S{"id", "Int"}, S{"id", "Num"}}
+	if !is(f1, f2) {
+		t.Fatalf("(Num->Int) <: (Int->Num) expected (contra/co)")
+	}
+}
+
+// Printer: elisions (Any) and POST-after-comma newline behavior.
+func Test_Builtin_Introspection_Printer_ElisionsAndPost(t *testing.T) {
+	// fun with default Any param/ret should omit types
+	fn := S{"fun",
+		S{"array", S{"pair", S{"id", "x"}, S{"id", "Any"}}},
+		S{"id", "Any"},
+		S{"block"},
+	}
+	out := FormatSExpr(fn)
+	if strings.Contains(out, "->") || !strings.Contains(out, "fun(x) do") {
+		t.Fatalf("fun defaults should elide Any; got:\n%s", out)
+	}
+
+	// array with last element POST should place closing ']' next line (no extra blank)
+	arr := S{"array",
+		S{"annot", S{"str", "<last"}, S{"int", int64(1)}},
+	}
+	src := FormatSExpr(arr)
+	if !strings.Contains(src, "# last") || !strings.Contains(src, "]") {
+		t.Fatalf("array last POST should render inline comment and close next line; got:\n%s", src)
+	}
+}
+=== END FILE: builtin_introspection_test.go ===
 

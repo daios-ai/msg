@@ -242,8 +242,8 @@ func deepEqualLit(a, b Value) bool {
 	case VTStr:
 		return a.Data.(string) == b.Data.(string)
 	case VTArray:
-		ax := a.Data.([]Value)
-		bx := b.Data.([]Value)
+		ax := a.Data.(*ArrayObject).Elems
+		bx := b.Data.(*ArrayObject).Elems
 		if len(ax) != len(bx) {
 			return false
 		}
@@ -342,7 +342,7 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 		return S{"id", "Str"}
 
 	case VTArray:
-		xs := v.Data.([]Value)
+		xs := v.Data.(*ArrayObject).Elems
 		if len(xs) == 0 {
 			return S{"array", S{"id", "Any"}}
 		}
@@ -507,7 +507,7 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 		if len(t) == 2 {
 			elemT = t[1].(S)
 		}
-		for _, elem := range v.Data.([]Value) {
+		for _, elem := range v.Data.(*ArrayObject).Elems {
 			if !ip.isType(elem, elemT, env) {
 				return false
 			}

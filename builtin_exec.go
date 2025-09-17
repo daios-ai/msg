@@ -56,7 +56,7 @@ func registerExecBuiltins(ip *Interpreter) {
 			if cmdVal.Tag != VTArray {
 				fail("exec: cmd must be [Str]")
 			}
-			arr := cmdVal.Data.([]Value)
+			arr := cmdVal.Data.(*ArrayObject).Elems
 			if len(arr) == 0 {
 				fail("exec: cmd must not be empty")
 			}

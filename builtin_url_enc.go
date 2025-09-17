@@ -263,7 +263,8 @@ Notes:
 					case VTStr:
 						qs.Add(k, val.Data.(string))
 					case VTArray:
-						for _, it := range val.Data.([]Value) {
+						ao := val.Data.(*ArrayObject)
+						for _, it := range ao.Elems {
 							if it.Tag != VTStr {
 								fail("urlBuild: query values must be Str or [Str]")
 							}
@@ -399,7 +400,8 @@ Notes:
 				case VTStr:
 					qs.Add(k, val.Data.(string))
 				case VTArray:
-					for _, it := range val.Data.([]Value) {
+					ao := val.Data.(*ArrayObject)
+					for _, it := range ao.Elems {
 						if it.Tag != VTStr {
 							fail("urlQueryString: values must be Str or [Str]")
 						}

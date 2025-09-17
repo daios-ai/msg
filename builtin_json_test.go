@@ -36,7 +36,7 @@ func Test_Builtin_Json_Parse_And_Stringify_Roundtrip_Object(t *testing.T) {
 	if m["ok"].Tag != VTBool || m["ok"].Data.(bool) != true {
 		t.Fatalf("roundtrip ok mismatch: %#v", m["ok"])
 	}
-	if m["tags"].Tag != VTArray || len(m["tags"].Data.([]Value)) != 2 {
+	if m["tags"].Tag != VTArray || len(m["tags"].Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("roundtrip tags mismatch: %#v", m["tags"])
 	}
 	if m["misc"].Tag != VTNull {
@@ -160,7 +160,7 @@ func Test_Builtin_Json_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
 		t.Fatalf("required missing or wrong type: %v", reqV)
 	}
 	found := false
-	for _, it := range reqV.Data.([]Value) {
+	for _, it := range reqV.Data.(*ArrayObject).Elems {
 		if it.Tag == VTStr && it.Data.(string) == "name" {
 			found = true
 			break
@@ -252,7 +252,7 @@ func Test_Builtin_Json_TypeToJSONSchema_WithAliasAndDefs(t *testing.T) {
 	if !ok || anyOf.Tag != VTArray {
 		t.Fatalf("friend should be nullable anyOf with $ref: %v", friend)
 	}
-	branches := anyOf.Data.([]Value)
+	branches := anyOf.Data.(*ArrayObject).Elems
 	if len(branches) != 2 {
 		t.Fatalf("expected two anyOf branches; got %d", len(branches))
 	}

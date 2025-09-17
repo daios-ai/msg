@@ -112,7 +112,8 @@ func (o *opsImpl) initCore() {
 				return Str(a.Data.(string) + b.Data.(string))
 			}
 			if a.Tag == VTArray && b.Tag == VTArray {
-				x := append(append([]Value{}, a.Data.([]Value)...), b.Data.([]Value)...)
+				x := append(append([]Value{}, a.Data.(*ArrayObject).Elems...),
+					b.Data.(*ArrayObject).Elems...)
 				return Arr(x)
 			}
 			if a.Tag == VTMap && b.Tag == VTMap {
@@ -187,8 +188,8 @@ func (o *opsImpl) initCore() {
 	reg("__map_from",
 		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ka := ctx.MustArg("keys").Data.([]Value)
-			va := ctx.MustArg("vals").Data.([]Value)
+			ka := ctx.MustArg("keys").Data.(*ArrayObject).Elems
+			va := ctx.MustArg("vals").Data.(*ArrayObject).Elems
 			if len(ka) != len(va) {
 				return errNull("map_from: mismatched arity")
 			}
@@ -218,7 +219,7 @@ func (o *opsImpl) initCore() {
 			x := AsMapValue(ctx.MustArg("x"))
 			switch x.Tag {
 			case VTArray:
-				return Int(int64(len(x.Data.([]Value))))
+				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
 			case VTMap:
 				return Int(int64(len(x.Data.(*MapObject).Entries)))
 			default:
@@ -239,8 +240,8 @@ func (o *opsImpl) initCore() {
 		},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			namesV := ctx.MustArg("params").Data.([]Value)
-			typesV := ctx.MustArg("types").Data.([]Value)
+			namesV := ctx.MustArg("params").Data.(*ArrayObject).Elems
+			typesV := ctx.MustArg("types").Data.(*ArrayObject).Elems
 			retTV := ctx.MustArg("ret").Data.(*TypeValue)
 			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
 			isOr := ctx.MustArg("isOracle").Data.(bool)
@@ -256,6 +257,27 @@ func (o *opsImpl) initCore() {
 				types[i] = typesV[i].Data.(*TypeValue).Ast
 			}
 
+			// ---- Validate and box examples as a VTArray of [input, output] pairs ----
+			var examples Value
+			if exAny.Tag == VTNull {
+				examples = Arr(nil)
+			} else if exAny.Tag == VTArray {
+				pairs := exAny.Data.(*ArrayObject).Elems
+				for i, ex := range pairs {
+					if ex.Tag != VTArray {
+						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
+					}
+					pp := ex.Data.(*ArrayObject).Elems
+					if len(pp) != 2 {
+						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
+					}
+				}
+				// Detach the slice so later mutations to the caller's array don't alias.
+				examples = Arr(append([]Value(nil), pairs...))
+			} else {
+				return errNull("examples must be an array of [input, output] pairs (or null)")
+			}
+
 			hidden := false
 			if len(names) == 0 {
 				names = []string{"_"}
@@ -263,15 +285,10 @@ func (o *opsImpl) initCore() {
 				hidden = true
 			}
 
-			var exVals []Value
-			if exAny.Tag == VTArray {
-				exVals = append([]Value(nil), exAny.Data.([]Value)...)
-			}
-
 			// Build absolute base path for the body
 			var base NodePath
 			if baseAny.Tag == VTArray {
-				xs := baseAny.Data.([]Value)
+				xs := baseAny.Data.(*ArrayObject).Elems
 				base = make(NodePath, 0, len(xs))
 				for _, v := range xs {
 					if v.Tag == VTInt {
@@ -316,7 +333,7 @@ func (o *opsImpl) initCore() {
 				Env:        closure, // <-- use the closure with hidden signature
 				HiddenNull: hidden,
 				IsOracle:   isOr,
-				Examples:   exVals,
+				Examples:   examples,
 				Src:        sr,
 			})
 		})
@@ -498,7 +515,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 	case "idx":
 		obj, idx := ip.evalFull(target[1].(S), env), ip.evalFull(target[2].(S), env)
 		if obj.Tag == VTArray && idx.Tag == VTInt {
-			xs := obj.Data.([]Value)
+			xs := obj.Data.(*ArrayObject).Elems
 			if len(xs) == 0 {
 				fail("index on empty array")
 			}
@@ -531,7 +548,7 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 			return
 		}
-		xs := value.Data.([]Value)
+		xs := value.Data.(*ArrayObject).Elems
 		for i := 1; i < len(target); i++ {
 			if i-1 < len(xs) {
 				ip.assignTo(target[i].(S), xs[i-1], env, true)
@@ -696,7 +713,8 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 	case VTStr:
 		return a.Data.(string) == b.Data.(string)
 	case VTArray:
-		ax, bx := a.Data.([]Value), b.Data.([]Value)
+		ax := a.Data.(*ArrayObject).Elems
+		bx := b.Data.(*ArrayObject).Elems
 		if len(ax) != len(bx) {
 			return false
 		}
@@ -896,7 +914,7 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	// Decode absolute base path from [Int]
 	var base NodePath
 	if baseV.Tag == VTArray {
-		xs := baseV.Data.([]Value)
+		xs := baseV.Data.(*ArrayObject).Elems
 		base = make(NodePath, 0, len(xs))
 		for _, v := range xs {
 			if v.Tag != VTInt {

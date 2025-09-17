@@ -454,7 +454,8 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res v
 
 			// array[int]
 			if obj.Tag == VTArray && idx.Tag == VTInt {
-				xs := obj.Data.([]Value)
+				ao := obj.Data.(*ArrayObject)
+				xs := ao.Elems
 				if len(xs) == 0 {
 					return m.fail("index on empty array")
 				}

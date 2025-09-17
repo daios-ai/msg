@@ -80,19 +80,14 @@ func registerJSONParse(ip *Interpreter) {
 
 // --- tiny assertions ---------------------------------------------------------
 
-// Count example TASK blocks in a prompt (excludes the final TASK).
-// Heuristic: fallback prompt renders one "TASK:" per example plus one final.
-// So (#TASK occurrences - 1) == #examples.
+// Count example INPUT blocks in a prompt (excludes the final call's INPUT).
+// Heuristic: the prompt renders one "INPUT:" per example plus one final "INPUT:"
+// for the current call. So (#INPUT occurrences - 1) == #examples.
 func countExamplesInPrompt(prompt string) int {
 	if prompt == "" {
 		return 0
 	}
-	n := strings.Count(prompt, "\nTASK:\n\n")
-	if n > 0 {
-		return n - 1
-	}
-	// Resilient fallback.
-	n = strings.Count(prompt, "TASK:\n\n")
+	n := strings.Count(prompt, "INPUT:\n\n")
 	if n > 0 {
 		return n - 1
 	}
@@ -594,6 +589,7 @@ func Test_Oracle_Alias_Param_WrongShape_HardError(t *testing.T) {
 	// Structural type check at call-site should fail.
 	wantHardErrorContains(t, err, "type mismatch")
 }
+
 func Test_Oracles_TaskLine_UsesAnnotation_StraightCall(t *testing.T) {
 	ip := NewInterpreter()
 	registerJSONParse(ip)
@@ -625,9 +621,9 @@ func Test_Oracles_TaskLine_UsesAnnotation_StraightCall(t *testing.T) {
 		t.Fatalf("fallback TASK line was used; prompt was:\n%s", gotPrompt)
 	}
 
-	// No examples provided → no example TASK blocks.
+	// No examples provided → no example INPUT blocks.
 	if n := countExamplesInPrompt(gotPrompt); n != 0 {
-		t.Fatalf("expected 0 example TASK blocks, got %d", n)
+		t.Fatalf("expected 0 example INPUT blocks, got %d", n)
 	}
 }
 
@@ -662,8 +658,8 @@ func Test_Oracles_TaskLine_UsesAnnotation_CurriedCall(t *testing.T) {
 		t.Fatalf("fallback TASK line was used after currying; prompt was:\n%s", gotPrompt)
 	}
 
-	// No examples provided → no example TASK blocks.
+	// No examples provided → no example INPUT blocks.
 	if n := countExamplesInPrompt(gotPrompt); n != 0 {
-		t.Fatalf("expected 0 example TASK blocks, got %d", n)
+		t.Fatalf("expected 0 example INPUT blocks, got %d", n)
 	}
 }

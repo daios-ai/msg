@@ -264,6 +264,9 @@ func (ip *Interpreter) buildOraclePrompt(
 		taskLine = strings.TrimSpace(instruction.Data.(string))
 	}
 
+	bld.WriteString("TASK:\n\n")
+	bld.WriteString(taskLine + "\n\n")
+
 	// Examples.
 	if examples.Tag == VTArray {
 		for _, ex := range examples.Data.(*ArrayObject).Elems {
@@ -276,8 +279,6 @@ func (ip *Interpreter) buildOraclePrompt(
 			}
 			inVal, outVal := pair[0], pair[1]
 
-			bld.WriteString("TASK:\n\n")
-			bld.WriteString(taskLine + "\n\n")
 			bld.WriteString("INPUT:\n\n")
 			bld.WriteString(toJSON(inVal) + "\n\n")
 			bld.WriteString("OUTPUT:\n\n")
@@ -286,8 +287,6 @@ func (ip *Interpreter) buildOraclePrompt(
 	}
 
 	// Final TASK with current call's input.
-	bld.WriteString("TASK:\n\n")
-	bld.WriteString(taskLine + "\n\n")
 	bld.WriteString("INPUT:\n\n")
 	bld.WriteString(toJSON(input) + "\n\n")
 	bld.WriteString("OUTPUT:\n")

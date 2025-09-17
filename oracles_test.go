@@ -663,3 +663,102 @@ func Test_Oracles_TaskLine_UsesAnnotation_CurriedCall(t *testing.T) {
 		t.Fatalf("expected 0 example INPUT blocks, got %d", n)
 	}
 }
+
+// --- extra tiny assertions for these tests ----------------------------------
+
+func wantAnnotNull(t *testing.T, v Value, substr string) {
+	t.Helper()
+	if v.Tag != VTNull {
+		t.Fatalf("want annotated null, got tag=%v val=%v", v.Tag, v)
+	}
+	if v.Annot == "" || !strings.Contains(v.Annot, substr) {
+		t.Fatalf("want annotated null containing %q, got %q", substr, v.Annot)
+	}
+}
+
+// --- lexical-resolution tests -----------------------------------------------
+
+//  1. If no hook is visible in the oracle's lexical chain at definition time,
+//     the call returns annotated null (no Global fallback).
+func Test_Oracle_LexicalHook_Missing(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip) // needed by oracle engine
+	// IMPORTANT: Do NOT register __oracle_execute anywhere.
+
+	v, err := ip.EvalSource(`
+		let o = oracle() -> Str
+		o()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotNull(t, v, "oracle backend not configured")
+}
+
+//  2. A user-space binding defined BEFORE the oracle is created is captured
+//     lexically and used by the oracle.
+func Test_Oracle_LexicalHook_UserSpaceBinding(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+
+	v, err := ip.EvalSource(`
+		let __oracle_execute = fun(prompt: Str) -> Str do
+			"{\"output\":\"X-Ray Spex\"}"
+		end
+		let o = oracle() -> Str
+		o()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "X-Ray Spex")
+}
+
+//  3. A call-site shadow (let __oracle_execute = ...) does NOT override the
+//     oracle's captured hook under pure lexical semantics.
+func Test_Oracle_LexicalHook_IgnoresCallSiteShadow(t *testing.T) {
+	ip := NewInterpreter()
+	registerJSONParse(ip)
+
+	// Install a fake backend in Core/Global *before* oracle definition so it’s
+	// visible lexically when the oracle is created.
+	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		let g = fun() -> Str do
+			# This local binding is at the call site and must NOT affect the oracle.
+			let __oracle_execute = fun(prompt: Str) -> Str do
+				"{\"output\":\"Hedy Lamarr\"}"
+			end
+			scientist()
+		end
+		g()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Should still use the pre-installed hook, not the call-site shadow.
+	wantStr(t, v, "Ada Lovelace")
+}
+
+//  4. The captured hook works inside a spawned process because the function's
+//     closure chain is snapshotted into the child isolate.
+func Test_Oracle_LexicalHook_SpawnedProcess(t *testing.T) {
+	ip, _ := NewRuntime()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"Grace Hopper"}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		let worker = fun() -> Str do
+			scientist()
+		end
+		let p = procSpawn(worker)
+		procJoin(p)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Grace Hopper")
+}

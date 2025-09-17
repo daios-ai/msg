@@ -134,8 +134,8 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 		f.Env,
 	)
 
-	// Locate executor hook.
-	hook, err := ip.Global.Get("__oracle_execute")
+	// Locate executor hook strictly via the oracle's lexical environment.
+	hook, err := f.Env.Get("__oracle_execute")
 	if err != nil || hook.Tag != VTFun {
 		return annotNull("oracle backend not configured (define __oracle_execute)")
 	}

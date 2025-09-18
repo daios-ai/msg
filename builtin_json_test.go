@@ -1,6 +1,7 @@
 package mindscript
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -364,5 +365,94 @@ func Test_Builtin_Json_JSONSchemaToType_ImportsDefs_AsTypeAliases(t *testing.T) 
 	}
 	if out.Tag != VTBool || out.Data.(bool) != true {
 		t.Fatalf("expected isType(5, Age) to be true; got %#v", out)
+	}
+}
+
+// ---------------- JSON: builtin jsonRepair ----------------
+
+func Test_Builting_Json_Repair_Fence_Comments_Unquoted_SingleQuotes(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	src := "```json\n{ a: 'z', nums: [1, 2,], /* trailing */ ok: true }\n```"
+	lit, err := json.Marshal(src) // produce a JSON-escaped string literal
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	out := evalWithIP(t, ip, `
+		let s = `+string(lit)+`
+	let v = jsonRepair(s)
+		{ a: v.a, ok: v.ok, nums: v.nums }
+	`)
+	m := entriesOf(t, out)
+
+	if m["a"].Tag != VTStr || m["a"].Data.(string) != "z" {
+		t.Fatalf("expected a == \"z\", got %#v", m["a"])
+	}
+	if m["ok"].Tag != VTBool || m["ok"].Data.(bool) != true {
+		t.Fatalf("expected ok == true, got %#v", m["ok"])
+	}
+	nums := m["nums"]
+	if nums.Tag != VTArray {
+		t.Fatalf("expected nums to be array, got %#v", nums)
+	}
+	elems := nums.Data.(*ArrayObject).Elems
+	if len(elems) != 2 || elems[0].Tag != VTInt || elems[0].Data.(int64) != 1 || elems[1].Data.(int64) != 2 {
+		t.Fatalf("expected nums == [1,2], got %#v", elems)
+	}
+}
+
+func Test_Builting_Json_Repair_BracketBalancing(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	out := evalWithIP(t, ip, `
+		let v = jsonRepair("{\"a\":[1,2,3}")
+		{ a: v.a }
+	`)
+	m := entriesOf(t, out)
+	a := m["a"]
+	if a.Tag != VTArray {
+		t.Fatalf("expected a to be array after repair, got %#v", a)
+	}
+	elems := a.Data.(*ArrayObject).Elems
+	if len(elems) != 3 || elems[0].Data.(int64) != 1 || elems[1].Data.(int64) != 2 || elems[2].Data.(int64) != 3 {
+		t.Fatalf("expected a == [1,2,3], got %#v", elems)
+	}
+}
+
+func Test_Builting_Json_Repair_Invalid_YieldsAnnotatedNull(t *testing.T) {
+	ip, _ := NewRuntime()
+	v := evalWithIP(t, ip, `jsonRepair("not json at all")`)
+	wantAnnotatedContains(t, v, "invalid json")
+}
+
+func Test_Builting_Json_Repair_NumberNormalization(t *testing.T) {
+	ip, _ := NewRuntime()
+
+	// Leading dot, trailing dot, leading plus — normalize to valid numbers.
+	out := evalWithIP(t, ip, `
+		let v = jsonRepair("{\"n\": [ .5, 1., +1, +0 ] }")
+		{ n: v.n }
+	`)
+	m := entriesOf(t, out)
+	n := m["n"]
+	if n.Tag != VTArray {
+		t.Fatalf("expected n to be array, got %#v", n)
+	}
+	elems := n.Data.(*ArrayObject).Elems
+	// Expect [0.5, 1, 1, 0] with Int where integral.
+	if len(elems) != 4 {
+		t.Fatalf("expected 4 elements, got %d", len(elems))
+	}
+	if elems[0].Tag != VTNum || elems[0].Data.(float64) != 0.5 {
+		t.Fatalf("elem0 got %#v; want Num(0.5)", elems[0])
+	}
+	if elems[1].Tag != VTInt || elems[1].Data.(int64) != 1 {
+		t.Fatalf("elem1 got %#v; want Int(1)", elems[1])
+	}
+	if elems[2].Tag != VTInt || elems[2].Data.(int64) != 1 {
+		t.Fatalf("elem2 got %#v; want Int(1)", elems[2])
+	}
+	if elems[3].Tag != VTInt || elems[3].Data.(int64) != 0 {
+		t.Fatalf("elem3 got %#v; want Int(0)", elems[3])
 	}
 }

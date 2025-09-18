@@ -40,6 +40,53 @@ Params:
 Returns:
   Any`)
 
+	// ---- Permissive JSON repair/parse ------------------------------------------
+
+	ip.RegisterNative(
+		"jsonRepair",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			src := ctx.MustArg("s").Data.(string)
+
+			// Use the permissive repairer/decoder. It returns a Go JSON-compatible
+			// value graph (with json.Number for numbers), the repaired text (ignored
+			// here), and warnings (used only to craft a friendly message on failure).
+			gv, _, warns := jsonRepair(src)
+			if gv == nil {
+				// Extract a useful decode error if present; otherwise fall back.
+				msg := "invalid JSON"
+				for i := len(warns) - 1; i >= 0; i-- {
+					if strings.HasPrefix(warns[i], "decode error: ") {
+						msg = "invalid JSON (after repair): " + strings.TrimPrefix(warns[i], "decode error: ")
+						break
+					}
+				}
+				return annotNull(msg)
+			}
+			return goJSONToValue(gv)
+		},
+	)
+
+	setBuiltinDoc(ip, "jsonRepair", `Repair and parse messy JSON into MindScript values.
+
+Like jsonParse, but permissive. Accepts JSON wrapped in markdown fences and
+tolerates common issues: comments, trailing commas, unquoted keys, single-quoted
+strings, key=value, .5 / 1. / +1 numbers, NaN/Infinity (→ null), and minor
+bracket/brace/string balancing. If repair still fails, returns an annotated null.
+
+Mapping rules (same as jsonParse):
+  • null/bool/number/string → Null/Bool/Int|Num/Str
+  • arrays → [Any]
+  • objects → {Str: Any}
+  • integral JSON numbers become Int; others become Num
+
+Params:
+  s: Str — JSON-ish text
+
+Returns:
+  Any`)
+
 	// jsonStringify(x: Any) -> Str
 	// jsonStringify(x: Any) -> Str?
 	ip.RegisterNative(

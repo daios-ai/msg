@@ -391,7 +391,7 @@ func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantAnnotatedNullContains(t, v, "returned null")
+	wantAnnotatedNullContains(t, v, "not valid JSON")
 }
 
 func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
@@ -420,7 +420,7 @@ func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantAnnotatedNullContains(t, v, "returned null")
+	wantAnnotatedNullContains(t, v, "not valid JSON")
 }
 
 // Already had a transport error test; add one more variant: backend returns empty -> annotated null

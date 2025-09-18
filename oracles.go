@@ -146,35 +146,28 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 		return res
 	}
 	if res.Tag != VTStr {
-		return annotNull("oracle executor must return Str (raw model output) or null")
+		return annotNull("oracle executor must return a string (raw model output) or null")
 	}
 
 	// Parse returned JSON and validate it matches {"output": T?}.
 	raw := strings.TrimSpace(res.Data.(string))
-	raw = unwrapFenced(raw) // tolerate accidental ```json fences
-
-	parsed, perr := ip.callGlobal1("jsonParse", Str(raw))
-	if perr != "" {
-		if raw == "null" {
-			return annotNull("oracle returned null")
-		}
+	decoded, _, _ := jsonRepair(raw)
+	if decoded == nil {
 		return annotNull("oracle output was not valid JSON")
 	}
-	if parsed.Tag != VTMap {
+	v := goJSONToValue(decoded)
+	if v.Tag != VTMap {
+		v = Value{Tag: VTMap, Data: &MapObject{
+			Entries: map[string]Value{"output": v},
+			KeyAnn:  map[string]string{}, Keys: []string{"output"},
+		}}
+	}
+	mo := v.Data.(*MapObject)
+	out, ok := mo.Entries["output"]
+	if !ok || !ip.isType(out, ensureNullableUnlessAny(f.ReturnType), f.Env) {
 		return annotNull("oracle output did not match the declared return type")
 	}
-	mo := parsed.Data.(*MapObject)
-	outVal, ok := mo.Entries["output"]
-	if !ok {
-		return annotNull("oracle output did not match the declared return type")
-	}
-
-	// Validate against operationally nullable return type (T?).
-	outTNullable := ensureNullableUnlessAny(f.ReturnType)
-	if !ip.isType(outVal, outTNullable, f.Env) {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	return outVal
+	return out
 }
 
 // buildOraclePrompt builds the prompt from Value-boxed parts.

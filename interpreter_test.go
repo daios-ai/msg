@@ -1844,3 +1844,19 @@ func Test_Interpreter_Array_Assignment_NegativeIndexing_OOB(t *testing.T) {
 	err = evalPersistentExpectError(t, ip, "a[3] = 1")
 	wantErrContains(t, err, "array index out of range")
 }
+
+func Test_Interpreter_FunLiteral_BasePath_Uses_Ints_Not_Floats(t *testing.T) {
+	// This primes the const pool with Num(0.0) and Num(2.0). The fun literal that
+	// follows is the 3rd top-level expression (block child index = 2), so the
+	// emitter passes basePath = [2, 2] (both **Int**) into __make_fun.
+	// If const interning incorrectly uses numeric-equality (Int(2) == Num(2.0)),
+	// those Int constants would be reused as Num and __make_fun would raise:
+	//   type mismatch in parameter 'basePath': expected [Int], got [Num]
+	// With the strict const-pool equality fix, this must succeed.
+	v := evalSrc(t, `
+0.0
+2.0
+(fun(x: Int) -> Int do x + 1 end)(6)
+`)
+	wantInt(t, v, 7)
+}

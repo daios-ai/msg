@@ -556,9 +556,33 @@ func (e *emitter) callWithMarkChild(argc int, childIdx int) {
 
 // ----------------------------------------------------------------------------
 
+func equalConst(a, b Value) bool {
+	if a.Tag != b.Tag {
+		return false
+	}
+	switch a.Tag {
+	case VTNull:
+		return true
+	case VTBool:
+		return a.Data.(bool) == b.Data.(bool)
+	case VTInt:
+		return a.Data.(int64) == b.Data.(int64)
+	case VTNum:
+		return a.Data.(float64) == b.Data.(float64)
+	case VTStr:
+		return a.Data.(string) == b.Data.(string)
+	case VTArray, VTMap, VTFun, VTType, VTModule, VTHandle:
+		// For const-pool purposes you usually don't intern compound values;
+		// fall back to pointer/identity if you really need it:
+		return &a == &b
+	default:
+		return false
+	}
+}
+
 func (e *emitter) k(v Value) uint32 {
 	for i := range e.consts {
-		if e.ip.deepEqual(e.consts[i], v) {
+		if equalConst(e.consts[i], v) { // <-- use strict equality here
 			return uint32(i)
 		}
 	}

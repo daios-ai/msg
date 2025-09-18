@@ -152,19 +152,31 @@ T.test("std/push/appends", fun(_: Null) do
 	T.assertEq(push([1, 2], 3), [1, 2, 3])
 end)
 
-T.test("std/pop/last-or-null", fun(_: Null) do
+T.test("std/pop/last", fun(_: Null) do
 	T.assertEq(pop([9, 8]), 8)
-	T.assertEq(pop([]), null)
 end)
 
-T.test("std/shift/front", fun(_: Null) do
-	T.assertEq(shift([2, 3], 1), [1, 2, 3])
+T.test("std/pop/empty-panics", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		pop([])
+	end, null)
 end)
 
-T.test("std/unshift/first-or-null", fun(_: Null) do
-	T.assertEq(unshift([5, 6]), 5)
-	T.assertEq(unshift([]), null)
+T.test("std/shift/first", fun(_: Null) do
+	T.assertEq(shift([1, 2, 3]), 1)
 end)
+
+T.test("std/shift/empty-panics", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		shift([])
+	end, null)
+end)
+
+T.test("std/unshift/prepend", fun(_: Null) do
+	T.assertEq(unshift([2, 3], 1), [1, 2, 3])
+	T.assertEq(unshift([], 5), [5])
+end)
+
 
 # -----------------------------
 # Objects (maps)

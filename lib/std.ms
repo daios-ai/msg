@@ -559,5 +559,5 @@ let llm = import("llm")
 # llm.init()
 
 oracleInstall(llm.exec)
-llm.useBackend("openai")
-llm.useModel("chatgpt-4o-latest")
+llm.useBackend("openai-responses")
+llm.useModel("gpt-5")

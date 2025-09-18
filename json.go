@@ -94,23 +94,6 @@ type jWarning struct {
 	Msg  string
 }
 
-// Token kinds (minimal for our tolerant lexer)
-type jTokenKind int
-
-const (
-	jSTRING jTokenKind = iota
-	jNUMBER
-	jIDENT
-	jLBRACE
-	jRBRACE
-	jLBRACK
-	jRBRACK
-	jCOLON
-	jCOMMA
-	jEOF
-	jUNKNOWN
-)
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,10 +257,6 @@ func jRepairSyntax(src string) (string, []string) {
 }
 
 func jBalanceBrackets(src string) (string, []string) {
-	type closer struct {
-		open  rune
-		close rune
-	}
 	emitCloser := func(b rune) rune {
 		if b == '{' {
 			return '}'

@@ -437,3 +437,219 @@ func Test_JSON_TrimLeadingGarbage_NoFence(t *testing.T) {
 		t.Fatalf("fixed=%q; want %q", fixed, `[1,2]`)
 	}
 }
+
+func Test_JSON_EmptyInputs(t *testing.T) {
+	v, fixed, warns := jsonRepair("")
+	if v != nil {
+		t.Fatalf("want nil value on empty input; got %#v", v)
+	}
+	if strings.TrimSpace(fixed) == "" {
+		// fixed should not be totally empty (we return something canonical like "null" + a warning)
+		t.Fatalf("fixed should not be empty")
+	}
+	if len(warns) == 0 {
+		t.Fatalf("expected a warning for empty/irreparable input")
+	}
+}
+
+func Test_JSON_TrailingJunkAfterValid(t *testing.T) {
+	v, fixed, warns := jsonRepair(`{"ok":1} trailing stuff`)
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"ok":1}` {
+		t.Fatalf("value=%v", m)
+	}
+	if fixed != `{"ok":1}` {
+		t.Fatalf("fixed=%q", fixed)
+	}
+	if !strings.Contains(strings.Join(warns, ";"), "trailing") {
+		t.Fatalf("expected trailing junk warning; got %v", warns)
+	}
+}
+
+func Test_JSON_MultipleTopLevelValues_ExtractFirstOnly(t *testing.T) {
+	v, fixed, _ := jsonRepair(`[]{} more`)
+	// We keep the first balanced region only
+	a := mustAsSlice(t, v)
+	if canonJSONString(t, a) != `[]` {
+		t.Fatalf("value=%v", a)
+	}
+	if fixed != `[]` {
+		t.Fatalf("fixed=%q; want []", fixed)
+	}
+}
+
+func Test_JSON_LargestFenceWins(t *testing.T) {
+	src := "```json\n{\"small\":true}\n```\ntext\n```json\n{\"big\": [1,2,3]}\n```"
+	v, fixed, warns := jsonRepair(src)
+	if strings.TrimSpace(fixed) != `{"big":[1,2,3]}` {
+		t.Fatalf("fixed=%q", fixed)
+	}
+	if len(warns) == 0 || !strings.Contains(strings.Join(warns, ";"), "fence") {
+		t.Fatalf("expected fence warning; got %v", warns)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"big":[1,2,3]}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_FenceWithNonJsonLabel(t *testing.T) {
+	src := "```jsonc\n{\"a\":1,/*c*/}\n```"
+	v, fixed, _ := jsonRepair(src)
+	if fixed != `{"a":1}` {
+		t.Fatalf("fixed=%q; want %q", fixed, `{"a":1}`)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"a":1}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_CommentBetweenKeyAndColon(t *testing.T) {
+	src := `{ "a" /* here */ : 1 }`
+	v, fixed, warns := jsonRepair(src)
+	if strings.Contains(fixed, "/*") {
+		t.Fatalf("comment not stripped; fixed=%q", fixed)
+	}
+	if !strings.Contains(strings.Join(warns, ";"), "comment") {
+		t.Fatalf("expected comment warning; got %v", warns)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"a":1}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_MalformedExponent_BecomesNull(t *testing.T) {
+	src := `{"n": 1e}`
+	v, fixed, _ := jsonRepair(src)
+	if strings.Contains(fixed, "1e") {
+		t.Fatalf("malformed exponent not normalized; fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"n":null}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_ControlCharsInKeyAndValue_AreEscaped(t *testing.T) {
+	src := "{\n  \"key\t_\n\": \"va\tl\nue\"\n}"
+	v, fixed, _ := jsonRepair(src)
+	if strings.Contains(fixed, "\t") || strings.Contains(fixed, "\n") {
+		t.Fatalf("control chars should be escaped in fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	js := canonJSONString(t, m)
+	if !strings.Contains(js, `\\t`) && !strings.Contains(js, `\u0009`) {
+		t.Fatalf("expected escaped tab in key/value; got %s", js)
+	}
+}
+
+func Test_JSON_HTTPAndDoubleSlashesInsideString_NotComments(t *testing.T) {
+	src := `{"u":"http://x//y"}`
+	v, fixed, _ := jsonRepair(src)
+	if fixed != `{"u":"http://x//y"}` {
+		t.Fatalf("fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"u":"http://x//y"}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_DuplicateKeysNested(t *testing.T) {
+	src := `{ "a": { "x": 1, "x": 2 } }`
+	v, _, warns := jsonRepair(src)
+	m := mustAsMap(t, v)
+	inner := mustAsMap(t, m["a"])
+	if canonJSONString(t, inner) != `{"x":2}` {
+		t.Fatalf("inner map=%v", inner)
+	}
+	if !strings.Contains(strings.Join(warns, ";"), "duplicate key") {
+		t.Fatalf("expected duplicate key warning; got %v", warns)
+	}
+}
+
+func Test_JSON_NestedMismatchedClosers(t *testing.T) {
+	src := `{ "a": [1, 2}, "b": 3]`
+	v, fixed, warns := jsonRepair(src)
+	jw := strings.Join(warns, ";")
+	if !(strings.Contains(jw, "balance_array") || strings.Contains(jw, "balance")) {
+		t.Fatalf("expected balance warnings; got %v", warns)
+	}
+	if strings.Count(fixed, "]") == 0 || strings.Count(fixed, "}") == 0 {
+		t.Fatalf("expected synthesized closers; fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	// Minimal sanity: both keys present, array truncated properly
+	if _, ok := m["a"]; !ok {
+		t.Fatalf("missing key 'a'")
+	}
+	if _, ok := m["b"]; !ok {
+		t.Fatalf("missing key 'b'")
+	}
+}
+
+func Test_JSON_NumericUnquotedKey_BecomesString(t *testing.T) {
+	src := `{ 5: "v" }`
+	v, fixed, _ := jsonRepair(src)
+	if !strings.Contains(fixed, `"5":`) {
+		t.Fatalf("numeric key not quoted; fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"5":"v"}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_SmartQuotesInArray_Normalize(t *testing.T) {
+	src := `["a", “b”, 'c']`
+	v, fixed, _ := jsonRepair(src)
+	if strings.Contains(fixed, "“") || strings.Contains(fixed, "’") || strings.Contains(fixed, "”") || strings.Contains(fixed, "'") {
+		t.Fatalf("smart/single quotes not normalized; fixed=%q", fixed)
+	}
+	a := mustAsSlice(t, v)
+	if canonJSONString(t, a) != `["a","b","c"]` {
+		t.Fatalf("array=%v", a)
+	}
+}
+
+func Test_JSON_TrailingCommaWithComment(t *testing.T) {
+	src := `{"a":1, /*c*/ }`
+	v, fixed, _ := jsonRepair(src)
+	if strings.Contains(fixed, "/*") || strings.Contains(fixed, ",}") {
+		t.Fatalf("comment/trailing comma not normalized; fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	if canonJSONString(t, m) != `{"a":1}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_MixedEqualsAndColon(t *testing.T) {
+	src := `{a=1,"b"=2,c :3}`
+	v, fixed, _ := jsonRepair(src)
+	if strings.Contains(fixed, "=") {
+		t.Fatalf("expected '=' normalized to ':'; fixed=%q", fixed)
+	}
+	m := mustAsMap(t, v)
+	js := canonJSONString(t, m)
+	if js != `{"a":1,"b":2,"c":3}` && js != `{"b":2,"a":1,"c":3}` && js != `{"c":3,"a":1,"b":2}` {
+		t.Fatalf("value=%v", m)
+	}
+}
+
+func Test_JSON_FirstValidBalancedAmongMany(t *testing.T) {
+	src := `junk {not:json} noise [1,2] later {"x":1}`
+	v, fixed, warns := jsonRepair(src)
+	if fixed != `[1,2]` {
+		t.Fatalf("fixed=%q; want [1,2]", fixed)
+	}
+	a := mustAsSlice(t, v)
+	if canonJSONString(t, a) != `[1,2]` {
+		t.Fatalf("value=%v", a)
+	}
+	if !strings.Contains(strings.Join(warns, ";"), "extracted first balanced JSON region") {
+		t.Fatalf("expected extraction warning; got %v", warns)
+	}
+}

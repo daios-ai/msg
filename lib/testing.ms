@@ -14,7 +14,31 @@
 # Internal state
 # =========================
 
-let _tests = {} # name -> (Null)->Any
+let _tests = {} # name -> (Null)->Any name -> { file!: Str, line!: Int }
+
+let _origins = {} # concrete tests: test("name", ...)
+
+let _caseOrigins = {} # case groups:   cases("prefix", ...)
+
+# Return the recorded origin for a test name, with cases("x") fallback for "x/NN".
+let _originOf = fun(name: Str) -> {}? do
+	if mapHas(_origins, name) then
+		return _origins[name]
+	end
+	# subtest fallback: prefix/NN  (NN = digits)
+	let parts = split(name, "/")
+	let n = len(parts)
+	if n >= 2 then
+		let last = parts[n - 1]
+		if len(match("^[0-9]+$", last)) > 0 then
+			let parent = join(slice(parts, 0, n - 1), "/")
+			if mapHas(_caseOrigins, parent) then
+				return _caseOrigins[parent]
+			end
+		end
+	end
+	return
+end
 
 # =========================
 # Small helpers
@@ -240,6 +264,42 @@ let Summary = type {passed: Int, failed: Int, total: Int, durationMs: Int}
 # Discovery & loading
 # =========================
 
+# Scan source text to record where tests/cases are declared.
+# Returns number of registrations indexed.
+let _indexTests = fun(file: Str, src: Str) -> Int do
+	let lines = split(src, "\n")
+	let i = 0
+	let found = 0
+	for _ in lines do
+		let line = lines[i]
+
+		# test("name", ...)  or  T.test("name", ...)
+		let p1 = split(line, "test(\"")
+		if len(p1) > 1 then
+			let tail = p1[1]
+			let name = split(tail, "\"")[0]
+			if len(name) > 0 then
+				_origins[name] = {file: file, line: i + 1}
+				found = found + 1
+			end
+		end
+
+		# cases("prefix", ...)  or  T.cases("prefix", ...)
+		let p2 = split(line, "cases(\"")
+		if len(p2) > 1 then
+			let tail2 = p2[1]
+			let prefix = split(tail2, "\"")[0]
+			if len(prefix) > 0 then
+				_caseOrigins[prefix] = {file: file, line: i + 1}
+				found = found + 1
+			end
+		end
+
+		i = i + 1
+	end
+	return found
+end
+
 let _endsWith = fun(s: Str, suffix: Str) -> Bool do
 	let n = len(s)
 	let m = len(suffix)
@@ -329,6 +389,10 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 			printf("FAIL read %s\n", [f])
 			continue
 		end
+
+		# origins index
+		_indexTests(f, src)
+
 		let name = sprintf("testing:%s:%d", [f, nowNanos()])
 		let r = try(fun(_: Null) do
 			importCode(name, src)
@@ -336,7 +400,7 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 		if r.ok then
 			loaded = loaded + 1
 		else
-			# caret-formatted by your try(); print verbatim
+			# caret-formatted by try(); print verbatim
 			printf("FAIL import %s\n%s\n", [f, r.error])
 		end
 	end
@@ -386,11 +450,16 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 
 		let res = chanRecv(done)
 
+		# Prefer cancelling the loser, then close and join both for hygiene.
 		if mapHas(res, "timeout") and bool(res.timeout) then
 			procCancel(tp)
 		else
 			procCancel(tt)
 		end
+		chanClose(done)
+		# Best-effort joins (ignore results)
+		procJoin(tp)
+		procJoin(tt)
 
 		res
 	end
@@ -404,27 +473,42 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 		""
 	end
 
+	# origin hint printed for failures (both verbose and quiet)
+	let _printOriginIfAny = fun(_: Null) -> Null do
+		let o = _originOf(name)
+		if o != null then
+			printf("    AT    %s:%d (test)\n", [o.file, int(o.line)])
+		end
+		null
+	end
+
 	if verbose then
-		let tag = if isTimeout then
-			"TIMEOUT"
-		elif ok then
-			"PASS"
+		if ok then
+			# PASS: we already printed "=== RUN" at the top; close with PASS.
+			printf("--- PASS: %s (%dms)\n", [name, int(dur)])
 		else
-			"FAIL"
-		end
-		printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
-		if not ok then
+			# FAILURE: show origin, then engine error blob, then close with FAIL/TIMEOUT.
+			_printOriginIfAny(null)
 			printf("%s\n", [err])
-		end
-	else
-		if not ok then
 			let tag = if isTimeout then
 				"TIMEOUT"
 			else
 				"FAIL"
 			end
-			printf("%s %s\n", [tag, name])
+			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+		end
+	else
+		if not ok then
+			# Quiet mode: print RUN, origin, error blob, then FAIL/TIMEOUT (same framing as verbose).
+			printf("=== RUN   %s\n", [name])
+			_printOriginIfAny(null)
 			printf("%s\n", [err])
+			let tag = if isTimeout then
+				"TIMEOUT"
+			else
+				"FAIL"
+			end
+			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
 		end
 	end
 

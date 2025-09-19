@@ -1,497 +1,1036 @@
-# Codegen core: co-evolve program and tests from a single Spec.
-#
-# Minimal surface:
-# - Oracles: specToTests(spec, seed) -> [Test]? ; specToProgram(spec, seed) -> Str?
-# - Runner: run(code, tests) -> RunResult
-# - Loop: bootstrap(...) -> State? ; evolve(state, budget) -> State
-#
-# Conventions:
-# - Soft errors return null with an annotation; hard errors are avoided.
-# - Functions are anonymous, bound via let; tabs for indentation.
+# ------ JSON-MindScript Manual -------------------------
 
-# ---------- Types ----------
-
-type Spec = { text!: Str }  # Single source of truth (types + PRE text)
-
-type Seeds = { tests!: Int, program!: Int }  # Deterministic seeds
-
-type Test = { name!: Str, src!: Str }  # Each test is a Bool-returning expression
-
-type FailureClass = Enum["lex", "parse", "runtime"]
-
-type TestOutcome = {
-	name!: Str,
-	ok!: Bool,
-	error: Str,
-	class!: FailureClass
-}
-
-type Trace = {
-	testOutcomes!: [TestOutcome],
-	elapsedMillis!: Int
-}
-
-type RunResult = { pass!: Bool, trace!: Trace }
-
-type Program = { code!: Str, hash!: Str }
-
-type State = {
-	spec!: Spec,
-	seeds!: Seeds,
-	T_test!: [Test],
-	T_train!: [Test],
-	program: Program,
-	last!: RunResult
-}
-
-type Budget = {
-	maxRounds!: Int,
-	maxAddsPerRound!: Int,
-	maxRepairsPerRound!: Int
-}
-
-# ---------- Oracles (public) ----------
-
-# Generate tests from a Spec (seeded, role-separated).
-#
-# Produce a non-empty, deduplicated set of Bool-returning test expressions.
-#
-# Args:
-#	spec: Spec — types + PRE notes (single source of truth).
-#	seed: Int — deterministic seed; same (spec, seed) → same tests.
-# Return:
-#	[Test]? — tests or null on error.
-let specToTests = oracle(spec: Spec, seed: Int) -> [Test]?
-
-# Generate a program candidate that attempts to satisfy the Spec (seeded, role-separated).
-#
-# Produce compilable MindScript source code for the program.
-#
-# Args:
-#	spec: Spec — single source of truth (types + PRE).
-#	seed: Int — deterministic seed; separate from tests’ seed.
-# Return:
-#	Str? — compilable source or null on error.
-let specToProgram = oracle(spec: Spec, seed: Int) -> Str?
-
-# ---------- Runner (public) ----------
-
-# Run a program against tests; classify failures; aggregate a trace.
-#
-# Each test is an expression expected to evaluate to true.
-#
-# Args:
-#	code: Str — MindScript program (module/function code).
-#	tests: [Test] — Bool-returning expressions.
-# Return:
-#	RunResult — pass=true iff all tests pass.
-let run = fun(code: Str, tests: [Test]) -> RunResult do
-	let t0 = nowMillis(null)
-	let imported = try(fun() do importCode("prog", code) end)
-	if not imported.ok then
-		let cls = _guessClass(imported.error)
-		let ts = list(map(fun(tt) do { name: tt.name, ok: false, error: imported.error, class: cls } end, iter(tests)))
-		{ pass: false, trace: { testOutcomes: ts, elapsedMillis: nowMillis(null) - t0 } }
-	else
-		let outcomes = []
-		for tt in tests do
-			let oc = _runOne(tt)
-			outcomes = push(outcomes, oc)
-		end
-		let allOk = _allOk(outcomes)
-		{ pass: allOk, trace: { testOutcomes: outcomes, elapsedMillis: nowMillis(null) - t0 } }
+let _manual = fun() do
+	let ROOT = osEnv("MSGPATH")
+	if ROOT == null then
+		return noteSet("<environment variable MSGPATH is undefined>", null)
 	end
+	let man = readFile(pathJoin([ROOT, "data", "msjson.md"]))
+	if man == null then
+		return noteSet("<JSON-MindScript manual not found (MSGPATH/data/msjson.md)>", null)
+	end
+	man
+end()
+
+# ------ Natural language -> Spec -----------------------
+
+# FEW-SHOTS: each output is a JSON-MS AST that EVALUATES to:
+# { doc: Str, jsonSpec: { name: Str, type: Type } }
+
+let _specExamples = [
+	[
+		"Add two real numbers and return the sum.",
+		[
+			"map",
+			[
+				"pair",
+				["str", "doc"],
+				[
+					"str",
+					"Add two numbers.\n\nArgs: a:Num, b:Num\nReturn: Num"
+				]
+			],
+			[
+				"pair",
+				["str", "jsonSpec"],
+				[
+					"map",
+					["pair", ["str", "name"], ["str", "add"]],
+					[
+						"pair",
+						["str", "type"],
+						[
+							"type",
+							[
+								"binop",
+								"->",
+								["id", "Num"],
+								[
+									"binop",
+									"->",
+									["id", "Num"],
+									["id", "Num"]
+								]
+							]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		"Factorial of n (n >= 0). Return null when n < 0.",
+		[
+			"map",
+			[
+				"pair",
+				["str", "doc"],
+				[
+					"str",
+					"Factorial with input check.\n\nArgs: n:Int\nReturn: Int?"
+				]
+			],
+			[
+				"pair",
+				["str", "jsonSpec"],
+				[
+					"map",
+					["pair", ["str", "name"], ["str", "factorial"]],
+					[
+						"pair",
+						["str", "type"],
+						[
+							"type",
+							[
+								"binop",
+								"->",
+								["id", "Int"],
+								["unop", "?", ["id", "Int"]]
+							]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		"Sort an array of strings ascending (stable).",
+		[
+			"map",
+			[
+				"pair",
+				["str", "doc"],
+				[
+					"str",
+					"Sort strings ascending (stable).\n\nArgs: xs:[Str]\nReturn: [Str]"
+				]
+			],
+			[
+				"pair",
+				["str", "jsonSpec"],
+				[
+					"map",
+					["pair", ["str", "name"], ["str", "sortStrings"]],
+					[
+						"pair",
+						["str", "type"],
+						[
+							"type",
+							[
+								"binop",
+								"->",
+								["array", ["id", "Str"]],
+								[
+									"array",
+									["id", "Str"]
+								]
+							]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		"Return the host part of a URL string; null if invalid.",
+		[
+			"map",
+			[
+				"pair",
+				["str", "doc"],
+				[
+					"str",
+					"Extract host from URL.\n\nArgs: url:Str\nReturn: Str?"
+				]
+			],
+			[
+				"pair",
+				["str", "jsonSpec"],
+				[
+					"map",
+					["pair", ["str", "name"], ["str", "host"]],
+					[
+						"pair",
+						["str", "type"],
+						[
+							"type",
+							[
+								"binop",
+								"->",
+								["id", "Str"],
+								["unop", "?", ["id", "Str"]]
+							]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		"Summarize a diff into a concise git commit subject (<= 72 chars). Return null if not possible.",
+		[
+			"map",
+			[
+				"pair",
+				["str", "doc"],
+				[
+					"str",
+					"Generate a short git commit subject.\n\nArgs: diff:Str\nReturn: Str?"
+				]
+			],
+			[
+				"pair",
+				["str", "jsonSpec"],
+				[
+					"map",
+					["pair", ["str", "name"], ["str", "commitSubject"]],
+					[
+						"pair",
+						["str", "type"],
+						[
+							"type",
+							[
+								"binop",
+								"->",
+								["id", "Str"],
+								["unop", "?", ["id", "Str"]]
+							]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		"Compute HMAC-SHA256 hex digest of msg with key.",
+		[
+			"map",
+			[
+				"pair",
+				["str", "doc"],
+				[
+					"str",
+					"Compute HMAC-SHA256.\n\nArgs: key:Str, msg:Str\nReturn: Str"
+				]
+			],
+			[
+				"pair",
+				["str", "jsonSpec"],
+				[
+					"map",
+					["pair", ["str", "name"], ["str", "hmac256"]],
+					[
+						"pair",
+						["str", "type"],
+						[
+							"type",
+							[
+								"binop",
+								"->",
+								["id", "Str"],
+								[
+									"binop",
+									"->",
+									["id", "Str"],
+									["id", "Str"]
+								]
+							]
+						]
+					]
+				]
+			]
+		]
+	]
+]
+
+# Oracle: minimal task, few-shots only. Assumes _manual: Str is already defined.
+let _specOracle = oracle(desc: Str) -> [Any]? from _specExamples
+_specOracle = noteSet("Return ONLY a JSON-MindScript AST for a map: { doc: Str, jsonSpec: { name: Str, type: Type } }.\n" + "Wrap the type with [\"type\", <TypeExpr>].\n\n" + _manual, _specOracle)
+
+# Public: natural language -> { doc, jsonSpec } (validate then eval)
+let spec = fun(desc: Str) -> {}? do
+	let ast = _specOracle(desc)
+	if ast == null then
+		return ast
+	end
+	let diags = astValidate(ast)
+	if diags != [] then
+		return noteSet(formatValue(diags[0]), null)
+	end
+	astEval(ast)
 end
 
-# ---------- Loop (public) ----------
+# ------ Coding Oracle ----------------------------------
 
-# Bootstrap from Spec: freeze tiny golden shard, generate first program, evaluate.
-#
-# Generate tests, split into T_test/T_train, synthesize program, and run once.
-#
-# Args:
-#	spec: Spec
-#	seeds: Seeds
-#	goldenSize: Int — size of frozen T_test (tiny; e.g., 3)
-# Return:
-#	State? — initialized state or null on error.
-let bootstrap = fun(spec: Spec, seeds: Seeds, goldenSize: Int) -> State? do
-	let allTests = specToTests(spec, seeds.tests)
-	if allTests == null then
-		return null # <tests generation failed>
-	end
-	let tests = _dedupeTests(allTests)
-	if len(tests) == 0 then
-		return null # <no tests>
-	end
+# Render a stabilized spec into a deterministic prompt for the coding oracle.
+# Expects: { doc!: Str, jsonSpec!: { name!: Str, type!: Type } }
+let _genPrompt = fun(s: {}) -> Str do
+	let name = s.jsonSpec.name
+	let tstr = formatValue(s.jsonSpec.type) # e.g., "<type: [Str] -> [Str]>"
 
-	let T_test = _pickGoldenShard(tests, goldenSize)
-	let T_train = _minus(tests, T_test)
-
-	let code = specToProgram(spec, seeds.program)
-	if code == null then
-		return null # <program generation failed>
-	end
-	let program = { code: code, hash: _hash(code) }
-
-	let gate = run(program.code, T_test)
-	let work = run(program.code, T_train)
-	let merged = _mergeTraces(gate.trace, work.trace)
-	{ spec: spec, seeds: seeds, T_test: T_test, T_train: T_train, program: program, last: { pass: gate.pass and work.pass, trace: merged } }
+	let doc = s.doc
+	join([
+		"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+		"",
+		"Name: " + name,
+		"Type: " + tstr,
+		"",
+		"Doc:",
+		doc
+	], "\n")
 end
 
-# Bounded evolution loop: add ≤1 canonical test per distinct failure; ≤1 minimal repair.
-#
-# Iterate within strict budgets. Stops on gate failure, all-pass, or budget exhaustion.
-#
-# Args:
-#	state: State — from bootstrap or prior step.
-#	budget: Budget — strict caps.
-# Return:
-#	State — final state after 0..maxRounds steps.
-let evolve = fun(state: State, budget: Budget) -> State do
-	let round = 0
-	let s = state
-	while round < budget.maxRounds do
-		let gate = run(s.program.code, s.T_test)
-		if not gate.pass then
-			let mergedEarly = _mergeTraces(gate.trace, run(s.program.code, s.T_train).trace)
-			return { spec: s.spec, seeds: s.seeds, T_test: s.T_test, T_train: s.T_train, program: s.program, last: { pass: false, trace: mergedEarly } }
-		end
+# Few-shots now use the SAME prompt shape produced by _renderSpecPrompt.
+# Each example’s first element is a synthetic prompt string with Name/Type/Doc.
+let _genExamples = [
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: add",
+			"Type: <type: Num -> Num -> Num>",
+			"",
+			"Doc:",
+			"Add two numbers.\n\nArgs: a:Num, b:Num\nReturn: Num"
+		], "\n"),
+		[
+			"annot",
+			[
+				"str",
+				"Add two numbers.\n\nArgs: a:Num, b:Num\nReturn: Num"
+			],
+			[
+				"fun",
+				[
+					"array",
+					["pair", ["id", "a"], ["id", "Num"]],
+					[
+						"pair",
+						["id", "b"],
+						["id", "Num"]
+					]
+				],
+				["id", "Num"],
+				[
+					"block",
+					["binop", "+", ["id", "a"], ["id", "b"]]
+				]
+			]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: factorial",
+			"Type: <type: Int -> Int?>",
+			"",
+			"Doc:",
+			"Factorial with input check.\n\nArgs: n:Int\nReturn: Int?"
+		], "\n"),
+		[
+			"annot",
+			[
+				"str",
+				"Factorial with input check.\n\nArgs: n:Int\nReturn: Int?"
+			],
+			[
+				"fun",
+				["array", ["pair", ["id", "n"], ["id", "Int"]]],
+				[
+					"unop",
+					"?",
+					["id", "Int"]
+				],
+				[
+					"block",
+					[
+						"if",
+						[
+							"pair",
+							["binop", "<", ["id", "n"], ["int", 0]],
+							[
+								"block",
+								[
+									"return",
+									[
+										"annot",
+										["str", "<negative input>"],
+										["null"]
+									]
+								]
+							]
+						],
+						[
+							"block",
+							["assign", ["decl", "res"], ["int", 1]],
+							[
+								"assign",
+								["decl", "i"],
+								["int", 2]
+							],
+							[
+								"while",
+								[
+									"binop",
+									"<=",
+									["id", "i"],
+									["id", "n"]
+								],
+								[
+									"block",
+									[
+										"assign",
+										["id", "res"],
+										[
+											"binop",
+											"*",
+											["id", "res"],
+											["id", "i"]
+										]
+									],
+									[
+										"assign",
+										["id", "i"],
+										[
+											"binop",
+											"+",
+											["id", "i"],
+											["int", 1]
+										]
+									]
+								]
+							],
+							["id", "res"]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: chooseColor",
+			"Type: <type: () -> Enum[\"red\",\"green\",\"blue\"]>",
+			"",
+			"Doc:",
+			"Pick a primary color.\n\nArgs: none\nReturn: Enum(red|green|blue)"
+		], "\n"),
+		[
+			"annot",
+			[
+				"str",
+				"Pick a primary color.\n\nArgs: none\nReturn: Enum(red|green|blue)"
+			],
+			[
+				"oracle",
+				["array"], # no params
+				[
+					"type",
+					[
+						"enum",
+						["str", "red"],
+						["str", "green"],
+						["str", "blue"]
+					]
+				],
+				[
+					"map",
+					[
+						"pair",
+						["str", "doc"],
+						[
+							"str",
+							"Pick one of the allowed colors."
+						]
+					],
+					[
+						"pair",
+						["str", "examples"],
+						[
+							"array",
+							["array", ["array"], ["str", "red"]],
+							[
+								"array",
+								["array"],
+								["str", "green"]
+							],
+							["array", ["array"], ["str", "blue"]]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: commitSubject",
+			"Type: <type: Str -> Str>",
+			"",
+			"Doc:",
+			"Generate a short, imperative git commit message.\n\nArgs: diff:Str\nReturn: Str"
+		], "\n"),
+		[
+			"annot",
+			[
+				"str",
+				"Generate a short, imperative git commit message.\n\nArgs: diff:Str\nReturn: Str"
+			],
+			[
+				"oracle",
+				["array", ["pair", ["id", "diff"], ["id", "Str"]]],
+				["id", "Str"],
+				[
+					"map",
+					[
+						"pair",
+						["str", "doc"],
+						[
+							"str",
+							"Summarize the diff into a concise commit subject (<= 72 chars)."
+						]
+					],
+					[
+						"pair",
+						["str", "examples"],
+						[
+							"array",
+							[
+								"array",
+								[
+									"array",
+									[
+										"str",
+										"+ add input validation to /login"
+									]
+								],
+								["str", "add input validation for /login"]
+							],
+							[
+								"array",
+								[
+									"array",
+									[
+										"str",
+										"- remove dead code in UserService"
+									]
+								],
+								["str", "remove dead code in UserService"]
+							]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: host",
+			"Type: <type: Str -> Str?>",
+			"",
+			"Doc:",
+			"Extract host from URL.\n\nArgs: url:Str\nReturn: Str?"
+		], "\n"),
+		[
+			"annot",
+			[
+				"str",
+				"Extract host from URL.\n\nArgs: url:Str\nReturn: Str?"
+			],
+			[
+				"fun",
+				["array", ["pair", ["id", "url"], ["id", "Str"]]],
+				[
+					"unop",
+					"?",
+					["id", "Str"]
+				],
+				[
+					"block",
+					[
+						"assign",
+						["decl", "u"],
+						[
+							"call",
+							["id", "urlParse"],
+							["id", "url"]
+						]
+					],
+					[
+						"if",
+						[
+							"pair",
+							["binop", "==", ["id", "u"], ["null"]],
+							[
+								"block",
+								[
+									"return",
+									[
+										"annot",
+										["str", "<invalid url>"],
+										["null"]
+									]
+								]
+							]
+						],
+						["block", ["idx", ["id", "u"], ["str", "host"]]]
+					]
+				]
+			]
+		]
+	]
+]
 
-		let work = run(s.program.code, s.T_train)
-		if work.pass then
-			let mergedDone = _mergeTraces(gate.trace, work.trace)
-			return { spec: s.spec, seeds: s.seeds, T_test: s.T_test, T_train: s.T_train, program: s.program, last: { pass: true, trace: mergedDone } }
-		end
+# The coding oracle still takes a Str prompt (rendered from the spec object).
+let _genOracle = oracle(spec: Str) -> [Any]? from _genExamples
 
-		let adds = _canonicalAdds(s.spec, s.program.code, work.trace, s, budget.maxAddsPerRound)
-		let newTrain = _appendNew(s.T_train, adds)
-		let repaired = _maybeRepair(s.spec, s.program.code, work.trace, budget.maxRepairsPerRound, s.seeds.program)
-		let nextCode = if repaired == null then s.program.code else repaired end
-		let nextProg = { code: nextCode, hash: _hash(nextCode) }
+let _genComment = "Return ONLY a JSON-MindScript AST for an anonymous function OR oracle " + "that conforms to the provided Name/Type and reflects the Doc.\n\n" + _manual
+_genOracle = noteSet(_genComment, _genOracle)
 
-		let nextGate = run(nextCode, s.T_test)
-		let nextWork = run(nextCode, newTrain)
-		let nextMerged = _mergeTraces(nextGate.trace, nextWork.trace)
-		let next = { spec: s.spec, seeds: s.seeds, T_test: s.T_test, T_train: newTrain, program: nextProg, last: { pass: nextGate.pass and nextWork.pass, trace: nextMerged } }
+# ------ Public ----------------------------------
 
-		s = next
-		round = round + 1
+# Generate a function/oracle from a stabilized spec object.
+# Expects: { doc!: Str, jsonSpec!: { name!: Str, type!: Type } }
+let gen = fun(spec: {}) do
+	let prompt = _genPrompt(spec)
+
+	let g = _genOracle(prompt)
+	if g == null then
+		return g
 	end
-	s
+
+	let validation = astValidate(g)
+	if validation != [] then
+		return noteSet(validation[0].message, null)
+	end
+
+	astEval(g)
 end
 
-# ---------- Helpers (private) ----------
+# ------ Test Ideas Oracle ------------------------------
 
-# Evaluate a single test; classify failure vs success.
-#
-# Args:
-#	tt: Test
-# Return:
-#	TestOutcome
-let _runOne = fun(tt: Test) -> TestOutcome do
-	let parsed = astParse(tt.src)
-	if parsed == null then
-		{ name: tt.name, ok: false, error: "parse error", class: "parse" }
-	else
-		let ev = try(fun() do astEval(parsed) end)
-		if not ev.ok then
-			let cls = _guessClass(ev.error)
-			{ name: tt.name, ok: false, error: ev.error, class: cls }
-		else
-			let okv = bool(ev.value)
-			if not okv then
-				{ name: tt.name, ok: false, error: "assertion failed", class: "runtime" }
-			else
-				{ name: tt.name, ok: true, error: "", class: "runtime" }
-			end
-		end
+# Few-shots mirror the same prompt shape as _genPrompt(Name/Type/Doc).
+# Output is a JSON-MS AST that EVALUATES to: [Str]
+let _ideasExamples = [
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: add",
+			"Type: <type: Num -> Num -> Num>",
+			"",
+			"Doc:",
+			"Add two numbers.\n\nArgs: a:Num, b:Num\nReturn: Num",
+			"",
+			"Now list tiny, orthogonal test ideas as an array of strings."
+		], "\n"),
+		[
+			"array",
+			["str", "simple positives (2.0 + 3.0 → 5.0)"],
+			[
+				"str",
+				"mixed int/num (2 + 3.5 → 5.5)"
+			],
+			["str", "negative numbers (-1.0 + -2.0 → -3.0)"],
+			[
+				"str",
+				"addition with zero (x + 0 → x)"
+			],
+			["str", "commutativity (a+b == b+a)"]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: factorial",
+			"Type: <type: Int -> Int?>",
+			"",
+			"Doc:",
+			"Factorial with input check.\n\nArgs: n:Int\nReturn: Int?",
+			"",
+			"Now list tiny, orthogonal test ideas as an array of strings."
+		], "\n"),
+		[
+			"array",
+			["str", "base case n=0 → 1"],
+			["str", "small n=1 → 1"],
+			["str", "typical n=5 → 120"],
+			[
+				"str",
+				"error path n<0 → null with <negative input>"
+			],
+			["str", "growth check n=10 (no overflow in int64 range)"]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: sortStrings",
+			"Type: <type: [Str] -> [Str]>",
+			"",
+			"Doc:",
+			"Sort strings ascending (stable).\n\nArgs: xs:[Str]\nReturn: [Str]",
+			"",
+			"Now list tiny, orthogonal test ideas as an array of strings."
+		], "\n"),
+		[
+			"array",
+			["str", "empty array → empty array"],
+			[
+				"str",
+				"already sorted remains unchanged"
+			],
+			["str", "reverse order sorted ascending"],
+			[
+				"str",
+				"stability: equal keys preserve order"
+			],
+			["str", "mixed case: verify lexicographic (not locale)"]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: host",
+			"Type: <type: Str -> Str?>",
+			"",
+			"Doc:",
+			"Extract host from URL.\n\nArgs: url:Str\nReturn: Str?",
+			"",
+			"Now list tiny, orthogonal test ideas as an array of strings."
+		], "\n"),
+		[
+			"array",
+			["str", "valid http url → host (http://a.com → a.com)"],
+			[
+				"str",
+				"https with port → host (https://a.com:443 → a.com)"
+			],
+			["str", "invalid url string → null with <invalid url>"],
+			[
+				"str",
+				"url with path/query → host only"
+			],
+			["str", "ipv4 host → returns ip"]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: hmac256",
+			"Type: <type: Str -> Str -> Str>",
+			"",
+			"Doc:",
+			"Compute HMAC-SHA256.\n\nArgs: key:Str, msg:Str\nReturn: Str",
+			"",
+			"Now list tiny, orthogonal test ideas as an array of strings."
+		], "\n"),
+		[
+			"array",
+			["str", "known test vector (RFC)"],
+			[
+				"str",
+				"empty key, non-empty msg"
+			],
+			["str", "non-empty key, empty msg"],
+			[
+				"str",
+				"repeatability with same inputs"
+			],
+			["str", "different keys produce different digests"]
+		]
+	]
+]
+
+let _ideasOracle = oracle(prompt: Str) -> [Any]? from _ideasExamples
+_ideasOracle = noteSet("Return ONLY a JSON-MindScript AST for an array of strings.\n" + "Each string is a tiny, orthogonal test idea (one thing to check). Prefer boundaries, null/error path, typical case, and one property if relevant. Keep it 3–7 items.\n\n" + _manual, _ideasOracle)
+
+# Public: testIdeas(spec:{doc!:Str, jsonSpec!:{name!:Str, type!:Type}}) -> [Str]?
+let testIdeas = fun(spec: {}) -> [Str]? do
+	# Reuse the same prompt shape and just append a single directive.
+	let prompt = _genPrompt(spec) + "\n\nNow list tiny, orthogonal test ideas as an array of strings."
+	let ast = _ideasOracle(prompt)
+	if ast == null then
+		return ast
 	end
+	let diags = astValidate(ast)
+	if diags != [] then
+		return noteSet(formatValue(diags[0]), null)
+	end
+	astEval(ast)
 end
 
-# Heuristic failure-class guess from error text.
-#
-# Args:
-#	msg: Str
-# Return:
-#	FailureClass
-let _guessClass = fun(msg: Str) -> FailureClass do
-	let m = toLower(msg)
-	let hasLex = len(match("lex|token", m)) > 0
-	let hasParse = len(match("parse|syntax", m)) > 0
-	if hasLex then
-		"lex"
-	elif hasParse then
-		"parse"
-	else
-		"runtime"
-	end
+# ------ Test Ideas → Tests --------------------------------
+
+# Helper: reuse the same spec prompt and specialize with a single idea.
+let _testPrompt = fun(s: {}, idea: Str) -> Str do
+	_genPrompt(s) + "\n\n" + "Write ONE tiny test as a JSON-MindScript AST for a function **value** with shape:\n" + "(impl: Any) -> { pass!: Bool, trace: {} }\n\n" + "Use this idea (verbatim) to pick concrete inputs/expectations:\n" + "«" + idea + "»\n" + "Keep it minimal: call impl, compare to expected, return { pass, trace:{ idea, input, got, want } }."
 end
 
-# All outcomes ok?
-#
-# Args:
-#	outs: [TestOutcome]
-# Return:
-#	Bool
-let _allOk = fun(outs: [TestOutcome]) -> Bool do
-	let ok = true
-	for o in outs do
-		if not o.ok then ok = false end
+# FEW-SHOTS: same Name/Type/Doc prompt shape, each yields a single test fn.
+# Each example EVALUATES to: (impl:Any) -> { pass!: Bool, trace:{} }
+let _testExamples = [
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: add",
+			"Type: <type: Num -> Num -> Num>",
+			"",
+			"Doc:",
+			"Add two numbers.\n\nArgs: a:Num, b:Num\nReturn: Num",
+			"",
+			"Write ONE tiny test as a JSON-MindScript AST for a function **value** with shape:",
+			"(impl: Any) -> { pass!: Bool, trace: {} }",
+			"",
+			"Use this idea (verbatim) to pick concrete inputs/expectations:",
+			"«simple positives (2.0 + 3.0 → 5.0)»",
+			"Keep it minimal: call impl, compare to expected, return { pass, trace:{ idea, input, got, want } }."
+		], "\n"),
+		[
+			"fun",
+			["array", ["pair", ["id", "impl"], ["id", "Any"]]],
+			["id", "Any"],
+			[
+				"block",
+				[
+					"assign",
+					["decl", "args"],
+					["array", ["num", 2.0], ["num", 3.0]]
+				],
+				[
+					"assign",
+					["decl", "got"],
+					[
+						"call",
+						[
+							"call",
+							["id", "impl"],
+							["idx", ["id", "args"], ["int", 0]]
+						],
+						["idx", ["id", "args"], ["int", 1]]
+					]
+				],
+				["assign", ["decl", "want"], ["num", 5.0]],
+				[
+					"map",
+					[
+						"pair",
+						["str", "pass"],
+						[
+							"binop",
+							"==",
+							["id", "got"],
+							["id", "want"]
+						]
+					],
+					[
+						"pair",
+						["str", "trace"],
+						[
+							"map",
+							[
+								"pair",
+								["str", "idea"],
+								[
+									"str",
+									"simple positives (2.0 + 3.0 → 5.0)"
+								]
+							],
+							["pair", ["str", "input"], ["id", "args"]],
+							[
+								"pair",
+								["str", "got"],
+								["id", "got"]
+							],
+							["pair", ["str", "want"], ["id", "want"]]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: factorial",
+			"Type: <type: Int -> Int?>",
+			"",
+			"Doc:",
+			"Factorial with input check.\n\nArgs: n:Int\nReturn: Int?",
+			"",
+			"Write ONE tiny test as a JSON-MindScript AST for a function **value** with shape:",
+			"(impl: Any) -> { pass!: Bool, trace: {} }",
+			"",
+			"Use this idea (verbatim) to pick concrete inputs/expectations:",
+			"«error path n<0 → null with <negative input>»",
+			"Keep it minimal: call impl, compare to expected, return { pass, trace:{ idea, input, got, want } }."
+		], "\n"),
+		[
+			"fun",
+			["array", ["pair", ["id", "impl"], ["id", "Any"]]],
+			["id", "Any"],
+			[
+				"block",
+				["assign", ["decl", "n"], ["int", -1]],
+				[
+					"assign",
+					["decl", "got"],
+					["call", ["id", "impl"], ["id", "n"]]
+				],
+				[
+					"map",
+					[
+						"pair",
+						["str", "pass"],
+						["binop", "==", ["id", "got"], ["null"]]
+					],
+					[
+						"pair",
+						["str", "trace"],
+						[
+							"map",
+							[
+								"pair",
+								["str", "idea"],
+								[
+									"str",
+									"error path n<0 → null with <negative input>"
+								]
+							],
+							["pair", ["str", "input"], ["id", "n"]],
+							[
+								"pair",
+								["str", "got"],
+								["id", "got"]
+							],
+							["pair", ["str", "want"], ["null"]]
+						]
+					]
+				]
+			]
+		]
+	],
+	[
+		join([
+			"Implement a JSON-MindScript anonymous function or oracle matching this spec.",
+			"",
+			"Name: host",
+			"Type: <type: Str -> Str?>",
+			"",
+			"Doc:",
+			"Extract host from URL.\n\nArgs: url:Str\nReturn: Str?",
+			"",
+			"Write ONE tiny test as a JSON-MindScript AST for a function **value** with shape:",
+			"(impl: Any) -> { pass!: Bool, trace: {} }",
+			"",
+			"Use this idea (verbatim) to pick concrete inputs/expectations:",
+			"«valid http url → host (http://a.com → a.com)»",
+			"Keep it minimal: call impl, compare to expected, return { pass, trace:{ idea, input, got, want } }."
+		], "\n"),
+		[
+			"fun",
+			["array", ["pair", ["id", "impl"], ["id", "Any"]]],
+			["id", "Any"],
+			[
+				"block",
+				["assign", ["decl", "url"], ["str", "http://a.com"]],
+				[
+					"assign",
+					["decl", "got"],
+					["call", ["id", "impl"], ["id", "url"]]
+				],
+				["assign", ["decl", "want"], ["str", "a.com"]],
+				[
+					"map",
+					[
+						"pair",
+						["str", "pass"],
+						[
+							"binop",
+							"==",
+							["id", "got"],
+							["id", "want"]
+						]
+					],
+					[
+						"pair",
+						["str", "trace"],
+						[
+							"map",
+							[
+								"pair",
+								["str", "idea"],
+								[
+									"str",
+									"valid http url → host (http://a.com → a.com)"
+								]
+							],
+							["pair", ["str", "input"], ["id", "url"]],
+							[
+								"pair",
+								["str", "got"],
+								["id", "got"]
+							],
+							["pair", ["str", "want"], ["id", "want"]]
+						]
+					]
+				]
+			]
+		]
+	]
+]
+
+let _testOracle = oracle(prompt: Str) -> [Any]? from _testExamples
+_testOracle = noteSet("Return ONLY a JSON-MindScript AST for a SINGLE tiny test function value.\n" + "Shape: (impl: Any) -> { pass!: Bool, trace: {} }\n" + "Call impl with concrete inputs implied by the idea; compare to expected; return pass + trace.\n\n" + _manual, _testOracle)
+
+# Helper: build one test from a single idea, then annotate it.
+let _buildTest = fun(spec: {}, idea: Str) -> Any? do
+	let ast = _testOracle(_testPrompt(spec, idea))
+	if ast == null then
+		println(idea + ": 3")
+		return ast
 	end
-	ok
+	let diags = astValidate(ast)
+	if diags != [] then
+		return
+	end
+	let t = astEval(ast)
+	noteSet("test idea: " + idea, t)
 end
 
-# Pick a tiny golden shard (first k after dedupe for stability).
-#
-# Args:
-#	ts: [Test]
-#	k: Int
-# Return:
-#	[Test]
-let _pickGoldenShard = fun(ts: [Test], k: Int) -> [Test] do
+# Public: parallel test generation + per-test annotation
+let tests = fun(spec: {}) -> [Any]? do
+	let ideas = testIdeas(spec)
+	if ideas == null then
+		return
+	end
+
+	# Spawn one worker per idea (parallelizable)
+	let ps = []
+	for idea in ideas do
+		push(ps, procSpawn(fun() do
+			_buildTest(spec, idea)
+		end))
+	end
+
+	# Collect results, drop nulls
 	let out = []
-	let i = 0
-	while i < len(ts) and len(out) < k do
-		out = push(out, ts[i])
-		i = i + 1
+	for r in procJoinAll(ps) do
+		if r != null then
+			push(out, r)
+		end
 	end
 	out
 end
-
-# Deduplicate tests by (name, src).
-#
-# Args:
-#	ts: [Test]
-# Return:
-#	[Test]
-let _dedupeTests = fun(ts: [Test]) -> [Test] do
-	let seen = {}
-	let out = []
-	for t in ts do
-		let key = _hash(t.name + ":" + t.src)
-		if not mapHas(seen, key) then
-			seen[key] = true
-			out = push(out, t)
-		end
-	end
-	out
-end
-
-# Set minus by (name, src).
-#
-# Args:
-#	all: [Test]
-#	part: [Test]
-# Return:
-#	[Test]
-let _minus = fun(all: [Test], part: [Test]) -> [Test] do
-	let out = []
-	for t in all do
-		let found = false
-		for p in part do
-			if t.name == p.name and t.src == p.src then
-				found = true
-			end
-		end
-		if not found then out = push(out, t) end
-	end
-	out
-end
-
-# Merge two traces (gate first, work second).
-#
-# Args:
-#	a: Trace
-#	b: Trace
-# Return:
-#	Trace
-let _mergeTraces = fun(a: Trace, b: Trace) -> Trace do
-	{ testOutcomes: a.testOutcomes + b.testOutcomes, elapsedMillis: a.elapsedMillis + b.elapsedMillis }
-end
-
-# Append new tests avoiding duplicates.
-#
-# Args:
-#	base: [Test]
-#	adds: [Test]
-# Return:
-#	[Test]
-let _appendNew = fun(base: [Test], adds: [Test]) -> [Test] do
-	_dedupeTests(base + adds)
-end
-
-# Determine ≤cap canonical additions: ≤1 per distinct failure class.
-#
-# Args:
-#	spec: Spec
-#	code: Str
-#	tr: Trace
-#	st: State
-#	cap: Int
-# Return:
-#	[Test]
-let _canonicalAdds = fun(spec: Spec, code: Str, tr: Trace, st: State, cap: Int) -> [Test] do
-	let classes = _distinctClasses(tr)
-	let out = []
-	for c in classes do
-		if len(out) >= cap then
-			break
-		end
-		let seed = _deriveSeed(st.seeds.tests, code, c)
-		let cand = specToTests(spec, seed)
-		if cand == null then
-			continue
-		end
-		let pool = _dedupeTests(cand)
-		let pick = _firstReproducing(pool, code, c, st)
-		if pick != null then
-			out = push(out, pick)
-		end
-	end
-	out
-end
-
-# Distinct failure classes from a trace (stable order).
-#
-# Args:
-#	tr: Trace
-# Return:
-#	[FailureClass]
-let _distinctClasses = fun(tr: Trace) -> [FailureClass] do
-	let seen = {}
-	let out = []
-	for o in tr.testOutcomes do
-		if not mapHas(seen, o.class) then
-			seen[o.class] = true
-			out = push(out, o.class)
-		end
-	end
-	out
-end
-
-# First candidate that reproduces the target class against current code.
-#
-# Args:
-#	pool: [Test]
-#	code: Str
-#	target: FailureClass
-#	st: State
-# Return:
-#	Test?
-let _firstReproducing = fun(pool: [Test], code: Str, target: FailureClass, st: State) -> Test? do
-	for t in pool do
-		# skip duplicates
-		let dup = false
-		for e in st.T_train do
-			if e.name == t.name and e.src == t.src then
-				dup = true
-			end
-		end
-		if dup then
-			continue
-		end
-		let outcome = run(code, [t]).trace.testOutcomes[0]
-		if (not outcome.ok) and outcome.class == target then
-			return t
-		end
-	end
-	return null # <no canonical candidate>
-end
-
-# One minimal "repair": regenerate program with derived seed from trace key.
-#
-# Args:
-#	spec: Spec
-#	code: Str
-#	tr: Trace
-#	cap: Int
-#	baseSeed: Int
-# Return:
-#	Str?
-let _maybeRepair = fun(spec: Spec, code: Str, tr: Trace, cap: Int, baseSeed: Int) -> Str? do
-	if cap <= 0 then
-		return null # <repairs disabled>
-	end
-	let seed = _mix(baseSeed, _traceKey(tr))
-	let next = specToProgram(spec, seed)
-	if next == null then
-		return null # <repair failed>
-	end
-	next
-end
-
-# Content hash as hex (stable-ish).
-#
-# Args:
-#	s: Str
-# Return:
-#	Str
-let _hash = fun(s: Str) -> Str do
-	sha256(s)
-end
-
-# Derive a seed from base + code + class (uses uid for Int).
-#
-# Args:
-#	base: Int
-#	code: Str
-#	cls: FailureClass
-# Return:
-#	Int
-let _deriveSeed = fun(base: Int, code: Str, cls: FailureClass) -> Int do
-	base + uid(code + ":" + cls)
-end
-
-# Mix an Int seed with a string key (uses uid).
-#
-# Args:
-#	seed: Int
-#	key: Str
-# Return:
-#	Int
-let _mix = fun(seed: Int, key: Str) -> Int do
-	seed + uid(key)
-end
-
-# Compact trace key (class:error pairs).
-#
-# Args:
-#	tr: Trace
-# Return:
-#	Str
-let _traceKey = fun(tr: Trace) -> Str do
-	join(list(map(fun(o) do o.class + ":" + o.error end, iter(tr.testOutcomes))), "|")
-end
-
-# Deterministically derive Seeds from the Spec text.
-#
-# Args:
-#	spec: Spec
-# Return:
-#	Seeds
-let deriveSeeds = fun(spec: Spec) -> Seeds do
-	let base = uid(spec.text)
-	{ tests: base, program: base + 1 }
-end
-
-# One-shot: freeze tiny shard, generate code, and evolve under small defaults.
-#
-# Args:
-#	spec: Spec
-# Return:
-#	State? — final state or null on error.
-let satisfy = fun(spec: { text!: Str }) -> State? do
-	# Small, sane defaults (minimal surface).
-	let DEFAULT_GOLDEN_SIZE = 3
-	let DEFAULT_BUDGET = { maxRounds: 3, maxAddsPerRound: 1, maxRepairsPerRound: 1 }
-
-	let seeds = deriveSeeds(spec)
-	let s0 = bootstrap(spec, seeds, DEFAULT_GOLDEN_SIZE)
-	if s0 == null then
-		return null # <bootstrap failed>
-	end
-	evolve(s0, DEFAULT_BUDGET)
-end
-

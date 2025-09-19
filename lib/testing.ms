@@ -1,14 +1,14 @@
 # testing.ms — minimal testing toolkit + simple test runner
 # 
 # Usage in *_test.ms:
-# let T = import("testing")
-# T.test("adds", fun(_: Null) -> Any do
-# T.assertEq(2 + 2, 4)
+# let testing = import("testing")
+# testing.test("adds", fun(_: Null) -> Any do
+# testing.assertEq(2 + 2, 4)
 # end)
 # 
 # Running:
-# let T = import("testing")
-# T.run({ root: ".", verbose: false, parallel: false, timeoutMs: 0 })
+# let testing = import("testing")
+# testing.run({ root: ".", verbose: false, parallel: false, timeoutMs: 0 })
 
 # =========================
 # Internal state

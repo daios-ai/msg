@@ -1,26 +1,26 @@
-# # llm.ms — minimal LLM backend manager (uniform contract + startup probe)
-# #
-# # Public surface:
-# #   init()                 -> { backends!: [Str], current!: Str }          # probe all, pick a usable default, print diagnostics
-# #   backends()             -> [Str]                                        # available backend names
-# #   status()               -> { backend!: Str, model: Str?, authed!: Bool, options!: {} }
-# #   useBackend(Str)        -> {}?                                          # switch current; returns status or soft-null
-# #   models()               -> [Str]?                                       # list models for current backend (if supported)
-# #   useModel(Str)          -> {}?                                          # set model for current backend; returns status
-# #   getConfig()            -> {}                                           # editable snapshot {backend, baseUrl, model, options, [timeoutMs]}
-# #   setConfig({})          -> {}?                                          # shallow-merge config; returns status
-# #   auth({})               -> {}?                                          # store credentials (e.g., {"apiKey":"…"}); returns status
-# #   exec(Str)              -> Str?                                         # run and return the provider's RAW STRING (or soft-null on error)
-# #
-# # Notes:
-# # - Backends expose { name, state, listModels?, probe, exec }.
-# # - init() prints diagnostics and auto-selects the first OK backend if current is not OK.
-# # - Only API keys are read from env; baseUrl/model are configured via setConfig/useModel.
-# # - Options live in per-backend state.options. Common knobs:
-# #     temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
-# #   Backends ignore unknown/unsupported options gracefully.
-# # - HTTP failures and provider error payloads are surfaced as soft errors (annotated null) with clear messages.
-# # - Oracles are responsible for validating/boxing as {"output": x}. Backends DO NOT normalize/box.
+# llm.ms — minimal LLM backend manager (uniform contract + startup probe)
+# 
+# Public surface:
+# init()                 -> { backends!: [Str], current!: Str }          # probe all, pick a usable default, print diagnostics
+# backends()             -> [Str]                                        # available backend names
+# status()               -> { backend!: Str, model: Str?, authed!: Bool, options!: {} }
+# useBackend(Str)        -> {}?                                          # switch current; returns status or soft-null
+# models()               -> [Str]?                                       # list models for current backend (if supported)
+# useModel(Str)          -> {}?                                          # set model for current backend; returns status
+# getConfig()            -> {}                                           # editable snapshot {backend, baseUrl, model, options, [timeoutMs]}
+# setConfig({})          -> {}?                                          # shallow-merge config; returns status
+# auth({})               -> {}?                                          # store credentials (e.g., {"apiKey":"…"}); returns status
+# exec(Str)              -> Str?                                         # run and return the provider's RAW STRING (or soft-null on error)
+# 
+# Notes:
+# - Backends expose { name, state, listModels?, probe, exec }.
+# - init() prints diagnostics and auto-selects the first OK backend if current is not OK.
+# - Only API keys are read from env; baseUrl/model are configured via setConfig/useModel.
+# - Options live in per-backend state.options. Common knobs:
+# temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
+# Backends ignore unknown/unsupported options gracefully.
+# - HTTP failures and provider error payloads are surfaced as soft errors (annotated null) with clear messages.
+# - Oracles are responsible for validating/boxing as {"output": x}. Backends DO NOT normalize/box.
 
 # =============================
 # Internal state and minimal helpers
@@ -72,11 +72,7 @@ end
 # Backend: Ollama
 let _ollama = {
 	name: "ollama",
-	state: {
-		baseUrl: "http://localhost:11434",
-		model: null,
-		options: {temperature: 0.5}
-	},
+	state: {baseUrl: "http://localhost:11434", model: null, options: {}},
 	listModels: fun(self: {}) -> [Str]? do
 		let url = self.state.baseUrl + "/api/tags"
 		let r = http({url: url, method: "GET"})
@@ -136,19 +132,19 @@ let _ollama = {
 			body: jsonStringify(reqBody)
 		})
 		if r == null then
-			return _err("ollama: request failed")
+			return r
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
 			if b != null and mapHas(b, "error") then
 				return _err("ollama: " + str(b.error))
 			end
-			return _err("ollama: HTTP " + str(r.status))
+			return r
 		end
 
 		let j = jsonParse(r.body)
 		if j == null then
-			return _err("ollama: bad JSON from server")
+			return r
 		end
 		if not mapHas(j, "response") or j.response == null then
 			return _err("ollama: missing response")
@@ -164,7 +160,7 @@ let _openai = {
 		baseUrl: "https://api.openai.com/v1",
 		model: null,
 		apiKey: osEnv("OPENAI_API_KEY"),
-		options: {temperature: 0.5}
+		options: {}
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
@@ -176,7 +172,7 @@ let _openai = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return _err("openai listModels: request failed")
+			return r
 		end
 		if r.status != 200 then
 			return _err("openai listModels: HTTP " + str(r.status))
@@ -202,7 +198,7 @@ let _openai = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return {ok: false, authed: authed, reason: "request failed"}
+			return {ok: false, authed: authed, reason: noteGet(r)}
 		end
 		if r.status != 200 then
 			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
@@ -254,7 +250,7 @@ let _openai = {
 			body: jsonStringify(body)
 		})
 		if r == null then
-			return _err("openai: request failed")
+			return r
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
@@ -282,7 +278,7 @@ let _openai_responses = {
 		baseUrl: "https://api.openai.com/v1",
 		model: null,
 		apiKey: osEnv("OPENAI_API_KEY"),
-		options: {temperature: 0.5}
+		options: {}
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
@@ -294,7 +290,7 @@ let _openai_responses = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return _err("openai-responses listModels: request failed")
+			return r
 		end
 		if r.status != 200 then
 			return _err("openai-responses listModels: HTTP " + str(r.status))
@@ -320,7 +316,7 @@ let _openai_responses = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return {ok: false, authed: authed, reason: "request failed"}
+			return {ok: false, authed: authed, reason: noteGet(r)}
 		end
 		if r.status != 200 then
 			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
@@ -386,13 +382,15 @@ let _openai_responses = {
 		end
 
 		let text = null
-		let msg = j.output[0]
-		if mapHas(msg, "content") and len(msg.content) > 0 then
-			for part in msg.content do
-				if mapHas(part, "type") and part.type == "output_text" and mapHas(part, "text") and part.text != null then
-					text = part.text
-					break
+		for msg in j.output do
+			if mapHas(msg, "content") and len(msg.content) > 0 then
+				for part in msg.content do
+					if mapHas(part, "type") and part.type == "output_text" and mapHas(part, "text") and part.text != null then
+						text = part.text
+						break
+					end
 				end
+				break
 			end
 		end
 		if text == null then
@@ -410,7 +408,7 @@ let _anthropic = {
 		model: null,
 		apiKey: osEnv("ANTHROPIC_API_KEY"),
 		version: "2023-06-01",
-		options: {temperature: 0.5, max_tokens: 1024}
+		options: {max_tokens: 1024}
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
@@ -420,8 +418,9 @@ let _anthropic = {
 			url: self.state.baseUrl + "/models",
 			method: "GET",
 			headers: {
-				Authorization: "Bearer " + self.state.apiKey,
-				"anthropic-version": self.state.version
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
 			}
 		})
 		if r == null then
@@ -451,8 +450,9 @@ let _anthropic = {
 			url: self.state.baseUrl + "/models",
 			method: "GET",
 			headers: {
-				Authorization: "Bearer " + self.state.apiKey,
-				"anthropic-version": self.state.version
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
 			}
 		})
 		if r == null then
@@ -493,9 +493,9 @@ let _anthropic = {
 			url: self.state.baseUrl + "/messages",
 			method: "POST",
 			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer " + self.state.apiKey,
-				"anthropic-version": self.state.version
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
 			},
 			body: jsonStringify(body)
 		})
@@ -528,7 +528,7 @@ let _cohere = {
 		baseUrl: "https://api.cohere.ai/v1",
 		model: null,
 		apiKey: osEnv("COHERE_API_KEY"),
-		options: {temperature: 0.5}
+		options: {}
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then

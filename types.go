@@ -74,6 +74,8 @@
 //	structural S-equality, and field extraction.
 package mindscript
 
+import "reflect"
+
 //// END_OF_PUBLIC
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -638,121 +640,131 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 // Structural subtyping  t1 <: t2
 // -----------------------------
 
+// isSubtype checks structural subtyping with a tiny coinductive memo to break cycles.
+// isSubtype — compact, coinductive (cycle-safe) structural subtyping.
+// Uses a tiny memo keyed by the memory addresses of the compared S-nodes.
+// isSubtype — compact, cycle-safe (coinductive) structural subtyping.
+// Uses address-based memo keys for recursion, keeping it hot-path friendly.
 func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 	a = stripAnnot(ip.resolveType(a, env))
 	b = stripAnnot(ip.resolveType(b, env))
-
 	if equalS(a, b) {
 		return true
 	}
 
-	isOpt := func(t S) bool { return len(t) >= 2 && t[0].(string) == "unop" && t[1].(string) == "?" }
-	unwrapOpt := func(t S) S { return t[2].(S) }
-
-	// Top
-	if b[0].(string) == "id" && b[1].(string) == "Any" {
-		return true
+	// Tiny address-based memo (pointer to first cell of each S node).
+	sid := func(s S) uintptr {
+		if len(s) == 0 {
+			return 0
+		}
+		return reflect.ValueOf(&s[0]).Pointer()
 	}
-	// Optional RHS
-	if isOpt(b) {
-		inner := unwrapOpt(b)
-		if ip.isSubtype(a, inner, env) {
+	seen := make(map[[2]uintptr]struct{})
+
+	isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
+	unwrap := func(t S) S { return t[2].(S) }
+
+	var sub func(S, S) bool
+	sub = func(x, y S) bool {
+		if equalS(x, y) {
 			return true
 		}
-		if a[0].(string) == "id" && a[1].(string) == "Null" {
+		k := [2]uintptr{sid(x), sid(y)}
+		if _, ok := seen[k]; ok {
+			return true
+		} // coinductive success on cycle
+		seen[k] = struct{}{}
+
+		// Top
+		if len(y) >= 2 && y[0].(string) == "id" && y[1].(string) == "Any" {
 			return true
 		}
-	}
-	// Int <: Num
-	if a[0].(string) == "id" && a[1].(string) == "Int" &&
-		b[0].(string) == "id" && b[1].(string) == "Num" {
-		return true
-	}
-	// A? <: B?  iff  A <: B
-	if isOpt(a) && isOpt(b) {
-		return ip.isSubtype(unwrapOpt(a), unwrapOpt(b), env)
-	}
-	// Identical primitive IDs
-	if a[0].(string) == "id" && b[0].(string) == "id" {
-		return a[1].(string) == b[1].(string)
-	}
 
-	// Arrays: elementwise covariance
-	if a[0].(string) == "array" && b[0].(string) == "array" {
-		elemA := S{"id", "Any"}
-		if len(a) == 2 {
-			elemA = a[1].(S)
+		// BOTH nullable first: A? <: B?  iff  A <: B
+		if isOpt(x) && isOpt(y) {
+			return sub(unwrap(x), unwrap(y))
 		}
-		elemB := S{"id", "Any"}
-		if len(b) == 2 {
-			elemB = b[1].(S)
-		}
-		return ip.isSubtype(elemA, elemB, env)
-	}
 
-	// Maps: must provide all required fields of b with compatible types,
-	// and cannot relax requiredness.
-	if a[0].(string) == "map" && b[0].(string) == "map" {
-		reqB := mapTypeFields(b)
-		haveA := mapTypeFields(a)
-		for name, fb := range reqB {
-			fa, ok := haveA[name]
-			if !ok {
-				if fb.required {
+		// RHS nullable: A <: B?  iff  A <: B  or  A == Null
+		if isOpt(y) {
+			return sub(x, unwrap(y)) || (len(x) >= 2 && x[0].(string) == "id" && x[1].(string) == "Null")
+		}
+
+		// Primitives (+ Int <: Num)
+		if len(x) >= 2 && len(y) >= 2 && x[0].(string) == "id" && y[0].(string) == "id" {
+			ax, ay := x[1].(string), y[1].(string)
+			return ax == ay || (ax == "Int" && ay == "Num")
+		}
+
+		// Arrays: elementwise covariance
+		if len(x) > 0 && len(y) > 0 && x[0].(string) == "array" && y[0].(string) == "array" {
+			ex, ey := S{"id", "Any"}, S{"id", "Any"}
+			if len(x) == 2 {
+				ex = x[1].(S)
+			}
+			if len(y) == 2 {
+				ey = y[1].(S)
+			}
+			return sub(ex, ey)
+		}
+
+		// Maps: must provide all required of y; cannot relax requiredness
+		if len(x) > 0 && len(y) > 0 && x[0].(string) == "map" && y[0].(string) == "map" {
+			reqY, haveX := mapTypeFields(y), mapTypeFields(x)
+			for name, fy := range reqY {
+				fx, ok := haveX[name]
+				if !ok {
+					if fy.required {
+						return false
+					}
+					continue
+				}
+				if fy.required && !fx.required {
 					return false
 				}
-				continue
-			}
-			if fb.required && !fa.required {
-				return false
-			}
-			if !ip.isSubtype(fa.typ, fb.typ, env) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Enums:
-	// 1) Enum ⊆ Enum by literal inclusion (structural equality on literal S)
-	if a[0].(string) == "enum" && b[0].(string) == "enum" {
-		for i := 1; i < len(a); i++ {
-			found := false
-			for j := 1; j < len(b); j++ {
-				if equalS(a[i].(S), b[j].(S)) {
-					found = true
-					break
+				if !sub(fx.typ, fy.typ) {
+					return false
 				}
 			}
-			if !found {
-				return false
-			}
+			return true
 		}
-		return true
-	}
-	// 2) Enum <: T if every member conforms to T
-	if a[0].(string) == "enum" {
-		for i := 1; i < len(a); i++ {
-			lv, ok := ip.litToValue(a[i].(S))
-			if !ok || !ip.isType(lv, b, env) {
-				return false
+
+		// Enums
+		if len(x) > 0 && len(y) > 0 && x[0].(string) == "enum" && y[0].(string) == "enum" {
+			for i := 1; i < len(x); i++ {
+				found := false
+				for j := 1; j < len(y); j++ {
+					if equalS(x[i].(S), y[j].(S)) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
 			}
+			return true
 		}
-		return true
+		if len(x) > 0 && x[0].(string) == "enum" {
+			for i := 1; i < len(x); i++ {
+				lv, ok := ip.litToValue(x[i].(S))
+				if !ok || !ip.isType(lv, y, env) {
+					return false
+				}
+			}
+			return true
+		}
+
+		// Functions: param contravariance, return covariance (right-assoc)
+		if len(x) >= 4 && len(y) >= 4 && x[0].(string) == "binop" && x[1].(string) == "->" &&
+			y[0].(string) == "binop" && y[1].(string) == "->" {
+			return sub(y[2].(S), x[2].(S)) && sub(x[3].(S), y[3].(S))
+		}
+
+		return false
 	}
 
-	// Functions: param contravariant, return covariant (right-assoc)
-	if a[0].(string) == "binop" && a[1].(string) == "->" &&
-		b[0].(string) == "binop" && b[1].(string) == "->" {
-		aParam, aRest := a[2].(S), a[3].(S)
-		bParam, bRest := b[2].(S), b[3].(S)
-		if !ip.isSubtype(bParam, aParam, env) { // contra
-			return false
-		}
-		return ip.isSubtype(aRest, bRest, env) // co (right)
-	}
-
-	return false
+	return sub(a, b)
 }
 
 // -----------------------------

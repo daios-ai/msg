@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- small helpers ----------------------------------------------------------
@@ -791,5 +792,64 @@ func Test_Types_ResolveType_FunctionalCycle_NoHang(t *testing.T) {
 	ret := res[3].(S)
 	if !(len(ret) >= 2 && ret[0].(string) == "id" && ret[1].(string) == "F") {
 		t.Fatalf("expected return to be id F (cycle-guarded), got %#v", ret)
+	}
+}
+
+// --- recursion / no-hang guards ---------------------------------------------
+
+func Test_Types_Runtime_Return_Check_Recursive_NoHang(t *testing.T) {
+	ip := newIP()
+
+	src := `
+let T = type { f!: Null -> T }
+
+let mk = fun() -> T do
+  let o = {}
+  o.f = fun(_: Null) -> T do
+    return o
+  end
+  return o
+end
+
+mk()
+`
+	done := make(chan struct{})
+	go func() {
+		// We only assert it *returns* (success or error) without hanging.
+		_, _ = ip.EvalSource(src)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok: did not hang
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runtime return type check on recursive T hung")
+	}
+}
+
+func Test_Types_IsSubtype_Recursive_Function_Type_NoHang(t *testing.T) {
+	ip := newIP()
+
+	// Persist the recursive alias: T = { f!: Null -> T }
+	if _, err := ip.EvalPersistentSource(`let T = type { f!: Null -> T }`); err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	// Check subtyping on the recursive arrow type does not hang.
+	a := typeS(t, ip, `Null -> T`)
+	b := typeS(t, ip, `Null -> T`)
+
+	done := make(chan struct{})
+	go func() {
+		_ = ip.isSubtype(a, b, ip.Global) // result value unimportant; liveness matters
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok: did not hang
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("isSubtype on recursive function type hung")
 	}
 }

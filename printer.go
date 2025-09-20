@@ -130,7 +130,7 @@
 //   - Param types default to `Any` and are not printed (e.g., `fun(x)` not `x: Any`).
 //   - Function return type defaults to `Any` and is not printed (`fun(...) do ... end`
 //     without `-> Any`).
-//   - `oracle(...)` without `from` carries an empty default source; `from …` is omitted.
+//   - `oracle(...)` without `from` carries an empty default source; `from ...` is omitted.
 //   - Bare `return` / `break` / `continue` carry an implicit `null` value and print
 //     as the bare keyword (no `null`).
 //   - Redundant parentheses are removed; only minimal parentheses are emitted.
@@ -279,13 +279,10 @@ func FormatType(t S) string {
 //   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
 //   - Modules: `<module: pretty-name>` when available.
 func FormatValue(v Value) string {
-	doc := docValue(v)
+	ctx := newValPrintCtx()
+	doc := ctx.docValue(v)
 	var b strings.Builder
-	r := renderer{
-		out:      &b,
-		maxWidth: MaxInlineWidth,
-		tabWidth: 4,
-	}
+	r := renderer{out: &b, maxWidth: MaxInlineWidth, tabWidth: 4}
 	r.render(doc)
 	return b.String()
 }
@@ -1403,38 +1400,36 @@ func numString(f float64) string {
 }
 
 // Detect cycles by pointer identity during a single render pass.
-type printCtx struct {
+type valPrintCtx struct {
 	seenA map[*ArrayObject]bool
 	seenM map[*MapObject]bool
 }
 
-func newPrintCtx() *printCtx {
-	return &printCtx{
-		seenA: map[*ArrayObject]bool{},
-		seenM: map[*MapObject]bool{},
+func newValPrintCtx() *valPrintCtx {
+	return &valPrintCtx{
+		seenA: make(map[*ArrayObject]bool),
+		seenM: make(map[*MapObject]bool),
 	}
 }
 
 // docValue: threads a cycle-detection context.
 // (Keeps existing PRE/POST handling and doc engine contract.)
-func docValue(v Value) *Doc {
+func (ctx *valPrintCtx) docValue(v Value) *Doc {
 	pre, post := splitAnnotText(v.Annot)
-	ctx := newPrintCtx()
-
-	body := docValueNoAnnWith(v, ctx)
-
+	var head []*Doc
 	if pre != "" {
-		body = Concat(annotPre(pre), body)
+		head = append(head, annotPre(pre))
 	}
+	body := ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data}) // print payload w/o own anns
 	if post != "" {
 		body = Concat(body, annotInline(post))
 	}
-	return body
+	return Concat(append(head, body)...)
 }
 
 // docValueNoAnnWith: actual value rendering with cycle guards.
 // Uses Python-style cycle markers: `[...]` for arrays, `{...}` for maps.
-func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
+func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
 	switch v.Tag {
 	case VTNull:
 		return Text("null")
@@ -1452,10 +1447,9 @@ func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
 
 	case VTArray:
 		ao := v.Data.(*ArrayObject)
-
-		// Cycle check (Python-style marker)
+		// ---- cycle guard (identity) ----
 		if ctx.seenA[ao] {
-			return Text("[...]")
+			return Text("[...]") // minimal, stable placeholder
 		}
 		ctx.seenA[ao] = true
 
@@ -1463,12 +1457,10 @@ func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
 		if len(xs) == 0 {
 			return Text("[]")
 		}
-
-		// Keep existing PRE/POST-on-elements + comma-after-POST behavior
 		joined := make([]sepItem, 0, len(xs))
 		for _, it := range xs {
 			pre, post := splitAnnotText(it.Annot)
-			elemDoc := docValueNoAnnWith(Value{Tag: it.Tag, Data: it.Data}, ctx) // drop elem's own annots
+			elemDoc := ctx.docValueNoAnn(Value{Tag: it.Tag, Data: it.Data})
 			if pre != "" {
 				elemDoc = Concat(annotPre(pre), elemDoc)
 			}
@@ -1485,31 +1477,26 @@ func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
 
 	case VTMap:
 		mo := v.Data.(*MapObject)
-
-		// Cycle check (Python-style marker)
+		// ---- cycle guard (identity) ----
 		if ctx.seenM[mo] {
-			return Text("{...}")
+			return Text("{...}") // minimal, stable placeholder
 		}
 		ctx.seenM[mo] = true
 
-		// Stable ordering preserved
 		keys := append([]string(nil), mo.Keys...)
 		sort.Strings(keys)
 		if len(keys) == 0 {
 			return Text("{}")
 		}
-
 		joined := make([]sepItem, 0, len(keys))
 		for _, k := range keys {
 			kPre, kPost := splitAnnotText(mo.KeyAnn[k])
-
 			vv := mo.Entries[k]
 			vPre, vPost := splitAnnotText(vv.Annot)
-
 			entry := kvEntry(
 				idOrQuoted(k),
-				docValueNoAnnWith(Value{Tag: vv.Tag, Data: vv.Data}, ctx), // drop value's own annots
-				kPre, vPre, kPost /*valPost*/, "",
+				ctx.docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}),
+				kPre, vPre, kPost /* valPost handled after comma */, "",
 			)
 			joined = append(joined, sepItem{main: entry, post: vPost})
 		}
@@ -1523,7 +1510,7 @@ func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
 		}())), "}"))
 
 	case VTFun:
-		// unchanged from your original (no container recursion)
+		// unchanged, no recursive descent into values
 		if f, ok := v.Data.(*Fun); ok && f != nil {
 			label := "fun"
 			if f.IsOracle {
@@ -1555,8 +1542,7 @@ func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
 		return Text("<fun>")
 
 	case VTType:
-		t := typeAst(v.Data)
-		return Group(Concat(Text("<type: "), docType(t), Text(">")))
+		return Group(Concat(Text("<type: "), docType(typeAst(v.Data)), Text(">")))
 
 	case VTModule:
 		name := "<module>"

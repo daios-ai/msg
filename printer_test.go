@@ -970,3 +970,50 @@ func Test_Printer_Value_Cycle_NestedAnnots_PreservePreAndPost(t *testing.T) {
 		t.Fatalf("nested PRE/POST mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
+
+func Test_Printer_Value_Cycle_ArrayToArray(t *testing.T) {
+	// a = [b]; b = [a]  (2-cycle through arrays)
+	aoA := &ArrayObject{}
+	aoB := &ArrayObject{}
+	a := Value{Tag: VTArray, Data: aoA}
+	b := Value{Tag: VTArray, Data: aoB}
+
+	aoA.Elems = []Value{b}
+	aoB.Elems = []Value{a}
+
+	got := FormatValue(a)
+	// Outer a contains b, which contains a (elided) → [[[...]]]
+	want := "[[[...]]]"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_MapValue_PostAfterCommaBetweenEntries(t *testing.T) {
+	// m = { a: m # post, b: 1 } — value POST for 'a' prints after the comma
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"a", "b"},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	val := m
+	val.Annot = "<first" // value POST
+	mo.Entries["a"] = val
+	mo.Entries["b"] = Int(1)
+
+	got := FormatValue(m)
+	want := "{\n\ta: {...}, # first\n\tb: 1\n}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_SharedSubstructure_ElidesSecondOccurrence(t *testing.T) {
+	// b = [1]; a = [b, b] — same identity appears twice; second occurrence elides.
+	aoB := &ArrayObject{Elems: []Value{Int(1)}}
+	b := Value{Tag: VTArray, Data: aoB}
+
+	aoA := &ArrayObject{Elems: []Value{b, b}}
+	a := Value{Tag: VTArray, Data: aoA}
+
+	got := FormatValue(a)
+	want := "[[1], [...]]"
+	eq(t, got, want)
+}

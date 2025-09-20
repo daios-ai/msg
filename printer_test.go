@@ -857,3 +857,116 @@ func Test_Printer_Type_Arrow_SingleVsMultiArg(t *testing.T) {
 		t.Fatalf("multi-arg func type mismatch: got %q want %q", got, want)
 	}
 }
+
+func Test_Printer_Value_Cycle_ArraySelf(t *testing.T) {
+	// a = []; a[0] = a
+	ao := &ArrayObject{}
+	a := Value{Tag: VTArray, Data: ao}
+	ao.Elems = []Value{a}
+
+	got := FormatValue(a)
+	want := "[[...]]" // Python-style cycle marker inside array, rendered inline
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_MapSelf(t *testing.T) {
+	// m = {}; m.self = m
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	mo.Entries["self"] = m
+	mo.Keys = append(mo.Keys, "self")
+
+	got := FormatValue(m)
+	// Keys are sorted; single key "self" prints inline.
+	want := "{self: {...}}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_Cross_ArrayToMap(t *testing.T) {
+	// a = [m]; m = { k: a }  (cross-reference; printing 'a' should show k: [...] )
+	ao := &ArrayObject{}
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"k"},
+	}
+
+	a := Value{Tag: VTArray, Data: ao}
+	m := Value{Tag: VTMap, Data: mo}
+
+	ao.Elems = []Value{m}
+	mo.Entries["k"] = a
+
+	got := FormatValue(a)
+	want := "[{k: [...]}]"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_ArrayElement_PostAfterComma(t *testing.T) {
+	// a = [a # post, 1]  — POST should print after the comma of the first element and force newline.
+	ao := &ArrayObject{}
+	a := Value{Tag: VTArray, Data: ao}
+	// First element is the array itself, *with* a POST annotation.
+	first := a
+	first.Annot = "< post here"
+	ao.Elems = []Value{first, Int(1)}
+
+	got := FormatValue(a)
+
+	// Expect multi-line due to POST (HardLine).
+	// Tabs for indentation (as the printer uses).
+	want := "[\n\t[...], # post here\n\t1\n]"
+	if strings.TrimSpace(got) != strings.TrimSpace(want) {
+		t.Fatalf("cycle array with POST mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func Test_Printer_Value_Cycle_MapValue_PostAfterComma(t *testing.T) {
+	// m = { k: m # post } — value POST prints after following comma;
+	// with a single entry there's no following comma, so it trails the value.
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"k"},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	val := m
+	val.Annot = "<v-post"
+	mo.Entries["k"] = val
+
+	got := FormatValue(m)
+	// Single entry: inline with value POST trailing.
+	want := "{\n\tk: {...} # v-post\n}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_NestedAnnots_PreservePreAndPost(t *testing.T) {
+	// Array with PRE on container element and POST on value:
+	// [  # pre
+	//   {...} # post
+	// ]
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"x"},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	mo.Entries["x"] = Int(1)
+
+	ao := &ArrayObject{}
+	elem := m
+	a := Value{Tag: VTArray, Data: ao}
+	ao.Elems = []Value{withAnnot(elem, "head")} // PRE on element via Annot without '<'
+
+	got := FormatValue(a)
+
+	// Expect multi-line due to PRE; POST remains trailing on the value line.
+	want := "[\n\t# head\n\t{x: 1}\n]"
+	if strings.TrimSpace(got) != strings.TrimSpace(want) {
+		t.Fatalf("nested PRE/POST mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}

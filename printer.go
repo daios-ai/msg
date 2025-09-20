@@ -1402,20 +1402,39 @@ func numString(f float64) string {
 	return s
 }
 
+// Detect cycles by pointer identity during a single render pass.
+type printCtx struct {
+	seenA map[*ArrayObject]bool
+	seenM map[*MapObject]bool
+}
+
+func newPrintCtx() *printCtx {
+	return &printCtx{
+		seenA: map[*ArrayObject]bool{},
+		seenM: map[*MapObject]bool{},
+	}
+}
+
+// docValue: threads a cycle-detection context.
+// (Keeps existing PRE/POST handling and doc engine contract.)
 func docValue(v Value) *Doc {
 	pre, post := splitAnnotText(v.Annot)
-	var head []*Doc
+	ctx := newPrintCtx()
+
+	body := docValueNoAnnWith(v, ctx)
+
 	if pre != "" {
-		head = append(head, annotPre(pre))
+		body = Concat(annotPre(pre), body)
 	}
-	body := docValueNoAnn(v)
 	if post != "" {
 		body = Concat(body, annotInline(post))
 	}
-	return Concat(append(head, body)...)
+	return body
 }
 
-func docValueNoAnn(v Value) *Doc {
+// docValueNoAnnWith: actual value rendering with cycle guards.
+// Uses Python-style cycle markers: `[...]` for arrays, `{...}` for maps.
+func docValueNoAnnWith(v Value, ctx *printCtx) *Doc {
 	switch v.Tag {
 	case VTNull:
 		return Text("null")
@@ -1430,15 +1449,26 @@ func docValueNoAnn(v Value) *Doc {
 		return Text(numString(v.Data.(float64)))
 	case VTStr:
 		return Text(quoteString(v.Data.(string)))
+
 	case VTArray:
-		xs := v.Data.(*ArrayObject).Elems
+		ao := v.Data.(*ArrayObject)
+
+		// Cycle check (Python-style marker)
+		if ctx.seenA[ao] {
+			return Text("[...]")
+		}
+		ctx.seenA[ao] = true
+
+		xs := ao.Elems
 		if len(xs) == 0 {
 			return Text("[]")
 		}
+
+		// Keep existing PRE/POST-on-elements + comma-after-POST behavior
 		joined := make([]sepItem, 0, len(xs))
 		for _, it := range xs {
 			pre, post := splitAnnotText(it.Annot)
-			elemDoc := docValueNoAnn(Value{Tag: it.Tag, Data: it.Data}) // without own annots
+			elemDoc := docValueNoAnnWith(Value{Tag: it.Tag, Data: it.Data}, ctx) // drop elem's own annots
 			if pre != "" {
 				elemDoc = Concat(annotPre(pre), elemDoc)
 			}
@@ -1452,20 +1482,35 @@ func docValueNoAnn(v Value) *Doc {
 			}
 			return SoftLineDoc()
 		}())), "]"))
+
 	case VTMap:
 		mo := v.Data.(*MapObject)
+
+		// Cycle check (Python-style marker)
+		if ctx.seenM[mo] {
+			return Text("{...}")
+		}
+		ctx.seenM[mo] = true
+
+		// Stable ordering preserved
 		keys := append([]string(nil), mo.Keys...)
 		sort.Strings(keys)
 		if len(keys) == 0 {
 			return Text("{}")
 		}
+
 		joined := make([]sepItem, 0, len(keys))
 		for _, k := range keys {
-			kAnn := mo.KeyAnn[k]
-			kPre, kPost := splitAnnotText(kAnn)
+			kPre, kPost := splitAnnotText(mo.KeyAnn[k])
+
 			vv := mo.Entries[k]
 			vPre, vPost := splitAnnotText(vv.Annot)
-			entry := kvEntry(idOrQuoted(k), docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}), kPre, vPre, kPost /*valPost*/, "")
+
+			entry := kvEntry(
+				idOrQuoted(k),
+				docValueNoAnnWith(Value{Tag: vv.Tag, Data: vv.Data}, ctx), // drop value's own annots
+				kPre, vPre, kPost /*valPost*/, "",
+			)
 			joined = append(joined, sepItem{main: entry, post: vPost})
 		}
 		inside := joinCommaWithPost(joined)
@@ -1476,17 +1521,14 @@ func docValueNoAnn(v Value) *Doc {
 			}
 			return SoftLineDoc()
 		}())), "}"))
+
 	case VTFun:
+		// unchanged from your original (no container recursion)
 		if f, ok := v.Data.(*Fun); ok && f != nil {
-			// Use "oracle" label for oracle functions, otherwise "fun".
 			label := "fun"
 			if f.IsOracle {
 				label = "oracle"
 			}
-
-			// Build `<{label}: a:T -> b:U -> R>`; when a param type is itself a
-			// function type (… -> …), wrap *that type* in parens to avoid
-			// ambiguity with the outer arrow chain.
 			var chain []*Doc
 			if len(f.ParamTypes) == 0 {
 				chain = append(chain, Text("_:Null"))
@@ -1501,7 +1543,6 @@ func docValueNoAnn(v Value) *Doc {
 					}
 					pt := f.ParamTypes[i]
 					td := docType(pt)
-					// If param type is a function type, parenthesize the whole type.
 					if len(pt) >= 4 && pt[0] == "binop" && pt[1] == "->" {
 						td = Concat(Text("("), td, Text(")"))
 					}
@@ -1512,9 +1553,11 @@ func docValueNoAnn(v Value) *Doc {
 			return Group(Concat(Text("<"+label+": "), Concat(chain...), Text(">")))
 		}
 		return Text("<fun>")
+
 	case VTType:
 		t := typeAst(v.Data)
 		return Group(Concat(Text("<type: "), docType(t), Text(">")))
+
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
@@ -1525,6 +1568,7 @@ func docValueNoAnn(v Value) *Doc {
 			name = "<module: " + disp + ">"
 		}
 		return Text(name)
+
 	default:
 		if v.Tag == VTHandle {
 			if h, ok := v.Data.(*Handle); ok {

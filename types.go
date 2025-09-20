@@ -328,57 +328,98 @@ func (ip *Interpreter) litToValue(lit S) (Value, bool) {
 // Value → Type inference (typeOf-like behavior)
 // -----------------------------
 
+// valueToTypeS infers a structural type for v. This wrapper seeds cycle guards.
 func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
-	switch v.Tag {
-	case VTNull:
-		return S{"id", "Null"}
-	case VTBool:
-		return S{"id", "Bool"}
-	case VTInt:
-		return S{"id", "Int"}
-	case VTNum:
-		return S{"id", "Num"}
-	case VTStr:
-		return S{"id", "Str"}
+	// Cycle guards for arrays and maps so self-references don't produce
+	// infinitely deep or self-nested element/object types. Any back-edge
+	// collapses to Any (conservative, JSON-friendly).
+	seenArr := map[*ArrayObject]bool{}
+	seenMap := map[*MapObject]bool{}
 
-	case VTArray:
-		xs := v.Data.(*ArrayObject).Elems
-		if len(xs) == 0 {
-			return S{"array", S{"id", "Any"}}
+	var go1 func(Value) S
+	go1 = func(v Value) S {
+		switch v.Tag {
+		case VTNull:
+			return S{"id", "Null"}
+		case VTBool:
+			return S{"id", "Bool"}
+		case VTInt:
+			return S{"id", "Int"}
+		case VTNum:
+			return S{"id", "Num"}
+		case VTStr:
+			return S{"id", "Str"}
+
+		case VTArray:
+			ao := v.Data.(*ArrayObject)
+
+			// If we're already walking this array, it's a cycle → Any.
+			if seenArr[ao] {
+				return S{"id", "Any"}
+			}
+			seenArr[ao] = true
+			defer func() { delete(seenArr, ao) }()
+
+			xs := ao.Elems
+			if len(xs) == 0 {
+				return S{"array", S{"id", "Any"}}
+			}
+
+			// If any element is exactly this array → element type Any.
+			for _, e := range xs {
+				if e.Tag == VTArray && e.Data.(*ArrayObject) == ao {
+					return S{"array", S{"id", "Any"}}
+				}
+			}
+
+			elem := go1(xs[0])
+			for i := 1; i < len(xs); i++ {
+				elem = ip.unifyTypes(elem, go1(xs[i]), env)
+				if isId(elem, "Any") {
+					// Can't get more specific; bail early.
+					break
+				}
+			}
+			return S{"array", elem}
+
+		case VTMap:
+			mo := v.Data.(*MapObject)
+
+			// Cycle guard for maps.
+			if seenMap[mo] {
+				return S{"id", "Any"}
+			}
+			seenMap[mo] = true
+			defer func() { delete(seenMap, mo) }()
+
+			out := S{"map"}
+			// Open-world: infer observed fields as optional ("pair").
+			for k, vv := range mo.Entries {
+				out = append(out, S{"pair", S{"str", k}, go1(vv)})
+			}
+			return out
+
+		case VTModule:
+			// Treat modules structurally as maps.
+			return go1(AsMapValue(v))
+
+		case VTFun:
+			f := v.Data.(*Fun)
+			t := f.ReturnType
+			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+				t = S{"binop", "->", f.ParamTypes[i], t}
+			}
+			return t
+
+		case VTType:
+			return S{"id", "Type"}
+
+		default:
+			return S{"id", "Any"}
 		}
-		elem := ip.valueToTypeS(xs[0], env)
-		for i := 1; i < len(xs); i++ {
-			elem = ip.unifyTypes(elem, ip.valueToTypeS(xs[i], env), env)
-		}
-		return S{"array", elem}
-
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		out := S{"map"}
-		// For a single observed map, infer optional fields (no required).
-		for k, vv := range mo.Entries {
-			out = append(out, S{"pair", S{"str", k}, ip.valueToTypeS(vv, env)})
-		}
-		return out
-
-	case VTModule:
-		// Treat modules structurally as maps.
-		return ip.valueToTypeS(AsMapValue(v), env)
-
-	case VTFun:
-		f := v.Data.(*Fun)
-		t := f.ReturnType
-		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-			t = S{"binop", "->", f.ParamTypes[i], t}
-		}
-		return t
-
-	case VTType:
-		return S{"id", "Type"}
-
-	default:
-		return S{"id", "Any"}
 	}
+
+	return go1(v)
 }
 
 // -----------------------------
@@ -390,7 +431,8 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 	seen := map[string]bool{}
 	var go1 func(S, *Env) S
 	go1 = func(x S, e *Env) S {
-		t = stripAnnot(t)
+		// IMPORTANT: strip on the current node (x), not the outer t.
+		x = stripAnnot(x)
 		if len(x) == 0 {
 			return x
 		}
@@ -455,112 +497,141 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 // Runtime type checking
 // -----------------------------
 
+// isType is the public-impl entry; it seeds cycle guards for runtime values.
+// isType checks whether runtime value v conforms to type t, with cycle guards
+// for arrays/maps to avoid non-termination on cyclic graphs. Modules are treated
+// structurally as maps. Annotations in type ASTs are ignored.
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	t = stripAnnot(ip.resolveType(t, env))
-	if len(t) == 0 {
-		return false
-	}
-	// Defensive: tolerate stray annotations if they sneak past.
-	if t[0].(string) == "annot" {
-		return ip.isType(v, t[2].(S), env)
-	}
+	seenMaps := make(map[*MapObject]bool)
+	seenArrays := make(map[*ArrayObject]bool)
 
-	// Treat modules structurally as maps during type checks.
-	v = AsMapValue(v)
-
-	switch t[0].(string) {
-	case "id":
-		switch t[1].(string) {
-		case "Any":
-			return true
-		case "Null":
-			return v.Tag == VTNull
-		case "Bool":
-			return v.Tag == VTBool
-		case "Int":
-			return v.Tag == VTInt
-		case "Num":
-			return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
-		case "Str":
-			return v.Tag == VTStr
-		case "Type":
-			return v.Tag == VTType
-		default:
+	var check func(Value, S) bool
+	check = func(v Value, t S) bool {
+		// Resolve aliases and strip annotations.
+		t = stripAnnot(ip.resolveType(t, env))
+		if len(t) == 0 {
 			return false
 		}
+		// Defensive: tolerate stray annot nodes.
+		if t[0].(string) == "annot" {
+			return check(v, t[2].(S))
+		}
 
-	case "unop":
-		if t[1].(string) != "?" {
-			return false
-		}
-		if v.Tag == VTNull {
-			return true
-		}
-		return ip.isType(v, t[2].(S), env)
+		// Treat modules as maps.
+		v = AsMapValue(v)
 
-	case "array":
-		if v.Tag != VTArray {
-			return false
-		}
-		// If no element type provided, treat as [Any]
-		elemT := S{"id", "Any"}
-		if len(t) == 2 {
-			elemT = t[1].(S)
-		}
-		for _, elem := range v.Data.(*ArrayObject).Elems {
-			if !ip.isType(elem, elemT, env) {
+		switch t[0].(string) {
+		case "id":
+			switch t[1].(string) {
+			case "Any":
+				return true
+			case "Null":
+				return v.Tag == VTNull
+			case "Bool":
+				return v.Tag == VTBool
+			case "Int":
+				return v.Tag == VTInt
+			case "Num":
+				return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
+			case "Str":
+				return v.Tag == VTStr
+			case "Type":
+				return v.Tag == VTType
+			default:
 				return false
 			}
-		}
-		return true
 
-	case "map":
-		if v.Tag != VTMap {
-			return false
-		}
-		fs := mapTypeFields(t)
-		mo := v.Data.(*MapObject)
-		for name, f := range fs {
-			val, ok := mo.Entries[name]
-			if !ok {
-				if f.required {
-					return false
-				}
-				continue
-			}
-			if !ip.isType(val, f.typ, env) {
+		case "unop":
+			if t[1].(string) != "?" {
 				return false
 			}
-		}
-		return true
-
-	case "enum":
-		// Deeply equal to one of the literal values
-		for i := 1; i < len(t); i++ {
-			lv, ok := ip.litToValue(t[i].(S))
-			if !ok {
-				continue
-			}
-			if deepEqualLit(lv, v) {
+			if v.Tag == VTNull {
 				return true
 			}
-		}
-		return false
+			return check(v, t[2].(S))
 
-	case "binop":
-		if t[1].(string) != "->" || v.Tag != VTFun {
+		case "array":
+			if v.Tag != VTArray {
+				return false
+			}
+			// Default element type is Any if not provided.
+			elemT := S{"id", "Any"}
+			if len(t) == 2 {
+				elemT = t[1].(S)
+			}
+			ao := v.Data.(*ArrayObject)
+			// Cycle guard: accept on revisit to prevent infinite descent.
+			if seenArrays[ao] {
+				return true
+			}
+			seenArrays[ao] = true
+			defer delete(seenArrays, ao)
+
+			for _, elem := range ao.Elems {
+				if !check(elem, elemT) {
+					return false
+				}
+			}
+			return true
+
+		case "map":
+			if v.Tag != VTMap {
+				return false
+			}
+			fs := mapTypeFields(t)
+			mo := v.Data.(*MapObject)
+			// Cycle guard: accept on revisit to prevent infinite descent.
+			if seenMaps[mo] {
+				return true
+			}
+			seenMaps[mo] = true
+			defer delete(seenMaps, mo)
+
+			for name, f := range fs {
+				val, ok := mo.Entries[name]
+				if !ok {
+					if f.required {
+						return false
+					}
+					continue
+				}
+				if !check(val, f.typ) {
+					return false
+				}
+			}
+			return true
+
+		case "enum":
+			// Deeply equal to one of the literal values.
+			for i := 1; i < len(t); i++ {
+				lit, ok := ip.litToValue(t[i].(S))
+				if !ok {
+					continue
+				}
+				if deepEqualLit(lit, v) {
+					return true
+				}
+			}
 			return false
+
+		case "binop":
+			if t[1].(string) != "->" || v.Tag != VTFun {
+				return false
+			}
+			// Compare the value's function type structurally via subtyping:
+			// (P1 -> ... -> R) <: t
+			f := v.Data.(*Fun)
+			ft := f.ReturnType
+			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+				ft = S{"binop", "->", f.ParamTypes[i], ft}
+			}
+			return ip.isSubtype(ft, t, env)
 		}
-		// value's function type
-		f := v.Data.(*Fun)
-		ft := f.ReturnType
-		for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-			ft = S{"binop", "->", f.ParamTypes[i], ft}
-		}
-		return ip.isSubtype(ft, t, env)
+
+		return false
 	}
 
-	return false
+	return check(v, t)
 }
 
 // -----------------------------

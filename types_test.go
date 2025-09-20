@@ -697,3 +697,99 @@ Int}`)
 		t.Fatalf("expected unify(a,b) to equal unannotated type; got %v", u)
 	}
 }
+
+func Test_Types_ValueToType_Array_SelfCycle(t *testing.T) {
+	ip := newIP()
+
+	// Build a self-referential array:
+	//   let a = [null]; a[0] = a; a
+	v := evalWithIP(t, ip, "let a = [null]\na[0] = a\na")
+
+	got := ip.valueToTypeS(v, ip.Global)
+	// Expect conservative widening to [Any] rather than infinite recursion.
+	want := typeS(t, ip, `[Any]`)
+	if !equalS(got, want) {
+		t.Fatalf("valueToTypeS on cyclic array: got %#v, want %#v", got, want)
+	}
+}
+
+func Test_Types_ValueToType_Map_SelfCycle(t *testing.T) {
+	ip := newIP()
+
+	// Self-referential map with an extra normal field:
+	//   let m = {}; m.self = m; m.x = 1; m
+	v := evalWithIP(t, ip, "let m = {}\nm.self = m\nm.x = 1\nm")
+
+	got := ip.valueToTypeS(v, ip.Global)
+	if len(got) == 0 || got[0].(string) != "map" {
+		t.Fatalf("expected map type, got %#v", got)
+	}
+
+	fs := mapTypeFields(got)
+	// self: Any (widened due to cycle), x: Int (optional/open-world)
+	if f, ok := fs["self"]; !ok || !isId(f.typ, "Any") {
+		t.Fatalf("expected field self: Any (from cycle), got %#v", f)
+	}
+	if f, ok := fs["x"]; !ok || !isId(f.typ, "Int") {
+		t.Fatalf("expected field x: Int, got %#v", f)
+	}
+}
+
+func Test_Types_IsType_Array_SelfCycle_NoHang(t *testing.T) {
+	ip := newIP()
+
+	// Cyclic array again
+	v := evalWithIP(t, ip, "let a = [null]\na[0] = a\na")
+
+	// Should trivially pass against [Any] without recursing forever.
+	tAny := typeS(t, ip, `[Any]`)
+	if !ip.isType(v, tAny, ip.Global) {
+		t.Fatalf("cyclic array should satisfy [Any]")
+	}
+
+	// And should fail (quickly) against [Int].
+	tInt := typeS(t, ip, `[Int]`)
+	if ip.isType(v, tInt, ip.Global) {
+		t.Fatalf("cyclic array should not satisfy [Int]")
+	}
+}
+
+func Test_Types_IsType_Map_SelfCycle_NoHang(t *testing.T) {
+	ip := newIP()
+
+	// Self-referential map with a valid required field
+	v := evalWithIP(t, ip, "let m = {}\nm.self = m\nm.x = 1\nm")
+
+	// Type only requires x!: Int; presence of self (cyclic) must not hang.
+	tReq := typeS(t, ip, `{x!: Int}`)
+	if !ip.isType(v, tReq, ip.Global) {
+		t.Fatalf("self-referential map should satisfy {x!: Int}")
+	}
+}
+
+func Test_Types_ResolveType_FunctionalCycle_NoHang(t *testing.T) {
+	ip := newIP()
+
+	// Recursive alias: F = Int -> F
+	if _, err := ip.EvalPersistentSource("let F = type Int -> F"); err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	// Resolving "F" should terminate and yield a function node whose return
+	// still contains the unresolved id "F" (cycle guarded).
+	res := ip.ResolveType(typeS(t, ip, `F`), ip.Global)
+
+	if len(res) < 4 || res[0].(string) != "binop" || res[1].(string) != "->" {
+		t.Fatalf("expected resolved F to be a function type, got %#v", res)
+	}
+	// Check param == Int
+	param := res[2].(S)
+	if !isId(param, "Int") {
+		t.Fatalf("expected param Int, got %#v", param)
+	}
+	// Return should still reference id "F" (not infinitely expanded).
+	ret := res[3].(S)
+	if !(len(ret) >= 2 && ret[0].(string) == "id" && ret[1].(string) == "F") {
+		t.Fatalf("expected return to be id F (cycle-guarded), got %#v", ret)
+	}
+}

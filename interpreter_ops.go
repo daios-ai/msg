@@ -689,72 +689,110 @@ func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
 ////////////////////////////////////////////////////////////////////////////////
 
 func (ip *Interpreter) deepEqual(a, b Value) bool {
-	if a.Tag == VTModule {
-		a = Value{Tag: VTMap, Data: a.Data.(*Module).Map}
-	}
-	if b.Tag == VTModule {
-		b = Value{Tag: VTMap, Data: b.Data.(*Module).Map}
-	}
-	if isNumber(a) && isNumber(b) {
-		return toFloat(a) == toFloat(b)
-	}
-	if a.Tag != b.Tag {
-		return false
-	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray:
-		ax := a.Data.(*ArrayObject).Elems
-		bx := b.Data.(*ArrayObject).Elems
-		if len(ax) != len(bx) {
+	// Visited set of (leftPtr,rightPtr) pairs to break cycles in arrays/maps.
+	type pair struct{ x, y any }
+	visited := make(map[pair]bool)
+
+	var eq func(x, y Value) bool
+	eq = func(x, y Value) bool {
+		// Treat modules as maps (same as the original function).
+		if x.Tag == VTModule {
+			x = Value{Tag: VTMap, Data: x.Data.(*Module).Map}
+		}
+		if y.Tag == VTModule {
+			y = Value{Tag: VTMap, Data: y.Data.(*Module).Map}
+		}
+
+		// Numeric unification (Int/Num compare by value).
+		if isNumber(x) && isNumber(y) {
+			return toFloat(x) == toFloat(y)
+		}
+
+		// Tags must match (after numeric normalization above).
+		if x.Tag != y.Tag {
 			return false
 		}
-		for i := range ax {
-			if !ip.deepEqual(ax[i], bx[i]) {
+
+		switch x.Tag {
+		case VTNull:
+			return true
+		case VTBool:
+			return x.Data.(bool) == y.Data.(bool)
+		case VTInt:
+			return x.Data.(int64) == y.Data.(int64)
+		case VTNum:
+			return x.Data.(float64) == y.Data.(float64)
+		case VTStr:
+			return x.Data.(string) == y.Data.(string)
+
+		case VTArray:
+			ax := x.Data.(*ArrayObject)
+			ay := y.Data.(*ArrayObject)
+			// Cycle guard: if we've already compared this pair, consider it equal.
+			k := pair{ax, ay}
+			if visited[k] {
+				return true
+			}
+			visited[k] = true
+
+			if len(ax.Elems) != len(ay.Elems) {
 				return false
 			}
-		}
-		return true
-	case VTMap:
-		am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
-		if len(am.Entries) != len(bm.Entries) {
+			for i := range ax.Elems {
+				if !eq(ax.Elems[i], ay.Elems[i]) {
+					return false
+				}
+			}
+			return true
+
+		case VTMap:
+			mx := x.Data.(*MapObject)
+			my := y.Data.(*MapObject)
+			// Cycle guard for maps.
+			k := pair{mx, my}
+			if visited[k] {
+				return true
+			}
+			visited[k] = true
+
+			if len(mx.Entries) != len(my.Entries) {
+				return false
+			}
+			for k, xv := range mx.Entries {
+				yv, ok := my.Entries[k]
+				if !ok || !eq(xv, yv) {
+					return false
+				}
+			}
+			return true
+
+		case VTFun:
+			// Pointer equality on closures (matches original behavior).
+			return x.Data.(*Fun) == y.Data.(*Fun)
+
+		case VTType:
+			// Resolve and structurally compare type ASTs (matches original behavior).
+			ta := x.Data.(*TypeValue)
+			tb := y.Data.(*TypeValue)
+			ea := ta.Env
+			if ea == nil {
+				ea = ip.Core
+			}
+			eb := tb.Env
+			if eb == nil {
+				eb = ip.Core
+			}
+			ra := ip.resolveType(ta.Ast, ea)
+			rb := ip.resolveType(tb.Ast, eb)
+			return equalS(ra, rb)
+
+		default:
+			// Handles VTHandle and any other tags we don't explicitly equal-compare.
 			return false
 		}
-		for k, av := range am.Entries {
-			bv, ok := bm.Entries[k]
-			if !ok || !ip.deepEqual(av, bv) {
-				return false
-			}
-		}
-		return true
-	case VTFun:
-		return a.Data.(*Fun) == b.Data.(*Fun)
-	case VTType:
-		ta := a.Data.(*TypeValue)
-		tb := b.Data.(*TypeValue)
-		ea := ta.Env
-		if ea == nil {
-			ea = ip.Core
-		}
-		eb := tb.Env
-		if eb == nil {
-			eb = ip.Core
-		}
-		ra := ip.resolveType(ta.Ast, ea)
-		rb := ip.resolveType(tb.Ast, eb)
-		return equalS(ra, rb)
-	default:
-		return false
 	}
+
+	return eq(a, b)
 }
 
 ////////////////////////////////////////////////////////////////////////////////

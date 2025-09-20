@@ -819,3 +819,75 @@ func Test_Introspection_Noop_Validate_BadArity(t *testing.T) {
 		t.Fatalf("expected at least one validation error for bad-arity noop")
 	}
 }
+
+func Test_Interpreter_DeepEqual_ArraySelfCycle(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Build a self-cyclic array: a = []; a[0] = a
+	aObj := &ArrayObject{Elems: make([]Value, 1)}
+	a := Value{Tag: VTArray, Data: aObj}
+	aObj.Elems[0] = a
+
+	// Another, structurally identical self-cyclic array
+	bObj := &ArrayObject{Elems: make([]Value, 1)}
+	b := Value{Tag: VTArray, Data: bObj}
+	bObj.Elems[0] = b
+
+	// A different array (no cycle)
+	c := Arr([]Value{Null})
+
+	if !ip.deepEqual(a, b) {
+		t.Fatalf("expected self-cyclic arrays to be equal")
+	}
+	if ip.deepEqual(a, c) {
+		t.Fatalf("expected cyclic array not equal to non-cyclic array")
+	}
+}
+
+func Test_Interpreter_DeepEqual_MapSelfCycle(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Build a self-cyclic map: m = {}; m['self'] = m
+	m1 := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"self"},
+	}
+	mv1 := Value{Tag: VTMap, Data: m1}
+	m1.Entries["self"] = mv1
+
+	// Another, structurally identical self-cyclic map
+	m2 := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"self"},
+	}
+	mv2 := Value{Tag: VTMap, Data: m2}
+	m2.Entries["self"] = mv2
+
+	// Different map: same key but different value
+	m3 := &MapObject{
+		Entries: map[string]Value{"self": Null},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"self"},
+	}
+	mv3 := Value{Tag: VTMap, Data: m3}
+
+	if !ip.deepEqual(mv1, mv2) {
+		t.Fatalf("expected self-cyclic maps to be equal")
+	}
+	if ip.deepEqual(mv1, mv3) {
+		t.Fatalf("expected cyclic map not equal to different map")
+	}
+}
+
+func Test_Interpreter_DeepEqual_IntVsNum(t *testing.T) {
+	ip := NewInterpreter()
+
+	if !ip.deepEqual(Int(3), Num(3.0)) {
+		t.Fatalf("expected Int(3) == Num(3.0)")
+	}
+	if ip.deepEqual(Int(3), Num(3.1)) {
+		t.Fatalf("did not expect Int(3) == Num(3.1)")
+	}
+}

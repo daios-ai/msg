@@ -853,3 +853,31 @@ func Test_Types_IsSubtype_Recursive_Function_Type_NoHang(t *testing.T) {
 		t.Fatal("isSubtype on recursive function type hung")
 	}
 }
+
+func Test_Types_Recursive_MapFun_Coinductive(t *testing.T) {
+	ip := newIP()
+
+	// Recursive alias: T = { f!: Null -> T }
+	if _, err := ip.EvalPersistentSource(`let T = type { f!: Null -> T }`); err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	// Function builds a self-referential object of type T and returns it.
+	src := `
+let mk = fun() -> T do
+  let o = {}
+  o.f = fun(_: Null) -> T do
+    return o
+  end
+  return o
+end
+mk()
+`
+	v := evalWithIP(t, ip, src)
+
+	// The returned value should conform to T.
+	typ := typeS(t, ip, `T`)
+	if !ip.isType(v, typ, ip.Global) {
+		t.Fatalf("expected mk() to yield value of type T, got %#v", v)
+	}
+}

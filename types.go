@@ -74,7 +74,9 @@
 //	structural S-equality, and field extraction.
 package mindscript
 
-import "reflect"
+import (
+	"unsafe"
+)
 
 //// END_OF_PUBLIC
 
@@ -503,24 +505,46 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 // isType checks whether runtime value v conforms to type t, with cycle guards
 // for arrays/maps to avoid non-termination on cyclic graphs. Modules are treated
 // structurally as maps. Annotations in type ASTs are ignored.
+// isType checks whether runtime value v conforms to type t in env.
+// Cycle-safe via coinductive memo on (value,type).
+// isType checks whether runtime value v conforms to type t in env.
+// It is cycle-safe via a coinductive memo keyed by (value-pointer, type-node-pointer).
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	seenMaps := make(map[*MapObject]bool)
-	seenArrays := make(map[*ArrayObject]bool)
+	t = stripAnnot(ip.resolveType(t, env))
+
+	// Coinductive memo: only set for pointer-backed values (maps/arrays/funs).
+	seen := make(map[[2]unsafe.Pointer]struct{})
 
 	var check func(Value, S) bool
 	check = func(v Value, t S) bool {
-		// Resolve aliases and strip annotations.
-		t = stripAnnot(ip.resolveType(t, env))
+		t = stripAnnot(t)
 		if len(t) == 0 {
 			return false
 		}
-		// Defensive: tolerate stray annot nodes.
-		if t[0].(string) == "annot" {
-			return check(v, t[2].(S))
-		}
 
-		// Treat modules as maps.
+		// Modules behave structurally as maps.
 		v = AsMapValue(v)
+
+		// Build memo key (value pointer, type-node pointer).
+		var vp unsafe.Pointer
+		switch v.Tag {
+		case VTMap:
+			vp = unsafe.Pointer(v.Data.(*MapObject))
+		case VTArray:
+			vp = unsafe.Pointer(v.Data.(*ArrayObject))
+		case VTFun:
+			vp = unsafe.Pointer(v.Data.(*Fun))
+		default:
+			vp = nil // scalars don’t participate in cycles; skip memo for them
+		}
+		tp := unsafe.Pointer(&t[0]) // address of this AST node’s tag
+		if vp != nil {
+			key := [2]unsafe.Pointer{vp, tp}
+			if _, ok := seen[key]; ok {
+				return true // coinductive success on the same (v,t) pair
+			}
+			seen[key] = struct{}{}
+		}
 
 		switch t[0].(string) {
 		case "id":
@@ -534,7 +558,7 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			case "Int":
 				return v.Tag == VTInt
 			case "Num":
-				return v.Tag == VTInt || v.Tag == VTNum // Int <: Num
+				return v.Tag == VTInt || v.Tag == VTNum
 			case "Str":
 				return v.Tag == VTStr
 			case "Type":
@@ -543,7 +567,7 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 				return false
 			}
 
-		case "unop":
+		case "unop": // nullable T?
 			if t[1].(string) != "?" {
 				return false
 			}
@@ -556,21 +580,12 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			if v.Tag != VTArray {
 				return false
 			}
-			// Default element type is Any if not provided.
 			elemT := S{"id", "Any"}
 			if len(t) == 2 {
 				elemT = t[1].(S)
 			}
-			ao := v.Data.(*ArrayObject)
-			// Cycle guard: accept on revisit to prevent infinite descent.
-			if seenArrays[ao] {
-				return true
-			}
-			seenArrays[ao] = true
-			defer delete(seenArrays, ao)
-
-			for _, elem := range ao.Elems {
-				if !check(elem, elemT) {
+			for _, e := range v.Data.(*ArrayObject).Elems {
+				if !check(e, elemT) {
 					return false
 				}
 			}
@@ -581,16 +596,9 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 				return false
 			}
 			fs := mapTypeFields(t)
-			mo := v.Data.(*MapObject)
-			// Cycle guard: accept on revisit to prevent infinite descent.
-			if seenMaps[mo] {
-				return true
-			}
-			seenMaps[mo] = true
-			defer delete(seenMaps, mo)
-
+			m := v.Data.(*MapObject).Entries
 			for name, f := range fs {
-				val, ok := mo.Entries[name]
+				val, ok := m[name]
 				if !ok {
 					if f.required {
 						return false
@@ -604,24 +612,17 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			return true
 
 		case "enum":
-			// Deeply equal to one of the literal values.
 			for i := 1; i < len(t); i++ {
-				lit, ok := ip.litToValue(t[i].(S))
-				if !ok {
-					continue
-				}
-				if deepEqualLit(lit, v) {
+				if lit, ok := ip.litToValue(t[i].(S)); ok && deepEqualLit(lit, v) {
 					return true
 				}
 			}
 			return false
 
-		case "binop":
+		case "binop": // function type
 			if t[1].(string) != "->" || v.Tag != VTFun {
 				return false
 			}
-			// Compare the value's function type structurally via subtyping:
-			// (P1 -> ... -> R) <: t
 			f := v.Data.(*Fun)
 			ft := f.ReturnType
 			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
@@ -645,72 +646,86 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 // Uses a tiny memo keyed by the memory addresses of the compared S-nodes.
 // isSubtype — compact, cycle-safe (coinductive) structural subtyping.
 // Uses address-based memo keys for recursion, keeping it hot-path friendly.
+// isSubtype checks structural subtyping a <: b with coinductive memoization.
+// It memoizes on the pair of underlying S nodes using raw pointers for speed.
 func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 	a = stripAnnot(ip.resolveType(a, env))
 	b = stripAnnot(ip.resolveType(b, env))
-	if equalS(a, b) {
-		return true
-	}
 
-	// Tiny address-based memo (pointer to first cell of each S node).
-	sid := func(s S) uintptr {
-		if len(s) == 0 {
-			return 0
-		}
-		return reflect.ValueOf(&s[0]).Pointer()
-	}
-	seen := make(map[[2]uintptr]struct{})
-
-	isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
-	unwrap := func(t S) S { return t[2].(S) }
+	seen := make(map[[2]unsafe.Pointer]struct{})
 
 	var sub func(S, S) bool
 	sub = func(x, y S) bool {
+		x = stripAnnot(x)
+		y = stripAnnot(y)
+		if len(x) == 0 || len(y) == 0 {
+			return false
+		}
+
+		// Coinductive memo key: (address of x[0], address of y[0])
+		key := [2]unsafe.Pointer{unsafe.Pointer(&x[0]), unsafe.Pointer(&y[0])}
+		if _, ok := seen[key]; ok {
+			return true
+		}
+		seen[key] = struct{}{}
+
+		// Fast-path equal
 		if equalS(x, y) {
 			return true
 		}
-		k := [2]uintptr{sid(x), sid(y)}
-		if _, ok := seen[k]; ok {
-			return true
-		} // coinductive success on cycle
-		seen[k] = struct{}{}
 
 		// Top
-		if len(y) >= 2 && y[0].(string) == "id" && y[1].(string) == "Any" {
+		if isId(y, "Any") {
 			return true
 		}
 
-		// BOTH nullable first: A? <: B?  iff  A <: B
+		// Nullable helpers
+		isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
+		unwrap := func(t S) S { return t[2].(S) }
+
+		// A <: B?  if  A <: B  or  A == Null
+		if isOpt(y) {
+			if sub(x, unwrap(y)) {
+				return true
+			}
+			if isId(x, "Null") {
+				return true
+			}
+		}
+		// Int <: Num
+		if isId(x, "Int") && isId(y, "Num") {
+			return true
+		}
+		// A? <: B? iff A <: B
 		if isOpt(x) && isOpt(y) {
 			return sub(unwrap(x), unwrap(y))
 		}
-
-		// RHS nullable: A <: B?  iff  A <: B  or  A == Null
-		if isOpt(y) {
-			return sub(x, unwrap(y)) || (len(x) >= 2 && x[0].(string) == "id" && x[1].(string) == "Null")
+		// Identical primitive ids
+		if len(x) >= 2 && x[0].(string) == "id" && len(y) >= 2 && y[0].(string) == "id" {
+			return x[1].(string) == y[1].(string)
 		}
 
-		// Primitives (+ Int <: Num)
-		if len(x) >= 2 && len(y) >= 2 && x[0].(string) == "id" && y[0].(string) == "id" {
-			ax, ay := x[1].(string), y[1].(string)
-			return ax == ay || (ax == "Int" && ay == "Num")
-		}
-
-		// Arrays: elementwise covariance
-		if len(x) > 0 && len(y) > 0 && x[0].(string) == "array" && y[0].(string) == "array" {
-			ex, ey := S{"id", "Any"}, S{"id", "Any"}
+		switch x[0].(string) {
+		case "array":
+			if y[0].(string) != "array" {
+				return false
+			}
+			xe := S{"id", "Any"}
+			ye := S{"id", "Any"}
 			if len(x) == 2 {
-				ex = x[1].(S)
+				xe = x[1].(S)
 			}
 			if len(y) == 2 {
-				ey = y[1].(S)
+				ye = y[1].(S)
 			}
-			return sub(ex, ey)
-		}
+			return sub(xe, ye) // covariance
 
-		// Maps: must provide all required of y; cannot relax requiredness
-		if len(x) > 0 && len(y) > 0 && x[0].(string) == "map" && y[0].(string) == "map" {
-			reqY, haveX := mapTypeFields(y), mapTypeFields(x)
+		case "map":
+			if y[0].(string) != "map" {
+				return false
+			}
+			reqY := mapTypeFields(y)
+			haveX := mapTypeFields(x)
 			for name, fy := range reqY {
 				fx, ok := haveX[name]
 				if !ok {
@@ -727,25 +742,25 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 				}
 			}
 			return true
-		}
 
-		// Enums
-		if len(x) > 0 && len(y) > 0 && x[0].(string) == "enum" && y[0].(string) == "enum" {
-			for i := 1; i < len(x); i++ {
-				found := false
-				for j := 1; j < len(y); j++ {
-					if equalS(x[i].(S), y[j].(S)) {
-						found = true
-						break
+		case "enum":
+			// Enum⊆Enum by literal inclusion
+			if y[0].(string) == "enum" {
+				for i := 1; i < len(x); i++ {
+					found := false
+					for j := 1; j < len(y); j++ {
+						if equalS(x[i].(S), y[j].(S)) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						return false
 					}
 				}
-				if !found {
-					return false
-				}
+				return true
 			}
-			return true
-		}
-		if len(x) > 0 && x[0].(string) == "enum" {
+			// Enum <: T if each member fits T
 			for i := 1; i < len(x); i++ {
 				lv, ok := ip.litToValue(x[i].(S))
 				if !ok || !ip.isType(lv, y, env) {
@@ -753,12 +768,15 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 				}
 			}
 			return true
-		}
 
-		// Functions: param contravariance, return covariance (right-assoc)
-		if len(x) >= 4 && len(y) >= 4 && x[0].(string) == "binop" && x[1].(string) == "->" &&
-			y[0].(string) == "binop" && y[1].(string) == "->" {
-			return sub(y[2].(S), x[2].(S)) && sub(x[3].(S), y[3].(S))
+		case "binop":
+			if x[1].(string) != "->" || y[0].(string) != "binop" || y[1].(string) != "->" {
+				return false
+			}
+			xp, xr := x[2].(S), x[3].(S)
+			yp, yr := y[2].(S), y[3].(S)
+			// Param contravariance, return covariance
+			return sub(yp, xp) && sub(xr, yr)
 		}
 
 		return false

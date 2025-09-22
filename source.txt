@@ -43,26 +43,20 @@ let _Handler = type { kind!: Str, call!: Any }  # kind ∈ {"value","stream"}
 # Utilities
 # =========================
 
-# Required: used ONCE to decide handler shape at registration.
-let _paramCount = fun(f) -> Int do
-	let rt = reflect(f)
-	if rt == null then return 1 end
-	if len(rt) == 0 or rt[0] != "fun" then return 1 end
-	let ps = rt[1]
-	if ps == null then return 0 end
-	if len(ps) >= 1 and ps[0] == "array" then return len(ps) - 1 end
-	return len(ps)
-end
-
-# DO NOT DELETE. Used in _mkRoute to add the explicit kind tag.
+# DO NOT DELETE. THIS TEST IS ROCK SOLID. 
+# Used in _mkRoute to add the explicit kind tag.
 # This function has been tested numerous times and it is rock solid.
 let _isStreaming = fun(f) -> Bool do
-	let n = _paramCount(f)
-	if n == 1 then return false end
-	if n == 2 then return true end
-	print("[DBG _isStreaming] f: " + formatValue(f))
-	print("[DBG _isStreaming] n: " + n)
-	fail(sprintf("unsupported handler arity: %d (want 1 or 2)", [n]))
+	let r = reflect(f)
+	if len(r) > 0 and r[0] == "fun" then
+		let paramlen = len(r[1]) - 1
+		if paramlen == 1 then
+			return false
+		elif paramlen == 2 then
+			return true
+		end
+	end
+	fail(sprintf("unsupported handler of type: " + formatValue(f), []))
 end
 
 let _normMethod = fun(m: Str) -> Str do toUpper(m) end
@@ -265,10 +259,8 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str], isPrefix: Bool) -> {}? do
 	params
 end
 
-# Middleware type (public surface): (Handler) -> Handler
-# We keep builder functions returning such transformers, same names as before:
-# mwRecover(): Any, mwRequestID(name): Any, mwTimeout(ms): Any, mwCors(opts): Any
-# Each returns a function that takes a Handler and returns a new Handler.
+
+
 
 let router = fun(_: Null) -> {} do
 	let _routes = []
@@ -328,7 +320,9 @@ let router = fun(_: Null) -> {} do
 
 		if h.kind == "stream" then
 			let pack = _newResponder()
-			let r1 = try(fun(_: Null) do h.call(rq, pack.api) end)
+			let r1 = try(fun(_: Null) do 
+				h.call(rq, pack.api) 
+			end)
 			if not r1.ok then
 				return text(500, "internal error")
 			end
@@ -487,7 +481,11 @@ let mwRequestID = fun(headerName: Str) -> Any do
 			return {
 				kind: "stream",
 				call: fun(req, res) -> Null do
-					let id = if mapHas(req.headers, name) and req.headers[name] != null then req.headers[name] else sprintf("r-%d", [nowNanos()]) end
+					let id = if mapHas(req.headers, name) and req.headers[name] != null then 
+						req.headers[name] 
+					else 
+						sprintf("r-%d", [nowNanos()]) 
+					end
 					req.headers[name] = id
 					res.setHeader(name, id)
 					h.call(req, res)
@@ -620,6 +618,106 @@ let mwCors = fun(opts: {}) -> Any do
 			}
 		end
 		fail("invalid handler kind in mwCors")
+	end
+end
+
+let mwAccessLog = fun(_: Null) -> Any do
+	return fun(h) do
+		if h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let t0 = nowMillis()
+					let out = h.call(req)
+					let dur = nowMillis() - t0
+
+					# Derive status & size without mutating framework internals.
+					let status = 200
+					let size = 0
+
+					if out == null then
+						# annotated null => treat as error; framework will map to 500
+						status = 500
+					elif isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+						status = out.status
+						size = len(out.body)
+					elif isType(out, _HttpError) then
+						status = out.status
+						size = if out.body == null then 0 else len(out.body) end
+					else
+						# Implicit JSON success path; approximate size with encoded form
+						let js = _json(out)
+						if js == null then
+							status = 500
+							size = 0
+						else
+							status = 200
+							size = len(js)
+						end
+					end
+
+					printf("%s \"%s %s\" %d %d %dms\n", [
+						"-",           # remote (unknown in Request for now)
+						req.method,
+						req.url.path,
+						int(status),
+						int(size),
+						int(dur)
+					])
+
+					out
+				end
+			}
+		elif h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let t0 = nowMillis()
+					let status = 200
+					let bytes = 0
+
+					# Wrap the responder to observe status/bytes.
+					let orig = res
+					let proxy = {}
+					proxy.status = fun(code: Int) -> {} do
+						status = code
+						orig.status(code)
+						proxy
+					end
+					proxy.setHeader = fun(k: Str, v: Str) -> {} do
+						orig.setHeader(k, v)
+						proxy
+					end
+					proxy.write = fun(chunk: Str) -> Int? do
+						let n = len(chunk)
+						let r = orig.write(chunk)
+						bytes = bytes + n
+						r
+					end
+					proxy.flush = fun(_: Null) -> Bool? do
+						orig.flush(null)
+					end
+					proxy.end = fun(_: Null) -> Bool? do
+						orig.end(null)
+					end
+
+					h.call(req, proxy)
+
+					let dur = nowMillis() - t0
+					printf("%s \"%s %s\" %d %d %dms\n", [
+						"-",
+						req.method,
+						req.url.path,
+						int(status),
+						int(bytes),
+						int(dur)
+					])
+
+					null
+				end
+			}
+		end
+		fail("invalid handler kind in mwAccessLog")
 	end
 end
 
@@ -1249,6 +1347,37 @@ testing.test("nethttp/request id propagate incoming", fun(_: Null) -> Any do
 	})
 	testing.assertEq(200, res.status)
 	testing.assertEq("req-123", res.headers["X-Request-ID"])
+end)
+
+testing.test("nethttp/accesslog counts streaming bytes", fun(_: Null) -> Any do
+	let http = import("nethttp")
+	let r = http.router()
+	r.use(http.mwAccessLog())
+	r.handle("GET", "/s", fun(req, res) -> Null do
+		res.status(200).setHeader("Content-Type","text/plain").write("hi")
+		res.end(null)
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/s" })
+	testing.assertEq(200, res.status)
+	# can’t read the printed line here; we at least ensure body’s there (2 bytes)
+	testing.assertEq("hi", res.body)
+end)
+
+testing.test("nethttp/mwAccessLog keeps chaining on proxy", fun(_: Null) -> Any do
+	let http = import("nethttp")
+	let r = http.router()
+	r.use(http.mwAccessLog())
+	r.handle("GET", "/chain", fun(req, res) -> Null do
+		# This would bypass the proxy if status/setHeader didn’t return the proxy
+		res.status(201).setHeader("X", "1").write("ok")
+		res.end(null)
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/chain" })
+	testing.assertEq(201, res.status)
+	testing.assertEq("ok", res.body)
+	testing.assertEq("1", res.headers["X"])
 end)
 === END FILE: lib/nethttp_test.ms ===
 

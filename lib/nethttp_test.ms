@@ -286,3 +286,34 @@ testing.test("nethttp/request id propagate incoming", fun(_: Null) -> Any do
 	testing.assertEq(200, res.status)
 	testing.assertEq("req-123", res.headers["X-Request-ID"])
 end)
+
+testing.test("nethttp/accesslog counts streaming bytes", fun(_: Null) -> Any do
+	let http = import("nethttp")
+	let r = http.router()
+	r.use(http.mwAccessLog())
+	r.handle("GET", "/s", fun(req, res) -> Null do
+		res.status(200).setHeader("Content-Type","text/plain").write("hi")
+		res.end(null)
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/s" })
+	testing.assertEq(200, res.status)
+	# can’t read the printed line here; we at least ensure body’s there (2 bytes)
+	testing.assertEq("hi", res.body)
+end)
+
+testing.test("nethttp/mwAccessLog keeps chaining on proxy", fun(_: Null) -> Any do
+	let http = import("nethttp")
+	let r = http.router()
+	r.use(http.mwAccessLog())
+	r.handle("GET", "/chain", fun(req, res) -> Null do
+		# This would bypass the proxy if status/setHeader didn’t return the proxy
+		res.status(201).setHeader("X", "1").write("ok")
+		res.end(null)
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/chain" })
+	testing.assertEq(201, res.status)
+	testing.assertEq("ok", res.body)
+	testing.assertEq("1", res.headers["X"])
+end)

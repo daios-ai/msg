@@ -42,11 +42,11 @@ let _Handler = type { kind!: Str, call!: Any }  # kind ∈ {"value","stream"}
 # Utilities
 # =========================
 
-# DO NOT DELETE. Used in _mkRoute to add the explicit kind tag.
+# DO NOT DELETE. THIS TEST IS ROCK SOLID. 
+# Used in _mkRoute to add the explicit kind tag.
 # This function has been tested numerous times and it is rock solid.
 let _isStreaming = fun(f) -> Bool do
 	let r = reflect(f)
-	printf("[DBG _isStreaming] r: " + formatValue(r) + "\n", [])
 	if len(r) > 0 and r[0] == "fun" then
 		let paramlen = len(r[1]) - 1
 		if paramlen == 1 then
@@ -220,8 +220,6 @@ let _mkRoute = fun(method: Str, pattern: Str, rawHandler) -> {} do
 	let m = _normMethod(method)
 	let isPrefix = _hasPrefix(pattern, "/") and len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
 
-	printf("[DBG _mkRoute] rawHandler: " + formatValue(rawHandler) + "\n", [])
-
 	# Decide once (explicit tag) and wrap into a handler object
 	let isStream = _isStreaming(rawHandler)
 	let h = if isStream then
@@ -260,10 +258,8 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str], isPrefix: Bool) -> {}? do
 	params
 end
 
-# Middleware type (public surface): (Handler) -> Handler
-# We keep builder functions returning such transformers, same names as before:
-# mwRecover(): Any, mwRequestID(name): Any, mwTimeout(ms): Any, mwCors(opts): Any
-# Each returns a function that takes a Handler and returns a new Handler.
+
+
 
 let router = fun(_: Null) -> {} do
 	let _routes = []
@@ -323,7 +319,9 @@ let router = fun(_: Null) -> {} do
 
 		if h.kind == "stream" then
 			let pack = _newResponder()
-			let r1 = try(fun(_: Null) do h.call(rq, pack.api) end)
+			let r1 = try(fun(_: Null) do 
+				h.call(rq, pack.api) 
+			end)
 			if not r1.ok then
 				return text(500, "internal error")
 			end
@@ -371,7 +369,6 @@ let router = fun(_: Null) -> {} do
 		__kind: "nethttp.router",
 
 		handle: fun(method: Str, pattern: Str, handler) -> Any do
-			printf("[DBG handle] handler: " + formatValue(handler) + "\n", [])
 			_routes = _routes + [_mkRoute(method, pattern, handler)]
 			true
 		end,
@@ -483,7 +480,11 @@ let mwRequestID = fun(headerName: Str) -> Any do
 			return {
 				kind: "stream",
 				call: fun(req, res) -> Null do
-					let id = if mapHas(req.headers, name) and req.headers[name] != null then req.headers[name] else sprintf("r-%d", [nowNanos()]) end
+					let id = if mapHas(req.headers, name) and req.headers[name] != null then 
+						req.headers[name] 
+					else 
+						sprintf("r-%d", [nowNanos()]) 
+					end
 					req.headers[name] = id
 					res.setHeader(name, id)
 					h.call(req, res)
@@ -616,6 +617,106 @@ let mwCors = fun(opts: {}) -> Any do
 			}
 		end
 		fail("invalid handler kind in mwCors")
+	end
+end
+
+let mwAccessLog = fun(_: Null) -> Any do
+	return fun(h) do
+		if h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let t0 = nowMillis()
+					let out = h.call(req)
+					let dur = nowMillis() - t0
+
+					# Derive status & size without mutating framework internals.
+					let status = 200
+					let size = 0
+
+					if out == null then
+						# annotated null => treat as error; framework will map to 500
+						status = 500
+					elif isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+						status = out.status
+						size = len(out.body)
+					elif isType(out, _HttpError) then
+						status = out.status
+						size = if out.body == null then 0 else len(out.body) end
+					else
+						# Implicit JSON success path; approximate size with encoded form
+						let js = _json(out)
+						if js == null then
+							status = 500
+							size = 0
+						else
+							status = 200
+							size = len(js)
+						end
+					end
+
+					printf("%s \"%s %s\" %d %d %dms\n", [
+						"-",           # remote (unknown in Request for now)
+						req.method,
+						req.url.path,
+						int(status),
+						int(size),
+						int(dur)
+					])
+
+					out
+				end
+			}
+		elif h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let t0 = nowMillis()
+					let status = 200
+					let bytes = 0
+
+					# Wrap the responder to observe status/bytes.
+					let orig = res
+					let proxy = {}
+					proxy.status = fun(code: Int) -> {} do
+						status = code
+						orig.status(code)
+						proxy
+					end
+					proxy.setHeader = fun(k: Str, v: Str) -> {} do
+						orig.setHeader(k, v)
+						proxy
+					end
+					proxy.write = fun(chunk: Str) -> Int? do
+						let n = len(chunk)
+						let r = orig.write(chunk)
+						bytes = bytes + n
+						r
+					end
+					proxy.flush = fun(_: Null) -> Bool? do
+						orig.flush(null)
+					end
+					proxy.end = fun(_: Null) -> Bool? do
+						orig.end(null)
+					end
+
+					h.call(req, proxy)
+
+					let dur = nowMillis() - t0
+					printf("%s \"%s %s\" %d %d %dms\n", [
+						"-",
+						req.method,
+						req.url.path,
+						int(status),
+						int(bytes),
+						int(dur)
+					])
+
+					null
+				end
+			}
+		end
+		fail("invalid handler kind in mwAccessLog")
 	end
 end
 

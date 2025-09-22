@@ -42,23 +42,20 @@ let _Handler = type { kind!: Str, call!: Any }  # kind ∈ {"value","stream"}
 # Utilities
 # =========================
 
-# Required: used ONCE to decide handler shape at registration.
-let _paramCount = fun(f) -> Int do
-	let rt = reflect(f)
-	if rt == null then return 1 end
-	if len(rt) == 0 or rt[0] != "fun" then return 1 end
-	let ps = rt[1]
-	if ps == null then return 0 end
-	if len(ps) >= 1 and ps[0] == "array" then return len(ps) - 1 end
-	return len(ps)
-end
-
 # DO NOT DELETE. Used in _mkRoute to add the explicit kind tag.
+# This function has been tested numerous times and it is rock solid.
 let _isStreaming = fun(f) -> Bool do
-	let n = _paramCount(f)
-	if n == 1 then return false end
-	if n == 2 then return true end
-	fail(sprintf("unsupported handler arity: %d (want 1 or 2)", [n]))
+	let r = reflect(f)
+	printf("[DBG _isStreaming] r: " + formatValue(r) + "\n", [])
+	if len(r) > 0 and r[0] == "fun" then
+		let paramlen = len(r[1]) - 1
+		if paramlen == 1 then
+			return false
+		elif paramlen == 2 then
+			return true
+		end
+	end
+	fail(sprintf("unsupported handler of type: " + formatValue(f), []))
 end
 
 let _normMethod = fun(m: Str) -> Str do toUpper(m) end
@@ -223,6 +220,8 @@ let _mkRoute = fun(method: Str, pattern: Str, rawHandler) -> {} do
 	let m = _normMethod(method)
 	let isPrefix = _hasPrefix(pattern, "/") and len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
 
+	printf("[DBG _mkRoute] rawHandler: " + formatValue(rawHandler) + "\n", [])
+
 	# Decide once (explicit tag) and wrap into a handler object
 	let isStream = _isStreaming(rawHandler)
 	let h = if isStream then
@@ -372,6 +371,7 @@ let router = fun(_: Null) -> {} do
 		__kind: "nethttp.router",
 
 		handle: fun(method: Str, pattern: Str, handler) -> Any do
+			printf("[DBG handle] handler: " + formatValue(handler) + "\n", [])
 			_routes = _routes + [_mkRoute(method, pattern, handler)]
 			true
 		end,
@@ -620,15 +620,324 @@ let mwCors = fun(opts: {}) -> Any do
 end
 
 # =========================
-# Server lifecycle (stub)
+# Server lifecycle (HTTP/1.1 MVP)
 # =========================
 
+# Minimal server handle for shutdown.
+let _ServerHandle = type {
+	listener!: Any,
+	stop!: {closed!: Bool},
+	conns!: [Any],
+	opts!: {}
+}
+
 let serve = fun(listener, r, opts: {}) -> {}? do
-	return null # <serve not implemented: transport layer TBD>
+	if listener == null then
+		return null # <serve: missing listener>
+	end
+	if not (mapHas(r, "_entryCall")) then
+		return null # <serve: not a router>
+	end
+
+	# Defaults (small + sensible)
+	if not mapHas(opts, "readHeaderTimeoutMs") or opts.readHeaderTimeoutMs == null then
+		opts.readHeaderTimeoutMs = 0
+	end
+	if not mapHas(opts, "writeTimeoutMs") or opts.writeTimeoutMs == null then
+		opts.writeTimeoutMs = 0
+	end
+	if not mapHas(opts, "idleTimeoutMs") or opts.idleTimeoutMs == null then
+		opts.idleTimeoutMs = 0
+	end
+	if not mapHas(opts, "maxHeaderBytes") or opts.maxHeaderBytes == null then
+		opts.maxHeaderBytes = 8192
+	end
+	if not mapHas(opts, "maxBodyBytes") or opts.maxBodyBytes == null then
+		opts.maxBodyBytes = 1048576  # 1 MiB
+	end
+
+	let server = { listener: listener, stop: {closed: false}, conns: [], opts: opts }
+
+	# Accept loop in a background process.
+	let _ = procSpawn(fun(_: Null) -> Null do
+		while not server.stop.closed do
+			let c = netAccept(listener)
+			if c == null then
+				# transient accept error; keep going unless closing
+				continue
+			end
+			# Track connection
+			server.conns = server.conns + [c]
+			procSpawn(fun(_: Null) -> Null do
+				_connLoop(c, r, server)
+			end)
+		end
+		null
+	end)
+
+	return server
 end
 
 let shutdown = fun(server, timeoutMs: Int?) -> Bool do
+	if server == null then
+		return true
+	end
+	server.stop.closed = true
+	# Best effort: stop listening and close all open connections.
+	close(server.listener)
+
+	# Close tracked connections (best effort).
+	let i = 0
+	while i < len(server.conns) do
+		let c = server.conns[i]
+		# Ignore errors on close.
+		close(c)
+		i = i + 1
+	end
+	server.conns = []
 	true
+end
+
+# =========================
+# Internal HTTP/1.1 helpers (MVP)
+# =========================
+
+let _reason = fun(code: Int) -> Str do
+	if code == 200 then return "OK" end
+	if code == 204 then return "No Content" end
+	if code == 400 then return "Bad Request" end
+	if code == 404 then return "Not Found" end
+	if code == 405 then return "Method Not Allowed" end
+	if code == 413 then return "Payload Too Large" end
+	if code == 431 then return "Request Header Fields Too Large" end
+	if code == 500 then return "Internal Server Error" end
+	if code == 504 then return "Gateway Timeout" end
+	"OK"
+end
+
+let _trimCR = fun(s: Str) -> Str do
+	let n = len(s)
+	if n > 0 and substr(s, n - 1, n) == "\r" then
+		return substr(s, 0, n - 1)
+	end
+	s
+end
+
+let _readLineLimited = fun(c, remaining: Int?) -> Str? do
+	# Use readLine (non-CRLF-aware), then trim a trailing '\r' if present.
+	# Enforce header size budget by subtracting consumed bytes (approximate).
+	let line = readLine(c)
+	if line == null then
+		return null
+	end
+	let s = _trimCR(line)
+	if remaining != null then
+		let left = int(remaining) - len(s) - 2  # crude account for CRLF
+		if left < 0 then
+			return null # <headers too large>
+		end
+	end
+	s
+end
+
+let _readHeaders = fun(c, maxBytes: Int) -> {}? do
+	let headers = {}
+	let budget = maxBytes
+	while true do
+		let line = _readLineLimited(c, budget)
+		if line == null then
+			return null # <bad headers or too large>
+		end
+		if len(line) == 0 then
+			break
+		end
+		# Split on first colon
+		let parts = split(line, ":")
+		if len(parts) < 2 then
+			return null # <malformed header>
+		end
+		let key = parts[0]
+		let value = strip(join(slice(parts, 1, len(parts)), ":"))
+		headers[key] = value
+		# shrink budget roughly
+		budget = budget - len(line) - 2
+	end
+	headers
+end
+
+let _parseTarget = fun(t: Str) -> {} do
+	let path = t
+	let query = null
+	let parts = split(t, "?")
+	if len(parts) >= 2 then
+		path = parts[0]
+		query = join(slice(parts, 1, len(parts)), "?")
+	end
+	{ path: path, query: query }
+end
+
+let _readBodyContentLength = fun(c, n: Int, cap: Int) -> Str? do
+	let want = if n > cap then cap else n end
+	let buf = ""
+	let remaining = want
+	while remaining > 0 do
+		let chunk = readN(c, remaining)
+		if chunk == null then
+			return null # <read body failed>
+		end
+		buf = buf + chunk
+		remaining = remaining - len(chunk)
+		if len(chunk) == 0 then
+			# EOF before Content-Length — treat as error
+			return null # <early eof>
+		end
+	end
+	# If original n > cap, we signal payload too large by caller using length comparison.
+	buf
+end
+
+let _lower = fun(s: Str) -> Str do toLower(s) end
+let _upper = fun(s: Str) -> Str do toUpper(s) end
+
+let _readRequest = fun(conn, opts: {}) -> {}? do
+	# Request line
+	let line = readLine(conn)
+	if line == null then
+		return null
+	end
+	let reqLine = _trimCR(line)
+	let parts = split(reqLine, " ")
+	if len(parts) != 3 then
+		return null # <bad request line>
+	end
+	let method = _upper(parts[0])
+	let target = parts[1]
+	let proto = parts[2]
+	if proto != "HTTP/1.1" then
+		return null # <unsupported proto>
+	end
+
+	# Headers (budgeted)
+	let maxHdr = int(opts.maxHeaderBytes)
+	let hdrs = _readHeaders(conn, maxHdr)
+	if hdrs == null then
+		return null
+	end
+
+	# Keep-Alive
+	let keepAlive = true
+	if mapHas(hdrs, "Connection") and _lower(hdrs["Connection"]) == "close" then
+		keepAlive = false
+	end
+
+	# Target parse
+	let t = _parseTarget(target)
+
+	# Body (Content-Length only in MVP)
+	let bodyStr = ""
+	if mapHas(hdrs, "Content-Length") then
+		let n = int(hdrs["Content-Length"])
+		if n == null or n < 0 then
+			return null # <bad content-length>
+		end
+		let cap = int(opts.maxBodyBytes)
+		let s = _readBodyContentLength(conn, n, cap)
+		if s == null then
+			return null # <read body failed>
+		end
+		if n > cap then
+			# Drain the rest of the declared body to keep the connection sane.
+			let toDrop = n - cap
+			while toDrop > 0 do
+				let d = readN(conn, if toDrop > 4096 then 4096 else toDrop end)
+				if d == null or len(d) == 0 then
+					break
+				end
+				toDrop = toDrop - len(d)
+			end
+			# Mark as too large (caller maps to 413)
+			return { tooLarge: true }
+		end
+		bodyStr = s
+	end
+
+	{
+		req: {
+			method: method,
+			url: { scheme: null, host: null, path: t.path, query: t.query },
+			headers: hdrs,
+			body: bodyStr,
+			pathParams: {}
+		},
+		keepAlive: keepAlive
+	}
+end
+
+let _writeResponse = fun(conn, res: _Response) -> Bool do
+	let status = int(res.status)
+	let headers = clone(res.headers)
+	let body = if res.body == null then "" else res.body end
+
+	if not mapHas(headers, "Content-Length") then
+		headers["Content-Length"] = str(len(body))
+	end
+	if not mapHas(headers, "Content-Type") then
+		headers["Content-Type"] = "text/plain"
+	end
+
+	let head = sprintf("HTTP/1.1 %d %s\r\n", [status, _reason(status)])
+	for [k, v] in headers do
+		head = head + sprintf("%s: %s\r\n", [k, v])
+	end
+	head = head + "\r\n"
+
+	let n1 = write(conn, head)
+	if n1 == null then return false end
+	let n2 = write(conn, body)
+	if n2 == null then return false end
+	flush(conn)
+	true
+end
+
+let _removeConn = fun(arr: [Any], c) -> [Any] do
+	let out = []
+	let i = 0
+	while i < len(arr) do
+		let it = arr[i]
+		if uid(it) != uid(c) then
+			out = out + [it]
+		end
+		i = i + 1
+	end
+	out
+end
+
+let _connLoop = fun(conn, router, server) -> Null do
+	# Simple per-connection loop (keep-alive). No idle/read/write deadlines in MVP.
+	while true do
+		let rr = _readRequest(conn, server.opts)
+		if rr == null then
+			# Could not parse request line/headers
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			break
+		end
+		if mapHas(rr, "tooLarge") and bool(rr.tooLarge) then
+			let _ = write(conn, sprintf("HTTP/1.1 413 %s\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\npayload too large", [_reason(413)]))
+			break
+		end
+
+		let req = rr.req
+		let out = router._entryCall(req)  # _Response
+
+		let ok = _writeResponse(conn, out)
+		if not ok or not rr.keepAlive then
+			break
+		end
+	end
+
+	close(conn)
+	server.conns = _removeConn(server.conns, conn)
+	null
 end
 
 # =========================

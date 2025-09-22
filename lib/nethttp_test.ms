@@ -41,7 +41,7 @@ testing.test("nethttp/router hello", fun(_: Null) -> Any do
 	let Request = http.Request
 	let r = http.router()
 
-	r.handle("GET", "/hello/{name}", fun(req: Request) -> Any? do
+	r.handle("GET", "/hello/{name}", fun(req: Request) -> Any do
 		let p = http.path(req)
 		return http.text(200, "hi " + p.name)
 	end)

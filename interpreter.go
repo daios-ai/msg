@@ -338,7 +338,8 @@ type Env struct {
 	sealParentWrites bool
 }
 
-// Seals the parent environment: env lookup stops here.
+// SealParentWrites prevents Set from climbing into parent frames.
+// Lookups (Get) still traverse parents as usual.
 func (e *Env) SealParentWrites() { e.sealParentWrites = true }
 
 // NewEnv creates a new lexical frame with the given parent (which may be nil).

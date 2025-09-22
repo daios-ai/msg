@@ -1860,3 +1860,56 @@ func Test_Interpreter_FunLiteral_BasePath_Uses_Ints_Not_Floats(t *testing.T) {
 `)
 	wantInt(t, v, 7)
 }
+
+func Test_Interpreter_Module_QualifiedType_Equals_Local(t *testing.T) {
+	src := `
+let M = module "M" do
+  let T = type { v!: Int }
+  let use = fun(x: T) -> Int do
+    x.v
+  end
+end
+
+# Local alias path (control)
+let T = M.T
+let ok = fun(x: T) -> Int do M.use(x) end
+ok({v: 1})
+
+# Qualified path must be accepted by callee expecting local T
+let boom = fun(x: M.T) -> Int do M.use(x) end
+boom({v: 2})
+`
+	wantInt(t, evalSrc(t, src), 2)
+}
+
+func Test_Interpreter_QualifiedType_Alias_Outside_Module(t *testing.T) {
+	src := `
+let M = module "M" do
+  let T = type { v!: Int }
+  let use = fun(x: T) -> Int do x.v end
+end
+
+# Alias M.T into caller scope; should behave exactly like local T
+let N_T = M.T
+let f = fun(x: N_T) -> Int do M.use(x) end
+f({v: 3})
+`
+	wantInt(t, evalSrc(t, src), 3)
+}
+
+func Test_Interpreter_QualifiedType_Unknown_Export_Errors_Nicely(t *testing.T) {
+	src := `
+let M = module "M" do
+  let T = type { v!: Int }
+end
+
+let f = fun(x: M.U) -> Int do 0 end
+f({v: 1})
+`
+	err := evalSrcExpectError(t, src)
+	// Accept either the property lookup error OR the parameter type-mismatch path.
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "unknown property") && !strings.Contains(msg, "type mismatch") {
+		t.Fatalf("want error mentioning unknown property or type mismatch, got: %v", err)
+	}
+}

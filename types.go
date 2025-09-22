@@ -430,6 +430,9 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 // Alias resolution for types
 // -----------------------------
 
+// resolveType walks a type S-expr and resolves identifiers using env.
+// IMPORTANT: This normalizes qualified exports like ("get", ("id","M"), ("str","T"))
+// to the SAME definition as the module-local ("id","T") inside M.
 func (ip *Interpreter) resolveType(t S, env *Env) S {
 	t = stripAnnot(t)
 	seen := map[string]bool{}
@@ -459,6 +462,33 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 				}
 			}
 			return x
+		case "get":
+			// Qualified type reference: ("get", baseExpr, ("str", key))
+			if len(t) >= 3 {
+				keyNode, _ := t[2].(S)
+				if len(keyNode) >= 2 && keyNode[0].(string) == "str" {
+					key := keyNode[1].(string)
+					// Try to evaluate the base as a module binding in this env.
+					baseId, isId := t[1].(S)
+					if isId && len(baseId) >= 2 && baseId[0].(string) == "id" {
+						// get module value by name
+						if env != nil {
+							if modVal, err := env.Get(baseId[1].(string)); err == nil && modVal.Tag == VTModule {
+								// look up exported member
+								if v, ok := modVal.Data.(*Module).get(key); ok && v.Tag == VTType {
+									tv := v.Data.(*TypeValue)
+									use := tv.Env
+									if use == nil {
+										use = env
+									}
+									return ip.resolveType(tv.Ast, use)
+								}
+							}
+						}
+					}
+				}
+			}
+			return t
 		case "unop":
 			if len(x) >= 3 && x[1].(string) == "?" {
 				return S{"unop", "?", go1(x[2].(S), e)}
@@ -501,12 +531,6 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 // Runtime type checking
 // -----------------------------
 
-// isType is the public-impl entry; it seeds cycle guards for runtime values.
-// isType checks whether runtime value v conforms to type t, with cycle guards
-// for arrays/maps to avoid non-termination on cyclic graphs. Modules are treated
-// structurally as maps. Annotations in type ASTs are ignored.
-// isType checks whether runtime value v conforms to type t in env.
-// Cycle-safe via coinductive memo on (value,type).
 // isType checks whether runtime value v conforms to type t in env.
 // It is cycle-safe via a coinductive memo keyed by (value-pointer, type-node-pointer).
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
@@ -641,11 +665,6 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 // Structural subtyping  t1 <: t2
 // -----------------------------
 
-// isSubtype checks structural subtyping with a tiny coinductive memo to break cycles.
-// isSubtype — compact, coinductive (cycle-safe) structural subtyping.
-// Uses a tiny memo keyed by the memory addresses of the compared S-nodes.
-// isSubtype — compact, cycle-safe (coinductive) structural subtyping.
-// Uses address-based memo keys for recursion, keeping it hot-path friendly.
 // isSubtype checks structural subtyping a <: b with coinductive memoization.
 // It memoizes on the pair of underlying S nodes using raw pointers for speed.
 func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {

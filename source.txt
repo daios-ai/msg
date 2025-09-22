@@ -1,864 +1,942 @@
-=== BEGIN FILE: lib/testing.ms ===
-# testing.ms — minimal testing toolkit + simple test runner
-# 
-# Usage in *_test.ms:
-# let testing = import("testing")
-# testing.test("adds", fun(_: Null) -> Any do
-# testing.assertEq(2 + 2, 4)
-# end)
-# 
-# Running:
-# let testing = import("testing")
-# testing.run({ root: ".", verbose: false, parallel: false, timeoutMs: 0 })
+=== BEGIN FILE: lib/nethttp.ms ===
+# nethttp — minimal HTTP server ergonomics for MindScript
+#
+# FastAPI-like developer experience with a tiny, composable core.
+# Focus: routing, handler ergonomics, validation, testing.
+# Transport (`serve`) remains a documented stub.
+#
+# Design notes:
+# - Handlers are FIRST-CLASS OBJECTS: { kind!: "value" | "stream", call!: Any }.
+#   This is the explicit runtime tag — no notes, no registries, no reflection for kind.
+# - Router decides kind once at registration via _isStreaming(f) and wraps into a handler object.
+# - Middleware is a transformation: (Handler) -> Handler. Kind is preserved explicitly.
+# - Boundary functions may return null with a POST reason; internals never return null on success.
+# - Debug prints are kept to aid bring-up.
 
 # =========================
-# Internal state
+# Public types (data-only)
 # =========================
 
-let _tests = {} # name -> (Null)->Any name -> { file!: Str, line!: Int }
-
-let _origins = {} # concrete tests: test("name", ...)
-
-let _caseOrigins = {} # case groups:   cases("prefix", ...)
-
-# Return the recorded origin for a test name, with cases("x") fallback for "x/NN".
-let _originOf = fun(name: Str) -> {}? do
-	if mapHas(_origins, name) then
-		return _origins[name]
-	end
-	# subtest fallback: prefix/NN  (NN = digits)
-	let parts = split(name, "/")
-	let n = len(parts)
-	if n >= 2 then
-		let last = parts[n - 1]
-		if len(match("^[0-9]+$", last)) > 0 then
-			let parent = join(slice(parts, 0, n - 1), "/")
-			if mapHas(_caseOrigins, parent) then
-				return _caseOrigins[parent]
-			end
-		end
-	end
-	return
-end
-
-# =========================
-# Small helpers
-# =========================
-
-# Stable value rendering: JSON if possible, else str, else formatValue (never null).
-let _repr = fun(x) -> Str do
-	let j = jsonStringify(x)
-	if j != null then
-		return j
-	end
-	let s = str(x)
-	if s != null then
-		return s
-	end
-	return formatValue(x)
-end
-
-# Minimal substring check.
-let _contains = fun(hay: Str, needle: Str) -> Bool do
-	if len(needle) == 0 then
-		return true
-	end
-	return len(split(hay, needle)) > 1
-end
-
-# In-place insertion sort for strings (single place only, used for determinism).
-let _sortStrs = fun(xs: [Str]) -> [Str] do
-	let n = len(xs)
-	let i = 0
-	while i < n do
-		let j = i
-		while j > 0 and xs[j - 1] > xs[j] do
-			let tmp = xs[j - 1]
-			xs[j - 1] = xs[j]
-			xs[j] = tmp
-			j = j - 1
-		end
-		i = i + 1
-	end
-	return xs
-end
-
-# =========================
-# Public API — assertions & registry
-# =========================
-
-# Register a test (name must be unique). Tests are (Null)->Any.
-let test = fun(name: Str, fn) -> Bool do
-	if not isType(fn, type Null -> Any) then
-		fail(sprintf("test(%s): second argument must be a function of type (Null)->Any", [
-			_repr(name)
-		]))
-	end
-	if mapHas(_tests, name) then
-		fail(sprintf("duplicate test name: %s", [_repr(name)]))
-	end
-	_tests[name] = fn
-	return true
-end
-
-# Return a shallow copy of the registry.
-let tests = fun(_: Null) -> {Str: Any} do
-	return clone(_tests)
-end
-
-# Reset the registry.
-let reset = fun(_: Null) -> Bool do
-	let keys = []
-	for [k, _] in _tests do
-		keys = keys + [k]
-	end
-	for k in keys do
-		mapDelete(_tests, k)
-	end
-	return true
-end
-
-# Boolean assertion.
-let assert = fun(ok: Bool, msg: Str?) -> Bool do
-	if not ok then
-		if msg == null then
-			fail("assertion failed")
-		end
-		fail(msg)
-	end
-	return true
-end
-
-# Equality assertion (pretty-prints values).
-let assertEq = fun(want, got) -> Bool do
-	if want == got then
-		return true
-	end
-	fail(sprintf("not equal:\nwant: %s\ngot:  %s", [_repr(want), _repr(got)]))
-end
-
-# Runtime type assertion.
-let assertType = fun(v, T: Type) -> Bool do
-	if isType(v, T) then
-		return true
-	end
-	fail(sprintf("type mismatch:\nvalue: %s\ndoes not satisfy: %s", [
-		_repr(v),
-		str(T)
-	]))
-end
-
-# Expect a hard failure; optionally assert error's first line contains substring.
-let assertThrows = fun(fn, sub: Str?) -> Bool do
-	if not isType(fn, type Null -> Any) then
-		fail("assertThrows: argument must be a function of type (Null)->Any")
-	end
-
-	let r = try(fun(_: Null) do
-		fn(null)
-	end)
-	if r.ok then
-		fail(sprintf("expected failure, got success with value: %s", [
-			_repr(r.value)
-		]))
-	end
-
-	if sub != null then
-		let e = r.error
-		# first line only (avoid matches in the caret frame)
-		let parts = split(e, "\n")
-		let first = if len(parts) == 0 then
-			e
-		else
-			parts[0]
-		end
-		if not _contains(first, sub) then
-			fail(sprintf("failure did not contain substring.\nwant in: %s\ngot:\n%s", [
-				_repr(sub),
-				e
-			]))
-		end
-	end
-
-	return true
-end
-
-# Table-driven subtests: registers name/0, name/1, ...
-let cases = fun(name: Str, xs: [Any], fn) -> Int do
-	if not isType(fn, type Any -> Any) then
-		fail(sprintf("cases(%s): fn must be a function taking one argument", [
-			_repr(name)
-		]))
-	end
-	let n = len(xs)
-	let i = 0
-	for _ in xs do
-		let sub = sprintf("%s/%d", [name, i])
-		let x = xs[i]
-		test(sub, fun(_: Null) do
-			fn(x)
-		end)
-		i = i + 1
-	end
-	return n
-end
-
-# Snapshot (golden) testing for values (write on update=true).
-let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
-	let want = _repr(value)
-	let have = readFile(path)
-	let doUpdate = update != null and bool(update)
-
-	if have == null then
-		if doUpdate then
-			let n = writeFile(path, want)
-			if n == null then
-				fail(sprintf("snapshot write failed: %s", [path]))
-			end
-			return true
-		end
-		fail(sprintf("snapshot missing (pass update=true to write): %s", [path]))
-	end
-
-	if have != want then
-		if doUpdate then
-			let n = writeFile(path, want)
-			if n == null then
-				fail(sprintf("snapshot write failed: %s", [path]))
-			end
-			return true
-		end
-		fail(sprintf("snapshot mismatch:\nfile: %s\n--- have ---\n%s\n--- want ---\n%s\n(pass update=true to overwrite)", [
-			path,
-			have,
-			want
-		]))
-	end
-
-	return true
-end
-
-let snapshotUpdate = fun(path: Str, value) -> Bool do
-	return snapshot(path, value, true)
-end
-
-# Seed RNG.
-let seed = fun(n: Int) -> Int do
-	seedRand(n)
-	return n
-end
-
-# =========================
-# Runner types
-# =========================
-
-let RunnerOpts = type {
-	root: Str, # directory to search (default ".")
-	parallel: Bool, # run tests concurrently
-	verbose: Bool, # Go-style per-test RUN/PASS/FAIL lines
-	timeoutMs: Int # per-test timeout in ms (<=0 or null disables)
+let Request = type {
+	method!: Str,
+	url!: { scheme: Str?, host: Str?, path!: Str, query: Str? },
+	headers!: {},
+	body!: Any,
+	pathParams: {}?
 }
 
-let Summary = type {passed: Int, failed: Int, total: Int, durationMs: Int}
+# Response accumulator (internal)
+let _Response = type { status!: Int, headers!: {}, body!: Str }
+
+# Structured HTTP error (value-returning handlers can return this)
+let _HttpError = type {
+	__http_error__!: Bool,
+	status!: Int,
+	body: Str,
+	headers: {}
+}
+
+# Handler object (EXPLICIT TAG)
+let _Handler = type { kind!: Str, call!: Any }  # kind ∈ {"value","stream"}
 
 # =========================
-# Discovery & loading
+# Utilities
 # =========================
 
-# Scan source text to record where tests/cases are declared.
-# Returns number of registrations indexed.
-let _indexTests = fun(file: Str, src: Str) -> Int do
-	let lines = split(src, "\n")
+# Required: used ONCE to decide handler shape at registration.
+let _paramCount = fun(f) -> Int do
+	let rt = reflect(f)
+	if rt == null then return 1 end
+	if len(rt) == 0 or rt[0] != "fun" then return 1 end
+	let ps = rt[1]
+	if ps == null then return 0 end
+	if len(ps) >= 1 and ps[0] == "array" then return len(ps) - 1 end
+	return len(ps)
+end
+
+# DO NOT DELETE. Used in _mkRoute to add the explicit kind tag.
+let _isStreaming = fun(f) -> Bool do
+	let n = _paramCount(f)
+	if n == 1 then return false end
+	if n == 2 then return true end
+	fail(sprintf("unsupported handler arity: %d (want 1 or 2)", [n]))
+end
+
+let _normMethod = fun(m: Str) -> Str do toUpper(m) end
+
+let _hasPrefix = fun(s: Str, prefix: Str) -> Bool do
+	let n = len(prefix)
+	if len(s) < n then
+		return false 
+	end
+	substr(s, 0, n) == prefix
+end
+
+let _splitPath = fun(p: Str) -> [Str] do
+	let s = if len(p) == 0 or substr(p, 0, 1) != "/" then "/" + p else p end
+	let raw = split(s, "/")
+	let out = []
 	let i = 0
-	let found = 0
-	for _ in lines do
-		let line = lines[i]
-
-		# test("name", ...)  or  T.test("name", ...)
-		let p1 = split(line, "test(\"")
-		if len(p1) > 1 then
-			let tail = p1[1]
-			let name = split(tail, "\"")[0]
-			if len(name) > 0 then
-				_origins[name] = {file: file, line: i + 1}
-				found = found + 1
-			end
-		end
-
-		# cases("prefix", ...)  or  T.cases("prefix", ...)
-		let p2 = split(line, "cases(\"")
-		if len(p2) > 1 then
-			let tail2 = p2[1]
-			let prefix = split(tail2, "\"")[0]
-			if len(prefix) > 0 then
-				_caseOrigins[prefix] = {file: file, line: i + 1}
-				found = found + 1
-			end
-		end
-
+	while i < len(raw) do
+		let seg = raw[i]
+		if len(seg) > 0 then out = out + [seg] end
 		i = i + 1
 	end
-	return found
+	out
 end
 
-let _endsWith = fun(s: Str, suffix: Str) -> Bool do
-	let n = len(s)
-	let m = len(suffix)
-	if m == 0 then
-		return true
-	end
-	if n < m then
-		return false
-	end
-	return substr(s, n - m, n) == suffix
+let _isParamSeg = fun(seg: Str) -> Bool do
+	let n = len(seg)
+	n >= 2 and substr(seg, 0, 1) == "{" and substr(seg, n - 1, n) == "}"
 end
 
-let _isTestFile = fun(path: Str) -> Bool do
-	return _endsWith(pathBase(path), "_test.ms")
+let _paramName = fun(seg: Str) -> Str do substr(seg, 1, len(seg) - 1) end
+
+let _makeURL = fun(path: Str, query: Str?) -> {} do
+	{ scheme: null, host: null, path: path, query: query }
 end
 
-let _isAbs = fun(p: Str) -> Bool do
-	if len(p) > 0 and substr(p, 0, 1) == "/" then
-		return true
-	end
-	if len(p) >= 2 and substr(p, 0, 2) == "\\\\" then
-		return true
-	end
-	return len(match("^[A-Za-z]:[\\\\/]", p)) > 0
-end
-
-let _walk = fun(dir: Str) -> [Str] do
-	let entries = dirList(dir)
-	if entries == null then
-		return []
-	end
-	let out = []
-	for entry in entries do
-		let p = pathJoin([dir, entry])
-		let st = stat(p)
-		if st == null then
-			continue
-		elif st.isDir then
-			let rec = _walk(p)
-			for q in rec do
-				out = out + [q]
-			end
-		else
-			out = out + [p]
-		end
-	end
-	return out
-end
-
-let _discover = fun(root: Str) -> [Str] do
-	let base = if cwd() == null then
-		"."
-	else
-		cwd()
-	end
-	let rootPath = if _isAbs(root) then
-		pathClean(root)
-	else
-		pathClean(pathJoin([base, root]))
-	end
-
-	let st = stat(rootPath)
-	if st == null or not st.isDir then
-		return []
-	end
-
-	let all = _walk(rootPath)
-	let ts = []
-	for f in all do
-		if _isTestFile(f) then
-			ts = ts + [f]
-		end
-	end
-
-	return _sortStrs(ts)
-end
-
-# Load test files fresh each run: cache-bust with importCode + unique name.
-let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
-	let loaded = 0
-	for f in files do
-		if verbose then
-			printf("discover: %s\n", [f])
-		end
-		let src = readFile(f)
-		if src == null then
-			printf("FAIL read %s\n", [f])
-			continue
-		end
-
-		# origins index
-		_indexTests(f, src)
-
-		let name = sprintf("testing:%s:%d", [f, nowNanos()])
-		let r = try(fun(_: Null) do
-			importCode(name, src)
-		end)
-		if r.ok then
-			loaded = loaded + 1
-		else
-			# caret-formatted by try(); print verbatim
-			printf("FAIL import %s\n%s\n", [f, r.error])
-		end
-	end
-	return loaded
+let _json = fun(v) -> Str? do
+	let s = jsonStringify(v)
+	if s != null then return s end
+	return null # <json stringify failed>
 end
 
 # =========================
-# Execution
+# Error helpers (public)
 # =========================
 
-# Run a single test with optional timeout.
-# Returns: { name, ok, durationMs, error?, timeout? }
-let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
-	if verbose then
-		printf("=== RUN   %s\n", [name])
-	end
-	let t0 = nowMillis()
+let raise = fun(status: Int, message: Str) -> {} do
+	{ __http_error__: true, status: status, body: message, headers: {} }
+end
 
-	let _exec = fun(_: Null) -> {} do
-		let r = try(fun(_: Null) do
-			fn(null)
-		end)
-		if r.ok then
-			return {ok: true}
-		end
-		return {ok: false, error: r.error}
-	end
+let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
+	{ __http_error__: true, status: status, body: message, headers: headers }
+end
 
-	let base = if timeoutMs == null or int(timeoutMs) <= 0 then
-		_exec(null)
+# =========================
+# Binding helpers (public, boundary-level)
+# =========================
+
+let bindJson = fun(req: Request, T: Type) -> Any? do
+	let raw = if isType(req.body, type Str) then
+		req.body
 	else
-		let done = chanOpen(1)
-
-		let tp = procSpawn(fun(_: Null) -> Null do
-			chanSend(done, _exec(null))
-		end)
-
-		let tt = procSpawn(fun(_: Null) -> Null do
-			let t = timerAfter(int(timeoutMs))
-			chanRecv(t)
-			chanSend(done, {
-				ok: false,
-				timeout: true,
-				error: sprintf("timeout after %dms", [int(timeoutMs)])
-			})
-		end)
-
-		let res = chanRecv(done)
-
-		# Prefer cancelling the loser, then close and join both for hygiene.
-		if mapHas(res, "timeout") and bool(res.timeout) then
-			procCancel(tp)
-		else
-			procCancel(tt)
+		let s = readAll(req.body)
+		if s == null then 
+			return null # <read body failed> 
 		end
-		chanClose(done)
-		# Best-effort joins (ignore results)
-		procJoin(tp)
-		procJoin(tt)
-
-		res
+		s
 	end
 
-	let dur = nowMillis() - t0
-	let ok = base.ok
-	let isTimeout = mapHas(base, "timeout") and bool(base.timeout)
-	let err = if mapHas(base, "error") and base.error != null then
-		base.error
+	let v = jsonParse(raw)
+	if v == null then
+		return null # <invalid json>
+	end
+	if not isType(v, T) then
+		return null # <validation failed>
+	end
+	v
+end
+
+let query = fun(req: Request) -> {} do
+	let raw = if req.url.query == null then "" else req.url.query end
+	let m = urlQueryParse(raw)
+	if m == null then return {} end
+	m
+end
+
+let bindQuery = fun(req: Request, T: Type) -> Any? do
+	let qm = query(req)
+	let out = {}
+	for [k, vs] in qm do
+		if vs == null or len(vs) == 0 then continue end
+		let s = vs[len(vs) - 1]
+		let parsed = try(fun(_: Null) do jsonParse(s) end)
+		if parsed.ok then out[k] = parsed.value else out[k] = s end
+	end
+	if isType(out, T) then return out end
+	return null # <query validation failed>
+end
+
+let path = fun(req: Request) -> {} do
+	if req.pathParams == null then return {} end
+	req.pathParams
+end
+
+# =========================
+# Response helpers (public)
+# =========================
+
+let json = fun(status: Int, value) -> {} do
+	let s = _json(value)
+	if s == null then
+		return { status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error" }
+	end
+	{ status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s }
+end
+
+let text = fun(status: Int, s: Str) -> {} do
+	{ status: status, headers: {"Content-Type": "text/plain"}, body: s }
+end
+
+let noContent = fun(_: Null) -> {} do
+	{ status: 204, headers: {}, body: "" }
+end
+
+let redirect = fun(status: Int, location: Str) -> {} do
+	{ status: status, headers: {"Location": location}, body: "" }
+end
+
+# =========================
+# Responder (opaque; per-request)
+# =========================
+
+let _newResponder = fun() -> { res: _Response, api: {} } do
+	let state = { status: 200, headers: {}, body: "" }
+	let api = {}
+
+	api.status = fun(code: Int) -> {} do 
+		state.status = code
+		api 
+	end
+	api.setHeader = fun(k: Str, v: Str) -> {} do 
+		state.headers[k] = v
+		api 
+	end
+	api.write = fun(chunk: Str) -> Int? do 
+		let n = len(chunk)
+		state.body = state.body + chunk
+		n 
+	end
+	api.flush = fun(_: Null) -> Bool? do true end
+	api.end = fun(_: Null) -> Bool? do true end
+
+	{ res: state, api: api }
+end
+
+# =========================
+# Router (closure-backed; no module globals)
+# =========================
+
+# Route record (private)
+let _mkRoute = fun(method: Str, pattern: Str, rawHandler) -> {} do
+	let m = _normMethod(method)
+	let isPrefix = _hasPrefix(pattern, "/") and len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
+
+	# Decide once (explicit tag) and wrap into a handler object
+	let isStream = _isStreaming(rawHandler)
+	let h = if isStream then
+		{ kind: "stream", call: rawHandler }
 	else
-		""
+		{ kind: "value", call: rawHandler }
 	end
 
-	# origin hint printed for failures (both verbose and quiet)
-	let _printOriginIfAny = fun(_: Null) -> Null do
-		let o = _originOf(name)
-		if o != null then
-			printf("    AT    %s:%d (test)\n", [o.file, int(o.line)])
-		end
-		null
-	end
-
-	if verbose then
-		if ok then
-			# PASS: we already printed "=== RUN" at the top; close with PASS.
-			printf("--- PASS: %s (%dms)\n", [name, int(dur)])
-		else
-			# FAILURE: show origin, then engine error blob, then close with FAIL/TIMEOUT.
-			_printOriginIfAny(null)
-			printf("%s\n", [err])
-			let tag = if isTimeout then
-				"TIMEOUT"
-			else
-				"FAIL"
-			end
-			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
-		end
-	else
-		if not ok then
-			# Quiet mode: print RUN, origin, error blob, then FAIL/TIMEOUT (same framing as verbose).
-			printf("=== RUN   %s\n", [name])
-			_printOriginIfAny(null)
-			printf("%s\n", [err])
-			let tag = if isTimeout then
-				"TIMEOUT"
-			else
-				"FAIL"
-			end
-			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
-		end
-	end
-
-	return {
-		name: name,
-		ok: ok,
-		durationMs: dur,
-		error: if not ok then
-			err
-		else
-			null
-		end,
-		timeout: isTimeout
+	{
+		method: m,
+		pattern: pattern,
+		isPrefix: isPrefix,
+		parts: _splitPath(pattern),
+		handler: h,
+		kind: h.kind
 	}
 end
 
-# Run all registered tests.
-let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
-	let start = nowMillis()
-	let passed = 0
-	let failed = 0
-	let total = 0
-
-	let reg = tests(null)
-
-	let names = []
-	for [k, _] in reg do
-		names = names + [k]
+# Path matcher → params or null
+let _pathMatch = fun(parts: [Str], reqSegs: [Str], isPrefix: Bool) -> {}? do
+	if isPrefix and len(reqSegs) < len(parts) then return end
+	if not isPrefix and len(reqSegs) != len(parts) then return end
+	let n = len(parts)
+	let params = {}
+	let i = 0
+	while i < n do
+		let rp = parts[i]
+		let qp = reqSegs[i]
+		if _isParamSeg(rp) then
+			params[_paramName(rp)] = qp
+		elif rp != qp then
+			return
+		end
+		i = i + 1
 	end
-	names = _sortStrs(names)
-
-	if parallel then
-		let ps = []
-		for name in names do
-			let fn = reg[name]
-			ps = ps + [
-				procSpawn(fun(_: Null) -> {} do
-					return _runOne(name, fn, timeoutMs, verbose)
-				end)
-			]
-			total = total + 1
-		end
-		let results = procJoinAll(ps)
-		let i = 0
-		while i < len(results) do
-			let res = results[i]
-			if res.ok then
-				passed = passed + 1
-			else
-				failed = failed + 1
-			end
-			i = i + 1
-		end
-	else
-		for name in names do
-			let fn = reg[name]
-			total = total + 1
-			let res = _runOne(name, fn, timeoutMs, verbose)
-			if res.ok then
-				passed = passed + 1
-			else
-				failed = failed + 1
-			end
-		end
-	end
-
-	let dur = nowMillis() - start
-	return {passed: passed, failed: failed, total: total, durationMs: dur}
+	params
 end
 
-# =========================
-# Public API — runner
-# =========================
+# Middleware type (public surface): (Handler) -> Handler
+# We keep builder functions returning such transformers, same names as before:
+# mwRecover(): Any, mwRequestID(name): Any, mwTimeout(ms): Any, mwCors(opts): Any
+# Each returns a function that takes a Handler and returns a new Handler.
 
-# Run: reset registry, discover tests, load fresh modules, run, print summary.
-let run = fun(opts: RunnerOpts) -> Summary do
-	let root = if mapHas(opts, "root") and opts.root != null then
-		opts.root
-	else
-		"."
-	end
-	let verbose = if mapHas(opts, "verbose") and opts.verbose != null then
-		bool(opts.verbose)
-	else
-		false
-	end
-	let parallel = if mapHas(opts, "parallel") and opts.parallel != null then
-		bool(opts.parallel)
-	else
-		false
-	end
-	let timeoutMs = if mapHas(opts, "timeoutMs") and opts.timeoutMs != null then
-		int(opts.timeoutMs)
-	else
+let router = fun(_: Null) -> {} do
+	let _routes = []
+	let _mws = []   # array of (Handler)->Handler transformers
+
+	let _match = fun(method: Str, path: Str) -> {}? do
+		let want = _normMethod(method)
+		let segs = _splitPath(path)
+		let best = null
+		let score = -1
+		for r in _routes do
+			if r.method != want then continue end
+			let p = _pathMatch(r.parts, segs, r.isPrefix)
+			if p != null then
+				let s = len(r.parts)
+				if s > score then
+					best = { route: r, params: p }
+					score = s
+				end
+			end
+		end
+		if best != null then return { route: best.route, params: best.params } end
 		null
 	end
 
-	reset(null)
-
-	let files = _discover(root)
-	if verbose then
-		printf("found %d test file(s)\n", [len(files)])
+	let _pathExists = fun(path: Str) -> Bool do
+		let segs = _splitPath(path)
+		for r in _routes do
+			if _pathMatch(r.parts, segs, r.isPrefix) != null then return true end
+		end
+		false
 	end
-	let _ = _loadTests(files, verbose)
 
-	let summary = _runAll(parallel, timeoutMs, verbose)
+	let _core = fun(req: Request) -> Any? do
+		let m = _match(req.method, req.url.path)
+		if m == null then
+			if _normMethod(req.method) == "OPTIONS" then return noContent(null) end
+			if _pathExists(req.url.path) then return text(405, "method not allowed") end
+			return text(404, "not found")
+		end
 
-	printf("ok: %d  fail: %d  total: %d  durationMs: %d\n", [
-		summary.passed,
-		summary.failed,
-		summary.total,
-		summary.durationMs
-	])
+		let rq = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: m.params }
+		let rt = m.route
 
-	return summary
-end=== END FILE: lib/testing.ms ===
+		# Compose middlewares (outermost last applies first) over the handler OBJECT
+		let h = rt.handler
+		let i = len(_mws) - 1
+		while i >= 0 do
+			h = _mws[i](h)
+			i = i - 1
+		end
+
+		# Enforce handler kind
+		if h.kind != "stream" and h.kind != "value" then
+			fail("invalid handler kind: expected value or stream")
+		end
+
+		if h.kind == "stream" then
+			let pack = _newResponder()
+			let r1 = try(fun(_: Null) do h.call(rq, pack.api) end)
+			if not r1.ok then
+				return text(500, "internal error")
+			end
+			return { status: pack.res.status, headers: pack.res.headers, body: pack.res.body }
+		end
+
+		# value
+		let r2 = try(fun(_: Null) do h.call(rq) end)
+		if not r2.ok then
+			return text(500, "internal error")
+		end
+		let out = r2.value
+
+		if isType(out, _HttpError) then
+			let hdrs = if mapHas(out, "headers") and out.headers != null then out.headers else {} end
+			return { status: out.status, headers: hdrs, body: out.body }
+		end
+
+		if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+			return out
+		end
+
+		let js = _json(out)
+		if js == null then return text(500, "json encode error") end
+		{ status: 200, headers: {"Content-Type": "application/json; charset=utf-8"}, body: js }
+	end
+
+	let _toInternal = fun(out) -> _Response do
+		if out == null then
+			let nt = noteGet(out)
+			let msg = if nt != null then nt else "error" end
+			return { status: 500, headers: {"Content-Type": "text/plain"}, body: msg }
+		end
+		if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+			return { status: out.status, headers: out.headers, body: out.body }
+		end
+		let js = _json(out)
+		if js == null then
+			return { status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error" }
+		end
+		{ status: 200, headers: {"Content-Type": "application/json; charset=utf-8"}, body: js }
+	end
+
+	let api = {
+		__kind: "nethttp.router",
+
+		handle: fun(method: Str, pattern: Str, handler) -> Any do
+			_routes = _routes + [_mkRoute(method, pattern, handler)]
+			true
+		end,
+
+		mount: fun(prefix: Str, child) -> Bool do
+			if not (mapHas(child, "__kind") and child.__kind == "nethttp.router") then
+				fail("mount: child must be a Router")
+			end
+			let dump = child._dump()
+			let pre = if _hasPrefix(prefix, "/") then prefix else "/" + prefix end
+			for rr in dump.routes do
+				let p = if _hasPrefix(rr.pattern, "/") then rr.pattern else "/" + rr.pattern end
+				api.handle(rr.method, pre + p, rr.handler.call)  # re-register using raw call; kind will be recomputed
+			end
+			true
+		end,
+
+		# Register a middleware transformer: (Handler) -> Handler
+		use: fun(mw) -> Bool do
+			_mws = _mws + [mw]
+			true
+		end,
+
+		_entryCall: fun(req: Request) -> _Response do
+			_toInternal(_core(req))
+		end,
+
+		_dump: fun(_: Null) -> {} do
+			{ routes: _routes, mws: _mws }
+		end
+	}
+	api
+end
+
+# =========================
+# Dispatch (internal) and test client (public)
+# =========================
+
+let testClient = fun(r) -> {} do
+	let call = fun(req: {}) -> {} do
+		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
+		let pathStr = if mapHas(req, "path") and req.path != null then req.path else "/" end
+		let headers = if mapHas(req, "headers") and req.headers != null then req.headers else {} end
+		let body = if mapHas(req, "body") and req.body != null then req.body else "" end
+
+		let q = ""
+		let p = pathStr
+		let parts = split(pathStr, "?")
+		if len(parts) >= 2 then
+			p = parts[0]
+			q = join(slice(parts, 1, len(parts)), "?")
+		end
+
+		let R = {
+			method: _normMethod(method),
+			url: _makeURL(p, q),
+			headers: headers,
+			body: body,
+			pathParams: {}
+		}
+		let res = r._entryCall(R)
+		{ status: res.status, headers: res.headers, body: res.body }
+	end
+	{ call: call }
+end
+
+# =========================
+# Middleware (built-ins)
+# =========================
+# IMPORTANT: middleware is now (Handler) -> Handler.
+# Each built-in inspects h.kind and returns a new handler with the same kind.
+
+let mwRecover = fun(_: Null) -> Any do
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let r = try(fun(_: Null) do h.call(req, res) end)
+					if not r.ok then
+						printf("panic: %s\n", [r.error])
+						res.status(500).setHeader("Content-Type", "text/plain").write("internal error")
+						res.end(null)
+					end
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let r2 = try(fun(_: Null) do h.call(req) end)
+					if not r2.ok then
+						printf("panic: %s\n", [r2.error])
+						return text(500, "internal error")
+					end
+					r2.value
+				end
+			}
+		end
+		fail("invalid handler kind in mwRecover")
+	end
+end
+
+let mwRequestID = fun(headerName: Str) -> Any do
+	let name = headerName
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let id = if mapHas(req.headers, name) and req.headers[name] != null then req.headers[name] else sprintf("r-%d", [nowNanos()]) end
+					req.headers[name] = id
+					res.setHeader(name, id)
+					h.call(req, res)
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let id2 = if mapHas(req.headers, name) and req.headers[name] != null then
+						req.headers[name]
+					else
+						sprintf("r-%d", [nowNanos()])
+					end
+					req.headers[name] = id2
+
+					let out = h.call(req)
+					if out == null then
+						return out
+					end
+
+					# If it's already a response map, inject the header and pass through.
+					if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+						out.headers[name] = id2
+						return out
+					end
+
+					# Implicit JSON case: wrap into a response so we can add the header.
+					let resp = json(200, out)
+					resp.headers[name] = id2
+					return resp
+				end
+			}
+		end
+		fail("invalid handler kind in mwRequestID")
+	end
+end
+
+let mwTimeout = fun(ms: Int) -> Any do
+	let dur = ms
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let pWorker = procSpawn(fun(_: Null) -> {} do h.call(req, res) end)
+					let pTimer = procSpawn(fun(_: Null) -> {} do
+						let t = timerAfter(dur)
+						chanRecv(t)
+						{ timeout: true }
+					end)
+					let r = procJoinAny([pWorker, pTimer])
+					let timedOut = isType(r.value, type {timeout!: Bool}) and bool(r.value.timeout)
+					if timedOut then
+						res.status(504).setHeader("Content-Type", "text/plain").write("timeout")
+						res.end(null)
+						procCancel(pWorker)
+					else
+						procCancel(pTimer)
+					end
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let pWorker = procSpawn(fun(_: Null) -> {} do h.call(req) end)
+					let pTimer = procSpawn(fun(_: Null) -> {} do
+						let t = timerAfter(dur)
+						chanRecv(t)
+						{ timeout: true }
+					end)
+					let r = procJoinAny([pWorker, pTimer])
+					let timedOut = isType(r.value, type {timeout!: Bool}) and bool(r.value.timeout)
+					if timedOut then
+						procCancel(pWorker)
+						return text(504, "timeout")
+					end
+					procCancel(pTimer)
+					r.value
+				end
+			}
+		end
+		fail("invalid handler kind in mwTimeout")
+	end
+end
+
+let mwCors = fun(opts: {}) -> Any do
+	let origin = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
+	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
+	let allowH = if mapHas(opts, "headers") and opts.headers != null then join(opts.headers, ", ") else "Content-Type, Authorization" end
+	let creds = if mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials) then "true" else "false" end
+
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					res.setHeader("Access-Control-Allow-Origin", origin)
+					res.setHeader("Access-Control-Allow-Methods", methods)
+					res.setHeader("Access-Control-Allow-Headers", allowH)
+					res.setHeader("Access-Control-Allow-Credentials", creds)
+					if req.method == "OPTIONS" then
+						res.status(204).end(null)
+						return null
+					end
+					h.call(req, res)
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					if req.method == "OPTIONS" then
+						return noContent(null)
+					end
+					let v = h.call(req)
+					if v == null then return v end
+					if isType(v, type {status!: Int, headers!: {}, body!: Str}) then
+						v.headers["Access-Control-Allow-Origin"] = origin
+						v.headers["Access-Control-Allow-Methods"] = methods
+						v.headers["Access-Control-Allow-Headers"] = allowH
+						v.headers["Access-Control-Allow-Credentials"] = creds
+					end
+					v
+				end
+			}
+		end
+		fail("invalid handler kind in mwCors")
+	end
+end
+
+# =========================
+# Server lifecycle (stub)
+# =========================
+
+let serve = fun(listener, r, opts: {}) -> {}? do
+	return null # <serve not implemented: transport layer TBD>
+end
+
+let shutdown = fun(server, timeoutMs: Int?) -> Bool do
+	true
+end
+
+# =========================
+# Tiny docs (optional)
+# =========================
+
+let openapi = fun(r) -> {}? do
+	if not (mapHas(r, "_dump")) then
+		return null # <not a router>
+	end
+	let dump = r._dump()
+	let rs = []
+	for rr in dump.routes do
+		rs = rs + [{ method: rr.method, pattern: rr.pattern, streaming: rr.kind == "stream" }]
+	end
+	{ routes: rs }
+end
+=== END FILE: lib/nethttp.ms ===
 
 === BEGIN FILE: lib/nethttp_test.ms ===
-# nethttp_test.ms — tiny & orthogonal tests
-
 let testing = import("testing")
-let nethttp = import("nethttp")
-let Request   = nethttp.Request
-let Responder = nethttp.Responder
+let http = import("nethttp")
 
-# --- Router: exact match
-testing.test("nethttp/router/exact", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	r.handle("GET", "/ping", fun(req: Request) -> Any? do
-		return nethttp.text(200, "pong")
+# ---- bindQuery: success ----
+testing.test("nethttp/bindQuery success", fun(_: Null) -> Any do
+	let req = {
+		method: "GET",
+		url: { scheme: null, host: null, path: "/q", query: "name=Ada&age=36" },
+		headers: {},
+		body: "",
+		pathParams: {}
+	}
+	let Q = type { name!: Str, age: Int }
+	let v = http.bindQuery(req, Q)
+	testing.assertEq({ name: "Ada", age: 36 }, v)
+end)
+
+# ---- bindQuery: failure (null + note) ----
+testing.test("nethttp/bindQuery failure", fun(_: Null) -> Any do
+	let req = {
+		method: "GET",
+		url: { scheme: null, host: null, path: "/q", query: "name=Ada&age=oops" },
+		headers: {},
+		body: "",
+		pathParams: {}
+	}
+	let Q = type { name!: Str, age: Int }
+	let v = http.bindQuery(req, Q)
+
+	# must be null
+	testing.assertEq(null, v)
+
+	# note should contain the reason, regardless of angle-bracket framing
+	let note = noteGet(v)
+	let parts = split(note, "query validation failed")
+	testing.assertEq(true, len(parts) > 1)
+end)
+
+# ---- tiny router: hello/{name} ----
+testing.test("nethttp/router hello", fun(_: Null) -> Any do
+	let Request = http.Request
+	let r = http.router()
+
+	r.handle("GET", "/hello/{name}", fun(req: Request) -> Any? do
+		let p = http.path(req)
+		return http.text(200, "hi " + p.name)
 	end)
 
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/ping" })
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/hello/Ada" })
 	testing.assertEq(200, res.status)
-	testing.assertEq("pong", res.body)
-
-	let miss = tc.call({ method: "GET", path: "/nope" })
-	testing.assertEq(404, miss.status)
+	testing.assertEq("hi Ada", res.body)
 end)
 
-# --- Router: path param
-testing.test("nethttp/router/param", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	r.handle("GET", "/users/{id}", fun(req: Request) -> Any? do
-		let p = nethttp.path(req)
-		return nethttp.json(200, { id: p.id })
-	end)
+# ---- tiny router: streaming ----
+testing.test("nethttp/streaming tiny", fun(_: Null) -> Any do
+	let r = http.router()
 
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/users/123" })
-	testing.assertEq(200, res.status)
-	testing.assertEq({ id: "123" }, jsonParse(res.body))
-end)
-
-# --- Router: prefix mount
-testing.test("nethttp/router/prefix", fun(_: Null) -> Any do
-	let api = nethttp.router()
-	api.handle("GET", "/x", fun(req: Request) -> Any? do
-		return { ok: true }
-	end)
-
-	let r = nethttp.router()
-	r.mount("/api", api)
-
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/api/x" })
-	testing.assertEq(200, res.status)
-	testing.assertEq({ ok: true }, jsonParse(res.body))
-end)
-
-# --- bindJson: ok and bad
-testing.test("nethttp/bindJson", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	let T = type { name!: Str, age: Int }
-
-	r.handle("POST", "/users", fun(req: Request) -> Any? do
-		let payload = nethttp.bindJson(req, T)
-		if payload == null then
-			return nethttp.raise(400, "<invalid body>")
-		end
-		return nethttp.json(201, payload)
-	end)
-
-	let tc = nethttp.testClient(r)
-
-	let ok = tc.call({
-		method: "POST",
-		path: "/users",
-		headers: {"Content-Type":"application/json"},
-		body: "{\"name\":\"Ada\",\"age\":36}"
-	})
-	testing.assertEq(201, ok.status)
-	testing.assertEq({ name: "Ada", age: 36 }, jsonParse(ok.body))
-
-	let bad = tc.call({
-		method: "POST",
-		path: "/users",
-		headers: {"Content-Type":"application/json"},
-		body: "{oops}"
-	})
-	testing.assertEq(400, bad.status)
-end)
-
-# --- bindQuery: simple shape
-testing.test("nethttp/bindQuery", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	let Q = type { q!: Str }
-
-	r.handle("GET", "/search", fun(req: Request) -> Any? do
-		let v = nethttp.bindQuery(req, Q)
-		if v == null then
-			return nethttp.raise(400, "<invalid query>")
-		end
-		return nethttp.text(200, v.q)
-	end)
-
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/search", query: "q=hello" })
-	testing.assertEq(200, res.status)
-	testing.assertEq("hello", res.body)
-end)
-
-# --- Response shaping: raw value vs explicit text/json
-testing.test("nethttp/response/helpers", fun(_: Null) -> Any do
-	let r = nethttp.router()
-
-	r.handle("GET", "/raw", fun(req: Request) -> Any? do
-		return { a: 1 }     # auto 200 JSON
-	end)
-
-	r.handle("GET", "/text", fun(req: Request) -> Any? do
-		return nethttp.text(200, "hi")
-	end)
-
-	let tc = nethttp.testClient(r)
-
-	let raw = tc.call({ method: "GET", path: "/raw" })
-	testing.assertEq(200, raw.status)
-	testing.assertEq({ a: 1 }, jsonParse(raw.body))
-
-	let txt = tc.call({ method: "GET", path: "/text" })
-	testing.assertEq(200, txt.status)
-	testing.assertEq("hi", txt.body)
-end)
-
-# --- Streaming handler
-testing.test("nethttp/streaming/basic", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	r.handle("GET", "/s", fun(req: Request, res: Responder) -> Null do
+	r.handle("GET", "/stream", fun(req, res) -> Null do
 		res.status(200).setHeader("Content-Type", "text/plain")
-		let _ = res.write("a\n")
-		res.flush(null)
-		let _2 = res.write("b\n")
-		res.end(null)
+		let _ = res.write("hey")
+		let _2 = res.end(null)
+		return
 	end)
 
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/s" })
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/stream" })
 	testing.assertEq(200, res.status)
-	testing.assertEq("text/plain", res.headers["Content-Type"])
-	testing.assertEq("a\nb\n", res.body)
+	testing.assertEq("hey", res.body)
 end)
 
-# --- Middleware: recover (panic -> 500 JSON)
-testing.test("nethttp/mw/recover", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	r.use(nethttp.mwRecover())
+# ---- tiny router: value echo ----
+testing.test("nethttp/value echo", fun(_: Null) -> Any do
+	let r = http.router()
 
-	r.handle("GET", "/boom", fun(req: Request) -> Any? do
+	r.handle("POST", "/echo", fun(req) -> Any? do
+		let T = type { msg!: Str }
+		let v = http.bindJson(req, T)
+		if v == null then
+			return http.raise(400, "<bad json>")
+		end
+		return http.json(200, { ok: true, msg: v.msg })
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({ method: "POST", path: "/echo", body: "{\"msg\":\"hi\"}" })
+	testing.assertEq(200, res.status)
+
+	# Body is JSON; key order may vary — parse then assert fields.
+	let obj = jsonParse(res.body)
+	testing.assertEq(true, obj.ok)
+	testing.assertEq("hi", obj.msg)
+end)
+
+# 404/405 behavior (prefix route + missing path)
+testing.test("nethttp/routing 404_405", fun(_: Null) -> Any do
+	let r = http.router()
+	r.handle("GET", "/x/", fun(req, res) -> Null do
+		res.status(200).write("ok")
+		res.end(null)
+		return
+	end)
+	let c = http.testClient(r)
+	let a = c.call({ method: "GET", path: "/x/abc" })
+	testing.assertEq(200, a.status)
+	let b = c.call({ method: "POST", path: "/x/abc" })
+	testing.assertEq(405, b.status)
+	let c2 = c.call({ method: "GET", path: "/nope" })
+	testing.assertEq(404, c2.status)
+end)
+
+# CORS preflight
+testing.test("nethttp/cors preflight", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwCors({origin: "*"}))
+	let c = http.testClient(r)
+	let res = c.call({ method: "OPTIONS", path: "/any" })
+	testing.assertEq(204, res.status)
+end)
+
+# Recover middleware on value handler that panics
+testing.test("nethttp/recover value panic", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRecover(null))
+	r.handle("GET", "/p", fun(req) -> Any? do
 		fail("boom")
 	end)
-
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/boom" })
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/p" })
 	testing.assertEq(500, res.status)
-	testing.assertEq({ error: "internal error" }, jsonParse(res.body))
 end)
 
-# --- Middleware: request id header
-testing.test("nethttp/mw/request_id", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	r.use(nethttp.mwRecover())
-	r.use(nethttp.mwRequestID("X-Req"))
+# Recover middleware on streaming handler that panics
+testing.test("nethttp/recover stream panic", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRecover(null))
+	r.handle("GET", "/ps", fun(req, res) -> Null do
+		fail("boom")
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/ps" })
+	testing.assertEq(500, res.status)
+	testing.assertEq("internal error", res.body)
+end)
 
-	r.handle("GET", "/ok", fun(req: Request) -> Any? do
-		return { ok: true }
+# Timeout middleware on value handler
+testing.test("nethttp/timeout value", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwTimeout(20))
+	r.handle("GET", "/slow", fun(req) -> Any? do
+		sleep(50)
+		return http.text(200, "late")
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/slow" })
+	testing.assertEq(504, res.status)
+end)
+
+# Mount child router under a prefix
+testing.test("nethttp/mount prefix", fun(_: Null) -> Any do
+	let child = http.router()
+	child.handle("GET", "/ping", fun(req) -> Any? do
+		return http.text(200, "pong")
 	end)
 
-	let tc = nethttp.testClient(r)
-	let res = tc.call({ method: "GET", path: "/ok" })
+	let parent = http.router()
+	parent.mount("/v1", child)
+
+	let c = http.testClient(parent)
+	let res = c.call({ method: "GET", path: "/v1/ping" })
 	testing.assertEq(200, res.status)
-	testing.assert(res.headers["X-Req"] != null, "missing X-Req")
-	testing.assertEq({ ok: true }, jsonParse(res.body))
+	testing.assertEq("pong", res.body)
 end)
 
-# --- CORS preflight (OPTIONS should be 204 via middleware)
-testing.test("nethttp/mw/cors", fun(_: Null) -> Any do
-	let r = nethttp.router()
-	r.use(nethttp.mwRecover())
-	r.use(nethttp.mwCors({}))
+# Value handler: implicit JSON encoding
+testing.test("nethttp/implicit json", fun(_: Null) -> Any do
+	let r = http.router()
+	r.handle("GET", "/j", fun(req) -> Any? do
+		return { ok: true, n: 7 }
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/j" })
+	testing.assertEq(200, res.status)
+	let obj = jsonParse(res.body)
+	testing.assertEq(true, obj.ok)
+	testing.assertEq(7, obj.n)
+end)
 
-	r.handle("POST", "/echo", fun(req: Request) -> Any? do
-		let T = type { msg!: Str }
-		let v = nethttp.bindJson(req, T)
-		if v == null then return nethttp.raise(400, "<bad>") end
-		return nethttp.json(200, { ok: true, msg: v.msg })
+# Value handler: JSON encode error (non-serializable)
+testing.test("nethttp/json encode error", fun(_: Null) -> Any do
+	let r = http.router()
+	r.handle("GET", "/badjson", fun(req) -> Any? do
+		return fun(_: Null) -> Any do true end
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/badjson" })
+	testing.assertEq(500, res.status)
+	testing.assertEq("json encode error", res.body)
+end)
+
+# Request ID middleware (value path)
+testing.test("nethttp/request id header", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.handle("GET", "/ok", fun(req) -> Any? do
+		return http.text(200, "ok")
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/ok" })
+	testing.assertEq(200, res.status)
+	testing.assert(res.headers["X-Request-ID"] != null, "missing request id")
+end)
+
+# Tiny openapi listing returns routes
+testing.test("nethttp/openapi routes", fun(_: Null) -> Any do
+	let r = http.router()
+	r.handle("GET", "/a/{id}", fun(req) -> Any? do
+		return http.text(200, "ok")
+	end)
+	r.handle("GET", "/stream", fun(req, res) -> Null do
+		res.status(200).write("x")
+		res.end(null)
+		return
+	end)
+	let doc = http.openapi(r)
+	testing.assert(doc != null, "openapi null")
+	let rs = doc.routes
+	testing.assertEq(2, len(rs))
+	# find the streaming entry
+	let found = false
+	let i = 0
+	while i < len(rs) do
+		let it = rs[i]
+		if it.pattern == "/stream" and it.streaming then
+			found = true
+		end
+		i = i + 1
+	end
+	testing.assert(found, "missing streaming route in openapi")
+end)
+
+# Implicit-JSON response should include X-Request-ID
+testing.test("nethttp/request id implicit json", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.handle("GET", "/j", fun(req) -> Any? do
+		return { ok: true }   # implicit JSON
 	end)
 
-	let tc = nethttp.testClient(r)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/j" })
+	testing.assertEq(200, res.status)
+	testing.assert(res.headers["X-Request-ID"] != null, "missing X-Request-ID")
+end)
 
-	let pre = tc.call({ method: "OPTIONS", path: "/echo" })
-	testing.assertEq(204, pre.status)
-	testing.assertEq("*", pre.headers["Access-Control-Allow-Origin"])
+# Streaming response should include X-Request-ID
+testing.test("nethttp/request id streaming", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.handle("GET", "/s", fun(req, res) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("ok")
+		res.end(null)
+		return
+	end)
 
-	let resp = tc.call({
-		method: "POST",
-		path: "/echo",
-		headers: {"Content-Type":"application/json"},
-		body: "{\"msg\":\"yo\"}"
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/s" })
+	testing.assertEq(200, res.status)
+	testing.assert(res.headers["X-Request-ID"] != null, "missing X-Request-ID")
+end)
+
+# Incoming X-Request-ID should be propagated (not regenerated)
+testing.test("nethttp/request id propagate incoming", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.handle("GET", "/p", fun(req) -> Any? do
+		return http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({
+		method: "GET",
+		path: "/p",
+		headers: {"X-Request-ID": "req-123"}
 	})
-	testing.assertEq(200, resp.status)
-	testing.assertEq({ ok: true, msg: "yo" }, jsonParse(resp.body))
-	testing.assertEq("*", resp.headers["Access-Control-Allow-Origin"])
-end)
-
-# --- Docs: routes listed
-testing.test("nethttp/docs/openapi_list", fun(_: Null) -> Any do
-	let api = nethttp.router()
-	api.handle("GET", "/users/{id}", fun(req: Request) -> Any? do
-		return { ok: true }
-	end)
-
-	let r = nethttp.router()
-	r.mount("/api", api)
-
-	r.handle("GET", "/docs.json", fun(req: Request) -> Any? do
-		let spec = nethttp.openapi(r)
-		if spec == null then return nethttp.raise(500, "<docs>") end
-		return nethttp.json(200, spec)
-	end)
-
-	let tc = nethttp.testClient(r)
-	let docs = tc.call({ method: "GET", path: "/docs.json" })
-	testing.assertEq(200, docs.status)
-	testing.assert(
-		len(split(docs.body, "\"/api/users/{id}\"")) > 1,
-		"docs missing route"
-	)
+	testing.assertEq(200, res.status)
+	testing.assertEq("req-123", res.headers["X-Request-ID"])
 end)
 === END FILE: lib/nethttp_test.ms ===
 

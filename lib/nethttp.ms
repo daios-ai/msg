@@ -1,1215 +1,648 @@
-# nethttp.ms — first-draft stubs (swept for arrow types in record type literals)
-# 
-# Philosophy:
-# - Small surface, explicit ops at edges.
-# - Internal helpers never return null on success.
-# - Edge ops may return null with a POST reason.
-# 
-# Status:
-# - Router + matching + path params: implemented (exact, {param}, and prefix "/...").
-# - bindJson / bindQuery / query / path: implemented (bindQuery = light coercions).
-# - Value-returning and streaming handlers supported in testClient.
-# - Responses helpers implemented.
-# - Middleware: mwRecover, mwRequestID, mwTimeout, mwCors (minimal behaviors).
-# - serve/shutdown/openapi: stubs (return null # <unimplemented>).
+# nethttp — minimal HTTP server ergonomics for MindScript
+#
+# FastAPI-like developer experience with a tiny, composable core.
+# Focus: routing, handler ergonomics, validation, testing.
+# Transport (`serve`) remains a documented stub.
+#
+# Design notes:
+# - Handlers are FIRST-CLASS OBJECTS: { kind!: "value" | "stream", call!: Any }.
+#   This is the explicit runtime tag — no notes, no registries, no reflection for kind.
+# - Router decides kind once at registration via _isStreaming(f) and wraps into a handler object.
+# - Middleware is a transformation: (Handler) -> Handler. Kind is preserved explicitly.
+# - Boundary functions may return null with a POST reason; internals never return null on success.
+# - Debug prints are kept to aid bring-up.
 
 # =========================
-# Public types
+# Public types (data-only)
 # =========================
 
 let Request = type {
-	method: Str,
-	url: {scheme: Str?, host: Str?, path: Str, query: Str?},
-	headers: {Str: Str},
-	body: Any, # readable handle OR raw Str (handled by helpers)
-	pathParams: {Str: Str}?
+	method!: Str,
+	url!: { scheme: Str?, host: Str?, path!: Str, query: Str? },
+	headers!: {},
+	body!: Any,
+	pathParams: {}?
 }
 
-# NOTE: arrow types (right-associative), not fun(...) in type fields.
-let Responder = type {
-	status: Int -> Responder,
-	setHeader: Str -> Str -> Responder,
-	write: Str -> Int?, # may return null # <io>
-	flush: Null -> Bool?, # may return null # <io>
-	end: Null -> Bool? # may return null # <io>
+# Response accumulator (internal)
+let _Response = type { status!: Int, headers!: {}, body!: Str }
+
+# Structured HTTP error (value-returning handlers can return this)
+let _HttpError = type {
+	__http_error__!: Bool,
+	status!: Int,
+	body: Str,
+	headers: {}
 }
 
-let Response = type {status: Int, headers: {Str: Str}, body: Str}
-
-let Router = type {
-	handle: Str -> Str -> Any -> Any, # method -> path -> handler -> handler
-	mount: Str -> Any -> Bool, # prefix -> childRouter -> ok
-	use: Any -> Bool # mw -> ok
-}
+# Handler object (EXPLICIT TAG)
+let _Handler = type { kind!: Str, call!: Any }  # kind ∈ {"value","stream"}
 
 # =========================
-# Internal router state
+# Utilities
 # =========================
 
-let _mkRouter = fun(_: Null) -> {} do
-	return {
-		_routes: [], # [{method, path, parts, isPrefix, handler, kind}]
-		_mw: [] # [mwFun]
-	}
+# Required: used ONCE to decide handler shape at registration.
+let _paramCount = fun(f) -> Int do
+	let rt = reflect(f)
+	if rt == null then return 1 end
+	if len(rt) == 0 or rt[0] != "fun" then return 1 end
+	let ps = rt[1]
+	if ps == null then return 0 end
+	if len(ps) >= 1 and ps[0] == "array" then return len(ps) - 1 end
+	return len(ps)
+end
+
+# DO NOT DELETE. Used in _mkRoute to add the explicit kind tag.
+let _isStreaming = fun(f) -> Bool do
+	let n = _paramCount(f)
+	if n == 1 then return false end
+	if n == 2 then return true end
+	fail(sprintf("unsupported handler arity: %d (want 1 or 2)", [n]))
+end
+
+let _normMethod = fun(m: Str) -> Str do toUpper(m) end
+
+let _hasPrefix = fun(s: Str, prefix: Str) -> Bool do
+	let n = len(prefix)
+	if len(s) < n then
+		return false 
+	end
+	substr(s, 0, n) == prefix
 end
 
 let _splitPath = fun(p: Str) -> [Str] do
-	if len(p) == 0 then
-		return []
-	end
-	let clean = if substr(p, 0, 1) == "/" then
-		substr(p, 1, len(p))
-	else
-		p
-	end
-	if len(clean) == 0 then
-		return []
-	end
-	return split(clean, "/")
-end
-
-let _isPrefixRoute = fun(path: Str) -> Bool do
-	# Convention: path ending with "/" matches as subtree prefix (e.g., "/static/")
-	if len(path) == 0 then
-		return false
-	end
-	return substr(path, len(path) - 1, len(path)) == "/"
-end
-
-let _compileRoute = fun(method: Str, path: Str) -> {} do
-	let parts = _splitPath(path)
-	let params = []
+	let s = if len(p) == 0 or substr(p, 0, 1) != "/" then "/" + p else p end
+	let raw = split(s, "/")
+	let out = []
 	let i = 0
-	for s in parts do
-		if len(s) >= 2 and substr(s, 0, 1) == "{" and substr(s, len(s) - 1, len(s)) == "}" then
-			params = params + [substr(s, 1, len(s) - 1)]
-		end
+	while i < len(raw) do
+		let seg = raw[i]
+		if len(seg) > 0 then out = out + [seg] end
+		i = i + 1
 	end
-	return {
-		method: toUpper(method),
-		path: path,
-		parts: parts,
-		params: params,
-		isPrefix: _isPrefixRoute(path)
-	}
+	out
 end
 
-# Match rules:
-# - Longest path wins.
-# - Exact or "{param}" segment matches.
-# - If route.isPrefix, it matches any request whose path starts with route.path.
-let _match = fun(R: {}, method: Str, reqPath: Str) -> {}? do
-	let m = toUpper(method)
-	let rparts = _splitPath(reqPath)
-
-	let best = null
-	let bestLen = -1
-	let pathHit = false
-
-	for rt in R._routes do
-		let segmentsMatch = fun(_: Null) -> Bool do
-			let i = 0
-			while i < len(rt.parts) do
-				let a = rt.parts[i]
-				let b = rparts[i]
-				let isParam = len(a) >= 2 and substr(a, 0, 1) == "{" and substr(a, len(a) - 1, len(a)) == "}"
-				if not (isParam or a == b) then
-					return false
-				end
-				i = i + 1
-			end
-			return true
-		end
-
-		# pathOk: prefix or same-length with {param} allowed
-		let pathOk = if rt.isPrefix then
-			len(rt.path) == 0 or substr(reqPath, 0, len(rt.path)) == rt.path
-		else
-			let sameLen = len(rt.parts) == len(rparts)
-			if not sameLen then
-				false
-			else
-				segmentsMatch(null)
-			end
-		end
-
-		if pathOk then
-			pathHit = true
-		end
-		if not pathOk or rt.method != m then
-			continue
-		end
-
-		# prefer longest; extract params only when selecting
-		if len(rt.path) > bestLen then
-			let params = if rt.isPrefix then
-				{}
-			else
-				let ps = {}
-				let i = 0
-				while i < len(rt.parts) do
-					let a = rt.parts[i]
-					let b = rparts[i]
-					let isParam = len(a) >= 2 and substr(a, 0, 1) == "{" and substr(a, len(a) - 1, len(a)) == "}"
-					if isParam then
-						ps[substr(a, 1, len(a) - 1)] = b
-					end
-					i = i + 1
-				end
-				ps
-			end
-			best = {route: rt, params: params}
-			bestLen = len(rt.path)
-		end
-	end
-
-	if best != null then
-		return best
-	end
-	if pathHit then
-		return {methodNotAllowed: true}
-	end
-	return
+let _isParamSeg = fun(seg: Str) -> Bool do
+	let n = len(seg)
+	n >= 2 and substr(seg, 0, 1) == "{" and substr(seg, n - 1, n) == "}"
 end
 
-# Compose value-returning middleware left-to-right: mw(next)->handler
-let _chainValue = fun(mws: [Any], leaf) do
-	let out = leaf
-	let i = len(mws) - 1
-	while i >= 0 do
-		out = mws[i](out)
-		i = i - 1
-	end
-	return out
+let _paramName = fun(seg: Str) -> Str do substr(seg, 1, len(seg) - 1) end
+
+let _makeURL = fun(path: Str, query: Str?) -> {} do
+	{ scheme: null, host: null, path: path, query: query }
+end
+
+let _json = fun(v) -> Str? do
+	let s = jsonStringify(v)
+	if s != null then return s end
+	return null # <json stringify failed>
 end
 
 # =========================
-# Public constructors
+# Error helpers (public)
 # =========================
 
-# Router factory
-let router = fun(_: Null) -> Router do
-	let R = {_routes: [], _mw: []} # private mutable state
+let raise = fun(status: Int, message: Str) -> {} do
+	{ __http_error__: true, status: status, body: message, headers: {} }
+end
 
-	let out = {_routes: [], _mw: []} # exported view (kept in sync)
-
-	let _sync = fun(_: Null) -> Null do
-		out._routes = R._routes
-		out._mw = R._mw
-		null
-	end
-
-	let handle = fun(method: Str, path: Str, handler) -> Any do
-		let c = _compileRoute(method, path)
-
-		# Non-recursive ResponderShape for classification only
-		let ResponderShape = type {
-			status: Int -> Any,
-			setHeader: Str -> Str -> Any,
-			write: Str -> Any?, flush: Null -> Any?, end: Null -> Any?
-		}
-		let isStream = isType(handler, type Request -> ResponderShape -> Null) or
-					isType(handler, type Request -> (ResponderShape -> Null))
-		let returnsFunction = isType(handler, type Request -> Any -> Any)
-		let isValue  = (not isStream) and (not returnsFunction) and
-					isType(handler, type Request -> Any?)
-
-		if not isStream and not isValue then
-			fail("handle: handler must be Request->Any? or Request->Responder->Null")
-		end
-
-		let kind = if isStream then "stream" else "value" end
-
-		R._routes = R._routes + [{
-			method: toUpper(c.method),
-			path: c.path,
-			parts: c.parts,
-			params: c.params,
-			isPrefix: c.isPrefix,
-			handler: handler,
-			kind: kind
-		}]
-		_sync(null)
-		return handler
-	end
-
-	let use = fun(mw) -> Bool do
-		R._mw = R._mw + [mw]
-		_sync(null)
-		return true
-	end
-
-	let mount = fun(prefix: Str, child) -> Bool do
-		if not mapHas(child, "_routes") then
-			fail("mount: child is not a router")
-		end
-		for rt in child._routes do
-			let newPath = if prefix == "/" then
-				rt.path
-			else
-				let pfx = if substr(prefix, len(prefix) - 1, len(prefix)) == "/" then
-					substr(prefix, 0, len(prefix) - 1)
-				else
-					prefix
-				end
-				let suf = if substr(rt.path, 0, 1) == "/" then
-					substr(rt.path, 1, len(rt.path))
-				else
-					rt.path
-				end
-				sprintf("%s/%s", [pfx, suf])
-			end
-			handle(rt.method, newPath, rt.handler)
-		end
-		_sync(null)
-		return true
-	end
-
-	out.handle = handle
-	out.mount = mount
-	out.use = use
-	_sync(null)
-	return out
+let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
+	{ __http_error__: true, status: status, body: message, headers: headers }
 end
 
 # =========================
-# Request helpers (edges)
+# Binding helpers (public, boundary-level)
 # =========================
-
-let query = fun(req: Request) -> {Str: [Str]} do
-	if mapHas(req, "_queryCache") and req._queryCache != null then
-		return req._queryCache
-	end
-	let q = if req.url.query == null then
-		""
-	else
-		req.url.query
-	end
-	let m = urlQueryParse(q)
-	if m == null then
-		return {}
-	end
-	let out = {}
-	for [k, v] in m do
-		if isType(v, type [Str]) then
-			out[k] = v
-		else
-			out[k] = [str(v)]
-		end
-	end
-	req._queryCache = out
-	return out
-end
-
-let path = fun(req: Request) -> {Str: Str} do
-	if mapHas(req, "pathParams") and req.pathParams != null then
-		return req.pathParams
-	end
-	return {}
-end
 
 let bindJson = fun(req: Request, T: Type) -> Any? do
 	let raw = if isType(req.body, type Str) then
 		req.body
 	else
 		let s = readAll(req.body)
-		if s == null then
-			return noteSet("<read error>", null)
+		if s == null then 
+			return null # <read body failed> 
 		end
 		s
 	end
+
 	let v = jsonParse(raw)
 	if v == null then
-		return noteSet("<invalid json>", null)
+		return null # <invalid json>
 	end
 	if not isType(v, T) then
-		return noteSet("<validation>", null)
+		return null # <validation failed>
 	end
-	return v
+	v
+end
+
+let query = fun(req: Request) -> {} do
+	let raw = if req.url.query == null then "" else req.url.query end
+	let m = urlQueryParse(raw)
+	if m == null then return {} end
+	m
 end
 
 let bindQuery = fun(req: Request, T: Type) -> Any? do
 	let qm = query(req)
-	let obj = {}
-
-	let auto = fun(s: Str) do
-		let j = jsonParse(s)
-		if j != null then
-			return j
-		end # handles numbers, true/false, arrays, objects
-
-		return s # bare strings remain strings
-
-	end
-
+	let out = {}
 	for [k, vs] in qm do
-		if len(vs) == 1 then
-			obj[k] = auto(vs[0])
-		else
-			let out = []
-			for s in vs do
-				out = out + [auto(s)]
-			end
-			obj[k] = out
-		end
+		if vs == null or len(vs) == 0 then continue end
+		let s = vs[len(vs) - 1]
+		let parsed = try(fun(_: Null) do jsonParse(s) end)
+		if parsed.ok then out[k] = parsed.value else out[k] = s end
 	end
+	if isType(out, T) then return out end
+	return null # <query validation failed>
+end
 
-	if isType(obj, T) then
-		return obj
-	end
-	return noteSet("<validation>", null)
+let path = fun(req: Request) -> {} do
+	if req.pathParams == null then return {} end
+	req.pathParams
 end
 
 # =========================
-# Response builders
+# Response helpers (public)
 # =========================
 
-let json = fun(status: Int, v) -> Response do
-	let body = jsonStringify(v)
-	let s = if body == null then
-		formatValue(v)
-	else
-		body
+let json = fun(status: Int, value) -> {} do
+	let s = _json(value)
+	if s == null then
+		return { status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error" }
 	end
-	return {
-		status: status,
-		headers: {"Content-Type": "application/json"},
-		body: s
+	{ status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s }
+end
+
+let text = fun(status: Int, s: Str) -> {} do
+	{ status: status, headers: {"Content-Type": "text/plain"}, body: s }
+end
+
+let noContent = fun(_: Null) -> {} do
+	{ status: 204, headers: {}, body: "" }
+end
+
+let redirect = fun(status: Int, location: Str) -> {} do
+	{ status: status, headers: {"Location": location}, body: "" }
+end
+
+# =========================
+# Responder (opaque; per-request)
+# =========================
+
+let _newResponder = fun() -> { res: _Response, api: {} } do
+	let state = { status: 200, headers: {}, body: "" }
+	let api = {}
+
+	api.status = fun(code: Int) -> {} do 
+		state.status = code
+		api 
+	end
+	api.setHeader = fun(k: Str, v: Str) -> {} do 
+		state.headers[k] = v
+		api 
+	end
+	api.write = fun(chunk: Str) -> Int? do 
+		let n = len(chunk)
+		state.body = state.body + chunk
+		n 
+	end
+	api.flush = fun(_: Null) -> Bool? do true end
+	api.end = fun(_: Null) -> Bool? do true end
+
+	{ res: state, api: api }
+end
+
+# =========================
+# Router (closure-backed; no module globals)
+# =========================
+
+# Route record (private)
+let _mkRoute = fun(method: Str, pattern: Str, rawHandler) -> {} do
+	let m = _normMethod(method)
+	let isPrefix = _hasPrefix(pattern, "/") and len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
+
+	# Decide once (explicit tag) and wrap into a handler object
+	let isStream = _isStreaming(rawHandler)
+	let h = if isStream then
+		{ kind: "stream", call: rawHandler }
+	else
+		{ kind: "value", call: rawHandler }
+	end
+
+	{
+		method: m,
+		pattern: pattern,
+		isPrefix: isPrefix,
+		parts: _splitPath(pattern),
+		handler: h,
+		kind: h.kind
 	}
 end
 
-let text = fun(status: Int, s: Str) -> Response do
-	return {
-		status: status,
-		headers: {"Content-Type": "text/plain; charset=utf-8"},
-		body: s
-	}
-end
-
-let noContent = fun(_: Null) -> Response do
-	return {status: 204, headers: {}, body: ""}
-end
-
-let redirect = fun(status: Int, location: Str) -> Response do
-	return {status: status, headers: {Location: location}, body: ""}
-end
-
-let raise = fun(status: Int, message: Str) -> Null do
-	return noteSet(sprintf("<status:%d message:%s>", [status, message]), null)
-end
-
-# =========================
-# Middleware (minimal)
-# =========================
-
-let mwRecover = fun(_: Null) do
-	return fun(next) do
-		return fun(req: Request) -> Any? do
-			let r = try(fun(_: Null) do
-				next(req)
-			end)
-			if r.ok then
-				return r.value
-			end
-			return json(500, {error: "internal error"})
+# Path matcher → params or null
+let _pathMatch = fun(parts: [Str], reqSegs: [Str], isPrefix: Bool) -> {}? do
+	if isPrefix and len(reqSegs) < len(parts) then return end
+	if not isPrefix and len(reqSegs) != len(parts) then return end
+	let n = len(parts)
+	let params = {}
+	let i = 0
+	while i < n do
+		let rp = parts[i]
+		let qp = reqSegs[i]
+		if _isParamSeg(rp) then
+			params[_paramName(rp)] = qp
+		elif rp != qp then
+			return
 		end
+		i = i + 1
 	end
+	params
 end
 
-let mwRequestID = fun(headerName: Str) do
-	let H = if len(headerName) == 0 then
-		"X-Request-ID"
-	else
-		headerName
-	end
-	return fun(next) do
-		return fun(req: Request) -> Any? do
-			let idv = sprintf("%d", [nowNanos()])
-			req.ctx = if mapHas(req, "ctx") and req.ctx != null then
-				req.ctx
-			else
-				{}
-			end
-			req.ctx.id = idv
-			let out = next(req)
-			if out != null and mapHas(out, "status") and mapHas(out, "headers") and mapHas(out, "body") then
-				out.headers[H] = idv
-				return out
-			end
-			let r = json(200, out)
-			r.headers[H] = idv
-			return r
-		end
-	end
-end
+# Middleware type (public surface): (Handler) -> Handler
+# We keep builder functions returning such transformers, same names as before:
+# mwRecover(): Any, mwRequestID(name): Any, mwTimeout(ms): Any, mwCors(opts): Any
+# Each returns a function that takes a Handler and returns a new Handler.
 
-let mwTimeout = fun(ms: Int) do
-	let dur = if ms <= 0 then
-		0
-	else
-		ms
-	end
-	return fun(next) do
-		return fun(req: Request) -> Any? do
-			if dur == 0 then
-				return next(req)
-			end
+let router = fun(_: Null) -> {} do
+	let _routes = []
+	let _mws = []   # array of (Handler)->Handler transformers
 
-			let worker = procSpawn(fun(_: Null) -> Any? do
-				return next(req)
-			end)
-			let timerP = procSpawn(fun(_: Null) -> {} do
-				sleep(dur)
-				return {timeout: true}
-			end)
-
-			let first = procJoinAny([worker, timerP])
-			if first.index == 0 then
-				# handler won
-				procCancel(timerP)
-				let v = first.value
-				return v
-			else
-				# timeout won
-				procCancel(worker)
-				return json(504, {error: "timeout"})
+	let _match = fun(method: Str, path: Str) -> {}? do
+		let want = _normMethod(method)
+		let segs = _splitPath(path)
+		let best = null
+		let score = -1
+		for r in _routes do
+			if r.method != want then continue end
+			let p = _pathMatch(r.parts, segs, r.isPrefix)
+			if p != null then
+				let s = len(r.parts)
+				if s > score then
+					best = { route: r, params: p }
+					score = s
+				end
 			end
 		end
+		if best != null then return { route: best.route, params: best.params } end
+		null
 	end
-end
 
-let mwCors = fun(opts: {}) do
-	let allowOrigin = if mapHas(opts, "allowOrigin") and opts.allowOrigin != null then
-		opts.allowOrigin
-	else
-		"*"
+	let _pathExists = fun(path: Str) -> Bool do
+		let segs = _splitPath(path)
+		for r in _routes do
+			if _pathMatch(r.parts, segs, r.isPrefix) != null then return true end
+		end
+		false
 	end
-	let allowMethods = if mapHas(opts, "allowMethods") and opts.allowMethods != null then
-		opts.allowMethods
-	else
-		"GET,POST,PUT,PATCH,DELETE,OPTIONS"
-	end
-	let allowHeaders = if mapHas(opts, "allowHeaders") and opts.allowHeaders != null then
-		opts.allowHeaders
-	else
-		"Content-Type,Authorization"
-	end
-	return fun(next) do
-		return fun(req: Request) -> Any? do
-			if toUpper(req.method) == "OPTIONS" then
-				let r = noContent(null)
-				r.headers["Access-Control-Allow-Origin"] = allowOrigin
-				r.headers["Access-Control-Allow-Methods"] = allowMethods
-				r.headers["Access-Control-Allow-Headers"] = allowHeaders
-				return r
+
+	let _core = fun(req: Request) -> Any? do
+		let m = _match(req.method, req.url.path)
+		if m == null then
+			if _normMethod(req.method) == "OPTIONS" then return noContent(null) end
+			if _pathExists(req.url.path) then return text(405, "method not allowed") end
+			return text(404, "not found")
+		end
+
+		let rq = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: m.params }
+		let rt = m.route
+
+		# Compose middlewares (outermost last applies first) over the handler OBJECT
+		let h = rt.handler
+		let i = len(_mws) - 1
+		while i >= 0 do
+			h = _mws[i](h)
+			i = i - 1
+		end
+
+		# Enforce handler kind
+		if h.kind != "stream" and h.kind != "value" then
+			fail("invalid handler kind: expected value or stream")
+		end
+
+		if h.kind == "stream" then
+			let pack = _newResponder()
+			let r1 = try(fun(_: Null) do h.call(rq, pack.api) end)
+			if not r1.ok then
+				return text(500, "internal error")
 			end
-			let out = next(req)
-			let r2 = if out != null and isType(out, type {
-				status: Int,
-				headers: {Str: Str},
-				body: Str
-			}) then
-				out
-			else
-				json(200, out)
-			end
-			r2.headers["Access-Control-Allow-Origin"] = allowOrigin
-			return r2
+			return { status: pack.res.status, headers: pack.res.headers, body: pack.res.body }
 		end
-	end
-end
 
-# =========================
-# Server internals (compact helpers)
-# =========================
-
-# Options (kept tiny)
-# readHeaderTimeoutMs?: Int
-# readTimeoutMs?: Int
-# writeTimeoutMs?: Int
-# idleTimeoutMs?: Int
-# maxHeaderBytes?: Int
-# maxBodyBytes?: Int
-let _normOpts = fun(opts: {}) -> {} do
-	let rh = if mapHas(opts, "readHeaderTimeoutMs") then
-		int(opts.readHeaderTimeoutMs)
-	else
-		0
-	end
-	let rd = if mapHas(opts, "readTimeoutMs") then
-		int(opts.readTimeoutMs)
-	else
-		0
-	end
-	let wr = if mapHas(opts, "writeTimeoutMs") then
-		int(opts.writeTimeoutMs)
-	else
-		0
-	end
-	let id = if mapHas(opts, "idleTimeoutMs") then
-		int(opts.idleTimeoutMs)
-	else
-		0
-	end
-	let mh = if mapHas(opts, "maxHeaderBytes") then
-		int(opts.maxHeaderBytes)
-	else
-		8192
-	end
-	let mb = if mapHas(opts, "maxBodyBytes") then
-		int(opts.maxBodyBytes)
-	else
-		1048576
-	end
-	return {
-		readHeaderTimeoutMs: rh,
-		readTimeoutMs: rd,
-		writeTimeoutMs: wr,
-		idleTimeoutMs: id,
-		maxHeaderBytes: mh,
-		maxBodyBytes: mb
-	}
-end
-
-# Blocking race between work() and a timeout.
-let _raceTimeout = fun(ms: Int, work) -> {} do
-	if ms <= 0 then
-		return {index: 0, value: work(null)}
-	end
-	let w = procSpawn(fun(_: Null) do
-		return work(null)
-	end)
-	let t = procSpawn(fun(_: Null) -> {} do
-		sleep(ms)
-		return {timeout: true}
-	end)
-	let r = procJoinAny([w, t])
-	if r.index == 0 then
-		procCancel(t)
-	else
-		procCancel(w)
-	end
-	return r
-end
-
-# Write full string with a single timeout budget.
-let _writeAll = fun(conn, s: Str, timeoutMs: Int) -> Bool do
-	let send = fun(_: Null) -> Bool do
-		let off = 0
-		let total = len(s)
-		while off < total do
-			let n = write(conn, substr(s, off, total))
-			if n == null or int(n) <= 0 then
-				return false
-			end
-			off = off + int(n)
+		# value
+		let r2 = try(fun(_: Null) do h.call(rq) end)
+		if not r2.ok then
+			return text(500, "internal error")
 		end
-		return true
-	end
-	if timeoutMs <= 0 then
-		return send(null)
-	end
-	let r = _raceTimeout(timeoutMs, send)
-	return r.index == 0 and bool(r.value)
-end
+		let out = r2.value
 
-# Minimal status text mapper.
-let _statusText = fun(code: Int) -> Str do
-	if code == 200 then
-		return "OK"
-	end
-	if code == 201 then
-		return "Created"
-	end
-	if code == 204 then
-		return "No Content"
-	end
-	if code == 302 then
-		return "Found"
-	end
-	if code == 400 then
-		return "Bad Request"
-	end
-	if code == 401 then
-		return "Unauthorized"
-	end
-	if code == 404 then
-		return "Not Found"
-	end
-	if code == 405 then
-		return "Method Not Allowed"
-	end
-	if code == 413 then
-		return "Payload Too Large"
-	end
-	if code == 500 then
-		return "Internal Server Error"
-	end
-	if code == 504 then
-		return "Gateway Timeout"
-	end
-	return "OK"
-end
-
-# Read one CRLF-terminated line with timeout; returns Str? (annotated null on timeout/IO).
-let _readLine = fun(conn, timeoutMs: Int) -> Str? do
-	let r = _raceTimeout(timeoutMs, fun(_: Null) -> Str? do
-		return readLine(conn)
-	end)
-	if r.index != 0 then
-		return noteSet("<timeout>", null)
-	end
-	return r.value
-end
-
-# Parse request start-line + headers; enforces readHeaderTimeoutMs and maxHeaderBytes.
-# Returns { method, path, query, headers }? (annotated null on error).
-let _readHead = fun(conn, opts: {}) -> {}? do
-	let t = _normOpts(opts)
-	let total = 0
-
-	# DEBUG
-	println("[nethttp] _readHead: start")
-
-	let first = _readLine(conn, t.readHeaderTimeoutMs)
-	if first == null then
-		return noteSet("<read header>", null)
-	end
-	total = total + len(first) + 2
-
-	# DEBUG
-	println(sprintf("[nethttp] _readHead: first=%q", [first]))
-
-	let parts = split(strip(first), " ")
-	if len(parts) < 3 then
-		return noteSet("<bad request line>", null)
-	end
-	let method = toUpper(parts[0])
-	let full = parts[1]
-	let pq = split(full, "?")
-	let path = if len(pq) >= 1 then
-		pq[0]
-	else
-		"/"
-	end
-	let query = if len(pq) == 2 then
-		pq[1]
-	else
-		""
-	end
-
-	let H = {}
-	while true do
-		if total > t.maxHeaderBytes then
-			return noteSet("<headers too large>", null)
+		if isType(out, _HttpError) then
+			let hdrs = if mapHas(out, "headers") and out.headers != null then out.headers else {} end
+			return { status: out.status, headers: hdrs, body: out.body }
 		end
-		let line = _readLine(conn, t.readHeaderTimeoutMs)
-		if line == null then
-			return noteSet("<read header>", null)
+
+		if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+			return out
 		end
-		if len(strip(line)) == 0 then
-			break
+
+		let js = _json(out)
+		if js == null then return text(500, "json encode error") end
+		{ status: 200, headers: {"Content-Type": "application/json; charset=utf-8"}, body: js }
+	end
+
+	let _toInternal = fun(out) -> _Response do
+		if out == null then
+			let nt = noteGet(out)
+			let msg = if nt != null then nt else "error" end
+			return { status: 500, headers: {"Content-Type": "text/plain"}, body: msg }
 		end
-		total = total + len(line) + 2
-		let kv = split(line, ":")
-		if len(kv) >= 2 then
-			let k = strip(kv[0])
-			let v = strip(join(slice(kv, 1, len(kv)), ":"))
-			H[k] = v
+		if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+			return { status: out.status, headers: out.headers, body: out.body }
 		end
-	end
-
-	return {method: method, path: path, query: query, headers: H}
-end
-
-# Buffered body read using Content-Length; enforces maxBodyBytes and readTimeoutMs.
-let _readBody = fun(conn, headers: {}, opts: {}) -> Str? do
-	let t = _normOpts(opts)
-	let rawLen = if mapHas(headers, "Content-Length") then
-		headers["Content-Length"]
-	else
-		"0"
-	end
-	let want = int(rawLen)
-	if want == null or want <= 0 then
-		return ""
-	end
-	if want > t.maxBodyBytes then
-		return noteSet("<payload too large>", null)
-	end
-
-	let r = _raceTimeout(t.readTimeoutMs, fun(_: Null) -> Str? do
-		let s = readN(conn, want)
-		if s == null or len(s) != want then
-			return noteSet("<read body>", null)
+		let js = _json(out)
+		if js == null then
+			return { status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error" }
 		end
-		return s
-	end)
-	if r.index != 0 then
-		return noteSet("<timeout>", null)
-	end
-	return r.value
-end
-
-# Hex helper for chunk sizes.
-let _hex = fun(n: Int) -> Str do
-	if n == 0 then
-		return "0"
-	end
-	let digits = "0123456789abcdef"
-	let out = ""
-	let x = n
-	while x > 0 do
-		let d = x % 16
-		out = substr(digits, d, d + 1) + out
-		x = int(x / 16)   # keep integer division; avoid Num promotion
-	end
-	return out
-end
-
-# Value response writer (adds Content-Length, Date, Connection).
-let _writeResponse = fun(conn, resp: Response, opts: {}) -> Bool do
-	let t = _normOpts(opts)
-	let body = if resp.body == null then
-		""
-	else
-		resp.body
-	end
-	let headers = clone(resp.headers)
-
-	# honor explicit Connection from caller (e.g., "close")
-	if not mapHas(headers, "Connection") then
-		headers["Connection"] = "keep-alive"
+		{ status: 200, headers: {"Content-Type": "application/json; charset=utf-8"}, body: js }
 	end
 
-	if not mapHas(headers, "Content-Length") then
-		headers["Content-Length"] = sprintf("%d", [len(body)])
-	end
-	if not mapHas(headers, "Date") then
-		headers["Date"] = timeFormatRFC3339(nowMillis())
-	end
+	let api = {
+		__kind: "nethttp.router",
 
-	let head = sprintf("HTTP/1.1 %d %s\r\n", [
-		resp.status,
-		_statusText(resp.status)
-	])
-	for [k, v] in headers do
-		head = head + sprintf("%s: %s\r\n", [k, v])
-	end
-	head = head + "\r\n" + body
-	return _writeAll(conn, head, t.writeTimeoutMs)
-end
-
-# Streaming responder (chunked). setHeader is ignored after first write/status.
-let _makeChunkedResponder = fun(conn, opts: {}) -> Responder do
-	let t = _normOpts(opts)
-	let wrote = {v: false}
-	let status = {v: 200}
-	let H = {"Transfer-Encoding": "chunked", Connection: "keep-alive"}
-
-	let _flushHead = fun(_: Null) -> Bool do
-		if wrote.v then
-			return true
-		end
-		wrote.v = true
-		if not mapHas(H, "Date") then
-			H["Date"] = timeFormatRFC3339(nowMillis())
-		end
-		let s = sprintf("HTTP/1.1 %d %s\r\n", [status.v, _statusText(status.v)])
-		for [k, v] in H do
-			s = s + sprintf("%s: %s\r\n", [k, v])
-		end
-		s = s + "\r\n"
-		return _writeAll(conn, s, t.writeTimeoutMs)
-	end
-
-	let _chunk = fun(s: Str) -> Bool do
-		let c = sprintf("%s\r\n%s\r\n", [_hex(len(s)), s])
-		return _writeAll(conn, c, t.writeTimeoutMs)
-	end
-
-	let res = {
-		status: fun(code: Int) -> Responder do
-			status.v = code
-			return res
+		handle: fun(method: Str, pattern: Str, handler) -> Any do
+			_routes = _routes + [_mkRoute(method, pattern, handler)]
+			true
 		end,
-		setHeader: fun(k: Str, v: Str) -> Responder do
-			if not wrote.v then
-				H[k] = v
+
+		mount: fun(prefix: Str, child) -> Bool do
+			if not (mapHas(child, "__kind") and child.__kind == "nethttp.router") then
+				fail("mount: child must be a Router")
 			end
-			return res
+			let dump = child._dump()
+			let pre = if _hasPrefix(prefix, "/") then prefix else "/" + prefix end
+			for rr in dump.routes do
+				let p = if _hasPrefix(rr.pattern, "/") then rr.pattern else "/" + rr.pattern end
+				api.handle(rr.method, pre + p, rr.handler.call)  # re-register using raw call; kind will be recomputed
+			end
+			true
 		end,
-		write: fun(s: Str) -> Int? do
-			if not _flushHead(null) then
-				return noteSet("<write head>", null)
-			end
-			if not _chunk(s) then
-				return noteSet("<write body>", null)
-			end
-			return len(s)
+
+		# Register a middleware transformer: (Handler) -> Handler
+		use: fun(mw) -> Bool do
+			_mws = _mws + [mw]
+			true
 		end,
-		flush: fun(_: Null) -> Bool? do
-			return true
+
+		_entryCall: fun(req: Request) -> _Response do
+			_toInternal(_core(req))
 		end,
-		end: fun(_: Null) -> Bool? do
-			if not wrote.v then
-				if not _flushHead(null) then
-					return noteSet("<write head>", null)
-				end
-			end
-			return _writeAll(conn, "0\r\n\r\n", t.writeTimeoutMs)
+
+		_dump: fun(_: Null) -> {} do
+			{ routes: _routes, mws: _mws }
 		end
 	}
-	return res
-end
-
-# Coerce handler output to Response (mirrors testClient).
-let _normalizeOut = fun(out) -> Response do
-	if out != null and mapHas(out, "status") and mapHas(out, "headers") and mapHas(out, "body") then
-		return out
-	end
-	return json(200, out)
+	api
 end
 
 # =========================
-# Server lifecycle
+# Dispatch (internal) and test client (public)
 # =========================
 
-# Serve on an existing listener; returns handle { listener, opts, closing!: Bool, conns!: {Str:Any}, acpt!: Any }
-# Bodies buffered (Content-Length). Keep-alive; idle timeout between requests.
-let serve = fun(listener, r: Router, opts: {}) -> {}? do
-	if listener == null then
-		return noteSet("<accept>", null)
-	end
-	let S = {
-		listener: listener,
-		opts: _normOpts(opts),
-		closing: false,
-		conns: {},
-		acpt: null
-	}
-
-	let _serveConn = fun(conn, id: Int) -> Null do
-		let t = S.opts
-		while true do
-			# Apply idle timeout as a budget for the next head read.
-			let head = fun(_: Null) -> {}? do
-				if t.idleTimeoutMs <= 0 then
-					return _readHead(conn, t)
-				end
-				let rto = _raceTimeout(t.idleTimeoutMs, fun(_: Null) -> {}? do
-					return _readHead(conn, t)
-				end)
-				if rto.index != 0 then
-					return
-				end
-				return rto.value
-			end()
-
-			# DEBUG
-			println(sprintf("[nethttp] head=%s", [
-				if head == null then
-					"<null>"
-				else
-					sprintf("%s %s?%s", [head.method, head.path, head.query])
-				end
-			]))
-
-			if head == null then
-				break
-			end
-
-			# Honor client “Connection: close”
-			let wantClose = fun(_: Null) -> Bool do
-				if mapHas(head.headers, "Connection") then
-					let v = toLower(head.headers["Connection"])
-					return v == "close"
-				end
-				return false
-			end()
-
-			let m = _match(r, head.method, head.path)
-			if m == null then
-				let leaf = fun(_: Request) -> Any? do
-					return json(404, {error: "not found"})
-				end
-				let req404 = {
-					method: head.method,
-					url: {
-						scheme: "http",
-						host: "",
-						path: head.path,
-						query: head.query
-					},
-					headers: head.headers,
-					body: ""
-				}
-				let out404 = _chainValue(r._mw, leaf)(req404)
-				let resp404 = _normalizeOut(out404)
-				if wantClose then
-					resp404.headers["Connection"] = "close"
-				end
-				if not _writeResponse(conn, resp404, t) then
-					break
-				end
-				if wantClose then
-					break
-				end
-				continue
-			end
-			if mapHas(m, "methodNotAllowed") and bool(m.methodNotAllowed) then
-				let resp405 = json(405, {error: "method not allowed"})
-				if wantClose then
-					resp405.headers["Connection"] = "close"
-				end
-				if not _writeResponse(conn, resp405, t) then
-					break
-				end
-				if wantClose then
-					break
-				end
-				continue
-			end
-
-			let body = _readBody(conn, head.headers, t)
-			if body == null then
-				let resp413 = json(413, {
-					error: "payload too large or read error"
-				})
-				if wantClose then
-					resp413.headers["Connection"] = "close"
-				end
-				_writeResponse(conn, resp413, t)
-				break
-			end
-
-			let req = {
-				method: head.method,
-				url: {
-					scheme: "http",
-					host: "",
-					path: head.path,
-					query: head.query
-				},
-				headers: head.headers,
-				body: body,
-				pathParams: m.params
-			}
-
-			let rt = m.route
-			if rt.kind == "value" then
-				let out = _chainValue(r._mw, rt.handler)(req)
-				if out == null then
-					let note = noteGet(out)
-					let status = 500
-					if note != null then
-						let n = int(replace("^.*status:([0-9]+).*$", "$1", note))
-						if n != null then
-							status = n
-						end
-					end
-					let errResp = json(status, {
-						error: if note != null then
-							note
-						else
-							"error"
-						end
-					})
-					if wantClose then
-						errResp.headers["Connection"] = "close"
-					end
-					if not _writeResponse(conn, errResp, t) then
-						break
-					end
-					if wantClose then
-						break
-					end
-				else
-					let resp = _normalizeOut(out)
-					if wantClose then
-						resp.headers["Connection"] = "close"
-					end
-					if not _writeResponse(conn, resp, t) then
-						break
-					end
-					if wantClose then
-						break
-					end
-				end
-			else
-				# streaming: adapt to value-middleware shape so mws still run
-				let wc = wantClose
-				let chain = _chainValue(r._mw, fun(next) do
-					return fun(req2: Request) -> Any? do
-						let res = _makeChunkedResponder(conn, t)
-						if wc then
-							# must set before first write/head flush
-							res.setHeader("Connection", "close")
-						end
-						rt.handler(req2, res)
-						return noContent(null) # not written; streaming already wrote
-
-					end
-				end)
-				let _ = chain(req)
-				if wantClose then
-					break
-				end
-			end
-		end
-		close(conn)
-		mapDelete(S.conns, sprintf("%d", [id]))
-		return
-	end
-
-	let acpt = procSpawn(fun(_: Null) -> Null do
-		let i = 1
-		while not S.closing do
-			let c = netAccept(S.listener)
-
-			# DEBUG
-			if c != null then
-				println("[nethttp] accept ok")
-			end
-
-			if c == null then
-				break
-			end
-			S.conns[sprintf("%d", [i])] = c
-			let id = i
-			i = i + 1
-			procSpawn(fun(_: Null) -> Null do
-				_serveConn(c, id)
-			end)
-		end
-		return
-	end)
-	S.acpt = acpt
-	return S
-end
-
-# Graceful shutdown: close listener, wait up to timeout for conns, then force-close.
-let shutdown = fun(server, timeoutMs: Int?) -> Bool do
-	if server == null then
-		return false
-	end
-	server.closing = true
-	close(server.listener)
-
-	let deadline = if timeoutMs == null or int(timeoutMs) <= 0 then
-		0
-	else
-		nowMillis() + int(timeoutMs)
-	end
-	while len(server.conns) > 0 and (deadline == 0 or nowMillis() < deadline) do
-		sleep(10)
-	end
-	if len(server.conns) > 0 then
-		for [_, c] in server.conns do
-			close(c)
-		end
-	end
-	return true
-end
-
-# ========================= 
-# Docs (stub) 
-# ========================= 
-
-let openapi = fun(r: Router) -> {}? do 
-	let items = [] 
-	for rt in r._routes do 
-		items = items + [{ method: rt.method, path: rt.path, kind: rt.kind }] 
-	end 
-	return { routes: items } 
-end 
-
-# ========================= 
-# In-process test client (usable today) 
-# =========================
-
-# In-process test client (value + stream; mirrors server normalization).
-let testClient = fun(r: Router) -> {} do
-	let call = fun(req: {}) -> {status: Int, headers: {}, body: Str} do
-		let method = toUpper(req.method)
-		let p = req.path
-		let m = _match(r, method, p)
-
-		# Construct Request
-		let urlObj = {
-			scheme: "http",
-			host: "test",
-			path: p,
-			query: if mapHas(req, "query") then req.query else "" end
-		}
+let testClient = fun(r) -> {} do
+	let call = fun(req: {}) -> {} do
+		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
+		let pathStr = if mapHas(req, "path") and req.path != null then req.path else "/" end
 		let headers = if mapHas(req, "headers") and req.headers != null then req.headers else {} end
 		let body = if mapHas(req, "body") and req.body != null then req.body else "" end
 
-		# 404 / 405 handling with middleware
-		if m == null then
-			let leaf = fun(_: Request) -> Any? do
-				return json(404, {error: "not found"})
-			end
-			let out = _chainValue(r._mw, leaf)({method: method, url: urlObj, headers: headers, body: body, pathParams: {}})
-			if out != null and mapHas(out, "status") and mapHas(out, "headers") and mapHas(out, "body") then
-				return out
-			end
-			return json(200, out)
-		end
-		if mapHas(m, "methodNotAllowed") and bool(m.methodNotAllowed) then
-			return json(405, {error: "method not allowed"})
+		let q = ""
+		let p = pathStr
+		let parts = split(pathStr, "?")
+		if len(parts) >= 2 then
+			p = parts[0]
+			q = join(slice(parts, 1, len(parts)), "?")
 		end
 
-		let rt = m.route
-		let request = {method: method, url: urlObj, headers: headers, body: body, pathParams: m.params}
-
-		if rt.kind == "value" then
-			let out = _chainValue(r._mw, rt.handler)(request)
-			if out == null then
-				let note = noteGet(out)
-				let code = if note != null then
-					let n = int(replace("^.*status:([0-9]+).*$", "$1", note))
-					if n != null then n else 500 end
-				else 500 end
-				return json(code, {error: if note != null then note else "error" end})
-			end
-			if out != null and mapHas(out, "status") and mapHas(out, "headers") and mapHas(out, "body") then
-				return out
-			end
-			return json(200, out)
-		end
-
-		# Streaming branch: simulate responder that buffers writes
-		let statusRef = {v: 200}
-		let hdrs = {}
-		let buf = ""
-		let res = {
-			status: fun(code: Int) -> Responder do
-				statusRef.v = code
-				return res
-			end,
-			setHeader: fun(k: Str, v: Str) -> Responder do
-				hdrs[k] = v
-				return res
-			end,
-			write: fun(s: Str) -> Int? do
-				buf = buf + s
-				return len(s)
-			end,
-			flush: fun(_: Null) -> Bool? do
-				return true
-			end,
-			end: fun(_: Null) -> Bool? do
-				return true
-			end
+		let R = {
+			method: _normMethod(method),
+			url: _makeURL(p, q),
+			headers: headers,
+			body: body,
+			pathParams: {}
 		}
-		let _ = _chainValue(r._mw, fun(next) -> Any do
-			return fun(req2: Request) -> Any? do
-				rt.handler(req2, res)
-				return noContent(null)
-			end
-		end)(request)
-		return {status: statusRef.v, headers: hdrs, body: buf}
+		let res = r._entryCall(R)
+		{ status: res.status, headers: res.headers, body: res.body }
 	end
-	return {call: call}
+	{ call: call }
+end
+
+# =========================
+# Middleware (built-ins)
+# =========================
+# IMPORTANT: middleware is now (Handler) -> Handler.
+# Each built-in inspects h.kind and returns a new handler with the same kind.
+
+let mwRecover = fun(_: Null) -> Any do
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let r = try(fun(_: Null) do h.call(req, res) end)
+					if not r.ok then
+						printf("panic: %s\n", [r.error])
+						res.status(500).setHeader("Content-Type", "text/plain").write("internal error")
+						res.end(null)
+					end
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let r2 = try(fun(_: Null) do h.call(req) end)
+					if not r2.ok then
+						printf("panic: %s\n", [r2.error])
+						return text(500, "internal error")
+					end
+					r2.value
+				end
+			}
+		end
+		fail("invalid handler kind in mwRecover")
+	end
+end
+
+let mwRequestID = fun(headerName: Str) -> Any do
+	let name = headerName
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let id = if mapHas(req.headers, name) and req.headers[name] != null then req.headers[name] else sprintf("r-%d", [nowNanos()]) end
+					req.headers[name] = id
+					res.setHeader(name, id)
+					h.call(req, res)
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let id2 = if mapHas(req.headers, name) and req.headers[name] != null then
+						req.headers[name]
+					else
+						sprintf("r-%d", [nowNanos()])
+					end
+					req.headers[name] = id2
+
+					let out = h.call(req)
+					if out == null then
+						return out
+					end
+
+					# If it's already a response map, inject the header and pass through.
+					if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+						out.headers[name] = id2
+						return out
+					end
+
+					# Implicit JSON case: wrap into a response so we can add the header.
+					let resp = json(200, out)
+					resp.headers[name] = id2
+					return resp
+				end
+			}
+		end
+		fail("invalid handler kind in mwRequestID")
+	end
+end
+
+let mwTimeout = fun(ms: Int) -> Any do
+	let dur = ms
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					let pWorker = procSpawn(fun(_: Null) -> {} do h.call(req, res) end)
+					let pTimer = procSpawn(fun(_: Null) -> {} do
+						let t = timerAfter(dur)
+						chanRecv(t)
+						{ timeout: true }
+					end)
+					let r = procJoinAny([pWorker, pTimer])
+					let timedOut = isType(r.value, type {timeout!: Bool}) and bool(r.value.timeout)
+					if timedOut then
+						res.status(504).setHeader("Content-Type", "text/plain").write("timeout")
+						res.end(null)
+						procCancel(pWorker)
+					else
+						procCancel(pTimer)
+					end
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					let pWorker = procSpawn(fun(_: Null) -> {} do h.call(req) end)
+					let pTimer = procSpawn(fun(_: Null) -> {} do
+						let t = timerAfter(dur)
+						chanRecv(t)
+						{ timeout: true }
+					end)
+					let r = procJoinAny([pWorker, pTimer])
+					let timedOut = isType(r.value, type {timeout!: Bool}) and bool(r.value.timeout)
+					if timedOut then
+						procCancel(pWorker)
+						return text(504, "timeout")
+					end
+					procCancel(pTimer)
+					r.value
+				end
+			}
+		end
+		fail("invalid handler kind in mwTimeout")
+	end
+end
+
+let mwCors = fun(opts: {}) -> Any do
+	let origin = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
+	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
+	let allowH = if mapHas(opts, "headers") and opts.headers != null then join(opts.headers, ", ") else "Content-Type, Authorization" end
+	let creds = if mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials) then "true" else "false" end
+
+	return fun(h) do
+		if h.kind == "stream" then
+			return {
+				kind: "stream",
+				call: fun(req, res) -> Null do
+					res.setHeader("Access-Control-Allow-Origin", origin)
+					res.setHeader("Access-Control-Allow-Methods", methods)
+					res.setHeader("Access-Control-Allow-Headers", allowH)
+					res.setHeader("Access-Control-Allow-Credentials", creds)
+					if req.method == "OPTIONS" then
+						res.status(204).end(null)
+						return null
+					end
+					h.call(req, res)
+					null
+				end
+			}
+		elif h.kind == "value" then
+			return {
+				kind: "value",
+				call: fun(req: Request) -> Any? do
+					if req.method == "OPTIONS" then
+						return noContent(null)
+					end
+					let v = h.call(req)
+					if v == null then return v end
+					if isType(v, type {status!: Int, headers!: {}, body!: Str}) then
+						v.headers["Access-Control-Allow-Origin"] = origin
+						v.headers["Access-Control-Allow-Methods"] = methods
+						v.headers["Access-Control-Allow-Headers"] = allowH
+						v.headers["Access-Control-Allow-Credentials"] = creds
+					end
+					v
+				end
+			}
+		end
+		fail("invalid handler kind in mwCors")
+	end
+end
+
+# =========================
+# Server lifecycle (stub)
+# =========================
+
+let serve = fun(listener, r, opts: {}) -> {}? do
+	return null # <serve not implemented: transport layer TBD>
+end
+
+let shutdown = fun(server, timeoutMs: Int?) -> Bool do
+	true
+end
+
+# =========================
+# Tiny docs (optional)
+# =========================
+
+let openapi = fun(r) -> {}? do
+	if not (mapHas(r, "_dump")) then
+		return null # <not a router>
+	end
+	let dump = r._dump()
+	let rs = []
+	for rr in dump.routes do
+		rs = rs + [{ method: rr.method, pattern: rr.pattern, streaming: rr.kind == "stream" }]
+	end
+	{ routes: rs }
 end

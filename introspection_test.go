@@ -200,7 +200,7 @@ func Test_Introspection_Fun_UserConstructor(t *testing.T) {
 }
 
 func Test_Introspection_Type_AsConstructor(t *testing.T) {
-	tv := TypeVal(S{"array", S{"id", "Int"}}) // Type value
+	tv := TypeValIn(S{"array", S{"id", "Int"}}, NewEnv(nil)) // pinned env
 	got := IxReflect(tv)
 	want := vArray(
 		vStr("type"),
@@ -664,7 +664,7 @@ func Test_Introspection_Reflect_Annotation_OnFunAndModule(t *testing.T) {
 }
 
 func Test_Introspection_Reflect_Type_WithEnum(t *testing.T) {
-	tv := TypeVal(S{"enum", S{"int", int64(1)}, S{"str", "a"}})
+	tv := TypeValIn(S{"enum", S{"int", int64(1)}, S{"str", "a"}}, NewEnv(nil))
 	got := IxReflect(tv)
 	want := vArray(
 		vStr("type"),

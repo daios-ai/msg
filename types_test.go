@@ -771,27 +771,25 @@ func Test_Types_IsType_Map_SelfCycle_NoHang(t *testing.T) {
 func Test_Types_ResolveType_FunctionalCycle_NoHang(t *testing.T) {
 	ip := newIP()
 
-	// Recursive alias: F = Int -> F
-	if _, err := ip.EvalPersistentSource("let F = type Int -> F"); err != nil {
+	// F = Int -> F
+	if _, err := ip.EvalPersistentSource(`let F = type Int -> F`); err != nil {
 		t.Fatalf("setup error: %v", err)
 	}
 
-	// Resolving "F" should terminate and yield a function node whose return
-	// still contains the unresolved id "F" (cycle guarded).
+	// Public ResolveType(id) now returns an alias node.
 	res := ip.ResolveType(typeS(t, ip, `F`), ip.Global)
+	if len(res) < 2 || res[0].(string) != "alias" {
+		t.Fatalf("expected alias node, got %#v", res)
+	}
 
-	if len(res) < 4 || res[0].(string) != "binop" || res[1].(string) != "->" {
-		t.Fatalf("expected resolved F to be a function type, got %#v", res)
+	// Quick sanity: payload is a *TypeValue whose AST is "Int -> F".
+	tv, ok := res[1].(*TypeValue)
+	if !ok || tv == nil {
+		t.Fatalf("expected *TypeValue payload, got %#v", res[1])
 	}
-	// Check param == Int
-	param := res[2].(S)
-	if !isId(param, "Int") {
-		t.Fatalf("expected param Int, got %#v", param)
-	}
-	// Return should still reference id "F" (not infinitely expanded).
-	ret := res[3].(S)
-	if !(len(ret) >= 2 && ret[0].(string) == "id" && ret[1].(string) == "F") {
-		t.Fatalf("expected return to be id F (cycle-guarded), got %#v", ret)
+	ast := tv.Ast
+	if !(len(ast) >= 4 && ast[0].(string) == "binop" && ast[1].(string) == "->") {
+		t.Fatalf("alias AST should be a function type, got %#v", ast)
 	}
 }
 
@@ -879,5 +877,216 @@ mk()
 	typ := typeS(t, ip, `T`)
 	if !ip.isType(v, typ, ip.Global) {
 		t.Fatalf("expected mk() to yield value of type T, got %#v", v)
+	}
+}
+
+func Test_Types_ModuleAlias_SubtypingAcrossModules(t *testing.T) {
+	ip := newIP()
+
+	src := `
+let M = module "M" do
+  let A = type { x!: Int }
+  let S = type A -> Any
+end
+
+let N = module "N" do
+  let A = M.A        # re-export under a new module
+  let S = M.S
+end
+`
+	_ = evalWithIP(t, ip, src)
+
+	mS := typeS(t, ip, `M.S`)
+	nS := typeS(t, ip, `N.S`)
+
+	// Should be equivalent via alias pointer identity.
+	if !equalS(ip.resolveType(mS, ip.Global), ip.resolveType(nS, ip.Global)) {
+		t.Fatalf("expected resolveType(M.S) == resolveType(N.S)")
+	}
+	if !ip.isSubtype(mS, nS, ip.Global) || !ip.isSubtype(nS, mS, ip.Global) {
+		t.Fatalf("expected M.S and N.S to be mutual subtypes")
+	}
+}
+
+func Test_Types_Module_QualifiedType_Equals_Local(t *testing.T) {
+	src := `
+let M = module "M" do
+  let T = type { v!: Int }
+  let use = fun(x: T) -> Int do
+    x.v
+  end
+end
+
+# Local alias path (control)
+let T = M.T
+let ok = fun(x: T) -> Int do M.use(x) end
+ok({v: 1})
+
+# Qualified path must be accepted by callee expecting local T
+let boom = fun(x: M.T) -> Int do M.use(x) end
+boom({v: 2})
+`
+	wantInt(t, evalSrc(t, src), 2)
+}
+
+func Test_Types_QualifiedType_Alias_Outside_Module(t *testing.T) {
+	src := `
+let M = module "M" do
+  let T = type { v!: Int }
+  let use = fun(x: T) -> Int do x.v end
+end
+
+# Alias M.T into caller scope; should behave exactly like local T
+let N_T = M.T
+let f = fun(x: N_T) -> Int do M.use(x) end
+f({v: 3})
+`
+	wantInt(t, evalSrc(t, src), 3)
+}
+
+func Test_Types_QualifiedType_Unknown_Export_Errors_Nicely(t *testing.T) {
+	src := `
+let M = module "M" do
+  let T = type { v!: Int }
+end
+
+let f = fun(x: M.U) -> Int do 0 end
+f({v: 1})
+`
+	err := evalSrcExpectError(t, src)
+	// Accept either the property lookup error OR the parameter type-mismatch path.
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "unknown property") && !strings.Contains(msg, "type mismatch") {
+		t.Fatalf("want error mentioning unknown property or type mismatch, got: %v", err)
+	}
+}
+
+// --- module aliases & recursive types ---------------------------------------
+
+func Test_Types_ModuleAlias_EqualityAndSubtype(t *testing.T) {
+	ip := newIP()
+
+	// Make the module persistent so later evals & typeS can see M.
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+end`); err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+
+	// Local alias of the exported type in Global (also persistent).
+	if _, err := ip.EvalPersistentSource(`let A = M.A`); err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+
+	// Types as written
+	tMod := typeS(t, ip, `M.A`)
+	tLocal := typeS(t, ip, `A`)
+
+	// They should be structurally equal under alias canonicalization…
+	if !equalS(ip.resolveType(tMod, ip.Global), ip.resolveType(tLocal, ip.Global)) {
+		t.Fatalf("expected resolveType(M.A) == resolveType(A)")
+	}
+
+	// …and mutually subtypes.
+	if !ip.isSubtype(tMod, tLocal, ip.Global) || !ip.isSubtype(tLocal, tMod, ip.Global) {
+		t.Fatalf("expected M.A and local A to be mutual subtypes")
+	}
+}
+
+func Test_Types_ModuleQualified_RecursiveParams_Accepts(t *testing.T) {
+	ip := newIP()
+
+	// Define M persistently so later calls see it.
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+  let B = type { k: Null -> B }     # recursive
+  let S = type A -> B -> Null
+  let t = fun(h: S) -> Bool do true end
+end`); err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+
+	// a function using fully-qualified params must satisfy M.S without local aliasing
+	evalWithIP(t, ip, `
+let f1 = fun(a: M.A, b: M.B) -> Null do null end
+M.t(f1)
+`)
+}
+
+func Test_Types_InlineFunctionType_ExportedParam(t *testing.T) {
+	ip := newIP()
+
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+  let w = fun(h: A -> Any) -> Bool do true end
+end`); err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+
+	// Return Any? is fine when the param expects Any (covariant returns)
+	evalWithIP(t, ip, `
+let f = fun(a: M.A) -> Any? do 0 end
+M.w(f)
+`)
+}
+
+func Test_Types_Function_IsType_WithModuleAliases(t *testing.T) {
+	ip := newIP()
+
+	// Persist the module first so typeS("M.S") can resolve it later.
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+  let B = type { k: Null -> B }
+  let S = type A -> B -> Null
+end`); err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+
+	// Produce a function value referencing M.A/M.B in a regular (ephemeral) run.
+	fv := evalWithIP(t, ip, `
+fun(a: M.A, b: M.B) -> Null do null end
+`)
+
+	// Expected type is the exported alias M.S (A -> B -> Null) — typeS uses EvalSource,
+	// which now resolves against Global where M is bound.
+	ts := typeS(t, ip, `M.S`)
+
+	if !ip.isType(fv, ts, ip.Global) {
+		t.Fatalf("expected function (a:M.A,b:M.B)->Null to conform to type M.S")
+	}
+}
+
+func Test_Types_ModuleAlias_ReexportViaGlobalAlias(t *testing.T) {
+	ip := newIP()
+
+	// We cannot refer to M *inside* another module body (module env sees Core only),
+	// so "re-export" by making Global aliases that mirror M's exports.
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+  let S = type A -> Any
+end
+let A2 = M.A
+let S2 = M.S
+`); err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+
+	// Compare the exported type with its Global alias.
+	mS := typeS(t, ip, `M.S`)
+	gS := typeS(t, ip, `S2`)
+
+	// Exact alias-pointer equality (equalS on resolved nodes) should hold for a direct alias.
+	if !equalS(ip.resolveType(mS, ip.Global), ip.resolveType(gS, ip.Global)) {
+		t.Fatalf("expected resolveType(M.S) == resolveType(S2)")
+	}
+
+	// And they’re mutual subtypes.
+	if !ip.isSubtype(mS, gS, ip.Global) || !ip.isSubtype(gS, mS, ip.Global) {
+		t.Fatalf("expected M.S and S2 to be mutual subtypes")
 	}
 }

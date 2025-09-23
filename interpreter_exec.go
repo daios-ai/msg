@@ -637,8 +637,12 @@ func (e *emitter) addContJump(at int) {
 // helpers for loops/blocks persisting "last" value
 func (e *emitter) preloadAssignToLast(lastName string) {
 	e.emit(opLoadGlobal, e.ks("__assign_set"))
-	e.emit(opConst, e.k(TypeVal(S{"id", lastName})))
+	// Build Type("id", lastName) at instantiation time with the current env.
+	e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+	e.emit(opConst, e.k(HandleVal("type-ast", S{"id", lastName})))
+	e.emit(opCall, 1)
 }
+
 func (e *emitter) saveLastAndJumpHead(head int) {
 	e.emit(opCall, 2)
 	e.emit(opPop, 0)
@@ -670,15 +674,9 @@ func (e *emitter) callBuiltin(name string, args ...S) {
 
 func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S, basePath NodePath) {
 	namesArr := make([]Value, 0, max(0, len(params)-1))
-	typesArr := make([]Value, 0, max(0, len(params)-1))
 	for i := 1; i < len(params); i++ {
 		p := params[i].(S)
 		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
-		t := p[2].(S)
-		if len(t) == 0 {
-			t = S{"id", "Any"}
-		}
-		typesArr = append(typesArr, TypeVal(t))
 	}
 	if len(retT) == 0 {
 		retT = S{"id", "Any"}
@@ -688,12 +686,23 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 		e.emit(opConst, e.k(v))
 	}
 	e.emit(opMakeArr, uint32(len(namesArr)))
-	for _, v := range typesArr {
-		e.emit(opConst, e.k(v))
+
+	// Build the param types at runtime via ("type", …) so they capture env.
+	typeCount := 0
+	for i := 1; i < len(params); i++ {
+		t := params[i].(S)[2].(S) // may be empty
+		if len(t) == 0 {
+			t = S{"id", "Any"}
+		}
+		e.emitExpr(S{"type", t})
+		typeCount++
 	}
-	e.emit(opMakeArr, uint32(len(typesArr)))
-	e.emit(opConst, e.k(TypeVal(retT)))
-	e.emit(opConst, e.k(TypeVal(bodyCarrier)))
+	e.emit(opMakeArr, uint32(typeCount))
+
+	// Return and body types (env-pinned)
+	e.emitExpr(S{"type", retT})
+	e.emitExpr(S{"type", bodyCarrier})
+
 	e.emit(opConst, e.k(Bool(isOracle)))
 	e.emitExpr(examples)
 	for _, idx := range basePath {
@@ -738,9 +747,6 @@ func (e *emitter) emitExpr(n S) {
 
 	// ----- blocks -----
 	case "block":
-		// IMPORTANT: Use ORIGINAL child indices for NodePath; do not compact
-		// after skipping noopish nodes. Keep a separate 'emitted' counter only
-		// to decide when to pop.
 		e.pushBlockCtx()
 		emitted := 0
 		for j := 1; j < len(n); j++ {
@@ -828,14 +834,12 @@ func (e *emitter) emitExpr(n S) {
 		case "==":
 			e.withChild(1, func() { e.emitExpr(a) })
 			e.withChild(2, func() { e.emitExpr(b) })
-			// Comparisons rarely fail, but we still enforce the "mark RHS before op" rule.
 			e.emitWithMarkChild(opEq, 2, 0)
 		case "!=":
 			e.withChild(1, func() { e.emitExpr(a) })
 			e.withChild(2, func() { e.emitExpr(b) })
 			e.emitWithMarkChild(opNe, 2, 0)
 		case "+":
-			// Lower to builtin __plus; blame RHS.
 			e.emit(opLoadGlobal, e.ks("__plus"))
 			e.withChild(1, func() { e.emitExpr(a) })
 			e.withChild(2, func() { e.emitExpr(b) })
@@ -851,12 +855,10 @@ func (e *emitter) emitExpr(n S) {
 		case "/":
 			e.withChild(1, func() { e.emitExpr(a) })
 			e.withChild(2, func() { e.emitExpr(b) })
-			// divide-by-zero etc. blame RHS
 			e.emitWithMarkChild(opDiv, 2, 0)
 		case "%":
 			e.withChild(1, func() { e.emitExpr(a) })
 			e.withChild(2, func() { e.emitExpr(b) })
-			// modulo-by-zero blame RHS
 			e.emitWithMarkChild(opMod, 2, 0)
 		case "<":
 			e.withChild(1, func() { e.emitExpr(a) })
@@ -887,7 +889,10 @@ func (e *emitter) emitExpr(n S) {
 			opName = "__assign_def"
 		}
 		e.emit(opLoadGlobal, e.ks(opName))
-		e.emit(opConst, e.k(TypeVal(lhs)))
+		// Build the LHS type at runtime (pinned).
+		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+		e.emit(opConst, e.k(HandleVal("type-ast", lhs)))
+		e.emit(opCall, 1)
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
 		e.callWithMarkChild(2, 0)
@@ -1071,9 +1076,12 @@ func (e *emitter) emitExpr(n S) {
 
 		head := e.here()
 
-		// tmp = iter(Null) — do NOT re-mark iterExpr here to preserve 1:1 mark rule.
+		// tmp = iter(Null)
 		e.emit(opLoadGlobal, e.ks("__assign_set"))
-		e.emit(opConst, e.k(TypeVal(S{"id", tmpName})))
+		// Type(tmpName) pinned at runtime
+		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+		e.emit(opConst, e.k(HandleVal("type-ast", S{"id", tmpName})))
+		e.emit(opCall, 1)
 		e.emit(opLoadGlobal, e.ks(iterName))
 		e.emit(opConst, e.k(Null))
 		e.emit(opCall, 1) // iter(Null)
@@ -1125,19 +1133,24 @@ func (e *emitter) emitExpr(n S) {
 
 	// ----- type / module / annot -----
 	case "type":
-		e.emit(opConst, e.k(TypeVal(n[1].(S))))
+		// Lower to: __type_from_ast(<handle carrying AST>), pinning env at runtime.
+		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+		e.emit(opConst, e.k(HandleVal("type-ast", n[1].(S))))
+		e.emit(opCall, 1)
 
 	case "module":
 		// Lower to: __make_module(nameExpr, Type(bodyAst), basePathArray)
 		e.emit(opLoadGlobal, e.ks("__make_module"))
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		e.emit(opConst, e.k(TypeVal(n[2].(S))))
+		// Build a pinned Type from the module body AST.
+		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+		e.emit(opConst, e.k(HandleVal("type-ast", n[2].(S))))
+		e.emit(opCall, 1)
 		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, body) → body at child #1
 		for _, idx := range absBase {
 			e.emit(opConst, e.k(Int(int64(idx))))
 		}
 		e.emit(opMakeArr, uint32(len(absBase)))
-		// The call itself is not expected to fail at the callsite; no mark needed.
 		e.emit(opCall, 3)
 
 	case "annot":
@@ -1159,7 +1172,10 @@ func (e *emitter) emitExpr(n S) {
 				opName = "__assign_def"
 			}
 			e.emit(opLoadGlobal, e.ks(opName))
-			e.emit(opConst, e.k(TypeVal(lhs)))
+			// Type(lhs), pinned
+			e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+			e.emit(opConst, e.k(HandleVal("type-ast", lhs)))
+			e.emit(opCall, 1)
 			e.emit(opLoadGlobal, e.ks("__annotate"))
 			e.emit(opConst, e.k(Str(text)))
 			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
@@ -1180,7 +1196,10 @@ func (e *emitter) emitExpr(n S) {
 					opName = "__assign_def"
 				}
 				e.emit(opLoadGlobal, e.ks(opName))
-				e.emit(opConst, e.k(TypeVal(subj)))
+				// Type(subj), pinned
+				e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+				e.emit(opConst, e.k(HandleVal("type-ast", subj)))
+				e.emit(opCall, 1)
 				e.emit(opLoadGlobal, e.ks("__annotate"))
 				e.emit(opConst, e.k(Str(text)))
 				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS

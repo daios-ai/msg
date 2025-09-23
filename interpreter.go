@@ -283,10 +283,6 @@ type TypeValue struct {
 	Env *Env
 }
 
-// TypeVal builds a VTType from a type expression AST (without pinning an env).
-// Resolution will default to Core/Global when used.
-func TypeVal(expr S) Value { return Value{Tag: VTType, Data: &TypeValue{Ast: expr}} }
-
 // TypeValIn builds a VTType and pins its resolution environment explicitly.
 // Use this when exporting user-defined types from specific scopes.
 func TypeValIn(expr S, env *Env) Value {

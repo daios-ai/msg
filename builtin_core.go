@@ -158,7 +158,7 @@ Returns:
 		S{"id", "Type"},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			x := ctx.MustArg("x")
-			return TypeVal(ip.ValueToType(x, ctx.Env()))
+			return TypeValIn(ip.ValueToType(x, ctx.Env()), ctx.Env())
 		},
 	)
 	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.

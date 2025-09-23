@@ -41,7 +41,7 @@ func Test_Schema_MSPrimitives_ToJSON(t *testing.T) {
 		{S{"id", "Type"}, map[string]any{}}, // widened
 	}
 	for _, c := range cases {
-		got := ip.TypeValueToJSONSchema(TypeVal(c.t), env)
+		got := ip.TypeValueToJSONSchema(TypeValIn(c.t, env), env)
 		// strip $defs if present
 		delete(got, "$defs")
 		if !reflect.DeepEqual(got, c.j) {
@@ -56,7 +56,7 @@ func Test_Schema_MSNullable_ToJSON(t *testing.T) {
 
 	// Primitive nullable uses type: ["<t>", "null"]
 	prim := S{"unop", "?", S{"id", "Int"}}
-	got := ip.TypeValueToJSONSchema(TypeVal(prim), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(prim, env), env)
 	delete(got, "$defs")
 	want := map[string]any{"type": []any{"integer", "null"}}
 	if !reflect.DeepEqual(got, want) {
@@ -65,7 +65,7 @@ func Test_Schema_MSNullable_ToJSON(t *testing.T) {
 
 	// Complex nullable uses anyOf
 	complex := S{"unop", "?", S{"array", S{"id", "Str"}}}
-	got = ip.TypeValueToJSONSchema(TypeVal(complex), env)
+	got = ip.TypeValueToJSONSchema(TypeValIn(complex, env), env)
 	delete(got, "$defs")
 	_, okType := got["anyOf"]
 	if !okType {
@@ -78,7 +78,7 @@ func Test_Schema_MSArray_ToJSON(t *testing.T) {
 	env := NewEnv(nil)
 
 	tarr := S{"array", S{"id", "Num"}}
-	got := ip.TypeValueToJSONSchema(TypeVal(tarr), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(tarr, env), env)
 	delete(got, "$defs")
 	want := map[string]any{"type": "array", "items": map[string]any{"type": "number"}}
 	if !reflect.DeepEqual(got, want) {
@@ -87,7 +87,7 @@ func Test_Schema_MSArray_ToJSON(t *testing.T) {
 
 	// Missing element type -> items: {}
 	tarr2 := S{"array"}
-	got = ip.TypeValueToJSONSchema(TypeVal(tarr2), env)
+	got = ip.TypeValueToJSONSchema(TypeValIn(tarr2, env), env)
 	delete(got, "$defs")
 	want = map[string]any{"type": "array", "items": map[string]any{}}
 	if !reflect.DeepEqual(got, want) {
@@ -103,7 +103,7 @@ func Test_Schema_MSObject_ToJSON(t *testing.T) {
 		S{"pair", S{"str", "name"}, S{"id", "Str"}},
 		S{"pair!", S{"str", "age"}, S{"id", "Int"}},
 	}
-	got := ip.TypeValueToJSONSchema(TypeVal(tobj), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(tobj, env), env)
 	delete(got, "$defs")
 	props := map[string]any{
 		"name": map[string]any{"type": "string"},
@@ -131,7 +131,7 @@ func Test_Schema_MSEnum_ToJSON(t *testing.T) {
 		S{"array", S{"int", int64(3)}},
 		S{"map", S{"pair", S{"str", "k"}, S{"bool", true}}},
 	}
-	got := ip.TypeValueToJSONSchema(TypeVal(tenum), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(tenum, env), env)
 	delete(got, "$defs")
 	// Only check that it's an enum with the right length and some key shapes.
 	ev, ok := got["enum"].([]any)
@@ -149,9 +149,9 @@ func Test_Schema_MSAlias_ToJSON_WithDefs(t *testing.T) {
 		S{"pair!", S{"str", "name"}, S{"id", "Str"}},
 		S{"pair", S{"str", "friend"}, S{"unop", "?", S{"id", "User"}}},
 	}
-	env.Define("User", TypeVal(user))
+	env.Define("User", TypeValIn(user, env))
 
-	root := ip.TypeValueToJSONSchema(TypeVal(S{"id", "User"}), env)
+	root := ip.TypeValueToJSONSchema(TypeValIn(S{"id", "User"}, env), env)
 
 	// Expect root: {"$ref":"#/$defs/User", "$defs": { "User": {type:"object", ...} } }
 	if ref, ok := root["$ref"].(string); !ok || ref != "#/$defs/User" {
@@ -190,7 +190,7 @@ func Test_Schema_MSFunction_ToJSON_Widens(t *testing.T) {
 	ip := NewInterpreter()
 	env := NewEnv(nil)
 	fn := S{"binop", "->", S{"id", "Int"}, S{"id", "Str"}}
-	got := ip.TypeValueToJSONSchema(TypeVal(fn), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(fn, env), env)
 	delete(got, "$defs")
 	if len(got) != 0 {
 		t.Fatalf("function should widen to empty schema, got %#v", got)
@@ -417,7 +417,7 @@ func Test_Schema_Roundtrip_MS_to_JSON_to_MS(t *testing.T) {
 		S{"pair!", S{"str", "id"}, S{"id", "Int"}},
 		S{"pair", S{"str", "tags"}, S{"array", S{"id", "Str"}}},
 	}
-	js := ip.TypeValueToJSONSchema(TypeVal(ms), env)
+	js := ip.TypeValueToJSONSchema(TypeValIn(ms, env), env)
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	// We expect equal shape (order-insensitive by our equality)
 	if !equalS(got, ms) {
@@ -537,10 +537,10 @@ func Test_Schema_Alias_Roundtrip_Smoke(t *testing.T) {
 		S{"pair!", S{"str", "id"}, S{"id", "Int"}},
 		S{"pair", S{"str", "child"}, S{"unop", "?", S{"id", "Order"}}},
 	}
-	env.Define("Order", TypeVal(order))
+	env.Define("Order", TypeValIn(order, env))
 
 	// MS -> JSON ($defs) -> MS
-	js := ip.TypeValueToJSONSchema(TypeVal(S{"id", "Order"}), env)
+	js := ip.TypeValueToJSONSchema(TypeValIn(S{"id", "Order"}, env), env)
 	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 
 	// The top-level will typically be ("id","Order") due to $ref handling
@@ -711,7 +711,7 @@ func Test_Schema_Annot_TopLevel_JSONDescription(t *testing.T) {
 		},
 	}
 
-	js := ip.TypeValueToJSONSchema(TypeVal(ms), ip.Global) // js is map[string]any
+	js := ip.TypeValueToJSONSchema(TypeValIn(ms, ip.Global), ip.Global) // js is map[string]any
 
 	if desc, _ := js["description"].(string); desc != "type for a person" {
 		t.Fatalf("missing/incorrect root description: %v", js["description"])
@@ -758,9 +758,9 @@ func Test_Schema_AliasDescriptions_In_Defs(t *testing.T) {
 	hobbiesAst := S{"array", S{"id", "Str"}}
 	statusAst := S{"enum", S{"str", "ready"}, S{"str", "running"}, S{"str", "done"}}
 
-	env.Define("User", withAnnot(TypeVal(userAst), "A user record."))
-	env.Define("Hobbies", withAnnot(TypeVal(hobbiesAst), "Hobbies."))
-	env.Define("Status", withAnnot(TypeVal(statusAst), "Status of execution."))
+	env.Define("User", withAnnot(TypeValIn(userAst, env), "A user record."))
+	env.Define("Hobbies", withAnnot(TypeValIn(hobbiesAst, env), "Hobbies."))
+	env.Define("Status", withAnnot(TypeValIn(statusAst, env), "Status of execution."))
 
 	// Ask for a schema of something that references all three aliases.
 	root := S{"map",
@@ -768,7 +768,7 @@ func Test_Schema_AliasDescriptions_In_Defs(t *testing.T) {
 		S{"pair!", S{"str", "h"}, S{"id", "Hobbies"}},
 		S{"pair!", S{"str", "output"}, S{"id", "Status"}},
 	}
-	got := ip.TypeValueToJSONSchema(TypeVal(root), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(root, env), env)
 
 	defs, ok := got["$defs"].(map[string]any)
 	if !ok {
@@ -820,7 +820,7 @@ func Test_Schema_MapKeyAnnotation_To_PropertyDescription(t *testing.T) {
 			S{"id", "Int"},
 		},
 	}
-	got := ip.TypeValueToJSONSchema(TypeVal(typ), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(typ, env), env)
 	props := got["properties"].(map[string]any)
 	age := props["age"].(map[string]any)
 	if desc, _ := age["description"].(string); desc != "Age in years." {
@@ -837,13 +837,13 @@ func Test_Schema_NullableAlias_AnyOf_With_Ref(t *testing.T) {
 
 	// Status alias (enum) with description.
 	statusAst := S{"enum", S{"str", "ready"}, S{"str", "running"}, S{"str", "done"}}
-	env.Define("Status", withAnnot(TypeVal(statusAst), "Status of execution."))
+	env.Define("Status", withAnnot(TypeValIn(statusAst, env), "Status of execution."))
 
 	// Use Status? (nullable) as a field type.
 	root := S{"map",
 		S{"pair!", S{"str", "result"}, S{"unop", "?", S{"id", "Status"}}},
 	}
-	got := ip.TypeValueToJSONSchema(TypeVal(root), env)
+	got := ip.TypeValueToJSONSchema(TypeValIn(root, env), env)
 
 	// result should be {"anyOf":[{"$ref":"#/$defs/Status"}, {"type":"null"}]}
 	props := got["properties"].(map[string]any)

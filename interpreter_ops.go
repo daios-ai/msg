@@ -159,7 +159,29 @@ func (o *opsImpl) initCore() {
 		func(ctx CallCtx) Value {
 			t := ctx.MustArg("t")
 			resolved := ip.resolveTypeValue(t, ctx.Env())
-			return TypeVal(resolved)
+			// Always return a pinned Type; never emit env-less types.
+			return TypeValIn(resolved, ctx.Env())
+		})
+
+	// __type_from_ast(ast: Any-handle) -> Type
+	// Build a Type at *instantiation* time from a serialized S-expression,
+	// pinning it to the current lexical environment (like closures do).
+	reg("__type_from_ast",
+		[]ParamSpec{{"ast", S{"id", "Any"}}}, S{"id", "Type"},
+		func(ctx CallCtx) Value {
+			h := ctx.MustArg("ast")
+			if h.Tag != VTHandle {
+				return errNull("__type_from_ast: expected internal type-ast handle")
+			}
+			hd := h.Data.(*Handle)
+			if hd == nil || hd.Kind != "type-ast" {
+				return errNull("__type_from_ast: bad handle kind")
+			}
+			s, ok := hd.Data.(S)
+			if !ok {
+				return errNull("__type_from_ast: payload not a type AST")
+			}
+			return TypeValIn(s, ctx.Env())
 		})
 
 	// __annotate(text: Str, v: Any) -> Any
@@ -319,7 +341,7 @@ func (o *opsImpl) initCore() {
 			}
 			typeVals := make([]Value, len(types))
 			for i, t := range types {
-				typeVals[i] = TypeVal(t)
+				typeVals[i] = TypeValIn(t, closure)
 			}
 			closure.Define("$__sig_names", Arr(nameVals))
 			closure.Define("$__sig_types", Arr(typeVals))

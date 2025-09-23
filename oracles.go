@@ -111,7 +111,7 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	inTypesVal := Arr(func() []Value {
 		arr := make([]Value, len(declTypes))
 		for i := range declTypes {
-			arr[i] = TypeVal(declTypes[i])
+			arr[i] = TypeValIn(declTypes[i], f.Env)
 		}
 		return arr
 	}())
@@ -129,7 +129,7 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 		instructionVal,
 		inArgsVal,
 		inTypesVal,
-		TypeVal(outBoxTypeS),
+		TypeValIn(outBoxTypeS, f.Env),
 		examplesVal,
 		f.Env,
 	)
@@ -214,7 +214,7 @@ func (ip *Interpreter) buildOraclePrompt(
 		}
 		return string(b)
 	}
-	inputSchema := toSchemaString(TypeVal(inMapTypeS))
+	inputSchema := toSchemaString(TypeValIn(inMapTypeS, env))
 	outputSchema := toSchemaString(outType)
 
 	// JSON stringifier (with spaces after ":" and ",").

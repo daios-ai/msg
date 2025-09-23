@@ -151,7 +151,7 @@ Returns:
 			doc, ok := gv.(map[string]any)
 			if !ok {
 				// Not a JSON object: widen gracefully (soft behavior rather than hard failure)
-				return TypeVal(S{"id", "Any"})
+				return TypeValIn(S{"id", "Any"}, ctx.Env())
 			}
 
 			// Convert the root to a Type value (keeps top-level description in Annot).
@@ -162,7 +162,7 @@ Returns:
 				for name, defRaw := range defs {
 					if defObj, ok := defRaw.(map[string]any); ok {
 						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
-						ctx.Env().Define(name, TypeVal(s))
+						ctx.Env().Define(name, TypeValIn(s, ctx.Env()))
 					}
 				}
 			}
@@ -202,7 +202,7 @@ Returns:
 				return annotNull(err.Error())
 			}
 			// Convert **value-centrically** to ensure annotations propagate.
-			js := ip.TypeValueToJSONSchema(TypeVal(s), ctx.Env())
+			js := ip.TypeValueToJSONSchema(TypeValIn(s, ctx.Env()), ctx.Env())
 			return goJSONToValue(js)
 		},
 	)
@@ -235,7 +235,7 @@ Returns:
 				for name, defRaw := range defs {
 					if defObj, ok := defRaw.(map[string]any); ok {
 						s := ip.schemaNodeToMSType(defObj, doc, map[string]bool{})
-						ctx.Env().Define(name, TypeVal(s))
+						ctx.Env().Define(name, TypeValIn(s, ctx.Env()))
 					}
 				}
 			}

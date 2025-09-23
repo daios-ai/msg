@@ -638,12 +638,13 @@ func Test_Printer_Oracle_Rendering(t *testing.T) {
 
 func Test_Printer_Type_Rendering(t *testing.T) {
 	// { age: Int, name: Str } — order is sorted by printer
+	env := NewEnv(nil)
 	typ := S{
 		"map",
 		S{"pair", S{"str", "name"}, S{"id", "Str"}},
 		S{"pair", S{"str", "age"}, S{"id", "Int"}},
 	}
-	got := FormatValue(TypeVal(typ))
+	got := FormatValue(TypeValIn(typ, env))
 	want := "<type: {age: Int, name: Str}>"
 	if got != want {
 		t.Fatalf("type rendering mismatch:\n got:  %q\n want: %q", got, want)
@@ -707,7 +708,8 @@ func Test_Printer_Handle_Rendering(t *testing.T) {
 }
 
 func Test_Printer_Value_Type_EmptyObject_NoSpace(t *testing.T) {
-	got := FormatValue(TypeVal(S{"map"}))
+	env := NewEnv(nil)
+	got := FormatValue(TypeValIn(S{"map"}, env))
 	want := "<type: {}>"
 	if norm(got) != norm(want) {
 		t.Fatalf("empty object type spacing mismatch\nwant: %q\ngot:  %q", want, got)

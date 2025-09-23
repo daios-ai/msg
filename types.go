@@ -5,7 +5,7 @@
 // This file contains the *private implementation* of the type engine used by
 // the public methods on *Interpreter* that live in interpreter.go:
 //
-//	ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
+//   ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
 //
 // Those exported methods are thin wrappers that delegate to the lower-case
 // functions defined here: resolveType, isType, isSubtype, unifyTypes,
@@ -33,22 +33,32 @@
 //   - `Int <: Num`, and `T?` means nullable.
 //   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
 //     inference (e.g., arrays with mixed contents).
-//   - `ResolveType(T, env)` resolves identifiers bound to `VTType` in `env`,
-//     with cycle protection and resolution using the alias’s own environment.
-//   - Enums are finite sets of *literal* values (null/bool/int/num/str/array/map).
-//     Their typing, subtyping, and unification follow intuitive set semantics.
 //   - **Modules:** Runtime values tagged `VTModule` are treated as **maps** for
-//     all type-checking and inference purposes (they normalize via `AsMapValue`).
+//     type-checking and inference purposes (they normalize via `AsMapValue`).
 //
-// TYPE SYNTAX (as S)
-// ------------------
+// CANONICALIZATION (alias nodes)
+// ------------------------------
+// A key improvement in this implementation is *alias canonicalization*.
 //
-//	("id","Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type")
-//	("unop","?", T)                                // nullable T?
-//	("array", T)                                   // homogeneous arrays
-//	("map", ("pair" | "pair!", ("str",k), T) ...)  // object schema; "pair!" = required
-//	("enum", literalS, ...)                        // finite set of literal values
-//	("binop","->", A, B)                           // function A -> B (right-assoc)
+//  • Any non-builtin type reference (local or module-qualified) is resolved to a
+//    stable, pointer-identified alias node:   ("alias", *TypeValue)
+//
+//  • Builtin type names remain as ("id", "Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type").
+//
+//  • Structural nodes ("array", "map", "unop ?","binop ->", "enum") are resolved
+//    recursively while keeping alias nodes *opaque* — we *do not* inline-expand
+//    aliases during ResolveType. This produces a canonical, name-agnostic
+//    representation so that `M.T` and a local `T = M.T` unify by *pointer
+//    identity* of the exported `*TypeValue`.
+//
+// EQUIRECURSIVE COMPARISON
+// ------------------------
+// Both `isType` and `isSubtype` are implemented coinductively with cycle
+// breaking using memo tables keyed on:
+//   • value-pointer × type-node-pointer (for isType), and
+//   • (left-node, right-node) identity (for isSubtype),
+// augmented so that ("alias", *TypeValue) keys by the *TypeValue pointer*.
+// This makes recursive types and module-qualified aliases compare correctly.
 //
 // DEPENDENCIES (other files)
 // --------------------------
@@ -69,9 +79,9 @@
 // PUBLIC  : Nothing.
 //
 // PRIVATE : All concrete algorithms and helpers: resolveType, isType,
-//
-//	isSubtype, unifyTypes, valueToTypeS, literal conversion,
-//	structural S-equality, and field extraction.
+//           isSubtype, unifyTypes, valueToTypeS, literal conversion,
+//           structural S-equality, and field extraction.
+
 package mindscript
 
 import (
@@ -142,7 +152,9 @@ func mapTypeFields(t S) map[string]objField {
 	return fs
 }
 
-// Structural equality for S-exprs (no fmt, no allocs).
+// Structural equality for S-exprs with special cases:
+//   - "map" and "enum" stay order-insensitive as before.
+//   - NEW: ("alias", *TypeValue) compares by pointer identity.
 func equalS(a, b S) bool {
 	if len(a) != len(b) {
 		return false
@@ -160,7 +172,16 @@ func equalS(a, b S) bool {
 		return false
 	}
 
-	// Order-insensitive equality for maps: compare by field name/required/type.
+	if ta == "alias" {
+		if len(a) < 2 || len(b) < 2 {
+			return false
+		}
+		atv, ok1 := a[1].(*TypeValue)
+		btv, ok2 := b[1].(*TypeValue)
+		return ok1 && ok2 && atv == btv
+	}
+
+	// Order-insensitive equality for maps.
 	if ta == "map" {
 		fa := mapTypeFields(a)
 		fb := mapTypeFields(b)
@@ -176,7 +197,7 @@ func equalS(a, b S) bool {
 		return true
 	}
 
-	// Order-insensitive equality for enums: set comparison on literal S-exprs.
+	// Order-insensitive equality for enums.
 	if ta == "enum" {
 		if len(a) != len(b) { // quick length check
 			return false
@@ -409,11 +430,13 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 
 		case VTFun:
 			f := v.Data.(*Fun)
-			t := f.ReturnType
+			// Resolve each piece in the function's own env to avoid <type>
+			rt := ip.resolveType(f.ReturnType, f.Env)
 			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-				t = S{"binop", "->", f.ParamTypes[i], t}
+				pt := ip.resolveType(f.ParamTypes[i], f.Env)
+				rt = S{"binop", "->", pt, rt}
 			}
-			return t
+			return rt
 
 		case VTType:
 			return S{"id", "Type"}
@@ -427,117 +450,147 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 }
 
 // -----------------------------
-// Alias resolution for types
+// Alias-based canonical resolution
 // -----------------------------
 
-// resolveType walks a type S-expr and resolves identifiers using env.
-// IMPORTANT: This normalizes qualified exports like ("get", ("id","M"), ("str","T"))
-// to the SAME definition as the module-local ("id","T") inside M.
+// resolveType canonicalizes a type S-expression in env:
+//   - Builtins stay as ("id", "...").
+//   - Any non-builtin type identifier or qualified get resolves to a stable,
+//     *pointer-identified* alias node: ("alias", *TypeValue).
+//   - Structure nodes ("array", "map", "unop ?","binop ->", "enum") are
+//     recursively resolved while *keeping* alias nodes opaque (no inline
+//     expansion). This gives us a canonical, name-agnostic graph suitable for
+//     equirecursive comparison across modules.
+//
+// NOTE: By avoiding inline expansion and using ("alias", *TypeValue), two
+// references to the same exported type (e.g., M.T and a local T = M.T) become
+// literally the same anchor, regardless of spelling.
 func (ip *Interpreter) resolveType(t S, env *Env) S {
 	t = stripAnnot(t)
-	seen := map[string]bool{}
-	var go1 func(S, *Env) S
-	go1 = func(x S, e *Env) S {
-		// IMPORTANT: strip on the current node (x), not the outer t.
-		x = stripAnnot(x)
-		if len(x) == 0 {
-			return x
+	if len(t) == 0 {
+		return t
+	}
+
+	// Helper: build alias if a local name resolves to a VTType.
+	// Self-cycle guard: let T = type T  must not aliasify; keep ("id","T").
+	aliasOf := func(e *Env, name string) (S, bool) {
+		if e == nil || isBuiltinTypeName(name) {
+			return nil, false
 		}
-		switch x[0].(string) {
-		case "id":
-			name := x[1].(string)
-			if isBuiltinTypeName(name) {
-				return x
-			}
-			if seen[name] {
-				return x // guard cycles
-			}
-			if e != nil {
-				if v, err := e.Get(name); err == nil && v.Tag == VTType {
-					tv := v.Data.(*TypeValue)
-					seen[name] = true
-					defer func() { delete(seen, name) }()
-					// recurse with the alias's own env (not the caller's env)
-					return go1(tv.Ast, tv.Env)
-				}
-			}
-			return x
-		case "get":
-			// Qualified type reference: ("get", baseExpr, ("str", key))
-			if len(t) >= 3 {
-				keyNode, _ := t[2].(S)
-				if len(keyNode) >= 2 && keyNode[0].(string) == "str" {
-					key := keyNode[1].(string)
-					// Try to evaluate the base as a module binding in this env.
-					baseId, isId := t[1].(S)
-					if isId && len(baseId) >= 2 && baseId[0].(string) == "id" {
-						// get module value by name
-						if env != nil {
-							if modVal, err := env.Get(baseId[1].(string)); err == nil && modVal.Tag == VTModule {
-								// look up exported member
-								if v, ok := modVal.Data.(*Module).get(key); ok && v.Tag == VTType {
-									tv := v.Data.(*TypeValue)
-									use := tv.Env
-									if use == nil {
-										use = env
-									}
-									return ip.resolveType(tv.Ast, use)
-								}
-							}
+		v, err := e.Get(name)
+		if err != nil || v.Tag != VTType {
+			return nil, false
+		}
+		tv := v.Data.(*TypeValue)
+		root := stripAnnot(tv.Ast)
+		if len(root) >= 2 && root[0].(string) == "id" && root[1].(string) == name {
+			return nil, false
+		}
+		return S{"alias", tv}, true
+	}
+
+	switch t[0].(string) {
+	case "id":
+		if a, ok := aliasOf(env, t[1].(string)); ok {
+			return a
+		}
+		return t // builtin or unknown stays as-is
+
+	case "get":
+		// Qualified reference: ("get", baseExpr, ("str", key))
+		if len(t) >= 3 {
+			keyNode, _ := t[2].(S)
+			if len(keyNode) >= 2 && keyNode[0].(string) == "str" {
+				key := keyNode[1].(string)
+				// If base is ("id", modName) and resolves to a module, fetch member
+				if base, ok := t[1].(S); ok && len(base) >= 2 && base[0].(string) == "id" && env != nil {
+					if modVal, err := env.Get(base[1].(string)); err == nil && modVal.Tag == VTModule {
+						if v, ok := modVal.Data.(*Module).get(key); ok && v.Tag == VTType {
+							return S{"alias", v.Data.(*TypeValue)}
 						}
 					}
 				}
 			}
-			return t
-		case "unop":
-			if len(x) >= 3 && x[1].(string) == "?" {
-				return S{"unop", "?", go1(x[2].(S), e)}
-			}
-			return x
-		case "array":
-			if len(x) == 2 {
-				return S{"array", go1(x[1].(S), e)}
-			}
-			out := S{"array"}
-			for i := 1; i < len(x); i++ {
-				out = append(out, go1(x[i].(S), e))
-			}
-			return out
-		case "map":
-			out := S{"map"}
-			for i := 1; i < len(x); i++ {
-				p := x[i].(S)
-				ttag := p[0].(string)
-				key := p[1].(S)
-				typ := go1(p[2].(S), e)
-				out = append(out, S{ttag, key, typ})
-			}
-			return out
-		case "enum":
-			return x
-		case "binop":
-			if len(x) >= 4 && x[1].(string) == "->" {
-				return S{"binop", "->", go1(x[2].(S), e), go1(x[3].(S), e)}
-			}
-			return x
-		default:
-			return x
 		}
+		return t // leave unresolved get as-is
+
+	case "unop":
+		if len(t) >= 3 && t[1].(string) == "?" {
+			return S{"unop", "?", ip.resolveType(t[2].(S), env)}
+		}
+		return t
+
+	case "array":
+		if len(t) == 2 {
+			return S{"array", ip.resolveType(t[1].(S), env)}
+		}
+		out := S{"array"}
+		for i := 1; i < len(t); i++ {
+			out = append(out, ip.resolveType(t[i].(S), env))
+		}
+		return out
+
+	case "map":
+		out := S{"map"}
+		for i := 1; i < len(t); i++ {
+			p := t[i].(S) // ("pair"|"pair!", ("str",k), T)
+			tag := p[0].(string)
+			key := p[1].(S)
+			out = append(out, S{tag, key, ip.resolveType(p[2].(S), env)})
+		}
+		return out
+
+	case "enum":
+		// Enum literals stay literal; we don't resolve inside.
+		return t
+
+	case "binop":
+		if len(t) >= 4 && t[1].(string) == "->" {
+			return S{"binop", "->", ip.resolveType(t[2].(S), env), ip.resolveType(t[3].(S), env)}
+		}
+		return t
+
+	default:
+		return t
 	}
-	return go1(t, env)
 }
 
 // -----------------------------
 // Runtime type checking
 // -----------------------------
 
-// isType checks whether runtime value v conforms to type t in env.
-// It is cycle-safe via a coinductive memo keyed by (value-pointer, type-node-pointer).
+// isType checks whether runtime value v conforms to type t under env.
+// We canonicalize t once (resolveType), then check structurally.
+// It fully supports nested function types and alias nodes.
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 	t = stripAnnot(ip.resolveType(t, env))
 
-	// Coinductive memo: only set for pointer-backed values (maps/arrays/funs).
+	// Coinductive memo: (valuePtr, nodeKey(t))
+	// nodeKey mirrors isSubtype: aliases key by *TypeValue, others by &t[0].
 	seen := make(map[[2]unsafe.Pointer]struct{})
+
+	nodeKey := func(t S) unsafe.Pointer {
+		if len(t) >= 2 && t[0].(string) == "alias" {
+			if tv, ok := t[1].(*TypeValue); ok {
+				return unsafe.Pointer(tv)
+			}
+		}
+		return unsafe.Pointer(&t[0])
+	}
+
+	// Build value pointer key for arrays/maps/funs for memoization.
+	valKey := func(v Value) unsafe.Pointer {
+		switch v.Tag {
+		case VTMap:
+			return unsafe.Pointer(v.Data.(*MapObject))
+		case VTArray:
+			return unsafe.Pointer(v.Data.(*ArrayObject))
+		case VTFun:
+			return unsafe.Pointer(v.Data.(*Fun))
+		default:
+			return nil
+		}
+	}
 
 	var check func(Value, S) bool
 	check = func(v Value, t S) bool {
@@ -549,25 +602,16 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 		// Modules behave structurally as maps.
 		v = AsMapValue(v)
 
-		// Build memo key (value pointer, type-node pointer).
-		var vp unsafe.Pointer
-		switch v.Tag {
-		case VTMap:
-			vp = unsafe.Pointer(v.Data.(*MapObject))
-		case VTArray:
-			vp = unsafe.Pointer(v.Data.(*ArrayObject))
-		case VTFun:
-			vp = unsafe.Pointer(v.Data.(*Fun))
-		default:
-			vp = nil // scalars don’t participate in cycles; skip memo for them
-		}
-		tp := unsafe.Pointer(&t[0]) // address of this AST node’s tag
-		if vp != nil {
-			key := [2]unsafe.Pointer{vp, tp}
-			if _, ok := seen[key]; ok {
-				return true // coinductive success on the same (v,t) pair
+		vp := valKey(v)
+		nk := nodeKey(t)
+		// For structured values (vp != nil), memoize all nodes.
+		// For scalars (vp == nil), memoize only alias nodes to break unfold cycles.
+		if vp != nil || (len(t) >= 2 && t[0].(string) == "alias") {
+			k := [2]unsafe.Pointer{vp, nk}
+			if _, ok := seen[k]; ok {
+				return true
 			}
-			seen[key] = struct{}{}
+			seen[k] = struct{}{}
 		}
 
 		switch t[0].(string) {
@@ -588,10 +632,17 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			case "Type":
 				return v.Tag == VTType
 			default:
+				// Non-builtin unresolved id: reject (canonical resolver leaves only builtins or aliases)
 				return false
 			}
 
-		case "unop": // nullable T?
+		case "alias":
+			// Unfold against the alias's own env; the unified memo above
+			// prevents both structured and scalar infinite unfolding.
+			tv := t[1].(*TypeValue)
+			return check(v, ip.resolveType(tv.Ast, tv.Env))
+
+		case "unop": // nullable
 			if t[1].(string) != "?" {
 				return false
 			}
@@ -643,16 +694,21 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			}
 			return false
 
-		case "binop": // function type
+		case "binop": // function type expected
 			if t[1].(string) != "->" || v.Tag != VTFun {
 				return false
 			}
+			// Build the function value's fully-resolved signature in its own env.
 			f := v.Data.(*Fun)
-			ft := f.ReturnType
+			rt := stripAnnot(ip.resolveType(f.ReturnType, f.Env))
 			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-				ft = S{"binop", "->", f.ParamTypes[i], ft}
+				pt := stripAnnot(ip.resolveType(f.ParamTypes[i], f.Env))
+				rt = S{"binop", "->", pt, rt}
 			}
-			return ip.isSubtype(ft, t, env)
+			// CRITICAL: Compare under the *expected-type's* env (the env passed into isType),
+			// so module-qualified names/aliases from the expected side resolve properly.
+			// 'rt' already contains alias nodes for the value side and does not require this env.
+			return ip.isSubtype(rt, t, env)
 		}
 
 		return false
@@ -665,11 +721,25 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 // Structural subtyping  t1 <: t2
 // -----------------------------
 
-// isSubtype checks structural subtyping a <: b with coinductive memoization.
-// It memoizes on the pair of underlying S nodes using raw pointers for speed.
+// isSubtype checks a <: b structurally. Both sides are first canonicalized by
+// resolveType(t, env). It supports equirecursive types via a coinductive memo
+// keyed by the underlying node identity; for ("alias", *TypeValue) it keys on
+// the *TypeValue pointer*, so module-qualified names unify with local aliases.
 func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 	a = stripAnnot(ip.resolveType(a, env))
 	b = stripAnnot(ip.resolveType(b, env))
+
+	// Produce a stable pointer identity for memo keys:
+	//  • for ("alias", *TypeValue) use the tv pointer,
+	//  • otherwise use &node[0] (address of tag cell).
+	nodeKey := func(t S) unsafe.Pointer {
+		if len(t) >= 2 && t[0].(string) == "alias" {
+			if tv, ok := t[1].(*TypeValue); ok {
+				return unsafe.Pointer(tv)
+			}
+		}
+		return unsafe.Pointer(&t[0])
+	}
 
 	seen := make(map[[2]unsafe.Pointer]struct{})
 
@@ -681,14 +751,13 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 			return false
 		}
 
-		// Coinductive memo key: (address of x[0], address of y[0])
-		key := [2]unsafe.Pointer{unsafe.Pointer(&x[0]), unsafe.Pointer(&y[0])}
-		if _, ok := seen[key]; ok {
+		k := [2]unsafe.Pointer{nodeKey(x), nodeKey(y)}
+		if _, ok := seen[k]; ok {
 			return true
 		}
-		seen[key] = struct{}{}
+		seen[k] = struct{}{}
 
-		// Fast-path equal
+		// Fast equality
 		if equalS(x, y) {
 			return true
 		}
@@ -702,7 +771,6 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 		isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
 		unwrap := func(t S) S { return t[2].(S) }
 
-		// A <: B?  if  A <: B  or  A == Null
 		if isOpt(y) {
 			if sub(x, unwrap(y)) {
 				return true
@@ -722,6 +790,16 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 		// Identical primitive ids
 		if len(x) >= 2 && x[0].(string) == "id" && len(y) >= 2 && y[0].(string) == "id" {
 			return x[1].(string) == y[1].(string)
+		}
+
+		// Alias unfolding (lazily)
+		if len(x) >= 2 && x[0].(string) == "alias" {
+			tv := x[1].(*TypeValue)
+			return sub(ip.resolveType(tv.Ast, tv.Env), y)
+		}
+		if len(y) >= 2 && y[0].(string) == "alias" {
+			tv := y[1].(*TypeValue)
+			return sub(x, ip.resolveType(tv.Ast, tv.Env))
 		}
 
 		switch x[0].(string) {
@@ -782,7 +860,7 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 			// Enum <: T if each member fits T
 			for i := 1; i < len(x); i++ {
 				lv, ok := ip.litToValue(x[i].(S))
-				if !ok || !ip.isType(lv, y, env) {
+				if !ok || !ip.isType(lv, y, nil) {
 					return false
 				}
 			}
@@ -809,8 +887,18 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 // -----------------------------
 
 func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
+	// Canonicalize both sides first (alias-aware)
 	t1 = stripAnnot(ip.resolveType(t1, env))
 	t2 = stripAnnot(ip.resolveType(t2, env))
+
+	// Helper: expand a single alias once (for LUB we can unfold to compare)
+	expandAlias := func(t S) S {
+		if len(t) >= 2 && t[0].(string) == "alias" {
+			tv := t[1].(*TypeValue)
+			return stripAnnot(ip.resolveType(tv.Ast, tv.Env))
+		}
+		return t
+	}
 
 	// Any absorbs
 	if isId(t1, "Any") {
@@ -860,6 +948,14 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 			return u
 		}
 		return S{"unop", "?", u}
+	}
+
+	// If either side is an alias, unfold once for comparison.
+	if len(t1) >= 2 && t1[0].(string) == "alias" {
+		t1 = expandAlias(t1)
+	}
+	if len(t2) >= 2 && t2[0].(string) == "alias" {
+		t2 = expandAlias(t2)
 	}
 
 	// ---- Primitives (incl. Int ⊔ Num = Num) ----

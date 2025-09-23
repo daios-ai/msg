@@ -102,9 +102,9 @@ import (
 //
 // Examples
 //
-//	// alias User := {name!: Str, age: Int?}
-//	ip.TypeValueToJSONSchema(TypeVal(S{"id","User"}), env) ==>
-//	  {"$ref":"#/$defs/User","$defs":{"User":{"type":"object", ...}}}
+//		// alias User := {name!: Str, age: Int?}
+//	 ip.TypeValueToJSONSchema(TypeValIn(S{"id","User"}, env), env) ==>
+//		  {"$ref":"#/$defs/User","$defs":{"User":{"type":"object", ...}}}
 func (ip *Interpreter) TypeValueToJSONSchema(tv Value, env *Env) map[string]any {
 	tS := typeAstFromValueData(tv.Data)
 
@@ -164,14 +164,16 @@ func (ip *Interpreter) TypeValueToJSONSchema(tv Value, env *Env) map[string]any 
 // Panics: none. This function only returns a Value.
 func (ip *Interpreter) JSONSchemaToTypeValue(doc map[string]any) Value {
 	if doc == nil {
-		return TypeVal(S{"id", "Any"})
+		// Always pin to an environment; schema-derived types do not depend on caller scopes.
+		return TypeValIn(S{"id", "Any"}, ip.Core)
 	}
 	t := ip.schemaNodeToMSType(doc, doc, map[string]bool{})
 	annot := ""
 	if d, ok := doc["description"].(string); ok && d != "" {
 		annot = d
 	}
-	return withAnnot(TypeVal(t), annot)
+	// Pin the produced type to ip.Core to preserve the invariant “no env-less types”.
+	return withAnnot(TypeValIn(t, ip.Core), annot)
 }
 
 // TypeStringToS parses a MindScript *type* written as a single expression into

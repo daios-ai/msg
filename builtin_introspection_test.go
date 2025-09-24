@@ -179,7 +179,7 @@ func Test_Builtin_Introspection_IxRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IxFromS failed: %v", err)
 	}
-	if !equalS(orig, back) {
+	if !equalLiteralS(orig, back) {
 		t.Fatalf("round-trip mismatch\norig=%#v\nback=%#v", orig, back)
 	}
 }

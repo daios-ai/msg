@@ -155,7 +155,7 @@ func mapTypeFields(t S) map[string]objField {
 // Structural equality for S-exprs with special cases:
 //   - "map" and "enum" stay order-insensitive as before.
 //   - NEW: ("alias", *TypeValue) compares by pointer identity.
-func equalS(a, b S) bool {
+func equalLiteralS(a, b S) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -190,7 +190,7 @@ func equalS(a, b S) bool {
 		}
 		for k, va := range fa {
 			vb, ok := fb[k]
-			if !ok || va.required != vb.required || !equalS(va.typ, vb.typ) {
+			if !ok || va.required != vb.required || !equalLiteralS(va.typ, vb.typ) {
 				return false
 			}
 		}
@@ -205,7 +205,7 @@ func equalS(a, b S) bool {
 	outer:
 		for i := 1; i < len(a); i++ {
 			for j := 1; j < len(b); j++ {
-				if equalS(a[i].(S), b[j].(S)) {
+				if equalLiteralS(a[i].(S), b[j].(S)) {
 					continue outer
 				}
 			}
@@ -230,7 +230,7 @@ func equalNode(x, y any) bool {
 		if !ok {
 			return false
 		}
-		return equalS(xv, yv)
+		return equalLiteralS(xv, yv)
 	case string:
 		ys, ok := y.(string)
 		return ok && xv == ys
@@ -453,6 +453,92 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 // Alias-based canonical resolution
 // -----------------------------
 
+// --- replace the old resolveModuleTypeAlias with these helpers ---
+
+// peelGetChain collects rightward keys from nested ("get", base, "str") nodes.
+// It returns (baseNode, keysRightToLeft).
+func peelGetChain(t S) (S, []string) {
+	t = stripAnnot(t)
+	keys := []string{}
+	node := t
+	for len(node) >= 3 && node[0].(string) == "get" {
+		keyNode, _ := node[2].(S)
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			return t, nil
+		}
+		keys = append(keys, keyNode[1].(string))
+		base, _ := node[1].(S)
+		node = base
+	}
+	return node, keys
+}
+
+// resolveTypePath walks a ("get", ...) chain against runtime values, switching
+// the lookup view when encountering a Type (use its Env) and stepping through
+// modules by reading their exported map. On success returns the terminal *TypeValue.
+func (ip *Interpreter) resolveTypePath(env *Env, t S) (*TypeValue, bool) {
+	base, keysRL := peelGetChain(t)
+	if len(keysRL) == 0 {
+		return nil, false
+	}
+
+	// Resolve the base to a runtime Value in the given env.
+	var cur Value
+	switch {
+	case len(base) >= 2 && base[0].(string) == "id":
+		v, err := env.Get(base[1].(string))
+		if err != nil {
+			return nil, false
+		}
+		cur = v
+
+	case len(base) >= 3 && base[0].(string) == "get":
+		// Recurse: resolve the inner path first.
+		tv, ok := ip.resolveTypePath(env, base)
+		if !ok {
+			return nil, false
+		}
+		// The base resolved to a Type; switch view to its Env to continue.
+		cur = TypeValIn(tv.Ast, tv.Env)
+
+	default:
+		return nil, false
+	}
+
+	// Walk keys left→right (we collected right→left).
+	for i := len(keysRL) - 1; i >= 0; i-- {
+		switch cur.Tag {
+		case VTModule:
+			mod := cur.Data.(*Module)
+			v, ok := mod.get(keysRL[i])
+			if !ok {
+				return nil, false
+			}
+			cur = v
+
+		case VTType:
+			// Switch lookup view to the type's own environment.
+			tv := cur.Data.(*TypeValue)
+			if tv.Env == nil {
+				return nil, false
+			}
+			v, err := tv.Env.Get(keysRL[i])
+			if err != nil {
+				return nil, false
+			}
+			cur = v
+
+		default:
+			return nil, false
+		}
+	}
+
+	if cur.Tag != VTType {
+		return nil, false
+	}
+	return cur.Data.(*TypeValue), true
+}
+
 // resolveType canonicalizes a type S-expression in env:
 //   - Builtins stay as ("id", "...").
 //   - Any non-builtin type identifier or qualified get resolves to a stable,
@@ -497,22 +583,11 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 		return t // builtin or unknown stays as-is
 
 	case "get":
-		// Qualified reference: ("get", baseExpr, ("str", key))
-		if len(t) >= 3 {
-			keyNode, _ := t[2].(S)
-			if len(keyNode) >= 2 && keyNode[0].(string) == "str" {
-				key := keyNode[1].(string)
-				// If base is ("id", modName) and resolves to a module, fetch member
-				if base, ok := t[1].(S); ok && len(base) >= 2 && base[0].(string) == "id" && env != nil {
-					if modVal, err := env.Get(base[1].(string)); err == nil && modVal.Tag == VTModule {
-						if v, ok := modVal.Data.(*Module).get(key); ok && v.Tag == VTType {
-							return S{"alias", v.Data.(*TypeValue)}
-						}
-					}
-				}
-			}
+		// Robust qualified resolution: walk through modules and types (env switch on type).
+		if tv, ok := ip.resolveTypePath(env, t); ok {
+			return S{"alias", tv}
 		}
-		return t // leave unresolved get as-is
+		return t
 
 	case "unop":
 		if len(t) >= 3 && t[1].(string) == "?" {
@@ -758,7 +833,7 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 		seen[k] = struct{}{}
 
 		// Fast equality
-		if equalS(x, y) {
+		if equalLiteralS(x, y) {
 			return true
 		}
 
@@ -846,7 +921,7 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 				for i := 1; i < len(x); i++ {
 					found := false
 					for j := 1; j < len(y); j++ {
-						if equalS(x[i].(S), y[j].(S)) {
+						if equalLiteralS(x[i].(S), y[j].(S)) {
 							found = true
 							break
 						}
@@ -1006,7 +1081,7 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 			switch {
 			case ok1 && ok2:
 				ut := ip.unifyTypes(s1.typ, s2.typ, env)
-				req := s1.required || s2.required
+				req := s1.required && s2.required
 				tag := "pair"
 				if req {
 					tag = "pair!"
@@ -1029,7 +1104,7 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 		union := S{"enum"}
 		seen := func(x S) bool {
 			for i := 1; i < len(union); i++ {
-				if equalS(union[i].(S), x) {
+				if equalLiteralS(union[i].(S), x) {
 					return true
 				}
 			}

@@ -252,7 +252,7 @@ func TestRoundTrip_ToS_FromS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !equalS(ast, back) {
+	if !equalLiteralS(ast, back) {
 		t.Fatalf("round-trip mismatch\nast : %#v\nback: %#v", ast, back)
 	}
 }

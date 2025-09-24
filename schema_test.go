@@ -216,7 +216,7 @@ func Test_Schema_JSONPrimitives_ToMS(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := typeSFromValue(t, ip.JSONSchemaToTypeValue(c.js))
-		if !equalS(got, c.ms) {
+		if !equalLiteralS(got, c.ms) {
 			t.Fatalf("JSON->MS %v => %v; want %v", c.js, got, c.ms)
 		}
 	}
@@ -229,7 +229,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 	m1 := map[string]any{"type": []any{"integer", "null"}}
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(m1))
 	want := S{"unop", "?", S{"id", "Int"}}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("nullable via type[] got %v; want %v", got, want)
 	}
 
@@ -237,7 +237,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 	m2 := map[string]any{"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}}}
 	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(m2))
 	want = S{"unop", "?", S{"id", "Str"}}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("nullable via anyOf got %v; want %v", got, want)
 	}
 
@@ -245,7 +245,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 	m3 := map[string]any{"oneOf": []any{map[string]any{"type": "number"}, map[string]any{"type": "null"}}}
 	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(m3))
 	want = S{"unop", "?", S{"id", "Num"}}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("nullable via oneOf got %v; want %v", got, want)
 	}
 
@@ -253,7 +253,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 	m4 := map[string]any{"type": "string", "nullable": true}
 	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(m4))
 	want = S{"unop", "?", S{"id", "Str"}}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("nullable:true got %v; want %v", got, want)
 	}
 }
@@ -264,14 +264,14 @@ func Test_Schema_JSONArray_ToMS(t *testing.T) {
 	js := map[string]any{"type": "array", "items": map[string]any{"type": "number"}}
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	want := S{"array", S{"id", "Num"}}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("array got %v; want %v", got, want)
 	}
 
 	// Missing items -> array[Any]
 	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(map[string]any{"type": "array"}))
 	want = S{"array", S{"id", "Any"}}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("array default items Any got %v; want %v", got, want)
 	}
 }
@@ -306,7 +306,7 @@ func Test_Schema_JSONObject_ToMS(t *testing.T) {
 	if nameF.required {
 		t.Fatalf("'name' should be optional")
 	}
-	if !equalS(nameF.typ, S{"id", "Str"}) {
+	if !equalLiteralS(nameF.typ, S{"id", "Str"}) {
 		t.Fatalf("'name' type mismatch: got %v", nameF.typ)
 	}
 
@@ -318,7 +318,7 @@ func Test_Schema_JSONObject_ToMS(t *testing.T) {
 	if !ageF.required {
 		t.Fatalf("'age' should be required")
 	}
-	if !equalS(ageF.typ, S{"id", "Int"}) {
+	if !equalLiteralS(ageF.typ, S{"id", "Int"}) {
 		t.Fatalf("'age' type mismatch: got %v", ageF.typ)
 	}
 }
@@ -355,7 +355,7 @@ func Test_Schema_JSONRefs_ToMS(t *testing.T) {
 	}
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(doc))
 	want := S{"id", "Pet"}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("$ref #/$defs/Pet -> %v; want %v", got, want)
 	}
 
@@ -370,7 +370,7 @@ func Test_Schema_JSONRefs_ToMS(t *testing.T) {
 	}
 	got = typeSFromValue(t, ip.JSONSchemaToTypeValue(doc))
 	want = S{"id", "Str"}
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("resolving local pointer -> %v; want %v", got, want)
 	}
 }
@@ -420,7 +420,7 @@ func Test_Schema_Roundtrip_MS_to_JSON_to_MS(t *testing.T) {
 	js := ip.TypeValueToJSONSchema(TypeValIn(ms, env), env)
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 	// We expect equal shape (order-insensitive by our equality)
-	if !equalS(got, ms) {
+	if !equalLiteralS(got, ms) {
 		t.Fatalf("round-trip mismatch: got %v; want %v", got, ms)
 	}
 }
@@ -672,11 +672,11 @@ func Test_Schema_Helper_JSONSchemaStringToObject_Integration(t *testing.T) {
 func Test_Schema_Internal_equalS_Sanity(t *testing.T) {
 	a := S{"map", S{"pair", S{"str", "x"}, S{"id", "Int"}}}
 	b := S{"map", S{"pair", S{"str", "x"}, S{"id", "Int"}}}
-	if !equalS(a, b) {
+	if !equalLiteralS(a, b) {
 		t.Fatalf("equalS should consider these equal")
 	}
 	c := S{"map", S{"pair", S{"str", "x"}, S{"id", "Str"}}}
-	if equalS(a, c) {
+	if equalLiteralS(a, c) {
 		t.Fatalf("equalS should consider these different")
 	}
 }

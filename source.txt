@@ -249,55 +249,6 @@ func equalNode(x, y any) bool {
 	}
 }
 
-// Deep equality on Values for the literal space used by enums
-// (null/bool/int/num/str/array/map). Named *Lit* to avoid confusion with
-// (*Interpreter).deepEqual used elsewhere.
-func deepEqualLit(a, b Value) bool {
-	if a.Tag != b.Tag {
-		return false
-	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray:
-		ax := a.Data.(*ArrayObject).Elems
-		bx := b.Data.(*ArrayObject).Elems
-		if len(ax) != len(bx) {
-			return false
-		}
-		for i := range ax {
-			if !deepEqualLit(ax[i], bx[i]) {
-				return false
-			}
-		}
-		return true
-	case VTMap:
-		am := a.Data.(*MapObject)
-		bm := b.Data.(*MapObject)
-		if len(am.Entries) != len(bm.Entries) {
-			return false
-		}
-		for k, av := range am.Entries {
-			bv, ok := bm.Entries[k]
-			if !ok || !deepEqualLit(av, bv) {
-				return false
-			}
-		}
-		return true
-	default:
-		// Not expected for enum literals
-		return false
-	}
-}
-
 // Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
 // Allowed forms: null/bool/int/num/str/array/map with literal children.
 // Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
@@ -454,6 +405,58 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 // Alias-based canonical resolution
 // -----------------------------
 
+// resolveModuleTypeAlias walks a nested module path like
+//
+//	("get", ("get", ("id","M"), ("str","T")), ("str","A"))
+//
+// and tries to retrieve the final member as a VTType value.
+// It returns (*TypeValue, true) on success, else (nil, false).
+func (ip *Interpreter) resolveModuleTypeAlias(env *Env, t S) (*TypeValue, bool) {
+	t = stripAnnot(t)
+	if len(t) == 0 || env == nil {
+		return nil, false
+	}
+	// Collect keys while peeling "get" nodes to the left.
+	keys := []string{}
+	node := t
+	for len(node) >= 3 && node[0].(string) == "get" {
+		keyNode, _ := node[2].(S)
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			return nil, false
+		}
+		keys = append(keys, keyNode[1].(string))
+		base, _ := node[1].(S)
+		node = base
+	}
+	// Leftmost base must be an identifier (module name).
+	if !(len(node) >= 2 && node[0].(string) == "id") {
+		return nil, false
+	}
+	baseName := node[1].(string)
+	mv, err := env.Get(baseName)
+	if err != nil || mv.Tag != VTModule {
+		return nil, false
+	}
+	cur := mv
+	// We collected keys from right to left; apply them in reverse (left to right).
+	for i := len(keys) - 1; i >= 0; i-- {
+		k := keys[i]
+		if cur.Tag != VTModule {
+			return nil, false
+		}
+		mod := cur.Data.(*Module)
+		v, ok := mod.get(k)
+		if !ok {
+			return nil, false
+		}
+		cur = v
+	}
+	if cur.Tag != VTType {
+		return nil, false
+	}
+	return cur.Data.(*TypeValue), true
+}
+
 // resolveType canonicalizes a type S-expression in env:
 //   - Builtins stay as ("id", "...").
 //   - Any non-builtin type identifier or qualified get resolves to a stable,
@@ -498,22 +501,12 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 		return t // builtin or unknown stays as-is
 
 	case "get":
-		// Qualified reference: ("get", baseExpr, ("str", key))
-		if len(t) >= 3 {
-			keyNode, _ := t[2].(S)
-			if len(keyNode) >= 2 && keyNode[0].(string) == "str" {
-				key := keyNode[1].(string)
-				// If base is ("id", modName) and resolves to a module, fetch member
-				if base, ok := t[1].(S); ok && len(base) >= 2 && base[0].(string) == "id" && env != nil {
-					if modVal, err := env.Get(base[1].(string)); err == nil && modVal.Tag == VTModule {
-						if v, ok := modVal.Data.(*Module).get(key); ok && v.Tag == VTType {
-							return S{"alias", v.Data.(*TypeValue)}
-						}
-					}
-				}
-			}
+		// Generalize to nested module paths (M.T.A) and aliasify only if the final
+		// member is a VTType. Otherwise leave the get as-is.
+		if tv, ok := ip.resolveModuleTypeAlias(env, t); ok {
+			return S{"alias", tv}
 		}
-		return t // leave unresolved get as-is
+		return t
 
 	case "unop":
 		if len(t) >= 3 && t[1].(string) == "?" {
@@ -689,8 +682,12 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 
 		case "enum":
 			for i := 1; i < len(t); i++ {
-				if lit, ok := ip.litToValue(t[i].(S)); ok && deepEqualLit(lit, v) {
-					return true
+				litS := t[i].(S)
+				if lit, ok := ip.litToValue(litS); ok {
+					// Use the single authoritative value equality
+					if ip.deepEqual(lit, v) {
+						return true
+					}
 				}
 			}
 			return false
@@ -708,7 +705,7 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 			}
 			// CRITICAL: Compare under the *expected-type's* env (the env passed into isType),
 			// so module-qualified names/aliases from the expected side resolve properly.
-			// 'rt' already contains alias nodes for the value side and does not require this env.
+			// 'rt' already contains alias nodes for the valsue side and does not require this env.
 			return ip.isSubtype(rt, t, env)
 		}
 
@@ -757,11 +754,6 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 			return true
 		}
 		seen[k] = struct{}{}
-
-		// Fast equality
-		if equalS(x, y) {
-			return true
-		}
 
 		// Top
 		if isId(y, "Any") {
@@ -845,18 +837,26 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 			// Enum⊆Enum by literal inclusion
 			if y[0].(string) == "enum" {
 				for i := 1; i < len(x); i++ {
+					xArm := x[i].(S)
+					lx, okx := ip.litToValue(xArm)
+					if !okx {
+						// Non-literal member: not a valid enum arm for inclusion
+						return false
+					}
 					found := false
 					for j := 1; j < len(y); j++ {
-						if equalS(x[i].(S), y[j].(S)) {
+						yArm := y[j].(S)
+						ly, oky := ip.litToValue(yArm)
+						if !oky {
+							continue
+						}
+						// Use interpreter's deep equality (Num/Int unification, modules-as-maps, cycles)
+						if ip.deepEqual(lx, ly) {
 							found = true
 							break
 						}
 					}
-					if !found {
-						return false
-					}
 				}
-				return true
 			}
 			// Enum <: T if each member fits T
 			for i := 1; i < len(x); i++ {
@@ -1007,7 +1007,7 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 			switch {
 			case ok1 && ok2:
 				ut := ip.unifyTypes(s1.typ, s2.typ, env)
-				req := s1.required || s2.required
+				req := s1.required && s2.required
 				tag := "pair"
 				if req {
 					tag = "pair!"

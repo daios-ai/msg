@@ -806,7 +806,7 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 			}
 			ra := ip.resolveType(ta.Ast, ea)
 			rb := ip.resolveType(tb.Ast, eb)
-			return equalS(ra, rb)
+			return equalLiteralS(ra, rb)
 
 		default:
 			// Handles VTHandle and any other tags we don't explicitly equal-compare.

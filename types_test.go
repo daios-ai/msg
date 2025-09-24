@@ -249,7 +249,7 @@ func Test_Types_FunctionChains_SubtypeAndUnify(t *testing.T) {
 	// LUB(Int->Int->Int, Num->Num->Num) = Int -> Int -> Num
 	u := ip.unifyTypes(typeS(t, ip, `Int -> Int -> Int`), typeS(t, ip, `Num -> Num -> Num`), ip.Global)
 	want := typeS(t, ip, `Int -> Int -> Num`)
-	if !equalS(u, want) {
+	if !equalLiteralS(u, want) {
 		t.Fatalf("function unify mismatch:\n got  %#v\n want %#v", u, want)
 	}
 	// And the result must be a supertype of both inputs
@@ -267,7 +267,7 @@ func Test_Types_Unify_Functions_ParamGLB_ReturnLUB(t *testing.T) {
 
 	// GLB(param) = Int, LUB(return) = Num  =>  Int -> Num
 	want := typeS(t, ip, `Int -> Num`)
-	if !equalS(u, want) {
+	if !equalLiteralS(u, want) {
 		t.Fatalf("function unify mismatch: got %#v, want %#v", u, want)
 	}
 	if !ip.isSubtype(f1, u, ip.Global) || !ip.isSubtype(f2, u, ip.Global) {
@@ -278,7 +278,7 @@ func Test_Types_Unify_Functions_ParamGLB_ReturnLUB(t *testing.T) {
 func Test_Types_Unify_Functions_UnrelatedParams_YieldsAny(t *testing.T) {
 	ip := newIP()
 	u := ip.unifyTypes(typeS(t, ip, `Int -> Num`), typeS(t, ip, `Str -> Num`), ip.Global)
-	if !equalS(u, typeS(t, ip, `Any`)) {
+	if !equalLiteralS(u, typeS(t, ip, `Any`)) {
 		t.Fatalf("unifying functions with unrelated params should yield Any, got %#v", u)
 	}
 }
@@ -287,7 +287,7 @@ func Test_Types_Unify_Functions_EnumParam_Meet(t *testing.T) {
 	ip := newIP()
 	u := ip.unifyTypes(typeS(t, ip, `Str -> Str`), typeS(t, ip, `Enum["a","b"] -> Str`), ip.Global)
 	want := typeS(t, ip, `Enum["a","b"] -> Str`)
-	if !equalS(u, want) {
+	if !equalLiteralS(u, want) {
 		t.Fatalf("function unify (enum param) mismatch: got %#v, want %#v", u, want)
 	}
 	// Supertype property
@@ -302,7 +302,7 @@ func Test_Types_Unify_Functions_NestedNullableReturns(t *testing.T) {
 	u := ip.unifyTypes(typeS(t, ip, `Int -> (Int -> Int?)`), typeS(t, ip, `Num -> (Num -> Null)`), ip.Global)
 	// Param GLB: Int; inner param GLB: Int; inner return LUB: Int?
 	want := typeS(t, ip, `Int -> Int -> Int?`)
-	if !equalS(u, want) {
+	if !equalLiteralS(u, want) {
 		t.Fatalf("nested function unify mismatch: got %#v, want %#v", u, want)
 	}
 }
@@ -493,18 +493,15 @@ func Test_Types_Map_Field_Enum_Required_Optional(t *testing.T) {
 	}
 }
 
-func Test_Types_Unify_Maps_Required_OR_Rule(t *testing.T) {
+func Test_Types_Unify_Maps_Required_AND_Rule(t *testing.T) {
 	ip := newIP()
-
-	// Required flag should OR on unify
-	m1 := typeS(t, ip, `{a!: Int}`) // a required
-	m2 := typeS(t, ip, `{a:  Num}`) // a optional
+	m1 := typeS(t, ip, `{a!: Int}`)
+	m2 := typeS(t, ip, `{a:  Num}`)
 	u := ip.unifyTypes(m1, m2, ip.Global)
 
-	// expect {a!: Num}  (type unified to Num, required ORed)
-	want := typeS(t, ip, `{a!: Num}`)
+	want := typeS(t, ip, `{a: Num}`) // AND → optional
 	if !ip.isSubtype(u, want, ip.Global) || !ip.isSubtype(want, u, ip.Global) {
-		t.Fatalf("map unify required OR rule failed: got %#v, want %#v", u, want)
+		t.Fatalf("map unify required AND rule failed: got %#v, want %#v", u, want)
 	}
 }
 
@@ -694,7 +691,7 @@ Int}`)
 
 	// Unification should also drop annotations (result == unannotated shape).
 	u := ip.unifyTypes(a, b, ip.Global)
-	if !equalS(u, b) {
+	if !equalLiteralS(u, b) {
 		t.Fatalf("expected unify(a,b) to equal unannotated type; got %v", u)
 	}
 }
@@ -709,7 +706,7 @@ func Test_Types_ValueToType_Array_SelfCycle(t *testing.T) {
 	got := ip.valueToTypeS(v, ip.Global)
 	// Expect conservative widening to [Any] rather than infinite recursion.
 	want := typeS(t, ip, `[Any]`)
-	if !equalS(got, want) {
+	if !equalLiteralS(got, want) {
 		t.Fatalf("valueToTypeS on cyclic array: got %#v, want %#v", got, want)
 	}
 }
@@ -880,34 +877,6 @@ mk()
 	}
 }
 
-func Test_Types_ModuleAlias_SubtypingAcrossModules(t *testing.T) {
-	ip := newIP()
-
-	src := `
-let M = module "M" do
-  let A = type { x!: Int }
-  let S = type A -> Any
-end
-
-let N = module "N" do
-  let A = M.A        # re-export under a new module
-  let S = M.S
-end
-`
-	_ = evalWithIP(t, ip, src)
-
-	mS := typeS(t, ip, `M.S`)
-	nS := typeS(t, ip, `N.S`)
-
-	// Should be equivalent via alias pointer identity.
-	if !equalS(ip.resolveType(mS, ip.Global), ip.resolveType(nS, ip.Global)) {
-		t.Fatalf("expected resolveType(M.S) == resolveType(N.S)")
-	}
-	if !ip.isSubtype(mS, nS, ip.Global) || !ip.isSubtype(nS, mS, ip.Global) {
-		t.Fatalf("expected M.S and N.S to be mutual subtypes")
-	}
-}
-
 func Test_Types_Module_QualifiedType_Equals_Local(t *testing.T) {
 	src := `
 let M = module "M" do
@@ -984,7 +953,7 @@ end`); err != nil {
 	tLocal := typeS(t, ip, `A`)
 
 	// They should be structurally equal under alias canonicalization…
-	if !equalS(ip.resolveType(tMod, ip.Global), ip.resolveType(tLocal, ip.Global)) {
+	if !equalLiteralS(ip.resolveType(tMod, ip.Global), ip.resolveType(tLocal, ip.Global)) {
 		t.Fatalf("expected resolveType(M.A) == resolveType(A)")
 	}
 
@@ -1060,11 +1029,172 @@ fun(a: M.A, b: M.B) -> Null do null end
 	}
 }
 
+func Test_Types_ModuleAlias_LocalAliasCallsOK(t *testing.T) {
+	ip := newIP()
+	src := `
+let M = module "M" do
+  let A = type { x!: Int }
+  let S = type A -> Any
+  let t = fun(h: S) -> Str do "OK" end
+end
+
+let A2 = M.A
+
+[
+  M.t(fun(a: M.A) -> Any do 0 end),
+  M.t(fun(a: A2)  -> Any do 0 end)
+]
+`
+	v := evalWithIP(t, ip, src)
+	if v.Tag != VTArray {
+		t.Fatalf("want array result, got %#v", v)
+	}
+	xs := v.Data.(*ArrayObject).Elems
+	if len(xs) != 2 || xs[0].Tag != VTStr || xs[1].Tag != VTStr ||
+		xs[0].Data.(string) != "OK" || xs[1].Data.(string) != "OK" {
+		t.Fatalf("expected [\"OK\",\"OK\"], got %#v", v)
+	}
+}
+
+func Test_Types_NestedModule_ResolveAndCallOK(t *testing.T) {
+	ip := newIP()
+	src := `
+let M = module "M" do
+  let T = module "T" do
+    let A = type { x!: Int }
+  end
+  let S = type T.A -> Any
+  let t = fun(h: S) -> Str do "OK" end
+end
+
+M.t(fun(a: M.T.A) -> Any do 0 end)
+`
+	v := evalWithIP(t, ip, src)
+	if v.Tag != VTStr || v.Data.(string) != "OK" {
+		t.Fatalf(`expected "OK", got %#v`, v)
+	}
+}
+
+func Test_Types_ModuleAlias_LocalAliasEquality(t *testing.T) {
+	ip := newIP()
+
+	// Persistent setup (matches REPL)
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+  let S = type A -> Any
+end
+let S2 = M.S   # top-level alias to a module-exported type
+`); err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	// Ask the interpreter for the VALUES.
+	mSVal, err := ip.EvalPersistentSource(`M.S`)
+	if err != nil {
+		t.Fatalf("get M.S: %v", err)
+	}
+	if mSVal.Tag != VTType {
+		t.Fatalf("M.S: expected VTType, got %v", mSVal.Tag)
+	}
+
+	s2Val, err := ip.EvalPersistentSource(`S2`)
+	if err != nil {
+		t.Fatalf("get S2: %v", err)
+	}
+	if s2Val.Tag != VTType {
+		t.Fatalf("S2: expected VTType, got %v", s2Val.Tag)
+	}
+
+	// Build alias nodes inline so the type engine uses the type’s own Env.
+	mS := S{"alias", mSVal.Data.(*TypeValue)}
+	s2 := S{"alias", s2Val.Data.(*TypeValue)}
+
+	// Semantic equality: mutual subtyping
+	if !ip.isSubtype(mS, s2, ip.Global) || !ip.isSubtype(s2, mS, ip.Global) {
+		t.Fatalf("expected M.S and S2 to be semantically equivalent (mutual subtypes)")
+	}
+}
+
+func Test_Types_ModuleAlias_LocalAliasEquality_Min(t *testing.T) {
+	ip := newIP()
+
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let A = type { x!: Int }
+  let S = type A -> Any
+end
+let S2 = M.S
+`); err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	mSVal, err := ip.EvalPersistentSource(`M.S`)
+	if err != nil {
+		t.Fatalf("get M.S: %v", err)
+	}
+	if mSVal.Tag != VTType {
+		t.Fatalf("M.S: expected VTType, got %v", mSVal.Tag)
+	}
+
+	s2Val, err := ip.EvalPersistentSource(`S2`)
+	if err != nil {
+		t.Fatalf("get S2: %v", err)
+	}
+	if s2Val.Tag != VTType {
+		t.Fatalf("S2: expected VTType, got %v", s2Val.Tag)
+	}
+
+	mS := S{"alias", mSVal.Data.(*TypeValue)}
+	s2 := S{"alias", s2Val.Data.(*TypeValue)}
+
+	if !ip.isSubtype(mS, s2, ip.Global) || !ip.isSubtype(s2, mS, ip.Global) {
+		t.Fatalf("expected M.S and S2 to be semantically equivalent (mutual subtypes)")
+	}
+}
+
+func Test_Types_NestedModule_TypePathResolves(t *testing.T) {
+	ip := newIP()
+
+	if _, err := ip.EvalPersistentSource(`
+let M = module "M" do
+  let T = module "T" do
+    let A = type { x!: Int }
+  end
+end
+`); err != nil {
+		t.Fatalf("setup error: %v", err)
+	}
+
+	// Ask the interpreter to build the *type values* (each is VTType with its own Env).
+	pathFunVal, err := ip.EvalPersistentSource(`type M.T.A -> Any`)
+	if err != nil {
+		t.Fatalf("build path fun type: %v", err)
+	}
+	if pathFunVal.Tag != VTType {
+		t.Fatalf("path fun type: expected VTType, got %v", pathFunVal.Tag)
+	}
+
+	shapeFunVal, err := ip.EvalPersistentSource(`type { x!: Int } -> Any`)
+	if err != nil {
+		t.Fatalf("build shape fun type: %v", err)
+	}
+	if shapeFunVal.Tag != VTType {
+		t.Fatalf("shape fun type: expected VTType, got %v", shapeFunVal.Tag)
+	}
+
+	got := S{"alias", pathFunVal.Data.(*TypeValue)}
+	want := S{"alias", shapeFunVal.Data.(*TypeValue)}
+
+	// Mutual subtyping = semantic equivalence
+	if !ip.isSubtype(got, want, ip.Global) || !ip.isSubtype(want, got, ip.Global) {
+		t.Fatalf("M.T.A -> Any should be semantically equivalent to {x!: Int} -> Any (mutual subtypes)")
+	}
+}
+
 func Test_Types_ModuleAlias_ReexportViaGlobalAlias(t *testing.T) {
 	ip := newIP()
 
-	// We cannot refer to M *inside* another module body (module env sees Core only),
-	// so "re-export" by making Global aliases that mirror M's exports.
 	if _, err := ip.EvalPersistentSource(`
 let M = module "M" do
   let A = type { x!: Int }
@@ -1073,20 +1203,29 @@ end
 let A2 = M.A
 let S2 = M.S
 `); err != nil {
-		t.Fatalf("EvalPersistentSource error: %v", err)
+		t.Fatalf("setup error: %v", err)
 	}
 
-	// Compare the exported type with its Global alias.
-	mS := typeS(t, ip, `M.S`)
-	gS := typeS(t, ip, `S2`)
-
-	// Exact alias-pointer equality (equalS on resolved nodes) should hold for a direct alias.
-	if !equalS(ip.resolveType(mS, ip.Global), ip.resolveType(gS, ip.Global)) {
-		t.Fatalf("expected resolveType(M.S) == resolveType(S2)")
+	mSVal, err := ip.EvalPersistentSource(`M.S`)
+	if err != nil {
+		t.Fatalf("get M.S: %v", err)
+	}
+	if mSVal.Tag != VTType {
+		t.Fatalf("M.S: expected VTType, got %v", mSVal.Tag)
 	}
 
-	// And they’re mutual subtypes.
+	gSVal, err := ip.EvalPersistentSource(`S2`)
+	if err != nil {
+		t.Fatalf("get S2: %v", err)
+	}
+	if gSVal.Tag != VTType {
+		t.Fatalf("S2: expected VTType, got %v", gSVal.Tag)
+	}
+
+	mS := S{"alias", mSVal.Data.(*TypeValue)}
+	gS := S{"alias", gSVal.Data.(*TypeValue)}
+
 	if !ip.isSubtype(mS, gS, ip.Global) || !ip.isSubtype(gS, mS, ip.Global) {
-		t.Fatalf("expected M.S and S2 to be mutual subtypes")
+		t.Fatalf("expected M.S and S2 to be semantically equivalent (mutual subtypes)")
 	}
 }

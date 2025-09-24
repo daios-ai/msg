@@ -334,6 +334,13 @@ type Env struct {
 	sealParentWrites bool
 }
 
+// ---- Builtin type names/constructors (value-namespace guards) ----
+var builtinTypeAtoms = map[string]struct{}{
+	"Any": {}, "Null": {}, "Bool": {}, "Int": {}, "Num": {}, "Str": {}, "Type": {}, "Enum": {},
+}
+
+func isBuiltinTypeAtom(name string) bool { _, ok := builtinTypeAtoms[name]; return ok }
+
 // SealParentWrites prevents Set from climbing into parent frames.
 // Lookups (Get) still traverse parents as usual.
 func (e *Env) SealParentWrites() { e.sealParentWrites = true }
@@ -349,6 +356,10 @@ func (e *Env) Define(name string, v Value) {
 // Set updates the nearest existing binding of name to v. If no binding exists
 // in any visible frame, Set returns an error (it does not implicitly define).
 func (e *Env) Set(name string, v Value) error {
+	// Disallow assignment to language-level builtins (even if not present in envs).
+	if isBuiltinTypeAtom(name) {
+		return fmt.Errorf("cannot assign to type atom/contructor: %s", name)
+	}
 	if _, ok := e.table[name]; ok {
 		e.table[name] = v
 		return nil
@@ -376,6 +387,10 @@ func (e *Env) Get(name string) (Value, error) {
 	}
 	if e.parent != nil {
 		return e.parent.Get(name)
+	}
+	// If the miss is a type atom/ctor, explain how to obtain a runtime Type.
+	if isBuiltinTypeAtom(name) {
+		return Value{}, fmt.Errorf("'%s' is a type expression, not a value. Use 'type %s' to obtain a runtime Type, or use it in a type annotation.", name, name)
 	}
 	return Value{}, fmt.Errorf("undefined variable: %s", name)
 }

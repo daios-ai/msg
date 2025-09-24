@@ -91,7 +91,7 @@ func Test_Builtin_Core_typeOf_and_isType_and_isSubtype(t *testing.T) {
 
 	// Contract violation: second arg must be a Type value (hard error).
 	_, err := ip.EvalSource(`isType(42, Int)`)
-	wantErrContains(t, err, "undefined variable")
+	wantErrContains(t, err, "is a type expression")
 }
 
 func Test_Builtin_Core_clone_deepcopy(t *testing.T) {

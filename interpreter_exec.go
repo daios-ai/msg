@@ -1153,6 +1153,18 @@ func (e *emitter) emitExpr(n S) {
 		e.markChild(0)
 		e.emit(opCall, 1)
 
+	// ----- type-only surface form seen in value position -----
+	case "enum":
+		// Users wrote Enum[...] as a *value*. Raise a compile-time hard error with a caret on Enum[...] itself.
+		if e.src != nil && e.src.Spans != nil {
+			if sp, ok := e.src.Spans.Get(e.path); ok {
+				line, col := offsetToLineCol(e.src.Src, sp.StartByte)
+				panicRt("Enum[...] is a type expression; wrap it with 'type' to obtain a runtime Type (e.g., type Enum[...]).", e.src, line, col)
+			}
+		}
+		// Fallback if no spans are available (defensive):
+		panicRt("Enum[...] is a type expression; wrap it with 'type' to obtain a runtime Type (e.g., type Enum[...]).", e.src, 1, 1)
+
 	case "module":
 		// Lower to: __make_module(nameExpr, <AST handle>, basePathArray)
 		e.emit(opLoadGlobal, e.ks("__make_module"))

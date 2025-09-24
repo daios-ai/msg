@@ -1860,3 +1860,64 @@ func Test_Interpreter_FunLiteral_BasePath_Uses_Ints_Not_Floats(t *testing.T) {
 `)
 	wantInt(t, v, 7)
 }
+func Test_Interpreter_Type_BuiltinAtoms_AsTypeValue(t *testing.T) {
+	// Builtin atoms become runtime Type values only via `type ...`
+	v := evalSrc(t, "type Int")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Int`, got %#v", v)
+	}
+
+	v = evalSrc(t, "type Str")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Str`, got %#v", v)
+	}
+
+	v = evalSrc(t, "type Num")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Num`, got %#v", v)
+	}
+
+	v = evalSrc(t, "type Bool")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Bool`, got %#v", v)
+	}
+
+	v = evalSrc(t, "type Null")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Null`, got %#v", v)
+	}
+
+	v = evalSrc(t, "type Any")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Any`, got %#v", v)
+	}
+
+	v = evalSrc(t, "type Type")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Type`, got %#v", v)
+	}
+}
+
+func Test_Interpreter_Type_Enum_TypeConstruction_Works(t *testing.T) {
+	// Constructing an Enum type is legal via `type Enum[...]`
+	v := evalSrc(t, "type Enum[0, 1, 2]")
+	if v.Tag != VTType {
+		t.Fatalf("want VTType from `type Enum[...]`, got %#v", v)
+	}
+}
+
+func Test_Interpreter_Type_Enum_ValuePosition_IsError(t *testing.T) {
+	// Using Enum[...] in *value position* must be a compile-time hard error
+	// with a helpful nudge to use `type`.
+	err := evalSrcExpectError(t, "Enum[0]")
+	wantErrContains(t, err, "Enum")
+	wantErrContains(t, err, "type") // e.g., "use 'type Enum[...]'"
+}
+
+func Test_Interpreter_Type_Enum_BareIdentifier_IsError(t *testing.T) {
+	// Bare `Enum` in value position should be an error (not a value).
+	err := evalSrcExpectError(t, "Enum")
+	// Keep this broad so it tolerates either “undefined variable: Enum” or a
+	// future friendlier “Enum is a type name; use 'type' ...”.
+	wantErrContains(t, err, "Enum")
+}

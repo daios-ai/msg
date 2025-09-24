@@ -157,6 +157,33 @@ func mapTypeFields(t S) map[string]objField {
 //   - "map" and "enum" stay order-insensitive as before.
 //   - NEW: ("alias", *TypeValue) compares by pointer identity.
 func equalLiteralS(a, b S) bool {
+
+	// Compares two primitive S nodes or scalars used inside S.
+	equalPrimitiveS := func(x, y any) bool {
+		switch xv := x.(type) {
+		case []any: // covers S too
+			yv, ok := y.([]any)
+			if !ok {
+				return false
+			}
+			return equalLiteralS(xv, yv)
+		case string:
+			ys, ok := y.(string)
+			return ok && xv == ys
+		case int64:
+			yi, ok := y.(int64)
+			return ok && xv == yi
+		case float64:
+			yf, ok := y.(float64)
+			return ok && xv == yf
+		case bool:
+			yb, ok := y.(bool)
+			return ok && xv == yb
+		default:
+			return x == y
+		}
+	}
+
 	if len(a) != len(b) {
 		return false
 	}
@@ -216,86 +243,11 @@ func equalLiteralS(a, b S) bool {
 	}
 
 	for i := 1; i < len(a); i++ {
-		if !equalNode(a[i], b[i]) {
+		if !equalPrimitiveS(a[i], b[i]) {
 			return false
 		}
 	}
 	return true
-}
-
-// Compares two S nodes or scalars used inside S.
-func equalNode(x, y any) bool {
-	switch xv := x.(type) {
-	case []any: // covers S too
-		yv, ok := y.([]any)
-		if !ok {
-			return false
-		}
-		return equalLiteralS(xv, yv)
-	case string:
-		ys, ok := y.(string)
-		return ok && xv == ys
-	case int64:
-		yi, ok := y.(int64)
-		return ok && xv == yi
-	case float64:
-		yf, ok := y.(float64)
-		return ok && xv == yf
-	case bool:
-		yb, ok := y.(bool)
-		return ok && xv == yb
-	default:
-		return x == y
-	}
-}
-
-// Deep equality on Values for the literal space used by enums
-// (null/bool/int/num/str/array/map). Named *Lit* to avoid confusion with
-// (*Interpreter).deepEqual used elsewhere.
-func deepEqualLit(a, b Value) bool {
-	if a.Tag != b.Tag {
-		return false
-	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray:
-		ax := a.Data.(*ArrayObject).Elems
-		bx := b.Data.(*ArrayObject).Elems
-		if len(ax) != len(bx) {
-			return false
-		}
-		for i := range ax {
-			if !deepEqualLit(ax[i], bx[i]) {
-				return false
-			}
-		}
-		return true
-	case VTMap:
-		am := a.Data.(*MapObject)
-		bm := b.Data.(*MapObject)
-		if len(am.Entries) != len(bm.Entries) {
-			return false
-		}
-		for k, av := range am.Entries {
-			bv, ok := bm.Entries[k]
-			if !ok || !deepEqualLit(av, bv) {
-				return false
-			}
-		}
-		return true
-	default:
-		// Not expected for enum literals
-		return false
-	}
 }
 
 // Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
@@ -362,8 +314,8 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 	seenArr := map[*ArrayObject]bool{}
 	seenMap := map[*MapObject]bool{}
 
-	var go1 func(Value) S
-	go1 = func(v Value) S {
+	var infer func(Value) S
+	infer = func(v Value) S {
 		switch v.Tag {
 		case VTNull:
 			return S{"id", "Null"}
@@ -398,9 +350,9 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 				}
 			}
 
-			elem := go1(xs[0])
+			elem := infer(xs[0])
 			for i := 1; i < len(xs); i++ {
-				elem = ip.unifyTypes(elem, go1(xs[i]), env)
+				elem = ip.unifyTypes(elem, infer(xs[i]), env)
 				if isId(elem, "Any") {
 					// Can't get more specific; bail early.
 					break
@@ -421,13 +373,13 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 			out := S{"map"}
 			// Open-world: infer observed fields as optional ("pair").
 			for k, vv := range mo.Entries {
-				out = append(out, S{"pair", S{"str", k}, go1(vv)})
+				out = append(out, S{"pair", S{"str", k}, infer(vv)})
 			}
 			return out
 
 		case VTModule:
 			// Treat modules structurally as maps.
-			return go1(AsMapValue(v))
+			return infer(AsMapValue(v))
 
 		case VTFun:
 			f := v.Data.(*Fun)
@@ -447,7 +399,7 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 		}
 	}
 
-	return go1(v)
+	return infer(v)
 }
 
 // -----------------------------
@@ -764,7 +716,7 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 
 		case "enum":
 			for i := 1; i < len(t); i++ {
-				if lit, ok := ip.litToValue(t[i].(S)); ok && deepEqualLit(lit, v) {
+				if lit, ok := ip.litToValue(t[i].(S)); ok && ip.deepEqual(lit, v) {
 					return true
 				}
 			}

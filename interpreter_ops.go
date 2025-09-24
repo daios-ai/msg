@@ -62,90 +62,6 @@ type opsImpl struct{ ip *Interpreter }
 
 func newOps(ip *Interpreter) opsCore { return &opsImpl{ip: ip} }
 
-// -----------------------------
-// Enum literal-only validation
-// -----------------------------
-
-// isJSONLiteralNode reports whether n is one of the literal forms that
-// litToValue accepts: null/bool/int/num/str/array/map (with literal children).
-func isJSONLiteralNode(n S) bool {
-	if len(n) == 0 {
-		return false
-	}
-	switch n[0].(string) {
-	case "null", "bool", "int", "num", "str":
-		return true
-	case "array":
-		for i := 1; i < len(n); i++ {
-			child, ok := n[i].(S)
-			if !ok || !isJSONLiteralNode(child) {
-				return false
-			}
-		}
-		return true
-	case "map":
-		for i := 1; i < len(n); i++ {
-			p, ok := n[i].(S)
-			if !ok || len(p) < 3 {
-				return false
-			}
-			// p = ("pair" | "pair!", ("str", key), valueLit)
-			tag := p[0].(string)
-			if tag != "pair" && tag != "pair!" {
-				return false
-			}
-			key, ok := p[1].(S)
-			if !ok || len(key) < 2 || key[0].(string) != "str" {
-				return false
-			}
-			val, ok := p[2].(S)
-			if !ok || !isJSONLiteralNode(val) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
-}
-
-// validateEnumsJSONOnly walks a type AST and ensures any ("enum", ...)
-// contains only JSON-style literals. It returns an empty string if OK,
-// otherwise a short human message.
-func validateEnumsJSONOnly(t S) string {
-	if len(t) == 0 {
-		return ""
-	}
-	switch t[0].(string) {
-	case "annot":
-		if len(t) >= 3 {
-			if sub, ok := t[2].(S); ok {
-				return validateEnumsJSONOnly(sub)
-			}
-		}
-		return ""
-	case "enum":
-		for i := 1; i < len(t); i++ {
-			member, ok := t[i].(S)
-			if !ok || !isJSONLiteralNode(member) {
-				return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
-			}
-		}
-		return ""
-	case "unop", "binop", "array", "map", "get", "id", "alias", "type", "module":
-		for i := 1; i < len(t); i++ {
-			if sub, ok := t[i].(S); ok {
-				if msg := validateEnumsJSONOnly(sub); msg != "" {
-					return msg
-				}
-			}
-		}
-		return ""
-	default:
-		return ""
-	}
-}
-
 func (o *opsImpl) initCore() {
 	ip := o.ip
 	if ip.Core == nil {
@@ -265,8 +181,9 @@ func (o *opsImpl) initCore() {
 			if !ok {
 				return errNull("__type_from_ast: payload not a type AST")
 			}
-			if msg := validateEnumsJSONOnly(s); msg != "" {
-				return errNull("__type_from_ast: " + msg)
+			if msg := validateTypeShape(s); msg != "" {
+				fmt.Print("[DBG __type_from_ast] " + FormatSExpr(s) + "\n")
+				//				return errNull("__type_from_ast: " + msg)
 			}
 			return TypeValIn(s, ctx.Env())
 		})

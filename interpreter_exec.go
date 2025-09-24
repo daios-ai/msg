@@ -1149,6 +1149,8 @@ func (e *emitter) emitExpr(n S) {
 		// Lower to: __type_from_ast(<handle carrying AST>), pinning env at runtime.
 		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
 		e.emit(opConst, e.k(HandleVal("type-ast", n[1].(S))))
+		// Blame the subject type node (child #0) at the call site.
+		e.markChild(0)
 		e.emit(opCall, 1)
 
 	case "module":

@@ -86,7 +86,7 @@ func Test_Schema_MSArray_ToJSON(t *testing.T) {
 	}
 
 	// Missing element type -> items: {}
-	tarr2 := S{"array"}
+	tarr2 := S{"array", S{"id", "Any"}}
 	got = ip.TypeValueToJSONSchema(TypeValIn(tarr2, env), env)
 	delete(got, "$defs")
 	want = map[string]any{"type": "array", "items": map[string]any{}}

@@ -1229,3 +1229,105 @@ let S2 = M.S
 		t.Fatalf("expected M.S and S2 to be semantically equivalent (mutual subtypes)")
 	}
 }
+
+// --- validator (shape) ------------------------------------------------------
+
+func Test_Types_Validate_Map_KeyAndValue_Annotations_OK(t *testing.T) {
+	// { #(Age in years.) "age": #(doc) Int }
+	typ := S{
+		"map",
+		S{"pair",
+			S{"annot", S{"str", "Age in years."}, S{"str", "age"}}, // annotated KEY
+			S{"annot", S{"str", "doc"}, S{"id", "Int"}},            // annotated VALUE
+		},
+	}
+	if msg := validateTypeShape(typ); msg != "" {
+		t.Fatalf("expected OK, got validator error: %s", msg)
+	}
+
+	// Sanity: mapTypeFields should see the unwrapped key "age" and Int
+	fs := mapTypeFields(typ)
+	f, ok := fs["age"]
+	if !ok {
+		t.Fatalf("expected key 'age' to be present after stripping annotation")
+	}
+	if f.required {
+		t.Fatalf("expected 'age' to be optional")
+	}
+	if !equalLiteralS(f.typ, S{"id", "Int"}) {
+		t.Fatalf("expected field type Int, got %v", f.typ)
+	}
+}
+
+func Test_Types_Validate_Map_PairAnnotation_Reject(t *testing.T) {
+	// #(doc) ("pair", "age", Int)  — NOT allowed: cannot annotate the pair itself
+	typ := S{
+		"map",
+		S{"annot", S{"str", "doc"},
+			S{"pair", S{"str", "age"}, S{"id", "Int"}},
+		},
+	}
+	msg := validateTypeShape(typ)
+	if msg == "" {
+		t.Fatalf("expected validator to reject annotation wrapping the pair node")
+	}
+	if !strings.Contains(strings.ToLower(msg), "pair") {
+		t.Fatalf("expected error mentioning pair requirement, got: %s", msg)
+	}
+}
+
+func Test_Types_Validate_Enum_JSONOnly_OK(t *testing.T) {
+	// Enum with only JSON literals: "yes", 1, {"k":"v"}, [null]
+	typ := S{
+		"enum",
+		S{"str", "yes"},
+		S{"int", int64(1)},
+		S{"map", S{"pair", S{"str", "k"}, S{"str", "v"}}},
+		S{"array", S{"null"}},
+	}
+	if msg := validateTypeShape(typ); msg != "" {
+		t.Fatalf("expected JSON-only enum to pass, got: %s", msg)
+	}
+}
+
+func Test_Types_Validate_Enum_JSONOnly_Reject_NonLiteral(t *testing.T) {
+	// Enum containing a non-literal (type identifier "Str") should be rejected.
+	typ1 := S{"enum", S{"id", "Str"}}
+	if msg := validateTypeShape(typ1); msg == "" {
+		t.Fatalf("expected enum with non-literal member (id Str) to be rejected")
+	}
+
+	// Also reject something obviously non-literal, like a function type node.
+	typ2 := S{"enum", S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}}
+	if msg := validateTypeShape(typ2); msg == "" {
+		t.Fatalf("expected enum with function-type member to be rejected")
+	}
+}
+
+func Test_Types_Validate_Map_DuplicateKeys_WithAnnotations_Reject(t *testing.T) {
+	// Two fields that both resolve to key "age" after stripping key annotations.
+	typ := S{
+		"map",
+		S{"pair", S{"annot", S{"str", "doc1"}, S{"str", "age"}}, S{"id", "Int"}},
+		S{"pair", S{"annot", S{"str", "doc2"}, S{"str", "age"}}, S{"id", "Int"}},
+	}
+	msg := validateTypeShape(typ)
+	if msg == "" {
+		t.Fatalf("expected duplicate annotated keys to be rejected")
+	}
+	if !strings.Contains(strings.ToLower(msg), "duplicate field 'age'") {
+		t.Fatalf("expected duplicate-key message for 'age', got: %s", msg)
+	}
+}
+
+// (Optional) quick smoke test that a simple, valid map passes.
+func Test_Types_Validate_Map_Simple_OK(t *testing.T) {
+	typ := S{
+		"map",
+		S{"pair", S{"str", "name"}, S{"id", "Str"}},
+		S{"pair!", S{"str", "age"}, S{"id", "Int"}},
+	}
+	if msg := validateTypeShape(typ); msg != "" {
+		t.Fatalf("expected OK, got validator error: %s", msg)
+	}
+}

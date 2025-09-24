@@ -1,1399 +1,3002 @@
-=== BEGIN FILE: types.go ===
-// types.go: runtime type & schema system for MindScript.
+=== BEGIN FILE: lexer.go ===
+// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
+// MindScript language. It converts a source string into a linear stream of
+// tokens with accurate source positions and rich literal decoding.
 //
-// IMPLEMENTATION-ONLY FILE
-// ------------------------
-// This file contains the *private implementation* of the type engine used by
-// the public methods on *Interpreter* that live in interpreter.go:
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-LEVEL OVERVIEW
 //
-//   ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
+// The lexer scans left→right and emits Token values, always ending with EOF.
+// Each token carries:
+//   - Type     — a TokenType enum
+//   - Lexeme   — the exact source slice (verbatim characters from the input)
+//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
+//   - Line/Col — 1-based line and 0-based column of the token’s *start*
+//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
 //
-// Those exported methods are thin wrappers that delegate to the lower-case
-// functions defined here: resolveType, isType, isSubtype, unifyTypes,
-// valueToTypeS (plus helpers like litToValue/equalS).
+// Whitespace-sensitive delimiters:
 //
-// Goals / design (practical, JSON-friendly, duck-typed):
+//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
+//	whether there is immediate whitespace before the delimiter:
 //
-// OVERVIEW
-// --------
-// This file implements MindScript’s *runtime* type system. Types are represented
-// as S-expressions (the same light-weight shape the parser produces) and remain
-// entirely structural. The system is designed for practical, JSON-friendly
-// validation and inference:
+//	  '('  → LROUND  if there IS preceding whitespace
+//	         CLROUND if there is NO preceding whitespace
+//	  '['  → LSQUARE if there IS preceding whitespace
+//	         CLSQUARE if there is NO preceding whitespace
 //
-//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
-//     {name:"Raffa"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
-//     Arrays unify element types conservatively; objects are “open-world”.
-//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
-//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
-//   - Arrays are covariant in element type.
-//   - Objects require that all *required* fields of `B` exist, with compatible
-//     types, and *requiredness cannot be relaxed*.
-//   - Extra fields on values are allowed (open-world).
-//   - Functions use parameter contravariance and return covariance.
-//   - `Int <: Num`, and `T?` means nullable.
-//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
-//     inference (e.g., arrays with mixed contents).
-//   - **Modules:** Runtime values tagged `VTModule` are treated as **maps** for
-//     type-checking and inference purposes (they normalize via `AsMapValue`).
+// Consequences (user-facing syntax):
+//   - Calls and parameter lists require NO space before '(':
+//     f(x)           // call: uses CLROUND
+//     fun(x: T)      // function params: uses CLROUND
+//     oracle(x: T)   // oracle params: uses CLROUND
+//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
+//     parameter list; the parser will error.
+//   - Indexing requires NO space before '[':
+//     arr[i]         // indexing: uses CLSQUARE
+//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
+//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
+//     CLROUND participates in call/juxtaposition chains.
 //
-// CANONICALIZATION (alias nodes)
-// ------------------------------
-// A key improvement in this implementation is *alias canonicalization*.
+// The '.' character is context-sensitive:
+//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
+//     produced.
+//   - Otherwise it is PERIOD (typically for property access).
 //
-//  • Any non-builtin type reference (local or module-qualified) is resolved to a
-//    stable, pointer-identified alias node:   ("alias", *TypeValue)
+// IDENTIFIERS & KEYWORDS
 //
-//  • Builtin type names remain as ("id", "Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type").
+//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
+//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
+//	After a PERIOD, both identifiers *and* quoted strings are treated as
+//	property names and forced to ID (even if the text is a keyword). This allows:
+//	    obj."then"   // ID with Literal="then"
+//	    obj.then     // ID with Literal="then"
 //
-//  • Structural nodes ("array", "map", "unop ?","binop ->", "enum") are resolved
-//    recursively while keeping alias nodes *opaque* — we *do not* inline-expand
-//    aliases during ResolveType. This produces a canonical, name-agnostic
-//    representation so that `M.T` and a local `T = M.T` unify by *pointer
-//    identity* of the exported `*TypeValue`.
+// LITERALS
+//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
+//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
+//     bytes in the lexeme are validated and decoded.
+//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
+//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
+//   - BOOLEAN — “true” or “false” (Literal: bool).
+//   - NULL    — “null” (Literal: nil).
 //
-// EQUIRECURSIVE COMPARISON
-// ------------------------
-// Both `isType` and `isSubtype` are implemented coinductively with cycle
-// breaking using memo tables keyed on:
-//   • value-pointer × type-node-pointer (for isType), and
-//   • (left-node, right-node) identity (for isSubtype),
-// augmented so that ("alias", *TypeValue) keys by the *TypeValue pointer*.
-// This makes recursive types and module-qualified aliases compare correctly.
+// ANNOTATIONS
+//   - Hash-line annotations: one or more consecutive lines where, after optional
+//     indentation, the first non-space is '#'. The leading '#' (and at most one
+//     optional following space) are stripped; lines are joined with '\n', and a
+//     single ANNOTATION token is emitted. A blank/non-# line ends the block.
 //
-// DEPENDENCIES (other files)
-// --------------------------
-// • parser.go
-//   - `type S = []any`  (S-expression node type)
+// ERRORS (start-of-token anchoring)
+//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
+//     reported as *Error* with precise location anchored to the **start** of the
+//     offending token (the token that is being scanned).
+//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
+//     strings produce *IncompleteError* (still anchored to the token start).
 //
-// • interpreter.go
-//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
-//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
-//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
-//   - Environments: `Env` with `Get/Set/Define`
-//   - `type Interpreter` (receiver for public API methods)
+// OUTPUT
+//   - Scan returns the full token slice *including* the terminal EOF token.
+//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
+//     includes the quotes and escapes), while Literal carries the decoded value.
 //
-// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
+// ──────────────────────────────────────────────────────────────────────────────
 //
-// PUBLIC VS PRIVATE
-// -----------------
-// PUBLIC  : Nothing.
+// FILE ORGANIZATION
+//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
+//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
 //
-// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
-//           isSubtype, unifyTypes, valueToTypeS, literal conversion,
-//           structural S-equality, and field extraction.
-
+// The PUBLIC API docs below are intentionally exhaustive so the behavior is
+// understandable without reading the implementation.
+//
+// ──────────────────────────────────────────────────────────────────────────────
 package mindscript
 
 import (
-	"unsafe"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
+
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// TokenType is the enumeration of all token kinds the lexer can emit.
+// Most names are self-explanatory; groups are listed for clarity.
+//
+// Special:
+//
+//	EOF     — end-of-file sentinel (always the final token)
+//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
+//
+// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
+//
+//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
+//	RROUND            — ')'
+//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
+//	RSQUARE           — ']'
+//	LCURLY, RCURLY    — '{', '}'
+//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
+//
+// Operators:
+//
+//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
+//	ASSIGN                      — '='
+//	EQ, NEQ                     — '==', '!='
+//	LESS, LESS_EQ               — '<',  '<='
+//	GREATER, GREATER_EQ         — '>',  '>='
+//	BANG                        — '!' (used by the language in object/type literals)
+//	ARROW                       — '->'
+//
+// Literals & identifiers:
+//
+//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
+//
+// Keywords (produced when the identifier text equals these words, except when
+// forced to an ID after PERIOD/property access):
+//
+//	AND, OR, NOT,
+//	LET, DO, END, RETURN, BREAK, CONTINUE,
+//	IF, THEN, ELIF, ELSE,
+//	FUNCTION, ORACLE, MODULE,
+//	FOR, IN, FROM, WHILE,
+//	TYPECONS, TYPE, ENUM
+//
+// Annotation:
+//
+//	ANNOTATION — emitted for multi-line blocks starting with '#'.
+type TokenType int
+
+const (
+	// Special
+	EOF TokenType = iota
+	ILLEGAL
+
+	// Punctuation
+	LROUND   // "(" when preceded by whitespace
+	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
+	RROUND   // ")"
+	LSQUARE  // "["
+	CLSQUARE // "[" when not preceded by whitespace (index-close)
+	RSQUARE  // "]"
+	LCURLY   // "{"
+	RCURLY   // "}"
+	COLON    // ":"
+	COMMA    // ","
+	PERIOD   // "."
+	QUESTION // "?"
+
+	// Operators
+	PLUS
+	MINUS
+	MULT
+	DIV
+	MOD
+	ASSIGN // "="
+	EQ     // "=="
+	NEQ    // "!="
+	LESS
+	LESS_EQ
+	GREATER
+	GREATER_EQ
+	BANG  // "!" (required-field marker in object/type literals)
+	ARROW // "->"
+
+	// Literals & identifiers
+	ID
+	STRING
+	INTEGER
+	NUMBER
+	BOOLEAN
+	NULL
+
+	// Keywords
+	AND
+	OR
+	NOT
+	LET
+	DO
+	END
+	RETURN
+	BREAK
+	CONTINUE
+	IF
+	THEN
+	ELIF
+	ELSE
+	FUNCTION
+	ORACLE
+	MODULE
+	FOR
+	IN
+	FROM
+	WHILE
+	TYPECONS
+	TYPE
+	ENUM
+
+	// Annotation token (from lines starting with '#')
+	ANNOTATION
+	NOOP
+)
+
+// Token is a single lexical unit produced by the lexer.
+//
+// Fields:
+//
+//	Type    — the TokenType kind.
+//	Lexeme  — the exact source slice comprising the token (verbatim, including
+//	          quotes for strings, escape sequences, etc.).
+//	Literal — a decoded value for literal tokens:
+//	          • STRING  → Go string with escapes and surrogate pairs resolved
+//	          • INTEGER → int64
+//	          • NUMBER  → float64
+//	          • BOOLEAN → bool
+//	          • NULL    → nil
+//	          Non-literal tokens usually carry nil or an unmodified string
+//	          (keywords may store their text; property IDs store the property name).
+//	Line    — 1-based line number at which this token starts.
+//	Col     — 0-based column index at which this token starts.
+//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
+type Token struct {
+	Type      TokenType
+	Lexeme    string
+	Literal   interface{}
+	Line      int
+	Col       int
+	StartByte int
+	EndByte   int
+}
+
+// HARD errors produced by the lexer use the unified *Error type defined in
+// errors.go. See DiagLex and DiagIncomplete.
+//
+// In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
+// when input ends inside an unterminated construct (e.g., string literal).
+//
+// **Error locations:** All lexing errors (both hard and incomplete) are anchored
+// to the **start of the offending token** (the token whose scanning raised
+// the error). This makes diagnostics stable and easy to map to spans.
+
+// Lexer is a streaming tokenizer for MindScript.
+//
+// Construction:
+//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
+//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
+//     produce IncompleteError.
+//
+// Semantics:
+//   - Scan() returns the full token slice including EOF. It never panics for
+//     malformed input; instead it returns (nil, error).
+//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
+//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
+//     either preceding whitespace *or* the previous token cannot be a left operand.
+//     Otherwise '.' is PERIOD used for property access.
+//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
+//     even if it matches a keyword.
+//
+// Positioning:
+//   - Line numbers are 1-based; column indices are 0-based.
+//   - A token’s position is captured at the start of scanning that token.
+type Lexer struct {
+	// public type with no exported fields; use constructors + Scan()
+	src    string
+	start  int // start index of current token
+	cur    int // current index
+	line   int // 1-based
+	col    int // 0-based column within line
+	tokens []Token
+
+	// precise token start position
+	tokStartLine int
+	tokStartCol  int
+
+	// interactive mode: produce IncompleteError for unterminated constructs at EOF
+	interactive bool
+}
+
+// NewLexer creates a new lexer for the given source in normal mode.
+func NewLexer(src string) *Lexer {
+	return &Lexer{
+		src: src,
+		// very rough guess to reduce reslices on big files
+		tokens: make([]Token, 0, len(src)/4),
+		line:   1,
+		col:    0,
+	}
+}
+
+// NewLexerInteractive creates a lexer in interactive mode.
+// Unterminated strings return IncompleteError at EOF, allowing REPLs to request more input.
+func NewLexerInteractive(src string) *Lexer {
+	return &Lexer{
+		src:         src,
+		tokens:      make([]Token, 0, len(src)/4),
+		line:        1,
+		col:         0,
+		interactive: true,
+	}
+}
+
+// Scan tokenizes the entire source string and returns the resulting slice of
+// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
+//
+// Error behavior summary:
+//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
+//   - Interactive mode: returns *IncompleteError at EOF if a construct is
+//     unterminated; other issues still return *LexError.
+//
+// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
+// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
+func (l *Lexer) Scan() ([]Token, error) {
+	for {
+		tok, err := l.scanToken()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Type == EOF {
+			return l.tokens, nil
+		}
+	}
+}
 
 //// END_OF_PUBLIC
 
 ////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
+//                            PRIVATE IMPLEMENTATION
 ////////////////////////////////////////////////////////////////////////////////
 
-// -----------------------------
-// Helpers
-// -----------------------------
+// ---------------- keywords map (private) ----------------
 
-// stripAnnot unwraps annotation wrappers inside type ASTs:
-//
-//	("annot", ("str", doc), T)  =>  T
-//
-// It repeats until the outer node is not "annot".
-func stripAnnot(t S) S {
-	for len(t) >= 3 {
-		tag, ok := t[0].(string)
-		if !ok || tag != "annot" {
-			break
-		}
-		t = t[2].(S)
-	}
-	return t
+var keywords = map[string]TokenType{
+	"null":     NULL,
+	"false":    BOOLEAN,
+	"true":     BOOLEAN,
+	"and":      AND,
+	"or":       OR,
+	"not":      NOT,
+	"let":      LET,
+	"do":       DO,
+	"end":      END,
+	"return":   RETURN,
+	"break":    BREAK,
+	"continue": CONTINUE,
+	"if":       IF,
+	"then":     THEN,
+	"elif":     ELIF,
+	"else":     ELSE,
+	"fun":      FUNCTION,
+	"oracle":   ORACLE,
+	"module":   MODULE,
+	"for":      FOR,
+	"in":       IN,
+	"from":     FROM,
+	"while":    WHILE,
+	"type":     TYPECONS,
+	"Type":     TYPE,
+	"Null":     TYPE,
+	"Str":      TYPE,
+	"Int":      TYPE,
+	"Num":      TYPE,
+	"Bool":     TYPE,
+	"Any":      TYPE,
+	"Enum":     ENUM,
 }
 
-func isBuiltinTypeName(name string) bool {
-	switch name {
-	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
+// ---------------- core scanning helpers ----------------
+
+func (l *Lexer) isAtEnd() bool { return l.cur >= len(l.src) }
+
+func (l *Lexer) peek() (byte, bool) {
+	if l.isAtEnd() {
+		return 0, false
+	}
+	return l.src[l.cur], true
+}
+
+func (l *Lexer) peekN(n int) (byte, bool) {
+	idx := l.cur + n
+	if idx >= len(l.src) {
+		return 0, false
+	}
+	return l.src[idx], true
+}
+
+func (l *Lexer) advance() (byte, bool) {
+	if l.isAtEnd() {
+		return 0, false
+	}
+	ch := l.src[l.cur]
+	l.cur++
+	if ch == '\n' {
+		l.line++
+		l.col = 0
+	} else {
+		l.col++
+	}
+	return ch, true
+}
+
+func (l *Lexer) rewindToStart() {
+	// We rewind only within the bounds of the current token start; line/col are kept
+	// for error arrows (OK since we set tokStartLine/Col before scanning).
+	l.cur = l.start
+}
+
+func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
+	lex := l.src[l.start:l.cur]
+	tok := Token{
+		Type:      tt,
+		Lexeme:    lex,
+		Literal:   lit,
+		Line:      l.tokStartLine,
+		Col:       l.tokStartCol,
+		StartByte: l.start,
+		EndByte:   l.cur,
+	}
+	l.tokens = append(l.tokens, tok)
+	l.start = l.cur
+	return tok
+}
+
+func (l *Lexer) previousToken() *Token {
+	if len(l.tokens) == 0 {
+		return nil
+	}
+	return &l.tokens[len(l.tokens)-1]
+}
+
+func (l *Lexer) skipHorizontalWhitespace() {
+	for !l.isAtEnd() {
+		ch, _ := l.peek()
+		switch ch {
+		case ' ', '\t', '\r':
+			l.advance()
+			l.start = l.cur
+		default:
+			return
+		}
+	}
+}
+
+// immediateWhitespaceBefore reports whether the byte immediately preceding the
+// current token start is ASCII whitespace. Called *after* skipWhitespace.
+func (l *Lexer) immediateWhitespaceBefore() bool {
+	if l.start == 0 {
+		return false
+	}
+	switch l.src[l.start-1] {
+	case ' ', '\t', '\n', '\r':
 		return true
 	default:
 		return false
 	}
 }
 
-func isId(t S, name string) bool {
-	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+// ---------------- small predicates ----------------
+
+func canBeLeftOperand(t TokenType) bool {
+	switch t {
+	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
+		TYPE, ENUM,
+		RROUND, RSQUARE, RCURLY,
+		QUESTION:
+		return true
+	default:
+		return false
+	}
 }
 
-// ("map", ("pair"| "pair!", ("str",k), T)...)
-type objField struct {
-	required bool
-	typ      S
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+func isHex(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+func isAlpha(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' }
+func isAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_'
 }
 
-func mapTypeFields(t S) map[string]objField {
-	fs := map[string]objField{}
-	for i := 1; i < len(t); i++ {
-		p := t[i].(S)
-		if len(p) < 3 {
+func (l *Lexer) afterDotIsProperty() bool {
+	p := l.previousToken()
+	return p != nil && p.Type == PERIOD
+}
+
+// ---------------- error builders (start-of-token anchored) ----------------
+
+func (l *Lexer) err(msg string) error {
+	// All lexer diagnostics are anchored to the start of the *current* token,
+	// which is the most stable and helpful position for tools and users.
+	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
+}
+
+func (l *Lexer) errIncomplete(msg string) error {
+	// Report need-more-input conditions in interactive mode, anchored to token start.
+	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
+}
+
+// ---------------- scanners ----------------
+
+// scanString parses a JSON-style string literal (single or double quotes).
+func (l *Lexer) scanString() (string, error) {
+	del := l.src[l.start]
+	if del != '"' && del != '\'' {
+		return "", l.err("internal: scanString without quote")
+	}
+	// consume the delimiter
+	l.advance()
+
+	var out []rune
+	for !l.isAtEnd() {
+		ch, _ := l.advance()
+		if ch == byte(del) {
+			return string(out), nil
+		}
+		if ch == '\\' {
+			if l.isAtEnd() {
+				if l.interactive {
+					return "", l.errIncomplete("unfinished escape sequence")
+				}
+				return "", l.err("unfinished escape sequence")
+			}
+			esc, _ := l.advance()
+			switch esc {
+			case '"':
+				out = append(out, '"')
+			case '\'':
+				out = append(out, '\'')
+			case '\\':
+				out = append(out, '\\')
+			case '/':
+				out = append(out, '/')
+			case 'b':
+				out = append(out, '\b')
+			case 'f':
+				out = append(out, '\f')
+			case 'n':
+				out = append(out, '\n')
+			case 'r':
+				out = append(out, '\r')
+			case 't':
+				out = append(out, '\t')
+			case 'u':
+				// expect 4 hex digits
+				toHex := func(b byte) int {
+					switch {
+					case b >= '0' && b <= '9':
+						return int(b - '0')
+					case b >= 'a' && b <= 'f':
+						return 10 + int(b-'a')
+					case b >= 'A' && b <= 'F':
+						return 10 + int(b-'A')
+					default:
+						return -1
+					}
+				}
+				val := 0
+				for i := 0; i < 4; i++ {
+					b, ok := l.peek()
+					if !ok {
+						if l.interactive {
+							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
+						}
+						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
+					}
+					d := toHex(b)
+					if d < 0 {
+						return "", l.err("invalid unicode escape")
+					}
+					val = (val << 4) | d
+					l.advance()
+				}
+				r := rune(val)
+
+				// handle surrogate pair \uD800-\uDBFF followed by \uDC00-\uDFFF
+				if 0xD800 <= r && r <= 0xDBFF {
+					saveCur := l.cur
+					saveLine, saveCol := l.line, l.col
+					if b1, ok := l.peek(); ok && b1 == '\\' {
+						l.advance()
+						if b2, ok := l.peek(); ok && b2 == 'u' {
+							l.advance()
+							val2 := 0
+							for i := 0; i < 4; i++ {
+								b, ok := l.peek()
+								if !ok {
+									if l.interactive {
+										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
+									}
+									return "", l.err("unicode surrogate pair low was not terminated")
+								}
+								d := toHex(b)
+								if d < 0 {
+									return "", l.err("invalid unicode surrogate pair low")
+								}
+								val2 = (val2 << 4) | d
+								l.advance()
+							}
+							r2 := rune(val2)
+							if 0xDC00 <= r2 && r2 <= 0xDFFF {
+								cp := utf16.DecodeRune(r, r2)
+								out = append(out, cp)
+								continue
+							}
+						}
+					}
+					// not a valid pair; rewind and just emit r
+					l.cur = saveCur
+					l.line, l.col = saveLine, saveCol
+				}
+				out = append(out, r)
+			default:
+				return "", l.err(fmt.Sprintf("invalid escape sequence: \\%c", esc))
+			}
 			continue
 		}
-		ptag := p[0].(string) // "pair" or "pair!"
-		keyNode := p[1].(S)   // ("str", k)
-		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+		// normal char; ensure it’s valid UTF-8 boundary (source may be UTF-8)
+		if ch < utf8.RuneSelf {
+			out = append(out, rune(ch))
 			continue
 		}
-		k := keyNode[1].(string)
-		required := ptag == "pair!"
-		fs[k] = objField{required: required, typ: stripAnnot(p[2].(S))}
+		// If we see a non-ASCII byte here, the source itself is UTF-8; back up one byte and decode rune.
+		l.cur-- // step back 1 byte to let utf8.DecodeRuneInString read from correct start
+		r, size := utf8.DecodeRuneInString(l.src[l.cur:])
+		if r == utf8.RuneError && size == 1 {
+			return "", l.err("invalid UTF-8 in source")
+		}
+		out = append(out, r)
+		l.cur += size
+		l.col += size - 1
 	}
-	return fs
+	if l.interactive {
+		return "", l.errIncomplete("string was not terminated")
+	}
+	return "", l.err("string was not terminated")
 }
 
-// Structural equality for S-exprs with special cases:
-//   - "map" and "enum" stay order-insensitive as before.
-//   - NEW: ("alias", *TypeValue) compares by pointer identity.
-func equalLiteralS(a, b S) bool {
-
-	// Compares two primitive S nodes or scalars used inside S.
-	equalPrimitiveS := func(x, y any) bool {
-		switch xv := x.(type) {
-		case []any: // covers S too
-			yv, ok := y.([]any)
-			if !ok {
-				return false
-			}
-			return equalLiteralS(xv, yv)
-		case string:
-			ys, ok := y.(string)
-			return ok && xv == ys
-		case int64:
-			yi, ok := y.(int64)
-			return ok && xv == yi
-		case float64:
-			yf, ok := y.(float64)
-			return ok && xv == yf
-		case bool:
-			yb, ok := y.(bool)
-			return ok && xv == yb
-		default:
-			return x == y
+// scanIdentifier parses [A-Za-z_][A-Za-z0-9_]*
+func (l *Lexer) scanIdentifier() string {
+	for {
+		b, ok := l.peek()
+		if !ok || !isAlphaNum(b) {
+			break
 		}
+		l.advance()
 	}
+	return l.src[l.start:l.cur]
+}
 
-	if len(a) != len(b) {
-		return false
-	}
-	if len(a) == 0 {
-		return true
-	}
+// scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
+// Precondition: current position is at l.start and the first rune is either a digit
+// or a '.' that has already been verified to start a number.
+func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
+	sawDigits := false
+	sawDot := false
+	sawExp := false
 
-	ta, ok := a[0].(string)
-	if !ok {
-		return false
-	}
-	tb, ok := b[0].(string)
-	if !ok || ta != tb {
-		return false
-	}
-
-	if ta == "alias" {
-		if len(a) < 2 || len(b) < 2 {
-			return false
+	// integral part (optional for leading '.')
+	for {
+		b, ok := l.peek()
+		if !ok || !isDigit(b) {
+			break
 		}
-		atv, ok1 := a[1].(*TypeValue)
-		btv, ok2 := b[1].(*TypeValue)
-		return ok1 && ok2 && atv == btv
+		l.advance()
+		sawDigits = true
 	}
 
-	// Order-insensitive equality for maps.
-	if ta == "map" {
-		fa := mapTypeFields(a)
-		fb := mapTypeFields(b)
-		if len(fa) != len(fb) {
-			return false
-		}
-		for k, va := range fa {
-			vb, ok := fb[k]
-			if !ok || va.required != vb.required || !equalLiteralS(va.typ, vb.typ) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Order-insensitive equality for enums.
-	if ta == "enum" {
-		if len(a) != len(b) { // quick length check
-			return false
-		}
-	outer:
-		for i := 1; i < len(a); i++ {
-			for j := 1; j < len(b); j++ {
-				if equalLiteralS(a[i].(S), b[j].(S)) {
-					continue outer
+	// fractional part
+	if b, ok := l.peek(); ok && b == '.' {
+		// Do NOT consume '.' if we're after a property PERIOD (obj.<digits>)
+		// OR if the next char is also '.' (e.g. "1..2").
+		if !(l.afterDotIsProperty()) {
+			if b2, ok2 := l.peekN(1); !(ok2 && b2 == '.') {
+				l.advance() // consume '.'
+				sawDot = true
+				for {
+					b2, ok2 := l.peek()
+					if !ok2 || !isDigit(b2) {
+						break
+					}
+					l.advance()
+					sawDigits = true
 				}
 			}
-			return false
 		}
-		return true
 	}
 
-	for i := 1; i < len(a); i++ {
-		if !equalPrimitiveS(a[i], b[i]) {
-			return false
+	// exponent part: ([eE][+-]?digits)?
+	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
+		save := l.cur
+		l.advance() // consume e/E
+		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
+			l.advance()
+		}
+		if b3, ok := l.peek(); ok && isDigit(b3) {
+			sawExp = true
+			for {
+				b4, ok := l.peek()
+				if !ok || !isDigit(b4) {
+					break
+				}
+				l.advance()
+			}
+		} else {
+			l.cur = save // no exponent
+		}
+	}
+
+	if !sawDigits {
+		return ILLEGAL, nil, l.err("malformed number")
+	}
+
+	lex := l.src[l.start:l.cur]
+	if !sawDot && !sawExp {
+		v, convErr := strconv.ParseInt(lex, 10, 64)
+		if convErr != nil {
+			return ILLEGAL, nil, l.err("invalid integer literal")
+		}
+		return INTEGER, v, nil
+	}
+	vf, convErr := strconv.ParseFloat(lex, 64)
+	if convErr != nil {
+		return ILLEGAL, nil, l.err("invalid float literal")
+	}
+	return NUMBER, vf, nil
+}
+
+// scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
+// Terminates on blank line or a line that does not begin (after spaces) with '#'.
+func (l *Lexer) scanAnnotation() (string, error) {
+	var bldr strings.Builder
+
+	// helper: check if the *next* line (after current '\n') starts with '#'
+	nextLineStartsWithHash := func() bool {
+		// we are currently positioned at the '\n' (unconsumed)
+		probe := l.cur + 1
+		for probe < len(l.src) {
+			c := l.src[probe]
+			if c == ' ' || c == '\t' || c == '\r' {
+				probe++
+				continue
+			}
+			break
+		}
+		return probe < len(l.src) && l.src[probe] == '#'
+	}
+
+	// Trim at most one ASCII space (NOT tab) after the first '#'.
+	if b, ok := l.peek(); ok && b == ' ' {
+		l.advance()
+	}
+
+	// ----- capture first line, but DO NOT consume its trailing '\n' -----
+	for {
+		b, ok := l.peek()
+		if !ok || b == '\n' {
+			// do not l.advance() here; leave '\n' in the stream
+			bldr.WriteByte('\n')
+			break
+		}
+		bldr.WriteByte(b)
+		l.advance()
+	}
+
+	// If there is another annotation line, consume the '\n' now and continue.
+	if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+		l.advance() // consume newline to move to start of the next line
+	} else {
+		// single-line block; leave the '\n' unconsumed
+		s := bldr.String()
+		if len(s) == 0 {
+			return "", errors.New("incomplete annotation")
+		}
+		for len(s) > 0 && s[len(s)-1] == '\n' {
+			s = s[:len(s)-1]
+		}
+		return s, nil
+	}
+
+	// ----- capture subsequent '#'-prefixed lines -----
+	consumeHashOnLine := func() (bool, error) {
+		for {
+			b, ok := l.peek()
+			if !ok || b == '\n' {
+				break
+			}
+			if b == ' ' || b == '\t' || b == '\r' {
+				l.advance()
+				continue
+			}
+			break
+		}
+		b, ok := l.peek()
+		if !ok || b != '#' {
+			return false, nil
+		}
+		l.advance() // '#'
+		// Trim at most one ASCII space (NOT tab) after '#'
+		if b2, ok2 := l.peek(); ok2 && b2 == ' ' {
+			l.advance()
+		}
+		return true, nil
+	}
+
+	for {
+		save := l.cur
+		cont, err := consumeHashOnLine()
+		if err != nil {
+			return "", err
+		}
+		if !cont {
+			l.cur = save
+			break
+		}
+
+		// read rest of line, but DO NOT consume trailing '\n'
+		for {
+			b, ok := l.peek()
+			if !ok || b == '\n' {
+				bldr.WriteByte('\n')
+				break
+			}
+			bldr.WriteByte(b)
+			l.advance()
+		}
+
+		// If another '#'-line follows, eat this '\n' and continue; else stop (leave '\n').
+		if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+			l.advance() // consume newline to move to next line
+		} else {
+			break // leave final '\n' unconsumed
+		}
+	}
+
+	s := bldr.String()
+	if len(s) == 0 {
+		return "", errors.New("incomplete annotation")
+	}
+	for len(s) > 0 && s[len(s)-1] == '\n' {
+		s = s[:len(s)-1]
+	}
+	return s, nil
+}
+
+// --- hash/comment helpers ---
+
+// handleSingleHash processes '#' annotations (inline or multiline).
+// Returns (producedAnnotation, text, err).
+func (l *Lexer) handleSingleHash() (bool, string, error) {
+	annot, err := l.scanAnnotation()
+	if err != nil {
+		return false, "", l.err("incomplete annotation")
+	}
+	return true, annot, nil
+}
+
+// scanNoopIfPresent emits a NOOP token if the source at the current position
+// matches: '\n' ( hws* '\n' )+  where hws ∈ {' ', '\r', '\t'}.
+func (l *Lexer) scanNoopIfPresent() (Token, bool) {
+	b, ok := l.peek()
+	if !ok || b != '\n' {
+		return Token{}, false
+	}
+
+	// Snapshot so we can roll back on non-match (i.e., if we don't see at least one repetition).
+	saveCur, saveLine, saveCol, saveStart := l.cur, l.line, l.col, l.start
+
+	// Token starts here.
+	l.tokStartLine = l.line
+	l.tokStartCol = l.col
+	l.start = l.cur
+
+	// Consume the initial newline.
+	l.advance()
+
+	matchedReps := 0
+	for {
+		// Consume zero or more horizontal whitespace chars.
+		for {
+			nb, ok := l.peek()
+			if !ok || (nb != ' ' && nb != '\t' && nb != '\r') {
+				break
+			}
+			l.advance()
+		}
+		// Require a newline to complete one (hws* '\n') repetition.
+		nb, ok := l.peek()
+		if ok && nb == '\n' {
+			l.advance()
+			matchedReps++
+			continue
+		}
+		break
+	}
+
+	if matchedReps >= 1 {
+		return l.addToken(NOOP, nil), true
+	}
+
+	// Not a full match: restore and report no-op not present.
+	l.cur, l.line, l.col, l.start = saveCur, saveLine, saveCol, saveStart
+	return Token{}, false
+}
+
+// --- misc helpers ---
+
+func (l *Lexer) dotStartsNumber() bool {
+	b, ok := l.peek()
+	if !ok || !isDigit(b) {
+		return false
+	}
+	prev := l.previousToken()
+	if l.immediateWhitespaceBefore() || prev == nil || !canBeLeftOperand(prev.Type) {
+		return true
+	}
+	return false
+}
+
+// ---------------- main tokenization ----------------
+
+func (l *Lexer) scanToken() (Token, error) {
+	for {
+		l.skipHorizontalWhitespace()
+		l.tokStartLine = l.line
+		l.tokStartCol = l.col
+		l.start = l.cur
+
+		if l.isAtEnd() {
+			return l.addToken(EOF, nil), nil
+		}
+
+		// No-op (blank lines)
+		if b, _ := l.peek(); b == '\n' {
+			if tok, ok := l.scanNoopIfPresent(); ok {
+				return tok, nil
+			}
+			// Lone newline (or newline followed by non-hws) → skip it as whitespace and loop.
+			l.advance()
+			l.start = l.cur
+			continue
+		}
+
+		ch, _ := l.advance()
+
+		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
+		switch ch {
+		case '(':
+			if l.immediateWhitespaceBefore() {
+				return l.addToken(LROUND, "("), nil
+			}
+			return l.addToken(CLROUND, "("), nil
+		case ')':
+			return l.addToken(RROUND, ")"), nil
+		case '[':
+			if l.immediateWhitespaceBefore() {
+				return l.addToken(LSQUARE, "["), nil
+			}
+			return l.addToken(CLSQUARE, "["), nil
+		case ']':
+			return l.addToken(RSQUARE, "]"), nil
+		case '{':
+			return l.addToken(LCURLY, "{"), nil
+		case '}':
+			return l.addToken(RCURLY, "}"), nil
+		case '+':
+			return l.addToken(PLUS, "+"), nil
+		case '*':
+			return l.addToken(MULT, "*"), nil
+		case '/':
+			return l.addToken(DIV, "/"), nil
+		case '%':
+			return l.addToken(MOD, "%"), nil
+		case ':':
+			return l.addToken(COLON, ":"), nil
+		case ',':
+			return l.addToken(COMMA, ","), nil
+		case '?':
+			return l.addToken(QUESTION, "?"), nil
+		}
+
+		// '.' : either decimal-starting float or PERIOD
+		if ch == '.' {
+			if l.dotStartsNumber() {
+				l.rewindToStart()
+				tt, lit, err := l.scanNumber()
+				if err != nil {
+					return Token{}, err
+				}
+				return l.addToken(tt, lit), nil
+			}
+			return l.addToken(PERIOD, "."), nil
+		}
+
+		// Two-char operators and fallbacks
+		switch ch {
+		case '-':
+			if b, ok := l.peek(); ok && b == '>' {
+				l.advance()
+				return l.addToken(ARROW, "->"), nil
+			}
+			return l.addToken(MINUS, "-"), nil
+		case '=':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(EQ, "=="), nil
+			}
+			return l.addToken(ASSIGN, "="), nil
+		case '!':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(NEQ, "!="), nil
+			}
+			return l.addToken(BANG, "!"), nil
+		case '<':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(LESS_EQ, "<="), nil
+			}
+			return l.addToken(LESS, "<"), nil
+		case '>':
+			if b, ok := l.peek(); ok && b == '=' {
+				l.advance()
+				return l.addToken(GREATER_EQ, ">="), nil
+			}
+			return l.addToken(GREATER, ">"), nil
+		}
+
+		// Annotations
+		if ch == '#' {
+			ok, text, err := l.handleSingleHash()
+			if err != nil {
+				return Token{}, err
+			}
+			if ok {
+				return l.addToken(ANNOTATION, text), nil
+			}
+		}
+
+		// Strings
+		if ch == '"' || ch == '\'' {
+			l.rewindToStart()
+			text, err := l.scanString()
+			if err != nil {
+				return Token{}, err
+			}
+			// After '.' a quoted key becomes ID (property name)
+			if l.afterDotIsProperty() {
+				return l.addToken(ID, text), nil
+			}
+			return l.addToken(STRING, text), nil
+		}
+
+		// Numbers (starting with digit)
+		if isDigit(ch) {
+			l.rewindToStart()
+			tt, lit, err := l.scanNumber()
+			if err != nil {
+				return Token{}, err
+			}
+			return l.addToken(tt, lit), nil
+		}
+
+		// Identifiers / Keywords
+		if isAlpha(ch) {
+			l.rewindToStart()
+			lex := l.scanIdentifier()
+			// After '.', treat as property name (ID)
+			if l.afterDotIsProperty() {
+				return l.addToken(ID, lex), nil
+			}
+			if tt, ok := keywords[lex]; ok {
+				switch tt {
+				case NULL:
+					return l.addToken(NULL, nil), nil
+				case BOOLEAN:
+					if lex == "true" {
+						return l.addToken(BOOLEAN, true), nil
+					}
+					return l.addToken(BOOLEAN, false), nil
+				default:
+					return l.addToken(tt, nil), nil
+				}
+			}
+			return l.addToken(ID, lex), nil
+		}
+
+		return Token{}, l.err(fmt.Sprintf("unexpected character: %q", ch))
+	}
+}
+=== END FILE: lexer.go ===
+
+=== BEGIN FILE: parser.go ===
+// parser.go — Pratt parser for MindScript that produces compact S-expressions.
+//
+// OVERVIEW
+// --------
+// This module implements the newline-aware Pratt parser for the MindScript
+// language. It consumes the token stream produced by the *whitespace-sensitive*
+// lexer (see lexer.go) and builds a compact, Lisp-style S-expression (AST).
+//
+// Design goals:
+//   - Keep the grammar readable via precedence rules (Pratt parser).
+//   - Encode the AST in a tiny, serialisable structure (S-expressions).
+//   - Respect whitespace-sensitive signals emitted by the lexer:
+//   - '(' can be LROUND or CLROUND; only CLROUND participates in calls.
+//   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
+//   - '.' is PERIOD unless it started a number in the lexer.
+//   - multi-line '#' annotations become ANNOTATION tokens.
+//   - blank-line runs may be emitted as NOOP tokens.
+//   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
+//     at EOF instead of hard parse errors, suitable for REPLs.
+//
+// Annotation model (lowest precedence):
+//   - PRE annotation decorates the expression to its right.
+//   - POST annotation decorates the expression to its left and can also appear
+//     after a comma or a colon (binding to the element/key/value on the left).
+//   - PRE and POST cannot stack. If both apply to the same expression, they are
+//     merged into a single PRE with text "pre\npost".
+//
+// Nodes & Spans
+// -------------
+// The AST is a tree of S-expressions: []any whose first element is a string tag.
+// **This list is the most important reference.**
+//
+//	("block", n1, n2, ...)
+//	("noop")
+//
+// Literals & identifiers:
+//
+//	("id",   string)              // identifier (includes property names coerced to ID by lexer rules)
+//	("int",  int64)               // from INTEGER
+//	("num",  float64)             // from NUMBER
+//	("str",  string)              // decoded literal
+//	("bool", bool)                // from BOOLEAN
+//	("null")                      // from NULL
+//	("type", expr)                // from 'type' ...
+//
+// Operators / expressions:
+//
+//	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
+//	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
+//	("assign", target, value)     // "=" (right-assoc)
+//
+// Property / call / index:
+//
+//	("call", callee, arg1, arg2, ...)
+//	("get",  obj, ("str", name))             // obj.name or obj."name"
+//	("idx",  obj, indexExpr)                 // obj[expr] or obj.(expr) or obj.12
+//
+// Collections:
+//
+//	("array", e1, e2, ...)
+//	("map",   ("pair",  keyStrExpr, value)*)
+//	("map",   ("pair!", keyStrExpr, value)*) // required-field (key! : value)
+//	("enum",  item1, item2, ...)             // from Enum[ ... ]
+//
+// Functions, modules, control, loops:
+//
+//	("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
+//	("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)
+//	("module",  nameExpr, bodyBlock)
+//	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)
+//	("while", cond, bodyBlock)
+//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
+//	("return", value)  // value may be "null" per newline semantics
+//	("break",  value)  // value may be "null"
+//	("continue", value)// value may be "null"
+//
+// Declaration patterns (used by 'let' and 'for' targets):
+//
+//	("decl", name)
+//	("darr", p1, p2, ...)
+//	("dobj", ("pair", keyStrExpr, subPattern), ...)
+//
+// Annotations:
+//
+//	("annot", ("str", textOr<text>), wrappedNode)
+//	   • PRE  text stored as-is
+//	   • POST text stored with leading "<"
+//	   • PRE+POST becomes PRE with "pre\npost" (no POST stacking)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SPAN EMISSION INVARIANT (CRITICAL)
+// ----------------------------------
+// **This file now centralizes AST construction and span emission.**
+//
+//   - Every AST node is constructed through `mk*` helpers that *atomically*
+//     append exactly one span for that node.
+//   - Spans are appended in strict **post-order** of the final AST (children
+//     first, then parent), left-to-right among siblings.
+//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule:
+//     child's span first, then the wrapper's span.
+//   - Nodes that are synthesized with no concrete tokens (e.g. default type
+//     `Any`) still receive a placeholder `Span{}` via `mk*` (using tok=-1).
+//   - The root block’s span is appended last.
+//
+// The helpers in this file enforce the invariant mechanically at every construct.
+//
+// Dependencies
+// ------------
+//   - lexer.go
+//   - errors.go (*Error, DiagParse, DiagIncomplete, IsIncomplete)
+//   - spans.go (Span, SpanIndex, BuildSpanIndexPostOrder)
+package mindscript
+
+import (
+	"fmt"
+	"strings"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+type S = []any
+
+func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
+
+// ParseSExpr parses a complete MindScript source string and returns its AST.
+func ParseSExpr(src string) (S, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	return p.program()
+}
+
+// ParseSExprWithSpans parses like ParseSExpr and also returns a *SpanIndex,
+// with spans recorded in strict post-order per the invariant.
+func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
+	lex := NewLexer(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, nil, err
+	}
+	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	ast, perr := p.program()
+	if perr != nil {
+		return nil, nil, perr
+	}
+	idx := BuildSpanIndexPostOrder(ast, p.post)
+	return ast, idx, nil
+}
+
+// ParseSExprInteractive parses in REPL-friendly mode.
+// Unterminated constructs at EOF produce *Error{Kind:DiagIncomplete}.
+func ParseSExprInteractive(src string) (S, error) {
+	lex := NewLexerInteractive(src)
+	toks, err := lex.Scan()
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
+	return p.program()
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+///////////////////////////// PRIVATE IMPLEMENTATION ///////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+type parser struct {
+	toks        []Token
+	i           int
+	interactive bool
+
+	post             []Span // strictly post-order: one span per node, appended after children
+	lastSpanStartTok int
+	lastSpanEndTok   int
+	src              string
+}
+
+// ─────────────────────────── token basics & helpers ─────────────────────────
+
+func (p *parser) atEnd() bool { return p.peek().Type == EOF }
+func (p *parser) peek() Token {
+	if p.i >= len(p.toks) {
+		return p.toks[len(p.toks)-1]
+	}
+	return p.toks[p.i]
+}
+func (p *parser) prev() Token { return p.toks[p.i-1] }
+
+func (p *parser) match(tt ...TokenType) bool {
+	if p.atEnd() {
+		return false
+	}
+	for _, t := range tt {
+		if p.peek().Type == t {
+			p.i++
+			return true
+		}
+	}
+	return false
+}
+
+func (p *parser) need(t TokenType, msg string) (Token, error) {
+	if p.match(t) {
+		return p.prev(), nil
+	}
+	g := p.peek()
+	if g.Type == EOF {
+		line, col := p.posAfterLastSpan()
+		kind := DiagParse
+		if p.interactive {
+			kind = DiagIncomplete
+		}
+		return Token{}, &Error{Kind: kind, Msg: msg, Line: line, Col: col}
+	}
+	line, col := p.posAtByte(g.StartByte)
+	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
+}
+
+func (p *parser) expect(t TokenType, msg string) (Token, error) {
+	p.skipNoops()
+	return p.need(t, msg)
+}
+func (p *parser) expectClose(t TokenType, msg string) error {
+	p.skipNoops()
+	_, err := p.need(t, msg)
+	return err
+}
+
+func (p *parser) posAtByte(b int) (int, int) {
+	if b < 0 {
+		g := p.peek()
+		return g.Line, g.Col + 1
+	}
+	if b > len(p.src) {
+		b = len(p.src)
+	}
+	line := 1 + strings.Count(p.src[:b], "\n")
+	lastNL := strings.LastIndex(p.src[:b], "\n")
+	if lastNL < 0 {
+		return line, b + 1
+	}
+	return line, b - lastNL
+}
+func (p *parser) posAfterLastSpan() (int, int) {
+	if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
+		endB := p.toks[p.lastSpanEndTok].EndByte
+		return p.posAtByte(endB)
+	}
+	g := p.peek()
+	return g.Line, g.Col + 1
+}
+
+func tokText(t Token) string {
+	if s, ok := t.Literal.(string); ok {
+		return s
+	}
+	return t.Lexeme
+}
+
+func (p *parser) skipNoops() {
+	for !p.atEnd() && p.peek().Type == NOOP {
+		p.i++
+	}
+}
+
+// ───────────────────────── precedence / associativity ──────────────────────
+
+func lbp(t TokenType) (int, bool) {
+	switch t {
+	case ARROW:
+		return 15, true
+	case MULT, DIV, MOD:
+		return 70, true
+	case PLUS, MINUS:
+		return 60, true
+	case LESS, LESS_EQ, GREATER, GREATER_EQ:
+		return 50, true
+	case EQ, NEQ:
+		return 40, true
+	case AND:
+		return 30, true
+	case OR:
+		return 20, true
+	case ASSIGN:
+		return 10, true
+	}
+	return 0, false
+}
+func isRightAssoc(tt TokenType) bool { return tt == ASSIGN || tt == ARROW }
+
+// ───────────────────────────── span emission (core) ─────────────────────────
+//
+// Centralized helpers. **All** node construction goes through these, which
+// also append exactly one span for the node (post-order).
+//
+// Rules:
+//   - For leaves tied to a concrete token, pass tok≥0 (start=end=tok).
+//   - For synthetic leaves (e.g. default "Any"), pass tok=-1 to emit Span{}.
+//   - For parents, pass the token range [startTok, endTok] that covers the node.
+//   - Helpers also update (lastSpanStartTok,lastSpanEndTok) to the node’s range,
+//     so callers can compose larger parent ranges deterministically.
+
+func (p *parser) appendNodeSpanByTok(startTok, endTok int) {
+	if startTok >= 0 && endTok >= startTok &&
+		startTok < len(p.toks) && endTok < len(p.toks) {
+		p.post = append(p.post, Span{
+			StartByte: p.toks[startTok].StartByte,
+			EndByte:   p.toks[endTok].EndByte,
+		})
+	} else {
+		p.post = append(p.post, Span{})
+	}
+	p.lastSpanStartTok = startTok
+	p.lastSpanEndTok = endTok
+}
+
+// mkLeaf builds a leaf node whose span is a single token (tok). If tok<0,
+// a placeholder empty span is appended (keeps post-order cardinality intact).
+func (p *parser) mkLeaf(tag string, tok int, parts ...any) S {
+	n := L(tag, parts...)
+	p.appendNodeSpanByTok(tok, tok)
+	return n
+}
+
+// mk builds a parent node after its children were already constructed.
+// It appends exactly one span for the parent covering [startTok,endTok].
+func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
+	n := L(tag, parts...)
+	p.appendNodeSpanByTok(startTok, endTok)
+	return n
+}
+
+// ───────────────────────────── NOOP / annotation utils ─────────────────────
+
+func tokenCanEndExpr(tt TokenType) bool {
+	switch tt {
+	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
+		TYPE, ENUM,
+		RROUND, RSQUARE, RCURLY,
+		QUESTION,
+		END:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *parser) nextTokenIsOnSameLine(as Token) bool {
+	if p.atEnd() {
+		return false
+	}
+	return p.peek().Line == as.Line
+}
+
+func (p *parser) isPreAnnotationAt(idx int) bool {
+	if idx <= 0 || idx >= len(p.toks) {
+		return true
+	}
+	ann := p.toks[idx]
+	for j := idx - 1; j >= 0; j-- {
+		t := p.toks[j]
+		if t.Line < ann.Line {
+			break
+		}
+		if t.Line == ann.Line {
+			if t.Type == COMMA || t.Type == COLON {
+				continue
+			}
+			return !tokenCanEndExpr(t.Type)
 		}
 	}
 	return true
 }
 
-// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
-// Allowed forms: null/bool/int/num/str/array/map with literal children.
-// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
-func (ip *Interpreter) litToValue(lit S) (Value, bool) {
-	if len(lit) == 0 {
-		return Null, false
+func isAnnot(n S) (isAnnot, isPost bool) {
+	if len(n) < 2 {
+		return false, false
 	}
-	switch lit[0].(string) {
-	case "null":
-		return Null, true
-	case "bool":
-		return Bool(lit[1].(bool)), true
-	case "int":
-		return Int(lit[1].(int64)), true
-	case "num":
-		return Num(lit[1].(float64)), true
-	case "str":
-		return Str(lit[1].(string)), true
-	case "array":
-		out := make([]Value, 0, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			v, ok := ip.litToValue(lit[i].(S))
-			if !ok {
-				return Null, false
-			}
-			out = append(out, v)
-		}
-		return Arr(out), true
-	case "map":
-		m := make(map[string]Value, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			p := lit[i].(S)
-			if len(p) < 3 {
-				return Null, false
-			}
-			keyNode := p[1].(S)
-			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-				return Null, false
-			}
-			k := keyNode[1].(string)
-			v, ok := ip.litToValue(p[2].(S))
-			if !ok {
-				return Null, false
-			}
-			m[k] = v
-		}
-		return Map(m), true
-	default:
-		return Null, false
+	tag, _ := n[0].(string)
+	if tag != "annot" {
+		return false, false
 	}
+	if child, ok := n[1].(S); ok && len(child) >= 2 && child[0] == "str" {
+		if s, ok := child[1].(string); ok && len(s) > 0 && s[0] == '<' {
+			return true, true
+		}
+		return true, false
+	}
+	return true, false
 }
 
-// -----------------------------
-// Value → Type inference (typeOf-like behavior)
-// -----------------------------
-
-// valueToTypeS infers a structural type for v. This wrapper seeds cycle guards.
-func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
-	// Cycle guards for arrays and maps so self-references don't produce
-	// infinitely deep or self-nested element/object types. Any back-edge
-	// collapses to Any (conservative, JSON-friendly).
-	seenArr := map[*ArrayObject]bool{}
-	seenMap := map[*MapObject]bool{}
-
-	var infer func(Value) S
-	infer = func(v Value) S {
-		switch v.Tag {
-		case VTNull:
-			return S{"id", "Null"}
-		case VTBool:
-			return S{"id", "Bool"}
-		case VTInt:
-			return S{"id", "Int"}
-		case VTNum:
-			return S{"id", "Num"}
-		case VTStr:
-			return S{"id", "Str"}
-
-		case VTArray:
-			ao := v.Data.(*ArrayObject)
-
-			// If we're already walking this array, it's a cycle → Any.
-			if seenArr[ao] {
-				return S{"id", "Any"}
-			}
-			seenArr[ao] = true
-			defer func() { delete(seenArr, ao) }()
-
-			xs := ao.Elems
-			if len(xs) == 0 {
-				return S{"array", S{"id", "Any"}}
-			}
-
-			// If any element is exactly this array → element type Any.
-			for _, e := range xs {
-				if e.Tag == VTArray && e.Data.(*ArrayObject) == ao {
-					return S{"array", S{"id", "Any"}}
+func mergePreWithPostText(preAnnot S, postTxt string) S {
+	if len(preAnnot) >= 2 {
+		if c, ok := preAnnot[1].(S); ok && len(c) >= 2 && c[0] == "str" {
+			if s, ok := c[1].(string); ok {
+				if postTxt != "" {
+					if s == "" {
+						c[1] = postTxt
+					} else {
+						c[1] = s + "\n" + postTxt
+					}
 				}
 			}
+		}
+	}
+	return preAnnot
+}
 
-			elem := infer(xs[0])
-			for i := 1; i < len(xs); i++ {
-				elem = ip.unifyTypes(elem, infer(xs[i]), env)
-				if isId(elem, "Any") {
-					// Can't get more specific; bail early.
+// Attach at most one trailing POST to `base`. (Used at top-level and list items)
+func (p *parser) afterExprMaybePost(base S, baseStartTok int) (S, error) {
+	n, _, err := p.absorbOneTrailingPostAnnot(base, baseStartTok)
+	return n, err
+}
+
+// absorbOneTrailingPostAnnot applies one POST annotation to `base`.
+// **Span order**: (1) POST child "str" leaf; (2) wrapping "annot" node.
+func (p *parser) absorbOneTrailingPostAnnot(base S, baseStartTok int) (S, bool, error) {
+	if p.atEnd() || p.peek().Type != ANNOTATION || p.isPreAnnotationAt(p.i) {
+		return base, false, nil
+	}
+	aTok := p.i
+	a := p.peek()
+	p.i++
+
+	postTxt := ""
+	if s, ok := a.Literal.(string); ok {
+		postTxt = s
+	}
+
+	// Disallow stacked POSTs.
+	if !p.atEnd() && p.peek().Type == ANNOTATION && !p.isPreAnnotationAt(p.i) {
+		line, col := p.posAtByte(p.peek().StartByte)
+		return nil, false, &Error{Kind: DiagParse, Line: line, Col: col, Msg: "multiple consecutive post-annotations are not allowed; combine them"}
+	}
+
+	// If base is already PRE, merge and return the same node.
+	if ok, isPost := isAnnot(base); ok && !isPost {
+		base = mergePreWithPostText(base, postTxt)
+		p.skipNoops()
+		return base, true, nil
+	}
+
+	// Normal POST: (1) child "str" span, (2) parent "annot" span.
+	child := p.mkLeaf("str", aTok, "<"+postTxt)
+	base = p.mk("annot", baseStartTok, aTok, child, base)
+	p.skipNoops()
+	return base, true, nil
+}
+
+// ───────────────────────── program / blocks ────────────────────────────
+
+func (p *parser) program() (S, error) {
+	var items []any
+	for !p.atEnd() {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		startTok := p.lastSpanStartTok
+		if ne, err := p.afterExprMaybePost(e, startTok); err != nil {
+			return nil, err
+		} else {
+			e = ne
+		}
+		items = append(items, e)
+	}
+	rootStart := 0
+	rootEnd := len(p.toks) - 2 // last non-EOF
+	if rootEnd < rootStart || len(p.toks) == 0 {
+		return p.mk("block", -1, -1 /*empty*/), nil
+	}
+	return p.mk("block", rootStart, rootEnd, items...), nil
+}
+
+// blockUntil parses statements until a stop token is seen.
+// Span append happens once for the "block" node, after its children.
+func (p *parser) blockUntil(stops ...TokenType) (S, error) {
+	stop := map[TokenType]bool{}
+	for _, s := range stops {
+		stop[s] = true
+	}
+	var items []any
+	startTok := p.i
+	consumedAny := false
+
+	for !p.atEnd() && !stop[p.peek().Type] {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		baseStartTok := p.lastSpanStartTok
+		if ne, err := p.afterExprMaybePost(e, baseStartTok); err != nil {
+			return nil, err
+		} else {
+			e = ne
+		}
+		items = append(items, e)
+		consumedAny = true
+	}
+	if consumedAny {
+		return p.mk("block", startTok, p.i-1, items...), nil
+	}
+	return p.mk("block", -1, -1 /*empty*/), nil
+}
+
+func (p *parser) parseBlock(requireDo bool) (S, error) {
+	if requireDo {
+		if _, err := p.need(DO, "expected 'do'"); err != nil {
+			return nil, err
+		}
+	}
+	b, err := p.blockUntil(END)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// ───────────────────────────── tiny node helpers ───────────────────────────
+
+func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
+	switch t.Type {
+	case ID, TYPE:
+		return p.mkLeaf("id", start, tokText(t)), true
+	case INTEGER:
+		return p.mkLeaf("int", start, t.Literal), true
+	case NUMBER:
+		return p.mkLeaf("num", start, t.Literal), true
+	case STRING:
+		return p.mkLeaf("str", start, t.Literal), true
+	case BOOLEAN:
+		return p.mkLeaf("bool", start, t.Literal), true
+	case NULL:
+		return p.mkLeaf("null", start), true
+	}
+	return nil, false
+}
+
+// ───────────────────────────── prefix / postfix / infix ────────────────────
+
+func (p *parser) expr(minBP int) (S, error) {
+	tokIndexOfThis := p.i
+	t := p.peek()
+	p.i++
+
+	var left S
+	leftStartTok := tokIndexOfThis
+
+	// ---- prefix ----
+	if n, ok := p.tryLiteralOrId(t, tokIndexOfThis); ok {
+		left = n
+	} else {
+		switch t.Type {
+		case NOOP:
+			left = p.mkLeaf("noop", tokIndexOfThis)
+
+		case ENUM:
+			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
+				p.i++ // consume '[' or CLSQUARE
+				arr, err := p.arrayLiteralAfterOpen()
+				if err != nil {
+					return nil, err
+				}
+				items := make([]any, 0, len(arr)-1)
+				for i := 1; i < len(arr); i++ {
+					items = append(items, arr[i])
+				}
+				left = p.mk("enum", tokIndexOfThis, p.i-1, items...)
+			} else {
+				left = p.mkLeaf("id", tokIndexOfThis, tokText(t))
+			}
+
+		case MINUS, NOT:
+			if err := p.needExprAfter(t, "expected expression after unary operator"); err != nil {
+				return nil, err
+			}
+			r, err := p.expr(80)
+			if err != nil {
+				return nil, err
+			}
+			endTok := p.lastSpanEndTok
+			if endTok < 0 {
+				endTok = tokIndexOfThis
+			}
+			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
+
+		case LROUND, CLROUND:
+			inner, err := p.parseGrouping()
+			if err != nil {
+				return nil, err
+			}
+			left = inner
+			leftStartTok = tokIndexOfThis
+
+		case LSQUARE, CLSQUARE:
+			a, err := p.arrayLiteralAfterOpen()
+			if err != nil {
+				return nil, err
+			}
+			left = a
+			leftStartTok = tokIndexOfThis
+
+		case LCURLY:
+			mp, err := p.mapLiteralAfterOpen(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = mp
+			leftStartTok = tokIndexOfThis
+
+		case FUNCTION:
+			fn, endTok, err := p.funExpr(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			_ = endTok
+			left = fn
+			leftStartTok = tokIndexOfThis
+
+		case ORACLE:
+			orc, endTok, err := p.oracleExpr(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			_ = endTok
+			left = orc
+			leftStartTok = tokIndexOfThis
+
+		case MODULE:
+			if err := p.needExprAfter(t, "expected module name expression"); err != nil {
+				return nil, err
+			}
+			name, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			body, err := p.parseBlock(true)
+			if err != nil {
+				return nil, err
+			}
+			left = p.mk("module", tokIndexOfThis, p.i-1, name, body)
+			leftStartTok = tokIndexOfThis
+
+		case RETURN, BREAK, CONTINUE:
+			n, err := p.parseControl(t, tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = n
+			leftStartTok = tokIndexOfThis
+
+		case IF:
+			thenIf, err := p.ifExpr()
+			if err != nil {
+				return nil, err
+			}
+			left = p.mk("if", tokIndexOfThis, p.i-1, thenIf[1:]...)
+			leftStartTok = tokIndexOfThis
+
+		case DO:
+			body, err := p.parseBlock(false)
+			if err != nil {
+				return nil, err
+			}
+			left = body
+			leftStartTok = tokIndexOfThis
+
+		case FOR:
+			f, err := p.forExpr(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = f
+			leftStartTok = tokIndexOfThis
+
+		case WHILE:
+			w, err := p.whileExpr(tokIndexOfThis)
+			if err != nil {
+				return nil, err
+			}
+			left = w
+			leftStartTok = tokIndexOfThis
+
+		case LET:
+			pat, err := p.declPattern()
+			if err != nil {
+				return nil, err
+			}
+			left = pat
+			base := unwrapAnnots(pat)
+			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
+				j := p.i
+				for j < len(p.toks) && p.toks[j].Type == ANNOTATION && !p.isPreAnnotationAt(j) {
+					j++
+				}
+				if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
+					g := p.peek()
+					if p.interactive && g.Type == EOF {
+						line, col := p.posAfterLastSpan()
+						return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+					}
+					line, col := p.posAtByte(g.StartByte)
+					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+				}
+			}
+			leftStartTok = tokIndexOfThis
+
+		case TYPECONS:
+			if err := p.needExprAfter(t, "expected type expression after 'type'"); err != nil {
+				return nil, err
+			}
+			x, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			left = p.mk("type", tokIndexOfThis, p.lastSpanEndTok, x)
+			leftStartTok = tokIndexOfThis
+
+		case ANNOTATION:
+			pre := p.isPreAnnotationAt(p.i - 1)
+			txt := ""
+			if s, ok := t.Literal.(string); ok {
+				txt = s
+			}
+
+			if pre {
+				// forbid stacked PREs
+				if !p.atEnd() && p.peek().Type == ANNOTATION && p.isPreAnnotationAt(p.i) {
+					next := p.peek()
+					line, col := p.posAtByte(next.StartByte)
+					return nil, &Error{
+						Kind: DiagParse, Line: line, Col: col,
+						Msg: "multiple consecutive pre-annotations are not allowed; combine them",
+					}
+				}
+
+				// If EOF in normal mode: PRE wraps NOOP (degenerate case)
+				if p.atEnd() && !p.interactive {
+					child := p.mkLeaf("str", tokIndexOfThis, txt)
+					node := p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, p.mkLeaf("noop", -1))
+					left = node
+					leftStartTok = tokIndexOfThis
 					break
 				}
-			}
-			return S{"array", elem}
-
-		case VTMap:
-			mo := v.Data.(*MapObject)
-
-			// Cycle guard for maps.
-			if seenMap[mo] {
-				return S{"id", "Any"}
-			}
-			seenMap[mo] = true
-			defer func() { delete(seenMap, mo) }()
-
-			out := S{"map"}
-			// Open-world: infer observed fields as optional ("pair").
-			for k, vv := range mo.Entries {
-				out = append(out, S{"pair", S{"str", k}, infer(vv)})
-			}
-			return out
-
-		case VTModule:
-			// Treat modules structurally as maps.
-			return infer(AsMapValue(v))
-
-		case VTFun:
-			f := v.Data.(*Fun)
-			// Resolve each piece in the function's own env to avoid <type>
-			rt := ip.resolveType(f.ReturnType, f.Env)
-			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-				pt := ip.resolveType(f.ParamTypes[i], f.Env)
-				rt = S{"binop", "->", pt, rt}
-			}
-			return rt
-
-		case VTType:
-			return S{"id", "Type"}
-
-		default:
-			return S{"id", "Any"}
-		}
-	}
-
-	return infer(v)
-}
-
-// -----------------------------
-// Alias-based canonical resolution
-// -----------------------------
-
-// --- replace the old resolveModuleTypeAlias with these helpers ---
-
-// peelGetChain collects rightward keys from nested ("get", base, "str") nodes.
-// It returns (baseNode, keysRightToLeft).
-func peelGetChain(t S) (S, []string) {
-	t = stripAnnot(t)
-	keys := []string{}
-	node := t
-	for len(node) >= 3 && node[0].(string) == "get" {
-		keyNode, _ := node[2].(S)
-		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-			return t, nil
-		}
-		keys = append(keys, keyNode[1].(string))
-		base, _ := node[1].(S)
-		node = base
-	}
-	return node, keys
-}
-
-// resolveTypePath walks a ("get", ...) chain against runtime values, switching
-// the lookup view when encountering a Type (use its Env) and stepping through
-// modules by reading their exported map. On success returns the terminal *TypeValue.
-func (ip *Interpreter) resolveTypePath(env *Env, t S) (*TypeValue, bool) {
-	base, keysRL := peelGetChain(t)
-	if len(keysRL) == 0 {
-		return nil, false
-	}
-
-	// Resolve the base to a runtime Value in the given env.
-	var cur Value
-	switch {
-	case len(base) >= 2 && base[0].(string) == "id":
-		v, err := env.Get(base[1].(string))
-		if err != nil {
-			return nil, false
-		}
-		cur = v
-
-	case len(base) >= 3 && base[0].(string) == "get":
-		// Recurse: resolve the inner path first.
-		tv, ok := ip.resolveTypePath(env, base)
-		if !ok {
-			return nil, false
-		}
-		// The base resolved to a Type; switch view to its Env to continue.
-		cur = TypeValIn(tv.Ast, tv.Env)
-
-	default:
-		return nil, false
-	}
-
-	// Walk keys left→right (we collected right→left).
-	for i := len(keysRL) - 1; i >= 0; i-- {
-		switch cur.Tag {
-		case VTModule:
-			mod := cur.Data.(*Module)
-			v, ok := mod.get(keysRL[i])
-			if !ok {
-				return nil, false
-			}
-			cur = v
-
-		case VTType:
-			// Switch lookup view to the type's own environment.
-			tv := cur.Data.(*TypeValue)
-			if tv.Env == nil {
-				return nil, false
-			}
-			v, err := tv.Env.Get(keysRL[i])
-			if err != nil {
-				return nil, false
-			}
-			cur = v
-
-		default:
-			return nil, false
-		}
-	}
-
-	if cur.Tag != VTType {
-		return nil, false
-	}
-	return cur.Data.(*TypeValue), true
-}
-
-// resolveType canonicalizes a type S-expression in env:
-//   - Builtins stay as ("id", "...").
-//   - Any non-builtin type identifier or qualified get resolves to a stable,
-//     *pointer-identified* alias node: ("alias", *TypeValue).
-//   - Structure nodes ("array", "map", "unop ?","binop ->", "enum") are
-//     recursively resolved while *keeping* alias nodes opaque (no inline
-//     expansion). This gives us a canonical, name-agnostic graph suitable for
-//     equirecursive comparison across modules.
-//
-// NOTE: By avoiding inline expansion and using ("alias", *TypeValue), two
-// references to the same exported type (e.g., M.T and a local T = M.T) become
-// literally the same anchor, regardless of spelling.
-func (ip *Interpreter) resolveType(t S, env *Env) S {
-	t = stripAnnot(t)
-	if len(t) == 0 {
-		return t
-	}
-
-	// Helper: build alias if a local name resolves to a VTType.
-	// Self-cycle guard: let T = type T  must not aliasify; keep ("id","T").
-	aliasOf := func(e *Env, name string) (S, bool) {
-		if e == nil || isBuiltinTypeName(name) {
-			return nil, false
-		}
-		v, err := e.Get(name)
-		if err != nil || v.Tag != VTType {
-			return nil, false
-		}
-		tv := v.Data.(*TypeValue)
-		root := stripAnnot(tv.Ast)
-		if len(root) >= 2 && root[0].(string) == "id" && root[1].(string) == name {
-			return nil, false
-		}
-		return S{"alias", tv}, true
-	}
-
-	switch t[0].(string) {
-	case "id":
-		if a, ok := aliasOf(env, t[1].(string)); ok {
-			return a
-		}
-		return t // builtin or unknown stays as-is
-
-	case "get":
-		// Robust qualified resolution: walk through modules and types (env switch on type).
-		if tv, ok := ip.resolveTypePath(env, t); ok {
-			return S{"alias", tv}
-		}
-		return t
-
-	case "unop":
-		if len(t) >= 3 && t[1].(string) == "?" {
-			return S{"unop", "?", ip.resolveType(t[2].(S), env)}
-		}
-		return t
-
-	case "array":
-		if len(t) == 2 {
-			return S{"array", ip.resolveType(t[1].(S), env)}
-		}
-		out := S{"array"}
-		for i := 1; i < len(t); i++ {
-			out = append(out, ip.resolveType(t[i].(S), env))
-		}
-		return out
-
-	case "map":
-		out := S{"map"}
-		for i := 1; i < len(t); i++ {
-			p := t[i].(S) // ("pair"|"pair!", ("str",k), T)
-			tag := p[0].(string)
-			key := p[1].(S)
-			out = append(out, S{tag, key, ip.resolveType(p[2].(S), env)})
-		}
-		return out
-
-	case "enum":
-		// Enum literals stay literal; we don't resolve inside.
-		return t
-
-	case "binop":
-		if len(t) >= 4 && t[1].(string) == "->" {
-			return S{"binop", "->", ip.resolveType(t[2].(S), env), ip.resolveType(t[3].(S), env)}
-		}
-		return t
-
-	default:
-		return t
-	}
-}
-
-// -----------------------------
-// Runtime type checking
-// -----------------------------
-
-// isType checks whether runtime value v conforms to type t under env.
-// We canonicalize t once (resolveType), then check structurally.
-// It fully supports nested function types and alias nodes.
-func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	t = stripAnnot(ip.resolveType(t, env))
-
-	// Coinductive memo: (valuePtr, nodeKey(t))
-	// nodeKey mirrors isSubtype: aliases key by *TypeValue, others by &t[0].
-	seen := make(map[[2]unsafe.Pointer]struct{})
-
-	nodeKey := func(t S) unsafe.Pointer {
-		if len(t) >= 2 && t[0].(string) == "alias" {
-			if tv, ok := t[1].(*TypeValue); ok {
-				return unsafe.Pointer(tv)
-			}
-		}
-		return unsafe.Pointer(&t[0])
-	}
-
-	// Build value pointer key for arrays/maps/funs for memoization.
-	valKey := func(v Value) unsafe.Pointer {
-		switch v.Tag {
-		case VTMap:
-			return unsafe.Pointer(v.Data.(*MapObject))
-		case VTArray:
-			return unsafe.Pointer(v.Data.(*ArrayObject))
-		case VTFun:
-			return unsafe.Pointer(v.Data.(*Fun))
-		default:
-			return nil
-		}
-	}
-
-	var check func(Value, S) bool
-	check = func(v Value, t S) bool {
-		t = stripAnnot(t)
-		if len(t) == 0 {
-			return false
-		}
-
-		// Modules behave structurally as maps.
-		v = AsMapValue(v)
-
-		vp := valKey(v)
-		nk := nodeKey(t)
-		// For structured values (vp != nil), memoize all nodes.
-		// For scalars (vp == nil), memoize only alias nodes to break unfold cycles.
-		if vp != nil || (len(t) >= 2 && t[0].(string) == "alias") {
-			k := [2]unsafe.Pointer{vp, nk}
-			if _, ok := seen[k]; ok {
-				return true
-			}
-			seen[k] = struct{}{}
-		}
-
-		switch t[0].(string) {
-		case "id":
-			switch t[1].(string) {
-			case "Any":
-				return true
-			case "Null":
-				return v.Tag == VTNull
-			case "Bool":
-				return v.Tag == VTBool
-			case "Int":
-				return v.Tag == VTInt
-			case "Num":
-				return v.Tag == VTInt || v.Tag == VTNum
-			case "Str":
-				return v.Tag == VTStr
-			case "Type":
-				return v.Tag == VTType
-			default:
-				// Non-builtin unresolved id: reject (canonical resolver leaves only builtins or aliases)
-				return false
-			}
-
-		case "alias":
-			// Unfold against the alias's own env; the unified memo above
-			// prevents both structured and scalar infinite unfolding.
-			tv := t[1].(*TypeValue)
-			return check(v, ip.resolveType(tv.Ast, tv.Env))
-
-		case "unop": // nullable
-			if t[1].(string) != "?" {
-				return false
-			}
-			if v.Tag == VTNull {
-				return true
-			}
-			return check(v, t[2].(S))
-
-		case "array":
-			if v.Tag != VTArray {
-				return false
-			}
-			elemT := S{"id", "Any"}
-			if len(t) == 2 {
-				elemT = t[1].(S)
-			}
-			for _, e := range v.Data.(*ArrayObject).Elems {
-				if !check(e, elemT) {
-					return false
+				if p.atEnd() && p.interactive {
+					line, col := p.posAtByte(t.StartByte)
+					return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
 				}
-			}
-			return true
 
-		case "map":
-			if v.Tag != VTMap {
-				return false
-			}
-			fs := mapTypeFields(t)
-			m := v.Data.(*MapObject).Entries
-			for name, f := range fs {
-				val, ok := m[name]
-				if !ok {
-					if f.required {
-						return false
-					}
-					continue
-				}
-				if !check(val, f.typ) {
-					return false
-				}
-			}
-			return true
-
-		case "enum":
-			for i := 1; i < len(t); i++ {
-				if lit, ok := ip.litToValue(t[i].(S)); ok && ip.deepEqual(lit, v) {
-					return true
-				}
-			}
-			return false
-
-		case "binop": // function type expected
-			if t[1].(string) != "->" || v.Tag != VTFun {
-				return false
-			}
-			// Build the function value's fully-resolved signature in its own env.
-			f := v.Data.(*Fun)
-			rt := stripAnnot(ip.resolveType(f.ReturnType, f.Env))
-			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-				pt := stripAnnot(ip.resolveType(f.ParamTypes[i], f.Env))
-				rt = S{"binop", "->", pt, rt}
-			}
-			// CRITICAL: Compare under the *expected-type's* env (the env passed into isType),
-			// so module-qualified names/aliases from the expected side resolve properly.
-			// 'rt' already contains alias nodes for the value side and does not require this env.
-			return ip.isSubtype(rt, t, env)
-		}
-
-		return false
-	}
-
-	return check(v, t)
-}
-
-// -----------------------------
-// Structural subtyping  t1 <: t2
-// -----------------------------
-
-// isSubtype checks a <: b structurally. Both sides are first canonicalized by
-// resolveType(t, env). It supports equirecursive types via a coinductive memo
-// keyed by the underlying node identity; for ("alias", *TypeValue) it keys on
-// the *TypeValue pointer*, so module-qualified names unify with local aliases.
-func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
-	a = stripAnnot(ip.resolveType(a, env))
-	b = stripAnnot(ip.resolveType(b, env))
-
-	// Produce a stable pointer identity for memo keys:
-	//  • for ("alias", *TypeValue) use the tv pointer,
-	//  • otherwise use &node[0] (address of tag cell).
-	nodeKey := func(t S) unsafe.Pointer {
-		if len(t) >= 2 && t[0].(string) == "alias" {
-			if tv, ok := t[1].(*TypeValue); ok {
-				return unsafe.Pointer(tv)
-			}
-		}
-		return unsafe.Pointer(&t[0])
-	}
-
-	seen := make(map[[2]unsafe.Pointer]struct{})
-
-	var sub func(S, S) bool
-	sub = func(x, y S) bool {
-		x = stripAnnot(x)
-		y = stripAnnot(y)
-		if len(x) == 0 || len(y) == 0 {
-			return false
-		}
-
-		k := [2]unsafe.Pointer{nodeKey(x), nodeKey(y)}
-		if _, ok := seen[k]; ok {
-			return true
-		}
-		seen[k] = struct{}{}
-
-		// Fast equality
-		if equalLiteralS(x, y) {
-			return true
-		}
-
-		// Top
-		if isId(y, "Any") {
-			return true
-		}
-
-		// Nullable helpers
-		isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
-		unwrap := func(t S) S { return t[2].(S) }
-
-		if isOpt(y) {
-			if sub(x, unwrap(y)) {
-				return true
-			}
-			if isId(x, "Null") {
-				return true
-			}
-		}
-		// Int <: Num
-		if isId(x, "Int") && isId(y, "Num") {
-			return true
-		}
-		// A? <: B? iff A <: B
-		if isOpt(x) && isOpt(y) {
-			return sub(unwrap(x), unwrap(y))
-		}
-		// Identical primitive ids
-		if len(x) >= 2 && x[0].(string) == "id" && len(y) >= 2 && y[0].(string) == "id" {
-			return x[1].(string) == y[1].(string)
-		}
-
-		// Alias unfolding (lazily)
-		if len(x) >= 2 && x[0].(string) == "alias" {
-			tv := x[1].(*TypeValue)
-			return sub(ip.resolveType(tv.Ast, tv.Env), y)
-		}
-		if len(y) >= 2 && y[0].(string) == "alias" {
-			tv := y[1].(*TypeValue)
-			return sub(x, ip.resolveType(tv.Ast, tv.Env))
-		}
-
-		switch x[0].(string) {
-		case "array":
-			if y[0].(string) != "array" {
-				return false
-			}
-			xe := S{"id", "Any"}
-			ye := S{"id", "Any"}
-			if len(x) == 2 {
-				xe = x[1].(S)
-			}
-			if len(y) == 2 {
-				ye = y[1].(S)
-			}
-			return sub(xe, ye) // covariance
-
-		case "map":
-			if y[0].(string) != "map" {
-				return false
-			}
-			reqY := mapTypeFields(y)
-			haveX := mapTypeFields(x)
-			for name, fy := range reqY {
-				fx, ok := haveX[name]
-				if !ok {
-					if fy.required {
-						return false
-					}
-					continue
-				}
-				if fy.required && !fx.required {
-					return false
-				}
-				if !sub(fx.typ, fy.typ) {
-					return false
-				}
-			}
-			return true
-
-		case "enum":
-			// Enum⊆Enum by literal inclusion
-			if y[0].(string) == "enum" {
-				for i := 1; i < len(x); i++ {
-					found := false
-					for j := 1; j < len(y); j++ {
-						if equalLiteralS(x[i].(S), y[j].(S)) {
-							found = true
-							break
+				// SPECIAL: PRE preceding a control form binds to the control's value.
+				nt := p.peek()
+				if nt.Type == RETURN || nt.Type == BREAK || nt.Type == CONTINUE {
+					p.i++ // consume control token
+					valueTokStart := p.i
+					var val S
+					if p.nextTokenIsOnSameLine(nt) {
+						if err := p.needExprAfter(nt, "expected value after control"); err != nil {
+							return nil, err
 						}
+						x, err := p.expr(0)
+						if err != nil {
+							return nil, err
+						}
+						if nx, _, err := p.absorbOneTrailingPostAnnot(x, valueTokStart); err != nil {
+							return nil, err
+						} else {
+							val = nx
+						}
+					} else {
+						val = p.mkLeaf("null", -1)
 					}
-					if !found {
-						return false
+					annChild := p.mkLeaf("str", tokIndexOfThis, txt)
+					ann := p.mk("annot", tokIndexOfThis, p.lastSpanEndTok, annChild, val)
+
+					tag := "return"
+					if nt.Type == BREAK {
+						tag = "break"
+					} else if nt.Type == CONTINUE {
+						tag = "continue"
 					}
+					left = p.mk(tag, tokIndexOfThis, p.lastSpanEndTok, ann)
+					leftStartTok = tokIndexOfThis
+					break
 				}
-				return true
-			}
-			// Enum <: T if each member fits T
-			for i := 1; i < len(x); i++ {
-				lv, ok := ip.litToValue(x[i].(S))
-				if !ok || !ip.isType(lv, y, nil) {
-					return false
+
+				// General PRE wrap (non-control)
+				operand, err := p.expr(0)
+				if err != nil {
+					return nil, err
 				}
-			}
-			return true
+				child := p.mkLeaf("str", tokIndexOfThis, txt) // PRE child
+				left = p.mk("annot", tokIndexOfThis, p.lastSpanEndTok, child, operand)
+				leftStartTok = tokIndexOfThis
 
-		case "binop":
-			if x[1].(string) != "->" || y[0].(string) != "binop" || y[1].(string) != "->" {
-				return false
-			}
-			xp, xr := x[2].(S), x[3].(S)
-			yp, yr := y[2].(S), y[3].(S)
-			// Param contravariance, return covariance
-			return sub(yp, xp) && sub(xr, yr)
-		}
-
-		return false
-	}
-
-	return sub(a, b)
-}
-
-// -----------------------------
-// Unification (least common supertype)
-// -----------------------------
-
-func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
-	// Canonicalize both sides first (alias-aware)
-	t1 = stripAnnot(ip.resolveType(t1, env))
-	t2 = stripAnnot(ip.resolveType(t2, env))
-
-	// Helper: expand a single alias once (for LUB we can unfold to compare)
-	expandAlias := func(t S) S {
-		if len(t) >= 2 && t[0].(string) == "alias" {
-			tv := t[1].(*TypeValue)
-			return stripAnnot(ip.resolveType(tv.Ast, tv.Env))
-		}
-		return t
-	}
-
-	// Any absorbs
-	if isId(t1, "Any") {
-		return t1
-	}
-	if isId(t2, "Any") {
-		return t2
-	}
-
-	// ---- Null / Nullable ----
-	if isId(t1, "Null") && isId(t2, "Null") {
-		return t1
-	}
-	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
-		return t2
-	}
-	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
-		return t1
-	}
-	if isId(t1, "Null") {
-		return S{"unop", "?", t2}
-	}
-	if isId(t2, "Null") {
-		return S{"unop", "?", t1}
-	}
-
-	// Nullable normalization
-	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
-	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
-	if isOpt1 && isOpt2 {
-		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt1 {
-		u := ip.unifyTypes(t1[2].(S), t2, env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt2 {
-		u := ip.unifyTypes(t1, t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-
-	// If either side is an alias, unfold once for comparison.
-	if len(t1) >= 2 && t1[0].(string) == "alias" {
-		t1 = expandAlias(t1)
-	}
-	if len(t2) >= 2 && t2[0].(string) == "alias" {
-		t2 = expandAlias(t2)
-	}
-
-	// ---- Primitives (incl. Int ⊔ Num = Num) ----
-	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
-		n1 := t1[1].(string)
-		n2 := t2[1].(string)
-		if n1 == n2 {
-			return t1
-		}
-		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
-			return S{"id", "Num"}
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Arrays ----
-	if t1[0].(string) == "array" && t2[0].(string) == "array" {
-		e1 := S{"id", "Any"}
-		e2 := S{"id", "Any"}
-		if len(t1) == 2 {
-			e1 = t1[1].(S)
-		}
-		if len(t2) == 2 {
-			e2 = t2[1].(S)
-		}
-		elem := ip.unifyTypes(e1, e2, env)
-		return S{"array", elem}
-	}
-	if t1[0].(string) == "array" || t2[0].(string) == "array" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Maps: fieldwise unify; required OR ----
-	if t1[0].(string) == "map" && t2[0].(string) == "map" {
-		f1 := mapTypeFields(t1)
-		f2 := mapTypeFields(t2)
-		keys := map[string]struct{}{}
-		for k := range f1 {
-			keys[k] = struct{}{}
-		}
-		for k := range f2 {
-			keys[k] = struct{}{}
-		}
-		out := S{"map"}
-		for k := range keys {
-			s1, ok1 := f1[k]
-			s2, ok2 := f2[k]
-			switch {
-			case ok1 && ok2:
-				ut := ip.unifyTypes(s1.typ, s2.typ, env)
-				req := s1.required && s2.required
-				tag := "pair"
-				if req {
-					tag = "pair!"
+				// Optionally absorb one immediate POST into this PRE (merge txt)
+				if nleft, _, err := p.absorbOneTrailingPostAnnot(left, tokIndexOfThis); err != nil {
+					return nil, err
+				} else {
+					left = nleft
 				}
-				out = append(out, S{tag, S{"str", k}, ut})
-			case ok1 && !ok2:
-				out = append(out, S{"pair", S{"str", k}, s1.typ})
-			case !ok1 && ok2:
-				out = append(out, S{"pair", S{"str", k}, s2.typ})
+				return left, nil
 			}
-		}
-		return out
-	}
-	if t1[0].(string) == "map" || t2[0].(string) == "map" {
-		return S{"id", "Any"}
-	}
 
-	// ---- Enums ----
-	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
-		union := S{"enum"}
-		seen := func(x S) bool {
-			for i := 1; i < len(union); i++ {
-				if equalLiteralS(union[i].(S), x) {
-					return true
-				}
-			}
-			return false
-		}
-		for i := 1; i < len(t1); i++ {
-			x := t1[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		for i := 1; i < len(t2); i++ {
-			x := t2[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		return union
-	}
-	// enum ⊔ Type → Type if all members fit; else Any
-	if t1[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t1); i++ {
-			lv, ok := ip.litToValue(t1[i].(S))
-			if !ok || !ip.isType(lv, t2, env) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return t2
-		}
-		return S{"id", "Any"}
-	}
-	if t2[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t2); i++ {
-			lv, ok := ip.litToValue(t2[i].(S))
-			if !ok || !ip.isType(lv, t1, env) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return t1
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Functions: pointwise ----
-	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
-		// f1 = A1 -> B1, f2 = A2 -> B2
-		a1, b1 := t1[2].(S), t1[3].(S)
-		a2, b2 := t2[2].(S), t2[3].(S)
-
-		// Param GLB (contravariant):
-		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
-		var param S
-		if ip.isSubtype(a1, a2, env) {
-			param = a1
-		} else if ip.isSubtype(a2, a1, env) {
-			param = a2
-		} else {
-			return S{"id", "Any"}
-		}
-
-		// Return LUB (covariant):
-		ret := ip.unifyTypes(b1, b2, env)
-		return S{"binop", "->", param, ret}
-	}
-	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
-		return S{"id", "Any"}
-	}
-
-	return S{"id", "Any"}
-}
-
-// validateTypeShape checks that an S-expression is a *type-shaped* AST.
-// It is purely syntactic: it does not resolve identifiers or paths.
-// Returns "" if OK; otherwise a short human-friendly error message.
-//
-// Allowed forms (with arity):
-//
-//	("id", name)
-//	("get", base=id|get, ("str", key))
-//	("unop","?", T)
-//	("binop","->", A, B)
-//	("array", T)
-//	("map", ("pair"| "pair!", ("str", key), T)*)
-//	("enum", <JSON-literal>...)
-//	("annot", ("str", doc), T)   // stripped and T validated
-//
-// Disallowed:
-//
-//	raw literals as types (e.g., ("int", 1)), ("fun", ...), ("type", ...),
-//	("module", ...), raw ("alias", *TypeValue) (internal canonical form),
-//	malformed arities, non-string map keys, duplicate keys within one map type.
-//
-// validateTypeShape checks that an S-expression is a syntactically valid *type*
-// shape (purely structural; no name resolution). It returns "" if OK, else a
-// short human-readable error message. Aliases/self-references are allowed
-// because ("id", ...) and ("get", ...) are accepted without resolution.
-//
-// Allowed nodes:
-//
-//	("id", name)
-//	("get", base, ("str", key))        // base must be id|get
-//	("unop", "?", T)                   // nullable
-//	("binop", "->", A, B)              // function type
-//	("array", T)                       // exactly one elem type
-//	("map", ("pair"| "pair!", ("str",k), T)...)  // no duplicate keys
-//	("enum", <anything>)               // JSON-literal check is done elsewhere
-//	("annot", ("str", doc), T)         // allowed wrapper anywhere
-//
-// Disallowed: literal value nodes ("int"/"num"/"str"/... as types), "fun",
-// "module", raw internal "alias" nodes, wrong arities, non-string keys, etc.
-func validateTypeShape(t S) string {
-	// Local helper to strip "annot" wrappers *and* validate their doc fields.
-	strip := func(n S) (S, string) {
-		for len(n) >= 3 {
-			tag, ok := n[0].(string)
-			if !ok || tag != "annot" {
-				break
-			}
-			// validate ("annot", ("str", doc), subj)
-			doc, ok := n[1].(S)
-			if !ok || len(doc) < 2 || doc[0].(string) != "str" {
-				return nil, "annotation must have a string doc"
-			}
-			subj, _ := n[2].(S)
-			n = subj
-		}
-		return n, ""
-	}
-
-	var walk func(S) string
-	walk = func(n S) string {
-		if len(n) == 0 {
-			return "invalid type: empty"
-		}
-		// peel/validate annot wrappers
-		var msg string
-		if n, msg = strip(n); msg != "" {
-			return msg
-		}
-		if len(n) == 0 {
-			return "invalid type: empty"
-		}
-
-		tag, ok := n[0].(string)
-		if !ok {
-			return "invalid type: corrupt node tag"
-		}
-
-		switch tag {
-		case "id":
-			if len(n) != 2 {
-				return "id type must have exactly one name"
-			}
-			if _, ok := n[1].(string); !ok {
-				return "id name must be a string"
-			}
-			return ""
-
-		case "get":
-			if len(n) != 3 {
-				return `qualified type must be ("get", base, ("str", key))`
-			}
-			base, okb := n[1].(S)
-			if !okb || len(base) == 0 {
-				return "qualified type has invalid base"
-			}
-			if btag, _ := base[0].(string); btag != "id" && btag != "get" && btag != "annot" {
-				return "qualified type base must be id or get"
-			}
-			// walk the base (allows nested get/annot/id)
-			if err := walk(base); err != "" {
-				return err
-			}
-			key, okk := n[2].(S)
-			if !okk || len(key) < 2 || key[0].(string) != "str" {
-				return "qualified type key must be a string literal"
-			}
-			return ""
-
-		case "unop":
-			if len(n) != 3 || n[1] != "?" {
-				return `nullable type must be ("unop", "?", T)`
-			}
-			sub, _ := n[2].(S)
-			return walk(sub)
-
-		case "binop":
-			if len(n) != 4 || n[1] != "->" {
-				return `function type must be ("binop", "->", A, B)`
-			}
-			if err := walk(n[2].(S)); err != "" {
-				return err
-			}
-			return walk(n[3].(S))
-
-		case "array":
-			if len(n) != 2 {
-				return "array type must have exactly one element type"
-			}
-			return walk(n[1].(S))
-
-		case "map":
-			seen := map[string]struct{}{}
-			for i := 1; i < len(n); i++ {
-				p, okp := n[i].(S)
-				if !okp || len(p) < 3 {
-					return `map field must be ("pair"|"pair!", ("str", key), T)`
-				}
-				ptag, ok := p[0].(string)
-				if !ok || (ptag != "pair" && ptag != "pair!") {
-					return `map field must start with "pair" or "pair!"`
-				}
-				key, okk := p[1].(S)
-				if !okk || len(key) < 2 || key[0].(string) != "str" {
-					return "map field key must be a string literal"
-				}
-				k := key[1].(string)
-				if _, dup := seen[k]; dup {
-					return "duplicate field '" + k + "' in map type"
-				}
-				seen[k] = struct{}{}
-				if err := walk(p[2].(S)); err != "" {
-					return err
-				}
-			}
-			return ""
-
-		case "enum":
-			// Shape is fine here; members being JSON-literals is validated
-			// by validateEnumsJSONOnly at construction call-sites.
-			return ""
-
-		case "annot":
-			// Should have been stripped; treat as error to avoid silent loops.
-			return "internal error: unexpected annot after strip"
-
-		// Explicitly disallow internal/user-nonsensical nodes in type shapes.
-		case "int", "num", "str", "bool", "null", "fun", "module", "type", "alias":
-			return "invalid type: unexpected node " + tag
+			// POST in prefix position is an error.
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: line, Col: col}
 
 		default:
-			return "invalid type: unexpected node " + tag
+			if t.Type == EOF && p.interactive {
+				line, col := p.posAfterLastSpan()
+				return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
+			}
+			line, col := p.posAtByte(t.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
 		}
 	}
 
-	return walk(t)
+	// ---- postfix chain ----
+	for {
+		n, ok, err := p.parseOnePostfix(left, leftStartTok)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		left = n
+	}
+
+	// ---- infix ops ----
+	for {
+		op := p.peek()
+		bp, ok := lbp(op.Type)
+		if !ok || bp < minBP {
+			break
+		}
+		p.i++
+
+		nextBP := bp + 1
+		if isRightAssoc(op.Type) {
+			nextBP = bp
+		}
+
+		if op.Type == ASSIGN && !assignable(left) {
+			line, col := p.posAtByte(op.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
+		}
+
+		if err := p.needExprAfter(op, "expected expression after operator"); err != nil {
+			return nil, err
+		}
+		right, err := p.expr(nextBP)
+		if err != nil {
+			return nil, err
+		}
+		endTok := p.lastSpanEndTok
+		if op.Type == ASSIGN {
+			left = p.mk("assign", leftStartTok, endTok, left, right)
+		} else {
+			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, right)
+		}
+	}
+
+	return left, nil
 }
 
-// -----------------------------
-// Enum literal-only validation
-// -----------------------------
-
-// isJSONLiteralNode reports whether n is one of the literal forms that
-// litToValue accepts: null/bool/int/num/str/array/map (with literal children).
-func isJSONLiteralNode(n S) bool {
-	if len(n) == 0 {
-		return false
+func (p *parser) needExprAfter(tok Token, msg string) error {
+	if p.atEnd() && p.interactive {
+		line, col := p.posAtByte(tok.StartByte)
+		return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
 	}
-	switch n[0].(string) {
-	case "null", "bool", "int", "num", "str":
-		return true
-	case "array":
-		for i := 1; i < len(n); i++ {
-			child, ok := n[i].(S)
-			if !ok || !isJSONLiteralNode(child) {
-				return false
-			}
-		}
-		return true
-	case "map":
-		for i := 1; i < len(n); i++ {
-			p, ok := n[i].(S)
-			if !ok || len(p) < 3 {
-				return false
-			}
-			// p = ("pair" | "pair!", ("str", key), valueLit)
-			tag := p[0].(string)
-			if tag != "pair" && tag != "pair!" {
-				return false
-			}
-			key, ok := p[1].(S)
-			if !ok || len(key) < 2 || key[0].(string) != "str" {
-				return false
-			}
-			val, ok := p[2].(S)
-			if !ok || !isJSONLiteralNode(val) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
+	return nil
 }
 
-// validateEnumsJSONOnly walks a type AST and ensures any ("enum", ...)
-// contains only JSON-style literals. It returns an empty string if OK,
-// otherwise a short human message.
-func validateEnumsJSONOnly(t S) string {
-	if len(t) == 0 {
-		return ""
+// parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
+func (p *parser) parseGrouping() (S, error) {
+	p.skipNoops()
+	inner, err := p.expr(0)
+	if err != nil {
+		return nil, err
 	}
-	switch t[0].(string) {
-	case "annot":
-		if len(t) >= 3 {
-			if sub, ok := t[2].(S); ok {
-				return validateEnumsJSONOnly(sub)
+	p.skipNoops()
+	if _, err := p.need(RROUND, "expected ')'"); err != nil {
+		return nil, err
+	}
+	return inner, nil
+}
+
+// ───────────────────────── unified postfix dispatcher ──────────────────────
+//
+// Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
+// **Span order** is enforced: children were already appended during their parse.
+// We append exactly one span for the new wrapper node (unop '?', call, idx, get).
+
+func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
+	switch p.peek().Type {
+	case QUESTION:
+		qtok := p.i
+		p.i++
+		n := p.mk("unop", leftStartTok, qtok, "?", left)
+		return n, true, nil
+
+	case CLROUND:
+		p.i++
+		p.skipNoops()
+		if p.match(RROUND) {
+			n := p.mk("call", leftStartTok, p.i-1, left)
+			return n, true, nil
+		}
+		args, _, closeTok, err := p.bracketed(RROUND, func() (S, int, error) {
+			p.skipNoops()
+			start := p.i
+			a, err := p.expr(0)
+			if err != nil {
+				return nil, 0, err
+			}
+			return a, start, nil
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		n := p.mk("call", leftStartTok, closeTok, append([]any{left}, args...)...)
+		return n, true, nil
+
+	case CLSQUARE:
+		p.i++
+		p.skipNoops()
+		idx, err := p.expr(0)
+		if err != nil {
+			return nil, false, err
+		}
+		p.skipNoops()
+		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
+			return nil, false, err
+		}
+		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
+		return n, true, nil
+
+	case PERIOD:
+		p.i++ // consume '.'
+		// (expr) -> idx
+		if p.match(LROUND) || p.match(CLROUND) {
+			p.skipNoops()
+			ex, err := p.expr(0)
+			if err != nil {
+				return nil, false, err
+			}
+			p.skipNoops()
+			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
+				return nil, false, perr
+			}
+			n := p.mk("idx", leftStartTok, p.i-1, left, ex)
+			return n, true, nil
+		}
+		// .<int> -> idx
+		if p.match(INTEGER) {
+			intTok := p.i - 1
+			intNode := p.mkLeaf("int", intTok, p.prev().Literal)
+			n := p.mk("idx", leftStartTok, intTok, left, intNode)
+			return n, true, nil
+		}
+		// .id / ."str" -> get
+		if p.match(ID) || p.match(STRING) {
+			propTok := p.i - 1
+			prop := p.mkLeaf("str", propTok, tokText(p.prev()))
+			n := p.mk("get", leftStartTok, propTok, left, prop)
+			return n, true, nil
+		}
+		g := p.peek()
+		line, col := p.posAtByte(g.StartByte)
+		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
+	}
+	return nil, false, nil
+}
+
+// ───────────────────────── collections / lists / maps ─────────────────────
+
+// bracketed parses a generic comma-list whose opener has just been consumed.
+func (p *parser) bracketed(
+	close TokenType,
+	parseElem func() (S, int, error),
+) ([]any, int, int, error) {
+	openTok := p.i - 1
+	p.skipNoops()
+	// Empty
+	if p.match(close) {
+		return nil, openTok, p.i - 1, nil
+	}
+	elems, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == close },
+		parseElem,
+	)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	p.skipNoops()
+	if _, err := p.need(close, "expected ')'"); err != nil {
+		return nil, 0, 0, err
+	}
+	return elems, openTok, p.i - 1, nil
+}
+
+// parseCommaList parses items until isClose(peek.Type) is true.
+// It also performs standardized "trailing POST binding" (after element and after comma).
+func (p *parser) parseCommaList(
+	isClose func(TokenType) bool,
+	parseElem func() (S, int, error),
+) ([]any, error) {
+	var out []any
+	for {
+		p.skipNoops()
+		if isClose(p.peek().Type) {
+			break
+		}
+		elem, startTok, err := parseElem()
+		if err != nil {
+			return nil, err
+		}
+		// direct trailing POST
+		elem, err = p.afterExprMaybePost(elem, startTok)
+		if err != nil {
+			return nil, err
+		}
+
+		p.skipNoops()
+		if p.match(COMMA) {
+			// POST after comma binds to the left element
+			p.skipNoops()
+			elem, err = p.afterExprMaybePost(elem, startTok)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, elem)
+			// allow trailing comma
+			p.skipNoops()
+			if isClose(p.peek().Type) {
+				break
+			}
+			continue
+		}
+
+		out = append(out, elem)
+		break
+	}
+	return out, nil
+}
+
+func (p *parser) arrayLiteralAfterOpen() (S, error) {
+	p.skipNoops()
+	if p.match(RSQUARE) {
+		return p.mk("array", p.i-2, p.i-1 /*'[]'*/), nil
+	}
+	elems, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == RSQUARE },
+		func() (S, int, error) {
+			p.skipNoops()
+			start := p.i
+			e, err := p.expr(0)
+			if err != nil {
+				return nil, 0, err
+			}
+			return e, start, nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, perr := p.need(RSQUARE, "expected ']'"); perr != nil {
+		return nil, perr
+	}
+	// span: from '[' (or CLSQUARE) to ']'
+	return p.mk("array", p.findMatchingOpenSquare(), p.i-1, elems...), nil
+}
+
+func (p *parser) findMatchingOpenSquare() int {
+	// Best-effort: previous token (we call right after consuming ']')
+	if p.i-2 >= 0 {
+		// walk back to LSQUARE/CLSQUARE
+		for j := p.i - 2; j >= 0; j-- {
+			if p.toks[j].Type == LSQUARE || p.toks[j].Type == CLSQUARE {
+				return j
 			}
 		}
-		return ""
-	case "enum":
-		for i := 1; i < len(t); i++ {
-			member, ok := t[i].(S)
-			if !ok || !isJSONLiteralNode(member) {
-				return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
+	}
+	return p.i - 1
+}
+
+// params parses (CLROUND ... RROUND) parameter pairs; POST can follow each param
+// directly or after the comma. Default type is Any.
+func (p *parser) params() (S, error) {
+	var openTok int
+	if _, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
+		return nil, perr
+	}
+	openTok = p.i - 1
+
+	p.skipNoops()
+	if p.match(RROUND) {
+		return p.mk("array", openTok, p.i-1), nil
+	}
+
+	elems, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == RROUND },
+		func() (S, int, error) {
+			p.skipNoops()
+			idTok, err := p.need(ID, "expected parameter name")
+			if err != nil {
+				return nil, 0, err
 			}
-		}
-		return ""
-	case "unop", "binop", "array", "map", "get", "id", "alias", "type", "module":
-		for i := 1; i < len(t); i++ {
-			if sub, ok := t[i].(S); ok {
-				if msg := validateEnumsJSONOnly(sub); msg != "" {
-					return msg
+			idIdx := p.i - 1
+			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
+
+			// Decide type presence first; emit exactly one node.
+			endTokForPair := idIdx
+			var typ S
+
+			p.skipNoops()
+			if p.match(COLON) {
+				if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
+					return nil, 0, err
 				}
+				p.skipNoops()
+				e, err := p.expr(0)
+				if err != nil {
+					return nil, 0, err
+				}
+				typ = e
+				endTokForPair = p.lastSpanEndTok
+			} else {
+				typ = p.mkLeaf("id", -1, "Any") // emit only in the untyped case
+			}
+
+			pair := p.mk("pair", idIdx, endTokForPair, nameLeaf, typ)
+			return pair, idIdx, nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	p.skipNoops()
+	if _, perr := p.need(RROUND, "expected ')' after parameters"); perr != nil {
+		return nil, perr
+	}
+	return p.mk("array", openTok, p.i-1, elems...), nil
+}
+
+func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
+	p.skipNoops()
+	if p.match(RCURLY) {
+		return p.mk("map", openTok, p.i-1), nil
+	}
+
+	isClose := func(tt TokenType) bool { return tt == RCURLY }
+	readKey := func() (S, int, bool, error) {
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		keyStartTok := p.lastSpanStartTok
+		req := p.match(BANG)
+		return k, keyStartTok, req, nil
+	}
+	parseVal := func() (S, int, error) {
+		p.skipNoops()
+		start := p.i
+		v, err := p.expr(0)
+		if err != nil {
+			return nil, 0, err
+		}
+		return v, start, nil
+	}
+
+	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, perr := p.need(RCURLY, "expected '}'"); perr != nil {
+		return nil, perr
+	}
+	return p.mk("map", openTok, p.i-1, pairs...), nil
+}
+
+// parseKVPairs reuses standardized trailing-POST logic on key (after ':')
+// and value (after value and after comma).
+func (p *parser) parseKVPairs(
+	isClose func(TokenType) bool,
+	readKey func() (key S, keyStartTok int, required bool, err error),
+	parseValue func() (val S, valStartTok int, err error),
+) ([]any, error) {
+	var pairs []any
+	for {
+		p.skipNoops()
+		if isClose(p.peek().Type) {
+			break
+		}
+		pairStartTok := p.i
+
+		k, keyStartTok, required, err := readKey()
+		if err != nil {
+			return nil, err
+		}
+		p.skipNoops()
+		if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+			return nil, err
+		}
+
+		// POST belonging to key (right after ':')
+		p.skipNoops()
+		if nk, _, err := p.absorbOneTrailingPostAnnot(k, keyStartTok); err != nil {
+			return nil, err
+		} else {
+			k = nk
+		}
+
+		// value
+		p.skipNoops()
+		v, vStartTok, err := parseValue()
+		if err != nil {
+			return nil, err
+		}
+		// direct value POST
+		p.skipNoops()
+		if nv, _, err := p.absorbOneTrailingPostAnnot(v, vStartTok); err != nil {
+			return nil, err
+		} else {
+			v = nv
+		}
+
+		// optional trailing comma (+ POST-after-comma binds to value)
+		p.skipNoops()
+		hadComma := p.match(COMMA)
+		if hadComma {
+			valStartTok := p.lastSpanStartTok
+			p.skipNoops()
+			if nv, _, err := p.absorbOneTrailingPostAnnot(v, valStartTok); err != nil {
+				return nil, err
+			} else {
+				v = nv
 			}
 		}
-		return ""
+
+		tag := "pair"
+		if required {
+			tag = "pair!"
+		}
+		endTok := p.lastSpanEndTok
+		pr := p.mk(tag, pairStartTok, endTok, k, v)
+		pairs = append(pairs, pr)
+
+		p.skipNoops()
+		if hadComma {
+			if isClose(p.peek().Type) {
+				break
+			}
+			continue
+		}
+		break
+	}
+	return pairs, nil
+}
+
+// ───────────────────────── control / loops / if ───────────────────────────
+
+func (p *parser) parseControl(t Token, startTok int) (S, error) {
+	// tag: "return" | "break" | "continue"
+	tag := "return"
+	switch t.Type {
+	case BREAK:
+		tag = "break"
+	case CONTINUE:
+		tag = "continue"
+	}
+
+	// Newline after the control word → no value (Null).
+	if !p.nextTokenIsOnSameLine(t) {
+		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
+	}
+
+	p.skipNoops()
+	// Same line but next token can't start a value → also Null.
+	switch p.peek().Type {
+	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
+		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
+	}
+
+	// Parse value and absorb a single trailing POST annotation.
+	valStartTok := p.i
+	x, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	if nx, _, err := p.absorbOneTrailingPostAnnot(x, valStartTok); err != nil {
+		return nil, err
+	} else {
+		x = nx
+	}
+	return p.mk(tag, startTok, p.lastSpanEndTok, x), nil
+}
+
+func (p *parser) ifExpr() (S, error) {
+	condStartTok := p.i
+	cond, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(THEN, "expected 'then'"); err != nil {
+		return nil, err
+	}
+	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
+	if err != nil {
+		return nil, err
+	}
+	arm := p.mk("pair", condStartTok, p.lastSpanEndTok, cond, thenBlk)
+	arms := []any{arm}
+
+	for p.match(ELIF) {
+		condStartTok = p.i
+		c, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.need(THEN, "expected 'then'"); err != nil {
+			return nil, err
+		}
+		b, err := p.blockUntil(END, ELIF, ELSE)
+		if err != nil {
+			return nil, err
+		}
+		arm := p.mk("pair", condStartTok, p.lastSpanEndTok, c, b)
+		arms = append(arms, arm)
+	}
+
+	var elseTail []any
+	if p.match(ELSE) {
+		b, err := p.blockUntil(END)
+		if err != nil {
+			return nil, err
+		}
+		elseTail = []any{b}
+	}
+	if _, err := p.need(END, "expected 'end'"); err != nil {
+		return nil, err
+	}
+	return L("if", append(arms, elseTail...)...), nil
+}
+
+func (p *parser) forExpr(openTok int) (S, error) {
+	tgt, err := p.forTarget()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.need(IN, "expected 'in'"); err != nil {
+		return nil, err
+	}
+	iter, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	return p.mk("for", openTok, p.i-1, tgt, iter, body), nil
+}
+
+func (p *parser) whileExpr(openTok int) (S, error) {
+	cond, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	return p.mk("while", openTok, p.i-1, cond, body), nil
+}
+
+// ───────────────────────── functions / oracle ─────────────────────────────
+
+func (p *parser) optionalArrowType(incMsg string) (S, error) {
+	if p.match(ARROW) {
+		arrowTok := p.prev()
+		if err := p.needExprAfter(arrowTok, incMsg); err != nil {
+			return nil, err
+		}
+		r, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil // parsed type (one node)
+	}
+	return p.mkLeaf("id", -1, "Any"), nil // single synthetic node
+}
+
+func (p *parser) funExpr(openTok int) (S, int, error) {
+	params, err := p.params()
+	if err != nil {
+		return nil, 0, err
+	}
+	ret, err := p.optionalArrowType("expected return type after '->'")
+	if err != nil {
+		return nil, 0, err
+	}
+	body, perr := p.parseBlock(true)
+	if perr != nil {
+		return nil, 0, perr
+	}
+	node := p.mk("fun", openTok, p.i-1, params, ret, body)
+	return node, p.i - 1, nil
+}
+
+func (p *parser) oracleExpr(openTok int) (S, int, error) {
+	params, err := p.params()
+	if err != nil {
+		return nil, 0, err
+	}
+	out, err := p.optionalArrowType("expected output type after '->'")
+	if err != nil {
+		return nil, 0, err
+	}
+	var src any
+	if p.match(FROM) {
+		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
+			return nil, 0, err
+		}
+		ex, err := p.expr(0)
+		if err != nil {
+			return nil, 0, err
+		}
+		src = ex
+	} else {
+		src = p.mk("array", -1, -1) // build only when needed
+	}
+	body := p.mk("oracle", openTok, p.i-1, params, out, src)
+	return body, p.i - 1, nil
+}
+
+// ─────────────────────── declaration patterns (let/for) ───────────────────
+
+type preAnn struct {
+	txt    string
+	tokIdx int
+}
+
+func (p *parser) takeOnePreAnnotation() (preAnn, bool, error) {
+	if p.atEnd() || p.peek().Type != ANNOTATION || !p.isPreAnnotationAt(p.i) {
+		return preAnn{}, false, nil
+	}
+	tok := p.peek()
+	p.i++
+	txt := ""
+	if s, ok := tok.Literal.(string); ok {
+		txt = s
+	}
+	return preAnn{txt: txt, tokIdx: p.i - 1}, true, nil
+}
+
+func (p *parser) declPattern() (S, error) {
+	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
+		return nil, err
+	} else if ok {
+		// Allow at most one POST to merge immediately after the pattern.
+		child := p.mkLeaf("str", ann.tokIdx, ann.txt) // PRE child ("str", pre)
+		sub, err := p.declPattern()
+		if err != nil {
+			return nil, err
+		}
+		// Direct trailing POST for the same pattern
+		if nsub, _, err := p.absorbOneTrailingPostAnnot(sub, p.lastSpanStartTok); err != nil {
+			return nil, err
+		} else {
+			sub = nsub
+		}
+		node := p.mk("annot", ann.tokIdx, p.lastSpanEndTok, child, sub)
+		return node, nil
+	}
+
+	if p.match(ID) {
+		idIdx := p.i - 1
+		return p.mk("decl", idIdx, idIdx, tokText(p.prev())), nil
+	}
+	if p.match(LSQUARE, CLSQUARE) {
+		return p.arrayDeclPattern()
+	}
+	if p.match(LCURLY) {
+		return p.objectDeclPattern()
+	}
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		line, col := p.posAfterLastSpan()
+		return nil, &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
+	}
+	line, col := p.posAtByte(g.StartByte)
+	return nil, &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
+}
+
+func (p *parser) arrayDeclPattern() (S, error) {
+	openTok := p.i - 1
+	p.skipNoops()
+	if p.match(RSQUARE) {
+		return p.mk("darr", openTok, p.i-1), nil
+	}
+
+	parts, err := p.parseCommaList(
+		func(tt TokenType) bool { return tt == RSQUARE },
+		func() (S, int, error) {
+			p.skipNoops()
+			start := p.i
+			pt, err := p.declPattern()
+			if err != nil {
+				return nil, 0, err
+			}
+			return pt, start, nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	p.skipNoops()
+	if _, perr := p.need(RSQUARE, "expected ']' in array pattern"); perr != nil {
+		return nil, perr
+	}
+	return p.mk("darr", openTok, p.i-1, parts...), nil
+}
+
+func (p *parser) objectDeclPattern() (S, error) {
+	openTok := p.i - 1
+	p.skipNoops()
+	if p.match(RCURLY) {
+		return p.mk("dobj", openTok, p.i-1), nil
+	}
+
+	isClose := func(tt TokenType) bool { return tt == RCURLY }
+	readKey := func() (S, int, bool, error) {
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		return k, p.lastSpanStartTok, false, nil
+	}
+	parseVal := func() (S, int, error) {
+		p.skipNoops()
+		ptStart := p.i
+		pt, err := p.declPattern()
+		if err != nil {
+			return nil, 0, err
+		}
+		return pt, ptStart, nil
+	}
+
+	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
+	if err != nil {
+		return nil, err
+	}
+
+	p.skipNoops()
+	if _, perr := p.need(RCURLY, "expected '}' in object pattern"); perr != nil {
+		return nil, perr
+	}
+	return p.mk("dobj", openTok, p.i-1, pairs...), nil
+}
+
+// readKeyString allows stacked PRE-annotations (handled recursively).
+// Span order: (1) PRE "str" child; (2) "annot" wrapper; (3) final key "str" leaf.
+func (p *parser) readKeyString() (S, error) {
+	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
+		return nil, err
+	} else if ok {
+		child := p.mkLeaf("str", ann.tokIdx, ann.txt)
+		k, err := p.readKeyString()
+		if err != nil {
+			return nil, err
+		}
+		return p.mk("annot", ann.tokIdx, p.lastSpanEndTok, child, k), nil
+	}
+
+	if p.match(STRING) {
+		return p.mkLeaf("str", p.i-1, p.prev().Literal), nil
+	}
+
+	t := p.peek()
+	if isWordLike(t.Type) {
+		p.i++
+		name := t.Lexeme
+		if s, ok := t.Literal.(string); ok {
+			name = s
+		}
+		return p.mkLeaf("str", p.i-1, name), nil
+	}
+
+	g := p.peek()
+	if p.interactive && g.Type == EOF {
+		line, col := p.posAfterLastSpan()
+		return nil, &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
+	}
+	line, col := p.posAtByte(g.StartByte)
+	return nil, &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
+}
+
+func isWordLike(tt TokenType) bool {
+	switch tt {
+	case ID, TYPE, ENUM, BOOLEAN, NULL,
+		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
+		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, MODULE, FOR, IN, FROM,
+		TYPECONS:
+		return true
+	}
+	return false
+}
+
+// ───────────────────────────── for-target helpers ─────────────────────────
+
+func (p *parser) forTarget() (S, error) {
+	if p.match(LET) {
+		return p.declPattern()
+	}
+	switch p.peek().Type {
+	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
+		save := p.i
+		pt, err := p.declPattern()
+		if err == nil {
+			return pt, nil
+		}
+		if p.interactive && IsIncomplete(err) {
+			return nil, err
+		}
+		p.i = save
+	}
+	save := p.i
+	e, err := p.expr(90)
+	if err != nil {
+		return nil, err
+	}
+	if !assignable(e) {
+		p.i = save
+		g := p.peek()
+		line, col := p.posAtByte(g.StartByte)
+		return nil, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
+	}
+	if e[0].(string) == "id" {
+		// Reuse the existing id span for the decl node range.
+		return p.mk("decl", p.lastSpanStartTok, p.lastSpanEndTok, e[1].(string)), nil
+	}
+	return e, nil
+}
+
+func assignable(n S) bool {
+	cur := n
+	for len(cur) > 0 {
+		tag, _ := cur[0].(string)
+		if tag == "annot" {
+			if inner, ok := cur[2].(S); ok {
+				cur = inner
+				continue
+			}
+		}
+		break
+	}
+	if len(cur) == 0 {
+		return false
+	}
+	switch cur[0] {
+	case "id", "get", "idx", "decl", "darr", "dobj":
+		return true
 	default:
-		return ""
+		return false
 	}
 }
-=== END FILE: types.go ===
+
+func unwrapAnnots(n S) S {
+	cur := n
+	for len(cur) > 0 {
+		tag, _ := cur[0].(string)
+		if tag != "annot" {
+			break
+		}
+		inner, ok := cur[2].(S)
+		if !ok {
+			break
+		}
+		cur = inner
+	}
+	return cur
+}
+=== END FILE: parser.go ===
+
+=== BEGIN FILE: spans.go ===
+// spans.go — Sidecar spans for MindScript ASTs (S-expressions)
+//
+// WHAT THIS MODULE DOES
+// =====================
+// This module provides a tiny, non-invasive mechanism to associate **source-code
+// byte spans** with nodes of a MindScript AST (encoded as the S-expression type
+// `S` from parser.go) **without modifying the AST itself**.
+//
+// The spans are modeled as half-open byte intervals `[StartByte, EndByte)`
+// relative to the original UTF-8 source. Line/column coordinates are intentionally
+// omitted here to keep the structure minimal; callers can derive them on demand
+// from the original source text.
+//
+// HOW SPANS ARE ASSOCIATED TO NODES
+// =================================
+// We use a *sidecar* structure (`SpanIndex`) keyed by a stable, structural
+// address called a **NodePath**. A `NodePath` is a slice of child indexes
+// into the AST tree: e.g. `[]int{0,2,1}` means “root’s 0th child → its 2nd
+// child → its 1st child”. Paths are defined against the S-expression shape
+// where a node is `[]any{tagString, child0, child1, ...}` — i.e. the first
+// element is the string tag, and child index 0 refers to the element at
+// S[1], child index 1 refers to S[2], etc.
+//
+// This file does **not** compute spans itself. Instead, the parser (or any
+// external producer) records one `Span` per AST node in **post-order**
+// (children before parent) while constructing or inspecting the tree, and
+// then calls `BuildSpanIndexPostOrder(ast, spans)` to bind those spans to
+// concrete paths via a deterministic walk of the AST in the same order.
+//
+// The result is a `SpanIndex` you can query with a `NodePath` to retrieve
+// the associated byte interval in the original source.
+//
+// DEPENDENCIES ON OTHER FILES
+// ===========================
+// • parser.go
+//   - Defines the S-expression node type alias `type S = []any`.
+//   - Produces the AST that this module indexes.
+//   - (Optional instrumentation) While parsing, record a `Span` per finished
+//     node in **post-order** (children first, then the node) using the token
+//     byte spans collected by the lexer.
+//
+// • lexer.go
+//   - Tokens should carry precise byte offsets (`StartByte`/`EndByte`) so that
+//     the parser can compute node spans as:
+//     node.StartByte = firstToken.StartByte
+//     node.EndByte   = lastToken.EndByte
+//
+// PERFORMANCE & CONCURRENCY
+// =========================
+// Building an index is O(n) in the number of AST nodes. `SpanIndex` is
+// read-only after construction and safe to share for concurrent reads.
+// Memory usage is one map entry per node (string key per `NodePath`).
+//
+// PUBLIC VS PRIVATE LAYOUT
+// ========================
+// The file is split into a PUBLIC API (types and functions you call) and a
+// PRIVATE section (helpers and internal details). The PUBLIC API is fully
+// documented so its behavior is understandable without reading the PRIVATE
+// code.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+package mindscript
+
+import (
+	"strconv"
+	"strings"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                                  PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// Span represents a half-open byte interval [StartByte, EndByte) in the original
+// source text. Offsets are counted in bytes from the start of the UTF-8 source.
+// EndByte is exclusive.
+//
+// Line/column coordinates are not stored here to keep Span minimal; if you need
+// them, compute (line, col) from the original source using your preferred mapping.
+type Span struct {
+	StartByte int // inclusive
+	EndByte   int // exclusive
+}
+
+// NodePath is a stable structural address into an S-expression AST.
+// Each integer selects a child in the node's children array:
+//
+//	path element k  → child at S[k+1] (since S[0] is the string tag).
+//
+// Example:
+//
+//	// ("call", callee, arg0, arg1)
+//	//  tag   ^      ^ child0 ^ child1
+//	//  S[0]        S[1]      S[2]     S[3]
+//	path []int{0}   → callee
+//	path []int{2}   → arg1
+type NodePath []int
+
+// SpanIndex stores a sidecar mapping from NodePath → Span for an AST.
+// It is read-only after construction. Use Get to retrieve spans by path.
+//
+// Typical construction flow (performed by the parser or a post-pass):
+//  1. Walk/construct the AST while recording one Span per node in post-order.
+//  2. Call BuildSpanIndexPostOrder(ast, postorderSpans) to bind spans to paths.
+//  3. Query with si.Get(path) wherever you need source intervals.
+type SpanIndex struct {
+	byPath map[string]Span
+}
+
+// Get returns the span associated with the given path, if present.
+// The boolean is false if the path is unknown or the index is nil.
+//
+// A SpanIndex may be partial (e.g., producer skipped some nodes). In that case
+// only the recorded nodes will resolve to spans.
+func (si *SpanIndex) Get(p NodePath) (Span, bool) {
+	if si == nil {
+		return Span{}, false
+	}
+	sp, ok := si.byPath[pathKey(p)]
+	return sp, ok
+}
+
+// BuildSpanIndexPostOrder constructs a SpanIndex by walking the AST in
+// **post-order** (children before parent) and binding each visited node to
+// the next span from the provided `postorder` slice.
+//
+// Contract:
+//   - The `postorder` slice must list exactly one Span for each node in `root`
+//     in post-order. If it is longer, extras are ignored; if shorter, remaining
+//     nodes are left unindexed (Get will return (Span{}, false) for them).
+//   - The resulting index is read-only and safe for concurrent reads.
+//
+// Complexity: O(n) time and O(n) space where n is the number of AST nodes.
+//
+// Example usage (parser instrumentation idea):
+//
+//	// During parse, for each finished node (after parsing children):
+//	//   spans = append(spans, Span{StartByte:firstTok.StartByte, EndByte:lastTok.EndByte})
+//	idx := BuildSpanIndexPostOrder(ast, spans)
+//	sp, ok := idx.Get(NodePath{0,2}) // lookup "child 0's child 2"
+func BuildSpanIndexPostOrder(root S, postorder []Span) *SpanIndex {
+	si := &SpanIndex{byPath: make(map[string]Span, len(postorder))}
+	bindPostOrder(si, root, postorder)
+	return si
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                                 PRIVATE
+////////////////////////////////////////////////////////////////////////////////
+
+// pathKey serializes a NodePath to a compact "a.b.c" string used as the map key.
+func pathKey(p NodePath) string {
+	if len(p) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, x := range p {
+		if i > 0 {
+			sb.WriteByte('.')
+		}
+		sb.WriteString(strconv.Itoa(x))
+	}
+	return sb.String()
+}
+
+// bindPostOrder walks `root` in post-order, assigning spans from `postorder`
+// to each visited node, in order.
+func bindPostOrder(si *SpanIndex, root S, postorder []Span) {
+	i := 0
+	var walk func(n S, path NodePath)
+	walk = func(n S, path NodePath) {
+		// Visit children
+		for ci := 1; ci < len(n); ci++ {
+			if child, ok := n[ci].(S); ok {
+				walk(child, append(path, ci-1))
+			}
+		}
+		// Bind this node
+		if i < len(postorder) {
+			si.byPath[pathKey(path)] = postorder[i]
+			i++
+		}
+	}
+	walk(root, nil)
+}
+=== END FILE: spans.go ===
 

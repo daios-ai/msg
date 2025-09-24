@@ -180,8 +180,7 @@ func (o *opsImpl) initCore() {
 				return errNull("__type_from_ast: payload not a type AST")
 			}
 			if msg := validateTypeShape(s); msg != "" {
-				fmt.Print("[DBG __type_from_ast] " + FormatSExpr(s) + "\n")
-				//return errNull("__type_from_ast: " + msg)
+				fail(msg)
 			}
 			return TypeValIn(s, ctx.Env())
 		})

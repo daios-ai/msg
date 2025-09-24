@@ -286,10 +286,6 @@ type TypeValue struct {
 // TypeValIn builds a VTType and pins its resolution environment explicitly.
 // Use this when exporting user-defined types from specific scopes.
 func TypeValIn(expr S, env *Env) Value {
-	if msg := validateTypeShape(expr); msg != "" {
-		fmt.Print("[DBG TypeValIn] " + FormatSExpr(expr) + "\n")
-		//		panic(rtErr{msg: msg})
-	}
 	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
 }
 

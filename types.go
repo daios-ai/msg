@@ -140,8 +140,8 @@ func mapTypeFields(t S) map[string]objField {
 		if len(p) < 3 {
 			continue
 		}
-		ptag := p[0].(string) // "pair" or "pair!"
-		keyNode := p[1].(S)   // ("str", k)
+		ptag := p[0].(string)           // "pair" or "pair!"
+		keyNode := stripAnnot(p[1].(S)) // allow annotated keys
 		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
 			continue
 		}
@@ -1271,12 +1271,19 @@ func validateTypeShape(t S) string {
 				if !okp || len(p) < 3 {
 					return `map field must be ("pair"|"pair!", ("str", key), T)`
 				}
+				// Forbid annot-wrapping the entire pair node.
 				ptag, ok := p[0].(string)
 				if !ok || (ptag != "pair" && ptag != "pair!") {
 					return `map field must start with "pair" or "pair!"`
 				}
+
+				// Allow annotations on the KEY: ("annot", ("str",doc), ("str", key))
 				key, okk := p[1].(S)
-				if !okk || len(key) < 2 || key[0].(string) != "str" {
+				if !okk {
+					return "map field key must be a string literal"
+				}
+				key = stripAnnot(key)
+				if len(key) < 2 || key[0].(string) != "str" {
 					return "map field key must be a string literal"
 				}
 				k := key[1].(string)
@@ -1284,6 +1291,7 @@ func validateTypeShape(t S) string {
 					return "duplicate field '" + k + "' in map type"
 				}
 				seen[k] = struct{}{}
+				// Value type may itself be annotated; walk handles that.
 				if err := walk(p[2].(S)); err != "" {
 					return err
 				}
@@ -1291,8 +1299,13 @@ func validateTypeShape(t S) string {
 			return ""
 
 		case "enum":
-			// Shape is fine here; members being JSON-literals is validated
-			// by validateEnumsJSONOnly at construction call-sites.
+			// Members must be JSON literals (null/bool/int/num/str/array/map of literals).
+			for i := 1; i < len(n); i++ {
+				member, ok := n[i].(S)
+				if !ok || !isJSONLiteralNode(member) {
+					return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
+				}
+			}
 			return ""
 
 		case "annot":

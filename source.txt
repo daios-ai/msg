@@ -1134,5 +1134,266 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 
 	return S{"id", "Any"}
 }
+
+// validateTypeShape checks that an S-expression is a *type-shaped* AST.
+// It is purely syntactic: it does not resolve identifiers or paths.
+// Returns "" if OK; otherwise a short human-friendly error message.
+//
+// Allowed forms (with arity):
+//
+//	("id", name)
+//	("get", base=id|get, ("str", key))
+//	("unop","?", T)
+//	("binop","->", A, B)
+//	("array", T)
+//	("map", ("pair"| "pair!", ("str", key), T)*)
+//	("enum", <JSON-literal>...)
+//	("annot", ("str", doc), T)   // stripped and T validated
+//
+// Disallowed:
+//
+//	raw literals as types (e.g., ("int", 1)), ("fun", ...), ("type", ...),
+//	("module", ...), raw ("alias", *TypeValue) (internal canonical form),
+//	malformed arities, non-string map keys, duplicate keys within one map type.
+//
+// validateTypeShape checks that an S-expression is a syntactically valid *type*
+// shape (purely structural; no name resolution). It returns "" if OK, else a
+// short human-readable error message. Aliases/self-references are allowed
+// because ("id", ...) and ("get", ...) are accepted without resolution.
+//
+// Allowed nodes:
+//
+//	("id", name)
+//	("get", base, ("str", key))        // base must be id|get
+//	("unop", "?", T)                   // nullable
+//	("binop", "->", A, B)              // function type
+//	("array", T)                       // exactly one elem type
+//	("map", ("pair"| "pair!", ("str",k), T)...)  // no duplicate keys
+//	("enum", <anything>)               // JSON-literal check is done elsewhere
+//	("annot", ("str", doc), T)         // allowed wrapper anywhere
+//
+// Disallowed: literal value nodes ("int"/"num"/"str"/... as types), "fun",
+// "module", raw internal "alias" nodes, wrong arities, non-string keys, etc.
+func validateTypeShape(t S) string {
+	// Local helper to strip "annot" wrappers *and* validate their doc fields.
+	strip := func(n S) (S, string) {
+		for len(n) >= 3 {
+			tag, ok := n[0].(string)
+			if !ok || tag != "annot" {
+				break
+			}
+			// validate ("annot", ("str", doc), subj)
+			doc, ok := n[1].(S)
+			if !ok || len(doc) < 2 || doc[0].(string) != "str" {
+				return nil, "annotation must have a string doc"
+			}
+			subj, _ := n[2].(S)
+			n = subj
+		}
+		return n, ""
+	}
+
+	var walk func(S) string
+	walk = func(n S) string {
+		if len(n) == 0 {
+			return "invalid type: empty"
+		}
+		// peel/validate annot wrappers
+		var msg string
+		if n, msg = strip(n); msg != "" {
+			return msg
+		}
+		if len(n) == 0 {
+			return "invalid type: empty"
+		}
+
+		tag, ok := n[0].(string)
+		if !ok {
+			return "invalid type: corrupt node tag"
+		}
+
+		switch tag {
+		case "id":
+			if len(n) != 2 {
+				return "id type must have exactly one name"
+			}
+			if _, ok := n[1].(string); !ok {
+				return "id name must be a string"
+			}
+			return ""
+
+		case "get":
+			if len(n) != 3 {
+				return `qualified type must be ("get", base, ("str", key))`
+			}
+			base, okb := n[1].(S)
+			if !okb || len(base) == 0 {
+				return "qualified type has invalid base"
+			}
+			if btag, _ := base[0].(string); btag != "id" && btag != "get" && btag != "annot" {
+				return "qualified type base must be id or get"
+			}
+			// walk the base (allows nested get/annot/id)
+			if err := walk(base); err != "" {
+				return err
+			}
+			key, okk := n[2].(S)
+			if !okk || len(key) < 2 || key[0].(string) != "str" {
+				return "qualified type key must be a string literal"
+			}
+			return ""
+
+		case "unop":
+			if len(n) != 3 || n[1] != "?" {
+				return `nullable type must be ("unop", "?", T)`
+			}
+			sub, _ := n[2].(S)
+			return walk(sub)
+
+		case "binop":
+			if len(n) != 4 || n[1] != "->" {
+				return `function type must be ("binop", "->", A, B)`
+			}
+			if err := walk(n[2].(S)); err != "" {
+				return err
+			}
+			return walk(n[3].(S))
+
+		case "array":
+			if len(n) != 2 {
+				return "array type must have exactly one element type"
+			}
+			return walk(n[1].(S))
+
+		case "map":
+			seen := map[string]struct{}{}
+			for i := 1; i < len(n); i++ {
+				p, okp := n[i].(S)
+				if !okp || len(p) < 3 {
+					return `map field must be ("pair"|"pair!", ("str", key), T)`
+				}
+				ptag, ok := p[0].(string)
+				if !ok || (ptag != "pair" && ptag != "pair!") {
+					return `map field must start with "pair" or "pair!"`
+				}
+				key, okk := p[1].(S)
+				if !okk || len(key) < 2 || key[0].(string) != "str" {
+					return "map field key must be a string literal"
+				}
+				k := key[1].(string)
+				if _, dup := seen[k]; dup {
+					return "duplicate field '" + k + "' in map type"
+				}
+				seen[k] = struct{}{}
+				if err := walk(p[2].(S)); err != "" {
+					return err
+				}
+			}
+			return ""
+
+		case "enum":
+			// Shape is fine here; members being JSON-literals is validated
+			// by validateEnumsJSONOnly at construction call-sites.
+			return ""
+
+		case "annot":
+			// Should have been stripped; treat as error to avoid silent loops.
+			return "internal error: unexpected annot after strip"
+
+		// Explicitly disallow internal/user-nonsensical nodes in type shapes.
+		case "int", "num", "str", "bool", "null", "fun", "module", "type", "alias":
+			return "invalid type: unexpected node " + tag
+
+		default:
+			return "invalid type: unexpected node " + tag
+		}
+	}
+
+	return walk(t)
+}
+
+// -----------------------------
+// Enum literal-only validation
+// -----------------------------
+
+// isJSONLiteralNode reports whether n is one of the literal forms that
+// litToValue accepts: null/bool/int/num/str/array/map (with literal children).
+func isJSONLiteralNode(n S) bool {
+	if len(n) == 0 {
+		return false
+	}
+	switch n[0].(string) {
+	case "null", "bool", "int", "num", "str":
+		return true
+	case "array":
+		for i := 1; i < len(n); i++ {
+			child, ok := n[i].(S)
+			if !ok || !isJSONLiteralNode(child) {
+				return false
+			}
+		}
+		return true
+	case "map":
+		for i := 1; i < len(n); i++ {
+			p, ok := n[i].(S)
+			if !ok || len(p) < 3 {
+				return false
+			}
+			// p = ("pair" | "pair!", ("str", key), valueLit)
+			tag := p[0].(string)
+			if tag != "pair" && tag != "pair!" {
+				return false
+			}
+			key, ok := p[1].(S)
+			if !ok || len(key) < 2 || key[0].(string) != "str" {
+				return false
+			}
+			val, ok := p[2].(S)
+			if !ok || !isJSONLiteralNode(val) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// validateEnumsJSONOnly walks a type AST and ensures any ("enum", ...)
+// contains only JSON-style literals. It returns an empty string if OK,
+// otherwise a short human message.
+func validateEnumsJSONOnly(t S) string {
+	if len(t) == 0 {
+		return ""
+	}
+	switch t[0].(string) {
+	case "annot":
+		if len(t) >= 3 {
+			if sub, ok := t[2].(S); ok {
+				return validateEnumsJSONOnly(sub)
+			}
+		}
+		return ""
+	case "enum":
+		for i := 1; i < len(t); i++ {
+			member, ok := t[i].(S)
+			if !ok || !isJSONLiteralNode(member) {
+				return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
+			}
+		}
+		return ""
+	case "unop", "binop", "array", "map", "get", "id", "alias", "type", "module":
+		for i := 1; i < len(t); i++ {
+			if sub, ok := t[i].(S); ok {
+				if msg := validateEnumsJSONOnly(sub); msg != "" {
+					return msg
+				}
+			}
+		}
+		return ""
+	default:
+		return ""
+	}
+}
 === END FILE: types.go ===
 

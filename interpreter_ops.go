@@ -72,27 +72,25 @@ func (o *opsImpl) initCore() {
 		ip.RegisterNative(name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
 	}
 
-	// __assign_set(target: Type, value: Any) -> Any
+	// __assign_set(targetAst: Any, value: Any) -> Any
 	reg("__assign_set",
-		[]ParamSpec{{"target", S{"id", "Type"}}, {"value", S{"id", "Any"}}},
+		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			t := ctx.MustArg("target")
+			ast := expectAST(ctx.MustArg("targetAst"), "__assign_set")
 			v := ctx.MustArg("value")
-			tv := t.Data.(*TypeValue)
-			ip.assignTo(tv.Ast, v, ctx.Env())
+			ip.assignTo(ast, v, ctx.Env())
 			return v
 		})
 
-	// __assign_def(target: Type, value: Any) -> Any
+	// __assign_def(targetAst: Any, value: Any) -> Any
 	reg("__assign_def",
-		[]ParamSpec{{"target", S{"id", "Type"}}, {"value", S{"id", "Any"}}},
+		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			t := ctx.MustArg("target")
+			ast := expectAST(ctx.MustArg("targetAst"), "__assign_def")
 			v := ctx.MustArg("value")
-			tv := t.Data.(*TypeValue)
-			ip.assignTo(tv.Ast, v, ctx.Env(), true)
+			ip.assignTo(ast, v, ctx.Env(), true)
 			return v
 		})
 
@@ -183,7 +181,7 @@ func (o *opsImpl) initCore() {
 			}
 			if msg := validateTypeShape(s); msg != "" {
 				fmt.Print("[DBG __type_from_ast] " + FormatSExpr(s) + "\n")
-				//				return errNull("__type_from_ast: " + msg)
+				//return errNull("__type_from_ast: " + msg)
 			}
 			return TypeValIn(s, ctx.Env())
 		})
@@ -253,13 +251,13 @@ func (o *opsImpl) initCore() {
 			}
 		})
 
-	// __make_fun(params:[Str], types:[Type], ret:Type, body:Type, isOracle:Bool, examples:Any) -> Fun
+	// __make_fun(params:[Str], types:[Type], ret:Type, bodyAst:Any, isOracle:Bool, examples:Any, basePath:[Int]) -> Fun
 	ip.RegisterNative("__make_fun",
 		[]ParamSpec{
 			{"params", S{"array", S{"id", "Str"}}},
 			{"types", S{"array", S{"id", "Type"}}},
 			{"ret", S{"id", "Type"}},
-			{"body", S{"id", "Type"}},
+			{"bodyAst", S{"id", "Any"}},
 			{"isOracle", S{"id", "Bool"}},
 			{"examples", S{"id", "Any"}},
 			{"basePath", S{"array", S{"id", "Int"}}},
@@ -269,7 +267,7 @@ func (o *opsImpl) initCore() {
 			namesV := ctx.MustArg("params").Data.(*ArrayObject).Elems
 			typesV := ctx.MustArg("types").Data.(*ArrayObject).Elems
 			retTV := ctx.MustArg("ret").Data.(*TypeValue)
-			bodyTV := ctx.MustArg("body").Data.(*TypeValue)
+			bodyAny := ctx.MustArg("bodyAst")
 			isOr := ctx.MustArg("isOracle").Data.(bool)
 			exAny := ctx.MustArg("examples")
 			baseAny := ctx.MustArg("basePath")
@@ -337,6 +335,9 @@ func (o *opsImpl) initCore() {
 				sr = &cpy
 			}
 
+			// Unbox function BODY from AST handle ----
+			bodyAst := expectAST(bodyAny, "__make_fun")
+
 			// Build closure env that carries hidden signature metadata
 			closure := NewEnv(ctx.Env())
 			nameVals := make([]Value, len(names))
@@ -355,7 +356,7 @@ func (o *opsImpl) initCore() {
 				Params:     names,
 				ParamTypes: types,
 				ReturnType: retAst,
-				Body:       bodyTV.Ast,
+				Body:       bodyAst,
 				Env:        closure, // <-- use the closure with hidden signature
 				HiddenNull: hidden,
 				IsOracle:   isOr,
@@ -897,6 +898,23 @@ func joinCyclePath(stack []string, again string) string {
 	return strings.Join(out, " -> ")
 }
 
+// expectAST extracts an S-expression from a VTHandle("ast", ...).
+// Fails with a friendly runtime error instead of panicking on bad inputs.
+func expectAST(v Value, where string) S {
+	if v.Tag != VTHandle {
+		fail(where + ": body must be an AST handle")
+	}
+	hd, _ := v.Data.(*Handle)
+	if hd == nil || hd.Kind != "ast" {
+		fail(where + ": body must be an AST handle")
+	}
+	s, ok := hd.Data.(S)
+	if !ok {
+		fail(where + ": AST payload corrupt")
+	}
+	return s
+}
+
 // nativeMakeModule is the implementation of the __make_module primitive.
 //
 // UNIFORM CACHING & CYCLE DETECTION LIVE HERE.
@@ -923,9 +941,6 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 
 	if nameV.Tag != VTStr {
 		fail("module name must be a string")
-	}
-	if bodyV.Tag != VTType {
-		fail("internal error: module body must be a Type")
 	}
 	canon := nameV.Data.(string)
 
@@ -972,8 +987,7 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	}()
 
 	// ---- Decode body AST and base path ----
-	tv := bodyV.Data.(*TypeValue)
-	bodyAst := tv.Ast
+	bodyAst := expectAST(bodyV, "__make_module")
 
 	// Decode absolute base path from [Int]
 	var base NodePath

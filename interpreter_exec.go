@@ -637,10 +637,8 @@ func (e *emitter) addContJump(at int) {
 // helpers for loops/blocks persisting "last" value
 func (e *emitter) preloadAssignToLast(lastName string) {
 	e.emit(opLoadGlobal, e.ks("__assign_set"))
-	// Build Type("id", lastName) at instantiation time with the current env.
-	e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-	e.emit(opConst, e.k(HandleVal("type-ast", S{"id", lastName})))
-	e.emit(opCall, 1)
+	// Preload the lvalue (("decl", lastName)) as AST handle. No call yet.
+	e.emit(opConst, e.k(HandleVal("ast", S{"decl", lastName})))
 }
 
 func (e *emitter) saveLastAndJumpHead(head int) {
@@ -672,6 +670,16 @@ func (e *emitter) callBuiltin(name string, args ...S) {
 	e.emit(opCall, uint32(len(args)))
 }
 
+// callBuiltinV calls a Core builtin with constant Value arguments.
+// Use this only when *all* arguments are constants you can encode now.
+func (e *emitter) callBuiltinV(name string, args ...Value) {
+	e.emit(opLoadGlobal, e.ks(name))
+	for _, v := range args {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opCall, uint32(len(args)))
+}
+
 func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S, basePath NodePath) {
 	namesArr := make([]Value, 0, max(0, len(params)-1))
 	for i := 1; i < len(params); i++ {
@@ -699,9 +707,9 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 	}
 	e.emit(opMakeArr, uint32(typeCount))
 
-	// Return and body types (env-pinned)
+	// Return type (env-pinned) and BODY as AST handle
 	e.emitExpr(S{"type", retT})
-	e.emitExpr(S{"type", bodyCarrier})
+	e.emit(opConst, e.k(HandleVal("ast", bodyCarrier)))
 
 	e.emit(opConst, e.k(Bool(isOracle)))
 	e.emitExpr(examples)
@@ -889,16 +897,14 @@ func (e *emitter) emitExpr(n S) {
 			opName = "__assign_def"
 		}
 		e.emit(opLoadGlobal, e.ks(opName))
-		// Build the LHS type at runtime (pinned).
-		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-		e.emit(opConst, e.k(HandleVal("type-ast", lhs)))
-		e.emit(opCall, 1)
+		// LHS as a pure AST handle.
+		e.emit(opConst, e.k(HandleVal("ast", lhs)))
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
 		e.callWithMarkChild(2, 0)
 
 	case "decl":
-		e.callBuiltin("__assign_def", S{"type", n}, S{"null"})
+		e.callBuiltinV("__assign_def", HandleVal("ast", n), Null)
 
 	// ----- arrays / maps -----
 	case "array":
@@ -1018,7 +1024,11 @@ func (e *emitter) emitExpr(n S) {
 		body := n[2].(S)
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
-		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		// Declare $last_* using an AST handle (no type building here).
+		e.callBuiltinV("__assign_def",
+			HandleVal("ast", S{"decl", lastName}),
+			Null,
+		)
 		e.emit(opPop, 0)
 
 		head := e.here()
@@ -1056,32 +1066,32 @@ func (e *emitter) emitExpr(n S) {
 		body := n[3].(S)
 
 		iterName := fmt.Sprintf("$iter_%d", e.here())
+		// Declare the hidden iterator binding with an AST handle (not a Type).
+		// We'll initialize it immediately with __to_iter(iterExpr) below.
 		e.emit(opLoadGlobal, e.ks("__assign_def"))
-		e.emitExpr(S{"type", S{"decl", iterName}})
+		e.emit(opConst, e.k(HandleVal("ast", S{"decl", iterName})))
 
 		// __to_iter(iterExpr); mark the iterExpr (child #1) at this call site.
 		e.emit(opLoadGlobal, e.ks("__to_iter"))
 		e.withChild(1, func() { e.emitExpr(iterExpr) })
 		e.callWithMarkChild(1, 1) // __to_iter(iterExpr)
-		e.emit(opCall, 2)         // assign_def(TypeDecl, iterator)
+		e.emit(opCall, 2)         // assign_def(<AST decl>, iterator)
 		e.emit(opPop, 0)
 
 		tmpName := fmt.Sprintf("$tmp_%d", e.here())
-		e.callBuiltin("__assign_def", S{"type", S{"decl", tmpName}}, S{"null"})
+		e.callBuiltinV("__assign_def", HandleVal("ast", S{"decl", tmpName}), Null)
 		e.emit(opPop, 0)
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
-		e.callBuiltin("__assign_def", S{"type", S{"decl", lastName}}, S{"null"})
+		e.callBuiltinV("__assign_def", HandleVal("ast", S{"decl", lastName}), Null)
 		e.emit(opPop, 0)
 
 		head := e.here()
 
 		// tmp = iter(Null)
 		e.emit(opLoadGlobal, e.ks("__assign_set"))
-		// Type(tmpName) pinned at runtime
-		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-		e.emit(opConst, e.k(HandleVal("type-ast", S{"id", tmpName})))
-		e.emit(opCall, 1)
+		// lvalue as AST handle
+		e.emit(opConst, e.k(HandleVal("ast", S{"decl", tmpName})))
 		e.emit(opLoadGlobal, e.ks(iterName))
 		e.emit(opConst, e.k(Null))
 		e.emit(opCall, 1) // iter(Null)
@@ -1107,7 +1117,10 @@ func (e *emitter) emitExpr(n S) {
 		case "decl", "darr", "dobj", "annot":
 			assignName = "__assign_def"
 		}
-		e.callBuiltin(assignName, S{"type", target}, S{"id", tmpName})
+		e.emit(opLoadGlobal, e.ks(assignName))
+		e.emit(opConst, e.k(HandleVal("ast", target)))
+		e.emit(opLoadGlobal, e.ks(tmpName))
+		e.emit(opCall, 2)
 		e.emit(opPop, 0)
 
 		e.pushLoopCtx()
@@ -1139,13 +1152,11 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opCall, 1)
 
 	case "module":
-		// Lower to: __make_module(nameExpr, Type(bodyAst), basePathArray)
+		// Lower to: __make_module(nameExpr, <AST handle>, basePathArray)
 		e.emit(opLoadGlobal, e.ks("__make_module"))
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		// Build a pinned Type from the module body AST.
-		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-		e.emit(opConst, e.k(HandleVal("type-ast", n[2].(S))))
-		e.emit(opCall, 1)
+		// Pass the module body as a pure AST handle (no env pinning).
+		e.emit(opConst, e.k(HandleVal("ast", n[2].(S))))
 		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, body) → body at child #1
 		for _, idx := range absBase {
 			e.emit(opConst, e.k(Int(int64(idx))))
@@ -1172,10 +1183,8 @@ func (e *emitter) emitExpr(n S) {
 				opName = "__assign_def"
 			}
 			e.emit(opLoadGlobal, e.ks(opName))
-			// Type(lhs), pinned
-			e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-			e.emit(opConst, e.k(HandleVal("type-ast", lhs)))
-			e.emit(opCall, 1)
+			// LHS as AST handle
+			e.emit(opConst, e.k(HandleVal("ast", lhs)))
 			e.emit(opLoadGlobal, e.ks("__annotate"))
 			e.emit(opConst, e.k(Str(text)))
 			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
@@ -1196,10 +1205,8 @@ func (e *emitter) emitExpr(n S) {
 					opName = "__assign_def"
 				}
 				e.emit(opLoadGlobal, e.ks(opName))
-				// Type(subj), pinned
-				e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-				e.emit(opConst, e.k(HandleVal("type-ast", subj)))
-				e.emit(opCall, 1)
+				// Subject as AST handle
+				e.emit(opConst, e.k(HandleVal("ast", subj)))
 				e.emit(opLoadGlobal, e.ks("__annotate"))
 				e.emit(opConst, e.k(Str(text)))
 				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS

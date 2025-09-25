@@ -44,7 +44,7 @@ end
 let _mustRead = fun(path: Str) -> Str do
 	let s = readFile(path)
 	if s == null then
-		fail(sprintf("mustRead failed: %s", [path]))
+		panic(sprintf("mustRead failed: %s", [path]))
 	end
 	s
 end

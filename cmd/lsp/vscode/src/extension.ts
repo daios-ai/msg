@@ -5,7 +5,7 @@ import * as path from 'path';
 let client: LanguageClient | undefined;
 
 function serverExecutablePath(ctx: vscode.ExtensionContext): string {
-  const exe = process.platform === 'win32' ? 'mindscript-lsp.exe' : 'mindscript-lsp';
+  const exe = process.platform === 'win32' ? 'msg-lsp.exe' : 'msg-lsp';
   // server/ sits at the extension root (same level as package.json)
   const uri = vscode.Uri.joinPath(ctx.extensionUri, 'server', exe);
   return uri.fsPath;
@@ -22,10 +22,10 @@ export async function activate(context: vscode.ExtensionContext) {
   };
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: 'file', language: 'mindscript' }, { scheme: 'untitled', language: 'mindscript' }]
+    documentSelector: [{ scheme: 'file', language: 'MindScript' }, { scheme: 'untitled', language: 'MindScript' }]
   };
 
-  client = new LanguageClient('mindscript', 'MindScript Language Server', executable, clientOptions);
+  client = new LanguageClient('MindScript', 'MindScript Language Server', executable, clientOptions);
   client.outputChannel.show(true); // surface logs
   await client.start();
 }

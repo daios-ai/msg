@@ -33,7 +33,7 @@
         "mindscript.serverPath": {
           "type": "string",
           "description": "Path to the MindScript LSP server binary",
-          "default": "mindscript-lsp"
+          "default": "server/msg-lsp"
         }
       }
     }

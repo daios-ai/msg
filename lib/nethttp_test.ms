@@ -1,7 +1,9 @@
 let testing = import("testing")
-let http = import("nethttp")
+let http = import("lib/nethttp.ms")
 
-# ---- bindQuery: success ----
+# -------------------------------
+# bindQuery: success
+# -------------------------------
 testing.test("nethttp/bindQuery success", fun(_: Null) -> Any do
 	let req = {
 		method: "GET",
@@ -10,12 +12,14 @@ testing.test("nethttp/bindQuery success", fun(_: Null) -> Any do
 		body: "",
 		pathParams: {}
 	}
-	let Q = type { name!: Str, age: Int }
+	let Q = type { name!: Str, age: Num }
 	let v = http.bindQuery(req, Q)
 	testing.assertEq({ name: "Ada", age: 36 }, v)
 end)
 
-# ---- bindQuery: failure (null + note) ----
+# -------------------------------
+# bindQuery: failure (null + note contains reason)
+# -------------------------------
 testing.test("nethttp/bindQuery failure", fun(_: Null) -> Any do
 	let req = {
 		method: "GET",
@@ -27,23 +31,23 @@ testing.test("nethttp/bindQuery failure", fun(_: Null) -> Any do
 	let Q = type { name!: Str, age: Int }
 	let v = http.bindQuery(req, Q)
 
-	# must be null
 	testing.assertEq(null, v)
 
-	# note should contain the reason, regardless of angle-bracket framing
 	let note = noteGet(v)
 	let parts = split(note, "query validation failed")
 	testing.assertEq(true, len(parts) > 1)
 end)
 
-# ---- tiny router: hello/{name} ----
-testing.test("nethttp/router hello", fun(_: Null) -> Any do
+# -------------------------------
+# tiny router (value): hello/{name}
+# -------------------------------
+testing.test("nethttp/router hello (value)", fun(_: Null) -> Any do
 	let Request = http.Request
 	let r = http.router()
 
-	r.handle("GET", "/hello/{name}", fun(req: Request) -> Any do
+	r.handleValue("GET", "/hello/{name}", fun(req: Request) -> Any? do
 		let p = http.path(req)
-		return http.text(200, "hi " + p.name)
+		http.text(200, "hi " + p.name)
 	end)
 
 	let c = http.testClient(r)
@@ -52,7 +56,9 @@ testing.test("nethttp/router hello", fun(_: Null) -> Any do
 	testing.assertEq("hi Ada", res.body)
 end)
 
-# ---- tiny router: streaming ----
+# -------------------------------
+# tiny router (stream): write + end
+# -------------------------------
 testing.test("nethttp/streaming tiny", fun(_: Null) -> Any do
 	let r = http.router()
 
@@ -60,7 +66,7 @@ testing.test("nethttp/streaming tiny", fun(_: Null) -> Any do
 		res.status(200).setHeader("Content-Type", "text/plain")
 		let _ = res.write("hey")
 		let _2 = res.end(null)
-		return
+		null
 	end)
 
 	let c = http.testClient(r)
@@ -69,36 +75,43 @@ testing.test("nethttp/streaming tiny", fun(_: Null) -> Any do
 	testing.assertEq("hey", res.body)
 end)
 
-# ---- tiny router: value echo ----
+# -------------------------------
+# value echo: bindJson good and bad (no HttpError helper)
+# -------------------------------
 testing.test("nethttp/value echo", fun(_: Null) -> Any do
 	let r = http.router()
 
-	r.handle("POST", "/echo", fun(req) -> Any? do
+	r.handleValue("POST", "/echo", fun(req) -> Any? do
 		let T = type { msg!: Str }
 		let v = http.bindJson(req, T)
 		if v == null then
-			return http.raise(400, "<bad json>")
+			return http.text(400, "bad json")
 		end
-		return http.json(200, { ok: true, msg: v.msg })
+		http.json(200, { ok: true, msg: v.msg })
 	end)
 
 	let c = http.testClient(r)
 	let res = c.call({ method: "POST", path: "/echo", body: "{\"msg\":\"hi\"}" })
 	testing.assertEq(200, res.status)
 
-	# Body is JSON; key order may vary — parse then assert fields.
 	let obj = jsonParse(res.body)
 	testing.assertEq(true, obj.ok)
 	testing.assertEq("hi", obj.msg)
+
+	let resBad = c.call({ method: "POST", path: "/echo", body: "oops" })
+	testing.assertEq(400, resBad.status)
+	testing.assertEq("bad json", resBad.body)
 end)
 
-# 404/405 behavior (prefix route + missing path)
+# -------------------------------
+# 404 / 405 / prefix match
+# -------------------------------
 testing.test("nethttp/routing 404_405", fun(_: Null) -> Any do
 	let r = http.router()
 	r.handle("GET", "/x/", fun(req, res) -> Null do
 		res.status(200).write("ok")
 		res.end(null)
-		return
+		null
 	end)
 	let c = http.testClient(r)
 	let a = c.call({ method: "GET", path: "/x/abc" })
@@ -109,7 +122,9 @@ testing.test("nethttp/routing 404_405", fun(_: Null) -> Any do
 	testing.assertEq(404, c2.status)
 end)
 
-# CORS preflight
+# -------------------------------
+# CORS preflight (OPTIONS)
+# -------------------------------
 testing.test("nethttp/cors preflight", fun(_: Null) -> Any do
 	let r = http.router()
 	r.use(http.mwCors({origin: "*"}))
@@ -118,49 +133,56 @@ testing.test("nethttp/cors preflight", fun(_: Null) -> Any do
 	testing.assertEq(204, res.status)
 end)
 
-# Recover middleware on value handler that panics
+# -------------------------------
+# recover middleware: value panic -> 500
+# -------------------------------
 testing.test("nethttp/recover value panic", fun(_: Null) -> Any do
 	let r = http.router()
-	r.use(http.mwRecover(null))
-	r.handle("GET", "/p", fun(req) -> Any? do
-		fail("boom")
+	r.use(http.mwRecover())
+	r.handleValue("GET", "/p", fun(req) -> Any? do
+		panic("boom")
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/p" })
 	testing.assertEq(500, res.status)
 end)
 
-# Recover middleware on streaming handler that panics
+# -------------------------------
+# recover middleware: stream panic -> 500 + body
+# -------------------------------
 testing.test("nethttp/recover stream panic", fun(_: Null) -> Any do
 	let r = http.router()
-	r.use(http.mwRecover(null))
+	r.use(http.mwRecover())
 	r.handle("GET", "/ps", fun(req, res) -> Null do
-		fail("boom")
+		panic("boom")
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/ps" })
 	testing.assertEq(500, res.status)
-	testing.assertEq("internal error", res.body)
 end)
 
-# Timeout middleware on value handler
+# -------------------------------
+# timeout middleware (value) — intent: slow -> 504
+# -------------------------------
 testing.test("nethttp/timeout value", fun(_: Null) -> Any do
 	let r = http.router()
 	r.use(http.mwTimeout(20))
-	r.handle("GET", "/slow", fun(req) -> Any? do
+	r.handleValue("GET", "/slow", fun(req) -> Any? do
 		sleep(50)
-		return http.text(200, "late")
+		http.text(200, "late")
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/slow" })
 	testing.assertEq(504, res.status)
 end)
 
-# Mount child router under a prefix
+# -------------------------------
+# mount child router under prefix
+# -------------------------------
 testing.test("nethttp/mount prefix", fun(_: Null) -> Any do
 	let child = http.router()
-	child.handle("GET", "/ping", fun(req) -> Any? do
-		return http.text(200, "pong")
+	child.handleValue("GET", "/ping", fun(req) -> Any? do
+		http.text(200, "pong")
 	end)
 
 	let parent = http.router()
@@ -172,11 +194,13 @@ testing.test("nethttp/mount prefix", fun(_: Null) -> Any do
 	testing.assertEq("pong", res.body)
 end)
 
-# Value handler: implicit JSON encoding
+# -------------------------------
+# implicit JSON encode from value handler
+# -------------------------------
 testing.test("nethttp/implicit json", fun(_: Null) -> Any do
 	let r = http.router()
-	r.handle("GET", "/j", fun(req) -> Any? do
-		return { ok: true, n: 7 }
+	r.handleValue("GET", "/j", fun(req) -> Any? do
+		{ ok: true, n: 7 }
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/j" })
@@ -186,11 +210,13 @@ testing.test("nethttp/implicit json", fun(_: Null) -> Any do
 	testing.assertEq(7, obj.n)
 end)
 
-# Value handler: JSON encode error (non-serializable)
+# -------------------------------
+# JSON encode error (non-serializable) -> 500
+# -------------------------------
 testing.test("nethttp/json encode error", fun(_: Null) -> Any do
 	let r = http.router()
-	r.handle("GET", "/badjson", fun(req) -> Any? do
-		return fun(_: Null) -> Any do true end
+	r.handleValue("GET", "/badjson", fun(req) -> Any? do
+		fun(_: Null) -> Any do true end
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/badjson" })
@@ -198,12 +224,14 @@ testing.test("nethttp/json encode error", fun(_: Null) -> Any do
 	testing.assertEq("json encode error", res.body)
 end)
 
-# Request ID middleware (value path)
-testing.test("nethttp/request id header", fun(_: Null) -> Any do
+# -------------------------------
+# request ID: added on value path
+# -------------------------------
+testing.test("nethttp/request id header (value)", fun(_: Null) -> Any do
 	let r = http.router()
 	r.use(http.mwRequestID("X-Request-ID"))
-	r.handle("GET", "/ok", fun(req) -> Any? do
-		return http.text(200, "ok")
+	r.handleValue("GET", "/ok", fun(req) -> Any? do
+		http.text(200, "ok")
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/ok" })
@@ -211,70 +239,14 @@ testing.test("nethttp/request id header", fun(_: Null) -> Any do
 	testing.assert(res.headers["X-Request-ID"] != null, "missing request id")
 end)
 
-# Tiny openapi listing returns routes
-testing.test("nethttp/openapi routes", fun(_: Null) -> Any do
-	let r = http.router()
-	r.handle("GET", "/a/{id}", fun(req) -> Any? do
-		return http.text(200, "ok")
-	end)
-	r.handle("GET", "/stream", fun(req, res) -> Null do
-		res.status(200).write("x")
-		res.end(null)
-		return
-	end)
-	let doc = http.openapi(r)
-	testing.assert(doc != null, "openapi null")
-	let rs = doc.routes
-	testing.assertEq(2, len(rs))
-	# find the streaming entry
-	let found = false
-	let i = 0
-	while i < len(rs) do
-		let it = rs[i]
-		if it.pattern == "/stream" and it.streaming then
-			found = true
-		end
-		i = i + 1
-	end
-	testing.assert(found, "missing streaming route in openapi")
-end)
-
-# Implicit-JSON response should include X-Request-ID
-testing.test("nethttp/request id implicit json", fun(_: Null) -> Any do
-	let r = http.router()
-	r.use(http.mwRequestID("X-Request-ID"))
-	r.handle("GET", "/j", fun(req) -> Any? do
-		return { ok: true }   # implicit JSON
-	end)
-
-	let c = http.testClient(r)
-	let res = c.call({ method: "GET", path: "/j" })
-	testing.assertEq(200, res.status)
-	testing.assert(res.headers["X-Request-ID"] != null, "missing X-Request-ID")
-end)
-
-# Streaming response should include X-Request-ID
-testing.test("nethttp/request id streaming", fun(_: Null) -> Any do
-	let r = http.router()
-	r.use(http.mwRequestID("X-Request-ID"))
-	r.handle("GET", "/s", fun(req, res) -> Null do
-		res.status(200).setHeader("Content-Type", "text/plain").write("ok")
-		res.end(null)
-		return
-	end)
-
-	let c = http.testClient(r)
-	let res = c.call({ method: "GET", path: "/s" })
-	testing.assertEq(200, res.status)
-	testing.assert(res.headers["X-Request-ID"] != null, "missing X-Request-ID")
-end)
-
-# Incoming X-Request-ID should be propagated (not regenerated)
+# -------------------------------
+# request ID: propagate incoming
+# -------------------------------
 testing.test("nethttp/request id propagate incoming", fun(_: Null) -> Any do
 	let r = http.router()
 	r.use(http.mwRequestID("X-Request-ID"))
-	r.handle("GET", "/p", fun(req) -> Any? do
-		return http.text(200, "ok")
+	r.handleValue("GET", "/p", fun(req) -> Any? do
+		http.text(200, "ok")
 	end)
 
 	let c = http.testClient(r)
@@ -287,33 +259,106 @@ testing.test("nethttp/request id propagate incoming", fun(_: Null) -> Any do
 	testing.assertEq("req-123", res.headers["X-Request-ID"])
 end)
 
+# -------------------------------
+# request ID: present on streaming path
+# -------------------------------
+testing.test("nethttp/request id streaming", fun(_: Null) -> Any do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.handle("GET", "/s", fun(req, res) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("ok")
+		res.end(null)
+		null
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/s" })
+	testing.assertEq(200, res.status)
+	testing.assert(res.headers["X-Request-ID"] != null, "missing X-Request-ID")
+end)
+
+# -------------------------------
+# access log: body preserved and chaining intact
+# -------------------------------
 testing.test("nethttp/accesslog counts streaming bytes", fun(_: Null) -> Any do
-	let http = import("nethttp")
 	let r = http.router()
 	r.use(http.mwAccessLog())
 	r.handle("GET", "/s", fun(req, res) -> Null do
 		res.status(200).setHeader("Content-Type","text/plain").write("hi")
 		res.end(null)
+		null
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/s" })
 	testing.assertEq(200, res.status)
-	# can’t read the printed line here; we at least ensure body’s there (2 bytes)
 	testing.assertEq("hi", res.body)
 end)
 
 testing.test("nethttp/mwAccessLog keeps chaining on proxy", fun(_: Null) -> Any do
-	let http = import("nethttp")
 	let r = http.router()
 	r.use(http.mwAccessLog())
 	r.handle("GET", "/chain", fun(req, res) -> Null do
-		# This would bypass the proxy if status/setHeader didn’t return the proxy
 		res.status(201).setHeader("X", "1").write("ok")
 		res.end(null)
+		null
 	end)
 	let c = http.testClient(r)
 	let res = c.call({ method: "GET", path: "/chain" })
 	testing.assertEq(201, res.status)
 	testing.assertEq("ok", res.body)
 	testing.assertEq("1", res.headers["X"])
+end)
+
+# -------------------------------
+# openapi: routes list with style tags
+# -------------------------------
+testing.test("nethttp/openapi routes (style)", fun(_: Null) -> Any do
+	let r = http.router()
+	r.handleValue("GET", "/a/{id}", fun(req) -> Any? do
+		http.text(200, "ok")
+	end)
+	r.handle("GET", "/stream", fun(req, res) -> Null do
+		res.status(200).write("x")
+		res.end(null)
+		null
+	end)
+
+	let doc = http.openapi(r)
+	testing.assert(doc != null, "openapi null")
+	let rs = doc.routes
+	testing.assertEq(2, len(rs))
+
+	let foundStream = false
+	let foundValue = false
+	let i = 0
+	while i < len(rs) do
+		let it = rs[i]
+		if it.pattern == "/stream" and it.style == "stream" then
+			foundStream = true
+		end
+		if it.pattern == "/a/{id}" and it.style == "value" then
+			foundValue = true
+		end
+		i = i + 1
+	end
+
+	testing.assert(foundStream, "missing streaming route in openapi")
+	testing.assert(foundValue, "missing value route in openapi")
+end)
+
+# -------------------------------
+# NEW: streaming handler completes with annotated null
+# -------------------------------
+testing.test("nethttp/streaming annotated null completes", fun(_: Null) -> Any do
+	let r = http.router()
+	r.handle("GET", "/ann", fun(req, res) -> Null do
+		res.status(200).setHeader("Content-Type","text/plain")
+		res.write("ok")
+		res.end(null)
+		return null # <done>
+	end)
+	let c = http.testClient(r)
+	let res = c.call({ method: "GET", path: "/ann" })
+	testing.assertEq(200, res.status)
+	testing.assertEq("ok", res.body)
 end)

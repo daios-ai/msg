@@ -10,7 +10,7 @@
 # # 2) Errors
 # #	Soft errors: use nullable returns (T?); return `null  # <reason>`.
 # #	Any? = Any → do NOT use Any for maybes; pick a concrete T.
-# #	Hard errors: `fail(msg)` only for invariants/programmer bugs or unrecoverable state.
+# #	Hard errors: `panic(msg)` only for invariants/programmer bugs or unrecoverable state.
 # #	Catch hard errors with `try`; prefer soft errors for expected conditions.
 # #	Caller check idiom:
 # #	```
@@ -59,7 +59,7 @@ let assert = fun(cond: Bool) -> Bool do
 	if cond then
 		true
 	else
-		fail("assertion failed")
+		panic("assertion failed")
 	end
 end
 
@@ -180,7 +180,7 @@ let iter = fun(v) -> Null -> Any? do
 	elif isType(v, type Null -> Any?) then
 		v
 	else
-		fail("iter: expected array, map, or iterator")
+		panic("iter: expected array, map, or iterator")
 	end
 end
 

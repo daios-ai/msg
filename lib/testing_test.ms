@@ -59,7 +59,7 @@ end)
 
 T.test("testing/assertThrows/catches-fail", fun(_: Null) do
 	T.assertThrows(fun(_: Null) do
-		fail("boom")
+		panic("boom")
 	end, "boom")
 end)
 
@@ -80,7 +80,7 @@ end)
 T.test("testing/assertThrows/substring-mismatch", fun(_: Null) do
 	T.assertThrows(fun(_: Null) do
 		T.assertThrows(fun(_: Null) do
-			fail("actual message")
+			panic("actual message")
 		end, "different substring")
 	end, "did not contain substring")
 end)
@@ -205,7 +205,7 @@ end)
 
 T.test("testing/assertThrows/empty-substring-ok", fun(_: Null) do
 	T.assertThrows(fun(_: Null) do
-		fail("some failure message")
+		panic("some failure message")
 	end, "")
 end)
 

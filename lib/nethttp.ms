@@ -25,7 +25,7 @@ let Responder = type {
 	setHeader: Str -> Str -> Responder,
 	write: Str -> Responder,
 	flush: Null -> Responder,
-	end: Null -> Responder
+	end: Null -> Null
 }
 
 # Internal accumulator for test client / server writer
@@ -82,7 +82,7 @@ end
 let _json = fun(v) -> Str? do
 	let s = jsonStringify(v)
 	if s != null then return s end
-	return null # <json stringify failed>
+	return null # json stringify failed
 end
 
 # =========================
@@ -107,17 +107,17 @@ let bindJson = fun(req: Request, T: Type) -> Any? do
 	else
 		let s = readAll(req.body)
 		if s == null then 
-			return null # <read body failed> 
+			return null # read body failed
 		end
 		s
 	end
 
 	let v = jsonParse(raw)
 	if v == null then
-		return null # <invalid json>
+		return null # invalid json
 	end
 	if not isType(v, T) then
-		return null # <validation failed>
+		return null # validation failed
 	end
 	v
 end
@@ -134,12 +134,12 @@ let bindQuery = fun(req: Request, T: Type) -> Any? do
 	let out = {}
 	for [k, vs] in qm do
 		if vs == null or len(vs) == 0 then continue end
-		let s = vs[len(vs) - 1]
+		let s = vs[-1]
 		let parsed = try(fun(_: Null) do jsonParse(s) end)
 		if parsed.ok then out[k] = parsed.value else out[k] = s end
 	end
 	if isType(out, T) then return out end
-	return null # <query validation failed>
+	return null # query validation failed
 end
 
 let path = fun(req: Request) -> {} do
@@ -195,8 +195,8 @@ let _newResponder = fun() -> { res: _Response, api: Responder } do
 	api.flush = fun(_: Null) -> Responder do 
 		api 
 	end
-	api.end = fun(_: Null) -> Responder do 
-		api 
+	api.end = fun(_: Null) -> Null do 
+		null
 	end
 
 	{ res: state, api: api }
@@ -210,7 +210,7 @@ let value = fun(fn: Request -> Any?) -> _StreamFn do
 	return fun(req: Request, res: Responder) -> Null do
 		let r = try(fun(_: Null) do fn(req) end)
 		if not r.ok then
-			res.status(500).setHeader("Content-Type","text/plain").write("internal error").end(null)
+			res.status(500).setHeader("Content-Type","text/plain").write("internal server error").end(null)
 			return null
 		end
 		let out = r.value
@@ -348,7 +348,7 @@ let router = fun(_: Null) -> {} do
 
 		let r = try(fun(_: Null) do call(rq, pack.api) end)
 		if not r.ok then
-			return { status: 500, headers: {"Content-Type":"text/plain"}, body: "internal error" }
+			return { status: 500, headers: {"Content-Type":"text/plain"}, body: "internal server error" }
 		end
 		{ status: pack.res.status, headers: pack.res.headers, body: pack.res.body }
 	end
@@ -372,7 +372,7 @@ let router = fun(_: Null) -> {} do
 		# Mount child router under a prefix
 		mount: fun(prefix: Str, child) -> Bool do
 			if not (mapHas(child, "__kind") and child.__kind == "nethttp.router") then
-				fail("mount: child must be a Router")
+				panic("mount: child must be a Router")
 			end
 			let dump = child._dump()
 			let pre = if _hasPrefix(prefix, "/") then prefix else "/" + prefix end
@@ -442,7 +442,7 @@ let mwRecover = fun(_: Null) -> _Mw do
 			let r = try(fun(_: Null) do next(req, res) end)
 			if not r.ok then
 				printf("panic: %s\n", [r.error])
-				res.status(500).setHeader("Content-Type", "text/plain").write("internal error").end(null)
+				res.status(500).setHeader("Content-Type", "text/plain").write("internal server error").end(null)
 			end
 			null
 		end
@@ -539,9 +539,9 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 				let _ = orig.flush(null)
 				proxy
 			end
-			proxy.end = fun(_: Null) -> Responder do
+			proxy.end = fun(_: Null) -> Null do
 				let _ = orig.end(null)
-				proxy
+				null
 			end
 
 			next(req, proxy)
@@ -573,10 +573,10 @@ let _ServerHandle = type {
 
 let serve = fun(listener, r, opts: {}) -> {}? do
 	if listener == null then
-		return null # <serve: missing listener>
+		return null # serve: missing listener
 	end
 	if not (mapHas(r, "_entryCall")) then
-		return null # <serve: not a router>
+		return null # serve: not a router
 	end
 
 	# Defaults
@@ -827,7 +827,7 @@ end
 
 let openapi = fun(r) -> {}? do
 	if not (mapHas(r, "_dump")) then
-		return null # <not a router>
+		return null # not a router
 	end
 	let dump = r._dump()
 	let rs = []

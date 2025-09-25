@@ -89,12 +89,12 @@ end
 # Register a test (name must be unique). Tests are (Null)->Any.
 let test = fun(name: Str, fn) -> Bool do
 	if not isType(fn, type Null -> Any) then
-		fail(sprintf("test(%s): second argument must be a function of type (Null)->Any", [
+		panic(sprintf("test(%s): second argument must be a function of type (Null)->Any", [
 			_repr(name)
 		]))
 	end
 	if mapHas(_tests, name) then
-		fail(sprintf("duplicate test name: %s", [_repr(name)]))
+		panic(sprintf("duplicate test name: %s", [_repr(name)]))
 	end
 	_tests[name] = fn
 	return true
@@ -121,9 +121,9 @@ end
 let assert = fun(ok: Bool, msg: Str?) -> Bool do
 	if not ok then
 		if msg == null then
-			fail("assertion failed")
+			panic("assertion failed")
 		end
-		fail(msg)
+		panic(msg)
 	end
 	return true
 end
@@ -133,7 +133,7 @@ let assertEq = fun(want, got) -> Bool do
 	if want == got then
 		return true
 	end
-	fail(sprintf("not equal:\nwant: %s\ngot:  %s", [_repr(want), _repr(got)]))
+	panic(sprintf("not equal:\nwant: %s\ngot:  %s", [_repr(want), _repr(got)]))
 end
 
 # Runtime type assertion.
@@ -141,7 +141,7 @@ let assertType = fun(v, T: Type) -> Bool do
 	if isType(v, T) then
 		return true
 	end
-	fail(sprintf("type mismatch:\nvalue: %s\ndoes not satisfy: %s", [
+	panic(sprintf("type mismatch:\nvalue: %s\ndoes not satisfy: %s", [
 		_repr(v),
 		str(T)
 	]))
@@ -150,20 +150,20 @@ end
 # Expect a hard failure; optionally assert error's first line contains substring.
 let assertThrows = fun(fn, sub: Str?) -> Bool do
 	if not isType(fn, type Null -> Any) then
-		fail("assertThrows: argument must be a function of type (Null)->Any")
+		panic("assertThrows: argument must be a function of type (Null)->Any")
 	end
 
 	let r = try(fun(_: Null) do
 		fn(null)
 	end)
 	if r.ok then
-		fail(sprintf("expected failure, got success with value: %s", [
+		panic(sprintf("expected failure, got success with value: %s", [
 			_repr(r.value)
 		]))
 	end
 
 	if sub != null then
-		let e = r.error
+		let e = noteGet(r.value)
 		# first line only (avoid matches in the caret frame)
 		let parts = split(e, "\n")
 		let first = if len(parts) == 0 then
@@ -172,7 +172,7 @@ let assertThrows = fun(fn, sub: Str?) -> Bool do
 			parts[0]
 		end
 		if not _contains(first, sub) then
-			fail(sprintf("failure did not contain substring.\nwant in: %s\ngot:\n%s", [
+			panic(sprintf("failure did not contain substring.\nwant in: %s\ngot:\n%s", [
 				_repr(sub),
 				e
 			]))
@@ -185,7 +185,7 @@ end
 # Table-driven subtests: registers name/0, name/1, ...
 let cases = fun(name: Str, xs: [Any], fn) -> Int do
 	if not isType(fn, type Any -> Any) then
-		fail(sprintf("cases(%s): fn must be a function taking one argument", [
+		panic(sprintf("cases(%s): fn must be a function taking one argument", [
 			_repr(name)
 		]))
 	end
@@ -212,22 +212,22 @@ let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
 		if doUpdate then
 			let n = writeFile(path, want)
 			if n == null then
-				fail(sprintf("snapshot write failed: %s", [path]))
+				panic(sprintf("snapshot write failed: %s", [path]))
 			end
 			return true
 		end
-		fail(sprintf("snapshot missing (pass update=true to write): %s", [path]))
+		panic(sprintf("snapshot missing (pass update=true to write): %s", [path]))
 	end
 
 	if have != want then
 		if doUpdate then
 			let n = writeFile(path, want)
 			if n == null then
-				fail(sprintf("snapshot write failed: %s", [path]))
+				panic(sprintf("snapshot write failed: %s", [path]))
 			end
 			return true
 		end
-		fail(sprintf("snapshot mismatch:\nfile: %s\n--- have ---\n%s\n--- want ---\n%s\n(pass update=true to overwrite)", [
+		panic(sprintf("snapshot mismatch:\nfile: %s\n--- have ---\n%s\n--- want ---\n%s\n(pass update=true to overwrite)", [
 			path,
 			have,
 			want
@@ -401,7 +401,8 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 			loaded = loaded + 1
 		else
 			# caret-formatted by try(); print verbatim
-			printf("FAIL import %s\n%s\n", [f, r.error])
+			errorMessage = noteGet(r.value)
+			printf("FAIL import %s\n%s\n", [f, errorMessage])
 		end
 	end
 	return loaded
@@ -426,7 +427,7 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 		if r.ok then
 			return {ok: true}
 		end
-		return {ok: false, error: r.error}
+		return {ok: false, error: noteGet(r.value)}
 	end
 
 	let base = if timeoutMs == null or int(timeoutMs) <= 0 then

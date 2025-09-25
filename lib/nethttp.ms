@@ -1,11 +1,16 @@
 # nethttp — streaming-first HTTP server for MindScript
 #
 # Design goals:
-# - Single handler shape (streaming): Request -> Responder -> Null
-# - Middleware: (StreamFn) -> StreamFn (simple, uniform composition)
-# - Value handlers supported as sugar via an adapter
-# - Minimal, explicit runtime validation; no reflection-based classification
+# - Single streaming core (Request -> Responder -> Null)
+# - Route-time contracts (FastAPI-like): path / query / body / responses
+# - Pre-binding & validation before handler runs (422 on failure)
+# - Value routes as sugar; streaming routes unchanged
+# - Auto OpenAPI from the same route contracts
 # - Internals never return null on success; boundary helpers may return annotated null
+#
+# Less is more:
+# - Tiny surface: route(), routeStream(), contract(), router(), openapiDoc()
+# - Optional legacy shims remain (handle, handleValue, bindJson, bindQuery, path)
 
 # =========================
 # Public types (data-only)
@@ -19,7 +24,7 @@ let Request = type {
 	pathParams: {}?
 }
 
-# Public fluent responder
+# Fluent responder
 let Responder = type {
 	status: Int -> Responder,
 	setHeader: Str -> Str -> Responder,
@@ -39,7 +44,14 @@ let _HttpError = type {
 	headers: {}
 }
 
-# Streaming handler and middleware shapes
+# Contract object (open map; all fields optional)
+# path: Type, query: Type, body: Type, responses: {Int: Type}, summary: Str, tags: [Str]
+let Contract = type {}
+
+# Handler contexts (open)
+let _Ctx = type { req!: Request, path: {}, query: {}, body: Any }
+
+# Streaming handler / middleware
 let _StreamFn = type Request -> Responder -> Null
 let _Mw = type _StreamFn -> _StreamFn
 
@@ -82,8 +94,10 @@ end
 let _json = fun(v) -> Str? do
 	let s = jsonStringify(v)
 	if s != null then return s end
-	return null # json stringify failed
+	return null # <json stringify failed>
 end
+
+let contract = fun(c: Contract) -> Contract do c end
 
 # =========================
 # Error helpers (public)
@@ -98,26 +112,32 @@ let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
 end
 
 # =========================
-# Binding helpers (public, boundary-level)
+# Binding helpers (boundary-level)
+# (kept for legacy routes; route/routeStream handle this automatically)
 # =========================
 
-let bindJson = fun(req: Request, T: Type) -> Any? do
-	let raw = if isType(req.body, type Str) then
-		req.body
-	else
-		let s = readAll(req.body)
-		if s == null then 
-			return null # read body failed
-		end
-		s
+let _rawBody = fun(req: Request) -> Str? do
+	if isType(req.body, type Str) then
+		return req.body
 	end
+	let s = readAll(req.body)
+	if s == null then
+		return null # <read body failed>
+	end
+	s
+end
 
-	let v = jsonParse(raw)
-	if v == null then
-		return null # invalid json
+let bindJson = fun(req: Request, T: Type) -> Any? do
+	let raw = _rawBody(req)
+	if raw == null then 
+		return null # <read body failed> 
 	end
-	if not isType(v, T) then
-		return null # validation failed
+	let v = jsonParse(raw)
+	if v == null then 
+		return null # <invalid json> 
+	end
+	if not isType(v, T) then 
+		return null # <validation failed> 
 	end
 	v
 end
@@ -129,17 +149,123 @@ let query = fun(req: Request) -> {} do
 	m
 end
 
-let bindQuery = fun(req: Request, T: Type) -> Any? do
-	let qm = query(req)
-	let out = {}
-	for [k, vs] in qm do
-		if vs == null or len(vs) == 0 then continue end
-		let s = vs[-1]
-		let parsed = try(fun(_: Null) do jsonParse(s) end)
-		if parsed.ok then out[k] = parsed.value else out[k] = s end
+# Improved query binding (scalars + arrays; minimal coercions)
+let _coerceScalar = fun(s: Str, T: Type) -> Any? do
+	if isSubtype(T, type Str) then
+		let pj = jsonParse(s)
+		return if pj != null and isType(pj, type Str) then pj else s end
 	end
+	if isSubtype(T, type Int) then
+		let i = int(s)
+		if i != null then return i end
+		let pj = jsonParse(s)
+		if pj != null and isType(pj, type Int) then return pj end
+		return null # <bad int>
+	end
+	if isSubtype(T, type Num) then
+		let n = num(s)
+		if n != null then return n end
+		let pj = jsonParse(s)
+		if pj != null and (isType(pj, type Num) or isType(pj, type Int)) then return pj end
+		return null # <bad num>
+	end
+	if isSubtype(T, type Bool) then
+		let sl = toLower(s)
+		if sl == "true" then return true end
+		if sl == "false" then return false end
+		let pj = jsonParse(s)
+		if pj != null and isType(pj, type Bool) then return pj end
+		return null # <bad bool>
+	end
+	return null # <unsupported scalar type>
+end
+
+let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
+	let rt = reflect(T)
+	if rt == null then 
+		return null # <reflect failed>
+	end
+	let node = rt[1]
+	if node[0] != "map" then 
+		return null # <only object types supported for query> 
+	end
+
+	let out = {}
+	let entries = slice(node, 1, len(node))
+	let i = 0
+	while i < len(entries) do
+		let e = entries[i]
+		let tag = e[0]         # "pair" | "pair!"
+		let k = e[1][1]
+		let TkNode = e[2]
+		let Tk = reify(["type", TkNode])
+
+		let vs = if mapHas(m, k) then m[k] else null end
+
+		if vs == null or len(vs) == 0 then
+			if tag == "pair!" then 
+				return null # <missing key: {k}> 
+			end
+			i = i + 1
+			continue
+		end
+
+		if TkNode[0] == "array" then
+			let U = reify(["type", TkNode[1]])
+			if len(vs) == 1 then
+				let pj = jsonParse(vs[0])
+				if pj != null and isType(pj, type [Any]) then
+					let arr = []
+					let j = 0
+					while j < len(pj) do
+						let s = str(pj[j])
+						let u = _coerceScalar(s, U)
+						if u == null then 
+							return null # <bad element for {k}> 
+						end
+						arr = arr + [u]
+						j = j + 1
+					end
+					out[k] = arr
+					i = i + 1
+					continue
+				end
+			end
+			let arr2 = []
+			let j2 = 0
+			while j2 < len(vs) do
+				let u2 = _coerceScalar(vs[j2], U)
+				if u2 == null then 
+					return null # <bad element for {k}> 
+				end
+				arr2 = arr2 + [u2]
+				j2 = j2 + 1
+			end
+			out[k] = arr2
+			i = i + 1
+			continue
+		end
+
+		let s = vs[len(vs) - 1]
+		let v = _coerceScalar(s, Tk)
+		if v == null then 
+			return null # <coercion failed: {k}> 
+		end
+		out[k] = v
+
+		i = i + 1
+	end
+
 	if isType(out, T) then return out end
-	return null # query validation failed
+	return null # <query validation failed>
+end
+
+let bindQuery = fun(req: Request, T: Type) -> Any? do
+	let qm = urlQueryParse(if req.url.query == null then "" else req.url.query end)
+	if qm == null then 
+		return null # <invalid query string> 
+	end
+	_bindQueryMap(qm, T)
 end
 
 let path = fun(req: Request) -> {} do
@@ -174,28 +300,27 @@ end
 # =========================
 # Responder (opaque; per-request)
 # =========================
-# Fluent methods: every method returns the responder to keep chains intact.
 
 let _newResponder = fun() -> { res: _Response, api: Responder } do
 	let state = { status: 200, headers: {}, body: "" }
 	let api = {}
 
-	api.status = fun(code: Int) -> Responder do 
+	api.status = fun(code: Int) -> Responder do
 		state.status = code
-		api 
+		api
 	end
-	api.setHeader = fun(k: Str, v: Str) -> Responder do 
+	api.setHeader = fun(k: Str, v: Str) -> Responder do
 		state.headers[k] = v
-		api 
+		api
 	end
-	api.write = fun(chunk: Str) -> Responder do 
+	api.write = fun(chunk: Str) -> Responder do
 		state.body = state.body + chunk
-		api 
+		api
 	end
-	api.flush = fun(_: Null) -> Responder do 
-		api 
+	api.flush = fun(_: Null) -> Responder do
+		api
 	end
-	api.end = fun(_: Null) -> Null do 
+	api.end = fun(_: Null) -> Null do
 		null
 	end
 
@@ -203,7 +328,7 @@ let _newResponder = fun() -> { res: _Response, api: Responder } do
 end
 
 # =========================
-# Value -> Stream adapter (public)
+# Value -> Stream adapter (legacy public)
 # =========================
 
 let value = fun(fn: Request -> Any?) -> _StreamFn do
@@ -247,12 +372,110 @@ let value = fun(fn: Request -> Any?) -> _StreamFn do
 end
 
 # =========================
-# Router (closure-backed; no module globals)
+# Validation helpers for contract routes
 # =========================
 
-# Route record (private)
-# style: "stream" for native streaming handlers, "value" when registered via handleValue
-let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str) -> {} do
+let _validationJSON = fun(where: Str, reason: Str) -> Str do
+	let obj = { error: "validation", detail: [{ in: where, reason: reason }] }
+	let s = _json(obj)
+	if s == null then return "{\"error\":\"validation\"}" end
+	s
+end
+
+# Build a "params dict" from path template + request path segments
+let _paramsFromPath = fun(parts: [Str], segs: [Str]) -> {} do
+	let ps = {}
+	let i = 0
+	while i < len(parts) do
+		let p = parts[i]
+		if _isParamSeg(p) then
+			ps[_paramName(p)] = segs[i]
+		end
+		i = i + 1
+	end
+	ps
+end
+
+# Bind & validate PATH according to Type TP (object type)
+let _bindPath = fun(ps: {}, TP: Type) -> Any? do
+	let rt = reflect(TP)
+	if rt == null then 
+		return null # <reflect failed> 
+	end
+	let node = rt[1]
+	if node[0] != "map" then 
+		return null # <path must be object type> 
+	end
+
+	let out = {}
+	let entries = slice(node, 1, len(node))
+	let i = 0
+	while i < len(entries) do
+		let e = entries[i]
+		let tag = e[0]
+		let k = e[1][1]
+		let Tk = reify(["type", e[2]])
+		let raw = if mapHas(ps, k) then ps[k] else null end
+		if raw == null then
+			if tag == "pair!" then 
+				return null # <missing key: {k}> 
+			end
+			i = i + 1
+			continue
+		end
+		# path params treated as scalars
+		let v = _coerceScalar(raw, Tk)
+		if v == null then 
+			return null # <coercion failed: {k}> 
+		end
+		out[k] = v
+		i = i + 1
+	end
+	if isType(out, TP) then return out end
+	return null # <path validation failed>
+end
+
+# Bind & validate QUERY according to Type TQ
+let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
+	let qm = urlQueryParse(if req.url.query == null then "" else req.url.query end)
+	if qm == null then 
+		return null # <invalid query string> 
+	end
+	_bindQueryMap(qm, TQ)
+end
+
+# Bind & validate BODY according to Type TB
+let _bindBody = fun(req: Request, TB: Type) -> Any? do
+	let raw = _rawBody(req)
+	if raw == null then 
+		return null # <read body failed> 
+	end
+	let v = jsonParse(raw)
+	if v == null then 
+		return null # <invalid json> 
+	end
+	if not isType(v, TB) then 
+		return null # <validation failed> 
+	end
+	v
+end
+
+# Validate an outgoing value against declared response type (if present)
+let _checkResponse = fun(status: Int, out, respMap: {}) -> Bool do
+	if respMap == null then return true end
+	if not mapHas(respMap, str(status)) and not mapHas(respMap, status) then
+		return true
+	end
+	let T = if mapHas(respMap, str(status)) then respMap[str(status)] else respMap[status] end
+	if not isType(T, type Type) then return true end
+	return isType(out, T)
+end
+
+# =========================
+# Router (closure-backed)
+# =========================
+
+let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
 	let m = _normMethod(method)
 	let isPrefix = _hasPrefix(pattern, "/") and len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
 	{
@@ -261,28 +484,25 @@ let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str) -> {}
 		isPrefix: isPrefix,
 		parts: _splitPath(pattern),
 		call: call,
-		style: style
+		style: style,
+		contract: c
 	}
 end
 
-# Path matcher → params or null
 let _pathMatch = fun(parts: [Str], reqSegs: [Str], isPrefix: Bool) -> {}? do
 	if isPrefix and len(reqSegs) < len(parts) then return end
 	if not isPrefix and len(reqSegs) != len(parts) then return end
 	let n = len(parts)
-	let params = {}
 	let i = 0
 	while i < n do
 		let rp = parts[i]
 		let qp = reqSegs[i]
-		if _isParamSeg(rp) then
-			params[_paramName(rp)] = qp
-		elif rp != qp then
+		if not _isParamSeg(rp) and rp != qp then
 			return
 		end
 		i = i + 1
 	end
-	params
+	{} # non-null match
 end
 
 let router = fun(_: Null) -> {} do
@@ -300,12 +520,12 @@ let router = fun(_: Null) -> {} do
 			if p != null then
 				let s = len(r.parts)
 				if s > score then
-					best = { route: r, params: p }
+					best = { route: r, segs: segs }
 					score = s
 				end
 			end
 		end
-		if best != null then return { route: best.route, params: best.params } end
+		if best != null then return best end
 		null
 	end
 
@@ -340,32 +560,208 @@ let router = fun(_: Null) -> {} do
 			return { status: 404, headers: {"Content-Type":"text/plain"}, body: "not found" }
 		end
 
-		let rq = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: m.params }
+		let r = m.route
+		let segs = m.segs
+
+		# pre-bind according to contract (if present)
+		let C = if mapHas(r, "contract") then r.contract else {} end
+
+		# Start with base request (pathParams filled for legacy)
+		let rq = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: _paramsFromPath(r.parts, segs) }
+
+		# Build ctx (only declared sections present)
+		let ctx = { req: rq }
+
+		# PATH
+		if mapHas(C, "path") and C.path != null then
+			let P = _bindPath(rq.pathParams, C.path)
+			if P == null then
+				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("path", noteGet(P)) }
+			end
+			ctx.path = P
+		end
+
+		# QUERY
+		if mapHas(C, "query") and C.query != null then
+			let Q = _bindQueryFromReq(rq, C.query)
+			if Q == null then
+				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("query", noteGet(Q)) }
+			end
+			ctx.query = Q
+		end
+
+		# BODY
+		if mapHas(C, "body") and C.body != null then
+			let B = _bindBody(rq, C.body)
+			if B == null then
+				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("body", noteGet(B)) }
+			end
+			ctx.body = B
+		end
 
 		# execute streaming handler into an in-memory responder
 		let pack = _newResponder()
-		let call = _compose(m.route.call)
+		let call = _compose(r.call)
 
-		let r = try(fun(_: Null) do call(rq, pack.api) end)
-		if not r.ok then
+		# For handlers that expect only (req,res), we still pass (req,res) (legacy).
+		# Contract routes wrap into a streaming fn that closes over ctx.
+
+		let t = try(fun(_: Null) do call(rq, pack.api) end)
+		if not t.ok then
 			return { status: 500, headers: {"Content-Type":"text/plain"}, body: "internal server error" }
 		end
 		{ status: pack.res.status, headers: pack.res.headers, body: pack.res.body }
 	end
 
+	let _fullKey = fun(m: Str, p: Str) -> Str do m + " " + p end
+
 	let api = {
 		__kind: "nethttp.router",
 
-		# Register a streaming handler
-		handle: fun(method: Str, pattern: Str, handler: _StreamFn) -> Bool do
-			_routes = _routes + [_mkRoute(method, pattern, handler, "stream")]
+		# -------- Contract-first: value route --------
+		route: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
+			# Wrap into streaming fn that runs the handler with ctx, then serializes
+			let parts = _splitPath(pattern)
+			let stream = fun(req: Request, res: Responder) -> Null do
+				# Pre-bind via outer _entryCore: we only need to rebuild ctx here
+				let pathParams = _paramsFromPath(parts, _splitPath(req.url.path))
+				let rq2 = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: pathParams }
+				let ctx = { req: rq2 }
+				if mapHas(c, "path") and c.path != null then
+					let P = _bindPath(pathParams, c.path)
+					if P == null then
+						res.status(422).setHeader("Content-Type","application/json").write(_validationJSON("path", noteGet(P))).end(null)
+						return null
+					end
+					ctx.path = P
+				end
+				if mapHas(c, "query") and c.query != null then
+					let Q = _bindQueryFromReq(rq2, c.query)
+					if Q == null then
+						res.status(422).setHeader("Content-Type","application/json").write(_validationJSON("query", noteGet(Q))).end(null)
+						return null
+					end
+					ctx.query = Q
+				end
+				if mapHas(c, "body") and c.body != null then
+					let B = _bindBody(rq2, c.body)
+					if B == null then
+						res.status(422).setHeader("Content-Type","application/json").write(_validationJSON("body", noteGet(B))).end(null)
+						return null
+					end
+					ctx.body = B
+				end
+
+				let r = try(fun(_: Null) do handler(ctx) end)
+				if not r.ok then
+					res.status(500).setHeader("Content-Type","text/plain").write("internal server error").end(null)
+					return null
+				end
+				let out = r.value
+
+				if out == null then
+					let nt = noteGet(out)
+					let msg = if nt != null then nt else "error" end
+					res.status(500).setHeader("Content-Type","text/plain").write(msg).end(null)
+					return null
+				end
+
+				# If user returned explicit response or HttpError, pass through
+				if isType(out, _HttpError) then
+					let hdrs = if mapHas(out, "headers") and out.headers != null then out.headers else {} end
+					let rt = if mapHas(out, "body") and out.body != null then out.body else "" end
+					for [k, v] in hdrs do res.setHeader(k, v) end
+					res.status(out.status).write(rt).end(null)
+					return null
+				end
+				if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+					let st = out.status
+					# optional response validation
+					if mapHas(c, "responses") and c.responses != null then
+						if not _checkResponse(st, if mapHas(out,"body") then jsonParse(out.body) else out end, c.responses) then
+							res.status(500).setHeader("Content-Type","application/json").write(_validationJSON("response","response-validation failed")).end(null)
+							return null
+						end
+					end
+					for [k, v] in out.headers do res.setHeader(k, v) end
+					res.status(st).write(out.body).end(null)
+					return null
+				end
+
+				# Plain value → JSON 200 by default; validate if response type declared
+				let js = _json(out)
+				if js == null then
+					res.status(500).setHeader("Content-Type","text/plain").write("json encode error").end(null)
+					return null
+				end
+				if mapHas(c, "responses") and c.responses != null then
+					let ok = _checkResponse(200, out, c.responses)
+					if not ok then
+						res.status(500).setHeader("Content-Type","application/json").write(_validationJSON("response","response-validation failed")).end(null)
+						return null
+					end
+				end
+				res.setHeader("Content-Type","application/json; charset=utf-8").status(200).write(js).end(null)
+				null
+			end
+
+			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
 			true
 		end,
 
-		# Register a value handler (sugar)
+		# -------- Contract-first: streaming route --------
+		routeStream: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
+			# We wrap to pre-bind and then call handler(req,res,ctx)
+			let parts = _splitPath(pattern)
+			let stream = fun(req: Request, res: Responder) -> Null do
+				let pathParams = _paramsFromPath(parts, _splitPath(req.url.path))
+				let rq2 = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: pathParams }
+				let ctx = { req: rq2 }
+
+				if mapHas(c, "path") and c.path != null then
+					let P = _bindPath(pathParams, c.path)
+					if P == null then
+						res.status(422).setHeader("Content-Type","application/json").write(_validationJSON("path", noteGet(P))).end(null)
+						return null
+					end
+					ctx.path = P
+				end
+				if mapHas(c, "query") and c.query != null then
+					let Q = _bindQueryFromReq(rq2, c.query)
+					if Q == null then
+						res.status(422).setHeader("Content-Type","application/json").write(_validationJSON("query", noteGet(Q))).end(null)
+						return null
+					end
+					ctx.query = Q
+				end
+				if mapHas(c, "body") and c.body != null then
+					let B = _bindBody(rq2, c.body)
+					if B == null then
+						res.status(422).setHeader("Content-Type","application/json").write(_validationJSON("body", noteGet(B))).end(null)
+						return null
+					end
+					ctx.body = B
+				end
+
+				let r = try(fun(_: Null) do handler(rq2, res, ctx) end)
+				if not r.ok then
+					res.status(500).setHeader("Content-Type","text/plain").write("internal server error").end(null)
+				end
+				null
+			end
+			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
+			true
+		end,
+
+		# -------- Legacy shims (kept; not contract-enforced) --------
+		handle: fun(method: Str, pattern: Str, handler: _StreamFn) -> Bool do
+			_routes = _routes + [_mkRoute(method, pattern, handler, "stream", {})]
+			true
+		end,
+
 		handleValue: fun(method: Str, pattern: Str, handler: Request -> Any?) -> Bool do
 			let s = value(handler)
-			_routes = _routes + [_mkRoute(method, pattern, s, "value")]
+			_routes = _routes + [_mkRoute(method, pattern, s, "value", {})]
 			true
 		end,
 
@@ -378,12 +774,13 @@ let router = fun(_: Null) -> {} do
 			let pre = if _hasPrefix(prefix, "/") then prefix else "/" + prefix end
 			for rr in dump.routes do
 				let p = if _hasPrefix(rr.pattern, "/") then rr.pattern else "/" + rr.pattern end
-				api.handle(rr.method, pre + p, rr.call)
+				# preserve original style and contract
+				_routes = _routes + [_mkRoute(rr.method, pre + p, rr.call, rr.style, rr.contract)]
 			end
 			true
 		end,
 
-		# Register a middleware: (StreamFn)->StreamFn
+		# Middleware
 		use: fun(mw: _Mw) -> Bool do
 			_mws = _mws + [mw]
 			true
@@ -573,10 +970,10 @@ let _ServerHandle = type {
 
 let serve = fun(listener, r, opts: {}) -> {}? do
 	if listener == null then
-		return null # serve: missing listener
+		return null # <serve: missing listener>
 	end
 	if not (mapHas(r, "_entryCall")) then
-		return null # serve: not a router
+		return null # <serve: not a router>
 	end
 
 	# Defaults
@@ -822,12 +1219,13 @@ let _connLoop = fun(conn, router, server) -> Null do
 end
 
 # =========================
-# Tiny docs (optional)
+# OpenAPI (contract-based)
 # =========================
 
 let openapi = fun(r) -> {}? do
+	# Legacy: list routes & style only (kept for compatibility)
 	if not (mapHas(r, "_dump")) then
-		return null # not a router
+		return null # <not a router>
 	end
 	let dump = r._dump()
 	let rs = []
@@ -837,3 +1235,6 @@ let openapi = fun(r) -> {}? do
 	{ routes: rs }
 end
 
+let openapiDoc = fun(r, info: {}, servers: [Str]?) -> {}? do
+	["stub"]
+end

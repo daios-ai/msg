@@ -233,7 +233,7 @@ func Test_Concurrency_ProcJoinAll_WithFailure(t *testing.T) {
 
 	v := evalWithIP(t, ip, `
 let ok = fun() -> Int do 7 end
-let bad = fun() do fail("boom") end
+let bad = fun() do panic("boom") end
 let ps = [ procSpawn(ok), procSpawn(bad) ]
 procJoinAll(ps)
 	`)

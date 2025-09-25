@@ -8,9 +8,9 @@ import (
 // ---- core built-ins ----------------------------------------------------
 
 func registerCoreBuiltins(ip *Interpreter) {
-	// fail(message?: Str) -> Null (never returns; hard runtime error)
+	// panic(message?: Str) -> Null (never returns; hard runtime error)
 	ip.RegisterNative(
-		"fail",
+		"panic",
 		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
@@ -23,7 +23,7 @@ func registerCoreBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "fail", `Fail: throw a runtime error (hard fault).
+	setBuiltinDoc(ip, "panic", `Fail: throw a runtime error (hard fault).
 
 Params:
   message: Str? — optional message (default "error")
@@ -31,18 +31,18 @@ Params:
 Returns:
   Null (never returns)`)
 
-	// try(f: (Null -> Any)) -> { ok: Bool, value: Any, error: Str? }
+	// try(f: (Null -> Any)) -> { ok: Bool, value: Any }
 	ip.RegisterNative(
 		"try",
 		[]ParamSpec{{Name: "f", Type: S{"binop", "->", S{"id", "Null"}, S{"id", "Any"}}}},
-		S{"map"}, // lax: a map with ok/value/error
+		S{"map", S{"pair!", S{"id", "ok"}, S{"id", "Bool"}},
+			S{"pair!", S{"id", "value"}, S{"id", "Any"}}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.Arg("f") // type-checked by runtime to be (Null -> Any)
 
 			out := Map(map[string]Value{
 				"ok":    Bool(false),
 				"value": Null,
-				"error": Null,
 			})
 
 			var pretty string
@@ -73,38 +73,29 @@ Returns:
 			// If we recovered, 'pretty' is set — treat as failure.
 			if pretty != "" {
 				out.Data.(*MapObject).Entries["ok"] = Bool(false)
-				out.Data.(*MapObject).Entries["error"] = Str(pretty)
-				out.Data.(*MapObject).Entries["value"] = Null
-				return out
-			}
-
-			// Treat annotated-null as soft failure.
-			if res.Tag == VTNull && res.Annot != "" {
-				out.Data.(*MapObject).Entries["ok"] = Bool(false)
-				out.Data.(*MapObject).Entries["error"] = Str(res.Annot)
-				out.Data.(*MapObject).Entries["value"] = Null
+				out.Data.(*MapObject).Entries["value"] = annotNull(pretty)
 				return out
 			}
 
 			// Success.
 			out.Data.(*MapObject).Entries["ok"] = Bool(true)
-			out.Data.(*MapObject).Entries["error"] = Null
 			out.Data.(*MapObject).Entries["value"] = res
 			return out
 		},
 	)
-	setBuiltinDoc(ip, "try", `Run a zero-arg function and capture hard failures.
+	setBuiltinDoc(ip, "try", `Run a zero-arg function and capture panics.
 
 Signature:
-  try(f: (Null -> Any)) -> { ok: Bool, value: Any, error: Str? }
+  try(f: (Null -> Any)) -> { ok: Bool, value: Any }
 
 Returns:
-  { ok: Bool, value: Any, error: Str? }
+  { ok: Bool, value: Any }
 
 Notes:
-  • Hard faults (e.g., division by zero, fail(...)) set ok=false and error.
-  • If the function returns an annotated null, ok=false and error is that annotation.
-  • On success, ok=true and value is the function's result.`)
+  • Panics (e.g., division by zero, panic(...)) set panic=true value to an
+    error-annotated null.
+  • Otherwise, ok=true and value is the function's result. Note the value
+    could still be an error.`)
 
 	// clone(x: Any) -> Any
 	ip.RegisterNative(

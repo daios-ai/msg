@@ -8,59 +8,57 @@ import (
 func Test_Builtin_Core_fail_and_try(t *testing.T) {
 	ip, _ := NewRuntime()
 
-	// fail(...) should surface a hard error.
-	_, err := ip.EvalSource(`fail("boom")`)
+	// fail(...) should surface a hard error when not wrapped in try.
+	_, err := ip.EvalSource(`panic("boom")`)
 	wantErrContains(t, err, "boom")
 
-	// try(fun() do fail("boom") end) should capture as ok=false with error text.
+	// try(fun() do fail("boom") end) captures a PANIC → ok=false, value=annotated null.
 	v := evalWithIP(t, ip, `
-		let f = fun() do fail("boom") end
+		let f = fun() do panic("boom") end
 		try(f)
 	`)
 	m := mustMap(t, v)
 	ok := m.Entries["ok"]
-	errv := m.Entries["error"]
 	val := m.Entries["value"]
+
 	if ok.Tag != VTBool || ok.Data.(bool) != false {
-		t.Fatalf("try.ok = false expected, got %#v", ok)
+		t.Fatalf("try.ok = false expected for panic, got %#v", ok)
 	}
-	if errv.Tag != VTStr || !strings.Contains(errv.Data.(string), "boom") {
-		t.Fatalf("try.error should contain boom, got %#v", errv)
-	}
-	if val.Tag != VTNull {
-		t.Fatalf("try.value should be null on error, got %#v", val)
+	if val.Tag != VTNull || !strings.Contains(val.Annot, "boom") {
+		t.Fatalf("try.value should be annotated null containing 'boom' on panic, got %#v (annot=%q)", val, val.Annot)
 	}
 
-	// try capturing an annotated-null (soft failure) from readFile(nonexistent)
+	// try capturing an annotated-null (soft failure) from readFile(nonexistent):
+	// This is NOT a panic; ok should be true and value is the annotated null.
 	v2 := evalWithIP(t, ip, `
 		let g = fun() do readFile("__definitely_not_exists__") end
 		try(g)
 	`)
 	m2 := mustMap(t, v2)
-	if m2.Entries["ok"].Data.(bool) != false {
-		t.Fatalf("try.ok should be false for annotated null")
+	ok2 := m2.Entries["ok"]
+	val2 := m2.Entries["value"]
+
+	if ok2.Tag != VTBool || ok2.Data.(bool) != true {
+		t.Fatalf("try.ok should be true for non-panicking annotated-null, got %#v", ok2)
 	}
-	if m2.Entries["error"].Tag != VTStr {
-		t.Fatalf("try.error should be Str for annotated null, got %#v", m2.Entries["error"])
-	}
-	if m2.Entries["value"].Tag != VTNull {
-		t.Fatalf("try.value should be null for annotated null, got %#v", m2.Entries["value"])
+	if val2.Tag != VTNull || val2.Annot == "" {
+		t.Fatalf("try.value should be annotated null (soft error) on success path, got %#v (annot=%q)", val2, val2.Annot)
 	}
 
-	// try on success
+	// try on success (non-null, no annotation)
 	v3 := evalWithIP(t, ip, `
 		let h = fun() do 40 + 2 end
 		try(h)
 	`)
 	m3 := mustMap(t, v3)
-	if m3.Entries["ok"].Data.(bool) != true {
-		t.Fatalf("try.ok should be true on success")
+	ok3 := m3.Entries["ok"]
+	val3 := m3.Entries["value"]
+
+	if ok3.Tag != VTBool || ok3.Data.(bool) != true {
+		t.Fatalf("try.ok should be true on success, got %#v", ok3)
 	}
-	if m3.Entries["error"].Tag != VTNull {
-		t.Fatalf("try.error should be null on success, got %#v", m3.Entries["error"])
-	}
-	if m3.Entries["value"].Tag != VTInt || m3.Entries["value"].Data.(int64) != 42 {
-		t.Fatalf("try.value should be 42, got %#v", m3.Entries["value"])
+	if val3.Tag != VTInt || val3.Data.(int64) != 42 {
+		t.Fatalf("try.value should be 42, got %#v", val3)
 	}
 }
 
@@ -134,12 +132,12 @@ func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 	}
 
 	// Builtins should be present and functions.
-	failVal, ok := mo.Entries["fail"]
+	failVal, ok := mo.Entries["panic"]
 	if !ok {
-		t.Fatalf("snapshot should include builtins (missing 'fail')")
+		t.Fatalf("snapshot should include builtins (missing 'panic')")
 	}
 	if failVal.Tag != VTFun {
-		t.Fatalf("'fail' should be a function value, got %#v", failVal)
+		t.Fatalf("'panic' should be a function value, got %#v", failVal)
 	}
 
 	typeOfVal, ok := mo.Entries["typeOf"]

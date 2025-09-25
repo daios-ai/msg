@@ -77,8 +77,8 @@ func (o *opsImpl) initCore() {
 		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.MustArg("targetAst"), "__assign_set")
-			v := ctx.MustArg("value")
+			ast := expectAST(ctx.Arg("targetAst"), "__assign_set")
+			v := ctx.Arg("value")
 			ip.assignTo(ast, v, ctx.Env())
 			return v
 		})
@@ -88,8 +88,8 @@ func (o *opsImpl) initCore() {
 		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.MustArg("targetAst"), "__assign_def")
-			v := ctx.MustArg("value")
+			ast := expectAST(ctx.Arg("targetAst"), "__assign_def")
+			v := ctx.Arg("value")
 			ip.assignTo(ast, v, ctx.Env(), true)
 			return v
 		})
@@ -98,8 +98,8 @@ func (o *opsImpl) initCore() {
 	reg("__plus",
 		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			a := AsMapValue(ctx.MustArg("a"))
-			b := AsMapValue(ctx.MustArg("b"))
+			a := AsMapValue(ctx.Arg("a"))
+			b := AsMapValue(ctx.Arg("b"))
 			if isNumber(a) && isNumber(b) {
 				if a.Tag == VTInt && b.Tag == VTInt {
 					return Int(a.Data.(int64) + b.Data.(int64))
@@ -155,7 +155,7 @@ func (o *opsImpl) initCore() {
 	reg("__resolve_type",
 		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
 		func(ctx CallCtx) Value {
-			t := ctx.MustArg("t")
+			t := ctx.Arg("t")
 			resolved := ip.resolveTypeValue(t, ctx.Env())
 			// Always return a pinned Type; never emit env-less types.
 			return TypeValIn(resolved, ctx.Env())
@@ -167,7 +167,7 @@ func (o *opsImpl) initCore() {
 	reg("__type_from_ast",
 		[]ParamSpec{{"ast", S{"id", "Any"}}}, S{"id", "Type"},
 		func(ctx CallCtx) Value {
-			h := ctx.MustArg("ast")
+			h := ctx.Arg("ast")
 			if h.Tag != VTHandle {
 				return errNull("__type_from_ast: expected internal type-ast handle")
 			}
@@ -188,7 +188,7 @@ func (o *opsImpl) initCore() {
 	// __annotate(text: Str, v: Any) -> Any
 	reg("__annotate",
 		[]ParamSpec{{"text", S{"id", "Str"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value { return withAnnot(ctx.MustArg("v"), ctx.MustArg("text").Data.(string)) })
+		func(ctx CallCtx) Value { return withAnnot(ctx.Arg("v"), ctx.Arg("text").Data.(string)) })
 
 	// __collect_for_elems(iter: Any) -> Any   (used by high-level mapping helpers)
 	reg("__collect_for_elems",
@@ -203,7 +203,7 @@ func (o *opsImpl) initCore() {
 					panic(r)
 				}
 			}()
-			out = Arr(ip.collectForElemsScoped(ctx.MustArg("iter"), ctx.Env()))
+			out = Arr(ip.collectForElemsScoped(ctx.Arg("iter"), ctx.Env()))
 			return
 		})
 
@@ -211,8 +211,8 @@ func (o *opsImpl) initCore() {
 	reg("__map_from",
 		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ka := ctx.MustArg("keys").Data.(*ArrayObject).Elems
-			va := ctx.MustArg("vals").Data.(*ArrayObject).Elems
+			ka := ctx.Arg("keys").Data.(*ArrayObject).Elems
+			va := ctx.Arg("vals").Data.(*ArrayObject).Elems
 			if len(ka) != len(va) {
 				return errNull("map_from: mismatched arity")
 			}
@@ -239,7 +239,7 @@ func (o *opsImpl) initCore() {
 	reg("__len",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
 		func(ctx CallCtx) Value {
-			x := AsMapValue(ctx.MustArg("x"))
+			x := AsMapValue(ctx.Arg("x"))
 			switch x.Tag {
 			case VTArray:
 				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
@@ -263,13 +263,13 @@ func (o *opsImpl) initCore() {
 		},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			namesV := ctx.MustArg("params").Data.(*ArrayObject).Elems
-			typesV := ctx.MustArg("types").Data.(*ArrayObject).Elems
-			retTV := ctx.MustArg("ret").Data.(*TypeValue)
-			bodyAny := ctx.MustArg("bodyAst")
-			isOr := ctx.MustArg("isOracle").Data.(bool)
-			exAny := ctx.MustArg("examples")
-			baseAny := ctx.MustArg("basePath")
+			namesV := ctx.Arg("params").Data.(*ArrayObject).Elems
+			typesV := ctx.Arg("types").Data.(*ArrayObject).Elems
+			retTV := ctx.Arg("ret").Data.(*TypeValue)
+			bodyAny := ctx.Arg("bodyAst")
+			isOr := ctx.Arg("isOracle").Data.(bool)
+			exAny := ctx.Arg("examples")
+			baseAny := ctx.Arg("basePath")
 
 			names := make([]string, len(namesV))
 			types := make([]S, len(typesV))
@@ -367,13 +367,13 @@ func (o *opsImpl) initCore() {
 	// __is_fun(x: Any) -> Bool
 	reg("__is_fun",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value { return Bool(ctx.MustArg("x").Tag == VTFun) })
+		func(ctx CallCtx) Value { return Bool(ctx.Arg("x").Tag == VTFun) })
 
 	// __iter_should_stop(x: Any) -> Bool
 	reg("__iter_should_stop",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
 		func(ctx CallCtx) Value {
-			v := ctx.MustArg("x")
+			v := ctx.Arg("x")
 			if v.Tag == VTNull {
 				if v.Annot != "" {
 					fail(v.Annot)
@@ -387,7 +387,7 @@ func (o *opsImpl) initCore() {
 	ip.RegisterNative("__to_iter",
 		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.MustArg("x"))
+			x := AsMapValue(ctx.Arg("x"))
 
 			// Already an iterator?
 			if x.Tag == VTFun {
@@ -934,9 +934,9 @@ func expectAST(v Value, where string) S {
 // Concurrency note: module load state (ip.modules, ip.loadStack) belongs to a
 // single Interpreter isolate. Do not share the same Interpreter across goroutines.
 func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
-	nameV := ctx.MustArg("name")
-	bodyV := ctx.MustArg("body")
-	baseV := ctx.MustArg("base")
+	nameV := ctx.Arg("name")
+	bodyV := ctx.Arg("body")
+	baseV := ctx.Arg("base")
 
 	if nameV.Tag != VTStr {
 		fail("module name must be a string")

@@ -52,7 +52,7 @@ func registerExecBuiltins(ip *Interpreter) {
 		},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			// --- Parse cmd: [Str] ---
-			cmdVal := ctx.MustArg("cmd")
+			cmdVal := ctx.Arg("cmd")
 			if cmdVal.Tag != VTArray {
 				fail("exec: cmd must be [Str]")
 			}
@@ -75,7 +75,7 @@ func registerExecBuiltins(ip *Interpreter) {
 				haveStdin  bool
 				envOverlay map[string]string // nil if not provided
 			)
-			if ov, ok := ctx.Arg("opts"); ok && ov.Tag != VTNull {
+			if ov := ctx.Arg("opts"); ov.Tag != VTNull {
 				if ov.Tag != VTMap {
 					fail("exec: opts must be {}")
 				}

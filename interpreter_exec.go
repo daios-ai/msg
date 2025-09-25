@@ -487,9 +487,8 @@ type callCtx struct {
 	scope  *Env
 }
 
-func (c *callCtx) Arg(name string) (Value, bool) { v, err := c.argEnv.Get(name); return v, err == nil }
-func (c *callCtx) MustArg(name string) Value {
-	if v, ok := c.Arg(name); ok {
+func (c *callCtx) Arg(name string) Value {
+	if v, err := c.argEnv.Get(name); err == nil {
 		return v
 	}
 	fail("missing argument: " + name)

@@ -1145,7 +1145,7 @@ func Test_Interpreter_Map_DeepEqual_Ignores_KeyAnnots(t *testing.T) {
 		[]ParamSpec{{"x", S{"id", "Any"}}, {"y", S{"id", "Any"}}},
 		S{"id", "Bool"},
 		func(ip2 *Interpreter, ctx CallCtx) Value {
-			return Bool(ip2.deepEqual(ctx.MustArg("x"), ctx.MustArg("y")))
+			return Bool(ip2.deepEqual(ctx.Arg("x"), ctx.Arg("y")))
 		})
 
 	srcA := `

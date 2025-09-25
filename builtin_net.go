@@ -83,7 +83,7 @@ func registerNetBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("addr")
+			av := ctx.Arg("addr")
 			conn, err := net.Dial("tcp", av.Data.(string))
 			if err != nil {
 				return annotNull(err.Error()) // soft
@@ -106,7 +106,7 @@ or null (annotated) on network error.`)
 		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("addr")
+			av := ctx.Arg("addr")
 			ln, err := net.Listen("tcp", av.Data.(string))
 			if err != nil {
 				return annotNull(err.Error()) // soft
@@ -125,7 +125,7 @@ Returns null (annotated) on bind/listen error.`)
 		[]ParamSpec{{Name: "l", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			ln := asHandle(ctx.MustArg("l"), "listener").Data.(*netListenerH).ln
+			ln := asHandle(ctx.Arg("l"), "listener").Data.(*netListenerH).ln
 			conn, err := ln.Accept()
 			if err != nil {
 				return annotNull(err.Error()) // soft
@@ -175,7 +175,7 @@ or null (annotated) on accept error.`)
 		[]ParamSpec{{Name: "req", Type: httpReqT}},
 		httpRespT,
 		func(_ *Interpreter, ctx CallCtx) Value {
-			rv := ctx.MustArg("req")
+			rv := ctx.Arg("req")
 			if rv.Tag != VTMap {
 				fail("http expects a request map") // contractual
 			}
@@ -304,7 +304,7 @@ Output:
 		[]ParamSpec{{Name: "req", Type: httpReqT}},
 		httpRespT,
 		func(_ *Interpreter, ctx CallCtx) Value {
-			rv := ctx.MustArg("req")
+			rv := ctx.Arg("req")
 			if rv.Tag != VTMap {
 				fail("httpStream expects a request map") // contractual
 			}

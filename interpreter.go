@@ -415,8 +415,7 @@ type Callable interface {
 // CallCtx is passed to native functions, providing access to bound arguments
 // (by parameter name) and the effect scope (where side effects should land).
 type CallCtx interface {
-	Arg(name string) (Value, bool)
-	MustArg(name string) Value
+	Arg(name string) Value
 	Env() *Env
 }
 

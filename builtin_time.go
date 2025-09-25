@@ -46,7 +46,7 @@ Returns:
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms").Data.(int64)
+			ms := ctx.Arg("ms").Data.(int64)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 			return Null
 		},
@@ -103,7 +103,7 @@ Returns:
 		[]ParamSpec{{Name: "millis", Type: S{"id", "Int"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("millis").Data.(int64)
+			ms := ctx.Arg("millis").Data.(int64)
 			t := time.Unix(0, ms*int64(time.Millisecond)).UTC()
 			// RFC3339Nano emits fractional seconds only when needed.
 			return Str(t.Format(time.RFC3339Nano))
@@ -128,7 +128,7 @@ Notes:
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Int"}}, // Int?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
+			s := ctx.Arg("s").Data.(string)
 			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 				return Int(t.UnixNano() / 1e6)
 			}

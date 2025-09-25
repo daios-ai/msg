@@ -17,7 +17,7 @@ func registerJsonBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			sv := ctx.MustArg("s")
+			sv := ctx.Arg("s")
 			var x any
 			if err := json.Unmarshal([]byte(sv.Data.(string)), &x); err != nil {
 				// Soft error: invalid JSON text
@@ -47,7 +47,7 @@ Returns:
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			src := ctx.MustArg("s").Data.(string)
+			src := ctx.Arg("s").Data.(string)
 
 			// Use the permissive repairer/decoder. It returns a Go JSON-compatible
 			// value graph (with json.Number for numbers), the repaired text (ignored
@@ -94,7 +94,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			xv := ctx.MustArg("x")
+			xv := ctx.Arg("x")
 			gv, err := valueToGoJSON(xv)
 			if err != nil {
 				return annotNull("json stringify: " + err.Error())
@@ -125,7 +125,7 @@ Returns:
 		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			tv := ctx.MustArg("t") // VTType value
+			tv := ctx.Arg("t") // VTType value
 			js := ip.TypeValueToJSONSchema(tv, ctx.Env())
 			return goJSONToValue(js)
 		},
@@ -144,7 +144,7 @@ Returns:
 		[]ParamSpec{{Name: "schema", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Type"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			gv, err := valueToGoJSON(ctx.MustArg("schema"))
+			gv, err := valueToGoJSON(ctx.Arg("schema"))
 			if err != nil {
 				return annotNull("json schema: " + err.Error())
 			}
@@ -195,7 +195,7 @@ Returns:
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			src := ctx.MustArg("src").Data.(string)
+			src := ctx.Arg("src").Data.(string)
 			s, err := TypeStringToS(src)
 			if err != nil {
 				// Soft error: parse failure
@@ -220,7 +220,7 @@ Returns:
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"id", "Type"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			src := ctx.MustArg("src").Data.(string)
+			src := ctx.Arg("src").Data.(string)
 			doc, err := JSONSchemaStringToObject(src)
 			if err != nil {
 				// Soft error: invalid JSON schema text

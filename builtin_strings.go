@@ -14,9 +14,9 @@ func registerStringBuiltins(ip *Interpreter) {
 		[]ParamSpec{{"s", S{"id", "Str"}}, {"i", S{"id", "Int"}}, {"j", S{"id", "Int"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
-			i := int(ctx.MustArg("i").Data.(int64))
-			j := int(ctx.MustArg("j").Data.(int64))
+			s := ctx.Arg("s").Data.(string)
+			i := int(ctx.Arg("i").Data.(int64))
+			j := int(ctx.Arg("j").Data.(int64))
 			r := []rune(s)
 			if i < 0 {
 				i = 0
@@ -50,7 +50,7 @@ Returns:
 		"toLower",
 		[]ParamSpec{{"s", S{"id", "Str"}}},
 		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.MustArg("s").Data.(string))) },
+		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.Arg("s").Data.(string))) },
 	)
 	setBuiltinDoc(ip, "toLower", `Lowercase conversion (Unicode aware).
 
@@ -64,7 +64,7 @@ Returns:
 		"toUpper",
 		[]ParamSpec{{"s", S{"id", "Str"}}},
 		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.MustArg("s").Data.(string))) },
+		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.Arg("s").Data.(string))) },
 	)
 	setBuiltinDoc(ip, "toUpper", `Uppercase conversion (Unicode aware).
 
@@ -89,7 +89,7 @@ Returns:
 	ip.RegisterNative("strip",
 		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(true, true)(ctx.MustArg("s").Data.(string)))
+			return Str(trimFunc(true, true)(ctx.Arg("s").Data.(string)))
 		},
 	)
 	setBuiltinDoc(ip, "strip", `Remove leading and trailing whitespace (Unicode).
@@ -103,7 +103,7 @@ Returns:
 	ip.RegisterNative("lstrip",
 		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(true, false)(ctx.MustArg("s").Data.(string)))
+			return Str(trimFunc(true, false)(ctx.Arg("s").Data.(string)))
 		},
 	)
 	setBuiltinDoc(ip, "lstrip", `Remove leading whitespace (Unicode).
@@ -117,7 +117,7 @@ Returns:
 	ip.RegisterNative("rstrip",
 		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(trimFunc(false, true)(ctx.MustArg("s").Data.(string)))
+			return Str(trimFunc(false, true)(ctx.Arg("s").Data.(string)))
 		},
 	)
 	setBuiltinDoc(ip, "rstrip", `Remove trailing whitespace (Unicode).
@@ -133,8 +133,8 @@ Returns:
 		[]ParamSpec{{"s", S{"id", "Str"}}, {"sep", S{"id", "Str"}}},
 		S{"array", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s").Data.(string)
-			sep := ctx.MustArg("sep").Data.(string)
+			s := ctx.Arg("s").Data.(string)
+			sep := ctx.Arg("sep").Data.(string)
 			parts := strings.Split(s, sep)
 			out := make([]Value, len(parts))
 			for i := range parts {
@@ -159,8 +159,8 @@ Returns:
 		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			xs := ctx.MustArg("xs").Data.(*ArrayObject).Elems
-			sep := ctx.MustArg("sep").Data.(string)
+			xs := ctx.Arg("xs").Data.(*ArrayObject).Elems
+			sep := ctx.Arg("sep").Data.(string)
 			strs := make([]string, len(xs))
 			for i := range xs {
 				strs[i] = xs[i].Data.(string)
@@ -183,8 +183,8 @@ Returns:
 		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
 		S{"array", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pat := ctx.MustArg("pattern").Data.(string)
-			s := ctx.MustArg("string").Data.(string)
+			pat := ctx.Arg("pattern").Data.(string)
+			s := ctx.Arg("string").Data.(string)
 			re, err := regexp.Compile(pat)
 			if err != nil {
 				// Soft error: invalid regex
@@ -213,9 +213,9 @@ Returns:
 		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"replace", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pat := ctx.MustArg("pattern").Data.(string)
-			rep := ctx.MustArg("replace").Data.(string)
-			s := ctx.MustArg("string").Data.(string)
+			pat := ctx.Arg("pattern").Data.(string)
+			rep := ctx.Arg("replace").Data.(string)
+			s := ctx.Arg("string").Data.(string)
 			re, err := regexp.Compile(pat)
 			if err != nil {
 				// Soft error: invalid regex

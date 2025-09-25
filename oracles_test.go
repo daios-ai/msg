@@ -42,7 +42,7 @@ func registerFakeOracleWithCapture(ip *Interpreter, raw string, outPrompt *strin
 		func(_ *Interpreter, ctx CallCtx) Value {
 			// capture the prompt for inspection in tests
 			if outPrompt != nil {
-				if p, ok := ctx.Arg("prompt"); ok && p.Tag == VTStr {
+				if p := ctx.Arg("prompt"); p.Tag == VTStr {
 					*outPrompt = p.Data.(string)
 				}
 			}
@@ -65,7 +65,7 @@ func registerJSONParse(ip *Interpreter) {
 		[]ParamSpec{{Name: "text", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			raw := ctx.MustArg("text").Data.(string)
+			raw := ctx.Arg("text").Data.(string)
 			var x any
 			if err := json.Unmarshal([]byte(raw), &x); err != nil {
 				return annotNull("json parse error")

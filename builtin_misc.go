@@ -25,7 +25,7 @@ func registerRandomBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n")
+			n := ctx.Arg("n")
 			rngMu.Lock()
 			rng.Seed(n.Data.(int64))
 			rngMu.Unlock()
@@ -47,7 +47,7 @@ Returns:
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Int"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("n").Data.(int64)
+			n := ctx.Arg("n").Data.(int64)
 			// Contractual: n must be > 0 (hard error)
 			if n <= 0 {
 				fail("randInt: n must be > 0")
@@ -100,7 +100,7 @@ func registerCastBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("src").Data.(string)
+			s := ctx.Arg("src").Data.(string)
 			out, err := Pretty(s)
 			if err != nil {
 				return annotNull(err.Error())
@@ -124,7 +124,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(FormatValue(ctx.MustArg("x")))
+			return Str(FormatValue(ctx.Arg("x")))
 		},
 	)
 	setBuiltinDoc(ip, "formatValue", `Render a runtime value (with annotations).
@@ -144,7 +144,7 @@ Returns:
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			// Normalize modules to maps so they print as their map view.
-			in := AsMapValue(ctx.MustArg("x"))
+			in := AsMapValue(ctx.Arg("x"))
 			// Functions, types, and handles are intentionally not printable.
 			switch in.Tag {
 			case VTFun, VTType, VTHandle:
@@ -171,7 +171,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
+			v := ctx.Arg("x")
 			switch v.Tag {
 			case VTInt:
 				return v
@@ -212,7 +212,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Num"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
+			v := ctx.Arg("x")
 			switch v.Tag {
 			case VTNum:
 				return v
@@ -253,7 +253,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
+			v := ctx.Arg("x")
 			switch v.Tag {
 			case VTBool:
 				return v
@@ -297,7 +297,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.MustArg("x"))
+			x := AsMapValue(ctx.Arg("x"))
 			switch x.Tag {
 			case VTArray:
 				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
@@ -350,7 +350,7 @@ Returns:
 			[]ParamSpec{{Name: "x", Type: S{"id", "Num"}}},
 			S{"id", "Num"},
 			func(_ *Interpreter, ctx CallCtx) Value {
-				return Num(f(ctx.MustArg("x").Data.(float64)))
+				return Num(f(ctx.Arg("x").Data.(float64)))
 			},
 		)
 		setBuiltinDoc(ip, name, doc)
@@ -406,7 +406,7 @@ Returns:
 		},
 		S{"id", "Num"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Num(math.Pow(ctx.MustArg("base").Data.(float64), ctx.MustArg("exp").Data.(float64)))
+			return Num(math.Pow(ctx.Arg("base").Data.(float64), ctx.Arg("exp").Data.(float64)))
 		},
 	)
 	setBuiltinDoc(ip, "pow", `Power: base^exp.
@@ -428,7 +428,7 @@ func registerProcessBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "code", Type: S{"unop", "?", S{"id", "Int"}}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			codeV := ctx.MustArg("code")
+			codeV := ctx.Arg("code")
 			code := 0
 			if codeV.Tag == VTInt {
 				code = int(codeV.Data.(int64))

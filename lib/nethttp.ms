@@ -206,7 +206,7 @@ end
 # Value -> Stream adapter (public)
 # =========================
 
-let value = fun(fn: type Request -> Any?) -> _StreamFn do
+let value = fun(fn: Request -> Any?) -> _StreamFn do
 	return fun(req: Request, res: Responder) -> Null do
 		let r = try(fun(_: Null) do fn(req) end)
 		if not r.ok then
@@ -363,7 +363,7 @@ let router = fun(_: Null) -> {} do
 		end,
 
 		# Register a value handler (sugar)
-		handleValue: fun(method: Str, pattern: Str, handler: type Request -> Any?) -> Bool do
+		handleValue: fun(method: Str, pattern: Str, handler: Request -> Any?) -> Bool do
 			let s = value(handler)
 			_routes = _routes + [_mkRoute(method, pattern, s, "value")]
 			true

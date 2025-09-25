@@ -34,7 +34,7 @@ func registerCompressionBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "data", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			arg := ctx.MustArg("data")
+			arg := ctx.Arg("data")
 			if arg.Tag != VTStr {
 				fail("gzipCompress: data must be Str")
 			}
@@ -84,7 +84,7 @@ Notes:
 		[]ParamSpec{{Name: "data", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			arg := ctx.MustArg("data")
+			arg := ctx.Arg("data")
 			if arg.Tag != VTStr {
 				fail("gzipDecompress: data must be Str")
 			}

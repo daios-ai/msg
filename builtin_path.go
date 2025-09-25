@@ -26,7 +26,7 @@ func registerPathBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "parts", Type: S{"array", S{"id", "Str"}}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("parts")
+			pv := ctx.Arg("parts")
 			if pv.Tag != VTArray {
 				fail("pathJoin: parts must be [Str]")
 			}
@@ -147,7 +147,7 @@ Notes:
 // mustStrArg is a tiny helper for native implementations in this file.
 // It fails with a consistent message if the named argument is not a Str.
 func mustStrArg(fn string, ctx CallCtx, name string) string {
-	v := ctx.MustArg(name)
+	v := ctx.Arg(name)
 	if v.Tag != VTStr {
 		fail(fmt.Sprintf("%s: %s must be Str", fn, name))
 	}

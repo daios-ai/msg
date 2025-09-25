@@ -53,7 +53,7 @@ func registerOsBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "name", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			n := ctx.MustArg("name").Data.(string)
+			n := ctx.Arg("name").Data.(string)
 			if v, ok := os.LookupEnv(n); ok {
 				return Str(v)
 			}
@@ -75,9 +75,9 @@ Returns:
 		},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			name := ctx.MustArg("name").Data.(string)
-			v, ok := ctx.Arg("value")
-			if ok && v.Tag == VTStr {
+			name := ctx.Arg("name").Data.(string)
+			v := ctx.Arg("value")
+			if v.Tag == VTStr {
 				if err := os.Setenv(name, v.Data.(string)); err != nil {
 					return annotNull(err.Error())
 				}
@@ -113,7 +113,7 @@ Returns:
 			S{"pair!", S{"str", "mode"}, S{"id", "Int"}},
 		}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			p := ctx.MustArg("path").Data.(string)
+			p := ctx.Arg("path").Data.(string)
 			info, err := os.Stat(p)
 			if err != nil {
 				return annotNull(err.Error())
@@ -145,7 +145,7 @@ Returns:
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			p := ctx.MustArg("path").Data.(string)
+			p := ctx.Arg("path").Data.(string)
 			// Create intermediate directories for practicality.
 			if err := os.MkdirAll(p, 0o755); err != nil {
 				return annotNull(err.Error())
@@ -169,8 +169,8 @@ Returns:
 		},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			oldP := ctx.MustArg("old").Data.(string)
-			newP := ctx.MustArg("new").Data.(string)
+			oldP := ctx.Arg("old").Data.(string)
+			newP := ctx.Arg("new").Data.(string)
 			if err := os.Rename(oldP, newP); err != nil {
 				return annotNull(err.Error())
 			}
@@ -191,7 +191,7 @@ Returns:
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			p := ctx.MustArg("path").Data.(string)
+			p := ctx.Arg("path").Data.(string)
 			// Be conservative: don't remove recursively.
 			if err := os.Remove(p); err != nil {
 				return annotNull(err.Error())
@@ -229,7 +229,7 @@ Returns:
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			p := ctx.MustArg("path").Data.(string)
+			p := ctx.Arg("path").Data.(string)
 			if err := os.Chdir(p); err != nil {
 				return annotNull(err.Error())
 			}
@@ -373,8 +373,8 @@ func registerIOBuiltins(ip *Interpreter) {
 		},
 		S{"unop", "?", S{"id", "Any"}}, // Any?
 		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			mv := ctx.MustArg("mode")
+			pv := ctx.Arg("path")
+			mv := ctx.Arg("mode")
 			if pv.Tag != VTStr {
 				fail("open expects path: Str")
 			}
@@ -410,7 +410,7 @@ Returns:
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(ip *Interpreter, ctx CallCtx) Value {
-			h := asHandle(ctx.MustArg("h"), "")
+			h := asHandle(ctx.Arg("h"), "")
 			var errMsg string
 			switch h.Kind {
 			case "file":
@@ -468,7 +468,7 @@ Returns:
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			rb, _ := getReader(ctx.MustArg("h"))
+			rb, _ := getReader(ctx.Arg("h"))
 			b, err := io.ReadAll(rb)
 			if err != nil {
 				return annotNull(err.Error())
@@ -486,8 +486,8 @@ Returns null (annotated) on I/O error.`)
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}, {Name: "n", Type: S{"id", "Int"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			rb, _ := getReader(ctx.MustArg("h"))
-			nv := ctx.MustArg("n")
+			rb, _ := getReader(ctx.Arg("h"))
+			nv := ctx.Arg("n")
 			n := int(nv.Data.(int64))
 			if n < 0 {
 				fail("readN expects n >= 0")
@@ -510,7 +510,7 @@ Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			rb, _ := getReader(ctx.MustArg("h"))
+			rb, _ := getReader(ctx.Arg("h"))
 			s, err := rb.ReadString('\n')
 			if errors.Is(err, io.EOF) && s == "" {
 				return Null
@@ -531,8 +531,8 @@ Returns null at EOF. Returns null (annotated) on I/O error.`)
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}, {Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			wb, _ := getWriter(ctx.MustArg("h"))
-			sv := ctx.MustArg("s")
+			wb, _ := getWriter(ctx.Arg("h"))
+			sv := ctx.Arg("s")
 			n, err := wb.WriteString(sv.Data.(string))
 			if err != nil {
 				return annotNull(err.Error())
@@ -550,7 +550,7 @@ Output is buffered; call flush to ensure delivery.`)
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
 		func(ip *Interpreter, ctx CallCtx) Value {
-			wb, _ := getWriter(ctx.MustArg("h"))
+			wb, _ := getWriter(ctx.Arg("h"))
 			if err := wb.Flush(); err != nil {
 				return annotNull(err.Error())
 			}
@@ -570,7 +570,7 @@ Returns:
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
+			pv := ctx.Arg("path")
 			b, err := os.ReadFile(pv.Data.(string))
 			if err != nil {
 				return annotNull(err.Error())
@@ -591,8 +591,8 @@ Returns:
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}, {Name: "data", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Int"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
-			dv := ctx.MustArg("data")
+			pv := ctx.Arg("path")
+			dv := ctx.Arg("data")
 			data := dv.Data.(string)
 			if err := os.WriteFile(pv.Data.(string), []byte(data), 0o644); err != nil {
 				return annotNull(err.Error())
@@ -610,7 +610,7 @@ Returns the number of bytes written as Int, or null (annotated) on I/O error.`)
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"array", S{"id", "Str"}}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
+			pv := ctx.Arg("path")
 			ents, err := os.ReadDir(pv.Data.(string))
 			if err != nil {
 				return annotNull(err.Error())
@@ -639,8 +639,8 @@ Returns:
 		},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			f := ctx.MustArg("fmt").Data.(string)
-			as := ctx.MustArg("args").Data.(*ArrayObject).Elems
+			f := ctx.Arg("fmt").Data.(string)
+			as := ctx.Arg("args").Data.(*ArrayObject).Elems
 			goArgs := make([]any, len(as))
 			for i := range as {
 				goArgs[i] = fmtArgFromValue(as[i])
@@ -675,8 +675,8 @@ Returns:
 		},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			f := ctx.MustArg("fmt").Data.(string)
-			as := ctx.MustArg("args").Data.(*ArrayObject).Elems
+			f := ctx.Arg("fmt").Data.(string)
+			as := ctx.Arg("args").Data.(*ArrayObject).Elems
 			goArgs := make([]any, len(as))
 			for i := range as {
 				goArgs[i] = fmtArgFromValue(as[i])

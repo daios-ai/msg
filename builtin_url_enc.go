@@ -43,7 +43,7 @@ func registerEncodingURLBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
+			x := ctx.Arg("x")
 			if x.Tag != VTStr {
 				fail("base64Encode: x must be Str")
 			}
@@ -65,7 +65,7 @@ Returns:
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s")
+			s := ctx.Arg("s")
 			if s.Tag != VTStr {
 				fail("base64Decode: s must be Str")
 			}
@@ -90,7 +90,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
+			x := ctx.Arg("x")
 			if x.Tag != VTStr {
 				fail("hexEncode: x must be Str")
 			}
@@ -112,7 +112,7 @@ Returns:
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			s := ctx.MustArg("s")
+			s := ctx.Arg("s")
 			if s.Tag != VTStr {
 				fail("hexDecode: s must be Str")
 			}
@@ -138,7 +138,7 @@ Returns:
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"map"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			sv := ctx.MustArg("s")
+			sv := ctx.Arg("s")
 			if sv.Tag != VTStr {
 				fail("urlParse: s must be Str")
 			}
@@ -218,7 +218,7 @@ Notes:
 		[]ParamSpec{{Name: "u", Type: S{"map"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			uv := ctx.MustArg("u")
+			uv := ctx.Arg("u")
 			if uv.Tag != VTMap {
 				fail("urlBuild: u must be {}")
 			}
@@ -343,7 +343,7 @@ Notes:
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"map"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			sv := ctx.MustArg("s")
+			sv := ctx.Arg("s")
 			if sv.Tag != VTStr {
 				fail("urlQueryParse: s must be Str")
 			}
@@ -388,7 +388,7 @@ Notes:
 		[]ParamSpec{{Name: "q", Type: S{"map"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			qv := ctx.MustArg("q")
+			qv := ctx.Arg("q")
 			if qv.Tag != VTMap {
 				fail("urlQueryString: q must be {}")
 			}

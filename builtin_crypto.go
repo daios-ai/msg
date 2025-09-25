@@ -28,7 +28,7 @@ func registerCryptoBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
 		func(_ *Interpreter, ctx CallCtx) Value {
-			nv := ctx.MustArg("n")
+			nv := ctx.Arg("n")
 			n := nv.Data.(int64)
 			if n < 0 {
 				fail("randBytes: n must be >= 0")
@@ -62,7 +62,7 @@ Notes:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x").Data.(string)
+			x := ctx.Arg("x").Data.(string)
 			sum := sha256.Sum256([]byte(x))
 			return Str(string(sum[:]))
 		},
@@ -85,8 +85,8 @@ Returns:
 		},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			key := []byte(ctx.MustArg("key").Data.(string))
-			msg := []byte(ctx.MustArg("msg").Data.(string))
+			key := []byte(ctx.Arg("key").Data.(string))
+			msg := []byte(ctx.Arg("msg").Data.(string))
 			m := hmac.New(sha256.New, key)
 			_, _ = m.Write(msg)
 			mac := m.Sum(nil)
@@ -115,8 +115,8 @@ Notes:
 		},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			a := []byte(ctx.MustArg("a").Data.(string))
-			b := []byte(ctx.MustArg("b").Data.(string))
+			a := []byte(ctx.Arg("a").Data.(string))
+			b := []byte(ctx.Arg("b").Data.(string))
 			ok := subtle.ConstantTimeCompare(a, b) == 1
 			return Bool(ok)
 		},

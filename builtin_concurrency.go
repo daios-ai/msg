@@ -160,7 +160,7 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f")
+			fv := ctx.Arg("f")
 			if fv.Tag != VTFun {
 				fail("procSpawn expects a function")
 			}
@@ -232,7 +232,7 @@ Returns:
 		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.MustArg("p"), "proc").Data.(*procState)
+			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
 			<-pr.done
 			return pr.result
 		},
@@ -251,7 +251,7 @@ Returns:
 		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.MustArg("p"), "proc").Data.(*procState)
+			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
 			// Close once; if already closed, signal soft error.
 			closed := false
 			func() {
@@ -284,7 +284,7 @@ Returns:
 		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.MustArg("p"), "proc").Data.(*procState)
+			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
 			select {
 			case <-pr.cancel:
 				return Bool(true)
@@ -309,7 +309,7 @@ Returns:
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
 		S{"array", S{"id", "Any"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ps := ctx.MustArg("ps").Data.(*ArrayObject).Elems
+			ps := ctx.Arg("ps").Data.(*ArrayObject).Elems
 			out := make([]Value, len(ps))
 			for i, p := range ps {
 				pr := asHandle(p, "proc").Data.(*procState)
@@ -333,7 +333,7 @@ Returns:
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
 		S{"unop", "?", S{"map"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ps := ctx.MustArg("ps").Data.(*ArrayObject).Elems
+			ps := ctx.Arg("ps").Data.(*ArrayObject).Elems
 			if len(ps) == 0 {
 				return errNull("procJoinAny: empty list")
 			}
@@ -377,7 +377,7 @@ Errors:
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			capacity := int64(0)
-			if v, ok := ctx.Arg("cap"); ok && v.Tag == VTInt {
+			if v := ctx.Arg("cap"); v.Tag == VTInt {
 				capacity = v.Data.(int64)
 				if capacity < 0 {
 					fail("chanOpen: cap must be >= 0")
@@ -402,8 +402,8 @@ Returns:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			x := ctx.MustArg("x")
+			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
+			x := ctx.Arg("x")
 			ok := true
 			func() {
 				defer func() {
@@ -434,7 +434,7 @@ Returns:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
 			v, ok := <-cb.ch
 			if !ok {
 				return annotNull("channel closed")
@@ -459,8 +459,8 @@ Errors:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
-			x := ctx.MustArg("x")
+			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
+			x := ctx.Arg("x")
 			sent := false
 			func() {
 				defer func() {
@@ -493,7 +493,7 @@ Returns:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"map"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
 			out := &MapObject{
 				Entries: map[string]Value{},
 				KeyAnn:  map[string]string{},
@@ -534,7 +534,7 @@ Returns:
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			cb := asHandle(ctx.MustArg("c"), "chan").Data.(*chanBox)
+			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
 			first := true
 			func() {
 				defer func() {
@@ -567,7 +567,7 @@ Returns:
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms").Data.(int64)
+			ms := ctx.Arg("ms").Data.(int64)
 			if ms < 0 {
 				fail("timerAfter: ms must be >= 0")
 			}
@@ -600,7 +600,7 @@ Errors:
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			ms := ctx.MustArg("ms").Data.(int64)
+			ms := ctx.Arg("ms").Data.(int64)
 			if ms <= 0 {
 				fail("ticker: ms must be > 0")
 			}

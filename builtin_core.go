@@ -14,7 +14,7 @@ func registerCoreBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
 		S{"id", "Null"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			mv := ctx.MustArg("message")
+			mv := ctx.Arg("message")
 			msg := "error"
 			if mv.Tag == VTStr {
 				msg = mv.Data.(string)
@@ -37,7 +37,7 @@ Returns:
 		[]ParamSpec{{Name: "f", Type: S{"binop", "->", S{"id", "Null"}, S{"id", "Any"}}}},
 		S{"map"}, // lax: a map with ok/value/error
 		func(ip *Interpreter, ctx CallCtx) Value {
-			fv := ctx.MustArg("f") // type-checked by runtime to be (Null -> Any)
+			fv := ctx.Arg("f") // type-checked by runtime to be (Null -> Any)
 
 			out := Map(map[string]Value{
 				"ok":    Bool(false),
@@ -112,7 +112,7 @@ Notes:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return cloneValue(ctx.MustArg("x"))
+			return cloneValue(ctx.Arg("x"))
 		},
 	)
 	setBuiltinDoc(ip, "clone", `Clone a value (deep-copy).
@@ -157,7 +157,7 @@ Returns:
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Type"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
+			x := ctx.Arg("x")
 			return TypeValIn(ip.ValueToType(x, ctx.Env()), ctx.Env())
 		},
 	)
@@ -180,8 +180,8 @@ Returns: Type`)
 		},
 		S{"id", "Bool"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			x := ctx.MustArg("x")
-			Tv := ctx.MustArg("T")
+			x := ctx.Arg("x")
+			Tv := ctx.Arg("T")
 			if Tv.Tag != VTType {
 				fail("isType expects a Type as second argument")
 			}
@@ -205,8 +205,8 @@ Returns: Bool`)
 		},
 		S{"id", "Bool"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			Av := ctx.MustArg("A")
-			Bv := ctx.MustArg("B")
+			Av := ctx.Arg("A")
+			Bv := ctx.Arg("B")
 			if Av.Tag != VTType || Bv.Tag != VTType {
 				fail("isSubtype expects Types as both arguments")
 			}
@@ -234,7 +234,7 @@ Returns: Bool`)
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			pv := ctx.MustArg("path")
+			pv := ctx.Arg("path")
 			if pv.Tag != VTStr {
 				fail("import expects path: Str")
 			}
@@ -279,8 +279,8 @@ Returns:
 		},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			nv := ctx.MustArg("name")
-			sv := ctx.MustArg("src")
+			nv := ctx.Arg("name")
+			sv := ctx.Arg("src")
 			if nv.Tag != VTStr || sv.Tag != VTStr {
 				fail("importCode expects (name: Str, src: Str)")
 			}
@@ -320,8 +320,8 @@ Returns:
 		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("obj")
-			k := ctx.MustArg("key").Data.(string)
+			v := ctx.Arg("obj")
+			k := ctx.Arg("key").Data.(string)
 			if v.Tag != VTMap {
 				fail("mapHas expects a map")
 			}
@@ -345,8 +345,8 @@ Returns:
 		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
 		S{"map"}, // returns the (mutated) input map
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("obj")
-			k := ctx.MustArg("key").Data.(string)
+			v := ctx.Arg("obj")
+			k := ctx.Arg("key").Data.(string)
 			if v.Tag != VTMap {
 				fail("mapDelete expects a map")
 			}
@@ -388,12 +388,12 @@ Returns:
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}, {Name: "v", Type: S{"id", "Any"}}},
 		S{"array", S{"id", "Any"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			a := ctx.MustArg("arr")
+			a := ctx.Arg("arr")
 			if a.Tag != VTArray {
 				fail("push expects array")
 			}
 			ao := a.Data.(*ArrayObject)
-			ao.Elems = append(ao.Elems, ctx.MustArg("v"))
+			ao.Elems = append(ao.Elems, ctx.Arg("v"))
 			return a
 		},
 	)
@@ -412,12 +412,12 @@ Returns:
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}, {Name: "v", Type: S{"id", "Any"}}},
 		S{"array", S{"id", "Any"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			a := ctx.MustArg("arr")
+			a := ctx.Arg("arr")
 			if a.Tag != VTArray {
 				fail("unshift expects array")
 			}
 			ao := a.Data.(*ArrayObject)
-			v := ctx.MustArg("v")
+			v := ctx.Arg("v")
 			ao.Elems = append([]Value{v}, ao.Elems...)
 			return a
 		},
@@ -437,7 +437,7 @@ Returns:
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			a := ctx.MustArg("arr")
+			a := ctx.Arg("arr")
 			if a.Tag != VTArray {
 				fail("pop expects array")
 			}
@@ -467,7 +467,7 @@ Returns:
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			a := ctx.MustArg("arr")
+			a := ctx.Arg("arr")
 			if a.Tag != VTArray {
 				fail("shift expects array")
 			}

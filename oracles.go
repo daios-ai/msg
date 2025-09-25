@@ -303,7 +303,7 @@ func valueMapFromArgs(ctx CallCtx, names []string) Value {
 	entries := make(map[string]Value, len(names))
 	keys := make([]string, 0, len(names))
 	for _, name := range names {
-		v, _ := ctx.Arg(name) // if missing, omit/zero-value
+		v := ctx.Arg(name) // if missing, omit/zero-value
 		entries[name] = v
 		keys = append(keys, name)
 	}

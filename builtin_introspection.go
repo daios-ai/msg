@@ -97,7 +97,7 @@ func registerIntrospectionBuiltins(ip *Interpreter) {
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.MustArg("x")
+			v := ctx.Arg("x")
 			if v.Annot == "" {
 				return Null
 			}
@@ -122,8 +122,8 @@ Notes:
 		},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			text := ctx.MustArg("text").Data.(string)
-			v := ctx.MustArg("value")
+			text := ctx.Arg("text").Data.(string)
+			v := ctx.Arg("value")
 			v.Annot = text
 			return v
 		},
@@ -145,7 +145,7 @@ Notes:
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"array"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			arg := ctx.MustArg("src")
+			arg := ctx.Arg("src")
 			if arg.Tag != VTStr {
 				fail("astParse: src must be Str")
 			}
@@ -172,7 +172,7 @@ Notes:
 		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("ast")
+			av := ctx.Arg("ast")
 			sexpr, soft := decodeAndValidate(av)
 			if sexpr == nil {
 				return soft
@@ -197,7 +197,7 @@ Returns:
 		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("ast")
+			av := ctx.Arg("ast")
 			sexpr, soft := decodeAndValidate(av)
 			if sexpr == nil {
 				return soft
@@ -219,7 +219,7 @@ Returns:
 		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
 		S{"array"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("ast")
+			av := ctx.Arg("ast")
 			// If not an array or cannot decode: return a single standardized error object.
 			if av.Tag != VTArray {
 				return valShapeErrors("expected []")
@@ -248,7 +248,7 @@ Returns:
 		[]ParamSpec{{Name: "val", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"array"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return IxReflect(ctx.MustArg("val"))
+			return IxReflect(ctx.Arg("val"))
 		},
 	)
 	setBuiltinDoc(ip, "reflect", `Reflect a value into constructor code (runtime-S).
@@ -266,7 +266,7 @@ Soft errors:
 		[]ParamSpec{{Name: "rt", Type: S{"array"}}},
 		S{"id", "Any"},
 		func(ip *Interpreter, ctx CallCtx) Value {
-			av := ctx.MustArg("rt")
+			av := ctx.Arg("rt")
 			sexpr, soft := decodeAndValidate(av)
 			if sexpr == nil {
 				return soft

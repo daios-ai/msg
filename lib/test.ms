@@ -1,7 +1,5 @@
-
-
-let Test = type {"name": Str, "age": Int}
+let Test = type {name: Str, age: Int}
 
 let print = fun(t) do
-    printf("[print] " + formatValue(t) + "\n", [])
+	printf("[print] " + formatValue(t) + "\n", [])
 end

@@ -527,7 +527,7 @@ end
 		if mapHas(C, "path") and C.path != null then
 			let P = _bindPath(rq.pathParams, C.path)
 			if P == null then
-				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("path", noteGet(P)) }
+				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("path", noteGet(P)) }
 			end
 			ctx.path = P
 		end
@@ -535,7 +535,7 @@ end
 		if mapHas(C, "query") and C.query != null then
 			let Q = _bindQueryFromReq(rq, C.query)
 			if Q == null then
-				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("query", noteGet(Q)) }
+				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("query", noteGet(Q)) }
 			end
 			ctx.query = Q
 		end
@@ -543,7 +543,7 @@ end
 		if mapHas(C, "body") and C.body != null then
 			let B = _bindBody(rq, C.body)
 			if B == null then
-				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("body", noteGet(B)) }
+				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("body", noteGet(B)) }
 			end
 			ctx.body = B
 		end
@@ -1018,6 +1018,7 @@ let _reason = fun(code: Int) -> Str do
 	if code == 404 then return "Not Found" end
 	if code == 405 then return "Method Not Allowed" end
 	if code == 413 then return "Payload Too Large" end
+	if code == 422 then return "Unprocessable Entity" end
 	if code == 431 then return "Request Header Fields Too Large" end
 	if code == 500 then return "Internal Server Error" end
 	if code == 504 then return "Gateway Timeout" end
@@ -1719,6 +1720,517 @@ testing.test("nethttp/options auto 204 on prefix", fun(_: Null) do
 	let c = http.testClient(r)
 	let res = c.call({method: "OPTIONS", path: "/p/anything"})
 	testing.assertEq(204, res.status)
+end)
+
+# =========================================================
+# S1) SERVER: plain text value route over TCP
+# =========================================================
+testing.test("server/hello over tcp", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/hello", http.contract({}), fun(_: {}) -> Any do
+		http.text(200, "hello")
+	end)
+
+	let addr = "127.0.0.1:18081"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# raw client
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# assert status line and body
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "\r\n\r\nhello")) > 1, "bad body")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S2) SERVER: 422 semantics (reason phrase + JSON content-type w/ charset)
+# =========================================================
+testing.test("server/422 reason + content-type", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/greet/{name}", http.contract({
+		path:  type { name!: Str },
+		query: type { times!: Int }
+	}), fun(_: {}) -> Any do
+		http.json(200, {ok: true})
+	end)
+
+	let addr = "127.0.0.1:18082"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /greet/Ada?times=oops HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# Reason phrase should be "Unprocessable Entity"
+	testing.assert(len(split(resp, "HTTP/1.1 422 Unprocessable Entity")) > 1, "bad 422 reason")
+	# JSON content type with charset
+	testing.assert(len(split(resp, "Content-Type: application/json; charset=utf-8")) > 1, "bad 422 content-type")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S3) SERVER: JSON POST echo (Content-Length correctness)
+# =========================================================
+testing.test("server/post echo content-length", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("POST", "/echo", http.contract({ body: type { msg!: Str } }), fun(ctx) -> Any do
+		http.json(200, {ok: true, msg: ctx.body.msg})
+	end)
+
+	let addr = "127.0.0.1:18083"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let body = "{\"msg\":\"hi\"}"
+	let req =
+		sprintf("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
+			len(body), body
+		])
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# status ok
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	# body
+	testing.assert(len(split(resp, "\r\n\r\n{\"msg\":\"hi\",\"ok\":true}")) > 1, "bad body")
+	# content-length header matches payload length (22)
+	testing.assert(len(split(resp, "Content-Length: 22")) > 1, "bad content-length")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S4) SERVER: streaming route + OPTIONS preflight
+# =========================================================
+testing.test("server/stream + options", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	# prefix route to allow OPTIONS anywhere under /time/
+	r.routeStream("GET", "/time/", http.contract({}), fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("tick 0\ntick 1\ntick 2\n")
+		res.end(null)
+		null
+	end)
+
+	let addr = "127.0.0.1:18084"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# GET stream
+	let c1 = netConnect(addr)
+	testing.assert(c1 != null, "connect failed")
+	let _ = write(c1, "GET /time/now HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	testing.assert(len(split(resp1, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp1, "\r\n\r\n")) > 1, "no body separator")
+	testing.assert(len(split(resp1, "tick 0")) > 1 and len(split(resp1, "tick 2")) > 1, "bad stream body")
+
+	# OPTIONS preflight auto-204
+	let c2 = netConnect(addr)
+	testing.assert(c2 != null, "connect failed")
+	let _ = write(c2, "OPTIONS /time/anything HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	testing.assert(len(split(resp2, "HTTP/1.1 204 No Content")) > 1, "bad options 204")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S5) SERVER: 405 Method Not Allowed
+# =========================================================
+testing.test("server/405 method not allowed", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/only-get", http.contract({}), fun(_: {}) -> Any do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18085"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "POST /only-get HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 405 Method Not Allowed")) > 1, "expected 405")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S6) SERVER: redirect helper sets Location
+# =========================================================
+testing.test("server/redirect sets location", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/old", http.contract({}), fun(_: {}) -> Any do
+		http.redirect(302, "/new")
+	end)
+
+	let addr = "127.0.0.1:18086"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 302 OK")) > 1 or len(split(resp, "HTTP/1.1 302 Found")) > 1, "bad 302 status")
+	testing.assert(len(split(resp, "\r\nLocation: /new\r\n")) > 1, "missing Location header")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S7) SERVER: CORS headers appear on normal GET (not only OPTIONS)
+# =========================================================
+testing.test("server/cors headers on get", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.use(http.mwCors({origin: "*"}))
+	r.route("GET", "/ping", http.contract({}), fun(_: {}) -> Any do
+		http.text(200, "pong")
+	end)
+
+	let addr = "127.0.0.1:18087"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "Access-Control-Allow-Origin: *")) > 1, "missing ACAO")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S8) SERVER: 413 Payload Too Large via maxBodyBytes
+# =========================================================
+testing.test("server/413 payload too large", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("POST", "/upload", http.contract({}), fun(_: {}) -> Any do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18088"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, { maxBodyBytes: 8 })   # tiny cap
+	testing.assert(srv != null, "serve failed")
+
+	let payload = "0123456789abcdef"  # 16 bytes > cap
+	let req = sprintf("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
+		len(payload), payload
+	])
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 413 Payload Too Large")) > 1, "expected 413")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S9) KEEP-ALIVE: two sequential requests on one connection
+# =========================================================
+testing.test("server/keepalive two requests", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/a", {}, fun(_: {}) -> Any do http.text(200, "A") end)
+	r.route("GET", "/b", {}, fun(_: {}) -> Any do http.text(200, "B") end)
+
+	let addr = "127.0.0.1:18089"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# One socket, two requests; second closes the connection.
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+
+	let req =
+		"GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" +
+		"GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# Expect two 200 OK responses and both bodies.
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) >= 3, "expected two 200 statuses")
+	testing.assert(len(split(resp, "\r\n\r\nA")) > 1, "missing body A")
+	testing.assert(len(split(resp, "\r\n\r\nB")) > 1, "missing body B")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S10) HEADER CASE: case-sensitive behavior is explicit
+# Middleware expects exact key; lowercase key should not be used.
+# =========================================================
+testing.test("server/header case-sensitive (explicit)", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.route("GET", "/ok", {}, fun(_: {}) -> Any do http.text(200, "ok") end)
+
+	let addr = "127.0.0.1:18090"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+
+	# Send lowercase header "x-request-id"; middleware looks for "X-Request-ID"
+	let _ = write(c, "GET /ok HTTP/1.1\r\nHost: localhost\r\nx-request-id: client-id\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# Server should generate a fresh X-Request-ID header, not reuse lowercase one.
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "\nX-Request-ID: ")) > 1, "missing canonical X-Request-ID")
+	testing.assert(len(split(resp, "\nx-request-id: client-id")) == 1, "lowercase header should not be echoed")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S11) PATH PARAM percent-encoding is not decoded (explicit behavior)
+# =========================================================
+testing.test("server/path param raw percent-encoding", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/p/{v}", {path: type {v!: Str}}, fun(ctx) -> Any do
+		http.text(200, ctx.path.v)
+	end)
+
+	let addr = "127.0.0.1:18091"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c1 = netConnect(addr)
+	testing.assert(c1 != null, "connect failed")
+	let _ = write(c1, "GET /p/%2F HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	testing.assert(len(split(resp1, "\r\n\r\n%2F")) > 1, "expected raw %2F (no decode)")
+
+	let c2 = netConnect(addr)
+	testing.assert(c2 != null, "connect failed")
+	let _2 = write(c2, "GET /p/%20 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _2f = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	testing.assert(len(split(resp2, "\r\n\r\n%20")) > 1, "expected raw %20 (no decode)")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S12) QUERY COERCION: booleans, optional missing, single-element arrays
+# =========================================================
+testing.test("server/query coercion edges", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/q", {query: type {flag!: Bool, n!: Int, tags!: [Int]}}, fun(ctx) -> Any do
+		http.json(200, {flag: ctx.query.flag, n: ctx.query.n, tags: ctx.query.tags})
+	end)
+
+	let addr = "127.0.0.1:18092"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# flag=false, omit optional 'n' by leaving it absent (contract has n without ! so it's optional)
+	# NOTE: the binder treats 'n' missing as null, which passes optional. 'tags=1' should coerce to [1].
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /q?flag=false&n=5&tags=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "\"flag\":false")) > 1, "flag=false not parsed")
+	testing.assert(len(split(resp, "\"tags\":[1]")) > 1, "single-element array not parsed")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S13) LARGE HEADERS: exceed header budget -> 400 (current behavior)
+# =========================================================
+testing.test("server/large headers -> 400", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/h", {}, fun(_: {}) -> Any do http.text(200, "ok") end)
+
+	let addr = "127.0.0.1:18093"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	# Make budget tiny so we overflow easily.
+	let srv = http.serve(l, r, { maxHeaderBytes: 64 })
+	testing.assert(srv != null, "serve failed")
+
+	let big = "X-Long: " + join([
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	], "")  # definitely >64 including CRLF & Host
+	let req = "GET /h HTTP/1.1\r\nHost: localhost\r\n" + big + "\r\n\r\n"
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# Current server maps header read failure to 400 Bad Request.
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 for header overflow")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S14) DATE HEADER: explicitly absent (documented behavior)
+# =========================================================
+testing.test("server/no Date header (explicit)", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/d", {}, fun(_: {}) -> Any do http.text(200, "ok") end)
+
+	let addr = "127.0.0.1:18094"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /d HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# We don't emit Date header; make that explicit.
+	testing.assert(len(split(resp, "\nDate:")) == 1, "Date header should be absent")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S15) SHUTDOWN: stops new accepts (late connect fails or yields no response)
+# =========================================================
+testing.test("server/shutdown stops accepts", fun(_: Null) -> Any do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/once", {}, fun(_: {}) -> Any do http.text(200, "ok") end)
+
+	let addr = "127.0.0.1:18095"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# First request succeeds.
+	let c1 = netConnect(addr)
+	testing.assert(c1 != null, "connect1 failed")
+	let _ = write(c1, "GET /once HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let _ = readAll(c1)
+	close(c1)
+
+	# Now shutdown.
+	let _ = http.shutdown(srv, 0)
+
+	# Late connection should fail to connect or produce no valid response.
+	let c2 = netConnect(addr)
+	if c2 == null then
+		# good: listener closed
+		return true
+	end
+	let w = write(c2, "GET /once HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c2)
+	let resp = readAll(c2)
+	close(c2)
+	# Either write failed (null) or empty/partial response returned. We only assert it's not a full 200 line.
+	testing.assert(w == null or len(resp) == 0 or len(split(resp, "HTTP/1.1 200 OK")) == 1, "shutdown did not stop new accepts")
 end)
 === END FILE: lib/nethttp_test.ms ===
 

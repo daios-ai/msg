@@ -526,7 +526,7 @@ end
 		if mapHas(C, "path") and C.path != null then
 			let P = _bindPath(rq.pathParams, C.path)
 			if P == null then
-				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("path", noteGet(P)) }
+				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("path", noteGet(P)) }
 			end
 			ctx.path = P
 		end
@@ -534,7 +534,7 @@ end
 		if mapHas(C, "query") and C.query != null then
 			let Q = _bindQueryFromReq(rq, C.query)
 			if Q == null then
-				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("query", noteGet(Q)) }
+				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("query", noteGet(Q)) }
 			end
 			ctx.query = Q
 		end
@@ -542,7 +542,7 @@ end
 		if mapHas(C, "body") and C.body != null then
 			let B = _bindBody(rq, C.body)
 			if B == null then
-				return { status: 422, headers: {"Content-Type":"application/json"}, body: _validationJSON("body", noteGet(B)) }
+				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("body", noteGet(B)) }
 			end
 			ctx.body = B
 		end
@@ -1017,6 +1017,7 @@ let _reason = fun(code: Int) -> Str do
 	if code == 404 then return "Not Found" end
 	if code == 405 then return "Method Not Allowed" end
 	if code == 413 then return "Payload Too Large" end
+	if code == 422 then return "Unprocessable Entity" end
 	if code == 431 then return "Request Header Fields Too Large" end
 	if code == 500 then return "Internal Server Error" end
 	if code == 504 then return "Gateway Timeout" end

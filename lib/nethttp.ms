@@ -5,14 +5,17 @@
 # - Route-time contracts (FastAPI-like): path / query / body / responses
 # - Pre-binding & validation before handler runs (422 on failure)
 # - Value routes as sugar over the streaming core
-# - Auto OpenAPI from the same route contracts
+# - Auto OpenAPI from the same route contracts (stub for now)
 # - Internals never return null on success; boundary helpers may return annotated null
 #
 # Less is more:
-# - Public surface: router(), route(), routeStream(), contract(), openapiDoc()
+# - Public surface: router(), route(), routeStream(), mount(), contract(), openapiDoc(), testClient()
 #
 # Errors in handlers:
 # - Use a structured _HttpError object to signal HTTP errors from user code.
+#
+# Breaking change (value route handler shape):
+# - Value handlers are now fun(req, ctx) -> {} (previously fun(ctx) -> {})
 
 # =========================
 # Public types (data-only)
@@ -47,11 +50,12 @@ let _HttpError = type {
 }
 
 # Contract (open map; optional fields)
-# path: Type, query: Type, body: Type, responses: {Int: Type}, summary: Str, tags: [Str]
+# path: Type, query: Type, body: Type, responses: {"200": Type, "404": Type, ...}, summary: Str, tags: [Str]
+# NOTE: MindScript maps are JSON-like; use STRING keys for status codes in responses
 let Contract = type {}
 
 # Handler context (open)
-let _Ctx = type { req!: Request, path: {}, query: {}, body: Any }
+let _Ctx = type { req!: Request, path: {}, query: {}, body: Any, deadlineMs: Int? }
 
 # Streaming handler / middleware (3-arg)
 let _StreamFn = type Request -> Responder -> {} -> Null
@@ -97,8 +101,19 @@ let _isParamSeg = fun(seg: Str) -> Bool do
 	n >= 2 and substr(seg, 0, 1) == "{" and substr(seg, n - 1, n) == "}"
 end
 
+let _isCatchSeg = fun(seg: Str) -> Bool do
+	# "{*rest}" ⇒ first char after '{' is '*'
+	let n = len(seg)
+	n >= 3 and substr(seg, 0, 1) == "{" and substr(seg, 1, 2) == "*" and substr(seg, n - 1, n) == "}"
+end
+
 let _paramName = fun(seg: Str) -> Str do
-	substr(seg, 1, len(seg) - 1)
+	# strip braces, then optional leading '*'
+	let name = substr(seg, 1, len(seg) - 1)
+	if len(name) > 0 and substr(name, 0, 1) == "*" then
+		return substr(name, 1, len(name))
+	end
+	name
 end
 
 let _makeURL = fun(path: Str, query: Str?) -> {} do
@@ -233,7 +248,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 						let s = str(pj[j])
 						let u = _coerceScalar(s, U)
 						if u == null then
-                            return null # <bad element for {k}>
+							return null # <bad element for {k}>
 						end
 						arr = arr + [u]
 						j = j + 1
@@ -350,7 +365,7 @@ let _bindBody = fun(req: Request, TB: Type) -> Any? do
 		return null # <invalid json>
 	end
 	if not isType(v, TB) then
-		return null # <validation failed>
+		return null # <validation failed: expected body to satisfy {str(TB)}>
 	end
 	v
 end
@@ -419,16 +434,14 @@ let _newResponder = fun() -> { res: _Response, api: Responder } do
 end
 
 # =========================
-# Router (closure-backed)
+# Router (closure-backed): exact match only + mount(prefix, child)
 # =========================
 
 let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
 	let m = _normMethod(method)
-	let isPrefix = _hasPrefix(pattern, "/") and len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
 	{
 		method: m,
 		pattern: pattern,
-		isPrefix: isPrefix,
 		parts: _splitPath(pattern),
 		call: call,
 		style: style,
@@ -436,31 +449,58 @@ let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Co
 	}
 end
 
-let _pathMatch = fun(parts: [Str], reqSegs: [Str], isPrefix: Bool) -> {}? do
-	if isPrefix and len(reqSegs) < len(parts) then
+let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
+	# Determine if the last segment is a catch-all "{*name}"
+	let nParts = len(parts)
+	let nReq = len(reqSegs)
+	if nParts == 0 then
+		return if nReq == 0 then {params: {}, matched: 0} else null end
+	end
+	let last = nParts - 1
+	let hasCatch = _isCatchSeg(parts[last])
+
+	# Shape checks: exact length unless trailing catch-all, which allows extra segs
+	if not hasCatch and nReq != nParts then
 		return
 	end
-	if not isPrefix and len(reqSegs) != len(parts) then
+	if hasCatch and nReq < last then
 		return
 	end
-	let n = len(parts)
+
+	# Match fixed/param prefix and record single-segment params
+	let params = {}
+	let limit = if hasCatch then last else nParts end
 	let i = 0
-	while i < n do
-		let rp = parts[i]
-		let qp = reqSegs[i]
-		if not _isParamSeg(rp) and rp != qp then
-			return
+	while i < limit do
+		let pat = parts[i]
+		let seg = reqSegs[i]
+		if _isParamSeg(pat) then
+			params[_paramName(pat)] = seg
+		else
+			if pat != seg then
+				return
+			end
 		end
 		i = i + 1
 	end
-	{}
+
+	# Trailing catch-all captures the remainder (can be empty if request ends there)
+	if hasCatch then
+		let name = _paramName(parts[last])
+		let rest = join(slice(reqSegs, last, nReq), "/")
+		params[name] = rest
+	end
+
+	# matched score prefers longer (more specific) patterns
+	{ params: params, matched: if hasCatch then last else nParts end }
 end
 
 let router = fun(_: Null) -> {} do
 	let _routes = []
 	let _mws = []
+	let _mounts = []  # entries: { prefixParts: [Str], child: Router }
 
-	let _match = fun(method: Str, path: Str) -> {}? do
+	let _matchLocal = fun(method: Str, path: Str) -> {}? do
 		let want = _normMethod(method)
 		let segs = _splitPath(path)
 		let best = null
@@ -469,11 +509,12 @@ let router = fun(_: Null) -> {} do
 			if r.method != want then
 				continue
 			end
-			let p = _pathMatch(r.parts, segs, r.isPrefix)
+			let p = _pathMatch(r.parts, segs)
 			if p != null then
-				let s = len(r.parts)
+				# prefer the *actual* matched depth (handles catch-alls cleanly)
+				let s = int(p.matched)
 				if s > score then
-					best = { route: r, segs: segs }
+					best = { route: r, segs: segs, params: p.params }
 					score = s
 				end
 			end
@@ -482,12 +523,12 @@ let router = fun(_: Null) -> {} do
 			return best
 		end
 		null
-end
+	end
 
-	let _pathExists = fun(path: Str) -> Bool do
+	let _pathExistsLocal = fun(path: Str) -> Bool do
 		let segs = _splitPath(path)
 		for r in _routes do
-			if _pathMatch(r.parts, segs, r.isPrefix) != null then
+			if _pathMatch(r.parts, segs) != null then
 				return true
 			end
 		end
@@ -504,13 +545,52 @@ end
 		h
 end
 
+	let _delegateToMount = fun(req: Request) -> _Response? do
+		# Try mounts in registration order; first match wins
+		let segs = _splitPath(req.url.path)
+		for m in _mounts do
+			let pfx = m.prefixParts
+			if len(segs) < len(pfx) then
+				continue
+			end
+			let ok = true
+			let i = 0
+			while i < len(pfx) do
+				if pfx[i] != segs[i] then
+					ok = false
+					break
+				end
+				i = i + 1
+			end
+			if not ok then
+				continue
+			end
+			let rest = slice(segs, len(pfx), len(segs))
+			let subPath = "/" + join(rest, "/")
+			let subReq = {
+				method: req.method,
+				url: { scheme: req.url.scheme, host: req.url.host, path: subPath, query: req.url.query },
+				headers: req.headers,
+				body: req.body,
+				pathParams: {}  # child recomputes its own path params
+			}
+			return m.child._entryCall(subReq)
+		end
+		null
+end
+
 	let _entryCore = fun(req: Request) -> _Response do
-		let m = _match(req.method, req.url.path)
+		let m = _matchLocal(req.method, req.url.path)
 		if m == null then
+			let delegated = _delegateToMount(req)
+			if delegated != null then
+				return delegated
+			end
+
 			if _normMethod(req.method) == "OPTIONS" then
 				return { status: 204, headers: {}, body: "" }
 			end
-			if _pathExists(req.url.path) then
+			if _pathExistsLocal(req.url.path) then
 				return { status: 405, headers: {"Content-Type":"text/plain"}, body: "method not allowed" }
 			end
 			return { status: 404, headers: {"Content-Type":"text/plain"}, body: "not found" }
@@ -518,9 +598,16 @@ end
 
 		let r = m.route
 		let segs = m.segs
+		let params = if mapHas(m, "params") and m.params != null then m.params else {} end
 		let C = if mapHas(r, "contract") then r.contract else {} end
 
-		let rq = { method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: _paramsFromPath(r.parts, segs) }
+		let rq = {
+			method: req.method,
+			url: req.url,
+			headers: req.headers,
+			body: req.body,
+			pathParams: params
+		}
 		let ctx = { req: rq }
 
 		if mapHas(C, "path") and C.path != null then
@@ -563,12 +650,13 @@ end
 	let api = {
 		__kind: "nethttp.router",
 
+		# Value route: handler(req, ctx) -> {}   (BREAKING: req added)
 		route: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
 			let parts = _splitPath(pattern)
 
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do
-					handler(ctx)
+					handler(req, ctx)
 				end)
 				if not r.ok then
 					res.status(500)
@@ -647,6 +735,7 @@ end
 			true
 		end,
 
+		# Streaming route: handler(req, res, ctx) -> Null
 		routeStream: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do
@@ -661,6 +750,12 @@ end
 				null
 			end
 			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
+			true
+		end,
+
+		# Mount a child router at a fixed prefix (exact segment prefix)
+		mount: fun(prefix: Str, child) -> Bool do
+			_mounts = _mounts + [{ prefixParts: _splitPath(prefix), child: child }]
 			true
 		end,
 
@@ -780,6 +875,9 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 			let deadline = nowMillis() + dur
 			let closed = {v: false}
 			let wrote = {v: false}
+
+			# expose deadline to handlers for cooperative cancellation
+			ctx.deadlineMs = deadline
 
 			let closeTimeout = fun(_: Null) -> Null do
 				if closed.v then

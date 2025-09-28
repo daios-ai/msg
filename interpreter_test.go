@@ -1921,3 +1921,29 @@ func Test_Interpreter_Type_Enum_BareIdentifier_IsError(t *testing.T) {
 	// future friendlier “Enum is a type name; use 'type' ...”.
 	wantErrContains(t, err, "Enum")
 }
+
+func Test_Interpreter_ZeroArity_Sugar_For_UserFun_And_Native(t *testing.T) {
+	ip := NewInterpreter()
+
+	// Register a zero-arity native (should be lowered to _:Null)
+	ip.RegisterNative("z0", nil, S{"id", "Str"}, func(_ *Interpreter, ctx CallCtx) Value {
+		return Str("ok")
+	})
+
+	// Both call forms must work for the native.
+	wantStr(t, mustEvalPersistent(t, ip, "z0()"), "ok")
+	wantStr(t, mustEvalPersistent(t, ip, "z0(null)"), "ok")
+
+	// Passing a non-null arg should be a type error (param is Null).
+	err := evalPersistentExpectError(t, ip, "z0(1)")
+	wantErrContains(t, err, "type mismatch")
+
+	// User-defined fun(): lowered to one param of type Null under the hood.
+	wantBool(t, mustEvalPersistent(t, ip, `
+let f = fun() do true end
+f()
+`), true)
+
+	// And the explicit-null call must also work.
+	wantBool(t, mustEvalPersistent(t, ip, `f(null)`), true)
+}

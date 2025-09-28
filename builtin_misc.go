@@ -148,11 +148,17 @@ Returns:
 			// Functions, types, and handles are intentionally not printable.
 			switch in.Tag {
 			case VTFun, VTType, VTHandle:
-				return annotNull("str: unsupported type")
+				return annotNull("unsupported type, cannot convert to Str")
 			}
 			// Strip annotations recursively before printing.
 			clean := stripAnnDeep(in)
-			// Delegate to the pretty printer.
+
+			// Identity for plain strings (no quotes).
+			if clean.Tag == VTStr {
+				return clean
+			}
+
+			// Everything else uses the pretty renderer.
 			return Str(FormatValue(clean))
 		},
 	)
@@ -186,9 +192,9 @@ Returns:
 				if n, err := strconv.ParseInt(v.Data.(string), 10, 64); err == nil {
 					return Int(n)
 				}
-				return Null
+				return annotNull("unsupported type, cannot convert to Int")
 			default:
-				return Null
+				return annotNull("unsupported type, cannot convert to Int")
 			}
 		},
 	)
@@ -227,9 +233,9 @@ Returns:
 				if f, err := strconv.ParseFloat(v.Data.(string), 64); err == nil {
 					return Num(f)
 				}
-				return Null
+				return annotNull("unsupported type, cannot convert to Num")
 			default:
-				return Null
+				return annotNull("unsupported type, cannot convert to Num")
 			}
 		},
 	)
@@ -270,7 +276,7 @@ Returns:
 			case VTMap:
 				return Bool(len(v.Data.(*MapObject).Entries) > 0)
 			default:
-				return annotNull("unsupported type, cannot convert to bool")
+				return annotNull("unsupported type, cannot convert to Bool")
 			}
 		},
 	)

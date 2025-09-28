@@ -738,11 +738,20 @@ func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, im
 	if ip.Core == nil {
 		ip.Core = NewEnv(nil)
 	}
+
 	names := make([]string, len(params))
 	types := make([]S, len(params))
 	for i, p := range params {
 		names[i], types[i] = p.Name, p.Type
 	}
+
+	hidden := false
+	if len(names) == 0 {
+		names = []string{"_"}
+		types = []S{S{"id", "Null"}}
+		hidden = true
+	}
+
 	ip.Core.Define(name, FunVal(&Fun{
 		Params:     names,
 		ParamTypes: types,
@@ -750,6 +759,7 @@ func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, im
 		Body:       S{"native", name}, // sentinel for debugging; not executed
 		Env:        ip.Core,
 		NativeName: name,
+		HiddenNull: hidden, // <-- set this
 	}))
 }
 

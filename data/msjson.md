@@ -538,7 +538,6 @@ error: <fun: msg:Str -> Null> — Produce an annotated null (soft error).
 exec: }?> — Run an external program.
 exit: <fun: code:Int? -> Null> — Terminate the current process with an optional status code.
 exp: <fun: x:Num -> Num> — Exponential function e^x.
-fail: <fun: message:Str? -> Null> — Fail: throw a runtime error (hard fault).
 filter: <fun: cond:(Any -> Bool) -> it:(Null -> Any?) -> Null -> Any?> — Filter an iterator (lazy predicate).
 flush: <fun: h:Any -> Bool?> — Flush buffered output for a handle.
 formatCode: <fun: src:Str -> Str?> — Format source code.
@@ -590,10 +589,11 @@ oracleHealth: <fun: _:Null -> {}?> — Quick oracle health check (real call, tin
 oracleInstall: <fun: exec:(Str -> Str?) -> Bool> — Install a new global oracle executor.
 oracleInstallWithTap: <fun: exec:(Str -> Str?) -> Bool> — Install an oracle executor that records each prompt before forwarding.
 oracleLastPrompt: <fun: _:Null -> Str?> — Return the most recently recorded oracle prompt (if any).
-oracleLog: <fun: _:Null -> [[Any]]> — Return the full recorded oracle prompt/output log.
+oracleLog: <fun: _:Null -> [[Str]]> — Return the full recorded oracle prompt/output log.
 oracleStatus: <fun: _:Null -> Str> — Show oracle installation status.
 osEnv: <fun: name:Str -> Str?> — Read an environment variable.
 osSetEnv: <fun: name:Str -> value:Str? -> Bool?> — Set or unset an environment variable.
+panic: <fun: message:Str? -> Null> — Fail: throw a runtime error (hard fault).
 pathBase: <fun: path:Str -> Str> — Return the last element of a path (OS-specific).
 pathClean: <fun: path:Str -> Str> — Clean a path by applying lexical simplifications.
 pathDir: <fun: path:Str -> Str> — Return all but the last element of a path.
@@ -649,7 +649,7 @@ timeParseRFC3339: <fun: s:Str -> Int?> — Parse an RFC 3339 timestamp into mill
 timerAfter: <fun: ms:Int -> Any> — Create a channel that emits one tick after a delay, then closes.
 toLower: <fun: s:Str -> Str> — Lowercase conversion (Unicode aware).
 toUpper: <fun: s:Str -> Str> — Uppercase conversion (Unicode aware).
-try: <fun: f:(Null -> Any) -> {}> — Run a zero-arg function and capture hard failures.
+try: <fun: f:(Null -> Any) -> {ok!: Bool, value!: Any}> — Run a zero-arg function and capture panics.
 typeOf: <fun: x:Any -> Type> — Return the dynamic Type of a value.
 typeStringToJSONSchema: <fun: src:Str -> Any> — Parse a MindScript type string and convert it to JSON Schema.
 typeToJSONSchema: <fun: t:Type -> Any> — Convert a MindScript Type to a JSON Schema object.

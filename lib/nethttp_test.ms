@@ -7,7 +7,7 @@ let http = import("nethttp")
 testing.test("nethttp/route path param (typed)", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/hello/{name}", http.contract({path: type {name: Str}}), fun(req, ctx) -> Any do
+	r.route("GET", "/hello/{name}", http.contract({path: type {name: Str}}), fun(req, ctx) do
 		http.text(200, "hi " + ctx.path.name)
 	end)
 
@@ -23,7 +23,7 @@ end)
 testing.test("nethttp/route query success", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/q", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) -> Any do
+	r.route("GET", "/q", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) do
 		http.json(200, {ok: true, who: ctx.query.name, age: ctx.query.age})
 	end)
 
@@ -42,7 +42,7 @@ end)
 testing.test("nethttp/route query failure -> 422", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/qbad", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) -> Any do
+	r.route("GET", "/qbad", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
@@ -57,7 +57,7 @@ end)
 testing.test("nethttp/route body json success", fun(_: Null) do
 	let r = http.router()
 
-	r.route("POST", "/echo", http.contract({body: type {msg: Str}}), fun(req, ctx) -> Any do
+	r.route("POST", "/echo", http.contract({body: type {msg: Str}}), fun(req, ctx) do
 		http.json(200, {ok: true, msg: ctx.body.msg})
 	end)
 
@@ -75,7 +75,7 @@ end)
 testing.test("nethttp/route body json failure -> 422", fun(_: Null) do
 	let r = http.router()
 
-	r.route("POST", "/echo2", http.contract({body: type {msg: Str}}), fun(req, ctx) -> Any do
+	r.route("POST", "/echo2", http.contract({body: type {msg: Str}}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
@@ -90,7 +90,7 @@ end)
 testing.test("nethttp/route implicit json encode", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/auto", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/auto", http.contract({}), fun(req, ctx) do
 		{ok: true, n: 7}
 	end)
 
@@ -108,7 +108,7 @@ end)
 testing.test("nethttp/route raise -> status", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/need-auth", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/need-auth", http.contract({}), fun(req, ctx) do
 		http.raise(401, "unauthorized")
 	end)
 
@@ -157,8 +157,6 @@ testing.test("nethttp/routing 404_405 prefix", fun(_: Null) do
 	testing.assertEq(404, c.call({method: "GET", path: "/nope"}).status)
 end)
 
-
-
 # =========================================================
 # 10) CORS preflight (OPTIONS)
 # =========================================================
@@ -178,7 +176,7 @@ testing.test("nethttp/recover value panic", fun(_: Null) do
 	let r = http.router()
 	r.use(http.mwRecover())
 
-	r.route("GET", "/p", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/p", http.contract({}), fun(req, ctx) do
 		panic("boom")
 	end)
 
@@ -207,7 +205,7 @@ testing.test("nethttp/timeout value", fun(_: Null) do
 	let r = http.router()
 	r.use(http.mwTimeout(20))
 
-	r.route("GET", "/slow", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/slow", http.contract({}), fun(req, ctx) do
 		sleep(50)
 		http.text(200, "late")
 	end)
@@ -224,7 +222,7 @@ testing.test("nethttp/request id (inject + propagate)", fun(_: Null) do
 	let r = http.router()
 	r.use(http.mwRequestID("X-Request-ID"))
 
-	r.route("GET", "/ok", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/ok", http.contract({}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
@@ -265,7 +263,7 @@ end)
 # =========================================================
 testing.test("nethttp/prefix registration", fun(_: Null) do
 	let parent = http.router()
-	parent.route("GET", "/v1/ping", http.contract({}), fun(req, ctx) -> Any do
+	parent.route("GET", "/v1/ping", http.contract({}), fun(req, ctx) do
 		http.text(200, "pong")
 	end)
 
@@ -281,7 +279,7 @@ end)
 testing.test("nethttp/json encode error", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/badjson", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/badjson", http.contract({}), fun(req, ctx) do
 		fun(_: Null) do
 			true
 		end
@@ -299,7 +297,7 @@ end)
 testing.test("nethttp/openapi basic", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/a/{id}", http.contract({path: type {id: Str}}), fun(req, ctx) -> Any do
+	r.route("GET", "/a/{id}", http.contract({path: type {id: Str}}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
@@ -330,7 +328,7 @@ let http = import("nethttp")
 # =========================================================
 testing.test("nethttp/path coercion failure -> 422", fun(_: Null) do
 	let r = http.router()
-	r.route("GET", "/a/{id}", {path: type {id!: Int}}, fun(req, ctx) -> Any? do
+	r.route("GET", "/a/{id}", {path: type {id: Int}}, fun(req, ctx) -> Any? do
 		http.text(200, "ok")
 	end)
 
@@ -344,7 +342,7 @@ end)
 # =========================================================
 testing.test("nethttp/query arrays repeated", fun(_: Null) do
 	let r = http.router()
-	r.route("GET", "/tags", {query: type {tag!: [Str]}}, fun(req, ctx) -> Any? do
+	r.route("GET", "/tags", {query: type {tag: [Str]}}, fun(req, ctx) -> Any? do
 		http.json(200, {count: len(ctx.query.tag)})
 	end)
 
@@ -360,7 +358,7 @@ end)
 # =========================================================
 testing.test("nethttp/query arrays json", fun(_: Null) do
 	let r = http.router()
-	r.route("GET", "/tags2", {query: type {tag!: [Str]}}, fun(req, ctx) -> Any? do
+	r.route("GET", "/tags2", {query: type {tag: [Str]}}, fun(req, ctx) -> Any? do
 		http.json(200, {ok: true, tags: ctx.query.tag})
 	end)
 
@@ -378,7 +376,7 @@ end)
 # =========================================================
 testing.test("nethttp/body invalid json -> 422", fun(_: Null) do
 	let r = http.router()
-	r.route("POST", "/echo", {body: type {msg!: Str}}, fun(req, ctx) -> Any? do
+	r.route("POST", "/echo", {body: type {msg: Str}}, fun(req, ctx) -> Any? do
 		http.text(200, "ok")
 	end)
 
@@ -392,7 +390,7 @@ end)
 # =========================================================
 testing.test("nethttp/body schema mismatch -> 422", fun(_: Null) do
 	let r = http.router()
-	r.route("POST", "/echo2", {body: type {msg!: Str}}, fun(req, ctx) -> Any? do
+	r.route("POST", "/echo2", {body: type {msg: Str}}, fun(req, ctx) -> Any? do
 		http.text(200, "ok")
 	end)
 
@@ -407,7 +405,7 @@ end)
 # =========================================================
 testing.test("nethttp/response schema validation -> 500", fun(_: Null) do
 	let r = http.router()
-	r.route("GET", "/check", {responses: {"200": type {ok!: Bool}}}, fun(req, ctx) -> Any? do
+	r.route("GET", "/check", {responses: {"200": type {ok: Bool}}}, fun(req, ctx) -> Any? do
 		http.json(200, {ok: "nope"})
 	end)
 
@@ -472,11 +470,11 @@ end)
 # =========================================================
 # S1) SERVER: plain text value route over TCP
 # =========================================================
-testing.test("server/hello over tcp", fun(_: Null) -> Any do
+testing.test("server/hello over tcp", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/hello", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/hello", http.contract({}), fun(req, ctx) do
 		http.text(200, "hello")
 	end)
 
@@ -504,14 +502,14 @@ end)
 # =========================================================
 # S2) SERVER: 422 semantics (reason phrase + JSON content-type w/ charset)
 # =========================================================
-testing.test("server/422 reason + content-type", fun(_: Null) -> Any do
+testing.test("server/422 reason + content-type", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
 	r.route("GET", "/greet/{name}", http.contract({
-		path:  type { name!: Str },
-		query: type { times!: Int }
-	}), fun(req, ctx) -> Any do
+		path: type {name: Str},
+		query: type {times: Int}
+	}), fun(req, ctx) do
 		http.json(200, {ok: true})
 	end)
 
@@ -539,11 +537,11 @@ end)
 # =========================================================
 # S3) SERVER: JSON POST echo (Content-Length correctness)
 # =========================================================
-testing.test("server/post echo content-length", fun(_: Null) -> Any do
+testing.test("server/post echo content-length", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("POST", "/echo", http.contract({ body: type { msg!: Str } }), fun(req, ctx) -> Any do
+	r.route("POST", "/echo", http.contract({body: type {msg: Str}}), fun(req, ctx) do
 		http.json(200, {ok: true, msg: ctx.body.msg})
 	end)
 
@@ -554,10 +552,10 @@ testing.test("server/post echo content-length", fun(_: Null) -> Any do
 	testing.assert(srv != null, "serve failed")
 
 	let body = "{\"msg\":\"hi\"}"
-	let req =
-		sprintf("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
-			len(body), body
-		])
+	let req = sprintf("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
+		len(body),
+		body
+	])
 
 	let c = netConnect(addr)
 	testing.assert(c != null, "connect failed")
@@ -579,7 +577,7 @@ end)
 # =========================================================
 # S4) SERVER: streaming route + OPTIONS preflight
 # =========================================================
-testing.test("server/stream + options", fun(_: Null) -> Any do
+testing.test("server/stream + options", fun(_: Null) do
 	let http = import("nethttp")
 
 	let root = http.router()
@@ -616,15 +614,14 @@ testing.test("server/stream + options", fun(_: Null) -> Any do
 	let _ = http.shutdown(srv, 0)
 end)
 
-
 # =========================================================
 # S5) SERVER: 405 Method Not Allowed
 # =========================================================
-testing.test("server/405 method not allowed", fun(_: Null) -> Any do
+testing.test("server/405 method not allowed", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/only-get", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/only-get", http.contract({}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
@@ -648,11 +645,11 @@ end)
 # =========================================================
 # S6) SERVER: redirect helper sets Location
 # =========================================================
-testing.test("server/redirect sets location", fun(_: Null) -> Any do
+testing.test("server/redirect sets location", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/old", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/old", http.contract({}), fun(req, ctx) do
 		http.redirect(302, "/new")
 	end)
 
@@ -677,12 +674,12 @@ end)
 # =========================================================
 # S7) SERVER: CORS headers appear on normal GET (not only OPTIONS)
 # =========================================================
-testing.test("server/cors headers on get", fun(_: Null) -> Any do
+testing.test("server/cors headers on get", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
 	r.use(http.mwCors({origin: "*"}))
-	r.route("GET", "/ping", http.contract({}), fun(req, ctx) -> Any do
+	r.route("GET", "/ping", http.contract({}), fun(req, ctx) do
 		http.text(200, "pong")
 	end)
 
@@ -707,23 +704,25 @@ end)
 # =========================================================
 # S8) SERVER: 413 Payload Too Large via maxBodyBytes
 # =========================================================
-testing.test("server/413 payload too large", fun(_: Null) -> Any do
+testing.test("server/413 payload too large", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("POST", "/upload", http.contract({}), fun(req, ctx) -> Any do
+	r.route("POST", "/upload", http.contract({}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
 	let addr = "127.0.0.1:18088"
 	let l = netListen(addr)
 	testing.assert(l != null, "listen failed")
-	let srv = http.serve(l, r, { maxBodyBytes: 8 })
+	let srv = http.serve(l, r, {maxBodyBytes: 8})
 	testing.assert(srv != null, "serve failed")
 
-	let payload = "0123456789abcdef"  # 16 bytes > cap
+	let payload = "0123456789abcdef" # 16 bytes > cap
+
 	let req = sprintf("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
-		len(payload), payload
+		len(payload),
+		payload
 	])
 
 	let c = netConnect(addr)
@@ -740,12 +739,16 @@ end)
 # =========================================================
 # S9) KEEP-ALIVE: two sequential requests on one connection
 # =========================================================
-testing.test("server/keepalive two requests", fun(_: Null) -> Any do
+testing.test("server/keepalive two requests", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/a", {}, fun(req, ctx) -> Any do http.text(200, "A") end)
-	r.route("GET", "/b", {}, fun(req, ctx) -> Any do http.text(200, "B") end)
+	r.route("GET", "/a", {}, fun(req, ctx) do
+		http.text(200, "A")
+	end)
+	r.route("GET", "/b", {}, fun(req, ctx) do
+		http.text(200, "B")
+	end)
 
 	let addr = "127.0.0.1:18089"
 	let l = netListen(addr)
@@ -757,9 +760,7 @@ testing.test("server/keepalive two requests", fun(_: Null) -> Any do
 	let c = netConnect(addr)
 	testing.assert(c != null, "connect failed")
 
-	let req =
-		"GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" +
-		"GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	let req = "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" + "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 	let _ = write(c, req)
 	let _ = flush(c)
 	let resp = readAll(c)
@@ -777,12 +778,14 @@ end)
 # S10) HEADER CASE: case-sensitive behavior is explicit
 # Middleware expects exact key; lowercase key should not be used.
 # =========================================================
-testing.test("server/header case-sensitive (explicit)", fun(_: Null) -> Any do
+testing.test("server/header case-sensitive (explicit)", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
 	r.use(http.mwRequestID("X-Request-ID"))
-	r.route("GET", "/ok", {}, fun(req, ctx) -> Any do http.text(200, "ok") end)
+	r.route("GET", "/ok", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
 
 	let addr = "127.0.0.1:18090"
 	let l = netListen(addr)
@@ -810,11 +813,11 @@ end)
 # =========================================================
 # S11) PATH PARAM percent-encoding is not decoded (explicit behavior)
 # =========================================================
-testing.test("server/path param raw percent-encoding", fun(_: Null) -> Any do
+testing.test("server/path param raw percent-encoding", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/p/{v}", {path: type {v!: Str}}, fun(req, ctx) -> Any do
+	r.route("GET", "/p/{v}", {path: type {v: Str}}, fun(req, ctx) do
 		http.text(200, ctx.path.v)
 	end)
 
@@ -846,12 +849,16 @@ end)
 # =========================================================
 # S12) QUERY COERCION: booleans, optional missing, single-element arrays
 # =========================================================
-testing.test("server/query coercion edges", fun(_: Null) -> Any do
+testing.test("server/query coercion edges", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/q", {query: type {flag!: Bool, n!: Int, tags!: [Int]}}, fun(req, ctx) -> Any do
-		http.json(200, {flag: ctx.query.flag, n: ctx.query.n, tags: ctx.query.tags})
+	r.route("GET", "/q", {query: type {flag: Bool, n: Int, tags: [Int]}}, fun(req, ctx) do
+		http.json(200, {
+			flag: ctx.query.flag,
+			n: ctx.query.n,
+			tags: ctx.query.tags
+		})
 	end)
 
 	let addr = "127.0.0.1:18092"
@@ -878,16 +885,18 @@ end)
 # =========================================================
 # S13) LARGE HEADERS: exceed header budget -> 400 (current behavior)
 # =========================================================
-testing.test("server/large headers -> 400", fun(_: Null) -> Any do
+testing.test("server/large headers -> 400", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/h", {}, fun(req, ctx) -> Any do http.text(200, "ok") end)
+	r.route("GET", "/h", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
 
 	let addr = "127.0.0.1:18093"
 	let l = netListen(addr)
 	testing.assert(l != null, "listen failed")
-	let srv = http.serve(l, r, { maxHeaderBytes: 64 })
+	let srv = http.serve(l, r, {maxHeaderBytes: 64})
 	testing.assert(srv != null, "serve failed")
 
 	let big = "X-Long: " + join([
@@ -910,11 +919,13 @@ end)
 # =========================================================
 # S14) DATE HEADER: explicitly absent (documented behavior)
 # =========================================================
-testing.test("server/no Date header (explicit)", fun(_: Null) -> Any do
+testing.test("server/no Date header (explicit)", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/d", {}, fun(req, ctx) -> Any do http.text(200, "ok") end)
+	r.route("GET", "/d", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
 
 	let addr = "127.0.0.1:18094"
 	let l = netListen(addr)
@@ -937,11 +948,13 @@ end)
 # =========================================================
 # S15) SHUTDOWN: stops new accepts (late connect fails or yields no response)
 # =========================================================
-testing.test("server/shutdown stops accepts", fun(_: Null) -> Any do
+testing.test("server/shutdown stops accepts", fun(_: Null) do
 	let http = import("nethttp")
 
 	let r = http.router()
-	r.route("GET", "/once", {}, fun(req, ctx) -> Any do http.text(200, "ok") end)
+	r.route("GET", "/once", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
 
 	let addr = "127.0.0.1:18095"
 	let l = netListen(addr)

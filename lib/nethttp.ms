@@ -1,5 +1,5 @@
 # nethttp — streaming-first HTTP server for MindScript
-#
+# 
 # Design goals:
 # - Single streaming core (Request -> Responder -> Null), middleware-friendly
 # - Route-time contracts (FastAPI-like): path / query / body / responses
@@ -7,13 +7,13 @@
 # - Value routes as sugar over the streaming core
 # - Auto OpenAPI from the same route contracts (stub for now)
 # - Internals never return null on success; boundary helpers may return annotated null
-#
+# 
 # Less is more:
 # - Public surface: router(), route(), routeStream(), mount(), contract(), openapiDoc(), testClient()
-#
+# 
 # Errors in handlers:
 # - Use a structured _HttpError object to signal HTTP errors from user code.
-#
+# 
 # Breaking change (value route handler shape):
 # - Value handlers are now fun(req, ctx) -> {} (previously fun(ctx) -> {})
 
@@ -22,10 +22,10 @@
 # =========================
 
 let Request = type {
-	method!: Str,
-	url!: { scheme: Str?, host: Str?, path!: Str, query: Str? },
-	headers!: {},
-	body!: Any,
+	method: Str,
+	url: {scheme: Str?, host: Str?, path: Str, query: Str?},
+	headers: {},
+	body: Any,
 	pathParams: {}?
 }
 
@@ -39,12 +39,12 @@ let Responder = type {
 }
 
 # Internal accumulator for test client / server writer
-let _Response = type { status!: Int, headers!: {}, body!: Str }
+let _Response = type {status: Int, headers: {}, body: Str}
 
 # Structured error for value handlers
 let _HttpError = type {
-	__http_error__!: Bool,
-	status!: Int,
+	__http_error__: Bool,
+	status: Int,
 	body: Str,
 	headers: {}
 }
@@ -55,7 +55,7 @@ let _HttpError = type {
 let Contract = type {}
 
 # Handler context (open)
-let _Ctx = type { req!: Request, path: {}, query: {}, body: Any, deadlineMs: Int? }
+let _Ctx = type {req: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
 
 # Streaming handler / middleware (3-arg)
 let _StreamFn = type Request -> Responder -> {} -> Null
@@ -117,7 +117,12 @@ let _paramName = fun(seg: Str) -> Str do
 end
 
 let _makeURL = fun(path: Str, query: Str?) -> {} do
-	{ scheme: null, host: null, path: path, query: query }
+	{
+		scheme: null,
+		host: null,
+		path: path,
+		query: query
+	}
 end
 
 let _json = fun(v) -> Str? do
@@ -126,6 +131,7 @@ let _json = fun(v) -> Str? do
 		return s
 	end
 	null # <json stringify failed>
+
 end
 
 let contract = fun(c: Contract) -> Contract do
@@ -137,11 +143,21 @@ end
 # =========================
 
 let raise = fun(status: Int, message: Str) -> {} do
-	{ __http_error__: true, status: status, body: message, headers: {} }
+	{
+		__http_error__: true,
+		status: status,
+		body: message,
+		headers: {}
+	}
 end
 
 let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
-	{ __http_error__: true, status: status, body: message, headers: headers }
+	{
+		__http_error__: true,
+		status: status,
+		body: message,
+		headers: headers
+	}
 end
 
 # =========================
@@ -155,6 +171,7 @@ let _rawBody = fun(req: Request) -> Str? do
 	let s = readAll(req.body)
 	if s == null then
 		return null # <read body failed>
+
 	end
 	s
 end
@@ -163,7 +180,11 @@ end
 let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 	if isSubtype(T, type Str) then
 		let pj = jsonParse(s)
-		return if pj != null and isType(pj, type Str) then pj else s end
+		return if pj != null and isType(pj, type Str) then
+			pj
+		else
+			s
+		end
 	end
 	if isSubtype(T, type Int) then
 		let i = int(s)
@@ -175,6 +196,7 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 			return pj
 		end
 		return null # <bad int>
+
 	end
 	if isSubtype(T, type Num) then
 		let n = num(s)
@@ -186,6 +208,7 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 			return pj
 		end
 		return null # <bad num>
+
 	end
 	if isSubtype(T, type Bool) then
 		let sl = toLower(s)
@@ -200,18 +223,22 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 			return pj
 		end
 		return null # <bad bool>
+
 	end
 	null # <unsupported scalar type>
+
 end
 
 let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 	let rt = reflect(T)
 	if rt == null then
 		return null # <reflect failed>
+
 	end
 	let node = rt[1]
 	if node[0] != "map" then
 		return null # <only object types supported for query>
+
 	end
 
 	let out = {}
@@ -232,6 +259,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		if vs == null or len(vs) == 0 then
 			if tag == "pair!" then
 				return null # <missing key: {k}>
+
 			end
 			i = i + 1
 			continue
@@ -249,6 +277,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 						let u = _coerceScalar(s, U)
 						if u == null then
 							return null # <bad element for {k}>
+
 						end
 						arr = arr + [u]
 						j = j + 1
@@ -264,6 +293,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 				let u2 = _coerceScalar(vs[j2], U)
 				if u2 == null then
 					return null # <bad element for {k}>
+
 				end
 				arr2 = arr2 + [u2]
 				j2 = j2 + 1
@@ -277,6 +307,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		let v = _coerceScalar(s, Tk)
 		if v == null then
 			return null # <coercion failed: {k}>
+
 		end
 		out[k] = v
 		i = i + 1
@@ -286,6 +317,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		return out
 	end
 	null # <query validation failed>
+
 end
 
 let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
@@ -296,6 +328,7 @@ let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
 	end)
 	if qm == null then
 		return null # <invalid query string>
+
 	end
 	_bindQueryMap(qm, TQ)
 end
@@ -317,10 +350,12 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 	let rt = reflect(TP)
 	if rt == null then
 		return null # <reflect failed>
+
 	end
 	let node = rt[1]
 	if node[0] != "map" then
 		return null # <path must be object type>
+
 	end
 	let out = {}
 	let entries = slice(node, 1, len(node))
@@ -338,6 +373,7 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		if raw == null then
 			if tag == "pair!" then
 				return null # <missing key: {k}>
+
 			end
 			i = i + 1
 			continue
@@ -345,6 +381,7 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		let v = _coerceScalar(raw, Tk)
 		if v == null then
 			return null # <coercion failed: {k}>
+
 		end
 		out[k] = v
 		i = i + 1
@@ -353,25 +390,29 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		return out
 	end
 	null # <path validation failed>
+
 end
 
 let _bindBody = fun(req: Request, TB: Type) -> Any? do
 	let raw = _rawBody(req)
 	if raw == null then
 		return null # <read body failed>
+
 	end
 	let v = jsonParse(raw)
 	if v == null then
 		return null # <invalid json>
+
 	end
 	if not isType(v, TB) then
 		return null # <validation failed: expected body to satisfy {str(TB)}>
+
 	end
 	v
 end
 
 let _validationJSON = fun(where: Str, reason: Str) -> Str do
-	let obj = { error: "validation", detail: [{ in: where, reason: reason }] }
+	let obj = {error: "validation", detail: [{in: where, reason: reason}]}
 	let s = _json(obj)
 	if s == null then
 		return "{\"error\":\"validation\"}"
@@ -386,29 +427,45 @@ end
 let json = fun(status: Int, value) -> {} do
 	let s = _json(value)
 	if s == null then
-		return { status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error" }
+		return {
+			status: 500,
+			headers: {"Content-Type": "text/plain"},
+			body: "json encode error"
+		}
 	end
-	{ status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s }
+	{
+		status: status,
+		headers: {"Content-Type": "application/json; charset=utf-8"},
+		body: s
+	}
 end
 
 let text = fun(status: Int, s: Str) -> {} do
-	{ status: status, headers: {"Content-Type": "text/plain"}, body: s }
+	{
+		status: status,
+		headers: {"Content-Type": "text/plain"},
+		body: s
+	}
 end
 
 let noContent = fun(_: Null) -> {} do
-	{ status: 204, headers: {}, body: "" }
+	{status: 204, headers: {}, body: ""}
 end
 
 let redirect = fun(status: Int, location: Str) -> {} do
-	{ status: status, headers: {"Location": location}, body: "" }
+	{
+		status: status,
+		headers: {Location: location},
+		body: ""
+	}
 end
 
 # =========================
 # Responder (opaque; per-request)
 # =========================
 
-let _newResponder = fun() -> { res: _Response, api: Responder } do
-	let state = { status: 200, headers: {}, body: "" }
+let _newResponder = fun() -> {res: _Response, api: Responder} do
+	let state = {status: 200, headers: {}, body: ""}
 	let api = {}
 
 	api.status = fun(code: Int) -> Responder do
@@ -430,7 +487,7 @@ let _newResponder = fun() -> { res: _Response, api: Responder } do
 		true
 	end
 
-	{ res: state, api: api }
+	{res: state, api: api}
 end
 
 # =========================
@@ -454,7 +511,11 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 	let nParts = len(parts)
 	let nReq = len(reqSegs)
 	if nParts == 0 then
-		return if nReq == 0 then {params: {}, matched: 0} else null end
+		return if nReq == 0 then
+			{params: {}, matched: 0}
+		else
+			null
+		end
 	end
 	let last = nParts - 1
 	let hasCatch = _isCatchSeg(parts[last])
@@ -469,7 +530,11 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 
 	# Match fixed/param prefix and record single-segment params
 	let params = {}
-	let limit = if hasCatch then last else nParts end
+	let limit = if hasCatch then
+		last
+	else
+		nParts
+	end
 	let i = 0
 	while i < limit do
 		let pat = parts[i]
@@ -492,13 +557,20 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 	end
 
 	# matched score prefers longer (more specific) patterns
-	{ params: params, matched: if hasCatch then last else nParts end }
+	{
+		params: params,
+		matched: if hasCatch then
+			last
+		else
+			nParts
+		end
+	}
 end
 
 let router = fun(_: Null) -> {} do
 	let _routes = []
 	let _mws = []
-	let _mounts = []  # entries: { prefixParts: [Str], child: Router }
+	let _mounts = [] # entries: { prefixParts: [Str], child: Router }
 
 	let _matchLocal = fun(method: Str, path: Str) -> {}? do
 		let want = _normMethod(method)
@@ -514,7 +586,7 @@ let router = fun(_: Null) -> {} do
 				# prefer the *actual* matched depth (handles catch-alls cleanly)
 				let s = int(p.matched)
 				if s > score then
-					best = { route: r, segs: segs, params: p.params }
+					best = {route: r, segs: segs, params: p.params}
 					score = s
 				end
 			end
@@ -533,7 +605,7 @@ let router = fun(_: Null) -> {} do
 			end
 		end
 		false
-end
+	end
 
 	let _compose = fun(fn: _StreamFn) -> _StreamFn do
 		let h = fn
@@ -543,7 +615,7 @@ end
 			i = i - 1
 		end
 		h
-end
+	end
 
 	let _delegateToMount = fun(req: Request) -> _Response? do
 		# Try mounts in registration order; first match wins
@@ -569,15 +641,20 @@ end
 			let subPath = "/" + join(rest, "/")
 			let subReq = {
 				method: req.method,
-				url: { scheme: req.url.scheme, host: req.url.host, path: subPath, query: req.url.query },
+				url: {
+					scheme: req.url.scheme,
+					host: req.url.host,
+					path: subPath,
+					query: req.url.query
+				},
 				headers: req.headers,
 				body: req.body,
-				pathParams: {}  # child recomputes its own path params
+				pathParams: {} # child recomputes its own path params
 			}
 			return m.child._entryCall(subReq)
 		end
 		null
-end
+	end
 
 	let _entryCore = fun(req: Request) -> _Response do
 		let m = _matchLocal(req.method, req.url.path)
@@ -588,18 +665,34 @@ end
 			end
 
 			if _normMethod(req.method) == "OPTIONS" then
-				return { status: 204, headers: {}, body: "" }
+				return {status: 204, headers: {}, body: ""}
 			end
 			if _pathExistsLocal(req.url.path) then
-				return { status: 405, headers: {"Content-Type":"text/plain"}, body: "method not allowed" }
+				return {
+					status: 405,
+					headers: {"Content-Type": "text/plain"},
+					body: "method not allowed"
+				}
 			end
-			return { status: 404, headers: {"Content-Type":"text/plain"}, body: "not found" }
+			return {
+				status: 404,
+				headers: {"Content-Type": "text/plain"},
+				body: "not found"
+			}
 		end
 
 		let r = m.route
 		let segs = m.segs
-		let params = if mapHas(m, "params") and m.params != null then m.params else {} end
-		let C = if mapHas(r, "contract") then r.contract else {} end
+		let params = if mapHas(m, "params") and m.params != null then
+			m.params
+		else
+			{}
+		end
+		let C = if mapHas(r, "contract") then
+			r.contract
+		else
+			{}
+		end
 
 		let rq = {
 			method: req.method,
@@ -608,12 +701,16 @@ end
 			body: req.body,
 			pathParams: params
 		}
-		let ctx = { req: rq }
+		let ctx = {req: rq}
 
 		if mapHas(C, "path") and C.path != null then
 			let P = _bindPath(rq.pathParams, C.path)
 			if P == null then
-				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("path", noteGet(P)) }
+				return {
+					status: 422,
+					headers: {"Content-Type": "application/json; charset=utf-8"},
+					body: _validationJSON("path", noteGet(P))
+				}
 			end
 			ctx.path = P
 		end
@@ -621,7 +718,11 @@ end
 		if mapHas(C, "query") and C.query != null then
 			let Q = _bindQueryFromReq(rq, C.query)
 			if Q == null then
-				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("query", noteGet(Q)) }
+				return {
+					status: 422,
+					headers: {"Content-Type": "application/json; charset=utf-8"},
+					body: _validationJSON("query", noteGet(Q))
+				}
 			end
 			ctx.query = Q
 		end
@@ -629,7 +730,11 @@ end
 		if mapHas(C, "body") and C.body != null then
 			let B = _bindBody(rq, C.body)
 			if B == null then
-				return { status: 422, headers: {"Content-Type":"application/json; charset=utf-8"}, body: _validationJSON("body", noteGet(B)) }
+				return {
+					status: 422,
+					headers: {"Content-Type": "application/json; charset=utf-8"},
+					body: _validationJSON("body", noteGet(B))
+				}
 			end
 			ctx.body = B
 		end
@@ -641,15 +746,22 @@ end
 			call(rq, pack.api, ctx)
 		end)
 		if not t.ok then
-			return { status: 500, headers: {"Content-Type":"text/plain"}, body: "internal server error" }
+			return {
+				status: 500,
+				headers: {"Content-Type": "text/plain"},
+				body: "internal server error"
+			}
 		end
 
-		{ status: pack.res.status, headers: pack.res.headers, body: pack.res.body }
-end
+		{
+			status: pack.res.status,
+			headers: pack.res.headers,
+			body: pack.res.body
+		}
+	end
 
 	let api = {
 		__kind: "nethttp.router",
-
 		# Value route: handler(req, ctx) -> {}   (BREAKING: req added)
 		route: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
 			let parts = _splitPath(pattern)
@@ -660,42 +772,54 @@ end
 				end)
 				if not r.ok then
 					res.status(500)
-					res.setHeader("Content-Type","text/plain")
+					res.setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
 					let _ = res.end(null)
-					return null
+					return
 				end
 				let out = r.value
 
 				if out == null then
 					res.status(500)
-					res.setHeader("Content-Type","text/plain")
+					res.setHeader("Content-Type", "text/plain")
 					let _ = res.write("handler returned null")
 					let _ = res.end(null)
-					return null
+					return
 				end
 
 				if isType(out, _HttpError) then
-					let hdrs = if mapHas(out, "headers") and out.headers != null then out.headers else {} end
-					let rt = if mapHas(out, "body") and out.body != null then out.body else "" end
+					let hdrs = if mapHas(out, "headers") and out.headers != null then
+						out.headers
+					else
+						{}
+					end
+					let rt = if mapHas(out, "body") and out.body != null then
+						out.body
+					else
+						""
+					end
 					for [k, v] in hdrs do
 						res.setHeader(k, v)
 					end
 					res.status(out.status)
 					let _ = res.write(rt)
 					let _ = res.end(null)
-					return null
+					return
 				end
 
-				if isType(out, type {status!: Int, headers!: {}, body!: Str}) then
+				if isType(out, type {status: Int, headers: {}, body: Str}) then
 					if mapHas(c, "responses") and c.responses != null then
-						let payload = if mapHas(out,"body") then jsonParse(out.body) else out end
+						let payload = if mapHas(out, "body") then
+							jsonParse(out.body)
+						else
+							out
+						end
 						if not _checkResponse(out.status, payload, c.responses) then
 							res.status(500)
-							res.setHeader("Content-Type","application/json")
-							let _ = res.write(_validationJSON("response","response-validation failed"))
+							res.setHeader("Content-Type", "application/json")
+							let _ = res.write(_validationJSON("response", "response-validation failed"))
 							let _ = res.end(null)
-							return null
+							return
 						end
 					end
 					for [k, v] in out.headers do
@@ -704,27 +828,27 @@ end
 					res.status(out.status)
 					let _ = res.write(out.body)
 					let _ = res.end(null)
-					return null
+					return
 				end
 
 				let js = _json(out)
 				if js == null then
 					res.status(500)
-					res.setHeader("Content-Type","text/plain")
+					res.setHeader("Content-Type", "text/plain")
 					let _ = res.write("json encode error")
 					let _ = res.end(null)
-					return null
+					return
 				end
 				if mapHas(c, "responses") and c.responses != null then
 					if not _checkResponse(200, out, c.responses) then
 						res.status(500)
-						res.setHeader("Content-Type","application/json")
-						let _ = res.write(_validationJSON("response","response-validation failed"))
+						res.setHeader("Content-Type", "application/json")
+						let _ = res.write(_validationJSON("response", "response-validation failed"))
 						let _ = res.end(null)
-						return null
+						return
 					end
 				end
-				res.setHeader("Content-Type","application/json; charset=utf-8")
+				res.setHeader("Content-Type", "application/json; charset=utf-8")
 				res.status(200)
 				let _ = res.write(js)
 				let _ = res.end(null)
@@ -734,7 +858,6 @@ end
 			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
 			true
 		end,
-
 		# Streaming route: handler(req, res, ctx) -> Null
 		routeStream: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -743,7 +866,7 @@ end
 				end)
 				if not r.ok then
 					res.status(500)
-					res.setHeader("Content-Type","text/plain")
+					res.setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
 					let _ = res.end(null)
 				end
@@ -752,24 +875,22 @@ end
 			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
 			true
 		end,
-
 		# Mount a child router at a fixed prefix (exact segment prefix)
 		mount: fun(prefix: Str, child) -> Bool do
-			_mounts = _mounts + [{ prefixParts: _splitPath(prefix), child: child }]
+			_mounts = _mounts + [
+				{prefixParts: _splitPath(prefix), child: child}
+			]
 			true
 		end,
-
 		use: fun(mw: _Mw) -> Bool do
 			_mws = _mws + [mw]
 			true
 		end,
-
 		_entryCall: fun(req: Request) -> _Response do
 			_entryCore(req)
 		end,
-
 		_dump: fun(_: Null) -> {} do
-			{ routes: _routes, mws: _mws }
+			{routes: _routes, mws: _mws}
 		end
 	}
 	api
@@ -803,10 +924,26 @@ end
 
 let testClient = fun(r) -> {} do
 	let call = fun(req: {}) -> {} do
-		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
-		let pathStr = if mapHas(req, "path") and req.path != null then req.path else "/" end
-		let headers = if mapHas(req, "headers") and req.headers != null then req.headers else {} end
-		let body = if mapHas(req, "body") and req.body != null then req.body else "" end
+		let method = if mapHas(req, "method") and req.method != null then
+			req.method
+		else
+			"GET"
+		end
+		let pathStr = if mapHas(req, "path") and req.path != null then
+			req.path
+		else
+			"/"
+		end
+		let headers = if mapHas(req, "headers") and req.headers != null then
+			req.headers
+		else
+			{}
+		end
+		let body = if mapHas(req, "body") and req.body != null then
+			req.body
+		else
+			""
+		end
 
 		let q = ""
 		let p = pathStr
@@ -824,9 +961,13 @@ let testClient = fun(r) -> {} do
 			pathParams: {}
 		}
 		let res = r._entryCall(R)
-		{ status: res.status, headers: res.headers, body: res.body }
+		{
+			status: res.status,
+			headers: res.headers,
+			body: res.body
+		}
 	end
-	{ call: call }
+	{call: call}
 end
 
 # =========================
@@ -881,7 +1022,7 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 
 			let closeTimeout = fun(_: Null) -> Null do
 				if closed.v then
-					return null
+					return
 				end
 				res.status(504)
 				res.setHeader("Content-Type", "text/plain")
@@ -962,12 +1103,27 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 	end
 end
 
-
 let mwCors = fun(opts: {}) -> _Mw do
-	let origin = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
-	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
-	let allowH = if mapHas(opts, "headers") and opts.headers != null then join(opts.headers, ", ") else "Content-Type, Authorization" end
-	let creds = if mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials) then "true" else "false" end
+	let origin = if mapHas(opts, "origin") and opts.origin != null then
+		opts.origin
+	else
+		"*"
+	end
+	let methods = if mapHas(opts, "methods") and opts.methods != null then
+		join(opts.methods, ", ")
+	else
+		"GET, POST, PUT, PATCH, DELETE, OPTIONS"
+	end
+	let allowH = if mapHas(opts, "headers") and opts.headers != null then
+		join(opts.headers, ", ")
+	else
+		"Content-Type, Authorization"
+	end
+	let creds = if mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials) then
+		"true"
+	else
+		"false"
+	end
 
 	return fun(next: _StreamFn) -> _StreamFn do
 		return fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -978,7 +1134,7 @@ let mwCors = fun(opts: {}) -> _Mw do
 			if req.method == "OPTIONS" then
 				res.status(204)
 				let _ = res.end(null)
-				return null
+				return
 			end
 			next(req, res, ctx)
 			null
@@ -1039,18 +1195,20 @@ end
 # =========================
 
 let _ServerHandle = type {
-	listener!: Any,
-	stop!: {closed!: Bool},
-	conns!: [Any],
-	opts!: {}
+	listener: Any,
+	stop: {closed: Bool},
+	conns: [Any],
+	opts: {}
 }
 
 let serve = fun(listener, r, opts: {}) -> {}? do
 	if listener == null then
 		return null # <serve: missing listener>
+
 	end
-	if not (mapHas(r, "_entryCall")) then
+	if not mapHas(r, "_entryCall") then
 		return null # <serve: not a router>
+
 	end
 
 	if not mapHas(opts, "readHeaderTimeoutMs") or opts.readHeaderTimeoutMs == null then
@@ -1069,7 +1227,12 @@ let serve = fun(listener, r, opts: {}) -> {}? do
 		opts.maxBodyBytes = 1048576
 	end
 
-	let server = { listener: listener, stop: {closed: false}, conns: [], opts: opts }
+	let server = {
+		listener: listener,
+		stop: {closed: false},
+		conns: [],
+		opts: opts
+	}
 
 	let _ = procSpawn(fun(_: Null) -> Null do
 		while not server.stop.closed do
@@ -1109,16 +1272,36 @@ end
 # =========================
 
 let _reason = fun(code: Int) -> Str do
-	if code == 200 then return "OK" end
-	if code == 204 then return "No Content" end
-	if code == 400 then return "Bad Request" end
-	if code == 404 then return "Not Found" end
-	if code == 405 then return "Method Not Allowed" end
-	if code == 413 then return "Payload Too Large" end
-	if code == 422 then return "Unprocessable Entity" end
-	if code == 431 then return "Request Header Fields Too Large" end
-	if code == 500 then return "Internal Server Error" end
-	if code == 504 then return "Gateway Timeout" end
+	if code == 200 then
+		return "OK"
+	end
+	if code == 204 then
+		return "No Content"
+	end
+	if code == 400 then
+		return "Bad Request"
+	end
+	if code == 404 then
+		return "Not Found"
+	end
+	if code == 405 then
+		return "Method Not Allowed"
+	end
+	if code == 413 then
+		return "Payload Too Large"
+	end
+	if code == 422 then
+		return "Unprocessable Entity"
+	end
+	if code == 431 then
+		return "Request Header Fields Too Large"
+	end
+	if code == 500 then
+		return "Internal Server Error"
+	end
+	if code == 504 then
+		return "Gateway Timeout"
+	end
 	"OK"
 end
 
@@ -1133,13 +1316,13 @@ end
 let _readLineLimited = fun(c, remaining: Int?) -> Str? do
 	let line = readLine(c)
 	if line == null then
-		return null
+		return
 	end
 	let s = _trimCR(line)
 	if remaining != null then
 		let left = int(remaining) - len(s) - 2
 		if left < 0 then
-			return null
+			return
 		end
 	end
 	s
@@ -1151,14 +1334,14 @@ let _readHeaders = fun(c, maxBytes: Int) -> {}? do
 	while true do
 		let line = _readLineLimited(c, budget)
 		if line == null then
-			return null
+			return
 		end
 		if len(line) == 0 then
 			break
 		end
 		let parts = split(line, ":")
 		if len(parts) < 2 then
-			return null
+			return
 		end
 		let key = parts[0]
 		let value = strip(join(slice(parts, 1, len(parts)), ":"))
@@ -1176,22 +1359,26 @@ let _parseTarget = fun(t: Str) -> {} do
 		path = parts[0]
 		query = join(slice(parts, 1, len(parts)), "?")
 	end
-	{ path: path, query: query }
+	{path: path, query: query}
 end
 
 let _readBodyContentLength = fun(c, n: Int, cap: Int) -> Str? do
-	let want = if n > cap then cap else n end
+	let want = if n > cap then
+		cap
+	else
+		n
+	end
 	let buf = ""
 	let remaining = want
 	while remaining > 0 do
 		let chunk = readN(c, remaining)
 		if chunk == null then
-			return null
+			return
 		end
 		buf = buf + chunk
 		remaining = remaining - len(chunk)
 		if len(chunk) == 0 then
-			return null
+			return
 		end
 	end
 	buf
@@ -1200,24 +1387,24 @@ end
 let _readRequest = fun(conn, opts: {}) -> {}? do
 	let line = readLine(conn)
 	if line == null then
-		return null
+		return
 	end
 	let reqLine = _trimCR(line)
 	let parts = split(reqLine, " ")
 	if len(parts) != 3 then
-		return null
+		return
 	end
 	let method = toUpper(parts[0])
 	let target = parts[1]
 	let proto = parts[2]
 	if proto != "HTTP/1.1" then
-		return null
+		return
 	end
 
 	let maxHdr = int(opts.maxHeaderBytes)
 	let hdrs = _readHeaders(conn, maxHdr)
 	if hdrs == null then
-		return null
+		return
 	end
 
 	let keepAlive = true
@@ -1231,23 +1418,27 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	if mapHas(hdrs, "Content-Length") then
 		let n = int(hdrs["Content-Length"])
 		if n == null or n < 0 then
-			return null
+			return
 		end
 		let cap = int(opts.maxBodyBytes)
 		let s = _readBodyContentLength(conn, n, cap)
 		if s == null then
-			return null
+			return
 		end
 		if n > cap then
 			let toDrop = n - cap
 			while toDrop > 0 do
-				let d = readN(conn, if toDrop > 4096 then 4096 else toDrop end)
+				let d = readN(conn, if toDrop > 4096 then
+					4096
+				else
+					toDrop
+				end)
 				if d == null or len(d) == 0 then
 					break
 				end
 				toDrop = toDrop - len(d)
 			end
-			return { tooLarge: true }
+			return {tooLarge: true}
 		end
 		bodyStr = s
 	end
@@ -1255,7 +1446,7 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	{
 		req: {
 			method: method,
-			url: { scheme: null, host: null, path: t.path, query: t.query },
+			url: {scheme: null, host: null, path: t.path, query: t.query},
 			headers: hdrs,
 			body: bodyStr,
 			pathParams: {}
@@ -1267,7 +1458,11 @@ end
 let _writeResponse = fun(conn, res: _Response) -> Bool do
 	let status = int(res.status)
 	let headers = clone(res.headers)
-	let body = if res.body == null then "" else res.body end
+	let body = if res.body == null then
+		""
+	else
+		res.body
+	end
 
 	if not mapHas(headers, "Content-Length") then
 		headers["Content-Length"] = str(len(body))
@@ -1311,11 +1506,15 @@ let _connLoop = fun(conn, router, server) -> Null do
 	while true do
 		let rr = _readRequest(conn, server.opts)
 		if rr == null then
-			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [
+				_reason(400)
+			]))
 			break
 		end
 		if mapHas(rr, "tooLarge") and bool(rr.tooLarge) then
-			let _ = write(conn, sprintf("HTTP/1.1 413 %s\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\npayload too large", [_reason(413)]))
+			let _ = write(conn, sprintf("HTTP/1.1 413 %s\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\npayload too large", [
+				_reason(413)
+			]))
 			break
 		end
 
@@ -1338,17 +1537,22 @@ end
 # =========================
 
 let openapiDoc = fun(r, info: {}, servers: [Str]?) -> {}? do
-	if not (mapHas(r, "_dump")) then
+	if not mapHas(r, "_dump") then
 		return null # <not a router>
+
 	end
 	let dump = r._dump()
 	let rs = []
 	for rr in dump.routes do
-		rs = rs + [{ method: rr.method, pattern: rr.pattern, style: rr.style }]
+		rs = rs + [{method: rr.method, pattern: rr.pattern, style: rr.style}]
 	end
 	{
 		info: info,
-		servers: if servers == null then [] else servers end,
+		servers: if servers == null then
+			[]
+		else
+			servers
+		end,
 		routes: rs
 	}
 end

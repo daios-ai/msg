@@ -454,6 +454,14 @@ let noContent = fun(_: Null) -> {} do
 end
 
 let redirect = fun(status: Int, location: Str) -> {} do
+	# Policy: only absolute-path redirects are allowed (must start with "/").
+	if len(location) == 0 or substr(location, 0, 1) != "/" then
+		return {
+			status: 400,
+			headers: {"Content-Type": "text/plain"},
+			body: "bad redirect"
+		}
+	end
 	{
 		status: status,
 		headers: {Location: location},
@@ -573,6 +581,29 @@ let router = fun(_: Null) -> {} do
 	let _mws = []
 	let _mounts = [] # entries: { prefixParts: [Str], child: Router }
 
+	let _allowedMethodsLocal = fun(path: Str) -> [Str] do
+		let segs = _splitPath(path)
+		let out = []
+		for r in _routes do
+			if _pathMatch(r.parts, segs) != null then
+				# de-dup
+				let seen = false
+				let i = 0
+				while i < len(out) do
+					if out[i] == r.method then
+						seen = true
+						break
+					end
+					i = i + 1
+				end
+				if not seen then
+					out = out + [r.method]
+				end
+			end
+		end
+		out
+	end
+
 	let _matchLocal = fun(method: Str, path: Str) -> {}? do
 		let want = _normMethod(method)
 		let segs = _splitPath(path)
@@ -666,12 +697,25 @@ let router = fun(_: Null) -> {} do
 			end
 
 			if _normMethod(req.method) == "OPTIONS" then
-				return {status: 204, headers: {}, body: ""}
+				let allowed = _allowedMethodsLocal(req.url.path)
+				if len(allowed) > 0 then
+					return {
+						status: 204,
+						headers: if len(allowed) > 0 then {"Allow": join(allowed, ", ")} else {} end,
+						body: ""
+					}
+				end
+				return {
+					status: 404,
+					headers: {"Content-Type": "text/plain"},
+					body: "not found"
+				}
 			end
 			if _pathExistsLocal(req.url.path) then
+				let allowed405 = _allowedMethodsLocal(req.url.path)
 				return {
 					status: 405,
-					headers: {"Content-Type": "text/plain"},
+					headers: {"Content-Type": "text/plain", "Allow": join(allowed405, ", ")},
 					body: "method not allowed"
 				}
 			end
@@ -1319,6 +1363,11 @@ let _trimCR = fun(s: Str) -> Str do
 	s
 end
 
+let _validHeaderValue = fun(v: Str) -> Bool do
+	# Disallow CR or LF anywhere in header values (prevents header injection)
+	match("\r|\n", v) == []
+end
+
 let _readLineLimited = fun(c, remaining: Int?) -> Str? do
 	let line = readLine(c)
 	if line == null then
@@ -1351,6 +1400,11 @@ let _readHeaders = fun(c, maxBytes: Int) -> {}? do
 		end
 		let key = parts[0]
 		let value = strip(join(slice(parts, 1, len(parts)), ":"))
+
+		if mapHas(headers, key) and toLower(key) == "content-length" and headers[key] != value then
+			headers["__cl_conflict__"] = true
+		end
+
 		headers[key] = value
 		budget = budget - len(line) - 2
 	end
@@ -1413,6 +1467,14 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 		return
 	end
 
+	# NEW: unsupported TE or conflicting CL -> 400
+	if mapHas(hdrs, "Transfer-Encoding") then
+		return {badRequest: true}
+	end
+	if mapHas(hdrs, "__cl_conflict__") and bool(hdrs["__cl_conflict__"]) then
+		return {badRequest: true}
+	end
+
 	let keepAlive = true
 	if mapHas(hdrs, "Connection") and toLower(hdrs["Connection"]) == "close" then
 		keepAlive = false
@@ -1426,25 +1488,16 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 		if n == null or n < 0 then
 			return
 		end
+
+		# NEW: do not read when too large; return signal for 413
 		let cap = int(opts.maxBodyBytes)
+		if n > cap then
+			return {tooLarge: true}
+		end
+
 		let s = _readBodyContentLength(conn, n, cap)
 		if s == null then
 			return
-		end
-		if n > cap then
-			let toDrop = n - cap
-			while toDrop > 0 do
-				let d = readN(conn, if toDrop > 4096 then
-					4096
-				else
-					toDrop
-				end)
-				if d == null or len(d) == 0 then
-					break
-				end
-				toDrop = toDrop - len(d)
-			end
-			return {tooLarge: true}
 		end
 		bodyStr = s
 	end
@@ -1468,6 +1521,17 @@ let _writeResponse = fun(conn, res: _Response) -> Bool do
 		""
 	else
 		res.body
+	end
+
+	# Validate header values to block CRLF injection
+	for [k, v] in headers do
+		if not _validHeaderValue(v) then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [
+				_reason(400)
+			]))
+			flush(conn)
+			return false
+		end
 	end
 
 	if not mapHas(headers, "Content-Length") then
@@ -1517,6 +1581,12 @@ let _connLoop = fun(conn, router, server) -> Null do
 			]))
 			break
 		end
+		if mapHas(rr, "badRequest") and bool(rr.badRequest) then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [
+				_reason(400)
+			]))
+			break
+		end
 		if mapHas(rr, "tooLarge") and bool(rr.tooLarge) then
 			let _ = write(conn, sprintf("HTTP/1.1 413 %s\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\npayload too large", [
 				_reason(413)
@@ -1537,6 +1607,7 @@ let _connLoop = fun(conn, router, server) -> Null do
 	server.conns = _removeConn(server.conns, conn)
 	null
 end
+
 
 # =========================
 # OpenAPI (contract-based)

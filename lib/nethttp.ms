@@ -528,7 +528,8 @@ end
 
 let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
 	let m = _normMethod(method)
-	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c}
+	let isPrefix = len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
+	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
 end
 
 let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
@@ -573,11 +574,26 @@ let router = fun(_: Null) -> {} do
 	let _mws = []
 	let _mounts = []
 
+	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
+		if len(a) < len(b) then
+			return false
+		end
+		let i = 0
+		while i < len(b) do
+			if a[i] != b[i] then
+				return false
+			end
+			i = i + 1
+		end
+		true
+	end
+
 	let _allowedMethodsLocal = fun(path: Str) -> [Str] do
 		let segs = _splitPath(path)
 		let out = []
 		for r in _routes do
-			if _pathMatch(r.parts, segs) != null then
+			let hit = _pathMatch(r.parts, segs) != null or (mapHas(r, "prefix") and r.prefix == true and _startsWith(segs, r.parts))
+			if hit then
 				let seen = false
 				let i = 0
 				while i < len(out) do
@@ -682,7 +698,11 @@ let router = fun(_: Null) -> {} do
 			if _normMethod(req.method) == "OPTIONS" then
 				let allowed = _allowedMethodsLocal(req.url.path)
 				if len(allowed) > 0 then
-					return {status: 204, headers: if len(allowed) > 0 then {"Allow": join(allowed, ", ")} else {} end, body: ""}
+					return {status: 204, headers: {"Allow": join(allowed, ", ")}, body: ""}
+				end
+				# If any middleware is installed (e.g., CORS), honor generic preflight.
+				if len(_mws) > 0 then
+					return {status: 204, headers: {}, body: ""}
 				end
 				return {status: 404, headers: {"Content-Type": "text/plain"}, body: "not found"}
 			end
@@ -1082,17 +1102,31 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 end
 
 let mwCors = fun(opts: {}) -> _Mw do
-	let origin = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
+	let originOpt = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
 	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
 	let allowH = if mapHas(opts, "headers") and opts.headers != null then join(opts.headers, ", ") else "Content-Type, Authorization" end
-	let creds = if mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials) then "true" else "false" end
+	let credsOn = mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials)
 
 	return fun(next: _StreamFn) -> _StreamFn do
 		return fun(req: Request, res: Responder, ctx: {}) -> Null do
-			res.setHeader("Access-Control-Allow-Origin", origin)
+			let reqOrigin = _getHeader(req.headers, "Origin")
+			let allowOrigin =
+				if credsOn then
+					if originOpt == "*" then
+						if reqOrigin != null then reqOrigin else "*" end
+					else
+						originOpt
+					end
+				else
+					originOpt
+				end
+			res.setHeader("Access-Control-Allow-Origin", allowOrigin)
 			res.setHeader("Access-Control-Allow-Methods", methods)
 			res.setHeader("Access-Control-Allow-Headers", allowH)
-			res.setHeader("Access-Control-Allow-Credentials", creds)
+			res.setHeader("Access-Control-Allow-Credentials", if credsOn then "true" else "false" end)
+			if credsOn then
+				res.setHeader("Vary", "Origin")
+			end
 			if req.method == "OPTIONS" then
 				res.status(204)
 				let _ = res.end(null)
@@ -1248,9 +1282,10 @@ let _readLineLimited = fun(c, remaining: Int?) -> Str? do
 	s
 end
 
-let _readHeaders = fun(c, maxBytes: Int) -> {}? do
+let _readHeaders = fun(c, maxBytes: Int, maxCount: Int?) -> {}? do
 	let headers = {}
 	let budget = maxBytes
+	let count = 0
 	while true do
 		let line = _readLineLimited(c, budget)
 		if line == null then
@@ -1258,6 +1293,10 @@ let _readHeaders = fun(c, maxBytes: Int) -> {}? do
 		end
 		if len(line) == 0 then
 			break
+		end
+		count = count + 1
+		if maxCount != null and count > int(maxCount) then
+			return {"__too_many__": true}
 		end
 		let parts = split(line, ":")
 		if len(parts) < 2 then
@@ -1328,9 +1367,13 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	end
 
 	let maxHdr = int(opts.maxHeaderBytes)
-	let hdrs = _readHeaders(conn, maxHdr)
+	let maxCnt = if mapHas(opts, "maxHeaders") then opts.maxHeaders else null end
+	let hdrs = _readHeaders(conn, maxHdr, maxCnt)
 	if hdrs == null then
 		return
+	end
+	if mapHas(hdrs, "__too_many__") then
+		return {tooManyHeaders: true}
 	end
 
 	if mapHas(hdrs, "Transfer-Encoding") then
@@ -1367,10 +1410,13 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	}
 end
 
-let _writeResponse = fun(conn, res: _Response) -> Bool do
+let _writeResponse = fun(conn, res: _Response, opts: {}) -> Bool do
 	let status = int(res.status)
 	let headers = clone(res.headers)
 	let body = if res.body == null then "" else res.body end
+	if mapHas(opts, "addDateHeader") and opts.addDateHeader != null and opts.addDateHeader and not mapHas(headers, "Date") then
+		headers["Date"] = timeFormatRFC3339(nowMillis())
+	end
 	for [k, v] in headers do
 		if not _validHeaderValue(v) then
 			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
@@ -1429,6 +1475,10 @@ let _connLoop = fun(conn, router, server) -> Null do
 			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
 			break
 		end
+		if mapHas(rr, "tooManyHeaders") and bool(rr.tooManyHeaders) then
+			let _ = write(conn, sprintf("HTTP/1.1 431 %s\r\nContent-Length: 27\r\nContent-Type: text/plain\r\n\r\nrequest header fields too large", [_reason(431)]))
+			break
+		end
 
 		let req = rr.req
 
@@ -1473,7 +1523,7 @@ let _connLoop = fun(conn, router, server) -> Null do
 
 		# Buffered value route
 		let out = router._entryCall(req)
-		let ok = _writeResponse(conn, out)
+		let ok = _writeResponse(conn, out, server.opts)
 		if not ok or not rr.keepAlive then
 			break
 		end

@@ -39,14 +39,14 @@ let Responder = type {
 }
 
 # Internal accumulator for test client / server writer
-let _Response = type {status: Int, headers: {}, body: Str}
+let _Response = type {status!: Int, headers!: {}, body!: Str}
 
 # Structured error for value handlers
 let _HttpError = type {
-	__http_error__: Bool,
-	status: Int,
-	body: Str,
-	headers: {}
+	__http_error__!: Bool,
+	status!: Int,
+	body!: Str,
+	headers!: {}
 }
 
 # Contract (open map; optional fields)
@@ -130,6 +130,7 @@ let _json = fun(v) -> Str? do
 	if s != null then
 		return s
 	end
+	printf("[DBG] _json failed: type=%s\n", [str(typeOf(v))])
 	null # <json stringify failed>
 
 end
@@ -778,6 +779,7 @@ let router = fun(_: Null) -> {} do
 					return
 				end
 				let out = r.value
+				printf("[DBG] route out: httpError=%s structured=%s willValidate=%s\n", [str(isType(out, _HttpError)), str(isType(out, type {status: Int, headers: {}, body: Str})), str(mapHas(c, "responses") and c.responses != null)])
 
 				if out == null then
 					res.status(500)
@@ -807,13 +809,15 @@ let router = fun(_: Null) -> {} do
 					return
 				end
 
-				if isType(out, type {status: Int, headers: {}, body: Str}) then
+				if isType(out, _Response) then
 					if mapHas(c, "responses") and c.responses != null then
 						let payload = if mapHas(out, "body") then
 							jsonParse(out.body)
 						else
 							out
 						end
+						printf("[DBG] struct resp: status=%d ct=%s jsonParsedNull=%s\n", [int(out.status), if mapHas(out.headers, "Content-Type") then out.headers["Content-Type"] else "(none)" end, str(payload == null)])
+
 						if not _checkResponse(out.status, payload, c.responses) then
 							res.status(500)
 							res.setHeader("Content-Type", "application/json")
@@ -832,6 +836,7 @@ let router = fun(_: Null) -> {} do
 				end
 
 				let js = _json(out)
+				printf("[DBG] implicit json: stringifyNull=%s willValidate=%s\n", [str(js == null), str(mapHas(c, "responses") and c.responses != null)])
 				if js == null then
 					res.status(500)
 					res.setHeader("Content-Type", "text/plain")
@@ -915,6 +920,7 @@ let _checkResponse = fun(status: Int, out, respMap: {}) -> Bool do
 	if not isType(T, type Type) then
 		return true
 	end
+	printf("[DBG] _checkResponse status=%d hasKey=%s typeIsTypeType=%s result=%s\n", [int(status), str(mapHas(respMap, str(status)) or mapHas(respMap, status)), str(isType(T, type Type)), str(isType(out, T))])
 	isType(out, T)
 end
 

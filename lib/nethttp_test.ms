@@ -1360,3 +1360,64 @@ testing.test("nethttp/date header on/off", fun(_: Null) do
 	let _ = http.shutdown(srv2, 0)
 	testing.assert(len(split(resp2, "\nDate: ")) == 1, "Date header should be absent when disabled")
 end)
+
+# =========================================================
+# nethttp/HEAD auto for value routes
+# Expect: 200; Content-Length equals GET body length; no body bytes written.
+# =========================================================
+testing.test("nethttp/HEAD auto value route", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/h", {}, fun(req, ctx) do
+		http.text(200, "hello")
+	end)
+
+	let addr = "127.0.0.1:18120"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})    # default: no Date header (fine)
+
+	# Send HEAD (no body expected)
+	let c = netConnect(addr)
+	let _ = write(c, "HEAD /h HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	# Status OK
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	# Correct Content-Length (len("hello") == 5)
+	testing.assert(len(split(resp, "\nContent-Length: 5")) > 1, "wrong Content-Length for HEAD")
+	# No body bytes after header terminator
+	testing.assert(len(split(resp, "\r\n\r\nhello")) == 1, "HEAD must not include body")
+end)
+
+# =========================================================
+# nethttp/HEAD on streaming route -> 405 (unless explicitly registered)
+# Expect: 405 and Allow header lists GET
+# =========================================================
+testing.test("nethttp/HEAD streaming -> 405", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.routeStream("GET", "/s", {}, fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("stream")
+		res.end(null)
+		null
+	end)
+
+	let addr = "127.0.0.1:18121"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "HEAD /s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 405 Method Not Allowed")) > 1, "expected 405 for HEAD on streaming route")
+	testing.assert(len(split(resp, "\nAllow: GET")) > 1, "Allow header should list GET")
+end)

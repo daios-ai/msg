@@ -618,7 +618,9 @@ let router = fun(_: Null) -> {} do
 		let score = -1
 		for r in _routes do
 			if r.method != want then
-				continue
+				if not (want == "HEAD" and r.method == "GET" and r.style == "value") then
+					continue
+				end
 			end
 			let p = _pathMatch(r.parts, segs)
 			if p != null then
@@ -1523,6 +1525,18 @@ let _connLoop = fun(conn, router, server) -> Null do
 
 		# Buffered value route
 		let out = router._entryCall(req)
+		# Auto-HEAD for value routes: same headers (with accurate Content-Length), no body
+		if req.method == "HEAD" then
+			let hdr = clone(out.headers)
+			if not mapHas(hdr, "Content-Length") then
+				hdr["Content-Length"] = str(len(out.body))
+			end
+			let ok = _writeResponse(conn, {status: out.status, headers: hdr, body: ""}, server.opts)
+			if not ok or not rr.keepAlive then
+				break
+			end
+			continue
+		end
 		let ok = _writeResponse(conn, out, server.opts)
 		if not ok or not rr.keepAlive then
 			break

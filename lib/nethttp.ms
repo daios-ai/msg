@@ -1044,10 +1044,7 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 				if closed.v then
 					return proxy
 				end
-				if timedOut(null) and not wrote.v then
-					closeTimeout(null)
-					return proxy
-				end
+				wrote.v = true
 				res.status(code)
 				proxy
 			end
@@ -1055,19 +1052,12 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 				if closed.v then
 					return proxy
 				end
-				if timedOut(null) and not wrote.v then
-					closeTimeout(null)
-					return proxy
-				end
+				wrote.v = true
 				res.setHeader(k, v)
 				proxy
 			end
 			proxy.write = fun(chunk: Str) -> Int? do
 				if closed.v then
-					return 0
-				end
-				if timedOut(null) and not wrote.v then
-					closeTimeout(null)
 					return 0
 				end
 				wrote.v = true

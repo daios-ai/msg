@@ -472,7 +472,7 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 		if st.ended then
 			return 0
 		end
-		if not _emitHead(null) then
+		if not _emitHead() then
 			return null # <write head failed>
 		end
 		if st.chunked then
@@ -505,7 +505,7 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 			return true
 		end
 		if not st.wroteHead then
-			if not _emitHead(null) then
+			if not _emitHead() then
 				return true
 			end
 		end
@@ -789,14 +789,14 @@ let router = fun(_: Null) -> {} do
 				if not r.ok then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
-					let _ = res.end(null)
+					let _ = res.end()
 					return
 				end
 				let out = r.value
 				if out == null then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("handler returned null")
-					let _ = res.end(null)
+					let _ = res.end()
 					return
 				end
 				if isType(out, _HttpError) then
@@ -807,7 +807,7 @@ let router = fun(_: Null) -> {} do
 					end
 					res.status(out.status)
 					let _ = res.write(rt)
-					let _ = res.end(null)
+					let _ = res.end()
 					return
 				end
 				if isType(out, _Response) then
@@ -816,7 +816,7 @@ let router = fun(_: Null) -> {} do
 						if not _checkResponse(out.status, payload, c.responses) then
 							res.status(500).setHeader("Content-Type", "application/json")
 							let _ = res.write(_validationJSON("response", "response-validation failed"))
-							let _ = res.end(null)
+							let _ = res.end()
 							return
 						end
 					end
@@ -825,27 +825,27 @@ let router = fun(_: Null) -> {} do
 					end
 					res.status(out.status)
 					let _ = res.write(out.body)
-					let _ = res.end(null)
+					let _ = res.end()
 					return
 				end
 				let js = _json(out)
 				if js == null then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("json encode error")
-					let _ = res.end(null)
+					let _ = res.end()
 					return
 				end
 				if mapHas(c, "responses") and c.responses != null then
 					if not _checkResponse(200, out, c.responses) then
 						res.status(500).setHeader("Content-Type", "application/json")
 						let _ = res.write(_validationJSON("response", "response-validation failed"))
-						let _ = res.end(null)
+						let _ = res.end()
 						return
 					end
 				end
 				res.setHeader("Content-Type", "application/json; charset=utf-8").status(200)
 				let _ = res.write(js)
-				let _ = res.end(null)
+				let _ = res.end()
 				null
 			end
 			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
@@ -857,7 +857,7 @@ let router = fun(_: Null) -> {} do
 				if not r.ok then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
-					let _ = res.end(null)
+					let _ = res.end()
 				end
 				null
 			end
@@ -924,7 +924,7 @@ let router = fun(_: Null) -> {} do
 					let _ = flush(conn)
 					return {streamed: true}
 				end
-				let _ = sock.api.end(null)
+				let _ = sock.api.end()
 				return {streamed: true}
 			end
 			_entryCore(req)
@@ -994,7 +994,7 @@ let mwRecover = fun(_: Null) -> _Mw do
 			if not r.ok then
 				res.status(500).setHeader("Content-Type", "text/plain")
 				let _ = res.write("internal server error")
-				let _ = res.end(null)
+				let _ = res.end()
 			end
 			null
 		end
@@ -1030,7 +1030,7 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 				end
 				res.status(504).setHeader("Content-Type", "text/plain")
 				let _ = res.write("timeout")
-				let _ = res.end(null)
+				let _ = res.end()
 				closed.v = true
 				null
 			end
@@ -1052,12 +1052,20 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 				if closed.v then
 					return proxy
 				end
+				if timedOut() and not wrote.v then
+					closeTimeout()
+					return proxy
+				end
 				wrote.v = true
 				res.setHeader(k, v)
 				proxy
 			end
 			proxy.write = fun(chunk: Str) -> Int? do
 				if closed.v then
+					return 0
+				end
+				if timedOut() and not wrote.v then
+					closeTimeout()
 					return 0
 				end
 				wrote.v = true
@@ -1067,26 +1075,26 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 				if closed.v then
 					return true
 				end
-				if timedOut(null) and not wrote.v then
-					closeTimeout(null)
+				if timedOut() and not wrote.v then
+					closeTimeout()
 					return true
 				end
-				res.flush(null)
+				res.flush()
 			end
 			proxy.end = fun(_: Null) -> Bool? do
 				if closed.v then
 					return true
 				end
-				if timedOut(null) and not wrote.v then
-					closeTimeout(null)
+				if timedOut() and not wrote.v then
+					closeTimeout()
 					return true
 				end
-				res.end(null)
+				res.end()
 			end
 
 			next(req, proxy, ctx)
-			if not closed.v and not wrote.v and timedOut(null) then
-				closeTimeout(null)
+			if not closed.v and not wrote.v and timedOut() then
+				closeTimeout()
 			end
 			null
 		end
@@ -1121,7 +1129,7 @@ let mwCors = fun(opts: {}) -> _Mw do
 			end
 			if req.method == "OPTIONS" then
 				res.status(204)
-				let _ = res.end(null)
+				let _ = res.end()
 				return
 			end
 			next(req, res, ctx)
@@ -1156,10 +1164,10 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 				n
 			end
 			proxy.flush = fun(_: Null) -> Bool? do
-				orig.flush(null)
+				orig.flush()
 			end
 			proxy.end = fun(_: Null) -> Bool? do
-				orig.end(null)
+				orig.end()
 			end
 
 			next(req, proxy, ctx)

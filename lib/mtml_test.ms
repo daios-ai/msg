@@ -275,13 +275,19 @@ testing.test("mtml/jail blocks parent escape", fun(_) do
 	testing.assert(match("path escapes basedir", toLower(noteGet(out))) != null, "expected jail error")
 end)
 
-# href/src require SafeURL
-testing.test("mtml/href requires safeURL", fun(_) do
+testing.test("mtml/href plain string allowed", fun(_) do
 	let e = mtml.env({})
 	let t = mtml.fromString(e, "<a href=\"{{ u }}\">x</a>", "href.html")
 	let out = mtml.render(e, t, {u: "/ok?q=1"})
+	testing.assertEq("<a href=\"/ok?q=1\">x</a>", out)
+end)
+
+# (Optional but recommended) add a guard test for disallowed schemes with plain strings:
+testing.test("mtml/href plain string rejects javascript", fun(_) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<a href=\"{{ u }}\">x</a>", "href-bad.html")
+	let out = mtml.render(e, t, {u: "javascript:alert(1)"})
 	testing.assertEq(null, out)
-	testing.assert(match("href/src require safeurl", toLower(noteGet(out))) != null, "expected href error")
 end)
 
 # event handler blocked
@@ -292,13 +298,14 @@ testing.test("mtml/event handler blocked", fun(_) do
 end)
 
 # script requires tojson
-testing.test("mtml/script requires tojson", fun(_) do
+testing.test("mtml/script requires tojson", fun(_: Null) do
 	let e = mtml.env({})
 	let t1 = mtml.fromString(e, "<script>var x={{ v }}</script>", "script1.html")
 	testing.assertEq(null, mtml.render(e, t1, {v: "<b>"}))
 	let _ = mtml.installBuiltins(e)
 	let t2 = mtml.fromString(e, "<script>var x={{ v | tojson }}</script>", "script2.html")
-	testing.assertEq("<script>var x=\"<b>\"</script>", mtml.render(e, t2, {v: "<b>"}))
+	# Expect JSON-escaped angle brackets inside the string literal
+	testing.assertEq("<script>var x=\"\\u003cb\\u003e\"</script>", mtml.render(e, t2, {v: "<b>"}))
 end)
 
 # |safe must be string or already-safe

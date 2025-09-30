@@ -125,7 +125,7 @@ end
 
 let _htmlEscape = fun(s: Str) -> Str do
 	# quick check: nothing to escape
-	if match("[&<>\"']", s) == null then return s end
+	if len(match("[&<>\"']", s)) == 0 then return s end
 	let t  = replace("&",  "&amp;",  s)
 	let t2 = replace("<",  "&lt;",   t)
 	let t3 = replace(">",  "&gt;",   t2)
@@ -283,52 +283,57 @@ end
 # Token: { kind!: Enum["text","expr","stmt"], value!: Str, trimL!: Bool, trimR!: Bool, line!: Int, col!: Int, ctx?: {} }
 # ctx for expr: {kind:"text"|"attr", attrName?:Str}
 let _attrCtx = fun(src: Str, idx: Int) -> {kind: Str, attrName: Str?} do
-	# find nearest '<' or '>' to the left
+	# Find nearest '<' or '>' to the left; if '>' is nearer, we're not inside a tag.
 	let j = idx - 1
-	let seenLt = -1
-	let seenGt = -1
+	let lt = -1
+	let gt = -1
 	while j >= 0 do
 		let c = substr(src, j, j + 1)
-		if c == "<" then seenLt = j
+		if c == "<" then lt = j
 			break
 		end
-		if c == ">" then seenGt = j
+		if c == ">" then gt = j
 			break
 		end
 		j = j - 1
 	end
-	if seenGt > seenLt then return {kind: "text"} end
-	if seenLt == -1 then return {kind: "text"} end
+	if lt == -1 or gt > lt then return {kind: "text"} end
 
-	# inside a tag; are we inside a quoted value?
-	let q = ""
+	# Look for '=' between '<' and the interpolation; if none, treat as text.
 	j = idx - 1
-	while j > seenLt do
+	let eq = -1
+	while j > lt do
 		let c = substr(src, j, j + 1)
-		if c == "\"" or c == "'" then
-			q = c
+		if c == "=" then eq = j
 			break
 		end
 		j = j - 1
 	end
-	if q == "" then return {kind: "text"} end
+	if eq == -1 then return {kind: "text"} end
 
-	# ensure '=' before the quote
-	let k = j - 1
-	while k > seenLt and substr(src, k, k + 1) == " " do
-		k = k - 1
-	end
-	if k <= seenLt or substr(src, k, k + 1) != "=" then
-		return {kind: "text"}
+	# Ensure we didn't cross a tag end before the interpolation.
+	j = eq + 1
+	while j < idx do
+		if substr(src, j, j + 1) == ">" then
+			return {kind: "text"}
+		end
+		j = j + 1
 	end
 
-	# extract attribute name
-	let aEnd = k - 1
-	while aEnd > seenLt and match("[\\s/]", substr(src, aEnd, aEnd + 1)) == null do
-		aEnd = aEnd - 1
+	# Extract attribute name to the left of '='.
+	j = eq - 1
+	while j > lt and substr(src, j, j + 1) == " " do
+		j = j - 1
 	end
-	let name = strip(substr(src, aEnd + 1, k - 0))
-	{kind: "attr", attrName: toLower(name)}
+	let endName = j
+	while j > lt do
+		let m = match("[A-Za-z0-9_:-]", substr(src, j, j + 1))
+		if m == null or len(m) == 0 then break end
+		j = j - 1
+	end
+	let name = toLower(strip(substr(src, j + 1, endName + 1)))
+	if len(name) == 0 then return {kind: "text"} end
+	{kind: "attr", attrName: name}
 end
 
 let _lex = fun(src: Str) -> [Any]? do
@@ -884,13 +889,36 @@ let _trimLeftNL = fun(bufs: Str) -> Str do
 	bufs
 end
 
+# Allow inside <script> only when the last top-level pipe is | tojson
+let _endsWithToJSON = fun(code: Str) -> Bool do
+	let pipes = _splitTopLevel(code, "|")
+	if len(pipes) == 0 then return false end
+	let last = toLower(strip(pipes[len(pipes) - 1]))
+	if substr(last, 0, 6) == "tojson" then
+		true
+	else
+		false
+	end
+end
+
+# Conservative fallback: consider we're in <script> if we've seen an opening but no closing yet.
+let _inScriptNow = fun(buf: {s: Str, inScript: Bool}) -> Bool do
+	if buf.inScript then return true end
+	let low = toLower(buf.s)
+	if len(match("<script\\b", low)) > 0 and len(match("</script>", low)) == 0 then
+		true
+	else
+		false
+	end
+end
+
 # Track <script>/<style> via scanning text chunks
 let _scanTagState = fun(buf: {inScript: Bool, inStyle: Bool}, s: Str) -> Null do
 	let low = toLower(s)
-	if match("<script\\b", low) != null then buf.inScript = true end
-	if match("</script>",  low) != null then buf.inScript = false end
-	if match("<style\\b",  low) != null then buf.inStyle = true end
-	if match("</style>",   low) != null then buf.inStyle = false end
+	if len(match("<script\\b", low)) > 0 then buf.inScript = true end
+	if len(match("</script>",  low)) > 0 then buf.inScript = false end
+	if len(match("<style\\b",  low)) > 0 then buf.inStyle = true end
+	if len(match("</style>",   low)) > 0 then buf.inStyle = false end
 	null
 end
 
@@ -962,8 +990,10 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {s: Str, tri
 			end
 
 			# Context guards (fail closed)
-			if buf.inScript then
-				return error("render: interpolation inside <script> is not allowed")
+			if _inScriptNow(buf) then
+				if not _endsWithToJSON(n.a.code) then
+					return error("render: interpolation inside <script> requires | tojson")
+				end
 			end
 			if buf.inStyle then
 				return error("render: interpolation inside <style> is not allowed")
@@ -976,11 +1006,19 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {s: Str, tri
 			if mapHas(n.a, "ctx") and n.a.ctx != null and n.a.ctx.kind == "attr" then
 				let an = n.a.ctx.attrName
 				if an != null then
+					printf("[DBG] attr=%s safe=%s isStr=%s allowed=%s val=%s\n", [an, str(isType(v, type {}) and mapHas(v, "__safe_url__")), str(isType(v, type Str)), str(if isType(v, type Str) then _urlAllowed(v) else null end), str(v)])
+
 					if substr(an, 0, 2) == "on" then
 						return error("render: event handler attributes disallow interpolation")
 					end
 					if an == "href" or an == "src" then
-						if not (isType(v, type {}) and mapHas(v, "__safe_url__")) then
+						if isType(v, type {}) and mapHas(v, "__safe_url__") then
+							null
+						elif isType(v, type Str) then
+							if not _urlAllowed(v) then
+								return error("render: disallowed url scheme")
+							end
+						else
 							return error("render: href/src require SafeURL")
 						end
 					end
@@ -1379,10 +1417,20 @@ let _installBuiltins = fun(e: Env) -> Null do
 		join(ss, sep)
 	end
 
+	let tojson = fun(x) -> SafeHTML do
+		let s = jsonStringify(x)
+		if s == null then s = "null" end
+		s = replace("</script>", "<\\/script>", s)
+		s = replace("\u2028", "\\u2028", s)
+		s = replace("\u2029", "\\u2029", s)
+		safeHTML(s)
+	end
+
 	let _ = registerFilter(e, "upper", upper)
 	let _ = registerFilter(e, "lower", lower)
 	let _ = registerFilter(e, "default", default)
 	let _ = registerFilter(e, "join", joinF)
+	let _ = registerFilter(e, "tojson", tojson)
 	null
 end
 

@@ -1,1901 +1,3203 @@
-=== BEGIN FILE: lib/mtml.ms ===
-# mtml — Minimal, context-aware HTML templating for MindScript
-# Surface: {{ expr | filter(a,b) }}, {% if/elif/else %}, {% for x in xs %},
-# {% include "p" [with expr] %}, {% extends "b" %}+{% block n %}...{% end %}, trims {%- -%}, {{- -}}
-# Policies (MVP): no unquoted attribute interpolation, no |safe in templates
-# URL attributes require url() → SafeURL (still HTML-escaped); style/event attrs forbidden
-# <script> requires final | tojson
+=== BEGIN FILE: lib/nethttp.ms ===
+# nethttp — streaming-first HTTP server for MindScript
+#
+# Design goals (LESS IS MORE):
+# - Single streaming core (Request -> Responder -> Null), middleware-friendly
+# - Route-time contracts: path / query / body / responses
+# - Pre-bind path+query+body before handler (422 on failure)
+# - Value routes are sugar over streaming core
+# - Auto OpenAPI from the same contracts (minimal)
+# - Internals never return null on success; boundary helpers may return annotated null
+#
+# Public surface:
+#   router(), route(), routeStream(), mount(), contract(), openapiDoc(), testClient()
+#   serve(), shutdown()
+#   mwRecover(), mwRequestID(), mwTimeout(), mwCors(), mwAccessLog()
+#
+# Streaming & backpressure (this refactor):
+# - True streaming responses for stream routes via socket-backed Responder
+# - Chunked transfer when length unknown; Content-Length when known
+# - Backpressure honored via socket writes (no in-memory growth)
+# - Request: Transfer-Encoding: chunked still rejected (documented)
+# - Expect: 100-continue preflight (route shape / limits) before reading body
 
-# ---------------- Types & constructors ----------------
+# =========================
+# Public types (data-only)
+# =========================
 
-let SafeHTML = type {__safe_html__!: Bool, html!: Str}
-let SafeURL  = type {__safe_url__!:  Bool, url!:  Str}
-
-let safeHTML = fun(s: Str) -> SafeHTML do
-	{ __safe_html__: true, html: s }
-end
-
-let _urlAllowed = fun(u: Str) -> Bool do
-	if u == null then
-		return false
-	end
-	let s = strip(toLower(u))
-	if len(match("[\\r\\n\\x00\\\\]", s)) > 0 then
-		return false
-	end
-	if substr(s, 0, 2) == "//" then
-		return true
-	end
-	if substr(s, 0, 1) == "/" then
-		return true
-	end
-	if substr(s, 0, 2) == "./" then
-		return true
-	end
-	if substr(s, 0, 3) == "../" then
-		return true
-	end
-	if substr(s, 0, 8) == "https://" then
-		return true
-	end
-	if substr(s, 0, 7) == "http://" then
-		return true
-	end
-	if substr(s, 0, 7) == "mailto:" then
-		return true
-	end
-	if substr(s, 0, 4) == "tel:" then
-		return true
-	end
-	false
-end
-
-let safeURL = fun(u: Str) -> SafeURL? do
-	if not _urlAllowed(u) then
-		return error("render: disallowed url scheme")
-	end
-	{ __safe_url__: true, url: u }
-end
-
-let RenderOpts = type { baseDir: Str, autoescape: Bool, strictUndefined: Bool, bytecodeCache: {} }
-let Span = type {line: Int, col: Int}
-let TemplateError = type {kind: Enum["parse","load","render","type"], message: Str, where: Span?}
-let Template = type {__mtml__: Bool, name: Str, ast: [Any]}
-let Writer = type {write: Str -> Int?, flush: Null -> Bool?}
-let Env = type {
-	__mtml_env__: Bool,
-	opts: RenderOpts,
-	_filters: {},
-	_helpers: {},
-	_globals: {},
-	_loader: Str -> {src: Str, name: Str}?
+# HTTP request value passed to handlers.
+#
+# Fields:
+#   method: Str — Uppercase HTTP method, e.g. "GET".
+#   url: {scheme: Str?, host: Str?, path: Str, query: Str?} — Parsed request-target parts.
+#   headers: {} — Map of request headers (case-preserving on ingest).
+#   body: Any — Raw request body as Str (server) or readable handle (test/client).
+#   pathParams: {}? — Raw `{name}` path parameters (strings), prior to contract binding.
+# Return: type
+let Request = type {
+	method: Str,
+	url: {scheme: Str?, host: Str?, path: Str, query: Str?},
+	headers: {},
+	body: Any,
+	pathParams: {}?
 }
 
-# ---------------- Utilities ----------------
+# Streaming responder interface for handlers.
+#
+# Methods:
+#   status(code: Int) -> Responder — Set status (before head write); chainable.
+#   setHeader(k: Str, v: Str) -> Responder — Set header (before head write); chainable.
+#   write(chunk: Str) -> Int? — Write a body chunk; returns bytes written or null # <write failed>.
+#   flush(_: Null) -> Bool? — Flush downstream buffers; null # <write failed> on error.
+#   end(_: Null) -> Bool? — Finish response; null # <write failed> on error.
+# Behavior:
+#   - For streaming routes, head is emitted lazily on first write/status/header.
+#   - If Content-Length is absent, Transfer-Encoding: chunked is used.
+# Return: type
+let Responder = type {
+	status: Int -> Responder,
+	setHeader: Str -> Str -> Responder,
+	write: Str -> Int?,
+	flush: Null -> Bool?,
+	end: Null -> Bool?
+}
 
-let _defaultOpts = fun(o: RenderOpts) -> RenderOpts do
-	let out = { baseDir: "", autoescape: true, strictUndefined: true, bytecodeCache: {} }
-	if o != null then
-		for [k, v] in o do
-			out[k] = v
-		end
-	end
-	out
+let _Response = type {status!: Int, headers!: {}, body!: Str}
+
+let _HttpError = type {
+	__http_error__!: Bool,
+	status!: Int,
+	body!: Str,
+	headers!: {}
+}
+
+# A marker wrapper for route contracts (path/query/body/responses).
+#
+# Purpose:
+#   Use contract({...}) to declare schemas for binding/validation at route time.
+# Return: type (opaque)
+let Contract = type {}
+
+let _Ctx = type {req: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
+
+let _StreamFn = type Request -> Responder -> {} -> Null
+let _Mw = type _StreamFn -> _StreamFn
+
+# =========================
+# Utilities
+# =========================
+
+let _normMethod = fun(m: Str) -> Str do
+	toUpper(m)
 end
 
-let _err = fun(kind: Str, msg: Str, line: Int, col: Int) -> TemplateError do
-	{ kind: kind, message: msg, where: {line: line, col: col} }
-end
-
-let diagnostics = fun(e: TemplateError) -> Str do
-	if e == null then
-		return ""
-	end
-	if e.where == null then
-		return sprintf("[%s] %s", [e.kind, e.message])
-	end
-	sprintf("[%s] %s at %d:%d", [e.kind, e.message, int(e.where.line), int(e.where.col)])
-end
-
-let _htmlEscape = fun(s: Str) -> Str do
-	if len(match("[&<>\"']", s)) == 0 then
-		return s
-	end
-	let t  = replace("&",  "&amp;",  s)
-	let t2 = replace("<",  "&lt;",   t)
-	let t3 = replace(">",  "&gt;",   t2)
-	let t4 = replace("\"", "&quot;", t3)
-	replace("'", "&#39;", t4)
-end
-
-let _trimLeadingWSNL = fun(s: Str) -> Str do
-	let i = 0
-	while i < len(s) do
-		let ch = substr(s, i, i + 1)
-		if ch == " " or ch == "\t" then
-			i = i + 1
-		else
-			break
-		end
-	end
-	if i < len(s) and substr(s, i, i + 1) == "\n" then
-		return substr(s, i + 1, len(s))
-	end
-	substr(s, i, len(s))
-end
-
-let _trimRightWS = fun(s: Str) -> Str do
-	let i = len(s) - 1
-	while i >= 0 do
-		let ch = substr(s, i, i + 1)
-		if ch == " " or ch == "\t" then
-			i = i - 1
-		else
-			break
-		end
-	end
-	substr(s, 0, i + 1)
-end
-
-let _resolvePath = fun(baseDir: Str, fromName: Str, req: Str) -> Str? do
-	let base = if len(fromName) == 0 then baseDir else pathDir(pathJoin([baseDir, fromName])) end
-	let clean = pathClean(pathJoin([base, req]))
-	let bd = pathClean(baseDir)
-	if len(bd) > 0 and substr(clean, 0, len(bd)) != bd then
-		return error("load: path escapes baseDir")
-	end
-	clean
-end
-
-let _relName = fun(baseDir: Str, full: Str) -> Str do
-	let bd = pathClean(baseDir)
-	if len(bd) == 0 then
-		return full
-	end
-	if substr(full, 0, len(bd)) == bd and len(full) > len(bd) and substr(full, len(bd), len(bd) + 1) == "/" then
-		return substr(full, len(bd) + 1, len(full))
-	end
-	full
-end
-
-# ---------------- Environment ----------------
-
-let env = fun(opts: RenderOpts) -> Env do
-	let o = _defaultOpts(opts)
-	{
-		__mtml_env__: true,
-		opts: o,
-		_filters: {},
-		_helpers: {},
-		_globals: {},
-		_loader: fun(path: Str) -> {src: Str, name: Str}? do
-			let full = _resolvePath(o.baseDir, "", path)
-			if full == null then
-				return error("load: unable to resolve path")
-			end
-			let s = readFile(full)
-			if s == null then
-				return error("load: unable to read file")
-			end
-			{src: s, name: _relName(o.baseDir, full)}
-		end
-	}
-end
-
-let registerFilter = fun(e: Env, name: Str, f) -> Bool do
-	e._filters[name] = f
-	true
-end
-
-let registerHelper = fun(e: Env, name: Str, f) -> Bool do
-	e._helpers[name] = f
-	true
-end
-
-let registerGlobal = fun(e: Env, name: Str, value) -> Bool do
-	e._globals[name] = value
-	true
-end
-
-# ---------------- Tokenizer helpers ----------------
-
-let _isURLAttr = fun(n: Str) -> Bool do
-	let x = toLower(n)
-	if x == "href" then return true end
-	if x == "src" then return true end
-	if x == "action" then return true end
-	if x == "formaction" then return true end
-	if x == "poster" then return true end
-	if x == "xlink:href" then return true end
-	if x == "data-src" then return true end
-	false
-end
-
-let _isEventAttr = fun(n: Str) -> Bool do
-	len(n) >= 2 and toLower(substr(n, 0, 2)) == "on"
-end
-
-let _quoteOf = fun(ch: Str) -> Str do
-	if ch == "\"" then
-		"double"
-	elif ch == "'" then
-		"single"
-	else
-		"unquoted"
-	end
-end
-
-let _hasInsensitiveAt = fun(s: Str, i: Int, lit: Str) -> Bool do
-	if i < 0 then
+let _hasPrefix = fun(s: Str, prefix: Str) -> Bool do
+	let n = len(prefix)
+	if len(s) < n then
 		return false
 	end
-	let n = len(lit)
-	if i + n > len(s) then
-		return false
-	end
-	let seg = toLower(substr(s, i, i + n))
-	toLower(lit) == seg
+	substr(s, 0, n) == prefix
 end
 
-# ---------------- Tokenizer (HTML-aware, minimal) ----------------
-# Emits [{kind:"text"|"expr"|"stmt", value, trimL, trimR, line, col, ctx?, quote?, attrName?}]
-
-let _lex = fun(src: Str) -> [Any]? do
+let _splitPath = fun(p: Str) -> [Str] do
+	let s = if len(p) == 0 or substr(p, 0, 1) != "/" then "/" + p else p end
+	let raw = split(s, "/")
 	let out = []
 	let i = 0
-	let line = 1
-	let col = 1
-	let trimNext = false
-
-	let ctx = "HtmlText"
-	let inTag = false
-	let curAttr = ""
-	let inAttr = false
-	let q = ""
-
-	let pushText = fun(s: Str, ln: Int, co: Int, tl: Bool, tr: Bool) -> Null do
-		if len(s) == 0 then
-			return
-		end
-		let vv = if trimNext then _trimLeadingWSNL(s) else s end
-		trimNext = false
-		out = out + [{kind: "text", value: vv, trimL: tl, trimR: tr, line: ln, col: co}]
-		null
-	end
-
-	let bump = fun(ch: Str) -> Null do
-		if ch == "\n" then
-			line = line + 1
-			col = 1
-		else
-			col = col + 1
-		end
-		null
-	end
-
-	while i < len(src) do
-		let startL = line
-		let startC = col
-
-		let j = i
-		let tag = ""
-		let found = -1
-		while j < len(src) do
-			let a = substr(src, j, j + 1)
-			let b = ""
-			if j + 1 < len(src) then
-				b = substr(src, j + 1, j + 2)
-			end
-
-			if a == "<" then
-				inTag = true
-				curAttr = ""
-				inAttr = false
-				q = ""
-			elif a == ">" then
-				inTag = false
-				curAttr = ""
-				inAttr = false
-				q = ""
-			elif inTag then
-				if a == "=" then
-					inAttr = true
-				elif a == "\"" or a == "'" then
-					if inAttr and q == "" then
-						q = a
-					elif inAttr and q == a then
-						q = ""
-					end
-				elif a == " " or a == "\t" or a == "\n" then
-					if q == "" then
-						inAttr = false
-						curAttr = ""
-					end
-				else
-					if not inAttr and q == "" then
-						if curAttr == "" then
-							curAttr = a
-						else
-							curAttr = curAttr + a
-						end
-					end
-				end
-			end
-
-			# context switches for script/style
-			if a == "<" and _hasInsensitiveAt(src, j, "<script") then
-				ctx = "RawJS"
-			end
-			if _hasInsensitiveAt(src, j - 2, "</script>") then
-				ctx = "HtmlText"
-			end
-			if a == "<" and _hasInsensitiveAt(src, j, "<style") then
-				ctx = "RawCSS"
-			end
-			if _hasInsensitiveAt(src, j - 1, "</style>") then
-				ctx = "HtmlText"
-			end
-
-			if a == "{" and (b == "{" or b == "%") then
-				found = j
-				tag = a + b
-				break
-			end
-			bump(a)
-			j = j + 1
-		end
-
-		if found == -1 then
-			pushText(substr(src, i, len(src)), startL, startC, false, false)
-			break
-		end
-
-		pushText(substr(src, i, found), startL, startC, false, false)
-
-		let trimL = false
-		if found + 2 < len(src) and substr(src, found + 2, found + 3) == "-" then
-			trimL = true
-			tag = tag + "-"
-		end
-
-		let close = if substr(tag, 0, 2) == "{{" then "}}" else "%}" end
-		let k = found + if tag == "{{-" or tag == "{%-" then 3 else 2 end
-		let innerStart = k
-		let trimR = false
-		let closed = -1
-		while k < len(src) - 1 do
-			let c2 = substr(src, k, k + 1)
-			let c3 = substr(src, k + 1, k + 2)
-			if c2 == "-" and c3 + substr(src, k + 2, k + 3) == close then
-				trimR = true
-				closed = k
-				break
-			end
-			if c2 + c3 == close then
-				closed = k
-				break
-			end
-			k = k + 1
-		end
-		if closed == -1 then
-			return error("parse: unclosed tag")
-		end
-		let inner = strip(substr(src, innerStart, closed))
-		let endSpan = if trimR then closed + 3 else closed + 2 end
-		let kind = if substr(tag, 0, 2) == "{{" then "expr" else "stmt" end
-
-		let tokCtx = null
-		if kind == "expr" then
-			if ctx == "RawJS" then
-				tokCtx = "RawJS"
-			elif ctx == "RawCSS" then
-				tokCtx = "RawCSS"
-			elif inTag and inAttr then
-				let an = toLower(strip(curAttr))
-				if _isEventAttr(an) then
-					tokCtx = "EventAttr"
-				elif an == "style" then
-					tokCtx = "StyleAttr"
-				elif _isURLAttr(an) then
-					tokCtx = "URLAttr"
-				else
-					tokCtx = "GenericAttr"
-				end
-			else
-				tokCtx = "HtmlText"
-			end
-		end
-
-		let qk = ""
-		if kind == "expr" and inTag and inAttr then
-			qk = _quoteOf(q)
-		end
-
-		out = out + [{
-			kind: kind,
-			value: inner,
-			trimL: trimL,
-			trimR: trimR,
-			line: startL,
-			col: startC,
-			ctx: tokCtx,
-			quote: qk,
-			attrName: curAttr
-		}]
-		if trimR then
-			trimNext = true
-		end
-
-		let chunk = substr(src, found, endSpan)
-		let p = 0
-		while p < len(chunk) do
-			bump(substr(chunk, p, p + 1))
-			p = p + 1
-		end
-		i = endSpan
-	end
-
-	out
-end
-
-# ---------------- Parser (AST) ----------------
-
-let _node = fun(tag: Str, a, b, c, d) -> {} do
-	{tag: tag, a: a, b: b, c: c, d: d}
-end
-
-let _splitTopLevel = fun(s: Str, sep: Str) -> [Str] do
-	let out = []
-	let i = 0
-	let last = 0
-	let inQ = ""
-	let esc = false
-	let depth = 0
-	let bcurly = 0
-	let bsquare = 0
-	while i < len(s) do
-		let ch = substr(s, i, i + 1)
-		if inQ != "" then
-			if esc then
-				esc = false
-			else
-				if ch == "\\" then
-					esc = true
-				elif ch == inQ then
-					inQ = ""
-				end
-			end
-		else
-			if ch == "\"" or ch == "'" then
-				inQ = ch
-			elif ch == "(" then
-				depth = depth + 1
-			elif ch == ")" and depth > 0 then
-				depth = depth - 1
-			elif ch == "{" then
-				bcurly = bcurly + 1
-			elif ch == "}" and bcurly > 0 then
-				bcurly = bcurly - 1
-			elif ch == "[" then
-				bsquare = bsquare + 1
-			elif ch == "]" and bsquare > 0 then
-				bsquare = bsquare - 1
-			else
-				if depth == 0 and bcurly == 0 and bsquare == 0 and substr(s, i, i + len(sep)) == sep then
-					out = out + [strip(substr(s, last, i))]
-					i = i + len(sep)
-					last = i
-					continue
-				end
-			end
+	while i < len(raw) do
+		let seg = raw[i]
+		if len(seg) > 0 and seg != "." then
+			out = out + [seg]
 		end
 		i = i + 1
 	end
-	out = out + [strip(substr(s, last, len(s)))]
 	out
 end
 
-let _parse = fun(tokens: [Any]) -> [Any]? do
-	let pos = 0
+let _isParamSeg = fun(seg: Str) -> Bool do
+	let n = len(seg)
+	n >= 2 and substr(seg, 0, 1) == "{" and substr(seg, n - 1, n) == "}"
+end
 
-	let parseSeq = fun(stopTags: [Str]) -> [Any]? do
-		let out = []
-		while pos < len(tokens) do
-			let t = tokens[pos]
-			if t.kind == "text" then
-				pos = pos + 1
-				out = out + [
-					_node("text", {s: t.value, tl: t.trimL, tr: t.trimR, line: t.line, col: t.col}, null, null, null)
-				]
-				continue
-			end
-			if t.kind == "expr" then
-				pos = pos + 1
-				out = out + [
-					_node("expr", {code: t.value, tl: t.trimL, tr: t.trimR, line: t.line, col: t.col, ctx: t.ctx, quote: t.quote, attrName: t.attrName}, null, null, null)
-				]
-				continue
-			end
+let _isCatchSeg = fun(seg: Str) -> Bool do
+	let n = len(seg)
+	n >= 3 and substr(seg, 0, 1) == "{" and substr(seg, 1, 2) == "*" and substr(seg, n - 1, n) == "}"
+end
 
-			let body = t.value
-			let parts = split(body, " ")
-			let head = parts[0]
+let _paramName = fun(seg: Str) -> Str do
+	let name = substr(seg, 1, len(seg) - 1)
+	if len(name) > 0 and substr(name, 0, 1) == "*" then
+		return substr(name, 1, len(name))
+	end
+	name
+end
 
-			for tag in stopTags do
-				if head == tag then
-					return out
-				end
-			end
+let _makeURL = fun(path: Str, query: Str?) -> {} do
+	{scheme: null, host: null, path: path, query: query}
+end
 
-			if head == "if" then
-				pos = pos + 1
-				let branches = []
-				let cond = strip(substr(body, 3, len(body)))
-				let thenBody = parseSeq(["elif","else","end"])
-				if thenBody == null then
-					return error("parse: unterminated if")
-				end
-				branches = branches + [[cond, thenBody]]
+let _json = fun(v) -> Str? do
+	let s = jsonStringify(v)
+	if s != null then
+		return s
+	end
+	null # <json stringify failed>
+end
 
-				while pos < len(tokens) and tokens[pos].kind == "stmt" do
-					let st = tokens[pos].value
-					let p2 = split(st, " ")
-					if p2[0] == "elif" then
-						pos = pos + 1
-						let cond2 = strip(substr(st, 5, len(st)))
-						let b2 = parseSeq(["elif","else","end"])
-						if b2 == null then
-							return error("parse: unterminated elif")
-						end
-						branches = branches + [[cond2, b2]]
-						continue
-					end
-					if p2[0] == "else" then
-						pos = pos + 1
-						let b3 = parseSeq(["end"])
-						if b3 == null then
-							return error("parse: unterminated else")
-						end
-						let endTL = tokens[pos].trimL
-						let endTR = tokens[pos].trimR
-						out = out + [_node("if", branches, b3, null, {tlOpen: t.trimL, trOpen: t.trimR, tlEnd: endTL, trEnd: endTR})]
-						if pos < len(tokens) and tokens[pos].kind == "stmt" and tokens[pos].value == "end" then
-							pos = pos + 1
-							break
-						end
-						return error("parse: expected end after else")
-					end
-					break
-				end
-
-				if len(out) == 0 or out[len(out)-1].tag != "if" then
-					let endTL2 = tokens[pos].trimL
-					let endTR2 = tokens[pos].trimR
-					out = out + [_node("if", branches, null, null, {tlOpen: t.trimL, trOpen: t.trimR, tlEnd: endTL2, trEnd: endTR2})]
-					if pos < len(tokens) and tokens[pos].kind == "stmt" and tokens[pos].value == "end" then
-						pos = pos + 1
-					else
-						return error("parse: expected end")
-					end
-				end
-				continue
-			end
-
-			if head == "for" then
-				pos = pos + 1
-				let rest = strip(substr(body, 4, len(body)))
-				let bits = _splitTopLevel(rest, " in ")
-				if len(bits) != 2 then
-					return error("parse: for syntax")
-				end
-				let name = strip(bits[0])
-				let iter = strip(bits[1])
-				let b = parseSeq(["end"])
-				if b == null then
-					return error("parse: unterminated for")
-				end
-				let endTL = tokens[pos].trimL
-				let endTR = tokens[pos].trimR
-				out = out + [_node("for", name, iter, b, {tlOpen: t.trimL, trOpen: t.trimR, tlEnd: endTL, trEnd: endTR})]
-				if pos < len(tokens) and tokens[pos].kind == "stmt" and tokens[pos].value == "end" then
-					pos = pos + 1
-				else
-					return error("parse: expected end")
-				end
-				continue
-			end
-
-			if head == "include" then
-				pos = pos + 1
-				let rest = strip(substr(body, 8, len(body)))
-				let parts2 = _splitTopLevel(rest, " with ")
-				let pth = parts2[0]
-				let ctxExpr = null
-				if len(parts2) >= 2 then
-					ctxExpr = parts2[1]
-				end
-				out = out + [_node("include", pth, ctxExpr, null, {tlOpen: t.trimL, trOpen: t.trimR})]
-				continue
-			end
-
-			if head == "block" then
-				pos = pos + 1
-				let nm = strip(substr(body, 6, len(body)))
-				let b = parseSeq(["end"])
-				if b == null then
-					return error("parse: unterminated block")
-				end
-				let endTL = tokens[pos].trimL
-				let endTR = tokens[pos].trimR
-				out = out + [_node("block", nm, b, null, {tlOpen: t.trimL, trOpen: t.trimR, tlEnd: endTL, trEnd: endTR})]
-				if pos < len(tokens) and tokens[pos].kind == "stmt" and tokens[pos].value == "end" then
-					pos = pos + 1
-				else
-					return error("parse: expected end")
-				end
-				continue
-			end
-
-			if head == "extends" then
-				pos = pos + 1
-				let p = strip(substr(body, 8, len(body)))
-				out = out + [_node("extends", p, null, null, {tlOpen: t.trimL, trOpen: t.trimR})]
-				continue
-			end
-
-			if head == "end" then
-				return out
-			end
-
-			return error("parse: unknown tag")
+let _getHeader = fun(h: {}, name: Str) -> Str? do
+	let want = toLower(name)
+	for [k, v] in h do
+		if toLower(k) == want then
+			return v
 		end
-		out
-	end
-
-	let ast = parseSeq([])
-	if ast == null then
-		return error("parse: invalid structure")
-	end
-	ast
-end
-
-# ---------------- Expression evaluation ----------------
-
-let _parseStringLit = fun(s: Str) -> Str? do
-	if len(s) < 2 then
-		return
-	end
-	let q = substr(s, 0, 1)
-	if q != "\"" and q != "'" then
-		return
-	end
-	if substr(s, len(s) - 1, len(s)) != q then
-		return
-	end
-	substr(s, 1, len(s) - 1)
-end
-
-let _numOrBoolOrNull = fun(s: Str) -> Any? do
-	if s == "true" then
-		return true
-	end
-	if s == "false" then
-		return false
-	end
-	if s == "null" then
-		return
-	end
-	let i = int(s)
-	if i != null and str(i) == s then
-		return i
-	end
-	let n = num(s)
-	if n != null then
-		return n
 	end
 	null
 end
 
-let _argsParse = fun(s: Str) -> [Str] do
-	if len(strip(s)) == 0 then
-		return []
-	end
-	_splitTopLevel(s, ",")
+# Wrap a route contract (marker).
+#
+# Summary:
+#   Returns the same object, labeled as a Contract for readability at callsites.
+# Args:
+#   c: Contract — A map describing path/query/body/responses (types).
+# Return: Contract
+let contract = fun(c: Contract) -> Contract do
+	c
 end
 
-let _splitTernary = fun(s: Str) -> {A: Str, cond: Str, B: Str}? do
-	let partsIf = _splitTopLevel(s, " if ")
-	if len(partsIf) != 2 then
-		return null
-	end
-	let partsElse = _splitTopLevel(partsIf[1], " else ")
-	if len(partsElse) != 2 then
-		return null
-	end
-	{A: partsIf[0], cond: partsElse[0], B: partsElse[1]}
+# =========================
+# Error helpers (public)
+# =========================
+
+# Create a structured HTTP error response for value routes.
+#
+# Summary:
+#   Returns a special object recognized by router value handlers to emit the given status and body.
+# Args:
+#   status: Int — HTTP status code.
+#   message: Str — Plaintext/error message body.
+# Return: {} — Structured error marker (not a panic).
+let raise = fun(status: Int, message: Str) -> {} do
+	{__http_error__: true, status: status, body: message, headers: {}}
 end
 
-let _findTopLevelParen = fun(s: Str) -> Int do
-	let i = 0
-	let inQ = ""
-	let depth = 0
-	while i < len(s) do
-		let ch = substr(s, i, i + 1)
-		if inQ != "" then
-			if ch == inQ then
-				inQ = ""
-			end
-			i = i + 1
-			continue
-		end
-		if ch == "\"" or ch == "'" then
-			inQ = ch
-			i = i + 1
-			continue
-		end
-		if ch == "(" then
-			if depth == 0 then
-				return i
-			end
-			depth = depth + 1
-			i = i + 1
-			continue
-		end
-		if ch == ")" and depth > 0 then
-			depth = depth - 1
-		end
-		i = i + 1
-	end
-	-1
+# Create a structured HTTP error with custom headers.
+#
+# Args:
+#   status: Int — HTTP status code.
+#   message: Str — Error message body.
+#   headers: {} — Additional headers to include in the response.
+# Return: {} — Structured error marker.
+let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
+	{__http_error__: true, status: status, body: message, headers: headers}
 end
 
-let _evalNamePath = fun(scope: {}, name: Str, strict: Bool) -> Any? do
-	let parts = _splitTopLevel(name, ".")
-	let cur = scope
-	let j = 0
-	while j < len(parts) do
-		let p = parts[j]
-		if j == 0 then
-			if mapHas(cur, p) then
-				cur = cur[p]
-			else
-				if strict then
-					return error("render: missing name " + p)
-				else
-					return null
-				end
-			end
-		else
-			if cur == null then
-				if strict then
-					return error("render: access null")
-				else
-					return null
-				end
-			end
-			if isType(cur, type {}) and mapHas(cur, p) then
-				cur = cur[p]
-			else
-				if strict then
-					return error("render: missing field " + p)
-				else
-					return null
-				end
-			end
-		end
-		j = j + 1
+# =========================
+# Binding helpers (internal)
+# =========================
+
+let _rawBody = fun(req: Request) -> Str? do
+	if isType(req.body, type Str) then
+		return req.body
 	end
-	cur
-end
-
-let _evalExpr = fun(e: Env, scope: {}, code: Str) -> Any? do
-	let pipes = _splitTopLevel(code, "|")
-	if len(pipes) == 0 then
-		return
-	end
-
-	let base = strip(pipes[0])
-	let val = null
-
-	let ter = _splitTernary(base)
-	if ter != null then
-		let cv = _evalExpr(e, scope, ter.cond)
-		if cv == null and noteGet(cv) != null then
-			return cv
-		end
-		if cv == null then
-			return error("render: bad condition")
-		end
-		let truth = bool(cv)
-		if truth == null then
-			return error("render: non-bool condition")
-		end
-		if truth then
-			val = _evalExpr(e, scope, ter.A)
-		else
-			val = _evalExpr(e, scope, ter.B)
-		end
-		if val == null and noteGet(val) != null then
-			return val
-		end
-	else
-		let q = _parseStringLit(base)
-		if q != null then
-			val = q
-		else
-			let prim = _numOrBoolOrNull(base)
-			if prim != null or base == "null" then
-				val = prim
-			else
-				let p = _findTopLevelParen(base)
-				if p >= 0 and substr(base, len(base) - 1, len(base)) == ")" then
-					let nm = strip(substr(base, 0, p))
-					if len(nm) == 0 then
-						val = _evalExpr(e, scope, strip(substr(base, p + 1, len(base) - 1)))
-					else
-						if not mapHas(e._helpers, nm) then
-							return error("render: unknown helper " + nm)
-						end
-						let argsStr = strip(substr(base, p + 1, len(base) - 1))
-						let argExprs = _argsParse(argsStr)
-						let argv = []
-						let i = 0
-						while i < len(argExprs) do
-							let v = _evalExpr(e, scope, argExprs[i])
-							if v == null and noteGet(v) != null then
-								return v
-							end
-							if v == null and strip(argExprs[i]) != "null" then
-								return error("render: bad arg")
-							end
-							argv = argv + [v]
-							i = i + 1
-						end
-						val = e._helpers[nm]
-						let k = 0
-						while k < len(argv) do
-							val = val(argv[k])
-							k = k + 1
-						end
-					end
-				else
-					let merged = {}
-					for [k, v] in e._globals do
-						merged[k] = v
-					end
-					for [k2, v2] in scope do
-						merged[k2] = v2
-					end
-					val = _evalNamePath(merged, base, e.opts.strictUndefined)
-				end
-			end
-		end
-	end
-
-	let i = 1
-	while i < len(pipes) do
-		let spec = strip(pipes[i])
-		if len(spec) == 0 then
-			i = i + 1
-			continue
-		end
-		let p = _findTopLevelParen(spec)
-		let fname = ""
-		let argList = []
-		if p >= 0 and substr(spec, len(spec) - 1, len(spec)) == ")" then
-			fname = strip(substr(spec, 0, p))
-			let as = strip(substr(spec, p + 1, len(spec) - 1))
-			argList = _argsParse(as)
-		else
-			fname = spec
-		end
-		if fname == "safe" then
-			return error("render: |safe disabled; pass SafeHTML from host")
-		end
-		if not mapHas(e._filters, fname) then
-			return error("render: unknown filter " + fname)
-		end
-		let f = e._filters[fname]
-		let argv = [val]
-		let j = 0
-		while j < len(argList) do
-			let vj = _evalExpr(e, scope, argList[j])
-			if vj == null and noteGet(vj) != null then
-				return vj
-			end
-			argv = argv + [vj]
-			j = j + 1
-		end
-		let out = f
-		let k = 0
-		while k < len(argv) do
-			out = out(argv[k])
-			k = k + 1
-		end
-		val = out
-		i = i + 1
-	end
-
-	val
-end
-
-# ---------------- Rendering ----------------
-
-let _endsWithToJSON = fun(code: Str) -> Bool do
-	let pipes = _splitTopLevel(code, "|")
-	if len(pipes) == 0 then
-		return false
-	end
-	toLower(strip(pipes[len(pipes) - 1])) == "tojson"
-end
-
-let _trimLeftNL = fun(s: Str) -> Str do
-	let i = len(s) - 1
-	while i >= 0 do
-		let ch = substr(s, i, i + 1)
-		if ch == " " or ch == "\t" then
-			i = i - 1
-			continue
-		end
-		if ch == "\n" then
-			return substr(s, 0, i)
-		end
-		break
+	let s = readAll(req.body)
+	if s == null then
+		return null # <read body failed>
 	end
 	s
 end
 
-let _flushPendingNL = fun(w: Writer, buf: {s: Str, trimNext: Bool, pendingNL: Bool}) -> Bool? do
-	if buf.pendingNL then
-		let n = w.write("\n")
-		if n == null then
-			return error("render: writer failed")
-		end
-		buf.s = buf.s + "\n"
-		buf.pendingNL = false
+let _coerceScalar = fun(s: Str, T: Type) -> Any? do
+	if isSubtype(T, type Str) then
+		let pj = jsonParse(s)
+		return if pj != null and isType(pj, type Str) then pj else s end
 	end
-	true
+	if isSubtype(T, type Int) then
+		let i = int(s)
+		if i != null then
+			return i
+		end
+		let pj = jsonParse(s)
+		if pj != null and isType(pj, type Int) then
+			return pj
+		end
+		return null # <bad int>
+	end
+	if isSubtype(T, type Num) then
+		let n = num(s)
+		if n != null then
+			return n
+		end
+		let pj = jsonParse(s)
+		if pj != null and (isType(pj, type Num) or isType(pj, type Int)) then
+			return pj
+		end
+		return null # <bad num>
+	end
+	if isSubtype(T, type Bool) then
+		let sl = toLower(s)
+		if sl == "true" then
+			return true
+		end
+		if sl == "false" then
+			return false
+		end
+		let pj = jsonParse(s)
+		if pj != null and isType(pj, type Bool) then
+			return pj
+		end
+		return null # <bad bool>
+	end
+	null # <unsupported scalar type>
 end
 
-let _write = fun(w: Writer, buf: {s: Str, trimNext: Bool, pendingNL: Bool}, s: Str) -> Bool? do
-	if buf.trimNext then
-		s = _trimLeadingWSNL(s)
-		buf.trimNext = false
+let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
+	let rt = reflect(T)
+	if rt == null then
+		return null # <reflect failed>
+	end
+	let node = rt[1]
+	if node[0] != "map" then
+		return null # <only object types supported for query>
 	end
 
-	if buf.pendingNL and len(s) > 0 then
-		let n1 = w.write("\n")
-		if n1 == null then
-			return error("render: writer failed")
-		end
-		buf.s = buf.s + "\n"
-		buf.pendingNL = false
-	end
-
-	if len(s) > 0 and substr(s, len(s)-1, len(s)) == "\n" then
-		let body = substr(s, 0, len(s)-1)
-		if len(body) > 0 then
-			let n2 = w.write(body)
-			if n2 == null then
-				return error("render: writer failed")
-			end
-			buf.s = buf.s + body
-		end
-		buf.pendingNL = true
-		return true
-	end
-
-	if len(s) > 0 then
-		let n = w.write(s)
-		if n == null then
-			return error("render: writer failed")
-		end
-		buf.s = buf.s + s
-	end
-	true
-end
-
-let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {s: Str, trimNext: Bool, pendingNL: Bool}, curName: Str, stack: [Str]) -> Bool? do
-	let autoesc = bool(e.opts.autoescape)
+	let out = {}
+	let entries = slice(node, 1, len(node))
 	let i = 0
-	while i < len(ast) do
-		let n = ast[i]
+	while i < len(entries) do
+		let e = entries[i]
+		let tag = e[0]
+		let k = e[1][1]
+		let TkNode = e[2]
+		let Tk = reify(["type", TkNode])
+		let vs = if mapHas(m, k) then m[k] else null end
 
-		if n.tag == "text" then
-			let s = n.a.s
-			if n.a.tl and buf.pendingNL then
-				buf.pendingNL = false
+		if vs == null or len(vs) == 0 then
+			if tag == "pair!" then
+				return null # <missing key: {k}>
 			end
-			if n.a.tr then
-				buf.trimNext = true
-			end
-			let ok = _write(w, buf, s)
-			if ok == null then
-				return ok
-			end
+			i = i + 1
+			continue
+		end
 
-		elif n.tag == "expr" then
-			if mapHas(n.a, "tl") and n.a.tl and buf.pendingNL then
-				buf.pendingNL = false
-			end
-
-			let c = n.a.ctx
-			if c == "RawCSS" or c == "StyleAttr" then
-				return error("render: interpolation in CSS/style is forbidden")
-			end
-			if c == "EventAttr" then
-				return error("render: event handler attributes disallow interpolation")
-			end
-			if c == "RawJS" and not _endsWithToJSON(n.a.code) then
-				return error("render: interpolation inside <script> requires | tojson")
-			end
-			if (c == "GenericAttr" or c == "URLAttr") and n.a.quote == "unquoted" then
-				return error("render: unquoted attribute interpolation is forbidden")
-			end
-
-			let v = _evalExpr(e, scope, n.a.code)
-			if v == null and noteGet(v) != null then
-				return v
-			end
-
-			if c == "URLAttr" then
-				if isType(v, type {}) and mapHas(v, "__safe_url__") then
-					null
-				else
-					return error("render: URL attribute requires url() or SafeURL")
-				end
-			end
-
-			let out = ""
-			if v == null then
-				let src = strip(n.a.code)
-				let hasPipe  = len(match("\\|", src)) > 0
-				let hasCall  = len(match("\\(", src)) > 0
-				let hasQuote = len(match("[\"']", src)) > 0
-				let hasSpace = len(match("\\s", src)) > 0
-				let badChar  = len(match("[^A-Za-z0-9_\\.]", src)) > 0
-				let isBare   = (not hasPipe) and (not hasCall) and (not hasQuote) and (not hasSpace) and (not badChar) and len(src) > 0
-				if e.opts.strictUndefined and isBare then
-					return error("render: missing name " + src)
-				end
-				out = ""
-			elif isType(v, type {}) and mapHas(v, "__safe_html__") then
-				out = v.html
-			elif isType(v, type {}) and mapHas(v, "__safe_url__") then
-				let s2 = v.url
-				if autoesc then
-					out = _htmlEscape(s2)
-				else
-					out = s2
-				end
-			else
-				let s2 = if isType(v, type Str) then v else str(v) end
-				if s2 == null then
-					return error("render: stringify failed")
-				end
-				if c == "RawJS" then
-					out = s2
-				else
-					if autoesc then
-						out = _htmlEscape(s2)
-					else
-						out = s2
+		if TkNode[0] == "array" then
+			let U = reify(["type", TkNode[1]])
+			if len(vs) == 1 then
+				let pj = jsonParse(vs[0])
+				if pj != null and isType(pj, type [Any]) then
+					let arr = []
+					let j = 0
+					while j < len(pj) do
+						let s = str(pj[j])
+						let u = _coerceScalar(s, U)
+						if u == null then
+							return null # <bad element for {k}>
+						end
+						arr = arr + [u]
+						j = j + 1
 					end
+					out[k] = arr
+					i = i + 1
+					continue
 				end
 			end
+			let arr2 = []
+			let j2 = 0
+			while j2 < len(vs) do
+				let u2 = _coerceScalar(vs[j2], U)
+				if u2 == null then
+					return null # <bad element for {k}>
+				end
+				arr2 = arr2 + [u2]
+				j2 = j2 + 1
+			end
+			out[k] = arr2
+			i = i + 1
+			continue
+		end
 
-			if mapHas(n.a, "tr") and n.a.tr then
-				buf.trimNext = true
-			end
-			let ok2 = _write(w, buf, out)
-			if ok2 == null then
-				return ok2
-			end
+		let s = vs[len(vs) - 1]
+		let v = _coerceScalar(s, Tk)
+		if v == null then
+			return null # <coercion failed: {k}>
+		end
+		out[k] = v
+		i = i + 1
+	end
 
-		elif n.tag == "if" then
-			if n.d != null and n.d.trOpen then
-				buf.trimNext = true
-			end
+	if isType(out, T) then
+		return out
+	end
+	null # <query validation failed>
+end
 
-			let done = false
-			let bi = 0
-			while bi < len(n.a) do
-				let pair = n.a[bi]
-				let cond = _evalExpr(e, scope, pair[0])
-				if cond == null and noteGet(cond) != null then
-					return cond
-				end
-				if cond == null then
-					return error("render: bad if cond")
-				end
-				let b = bool(cond)
-				if b == null then
-					return error("render: non-bool if cond")
-				end
-				if b then
-					let ok = _renderSeq(e, pair[1], scope, w, buf, curName, stack)
-					if ok == null then
-						return ok
+let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
+	let qm = urlQueryParse(if req.url.query == null then "" else req.url.query end)
+	if qm == null then
+		return null # <invalid query string>
+	end
+	_bindQueryMap(qm, TQ)
+end
+
+let _paramsFromPath = fun(parts: [Str], segs: [Str]) -> {} do
+	let ps = {}
+	let i = 0
+	while i < len(parts) do
+		let p = parts[i]
+		if _isParamSeg(p) then
+			ps[_paramName(p)] = segs[i]
+		end
+		i = i + 1
+	end
+	ps
+end
+
+let _bindPath = fun(ps: {}, TP: Type) -> Any? do
+	let rt = reflect(TP)
+	if rt == null then
+		return null # <reflect failed>
+	end
+	let node = rt[1]
+	if node[0] != "map" then
+		return null # <path must be object type>
+	end
+	let out = {}
+	let entries = slice(node, 1, len(node))
+	let i = 0
+	while i < len(entries) do
+		let e = entries[i]
+		let tag = e[0]
+		let k = e[1][1]
+		let Tk = reify(["type", e[2]])
+		let raw = if mapHas(ps, k) then ps[k] else null end
+		if raw == null then
+			if tag == "pair!" then
+				return null # <missing key: {k}>
+			end
+			i = i + 1
+			continue
+		end
+		let v = _coerceScalar(raw, Tk)
+		if v == null then
+			return null # <coercion failed: {k}>
+		end
+		out[k] = v
+		i = i + 1
+	end
+	if isType(out, TP) then
+		return out
+	end
+	null # <path validation failed>
+end
+
+let _bindBody = fun(req: Request, TB: Type) -> Any? do
+	let raw = _rawBody(req)
+	if raw == null then
+		return null # <read body failed>
+	end
+	let v = jsonParse(raw)
+	if v == null then
+		return null # <invalid json>
+	end
+	if not isType(v, TB) then
+		return null # <validation failed: expected body to satisfy {str(TB)}>
+	end
+	v
+end
+
+let _validationJSON = fun(where: Str, reason: Str) -> Str do
+	let obj = {error: "validation", detail: [{in: where, reason: reason}]}
+	let s = _json(obj)
+	if s == null then
+		return "{\"error\":\"validation\"}"
+	end
+	s
+end
+
+# =========================
+# Response helpers (for value handlers)
+# =========================
+
+# Send JSON from a value route.
+#
+# Summary:
+#   Serializes the value to JSON and returns a buffered response with Content-Type set.
+# Args:
+#   status: Int — HTTP status code.
+#   value: Any — Value to encode as JSON.
+# Return: {} — Buffered response or {status:500,"json encode error"} on encode failure.
+let json = fun(status: Int, value) -> {} do
+	let s = _json(value)
+	if s == null then
+		return {status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error"}
+	end
+	{status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s}
+end
+
+# Send plaintext from a value route.
+#
+# Args:
+#   status: Int — HTTP status code.
+#   s: Str — Body.
+# Return: {} — Buffered response with text/plain Content-Type.
+let text = fun(status: Int, s: Str) -> {} do
+	{status: status, headers: {"Content-Type": "text/plain"}, body: s}
+end
+
+# Send 204 No Content from a value route.
+#
+# Args:
+#   _: Null — Unused.
+# Return: {} — Buffered response with empty body.
+let noContent = fun(_: Null) -> {} do
+	{status: 204, headers: {}, body: ""}
+end
+
+# Send an internal redirect (path-only) from a value route.
+#
+# Summary:
+#   Only absolute-path locations are allowed (e.g., "/new"). External absolute URLs are rejected with 400.
+# Args:
+#   status: Int — Redirect code (e.g., 302).
+#   location: Str — Absolute path starting with "/".
+# Return: {} — Buffered response or {status:400,"bad redirect"}.
+let redirect = fun(status: Int, location: Str) -> {} do
+	if len(location) == 0 or substr(location, 0, 1) != "/" then
+		return {status: 400, headers: {"Content-Type": "text/plain"}, body: "bad redirect"}
+	end
+	{status: status, headers: {Location: location}, body: ""}
+end
+
+# =========================
+# Buffered responder (for value routes, tests)
+# =========================
+
+let _newResponder = fun() -> {res: _Response, api: Responder} do
+	let state = {status: 200, headers: {}, body: ""}
+	let api = {}
+	api.status = fun(code: Int) -> Responder do
+		state.status = code
+		api
+	end
+	api.setHeader = fun(k: Str, v: Str) -> Responder do
+		state.headers[k] = v
+		api
+	end
+	api.write = fun(chunk: Str) -> Int? do
+		state.body = state.body + chunk
+		len(chunk)
+	end
+	api.flush = fun(_: Null) -> Bool? do
+		true
+	end
+	api.end = fun(_: Null) -> Bool? do
+		true
+	end
+	{res: state, api: api}
+end
+
+# =========================
+# Socket-backed responder (true streaming)
+# =========================
+
+let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
+	let st = {status: 200, headers: {}, wroteHead: false, chunked: false, ended: false}
+	let _emitHead = fun(_: Null) -> Bool do
+		if st.wroteHead then
+			return true
+		end
+		if not mapHas(st.headers, "Content-Type") then
+			st.headers["Content-Type"] = "text/plain"
+		end
+		let useCL = mapHas(st.headers, "Content-Length")
+		if not useCL then
+			st.headers["Transfer-Encoding"] = "chunked"
+			st.chunked = true
+		end
+		let head = sprintf("HTTP/1.1 %d %s\r\n", [int(st.status), _reason(int(st.status))])
+		for [k, v] in st.headers do
+			head = head + sprintf("%s: %s\r\n", [k, v])
+		end
+		head = head + "\r\n"
+		let n = write(conn, head)
+		if n == null then
+			return false
+		end
+		let _ = flush(conn)
+		st.wroteHead = true
+		true
+	end
+
+	let api = {}
+	api.status = fun(code: Int) -> Responder do
+		if st.wroteHead then
+			return api
+		end
+		st.status = code
+		api
+	end
+	api.setHeader = fun(k: Str, v: Str) -> Responder do
+		if st.wroteHead then
+			return api
+		end
+		st.headers[k] = v
+		api
+	end
+	api.write = fun(chunk: Str) -> Int? do
+		if st.ended then
+			return 0
+		end
+		if not _emitHead() then
+			return null # <write head failed>
+		end
+		if st.chunked then
+			let pre = sprintf("%x\r\n", [len(chunk)])
+			if write(conn, pre) == null then
+				return null # <write failed>
+			end
+			if write(conn, chunk) == null then
+				return null # <write failed>
+			end
+			if write(conn, "\r\n") == null then
+				return null # <write failed>
+			end
+			let _ = flush(conn)
+			len(chunk)
+		else
+			let n = write(conn, chunk)
+			if n == null then
+				return null # <write failed>
+			end
+			let _ = flush(conn)
+			n
+		end
+	end
+	api.flush = fun(_: Null) -> Bool? do
+		flush(conn)
+	end
+	api.end = fun(_: Null) -> Bool? do
+		if st.ended then
+			return true
+		end
+		if not st.wroteHead then
+			if not _emitHead() then
+				return true
+			end
+		end
+		if st.chunked then
+			if write(conn, "0\r\n\r\n") == null then
+				return null # <write failed>
+			end
+		end
+		let _ = flush(conn)
+		st.ended = true
+		true
+	end
+
+	{api: api, state: st}
+end
+
+# =========================
+# Router (closure-backed)
+# =========================
+
+let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
+	let m = _normMethod(method)
+	let isPrefix = len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
+	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
+end
+
+let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
+	let nParts = len(parts)
+	let nReq = len(reqSegs)
+	if nParts == 0 then
+		return if nReq == 0 then {params: {}, matched: 0} else null end
+	end
+	let last = nParts - 1
+	let hasCatch = _isCatchSeg(parts[last])
+	if not hasCatch and nReq != nParts then
+		return
+	end
+	if hasCatch and nReq < last then
+		return
+	end
+	let params = {}
+	let limit = if hasCatch then last else nParts end
+	let i = 0
+	while i < limit do
+		let pat = parts[i]
+		let seg = reqSegs[i]
+		if _isParamSeg(pat) then
+			params[_paramName(pat)] = seg
+		else
+			if pat != seg then
+				return
+			end
+		end
+		i = i + 1
+	end
+	if hasCatch then
+		let name = _paramName(parts[last])
+		let rest = join(slice(reqSegs, last, nReq), "/")
+		params[name] = rest
+	end
+	{params: params, matched: if hasCatch then last else nParts end}
+end
+
+# Create a new router.
+#
+# Summary:
+#   Builds a closure-backed router with registration for value/stream routes, middleware, and mounts.
+# Methods on returned object:
+#   route(method: Str, pattern: Str, c: Contract, handler) -> Bool
+#   routeStream(method: Str, pattern: Str, c: Contract, handler) -> Bool
+#   mount(prefix: Str, childRouter) -> Bool
+#   use(mw: _Mw) -> Bool
+#   _entryCall(req: Request) -> {status!: Int, headers!: {}, body!: Str}
+#   _entryCallStream(req: Request, conn, opts: {}) -> {}?
+# Args:
+#   _: Null — Unused.
+# Return: {} — Router instance.
+let router = fun(_: Null) -> {} do
+	let _routes = []
+	let _mws = []
+	let _mounts = []
+
+	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
+		if len(a) < len(b) then
+			return false
+		end
+		let i = 0
+		while i < len(b) do
+			if a[i] != b[i] then
+				return false
+			end
+			i = i + 1
+		end
+		true
+	end
+
+	let _allowedMethodsLocal = fun(path: Str) -> [Str] do
+		let segs = _splitPath(path)
+		let out = []
+		for r in _routes do
+			let hit = _pathMatch(r.parts, segs) != null or (mapHas(r, "prefix") and r.prefix == true and _startsWith(segs, r.parts))
+			if hit then
+				let seen = false
+				let i = 0
+				while i < len(out) do
+					if out[i] == r.method then
+						seen = true
+						break
 					end
-					done = true
+					i = i + 1
+				end
+				if not seen then
+					out = out + [r.method]
+				end
+			end
+		end
+		out
+	end
+
+	let _matchLocal = fun(method: Str, path: Str) -> {}? do
+		let want = _normMethod(method)
+		let segs = _splitPath(path)
+		let best = null
+		let score = -1
+		for r in _routes do
+			if r.method != want then
+				if not (want == "HEAD" and r.method == "GET" and r.style == "value") then
+					continue
+				end
+			end
+			let p = _pathMatch(r.parts, segs)
+			if p != null then
+				let s = int(p.matched)
+				if s > score then
+					best = {route: r, segs: segs, params: p.params}
+					score = s
+				end
+			end
+		end
+		if best != null then
+			return best
+		end
+		null
+	end
+
+	let _pathExistsLocal = fun(path: Str) -> Bool do
+		let segs = _splitPath(path)
+		for r in _routes do
+			if _pathMatch(r.parts, segs) != null then
+				return true
+			end
+		end
+		false
+	end
+
+	let _compose = fun(fn: _StreamFn) -> _StreamFn do
+		let h = fn
+		let i = len(_mws) - 1
+		while i >= 0 do
+			h = _mws[i](h)
+			i = i - 1
+		end
+		h
+	end
+
+	let _delegateToMount = fun(req: Request) -> _Response? do
+		let segs = _splitPath(req.url.path)
+		for m in _mounts do
+			let pfx = m.prefixParts
+			if len(segs) < len(pfx) then
+				continue
+			end
+			let ok = true
+			let i = 0
+			while i < len(pfx) do
+				if pfx[i] != segs[i] then
+					ok = false
 					break
 				end
-				bi = bi + 1
+				i = i + 1
 			end
-			if not done and n.b != null then
-				let ok3 = _renderSeq(e, n.b, scope, w, buf, curName, stack)
-				if ok3 == null then
-					return ok3
+			if not ok then
+				continue
+			end
+			let rest = slice(segs, len(pfx), len(segs))
+			let subPath = "/" + join(rest, "/")
+			let subReq = {
+				method: req.method,
+				url: {scheme: req.url.scheme, host: req.url.host, path: subPath, query: req.url.query},
+				headers: req.headers,
+				body: req.body,
+				pathParams: {}
+			}
+			return m.child._entryCall(subReq)
+		end
+		null
+	end
+
+	let _entryCore = fun(req: Request) -> _Response do
+		let m = _matchLocal(req.method, req.url.path)
+		if m == null then
+			let delegated = _delegateToMount(req)
+			if delegated != null then
+				return delegated
+			end
+			if _normMethod(req.method) == "OPTIONS" then
+				let allowed = _allowedMethodsLocal(req.url.path)
+				if len(allowed) > 0 then
+					return {status: 204, headers: {"Allow": join(allowed, ", ")}, body: ""}
 				end
-			end
-
-			if n.d != null and n.d.tlEnd and buf.pendingNL then
-				buf.pendingNL = false
-			end
-			if n.d != null and n.d.trEnd then
-				buf.trimNext = true
-			end
-
-		elif n.tag == "for" then
-			if n.d != null and n.d.trOpen then
-				buf.trimNext = true
-			end
-
-			let it = _evalExpr(e, scope, n.b)
-			if it == null and noteGet(it) != null then
-				return it
-			end
-
-			if it == null then
-				null
-			elif isType(it, type [Any]) then
-				let L = len(it)
-				let idx = 0
-				while idx < L do
-					let loop = { index0: idx, index: idx + 1, first: idx == 0, last: idx == L - 1, length: L }
-					let sc = {}
-					for [k, v] in scope do
-						sc[k] = v
-					end
-					sc[n.a] = it[idx]
-					sc["loop"] = loop
-					let ok4 = _renderSeq(e, n.c, sc, w, buf, curName, stack)
-					if ok4 == null then
-						return ok4
-					end
-					idx = idx + 1
+				# If any middleware is installed (e.g., CORS), honor generic preflight.
+				if len(_mws) > 0 then
+					return {status: 204, headers: {}, body: ""}
 				end
-			elif isType(it, type {}) then
-				let keysArr = []
-				for [k, _] in it do
-					keysArr = keysArr + [k]
-				end
-				let L2 = len(keysArr)
-				let j = 0
-				let pat = strip(n.a)
-				let dk = ""
-				let dv = ""
-				if len(pat) > 0 and substr(pat, 0, 1) == "[" and substr(pat, len(pat) - 1, len(pat)) == "]" then
-					let inner = strip(substr(pat, 1, len(pat) - 1))
-					let parts = _splitTopLevel(inner, ",")
-					if len(parts) == 2 then
-						dk = strip(parts[0])
-						dv = strip(parts[1])
-					end
-				end
-				while j < L2 do
-					let k = keysArr[j]
-					let loop2 = { index0: j, index: j + 1, first: j == 0, last: j == L2 - 1, length: L2 }
-					let sc2 = {}
-					for [kk, vv] in scope do
-						sc2[kk] = vv
-					end
-					if dk != "" and dv != "" then
-						sc2[dk] = k
-						sc2[dv] = it[k]
-					else
-						sc2[n.a] = [k, it[k]]
-					end
-					sc2["loop"] = loop2
-					let ok5 = _renderSeq(e, n.c, sc2, w, buf, curName, stack)
-					if ok5 == null then
-						return ok5
-					end
-					j = j + 1
-				end
-			else
-				null
+				return {status: 404, headers: {"Content-Type": "text/plain"}, body: "not found"}
 			end
-
-			if n.d != null and n.d.tlEnd and buf.pendingNL then
-				buf.pendingNL = false
+			if _pathExistsLocal(req.url.path) then
+				let allowed405 = _allowedMethodsLocal(req.url.path)
+				return {status: 405, headers: {"Content-Type": "text/plain", "Allow": join(allowed405, ", ")}, body: "method not allowed"}
 			end
-			if n.d != null and n.d.trEnd then
-				buf.trimNext = true
-			end
-
-		elif n.tag == "include" then
-			if n.d != null and n.d.trOpen then
-				buf.trimNext = true
-			end
-
-			let pthLit = _parseStringLit(n.a)
-			let pathVal = if pthLit != null then pthLit else _evalExpr(e, scope, n.a) end
-			if pathVal == null and noteGet(pathVal) != null then
-				return pathVal
-			end
-			if pathVal == null then
-				return error("render: include path")
-			end
-
-			let full = _resolvePath(e.opts.baseDir, curName, str(pathVal))
-			if full == null then
-				return full
-			end
-			let src = readFile(full)
-			if src == null then
-				return error("load: include failed")
-			end
-			let childT = fromString(e, src, _relName(e.opts.baseDir, full))
-			if childT == null then
-				return childT
-			end
-
-			let ctx2 = scope
-			if n.b != null then
-				let evalRes = _evalExpr(e, scope, n.b)
-				let cx = evalRes
-				let s = strip(n.b)
-				let braceLiteral = len(s) >= 2 and substr(s, 0, 1) == "{" and substr(s, len(s) - 1, len(s)) == "}"
-				if braceLiteral and (cx == null or noteGet(cx) != null) then
-					let inner = strip(substr(s, 1, len(s) - 1))
-					let pairs = _splitTopLevel(inner, ",")
-					let m = {}
-					let pi = 0
-					let okMap = true
-					while pi < len(pairs) do
-						let kv = _splitTopLevel(pairs[pi], ":")
-						if len(kv) != 2 then
-							okMap = false
-							break
-						end
-						let kraw = strip(kv[0])
-						let ks = _parseStringLit(kraw)
-						let key = if ks != null then ks else kraw end
-						let vexpr = strip(kv[1])
-						let vv = _evalExpr(e, scope, vexpr)
-						if vv == null and noteGet(vv) != null then
-							okMap = false
-							break
-						end
-						if vv == null and vexpr != "null" then
-							okMap = false
-							break
-						end
-						m[key] = vv
-						pi = pi + 1
-					end
-					if okMap then
-						cx = m
-					end
-				end
-				if cx == null then
-					if noteGet(evalRes) != null and not braceLiteral then
-						return evalRes
-					end
-					return error("render: include ctx")
-				end
-				if isType(cx, type {}) then
-					let merged = {}
-					for [k, v] in scope do
-						merged[k] = v
-					end
-					for [k2, v2] in cx do
-						merged[k2] = v2
-					end
-					ctx2 = merged
-				else
-					return error("render: include ctx must be map")
-				end
-			end
-
-			# tiny cycle detection for include
-			let z = 0
-			while z < len(stack) do
-				if stack[z] == childT.name then
-					return error("render: include/extends cycle")
-				end
-				z = z + 1
-			end
-
-			let ok6 = _renderTemplate(e, childT, ctx2, w, stack + [childT.name])
-			if ok6 == null then
-				return ok6
-			end
-
-		elif n.tag == "block" then
-			if n.d != null and n.d.trOpen then
-				buf.trimNext = true
-			end
-			let okb = _renderSeq(e, n.b, scope, w, buf, curName, stack)
-			if okb == null then
-				return okb
-			end
-			if n.d != null and n.d.tlEnd and buf.pendingNL then
-				buf.pendingNL = false
-			end
-			if n.d != null and n.d.trEnd then
-				buf.trimNext = true
-			end
-
-		elif n.tag == "extends" then
-			null
-
-		else
-			return error("render: unknown node")
+			return {status: 404, headers: {"Content-Type": "text/plain"}, body: "not found"}
 		end
 
+		let r = m.route
+		let params = if mapHas(m, "params") and m.params != null then m.params else {} end
+		let C = if mapHas(r, "contract") then r.contract else {} end
+
+		let rq = {method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: params}
+		let ctx = {req: rq}
+
+		if mapHas(C, "path") and C.path != null then
+			let P = _bindPath(rq.pathParams, C.path)
+			if P == null then
+				return {status: 422, headers: {"Content-Type": "application/json; charset=utf-8"}, body: _validationJSON("path", noteGet(P))}
+			end
+			ctx.path = P
+		end
+		if mapHas(C, "query") and C.query != null then
+			let Q = _bindQueryFromReq(rq, C.query)
+			if Q == null then
+				return {status: 422, headers: {"Content-Type": "application/json; charset=utf-8"}, body: _validationJSON("query", noteGet(Q))}
+			end
+			ctx.query = Q
+		end
+		if mapHas(C, "body") and C.body != null then
+			let B = _bindBody(rq, C.body)
+			if B == null then
+				return {status: 422, headers: {"Content-Type": "application/json; charset=utf-8"}, body: _validationJSON("body", noteGet(B))}
+			end
+			ctx.body = B
+		end
+
+		let pack = _newResponder()
+		let call = _compose(r.call)
+
+		let t = try(fun(_: Null) do call(rq, pack.api, ctx) end)
+		if not t.ok then
+			return {status: 500, headers: {"Content-Type": "text/plain"}, body: "internal server error"}
+		end
+
+		{status: pack.res.status, headers: pack.res.headers, body: pack.res.body}
+	end
+
+	# Preflight used by server for Expect: 100-continue (no body binding here)
+	let _preflight = fun(req: Request) -> {ok!: Bool} do
+		let m = _matchLocal(req.method, req.url.path)
+		if m == null then
+			return {ok: false}
+		end
+		let r = m.route
+		let params = if mapHas(m, "params") and m.params != null then m.params else {} end
+		let C = if mapHas(r, "contract") then r.contract else {} end
+		let rq = {method: req.method, url: req.url, headers: req.headers, body: "", pathParams: params}
+		if mapHas(C, "path") and C.path != null then
+			let P = _bindPath(rq.pathParams, C.path)
+			if P == null then
+				return {ok: false}
+			end
+		end
+		if mapHas(C, "query") and C.query != null then
+			let Q = _bindQueryFromReq(rq, C.query)
+			if Q == null then
+				return {ok: false}
+			end
+		end
+		{ok: true}
+	end
+
+	let api = {
+		__kind: "nethttp.router",
+
+		# Register a buffered (value) route with contract binding.
+		#
+		# Summary:
+		#   Handler returns either a buffered {_Response}, a structured http error (raise*),
+		#   any JSON-encodable value (auto 200 + application/json), or null (treated as 500).
+		#   If 'responses' is present in contract, the response payload is type-checked.
+		# Args:
+		#   method: Str — "GET", "POST", ...
+		#   pattern: Str — e.g., "/users/{id}", "/v1/", "{*tail}" at end for catch-all.
+		#   c: Contract — {path?:Type, query?:Type, body?:Type, responses?:{code->Type}}
+		#   handler: (req: Request, ctx: {}) -> Any — Value-returning handler.
+		# Return: Bool — true when registered.
+		route: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
+			let parts = _splitPath(pattern)
+			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
+				let r = try(fun(_: Null) do handler(req, ctx) end)
+				if not r.ok then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("internal server error")
+					let _ = res.end()
+					return
+				end
+				let out = r.value
+				if out == null then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("handler returned null")
+					let _ = res.end()
+					return
+				end
+				if isType(out, _HttpError) then
+					let hdrs = if mapHas(out, "headers") and out.headers != null then out.headers else {} end
+					let rt = if mapHas(out, "body") and out.body != null then out.body else "" end
+					for [k, v] in hdrs do
+						res.setHeader(k, v)
+					end
+					res.status(out.status)
+					let _ = res.write(rt)
+					let _ = res.end()
+					return
+				end
+				if isType(out, _Response) then
+					if mapHas(c, "responses") and c.responses != null then
+						let payload = if mapHas(out, "body") then jsonParse(out.body) else out end
+						if not _checkResponse(out.status, payload, c.responses) then
+							res.status(500).setHeader("Content-Type", "application/json")
+							let _ = res.write(_validationJSON("response", "response-validation failed"))
+							let _ = res.end()
+							return
+						end
+					end
+					for [k, v] in out.headers do
+						res.setHeader(k, v)
+					end
+					res.status(out.status)
+					let _ = res.write(out.body)
+					let _ = res.end()
+					return
+				end
+				let js = _json(out)
+				if js == null then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("json encode error")
+					let _ = res.end()
+					return
+				end
+				if mapHas(c, "responses") and c.responses != null then
+					if not _checkResponse(200, out, c.responses) then
+						res.status(500).setHeader("Content-Type", "application/json")
+						let _ = res.write(_validationJSON("response", "response-validation failed"))
+						let _ = res.end()
+						return
+					end
+				end
+				res.setHeader("Content-Type", "application/json; charset=utf-8").status(200)
+				let _ = res.write(js)
+				let _ = res.end()
+				null
+			end
+			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
+			true
+		end,
+
+		# Register a streaming route with contract binding.
+		#
+		# Summary:
+		#   Handler receives a streaming Responder; must write/end explicitly.
+		#   Note: HEAD is NOT auto-mapped to GET for streaming routes (405 unless registered).
+		# Args:
+		#   method: Str — HTTP method.
+		#   pattern: Str — Route pattern (may include {name}, {*tail}).
+		#   c: Contract — Path/query/body types and optional responses (ignored for streaming).
+		#   handler: (req: Request, res: Responder, ctx: {}) -> Null
+		# Return: Bool — true when registered.
+		routeStream: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
+			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
+				let r = try(fun(_: Null) do handler(req, res, ctx) end)
+				if not r.ok then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("internal server error")
+					let _ = res.end()
+				end
+				null
+			end
+			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
+			true
+		end,
+
+		# Mount a child router at a path prefix.
+		#
+		# Args:
+		#   prefix: Str — e.g., "/api", "/v1/users".
+		#   child: {} — Another router() instance.
+		# Return: Bool — true when mounted.
+		mount: fun(prefix: Str, child) -> Bool do
+			_mounts = _mounts + [{prefixParts: _splitPath(prefix), child: child}]
+			true
+		end,
+
+		# Install middleware (applied outer-to-inner in registration order).
+		#
+		# Args:
+		#   mw: _Mw — Middleware transformer: next:_StreamFn -> _StreamFn.
+		# Return: Bool — true when installed.
+		use: fun(mw: _Mw) -> Bool do
+			_mws = _mws + [mw]
+			true
+		end,
+
+		_entryCall: fun(req: Request) -> _Response do
+			_entryCore(req)
+		end,
+
+		_entryCallStream: fun(req: Request, conn, opts: {}) -> {}? do
+			let m = _matchLocal(req.method, req.url.path)
+			if m == null then
+				return null
+			end
+			let r = m.route
+			let params = if mapHas(m, "params") and m.params != null then m.params else {} end
+			let C = if mapHas(r, "contract") then r.contract else {} end
+			let rq = {method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: params}
+			let ctx = {req: rq}
+			if mapHas(C, "path") and C.path != null then
+				let P = _bindPath(rq.pathParams, C.path)
+				if P == null then
+					let s = _validationJSON("path", noteGet(P))
+					let _ = write(conn, sprintf("HTTP/1.1 422 %s\r\nContent-Length: %d\r\nContent-Type: application/json; charset=utf-8\r\n\r\n%s", [_reason(422), len(s), s]))
+					let _ = flush(conn)
+					return {streamed: true}
+				end
+				ctx.path = P
+			end
+			if mapHas(C, "query") and C.query != null then
+				let Q = _bindQueryFromReq(rq, C.query)
+				if Q == null then
+					let s = _validationJSON("query", noteGet(Q))
+					let _ = write(conn, sprintf("HTTP/1.1 422 %s\r\nContent-Length: %d\r\nContent-Type: application/json; charset=utf-8\r\n\r\n%s", [_reason(422), len(s), s]))
+					let _ = flush(conn)
+					return {streamed: true}
+				end
+				ctx.query = Q
+			end
+			if mapHas(C, "body") and C.body != null then
+				let B = _bindBody(rq, C.body)
+				if B == null then
+					let s = _validationJSON("body", noteGet(B))
+					let _ = write(conn, sprintf("HTTP/1.1 422 %s\r\nContent-Length: %d\r\nContent-Type: application/json; charset=utf-8\r\n\r\n%s", [_reason(422), len(s), s]))
+					let _ = flush(conn)
+					return {streamed: true}
+				end
+				ctx.body = B
+			end
+			if r.style == "stream" then
+				let sock = _newSockResponder(conn, opts)
+				let call = _compose(r.call)
+				let t = try(fun(_: Null) do call(rq, sock.api, ctx) end)
+				if not t.ok then
+					let _ = write(conn, sprintf("HTTP/1.1 500 %s\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\ninternal server error", [_reason(500)]))
+					let _ = flush(conn)
+					return {streamed: true}
+				end
+				let _ = sock.api.end()
+				return {streamed: true}
+			end
+			_entryCore(req)
+		end,
+
+		_dump: fun(_: Null) -> {} do
+			{routes: _routes, mws: _mws}
+		end,
+
+		_preflight: fun(req: Request) -> {ok!: Bool} do
+			_preflight(req)
+		end
+	}
+	api
+end
+
+# =========================
+# Response validation (contract responses)
+# =========================
+
+let _checkResponse = fun(status: Int, out, respMap: {}) -> Bool do
+	if respMap == null then
+		return true
+	end
+	if not mapHas(respMap, str(status)) and not mapHas(respMap, status) then
+		return true
+	end
+	let T = if mapHas(respMap, str(status)) then respMap[str(status)] else respMap[status] end
+	if not isType(T, type Type) then
+		return true
+	end
+	isType(out, T)
+end
+
+# =========================
+# Test client (buffered)
+# =========================
+
+# Create a buffered in-memory test client for a router.
+#
+# Summary:
+#   Simulates HTTP calls without sockets; routes through the router’s entry points.
+# Methods on return:
+#   call(req: {method?:Str, path?:Str, headers?:{}, body?:Str}) -> {status:Int, headers:{}, body:Str}
+# Args:
+#   r: {} — Router instance created by router().
+# Return: {} — {call: fun} test client.
+let testClient = fun(r) -> {} do
+	let call = fun(req: {}) -> {} do
+		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
+		let pathStr = if mapHas(req, "path") and req.path != null then req.path else "/" end
+		let headers = if mapHas(req, "headers") and req.headers != null then req.headers else {} end
+		let body = if mapHas(req, "body") and req.body != null then req.body else "" end
+
+		let q = ""
+		let p = pathStr
+		let parts = split(pathStr, "?")
+		if len(parts) >= 2 then
+			p = parts[0]
+			q = join(slice(parts, 1, len(parts)), "?")
+		end
+
+		let R = {method: _normMethod(method), url: _makeURL(p, q), headers: headers, body: body, pathParams: {}}
+		let res = r._entryCall(R)
+		{status: res.status, headers: res.headers, body: res.body}
+	end
+	{call: call}
+end
+
+# =========================
+# Middleware (streaming-friendly)
+# =========================
+
+# Recover middleware — converts handler panics to 500 responses.
+#
+# Summary:
+#   Wraps next and catches panics (via try), returning "internal server error".
+# Args:
+#   _: Null — Unused.
+# Return: _Mw — Middleware function.
+let mwRecover = fun(_: Null) -> _Mw do
+	return fun(next: _StreamFn) -> _StreamFn do
+		return fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let r = try(fun(_: Null) do next(req, res, ctx) end)
+			if not r.ok then
+				res.status(500).setHeader("Content-Type", "text/plain")
+				let _ = res.write("internal server error")
+				let _ = res.end()
+			end
+			null
+		end
+	end
+end
+
+# Request ID middleware — injects/propagates a request identifier.
+#
+# Summary:
+#   If the incoming header is present (case-insensitive), reuses it.
+#   Otherwise generates one and echoes it on the response.
+# Args:
+#   headerName: Str — e.g., "X-Request-ID".
+# Return: _Mw — Middleware function.
+let mwRequestID = fun(headerName: Str) -> _Mw do
+	let name = headerName
+	return fun(next: _StreamFn) -> _StreamFn do
+		return fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let seen = _getHeader(req.headers, name)
+			let id = if seen != null then seen else sprintf("r-%d", [nowNanos()]) end
+			req.headers[name] = id
+			res.setHeader(name, id)
+			next(req, res, ctx)
+			null
+		end
+	end
+end
+
+# Timeout middleware — emits 504 if no bytes were written by the deadline.
+#
+# Summary:
+#   Wraps the responder to defer first write; if time passes and nothing was written,
+#   sends 504 timeout and prevents further writes.
+# Args:
+#   ms: Int — Deadline in milliseconds from request start.
+# Return: _Mw — Middleware function.
+let mwTimeout = fun(ms: Int) -> _Mw do
+	let dur = ms
+	return fun(next: _StreamFn) -> _StreamFn do
+		return fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let deadline = nowMillis() + dur
+			let closed = {v: false}
+			let wrote = {v: false}
+			ctx.deadlineMs = deadline
+
+			let closeTimeout = fun(_: Null) -> Null do
+				if closed.v then
+					return
+				end
+				res.status(504).setHeader("Content-Type", "text/plain")
+				let _ = res.write("timeout")
+				let _ = res.end()
+				closed.v = true
+				null
+			end
+
+			let timedOut = fun(_: Null) -> Bool do
+				nowMillis() > deadline
+			end
+
+			let proxy = {}
+			proxy.status = fun(code: Int) -> Responder do
+				if closed.v then
+					return proxy
+				end
+				wrote.v = true
+				res.status(code)
+				proxy
+			end
+			proxy.setHeader = fun(k: Str, v: Str) -> Responder do
+				if closed.v then
+					return proxy
+				end
+				if timedOut() and not wrote.v then
+					closeTimeout()
+					return proxy
+				end
+				wrote.v = true
+				res.setHeader(k, v)
+				proxy
+			end
+			proxy.write = fun(chunk: Str) -> Int? do
+				if closed.v then
+					return 0
+				end
+				if timedOut() and not wrote.v then
+					closeTimeout()
+					return 0
+				end
+				wrote.v = true
+				res.write(chunk)
+			end
+			proxy.flush = fun(_: Null) -> Bool? do
+				if closed.v then
+					return true
+				end
+				if timedOut() and not wrote.v then
+					closeTimeout()
+					return true
+				end
+				res.flush()
+			end
+			proxy.end = fun(_: Null) -> Bool? do
+				if closed.v then
+					return true
+				end
+				if timedOut() and not wrote.v then
+					closeTimeout()
+					return true
+				end
+				res.end()
+			end
+
+			next(req, proxy, ctx)
+			if not closed.v and not wrote.v and timedOut() then
+				closeTimeout()
+			end
+			null
+		end
+	end
+end
+
+# CORS middleware — adds Access-Control-* headers and handles OPTIONS.
+#
+# Summary:
+#   Supports wildcard origins or credentials mode that reflects the Origin and sets Vary: Origin.
+# Args:
+#   opts: {} — {
+#     origin?: Str|"*",
+#     methods?: [Str],    # default allows common verbs
+#     headers?: [Str],    # default "Content-Type, Authorization"
+#     credentials?: Bool  # reflect Origin + Vary when true
+#   }
+# Return: _Mw — Middleware function.
+let mwCors = fun(opts: {}) -> _Mw do
+	let originOpt = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
+	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
+	let allowH = if mapHas(opts, "headers") and opts.headers != null then join(opts.headers, ", ") else "Content-Type, Authorization" end
+	let credsOn = mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials)
+
+	return fun(next: _StreamFn) -> _StreamFn do
+		return fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let reqOrigin = _getHeader(req.headers, "Origin")
+			let allowOrigin =
+				if credsOn then
+					if originOpt == "*" then
+						if reqOrigin != null then reqOrigin else "*" end
+					else
+						originOpt
+					end
+				else
+					originOpt
+				end
+			res.setHeader("Access-Control-Allow-Origin", allowOrigin)
+			res.setHeader("Access-Control-Allow-Methods", methods)
+			res.setHeader("Access-Control-Allow-Headers", allowH)
+			res.setHeader("Access-Control-Allow-Credentials", if credsOn then "true" else "false" end)
+			if credsOn then
+				res.setHeader("Vary", "Origin")
+			end
+			if req.method == "OPTIONS" then
+				res.status(204)
+				let _ = res.end()
+				return
+			end
+			next(req, res, ctx)
+			null
+		end
+	end
+end
+
+# Access log middleware — logs after response with status/bytes/duration.
+#
+# Summary:
+#   Proxies status/write to measure bytes; writes a single line via printf.
+# Args:
+#   _: Null — Unused.
+# Return: _Mw — Middleware function.
+let mwAccessLog = fun(_: Null) -> _Mw do
+	return fun(next: _StreamFn) -> _StreamFn do
+		return fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let t0 = nowMillis()
+			let status = {v: 200}
+			let bytes = {v: 0}
+
+			let orig = res
+			let proxy = {}
+			proxy.status = fun(code: Int) -> Responder do
+				status.v = code
+				orig.status(code)
+				proxy
+			end
+			proxy.setHeader = fun(k: Str, v: Str) -> Responder do
+				orig.setHeader(k, v)
+				proxy
+			end
+			proxy.write = fun(chunk: Str) -> Int? do
+				let n = orig.write(chunk)
+				if n != null then
+					bytes.v = bytes.v + int(n)
+				end
+				n
+			end
+			proxy.flush = fun(_: Null) -> Bool? do
+				orig.flush()
+			end
+			proxy.end = fun(_: Null) -> Bool? do
+				orig.end()
+			end
+
+			next(req, proxy, ctx)
+
+			let dur = nowMillis() - t0
+			printf("%s \"%s %s\" %d %d %dms\n", ["-", req.method, req.url.path, int(status.v), int(bytes.v), int(dur)])
+			null
+		end
+	end
+end
+
+# =========================
+# Server lifecycle (HTTP/1.1 MVP)
+# =========================
+
+let _ServerHandle = type {listener: Any, stop: {closed: Bool}, conns: [Any], opts: {}}
+
+# Start an HTTP/1.1 server with a router.
+#
+# Summary:
+#   Accepts TCP connections from 'listener', parses requests with limits, and dispatches
+#   to the router. Supports Expect: 100-continue preflight and keep-alive.
+# Args:
+#   listener: Any — TCP listener handle (from netListen).
+#   r: {} — Router instance built by router().
+#   opts: {} — {
+#     readHeaderTimeoutMs?: Int,
+#     writeTimeoutMs?: Int,
+#     idleTimeoutMs?: Int,
+#     maxHeaderBytes?: Int = 8192,
+#     maxHeaders?: Int?,
+#     maxBodyBytes?: Int = 1048576,
+#     maxStartLineBytes?: Int?,
+#     addDateHeader?: Bool?
+#   }
+# Return: {}? — Server handle or null # <serve: ...> on configuration errors.
+let serve = fun(listener, r, opts: {}) -> {}? do
+	if listener == null then
+		return null # <serve: missing listener>
+	end
+	if not mapHas(r, "_entryCall") then
+		return null # <serve: not a router>
+	end
+
+	if not mapHas(opts, "readHeaderTimeoutMs") or opts.readHeaderTimeoutMs == null then opts.readHeaderTimeoutMs = 0 end
+	if not mapHas(opts, "writeTimeoutMs") or opts.writeTimeoutMs == null then opts.writeTimeoutMs = 0 end
+	if not mapHas(opts, "idleTimeoutMs") or opts.idleTimeoutMs == null then opts.idleTimeoutMs = 0 end
+	if not mapHas(opts, "maxHeaderBytes") or opts.maxHeaderBytes == null then opts.maxHeaderBytes = 8192 end
+	if not mapHas(opts, "maxBodyBytes") or opts.maxBodyBytes == null then opts.maxBodyBytes = 1048576 end
+
+	let server = {listener: listener, stop: {closed: false}, conns: [], opts: opts}
+
+	let _ = procSpawn(fun(_: Null) -> Null do
+		while not server.stop.closed do
+			let c = netAccept(listener)
+			if c == null then
+				continue
+			end
+			server.conns = server.conns + [c]
+			procSpawn(fun(_: Null) -> Null do
+				_connLoop(c, r, server)
+			end)
+		end
+		null
+	end)
+
+	server
+end
+
+# Gracefully shut down a server, closing the listener and active connections.
+#
+# Args:
+#   server: {}? — Handle returned by serve(); null is a no-op.
+#   timeoutMs: Int? — Currently unused; reserved for future graceful drains.
+# Return: Bool — true after resources are closed/cleared.
+let shutdown = fun(server, timeoutMs: Int?) -> Bool do
+	if server == null then
+		return true
+	end
+	server.stop.closed = true
+	close(server.listener)
+	let i = 0
+	while i < len(server.conns) do
+		let c = server.conns[i]
+		close(c)
 		i = i + 1
 	end
+	server.conns = []
 	true
 end
 
-let _collectBlocks = fun(ast: [Any]) -> {} do
-	let m = {}
-	let i = 0
-	while i < len(ast) do
-		let n = ast[i]
-		if n.tag == "block" then
-			m[n.a] = n.b
-		end
-		i = i + 1
-	end
-	m
+# =========================
+# HTTP/1.1 helpers (MVP)
+# =========================
+
+let _reason = fun(code: Int) -> Str do
+	if code == 200 then return "OK" end
+	if code == 204 then return "No Content" end
+	if code == 302 then return "Found" end
+	if code == 400 then return "Bad Request" end
+	if code == 401 then return "Unauthorized" end
+	if code == 404 then return "Not Found" end
+	if code == 405 then return "Method Not Allowed" end
+	if code == 413 then return "Payload Too Large" end
+	if code == 414 then return "URI Too Long" end
+	if code == 422 then return "Unprocessable Entity" end
+	if code == 431 then return "Request Header Fields Too Large" end
+	if code == 500 then return "Internal Server Error" end
+	if code == 504 then return "Gateway Timeout" end
+	"OK"
 end
 
-let _applyBlocks = fun(baseAst: [Any], slots: {}) -> [Any] do
+let _trimCR = fun(s: Str) -> Str do
+	let n = len(s)
+	if n > 0 and substr(s, n - 1, n) == "\r" then
+		return substr(s, 0, n - 1)
+	end
+	s
+end
+
+let _validHeaderValue = fun(v: Str) -> Bool do
+	match("\r|\n", v) == []
+end
+
+let _readLineLimited = fun(c, remaining: Int?) -> Str? do
+	let line = readLine(c)
+	if line == null then
+		return
+	end
+	let s = _trimCR(line)
+	if remaining != null then
+		let left = int(remaining) - len(s) - 2
+		if left < 0 then
+			return
+		end
+	end
+	s
+end
+
+let _readHeaders = fun(c, maxBytes: Int, maxCount: Int?) -> {}? do
+	let headers = {}
+	let budget = maxBytes
+	let count = 0
+	while true do
+		let line = _readLineLimited(c, budget)
+		if line == null then
+			return
+		end
+		if len(line) == 0 then
+			break
+		end
+		count = count + 1
+		if maxCount != null and count > int(maxCount) then
+			return {"__too_many__": true}
+		end
+		let parts = split(line, ":")
+		if len(parts) < 2 then
+			return
+		end
+		let key = parts[0]
+		let value = strip(join(slice(parts, 1, len(parts)), ":"))
+		if mapHas(headers, key) and toLower(key) == "content-length" and headers[key] != value then
+			headers["__cl_conflict__"] = true
+		end
+		headers[key] = value
+		budget = budget - len(line) - 2
+	end
+	headers
+end
+
+let _parseTarget = fun(t: Str) -> {} do
+	if match("^[a-zA-Z][a-zA-Z0-9+.-]*://", t) != [] then
+		return {absolute: true, path: "/", query: null}
+	end
+	let path = t
+	let query = null
+	let parts = split(t, "?")
+	if len(parts) >= 2 then
+		path = parts[0]
+		query = join(slice(parts, 1, len(parts)), "?")
+	end
+	{path: path, query: query}
+end
+
+let _readBodyContentLength = fun(c, n: Int, cap: Int) -> Str? do
+	let want = if n > cap then cap else n end
+	let buf = ""
+	let remaining = want
+	while remaining > 0 do
+		let chunk = readN(c, remaining)
+		if chunk == null then
+			return
+		end
+		buf = buf + chunk
+		remaining = remaining - len(chunk)
+		if len(chunk) == 0 then
+			return
+		end
+	end
+	buf
+end
+
+# Headers-only parse; body is read later (after 100-continue if any)
+let _readRequest = fun(conn, opts: {}) -> {}? do
+	let line = readLine(conn)
+	if line == null then
+		return
+	end
+	let reqLine = _trimCR(line)
+	if len(reqLine) > 0 and mapHas(opts, "maxStartLineBytes") and opts.maxStartLineBytes != null and len(reqLine) > int(opts.maxStartLineBytes) then
+		return {tooLong: true}
+	end
+	let parts = split(reqLine, " ")
+	if len(parts) != 3 then
+		return
+	end
+	let method = toUpper(parts[0])
+	let target = parts[1]
+	let proto = parts[2]
+	if proto != "HTTP/1.1" then
+		return
+	end
+
+	let maxHdr = int(opts.maxHeaderBytes)
+	let maxCnt = if mapHas(opts, "maxHeaders") then opts.maxHeaders else null end
+	let hdrs = _readHeaders(conn, maxHdr, maxCnt)
+	if hdrs == null then
+		return
+	end
+	if mapHas(hdrs, "__too_many__") then
+		return {tooManyHeaders: true}
+	end
+
+	if mapHas(hdrs, "Transfer-Encoding") then
+		return {badRequest: true}
+	end
+	if mapHas(hdrs, "__cl_conflict__") and bool(hdrs["__cl_conflict__"]) then
+		return {badRequest: true}
+	end
+
+	let keepAlive = true
+	let connV = _getHeader(hdrs, "Connection")
+	if connV != null and toLower(connV) == "close" then
+		keepAlive = false
+	end
+
+	let t = _parseTarget(target)
+	if mapHas(t, "absolute") and t.absolute == true then
+		return {badRequest: true}
+	end
+
+	let wantCL = -1
+	if mapHas(hdrs, "Content-Length") then
+		let n = int(hdrs["Content-Length"])
+		if n == null or n < 0 then
+			return
+		end
+		wantCL = n
+	end
+
+	{
+		req: {method: method, url: {scheme: null, host: null, path: t.path, query: t.query}, headers: hdrs, body: "", pathParams: {}},
+		wantCL: wantCL,
+		keepAlive: keepAlive
+	}
+end
+
+let _writeResponse = fun(conn, res: _Response, opts: {}) -> Bool do
+	let status = int(res.status)
+	let headers = clone(res.headers)
+	let body = if res.body == null then "" else res.body end
+	if mapHas(opts, "addDateHeader") and opts.addDateHeader != null and opts.addDateHeader and not mapHas(headers, "Date") then
+		headers["Date"] = timeFormatRFC3339(nowMillis())
+	end
+	for [k, v] in headers do
+		if not _validHeaderValue(v) then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			flush(conn)
+			return false
+		end
+	end
+	if not mapHas(headers, "Content-Length") then
+		headers["Content-Length"] = str(len(body))
+	end
+	if not mapHas(headers, "Content-Type") then
+		headers["Content-Type"] = "text/plain"
+	end
+	let head = sprintf("HTTP/1.1 %d %s\r\n", [status, _reason(status)])
+	for [k, v] in headers do
+		head = head + sprintf("%s: %s\r\n", [k, v])
+	end
+	head = head + "\r\n"
+	let n1 = write(conn, head)
+	if n1 == null then
+		return false
+	end
+	let n2 = write(conn, body)
+	if n2 == null then
+		return false
+	end
+	flush(conn)
+	true
+end
+
+let _removeConn = fun(arr: [Any], c) -> [Any] do
 	let out = []
 	let i = 0
-	while i < len(baseAst) do
-		let n = baseAst[i]
-		if n.tag == "block" then
-			if mapHas(slots, n.a) then
-				out = out + slots[n.a]
-			else
-				out = out + [_node("seq", n.b, null, null, null)]
-			end
-		else
-			out = out + [n]
+	while i < len(arr) do
+		let it = arr[i]
+		if uid(it) != uid(c) then
+			out = out + [it]
 		end
 		i = i + 1
 	end
 	out
 end
 
-let _renderTemplate = fun(e: Env, t: Template, data: {}, w: Writer, stack: [Str]) -> Bool? do
-	let hasExt = false
-	let parentPath = ""
-	let i = 0
-	while i < len(t.ast) do
-		let n = t.ast[i]
-		if n.tag == "extends" then
-			hasExt = true
-			let pth = _parseStringLit(n.a)
-			let pv = if pth != null then pth else str(_evalExpr(e, data, n.a)) end
-			if pv == null then
-				return error("render: extends path")
-			end
-			parentPath = pv
+let _connLoop = fun(conn, router, server) -> Null do
+	while true do
+		let rr = _readRequest(conn, server.opts)
+		if rr == null then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
 			break
 		end
-		i = i + 1
-	end
-	if not hasExt then
-		let buf = {s: "", trimNext: false, pendingNL: false}
-		let ok = _renderSeq(e, t.ast, data, w, buf, t.name, stack)
-		if ok == null then
-			return ok
+		if mapHas(rr, "tooLong") and bool(rr.tooLong) then
+			let _ = write(conn, sprintf("HTTP/1.1 414 %s\r\nContent-Length: 8\r\nContent-Type: text/plain\r\n\r\ntoo long", [_reason(414)]))
+			break
 		end
-		if buf.pendingNL then
-			let n1 = w.write("\n")
-			if n1 == null then
-				return error("render: writer failed")
+		if mapHas(rr, "badRequest") and bool(rr.badRequest) then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			break
+		end
+		if mapHas(rr, "tooManyHeaders") and bool(rr.tooManyHeaders) then
+			let _ = write(conn, sprintf("HTTP/1.1 431 %s\r\nContent-Length: 27\r\nContent-Type: text/plain\r\n\r\nrequest header fields too large", [_reason(431)]))
+			break
+		end
+
+		let req = rr.req
+
+		# Expect: 100-continue preflight (path+query only)
+		let expect = _getHeader(req.headers, "Expect")
+		if expect != null and toLower(expect) == "100-continue" then
+			let pf = router._preflight(req)
+			if pf == null or not pf.ok then
+				let _ = write(conn, sprintf("HTTP/1.1 404 %s\r\nContent-Length: 9\r\nContent-Type: text/plain\r\n\r\nnot found", [_reason(404)]))
+				let _ = flush(conn)
+				break
 			end
-			buf.pendingNL = false
-		end
-		true
-	else
-		let full = _resolvePath(e.opts.baseDir, t.name, parentPath)
-		if full == null then
-			return full
-		end
-		let src = readFile(full)
-		if src == null then
-			return error("load: extends failed")
-		end
-		let baseT = fromString(e, src, _relName(e.opts.baseDir, full))
-		if baseT == null then
-			return baseT
-		end
-		# cycle detection for extends
-		let cyc = 0
-		while cyc < len(stack) do
-			if stack[cyc] == baseT.name then
-				return error("render: include/extends cycle")
+			if rr.wantCL > 0 then
+				let _ = write(conn, "HTTP/1.1 100 Continue\r\n\r\n")
+				let _ = flush(conn)
 			end
-			cyc = cyc + 1
 		end
 
-		let slots = _collectBlocks(t.ast)
-		let combined = _applyBlocks(baseT.ast, slots)
-		let buf2 = {s: "", trimNext: false, pendingNL: false}
-		let ok2 = _renderSeq(e, combined, data, w, buf2, baseT.name, stack + [baseT.name])
-		if ok2 == null then
-			return ok2
-		end
-		if buf2.pendingNL then
-			let n2 = w.write("\n")
-			if n2 == null then
-				return error("render: writer failed")
+		# Read body (Content-Length only)
+		if rr.wantCL >= 0 then
+			let cap = int(server.opts.maxBodyBytes)
+			if rr.wantCL > cap then
+				let _ = write(conn, sprintf("HTTP/1.1 413 %s\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\npayload too large", [_reason(413)]))
+				break
 			end
-			buf2.pendingNL = false
-		end
-		true
-	end
-end
-
-# ---------------- Compilation & I/O ----------------
-
-let fromString = fun(e: Env, src: Str, name: Str?) -> Template? do
-	let toks = _lex(src)
-	if toks == null then
-		return toks
-	end
-	let ast = _parse(toks)
-	if ast == null then
-		return ast
-	end
-	{ __mtml__: true, name: if name == null then "<string>" else name end, ast: ast }
-end
-
-let load = fun(e: Env, path: Str) -> Template? do
-	let info = e._loader(path)
-	if info == null then
-		return error("load: not found")
-	end
-	fromString(e, info.src, info.name)
-end
-
-let _stringWriter = fun() -> {w: Writer, buf: {s: Str}} do
-	let state = {s: ""}
-	let w = {
-		write: fun(s: Str) -> Int? do
-			state.s = state.s + s
-			len(s)
-		end,
-		flush: fun(_: Null) -> Bool? do
-			true
-		end
-	}
-	{w: w, buf: state}
-end
-
-let render = fun(e: Env, t: Template, data: {}) -> Str? do
-	if t == null or not isType(t, Template) then
-		return error("render: not a template")
-	end
-	let pack = _stringWriter()
-	let ok = _renderTemplate(e, t, data, pack.w, [t.name])
-	if ok == null then
-		return ok
-	end
-	pack.buf.s
-end
-
-let renderTo = fun(e: Env, t: Template, w: Writer, data: {}) -> Int? do
-	let counter = {n: 0}
-	let ww = {
-		write: fun(s: Str) -> Int? do
-			let n = w.write(s)
-			if n == null then
-				return
+			let s = _readBodyContentLength(conn, rr.wantCL, cap)
+			if s == null then
+				let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+				break
 			end
-			counter.n = counter.n + int(n)
-			n
-		end,
-		flush: fun(_: Null) -> Bool? do
-			w.flush(null)
+			req.body = s
 		end
-	}
-	let ok = _renderTemplate(e, t, data, ww, [t.name])
-	if ok == null then
-		return ok
-	end
-	let _ = ww.flush(null)
-	counter.n
-end
 
-# ---------------- Built-ins ----------------
-
-let _installBuiltins = fun(e: Env) -> Null do
-	let upper = fun(s: Str) -> Str do
-		toUpper(s)
-	end
-	let lower = fun(s: Str) -> Str do
-		toLower(s)
-	end
-
-	let default = fun(x, fallback) do
-		if x == null then
-			fallback
-		elif isType(x, type Str) and x == "" then
-			fallback
-		else
-			x
-		end
-	end
-
-	let joinF = fun(xs: [Any], sep: Str) -> Str do
-		let ss = []
-		let i = 0
-		while i < len(xs) do
-			let si = str(xs[i])
-			if si == null then
-				si = ""
+		# Try streaming path first (for stream routes)
+		let sres = router._entryCallStream(req, conn, server.opts)
+		if sres != null and mapHas(sres, "streamed") and sres.streamed == true then
+			if not rr.keepAlive then
+				break
 			end
-			ss = ss + [si]
-			i = i + 1
+			continue
 		end
-		join(ss, sep)
-	end
 
-	let tojson = fun(x) -> SafeHTML do
-		let s = jsonStringify(x)
-		if s == null then
-			s = "null"
+		# Buffered value route
+		let out = router._entryCall(req)
+		# Auto-HEAD for value routes: same headers (with accurate Content-Length), no body
+		if req.method == "HEAD" then
+			let hdr = clone(out.headers)
+			if not mapHas(hdr, "Content-Length") then
+				hdr["Content-Length"] = str(len(out.body))
+			end
+			let ok = _writeResponse(conn, {status: out.status, headers: hdr, body: ""}, server.opts)
+			if not ok or not rr.keepAlive then
+				break
+			end
+			continue
 		end
-		let s2 = replace("</script>", "<\\/script>", s)
-		let s3 = replace("\u2028", "\\u2028", s2)
-		let s4 = replace("\u2029", "\\u2029", s3)
-		safeHTML(s4)
+		let ok = _writeResponse(conn, out, server.opts)
+		if not ok or not rr.keepAlive then
+			break
+		end
 	end
 
-	let url = fun(u: Str) -> SafeURL? do
-		safeURL(u)
-	end
-
-	let _ = registerFilter(e, "upper", upper)
-	let _ = registerFilter(e, "lower", lower)
-	let _ = registerFilter(e, "default", default)
-	let _ = registerFilter(e, "join", joinF)
-	let _ = registerFilter(e, "tojson", tojson)
-	let _ = registerFilter(e, "url", url)
+	close(conn)
+	server.conns = _removeConn(server.conns, conn)
 	null
 end
 
-let installBuiltins = fun(e: Env) -> Bool do
-	_installBuiltins(e)
-	true
+# =========================
+# OpenAPI (contract-based, minimal)
+# =========================
+
+# Generate a minimal OpenAPI-like doc from registered routes.
+#
+# Summary:
+#   Produces a lightweight structure listing method, pattern, and style for each route.
+#   This is not a full OpenAPI 3 document—intended for quick inspection/testing.
+# Args:
+#   r: {} — Router instance.
+#   info: {} — Arbitrary info block, e.g., {title: "API", version: "1.0.0"}.
+#   servers: [Str]? — Optional server URLs.
+# Return: {}? — {info, servers, routes:[{method, pattern, style}]} or null # <not a router>.
+let openapiDoc = fun(r, info: {}, servers: [Str]?) -> {}? do
+	if not mapHas(r, "_dump") then
+		return null # <not a router>
+	end
+	let dump = r._dump()
+	let rs = []
+	for rr in dump.routes do
+		rs = rs + [{method: rr.method, pattern: rr.pattern, style: rr.style}]
+	end
+	{info: info, servers: if servers == null then [] else servers end, routes: rs}
 end
-=== END FILE: lib/mtml.ms ===
+=== END FILE: lib/nethttp.ms ===
 
-=== BEGIN FILE: lib/mtml_test.ms ===
+=== BEGIN FILE: lib/nethttp_test.ms ===
 let testing = import("testing")
-let mtml = import("mtml")
+let http = import("nethttp")
 
-# 1) Interpolation + autoescape (HTML text)
-testing.test("mtml/interpolate autoescape", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<p>{{ raw }}</p>", "auto.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {raw: "<b>bold</b>"})
-	testing.assert(out != null, "render null")
-	testing.assertEq("<p>&lt;b&gt;bold&lt;/b&gt;</p>", out)
+# =========================================================
+# 1) PATH PARAMS — typed, automatic bind
+# =========================================================
+testing.test("nethttp/route path param (typed)", fun(_: Null) do
+	let r = http.router()
+
+	r.route("GET", "/hello/{name}", http.contract({path: type {name: Str}}), fun(req, ctx) do
+		http.text(200, "hi " + ctx.path.name)
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/hello/Ada"})
+	testing.assertEq(200, res.status)
+	testing.assertEq("hi Ada", res.body)
 end)
 
-# 2) Built-in filters: default + upper
-testing.test("mtml/filters default+upper", fun(_: Null) do
-	let e = mtml.env({})
-	let _ = mtml.installBuiltins(e)
-	let t = mtml.fromString(e, "{{ name | default(\"anon\") | upper }}", "filt.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {})
-	testing.assert(out != null, "render null")
-	testing.assertEq("ANON", out)
+# =========================================================
+# 2) QUERY — success (auto-bind to declared type)
+# =========================================================
+testing.test("nethttp/route query success", fun(_: Null) do
+	let r = http.router()
+
+	r.route("GET", "/q", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) do
+		http.json(200, {ok: true, who: ctx.query.name, age: ctx.query.age})
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/q?name=%22Ada%22&age=36"})
+	testing.assertEq(200, res.status)
+	let obj = jsonParse(res.body)
+	testing.assertEq(true, obj.ok)
+	testing.assertEq("Ada", obj.who)
+	testing.assertEq(36, obj.age)
 end)
 
-# 3) Custom filter (prefix)
-testing.test("mtml/custom filter prefix", fun(_: Null) do
-	let e = mtml.env({})
-	let f = fun(x) do
-		fun(p: Str) -> Str do
-			let sx = str(x)
-			if sx == null then
-				""
-			else
-				p + sx
-			end
-		end
-	end
-	let _ = mtml.registerFilter(e, "prefix", f)
-	let t = mtml.fromString(e, "{{ who | prefix(\"Hi \") }}", "pref.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {who: "Ada"})
-	testing.assert(out != null, "render null")
-	testing.assertEq("Hi Ada", out)
+# =========================================================
+# 3) QUERY — failure (auto 422 on validation error)
+# =========================================================
+testing.test("nethttp/route query failure -> 422", fun(_: Null) do
+	let r = http.router()
+
+	r.route("GET", "/qbad", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/qbad?name=Ada&age=oops"})
+	testing.assertEq(422, res.status)
 end)
 
-# 4) Helper call (repeat)
-testing.test("mtml/helper call repeat", fun(_: Null) do
-	let e = mtml.env({})
-	# repeat(s: Str, n: Int) -> Str
-	let rep = fun(s: Str) do
-		fun(n: Int) -> Str do
-			let i = 0
-			let acc = ""
-			while i < n do
-				acc = acc + s
-				i = i + 1
-			end
-			acc
-		end
-	end
-	let _ = mtml.registerHelper(e, "repeat", rep)
-	let t = mtml.fromString(e, "{{ repeat(\"ha\", 3) }}", "rep.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {})
-	testing.assert(out != null, "render null")
-	testing.assertEq("hahaha", out)
+# =========================================================
+# 4) BODY — success
+# =========================================================
+testing.test("nethttp/route body json success", fun(_: Null) do
+	let r = http.router()
+
+	r.route("POST", "/echo", http.contract({body: type {msg: Str}}), fun(req, ctx) do
+		http.json(200, {ok: true, msg: ctx.body.msg})
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "POST", path: "/echo", body: "{\"msg\":\"hi\"}"})
+	testing.assertEq(200, res.status)
+	let obj = jsonParse(res.body)
+	testing.assertEq(true, obj.ok)
+	testing.assertEq("hi", obj.msg)
 end)
 
-# 5) For over array + loop meta (index)
-testing.test("mtml/for array loop meta", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "{% for x in xs %}{{ loop.index }}:{{ x }};{% end %}", "loop.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {xs: ["a", "b"]})
-	testing.assert(out != null, "render null")
-	testing.assertEq("1:a;2:b;", out)
+# =========================================================
+# 5) BODY — failure (auto 422)
+# =========================================================
+testing.test("nethttp/route body json failure -> 422", fun(_: Null) do
+	let r = http.router()
+
+	r.route("POST", "/echo2", http.contract({body: type {msg: Str}}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "POST", path: "/echo2", body: "oops"})
+	testing.assertEq(422, res.status)
 end)
 
-# 6) strictUndefined -> error (annotated null)
-testing.test("mtml/strictUndefined error", fun(_: Null) do
-	let e = mtml.env({}) # strict=true default
+# =========================================================
+# 6) IMPLICIT JSON ENCODE from returned value (no helper)
+# =========================================================
+testing.test("nethttp/route implicit json encode", fun(_: Null) do
+	let r = http.router()
 
-	let t = mtml.fromString(e, "X: {{ nope }}", "strict.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
+	r.route("GET", "/auto", http.contract({}), fun(req, ctx) do
+		{ok: true, n: 7}
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/auto"})
+	testing.assertEq(200, res.status)
+	let obj = jsonParse(res.body)
+	testing.assertEq(true, obj.ok)
+	testing.assertEq(7, obj.n)
 end)
 
-# 7) strictUndefined=false -> missing renders empty string
-testing.test("mtml/strictUndefined false -> empty", fun(_: Null) do
-	let e = mtml.env({strictUndefined: false})
-	let t = mtml.fromString(e, "A{{ missing }}B", "nonstrict.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {})
-	testing.assert(out != null, "render null")
-	testing.assertEq("AB", out)
+# =========================================================
+# 7) RAISE helper (structured error) -> custom status
+# =========================================================
+testing.test("nethttp/route raise -> status", fun(_: Null) do
+	let r = http.router()
+
+	r.route("GET", "/need-auth", http.contract({}), fun(req, ctx) do
+		http.raise(401, "unauthorized")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/need-auth"})
+	testing.assertEq(401, res.status)
+	testing.assertEq("unauthorized", res.body)
 end)
 
-# 8) include with inline context (uses temp dir)
-testing.test("mtml/include with ctx", fun(_: Null) do
-	let dir = tempDir()
-	let p = pathJoin([dir, "part.html"])
-	let n = writeFile(p, "<em>{{ x }}</em>")
-	testing.assert(n != null, "write part failed")
+# =========================================================
+# 8) STREAMING handler (raw) works
+# =========================================================
+testing.test("nethttp/streaming handler works", fun(_: Null) do
+	let r = http.router()
 
-	let e = mtml.env({baseDir: dir})
-	let t = mtml.fromString(e, "<p>Start {% include \"part.html\" with {x: \"ok\"} %} End</p>", "incl.html")
-	testing.assert(t != null, "compile null")
-	let out = mtml.render(e, t, {})
-	testing.assert(out != null, "render null")
-	testing.assertEq("<p>Start <em>ok</em> End</p>", out)
+	r.routeStream("GET", "/stream", http.contract({}), fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("hey")
+		res.end(null)
+		null
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/stream"})
+	testing.assertEq(200, res.status)
+	testing.assertEq("hey", res.body)
 end)
 
-# 9) extends + block override (single inheritance; uses temp dir)
-testing.test("mtml/extends block override", fun(_: Null) do
-	let dir = tempDir()
-	let basePath = pathJoin([dir, "base.html"])
-	let _ = writeFile(basePath, "<html><body>{% block content %}base{% end %}</body></html>")
+# =========================================================
+# 9) 404 / 405 and prefix matching
+# =========================================================
+testing.test("nethttp/routing 404_405 prefix", fun(_: Null) do
+	let r = http.router()
 
-	let e = mtml.env({baseDir: dir})
-	let child = "{% extends \"base.html\" %}{% block content %}hi{% end %}"
-	let t = mtml.fromString(e, child, "child.html")
-	testing.assert(t != null, "compile null")
+	let child = http.router()
+	child.routeStream("GET", "/{tail}", http.contract({}), fun(req, res, ctx) -> Null do
+		res.status(200).write("ok")
+		res.end(null)
+		null
+	end)
 
-	let out = mtml.render(e, t, {})
-	testing.assert(out != null, "render null")
-	testing.assertEq("<html><body>hi</body></html>", out)
+	r.mount("/x", child)
+
+	let c = http.testClient(r)
+	testing.assertEq(200, c.call({method: "GET", path: "/x/abc"}).status)
+	testing.assertEq(405, c.call({method: "POST", path: "/x/abc"}).status)
+	testing.assertEq(404, c.call({method: "GET", path: "/nope"}).status)
 end)
 
-# 10) URLs: escaped vs safeURL in attribute
-testing.test("mtml/url escaped vs safe", fun(_: Null) do
-	let e = mtml.env({})
-	let t1 = mtml.fromString(e, "<a href=\"{{ url }}\">go</a>", "url1.html")
-	testing.assert(t1 != null, "compile1 null")
-	let out1 = mtml.render(e, t1, {url: "https://ex.com/?q=1&x=\"y\""})
-	testing.assert(out1 != null, "render1 null")
-	# quotes and & must be escaped
-	testing.assertEq("<a href=\"https://ex.com/?q=1&amp;x=&quot;y&quot;\">go</a>", out1)
+# =========================================================
+# 10) CORS preflight (OPTIONS)
+# =========================================================
+testing.test("nethttp/cors preflight", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwCors({origin: "*"}))
 
-	let t2 = mtml.fromString(e, "<a href=\"{{ url }}\">go</a>", "url2.html")
-	testing.assert(t2 != null, "compile2 null")
-	let out2 = mtml.render(e, t2, {
-		url: mtml.safeURL("https://ex.com/?q=1&x=\"y\"")
+	let c = http.testClient(r)
+	let res = c.call({method: "OPTIONS", path: "/any"})
+	testing.assertEq(204, res.status)
+end)
+
+# =========================================================
+# 11) Recover middleware catches panics -> 500
+# =========================================================
+testing.test("nethttp/recover value panic", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwRecover())
+
+	r.route("GET", "/p", http.contract({}), fun(req, ctx) do
+		panic("boom")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/p"})
+	testing.assertEq(500, res.status)
+end)
+
+testing.test("nethttp/recover stream panic", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwRecover())
+
+	r.routeStream("GET", "/ps", http.contract({}), fun(req, res, ctx) -> Null do
+		panic("boom")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/ps"})
+	testing.assertEq(500, res.status)
+end)
+
+# =========================================================
+# 12) Timeout middleware -> 504 on slow value handler
+# =========================================================
+testing.test("nethttp/timeout value", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwTimeout(20))
+
+	r.route("GET", "/slow", http.contract({}), fun(req, ctx) do
+		sleep(50)
+		http.text(200, "late")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/slow"})
+	testing.assertEq(504, res.status)
+end)
+
+# =========================================================
+# 13) Request ID middleware (inject + propagate)
+# =========================================================
+testing.test("nethttp/request id (inject + propagate)", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+
+	r.route("GET", "/ok", http.contract({}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let a = c.call({method: "GET", path: "/ok"})
+	testing.assertEq(200, a.status)
+	testing.assert(a.headers["X-Request-ID"] != null, "missing request id")
+
+	let b = c.call({
+		method: "GET",
+		path: "/ok",
+		headers: {"X-Request-ID": "req-123"}
 	})
-	testing.assert(out2 != null, "render2 null")
-	# safeURL bypasses escaping
-	testing.assertEq("<a href=\"https://ex.com/?q=1&x=\"y\"\">go</a>", out2)
+	testing.assertEq("req-123", b.headers["X-Request-ID"])
 end)
 
-# --- Ternary ---------------------------------------------------------------
+# =========================================================
+# 14) Access log middleware preserves body and chaining
+# =========================================================
+testing.test("nethttp/accesslog preserves body + chaining", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwAccessLog())
 
-testing.test("mtml/ternary basic", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "{{ 'yes' if ok else 'no' }}", "tern1.html")
-	testing.assert(t != null, "compile null")
-	testing.assertEq("yes", mtml.render(e, t, {ok: true}))
-	testing.assertEq("no", mtml.render(e, t, {ok: false}))
+	r.routeStream("GET", "/s", http.contract({}), fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("hi")
+		res.end(null)
+		null
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/s"})
+	testing.assertEq(200, res.status)
+	testing.assertEq("hi", res.body)
 end)
 
-testing.test("mtml/ternary with filters", fun(_: Null) do
-	let e = mtml.env({})
-	let _ = mtml.installBuiltins(e)
-	let t = mtml.fromString(e, "{{ ('hi' if loud else 'ok') | upper }}", "tern2.html")
-	testing.assertEq("HI", mtml.render(e, t, {loud: true}))
-	testing.assertEq("OK", mtml.render(e, t, {loud: false}))
+# =========================================================
+# 15) Prefix registration (mount-free)
+# =========================================================
+testing.test("nethttp/prefix registration", fun(_: Null) do
+	let parent = http.router()
+	parent.route("GET", "/v1/ping", http.contract({}), fun(req, ctx) do
+		http.text(200, "pong")
+	end)
+
+	let c = http.testClient(parent)
+	let res = c.call({method: "GET", path: "/v1/ping"})
+	testing.assertEq(200, res.status)
+	testing.assertEq("pong", res.body)
 end)
 
-# --- Whitespace trim around statements ------------------------------------
+# =========================================================
+# 16) JSON encode error -> 500
+# =========================================================
+testing.test("nethttp/json encode error", fun(_: Null) do
+	let r = http.router()
 
-testing.test("mtml/trim around if", fun(_: Null) do
-	let e = mtml.env({})
-	let src = "A\n{%- if true -%}\nX\n{%- end -%}\nB"
-	let t = mtml.fromString(e, src, "trim-if.html")
-	testing.assertEq("A\nXB", mtml.render(e, t, {}))
-end)
-
-# --- Strict undefined: deterministic & nested ------------------------------
-
-testing.test("mtml/strictUndefined bare name annotated", fun(_: Null) do
-	let e = mtml.env({}) # strict true
-
-	let t = mtml.fromString(e, "X={{ missing }}", "strict-bare.html")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
-	# must carry an annotation with a clear reason
-	testing.assert(toLower(noteGet(out)) != null, "no annotation on error")
-	testing.assert(match("render: missing name", toLower(noteGet(out))) != null, "missing reason")
-end)
-
-testing.test("mtml/strictUndefined nested helper arg", fun(_: Null) do
-	let e = mtml.env({})
-	let _ = mtml.registerHelper(e, "wrap", fun(x) do
-		fun(y) do
-			str(x) + str(y)
+	r.route("GET", "/badjson", http.contract({}), fun(req, ctx) do
+		fun(_: Null) do
+			true
 		end
 	end)
-	let t = mtml.fromString(e, "{{ wrap('x', missing) }}", "strict-nested.html")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
-	testing.assert(match("render:", toLower(noteGet(out))) != null, "no render error annotation")
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/badjson"})
+	testing.assertEq(500, res.status)
+	testing.assertEq("json encode error", res.body)
 end)
 
-# --- Error annotations for parse/load/filter failures ----------------------
+# =========================================================
+# 17) OpenAPI (minimal): ensure we get a doc back with the registered paths
+# =========================================================
+testing.test("nethttp/openapi basic", fun(_: Null) do
+	let r = http.router()
 
-testing.test("mtml/error annotate: unclosed tag", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<p>{{ x </p>", "bad1.html")
-	testing.assertEq(null, t)
-	testing.assert(match("parse:", toLower(noteGet(t))) != null, "expected parse annotation")
+	r.route("GET", "/a/{id}", http.contract({path: type {id: Str}}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	r.routeStream("GET", "/stream", http.contract({}), fun(req, res, ctx) -> Null do
+		res.status(200).write("x")
+		res.end(null)
+		null
+	end)
+
+	let doc = http.openapiDoc(r, {title: "API", version: "1.0.0"}, [
+		"http://localhost"
+	])
+
+	testing.assert(doc != null, "openapi null")
+	let s = str(doc)
+	testing.assert(len(split(s, "/a/{id}")) > 1 or len(split(s, "\"/a/{id}\"")) > 1, "missing /a/{id} in doc")
 end)
 
-testing.test("mtml/error annotate: unknown filter", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "{{ 1 | nope() }}", "bad2.html")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
-	testing.assert(match("render: unknown filter", toLower(noteGet(out))) != null, "expected filter error")
+# -------------------------
+# Extended server tests
+# -------------------------
+
+let testing = import("testing")
+let http = import("nethttp")
+
+# =========================================================
+# A) PATH: coercion failure -> 422
+# =========================================================
+testing.test("nethttp/path coercion failure -> 422", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/a/{id}", {path: type {id: Int}}, fun(req, ctx) -> Any? do
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/a/not-an-int"})
+	testing.assertEq(422, res.status)
 end)
 
-testing.test("mtml/error annotate: include missing", fun(_: Null) do
-	let e = mtml.env({baseDir: tempDir()})
-	let t = mtml.fromString(e, "A {% include \"nope.html\" %} B", "incl-missing.html")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
-	testing.assert(match("load: include", toLower(noteGet(out))) != null, "expected include load error")
+# =========================================================
+# B1) QUERY arrays: repeated params bind to [Str]
+# =========================================================
+testing.test("nethttp/query arrays repeated", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/tags", {query: type {tag: [Str]}}, fun(req, ctx) -> Any? do
+		http.json(200, {count: len(ctx.query.tag)})
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/tags?tag=a&tag=b&tag=c"})
+	testing.assertEq(200, res.status)
+	let obj = jsonParse(res.body)
+	testing.assertEq(3, obj.count)
 end)
 
-# --- safeURL allowlist -----------------------------------------------------
+# =========================================================
+# B2) QUERY arrays: JSON array in single param binds to [Str]
+# =========================================================
+testing.test("nethttp/query arrays json", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/tags2", {query: type {tag: [Str]}}, fun(req, ctx) -> Any? do
+		http.json(200, {ok: true, tags: ctx.query.tag})
+	end)
 
-testing.test("mtml/safeURL allowed https", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<a href=\"{{ url }}\">go</a>", "safeurl-ok.html")
-	let out = mtml.render(e, t, {
-		url: mtml.safeURL("https://ex.com/?q=1&x=\"y\"")
-	})
-	testing.assertEq("<a href=\"https://ex.com/?q=1&x=\"y\"\">go</a>", out)
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/tags2?tag=%5B%22x%22,%22y%22%5D"})
+	testing.assertEq(200, res.status)
+	let obj = jsonParse(res.body)
+	testing.assertEq(true, obj.ok)
+	testing.assertEq("x", obj.tags[0])
+	testing.assertEq("y", obj.tags[1])
 end)
 
-testing.test("mtml/safeURL rejects javascript", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<a href=\"{{ url }}\">go</a>", "safeurl-bad.html")
-	let out = mtml.render(e, t, {url: mtml.safeURL("javascript:alert(1)")})
-	testing.assertEq(null, out)
-	testing.assert(match("disallowed url scheme", toLower(noteGet(out))) != null, "expected scheme error")
+# =========================================================
+# C1) BODY: invalid JSON -> 422
+# =========================================================
+testing.test("nethttp/body invalid json -> 422", fun(_: Null) do
+	let r = http.router()
+	r.route("POST", "/echo", {body: type {msg: Str}}, fun(req, ctx) -> Any? do
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "POST", path: "/echo", body: "not json"})
+	testing.assertEq(422, res.status)
 end)
 
-# --- Map iteration ergonomics (destructuring) ------------------------------
+# =========================================================
+# C2) BODY: schema mismatch -> 422
+# =========================================================
+testing.test("nethttp/body schema mismatch -> 422", fun(_: Null) do
+	let r = http.router()
+	r.route("POST", "/echo2", {body: type {msg: Str}}, fun(req, ctx) -> Any? do
+		http.text(200, "ok")
+	end)
 
-testing.test("mtml/for object destructuring", fun(_: Null) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "{% for [k, v] in m %}{{ k }}={{ v }};{% end %}", "for-map-destr.html")
-	let out = mtml.render(e, t, {m: {a: 1, b: 2}})
-	# map order preserved per spec
-	testing.assertEq("a=1;b=2;", out)
+	let c = http.testClient(r)
+	let res = c.call({method: "POST", path: "/echo2", body: "{\"msg\": 1}"})
+	testing.assertEq(422, res.status)
 end)
 
-# --- Extends: missing parent annotated -------------------------------------
+# =========================================================
+# D) RESPONSE schema validation failure -> 500
+# (kept as-is; response checking still optional feature-flag)
+# =========================================================
+testing.test("nethttp/response schema validation -> 500", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/check", {responses: {"200": type {ok: Bool}}}, fun(req, ctx) -> Any? do
+		http.json(200, {ok: "nope"})
+	end)
 
-testing.test("mtml/extends missing parent annotates", fun(_: Null) do
-	let e = mtml.env({baseDir: tempDir()})
-	let child = "{% extends \"no-base.html\" %}{% block content %}x{% end %}"
-	let t = mtml.fromString(e, child, "child-miss.html")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
-	testing.assert(match("load: extends", toLower(noteGet(out))) != null, "expected extends load error")
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/check"})
+	testing.assertEq(500, res.status)
 end)
 
-# loader jail
-testing.test("mtml/jail blocks parent escape", fun(_) do
-	let dir = tempDir()
-	let e = mtml.env({baseDir: dir})
-	let t = mtml.fromString(e, "{% include \"../hack.html\" %}", "jail.html")
-	let out = mtml.render(e, t, {})
-	testing.assertEq(null, out)
-	testing.assert(match("path escapes basedir", toLower(noteGet(out))) != null, "expected jail error")
+# =========================================================
+# E) TIMEOUT middleware: fast handler stays 200
+# =========================================================
+testing.test("nethttp/timeout fast -> 200", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwTimeout(50))
+
+	r.route("GET", "/fast", {}, fun(req, ctx) -> Any? do
+		sleep(10)
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/fast"})
+	testing.assertEq(200, res.status)
+	testing.assertEq("ok", res.body)
 end)
 
-testing.test("mtml/href plain string allowed", fun(_) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<a href=\"{{ u }}\">x</a>", "href.html")
-	let out = mtml.render(e, t, {u: "/ok?q=1"})
-	testing.assertEq("<a href=\"/ok?q=1\">x</a>", out)
+# =========================================================
+# F) STREAM: multi-chunk writes + flush preserve body
+# =========================================================
+testing.test("nethttp/stream chunks + flush", fun(_: Null) do
+	let r = http.router()
+	r.routeStream("GET", "/chunks", {}, fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("a")
+		let _ = res.flush(null)
+		let _ = res.write("b")
+		let _ = res.end(null)
+		null
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/chunks"})
+	testing.assertEq(200, res.status)
+	testing.assertEq("ab", res.body)
 end)
 
-# (Optional but recommended) add a guard test for disallowed schemes with plain strings:
-testing.test("mtml/href plain string rejects javascript", fun(_) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<a href=\"{{ u }}\">x</a>", "href-bad.html")
-	let out = mtml.render(e, t, {u: "javascript:alert(1)"})
-	testing.assertEq(null, out)
+# =========================================================
+# G) OPTIONS auto-204 on known (prefix) path
+# =========================================================
+testing.test("nethttp/options auto 204 on prefix", fun(_: Null) do
+	let r = http.router()
+	r.routeStream("GET", "/p/", {}, fun(req, res, ctx) -> Null do
+		res.status(200).write("ok")
+		res.end(null)
+		null
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "OPTIONS", path: "/p/anything"})
+	testing.assertEq(204, res.status)
 end)
 
-# event handler blocked
-testing.test("mtml/event handler blocked", fun(_) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "<a onclick='{{ x }}'>x</a>", "onclick.html")
-	testing.assertEq(null, mtml.render(e, t, {x: "alert(1)"}))
+# =========================================================
+# S1) SERVER: plain text value route over TCP
+# =========================================================
+testing.test("nethttp/hello over tcp", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/hello", http.contract({}), fun(req, ctx) do
+		http.text(200, "hello")
+	end)
+
+	let addr = "127.0.0.1:18081"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# raw client
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# assert status line and body
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "\r\n\r\nhello")) > 1, "bad body")
+
+	let _ = http.shutdown(srv, 0)
 end)
 
-# script requires tojson
-testing.test("mtml/script requires tojson", fun(_: Null) do
-	let e = mtml.env({})
-	let t1 = mtml.fromString(e, "<script>var x={{ v }}</script>", "script1.html")
-	testing.assertEq(null, mtml.render(e, t1, {v: "<b>"}))
-	let _ = mtml.installBuiltins(e)
-	let t2 = mtml.fromString(e, "<script>var x={{ v | tojson }}</script>", "script2.html")
-	# Expect JSON-escaped angle brackets inside the string literal
-	testing.assertEq("<script>var x=\"\\u003cb\\u003e\"</script>", mtml.render(e, t2, {
-		v: "<b>"
-	}))
+# =========================================================
+# S2) SERVER: 422 semantics (reason phrase + JSON content-type w/ charset)
+# =========================================================
+testing.test("nethttp/422 reason + content-type", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/greet/{name}", http.contract({
+		path: type {name: Str},
+		query: type {times: Int}
+	}), fun(req, ctx) do
+		http.json(200, {ok: true})
+	end)
+
+	let addr = "127.0.0.1:18082"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /greet/Ada?times=oops HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# Reason phrase should be "Unprocessable Entity"
+	testing.assert(len(split(resp, "HTTP/1.1 422 Unprocessable Entity")) > 1, "bad 422 reason")
+	# JSON content type with charset
+	testing.assert(len(split(resp, "Content-Type: application/json; charset=utf-8")) > 1, "bad 422 content-type")
+
+	let _ = http.shutdown(srv, 0)
 end)
 
-# |safe must be string or already-safe
-testing.test("mtml/safe guard", fun(_) do
-	let e = mtml.env({})
-	let t = mtml.fromString(e, "{{ 42 | safe }}", "safe-guard.html")
-	testing.assertEq(null, mtml.render(e, t, {}))
-end)=== END FILE: lib/mtml_test.ms ===
+# =========================================================
+# S3) SERVER: JSON POST echo (Content-Length correctness)
+# =========================================================
+testing.test("nethttp/post echo content-length", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("POST", "/echo", http.contract({body: type {msg: Str}}), fun(req, ctx) do
+		http.json(200, {ok: true, msg: ctx.body.msg})
+	end)
+
+	let addr = "127.0.0.1:18083"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let body = "{\"msg\":\"hi\"}"
+	let req = sprintf("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
+		len(body),
+		body
+	])
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# status ok
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	# body
+	testing.assert(len(split(resp, "\r\n\r\n{\"msg\":\"hi\",\"ok\":true}")) > 1, "bad body")
+	# content-length header matches payload length (22)
+	testing.assert(len(split(resp, "Content-Length: 22")) > 1, "bad content-length")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S4) SERVER: streaming route + OPTIONS preflight
+# =========================================================
+testing.test("nethttp/stream + options", fun(_: Null) do
+	let http = import("nethttp")
+
+	let root = http.router()
+	let time = http.router()
+	time.routeStream("GET", "/{tail}", http.contract({}), fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("tick 0\ntick 1\ntick 2\n")
+		res.end(null)
+		null
+	end)
+	root.mount("/time", time)
+
+	let addr = "127.0.0.1:18084"
+	let l = netListen(addr)
+	let srv = http.serve(l, root, {})
+
+	# GET stream
+	let c1 = netConnect(addr)
+	let _ = write(c1, "GET /time/now HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	testing.assert(len(split(resp1, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp1, "\r\n\r\n")) > 1, "no body separator")
+	testing.assert(len(split(resp1, "tick 0")) > 1 and len(split(resp1, "tick 2")) > 1, "bad stream body")
+
+	# OPTIONS preflight (still 204 with your current logic)
+	let c2 = netConnect(addr)
+	let _ = write(c2, "OPTIONS /time/anything HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	testing.assert(len(split(resp2, "HTTP/1.1 204 No Content")) > 1, "bad options 204")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S5) SERVER: 405 Method Not Allowed
+# =========================================================
+testing.test("nethttp/405 method not allowed", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/only-get", http.contract({}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18085"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "POST /only-get HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 405 Method Not Allowed")) > 1, "expected 405")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S6) SERVER: redirect helper sets Location
+# =========================================================
+testing.test("nethttp/redirect sets location", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/old", http.contract({}), fun(req, ctx) do
+		http.redirect(302, "/new")
+	end)
+
+	let addr = "127.0.0.1:18086"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 302 OK")) > 1 or len(split(resp, "HTTP/1.1 302 Found")) > 1, "bad 302 status")
+	testing.assert(len(split(resp, "\r\nLocation: /new\r\n")) > 1, "missing Location header")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S7) SERVER: CORS headers appear on normal GET (not only OPTIONS)
+# =========================================================
+testing.test("nethttp/cors headers on get", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.use(http.mwCors({origin: "*"}))
+	r.route("GET", "/ping", http.contract({}), fun(req, ctx) do
+		http.text(200, "pong")
+	end)
+
+	let addr = "127.0.0.1:18087"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "Access-Control-Allow-Origin: *")) > 1, "missing ACAO")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S8) SERVER: 413 Payload Too Large via maxBodyBytes
+# =========================================================
+testing.test("nethttp/413 payload too large", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("POST", "/upload", http.contract({}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18088"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {maxBodyBytes: 8})
+	testing.assert(srv != null, "serve failed")
+
+	let payload = "0123456789abcdef" # 16 bytes > cap
+
+	let req = sprintf("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", [
+		len(payload),
+		payload
+	])
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 413 Payload Too Large")) > 1, "expected 413")
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S9) KEEP-ALIVE: two sequential requests on one connection
+# =========================================================
+testing.test("nethttp/keepalive two requests", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/a", {}, fun(req, ctx) do
+		http.text(200, "A")
+	end)
+	r.route("GET", "/b", {}, fun(req, ctx) do
+		http.text(200, "B")
+	end)
+
+	let addr = "127.0.0.1:18089"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# One socket, two requests; second closes the connection.
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+
+	let req = "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" + "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	# Expect two 200 OK responses and both bodies.
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) >= 3, "expected two 200 statuses")
+	testing.assert(len(split(resp, "\r\n\r\nA")) > 1, "missing body A")
+	testing.assert(len(split(resp, "\r\n\r\nB")) > 1, "missing body B")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S11) PATH PARAM percent-encoding is not decoded (explicit behavior)
+# =========================================================
+testing.test("nethttp/path param raw percent-encoding", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/p/{v}", {path: type {v: Str}}, fun(req, ctx) do
+		http.text(200, ctx.path.v)
+	end)
+
+	let addr = "127.0.0.1:18091"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c1 = netConnect(addr)
+	testing.assert(c1 != null, "connect failed")
+	let _ = write(c1, "GET /p/%2F HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	testing.assert(len(split(resp1, "\r\n\r\n%2F")) > 1, "expected raw %2F (no decode)")
+
+	let c2 = netConnect(addr)
+	testing.assert(c2 != null, "connect failed")
+	let _2 = write(c2, "GET /p/%20 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _2f = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	testing.assert(len(split(resp2, "\r\n\r\n%20")) > 1, "expected raw %20 (no decode)")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S12) QUERY COERCION: booleans, optional missing, single-element arrays
+# =========================================================
+testing.test("nethttp/query coercion edges", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/q", {query: type {flag: Bool, n: Int, tags: [Int]}}, fun(req, ctx) do
+		http.json(200, {
+			flag: ctx.query.flag,
+			n: ctx.query.n,
+			tags: ctx.query.tags
+		})
+	end)
+
+	let addr = "127.0.0.1:18092"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /q?flag=false&n=5&tags=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "\"flag\":false")) > 1, "flag=false not parsed")
+	testing.assert(len(split(resp, "\"tags\":[1]")) > 1, "single-element array not parsed")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S13) LARGE HEADERS: exceed header budget -> 400 (current behavior)
+# =========================================================
+testing.test("nethttp/large headers -> 400", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/h", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18093"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {maxHeaderBytes: 64})
+	testing.assert(srv != null, "serve failed")
+
+	let big = "X-Long: " + join([
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	], "")
+	let req = "GET /h HTTP/1.1\r\nHost: localhost\r\n" + big + "\r\n\r\n"
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 for header overflow")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S14) DATE HEADER: explicitly absent (documented behavior)
+# =========================================================
+testing.test("nethttp/no Date header (explicit)", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/d", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18094"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	let c = netConnect(addr)
+	testing.assert(c != null, "connect failed")
+	let _ = write(c, "GET /d HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+
+	testing.assert(len(split(resp, "\nDate:")) == 1, "Date header should be absent")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# S15) SHUTDOWN: stops new accepts (late connect fails or yields no response)
+# =========================================================
+testing.test("nethttp/shutdown stops accepts", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/once", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18095"
+	let l = netListen(addr)
+	testing.assert(l != null, "listen failed")
+	let srv = http.serve(l, r, {})
+	testing.assert(srv != null, "serve failed")
+
+	# First request succeeds.
+	let c1 = netConnect(addr)
+	testing.assert(c1 != null, "connect1 failed")
+	let _ = write(c1, "GET /once HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let _ = readAll(c1)
+	close(c1)
+
+	# Now shutdown.
+	let _ = http.shutdown(srv, 0)
+
+	# Late connection should fail to connect or produce no valid response.
+	let c2 = netConnect(addr)
+	if c2 == null then
+		return true
+	end
+	let w = write(c2, "GET /once HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c2)
+	let resp = readAll(c2)
+	close(c2)
+	testing.assert(w == null or len(resp) == 0 or len(split(resp, "HTTP/1.1 200 OK")) == 1, "shutdown did not stop new accepts")
+end)
+
+# =========================================================
+# nethttp/headers case-insensitive (ingest + echo)
+# Expect: lowercase request header is accepted; response echoes canonical key with same value.
+# =========================================================
+testing.test("nethttp/headers case-insensitive", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwRequestID("X-Request-ID"))
+	r.route("GET", "/ok", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18101"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+	let c = netConnect(addr)
+	let _ = write(c, "GET /ok HTTP/1.1\r\nHost: localhost\r\nx-request-id: client-id\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "\nX-Request-ID: client-id")) > 1, "missing echoed canonical request id")
+end)
+
+# =========================================================
+# nethttp/options known vs unknown path
+# Expect: 204 for known shape; 404 for unknown
+# =========================================================
+testing.test("nethttp/options known-vs-unknown", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/users/{id}", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18102"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	# known shape
+	let c1 = netConnect(addr)
+	let _ = write(c1, "OPTIONS /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	testing.assert(len(split(resp1, "HTTP/1.1 204 No Content")) > 1, "expected 204 on known path")
+
+	# unknown
+	let c2 = netConnect(addr)
+	let _2 = write(c2, "OPTIONS /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _2f = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	testing.assert(len(split(resp2, "HTTP/1.1 404 Not Found")) > 1, "expected 404 on unknown path")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# nethttp/405 Allow header
+# Expect: 405 with Allow listing permitted methods for the path shape
+# =========================================================
+testing.test("nethttp/405 with Allow", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/only-get/{x}", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18103"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "POST /only-get/1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 405 Method Not Allowed")) > 1, "expected 405")
+	testing.assert(len(split(resp, "\nAllow: GET")) > 1, "missing Allow header")
+end)
+
+# =========================================================
+# nethttp/reason phrases polish (302 -> Found)
+# =========================================================
+testing.test("nethttp/reason phrase 302 Found", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/old", {}, fun(req, ctx) do
+		http.redirect(302, "/new")
+	end)
+
+	let addr = "127.0.0.1:18104"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 302 Found")) > 1, "expected 302 Found")
+end)
+
+# =========================================================
+# nethttp/TE chunked rejected (unsupported)
+# Expect: 400 on Transfer-Encoding: chunked request
+# =========================================================
+testing.test("nethttp/te chunked -> 400", fun(_: Null) do
+	let r = http.router()
+	r.route("POST", "/u", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18105"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "POST /u HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + "4\r\nTest\r\n0\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 for TE: chunked")
+end)
+
+# =========================================================
+# nethttp/duplicate Content-Length mismatch -> 400
+# =========================================================
+testing.test("nethttp/duplicate content-length mismatch", fun(_: Null) do
+	let r = http.router()
+	r.route("POST", "/echo", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18106"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 on conflicting Content-Length")
+end)
+
+# =========================================================
+# nethttp/absolute-form target -> 400
+# =========================================================
+testing.test("nethttp/absolute-form -> 400", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/p", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18107"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "GET http://localhost/p HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 for absolute-form target")
+end)
+
+# =========================================================
+# nethttp/start-line limit -> 414 URI Too Long
+# =========================================================
+testing.test("nethttp/start-line too long -> 414", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/ok", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18108"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {maxStartLineBytes: 64})
+
+	let big = "/" + join([
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	], "")
+	let c = netConnect(addr)
+	let _ = write(c, "GET " + big + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 414 URI Too Long")) > 1, "expected 414")
+end)
+
+# =========================================================
+# nethttp/header count limit -> 431
+# =========================================================
+testing.test("nethttp/header count -> 431", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/h", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18109"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {maxHeaders: 2})
+
+	let req = "GET /h HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3\r\nConnection: close\r\n\r\n"
+	let c = netConnect(addr)
+	let _ = write(c, req)
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 431 Request Header Fields Too Large")) > 1, "expected 431")
+end)
+
+# =========================================================
+# nethttp/streaming chunked response (no Content-Length)
+# Expect: Transfer-Encoding: chunked; body has chunk terminator; contains ticks
+# =========================================================
+testing.test("nethttp/streaming chunked", fun(_: Null) do
+	let r = http.router()
+	r.routeStream("GET", "/ticks", {}, fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain")
+		let _ = res.write("tick 0\n")
+		sleep(10)
+		let _ = res.write("tick 1\n")
+		sleep(10)
+		let _ = res.write("tick 2\n")
+		let _ = res.end(null)
+		null
+	end)
+
+	let addr = "127.0.0.1:18110"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "GET /ticks HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "Transfer-Encoding: chunked")) > 1, "missing chunked header")
+	testing.assert(len(split(resp, "\r\n0\r\n\r\n")) > 1, "missing chunk terminator")
+	testing.assert(len(split(resp, "tick 0")) > 1 and len(split(resp, "tick 2")) > 1, "missing chunks")
+end)
+
+# =========================================================
+# nethttp/header CRLF injection blocked (redirect Location)
+# Expect: 400 on CRLF in Location
+# =========================================================
+testing.test("nethttp/header crlf blocked", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/bad", {}, fun(req, ctx) do
+		# Attempt to inject newline in Location
+		http.redirect(302, "/good\r\nInjected: yes")
+	end)
+
+	let addr = "127.0.0.1:18111"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "GET /bad HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 on CRLF header value")
+end)
+
+# =========================================================
+# nethttp/redirect path-only policy
+# Expect: external absolute URL is rejected with 400
+# =========================================================
+testing.test("nethttp/redirect external blocked", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/go", {}, fun(req, ctx) do
+		http.redirect(302, "http://evil.example/boom")
+	end)
+
+	let addr = "127.0.0.1:18112"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "GET /go HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 400 Bad Request")) > 1, "expected 400 for external redirect")
+end)
+
+# =========================================================
+# nethttp/path normalization for matching (handlers still see raw)
+# Expect: /a//b and /a/./b route same as /a/b
+# =========================================================
+testing.test("nethttp/path normalization (match only)", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/a/b", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr = "127.0.0.1:18113"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let req1 = "GET /a//b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	let req2 = "GET /a/./b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+	let c1 = netConnect(addr)
+	let _ = write(c1, req1)
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	testing.assert(len(split(resp1, "HTTP/1.1 200 OK")) > 1, "expected 200 for // path")
+
+	let c2 = netConnect(addr)
+	let _2 = write(c2, req2)
+	let _2f = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	testing.assert(len(split(resp2, "HTTP/1.1 200 OK")) > 1, "expected 200 for ./ path")
+
+	let _ = http.shutdown(srv, 0)
+end)
+
+# =========================================================
+# nethttp/cors credentials: echo Origin + Vary: Origin
+# =========================================================
+testing.test("nethttp/cors credentials echo origin", fun(_: Null) do
+	let r = http.router()
+	r.use(http.mwCors({origin: "*", credentials: true}))
+	r.route("GET", "/ping", {}, fun(req, ctx) do
+		http.text(200, "pong")
+	end)
+
+	let addr = "127.0.0.1:18114"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "GET /ping HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	testing.assert(len(split(resp, "Access-Control-Allow-Origin: https://example.com")) > 1, "expected reflected origin")
+	testing.assert(len(split(resp, "\nVary: Origin")) > 1, "missing Vary: Origin")
+end)
+
+# =========================================================
+# nethttp/date header default ON; toggle OFF
+# =========================================================
+testing.test("nethttp/date header on/off", fun(_: Null) do
+	let r1 = http.router()
+	r1.route("GET", "/d", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr1 = "127.0.0.1:18115"
+	let l1 = netListen(addr1)
+	let srv1 = http.serve(l1, r1, {addDateHeader: true})
+
+	let c1 = netConnect(addr1)
+	let _ = write(c1, "GET /d HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c1)
+	let resp1 = readAll(c1)
+	close(c1)
+	let _ = http.shutdown(srv1, 0)
+	testing.assert(len(split(resp1, "\nDate: ")) > 1, "expected Date header present")
+
+	let r2 = http.router()
+	r2.route("GET", "/d", {}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let addr2 = "127.0.0.1:18116"
+	let l2 = netListen(addr2)
+	let srv2 = http.serve(l2, r2, {addDateHeader: false})
+
+	let c2 = netConnect(addr2)
+	let _2 = write(c2, "GET /d HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _2f = flush(c2)
+	let resp2 = readAll(c2)
+	close(c2)
+	let _ = http.shutdown(srv2, 0)
+	testing.assert(len(split(resp2, "\nDate: ")) == 1, "Date header should be absent when disabled")
+end)
+
+# =========================================================
+# nethttp/HEAD auto for value routes
+# Expect: 200; Content-Length equals GET body length; no body bytes written.
+# =========================================================
+testing.test("nethttp/HEAD auto value route", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.route("GET", "/h", {}, fun(req, ctx) do
+		http.text(200, "hello")
+	end)
+
+	let addr = "127.0.0.1:18120"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {}) # default: no Date header (fine)
+
+	# Send HEAD (no body expected)
+	let c = netConnect(addr)
+	let _ = write(c, "HEAD /h HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	# Status OK
+	testing.assert(len(split(resp, "HTTP/1.1 200 OK")) > 1, "bad status")
+	# Correct Content-Length (len("hello") == 5)
+	testing.assert(len(split(resp, "\nContent-Length: 5")) > 1, "wrong Content-Length for HEAD")
+	# No body bytes after header terminator
+	testing.assert(len(split(resp, "\r\n\r\nhello")) == 1, "HEAD must not include body")
+end)
+
+# =========================================================
+# nethttp/HEAD on streaming route -> 405 (unless explicitly registered)
+# Expect: 405 and Allow header lists GET
+# =========================================================
+testing.test("nethttp/HEAD streaming -> 405", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.routeStream("GET", "/s", {}, fun(req, res, ctx) -> Null do
+		res.status(200).setHeader("Content-Type", "text/plain").write("stream")
+		res.end(null)
+		null
+	end)
+
+	let addr = "127.0.0.1:18121"
+	let l = netListen(addr)
+	let srv = http.serve(l, r, {})
+
+	let c = netConnect(addr)
+	let _ = write(c, "HEAD /s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	let _ = flush(c)
+	let resp = readAll(c)
+	close(c)
+	let _ = http.shutdown(srv, 0)
+
+	testing.assert(len(split(resp, "HTTP/1.1 405 Method Not Allowed")) > 1, "expected 405 for HEAD on streaming route")
+	testing.assert(len(split(resp, "\nAllow: GET")) > 1, "Allow header should list GET")
+end)=== END FILE: lib/nethttp_test.ms ===
 

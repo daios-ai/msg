@@ -24,6 +24,15 @@
 # Public types (data-only)
 # =========================
 
+# HTTP request value passed to handlers.
+#
+# Fields:
+#   method: Str — Uppercase HTTP method, e.g. "GET".
+#   url: {scheme: Str?, host: Str?, path: Str, query: Str?} — Parsed request-target parts.
+#   headers: {} — Map of request headers (case-preserving on ingest).
+#   body: Any — Raw request body as Str (server) or readable handle (test/client).
+#   pathParams: {}? — Raw `{name}` path parameters (strings), prior to contract binding.
+# Return: type
 let Request = type {
 	method: Str,
 	url: {scheme: Str?, host: Str?, path: Str, query: Str?},
@@ -32,7 +41,18 @@ let Request = type {
 	pathParams: {}?
 }
 
-# Fluent responder; boundary write/flush/end surface errors (Int?/Bool?).
+# Streaming responder interface for handlers.
+#
+# Methods:
+#   status(code: Int) -> Responder — Set status (before head write); chainable.
+#   setHeader(k: Str, v: Str) -> Responder — Set header (before head write); chainable.
+#   write(chunk: Str) -> Int? — Write a body chunk; returns bytes written or null # <write failed>.
+#   flush(_: Null) -> Bool? — Flush downstream buffers; null # <write failed> on error.
+#   end(_: Null) -> Bool? — Finish response; null # <write failed> on error.
+# Behavior:
+#   - For streaming routes, head is emitted lazily on first write/status/header.
+#   - If Content-Length is absent, Transfer-Encoding: chunked is used.
+# Return: type
 let Responder = type {
 	status: Int -> Responder,
 	setHeader: Str -> Str -> Responder,
@@ -50,6 +70,11 @@ let _HttpError = type {
 	headers!: {}
 }
 
+# A marker wrapper for route contracts (path/query/body/responses).
+#
+# Purpose:
+#   Use contract({...}) to declare schemas for binding/validation at route time.
+# Return: type (opaque)
 let Contract = type {}
 
 let _Ctx = type {req: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
@@ -128,6 +153,13 @@ let _getHeader = fun(h: {}, name: Str) -> Str? do
 	null
 end
 
+# Wrap a route contract (marker).
+#
+# Summary:
+#   Returns the same object, labeled as a Contract for readability at callsites.
+# Args:
+#   c: Contract — A map describing path/query/body/responses (types).
+# Return: Contract
 let contract = fun(c: Contract) -> Contract do
 	c
 end
@@ -136,10 +168,25 @@ end
 # Error helpers (public)
 # =========================
 
+# Create a structured HTTP error response for value routes.
+#
+# Summary:
+#   Returns a special object recognized by router value handlers to emit the given status and body.
+# Args:
+#   status: Int — HTTP status code.
+#   message: Str — Plaintext/error message body.
+# Return: {} — Structured error marker (not a panic).
 let raise = fun(status: Int, message: Str) -> {} do
 	{__http_error__: true, status: status, body: message, headers: {}}
 end
 
+# Create a structured HTTP error with custom headers.
+#
+# Args:
+#   status: Int — HTTP status code.
+#   message: Str — Error message body.
+#   headers: {} — Additional headers to include in the response.
+# Return: {} — Structured error marker.
 let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
 	{__http_error__: true, status: status, body: message, headers: headers}
 end
@@ -370,6 +417,14 @@ end
 # Response helpers (for value handlers)
 # =========================
 
+# Send JSON from a value route.
+#
+# Summary:
+#   Serializes the value to JSON and returns a buffered response with Content-Type set.
+# Args:
+#   status: Int — HTTP status code.
+#   value: Any — Value to encode as JSON.
+# Return: {} — Buffered response or {status:500,"json encode error"} on encode failure.
 let json = fun(status: Int, value) -> {} do
 	let s = _json(value)
 	if s == null then
@@ -378,14 +433,33 @@ let json = fun(status: Int, value) -> {} do
 	{status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s}
 end
 
+# Send plaintext from a value route.
+#
+# Args:
+#   status: Int — HTTP status code.
+#   s: Str — Body.
+# Return: {} — Buffered response with text/plain Content-Type.
 let text = fun(status: Int, s: Str) -> {} do
 	{status: status, headers: {"Content-Type": "text/plain"}, body: s}
 end
 
+# Send 204 No Content from a value route.
+#
+# Args:
+#   _: Null — Unused.
+# Return: {} — Buffered response with empty body.
 let noContent = fun(_: Null) -> {} do
 	{status: 204, headers: {}, body: ""}
 end
 
+# Send an internal redirect (path-only) from a value route.
+#
+# Summary:
+#   Only absolute-path locations are allowed (e.g., "/new"). External absolute URLs are rejected with 400.
+# Args:
+#   status: Int — Redirect code (e.g., 302).
+#   location: Str — Absolute path starting with "/".
+# Return: {} — Buffered response or {status:400,"bad redirect"}.
 let redirect = fun(status: Int, location: Str) -> {} do
 	if len(location) == 0 or substr(location, 0, 1) != "/" then
 		return {status: 400, headers: {"Content-Type": "text/plain"}, body: "bad redirect"}
@@ -569,6 +643,20 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 	{params: params, matched: if hasCatch then last else nParts end}
 end
 
+# Create a new router.
+#
+# Summary:
+#   Builds a closure-backed router with registration for value/stream routes, middleware, and mounts.
+# Methods on returned object:
+#   route(method: Str, pattern: Str, c: Contract, handler) -> Bool
+#   routeStream(method: Str, pattern: Str, c: Contract, handler) -> Bool
+#   mount(prefix: Str, childRouter) -> Bool
+#   use(mw: _Mw) -> Bool
+#   _entryCall(req: Request) -> {status!: Int, headers!: {}, body!: Str}
+#   _entryCallStream(req: Request, conn, opts: {}) -> {}?
+# Args:
+#   _: Null — Unused.
+# Return: {} — Router instance.
 let router = fun(_: Null) -> {} do
 	let _routes = []
 	let _mws = []
@@ -782,6 +870,19 @@ let router = fun(_: Null) -> {} do
 
 	let api = {
 		__kind: "nethttp.router",
+
+		# Register a buffered (value) route with contract binding.
+		#
+		# Summary:
+		#   Handler returns either a buffered {_Response}, a structured http error (raise*),
+		#   any JSON-encodable value (auto 200 + application/json), or null (treated as 500).
+		#   If 'responses' is present in contract, the response payload is type-checked.
+		# Args:
+		#   method: Str — "GET", "POST", ...
+		#   pattern: Str — e.g., "/users/{id}", "/v1/", "{*tail}" at end for catch-all.
+		#   c: Contract — {path?:Type, query?:Type, body?:Type, responses?:{code->Type}}
+		#   handler: (req: Request, ctx: {}) -> Any — Value-returning handler.
+		# Return: Bool — true when registered.
 		route: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
 			let parts = _splitPath(pattern)
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -851,6 +952,18 @@ let router = fun(_: Null) -> {} do
 			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
 			true
 		end,
+
+		# Register a streaming route with contract binding.
+		#
+		# Summary:
+		#   Handler receives a streaming Responder; must write/end explicitly.
+		#   Note: HEAD is NOT auto-mapped to GET for streaming routes (405 unless registered).
+		# Args:
+		#   method: Str — HTTP method.
+		#   pattern: Str — Route pattern (may include {name}, {*tail}).
+		#   c: Contract — Path/query/body types and optional responses (ignored for streaming).
+		#   handler: (req: Request, res: Responder, ctx: {}) -> Null
+		# Return: Bool — true when registered.
 		routeStream: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do handler(req, res, ctx) end)
@@ -864,17 +977,32 @@ let router = fun(_: Null) -> {} do
 			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
 			true
 		end,
+
+		# Mount a child router at a path prefix.
+		#
+		# Args:
+		#   prefix: Str — e.g., "/api", "/v1/users".
+		#   child: {} — Another router() instance.
+		# Return: Bool — true when mounted.
 		mount: fun(prefix: Str, child) -> Bool do
 			_mounts = _mounts + [{prefixParts: _splitPath(prefix), child: child}]
 			true
 		end,
+
+		# Install middleware (applied outer-to-inner in registration order).
+		#
+		# Args:
+		#   mw: _Mw — Middleware transformer: next:_StreamFn -> _StreamFn.
+		# Return: Bool — true when installed.
 		use: fun(mw: _Mw) -> Bool do
 			_mws = _mws + [mw]
 			true
 		end,
+
 		_entryCall: fun(req: Request) -> _Response do
 			_entryCore(req)
 		end,
+
 		_entryCallStream: fun(req: Request, conn, opts: {}) -> {}? do
 			let m = _matchLocal(req.method, req.url.path)
 			if m == null then
@@ -929,9 +1057,11 @@ let router = fun(_: Null) -> {} do
 			end
 			_entryCore(req)
 		end,
+
 		_dump: fun(_: Null) -> {} do
 			{routes: _routes, mws: _mws}
 		end,
+
 		_preflight: fun(req: Request) -> {ok!: Bool} do
 			_preflight(req)
 		end
@@ -961,6 +1091,15 @@ end
 # Test client (buffered)
 # =========================
 
+# Create a buffered in-memory test client for a router.
+#
+# Summary:
+#   Simulates HTTP calls without sockets; routes through the router’s entry points.
+# Methods on return:
+#   call(req: {method?:Str, path?:Str, headers?:{}, body?:Str}) -> {status:Int, headers:{}, body:Str}
+# Args:
+#   r: {} — Router instance created by router().
+# Return: {} — {call: fun} test client.
 let testClient = fun(r) -> {} do
 	let call = fun(req: {}) -> {} do
 		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
@@ -987,6 +1126,13 @@ end
 # Middleware (streaming-friendly)
 # =========================
 
+# Recover middleware — converts handler panics to 500 responses.
+#
+# Summary:
+#   Wraps next and catches panics (via try), returning "internal server error".
+# Args:
+#   _: Null — Unused.
+# Return: _Mw — Middleware function.
 let mwRecover = fun(_: Null) -> _Mw do
 	return fun(next: _StreamFn) -> _StreamFn do
 		return fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -1001,6 +1147,14 @@ let mwRecover = fun(_: Null) -> _Mw do
 	end
 end
 
+# Request ID middleware — injects/propagates a request identifier.
+#
+# Summary:
+#   If the incoming header is present (case-insensitive), reuses it.
+#   Otherwise generates one and echoes it on the response.
+# Args:
+#   headerName: Str — e.g., "X-Request-ID".
+# Return: _Mw — Middleware function.
 let mwRequestID = fun(headerName: Str) -> _Mw do
 	let name = headerName
 	return fun(next: _StreamFn) -> _StreamFn do
@@ -1015,6 +1169,14 @@ let mwRequestID = fun(headerName: Str) -> _Mw do
 	end
 end
 
+# Timeout middleware — emits 504 if no bytes were written by the deadline.
+#
+# Summary:
+#   Wraps the responder to defer first write; if time passes and nothing was written,
+#   sends 504 timeout and prevents further writes.
+# Args:
+#   ms: Int — Deadline in milliseconds from request start.
+# Return: _Mw — Middleware function.
 let mwTimeout = fun(ms: Int) -> _Mw do
 	let dur = ms
 	return fun(next: _StreamFn) -> _StreamFn do
@@ -1101,6 +1263,18 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 	end
 end
 
+# CORS middleware — adds Access-Control-* headers and handles OPTIONS.
+#
+# Summary:
+#   Supports wildcard origins or credentials mode that reflects the Origin and sets Vary: Origin.
+# Args:
+#   opts: {} — {
+#     origin?: Str|"*",
+#     methods?: [Str],    # default allows common verbs
+#     headers?: [Str],    # default "Content-Type, Authorization"
+#     credentials?: Bool  # reflect Origin + Vary when true
+#   }
+# Return: _Mw — Middleware function.
 let mwCors = fun(opts: {}) -> _Mw do
 	let originOpt = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
 	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
@@ -1138,6 +1312,13 @@ let mwCors = fun(opts: {}) -> _Mw do
 	end
 end
 
+# Access log middleware — logs after response with status/bytes/duration.
+#
+# Summary:
+#   Proxies status/write to measure bytes; writes a single line via printf.
+# Args:
+#   _: Null — Unused.
+# Return: _Mw — Middleware function.
 let mwAccessLog = fun(_: Null) -> _Mw do
 	return fun(next: _StreamFn) -> _StreamFn do
 		return fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -1185,6 +1366,25 @@ end
 
 let _ServerHandle = type {listener: Any, stop: {closed: Bool}, conns: [Any], opts: {}}
 
+# Start an HTTP/1.1 server with a router.
+#
+# Summary:
+#   Accepts TCP connections from 'listener', parses requests with limits, and dispatches
+#   to the router. Supports Expect: 100-continue preflight and keep-alive.
+# Args:
+#   listener: Any — TCP listener handle (from netListen).
+#   r: {} — Router instance built by router().
+#   opts: {} — {
+#     readHeaderTimeoutMs?: Int,
+#     writeTimeoutMs?: Int,
+#     idleTimeoutMs?: Int,
+#     maxHeaderBytes?: Int = 8192,
+#     maxHeaders?: Int?,
+#     maxBodyBytes?: Int = 1048576,
+#     maxStartLineBytes?: Int?,
+#     addDateHeader?: Bool?
+#   }
+# Return: {}? — Server handle or null # <serve: ...> on configuration errors.
 let serve = fun(listener, r, opts: {}) -> {}? do
 	if listener == null then
 		return null # <serve: missing listener>
@@ -1218,6 +1418,12 @@ let serve = fun(listener, r, opts: {}) -> {}? do
 	server
 end
 
+# Gracefully shut down a server, closing the listener and active connections.
+#
+# Args:
+#   server: {}? — Handle returned by serve(); null is a no-op.
+#   timeoutMs: Int? — Currently unused; reserved for future graceful drains.
+# Return: Bool — true after resources are closed/cleared.
 let shutdown = fun(server, timeoutMs: Int?) -> Bool do
 	if server == null then
 		return true
@@ -1550,6 +1756,16 @@ end
 # OpenAPI (contract-based, minimal)
 # =========================
 
+# Generate a minimal OpenAPI-like doc from registered routes.
+#
+# Summary:
+#   Produces a lightweight structure listing method, pattern, and style for each route.
+#   This is not a full OpenAPI 3 document—intended for quick inspection/testing.
+# Args:
+#   r: {} — Router instance.
+#   info: {} — Arbitrary info block, e.g., {title: "API", version: "1.0.0"}.
+#   servers: [Str]? — Optional server URLs.
+# Return: {}? — {info, servers, routes:[{method, pattern, style}]} or null # <not a router>.
 let openapiDoc = fun(r, info: {}, servers: [Str]?) -> {}? do
 	if not mapHas(r, "_dump") then
 		return null # <not a router>

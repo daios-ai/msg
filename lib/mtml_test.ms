@@ -316,3 +316,143 @@ testing.test("mtml/safe guard", fun(_) do
 	let t = mtml.fromString(e, "{{ 42 | safe }}", "safe-guard.html")
 	testing.assertEq(null, mtml.render(e, t, {}))
 end)
+
+# --- srcset: preserves descriptors and validates each URL -------------------
+
+testing.test("mtml/srcset preserves descriptors", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<img srcset=\"{{ s }}\">", "srcset-ok.html")
+	let out = mtml.render(e, t, {
+		s: "/a.jpg 1x, https://ex.com/b.jpg 2x"
+	})
+	testing.assertEq("<img srcset=\"/a.jpg 1x, https://ex.com/b.jpg 2x\">", out)
+end)
+
+testing.test("mtml/srcset rejects bad candidate", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<img srcset=\"{{ s }}\">", "srcset-bad.html")
+	let out = mtml.render(e, t, {
+		s: "/ok.jpg 1x, javascript:alert(1) 2x"
+	})
+	testing.assertEq(null, out)
+end)
+
+# --- loader jail: Windows-style backslash escape should be blocked ---------
+
+testing.test("mtml/jail blocks backslash parent escape", fun(_: Null) do
+	let dir = tempDir()
+	let e = mtml.env({baseDir: dir})
+	let t = mtml.fromString(e, "{% include \"..\\\\hack.html\" %}", "jail-win.html")
+	let out = mtml.render(e, t, {})
+	testing.assertEq(null, out)
+end)
+
+# --- error spans: annotated message should include a line:col --------------
+
+testing.test("mtml/errors include line and col", fun(_: Null) do
+	let e = mtml.env({})
+	let src = "line1\nline2 {{ missing }} line2b"
+	let t = mtml.fromString(e, src, "spans.html")
+	let out = mtml.render(e, t, {})
+	testing.assertEq(null, out)
+	testing.assert(match("\\d+:\\d+", noteGet(out)) != null, "expected line:col in annotation")
+end)
+
+# --- Error spans: parse-time unclosed tag includes line:col -----------------
+
+testing.test("mtml/error spans: parse unclosed shows line:col", fun(_: Null) do
+	let e = mtml.env({})
+	let src = "line1\n<p>{{ x </p>\nline3"
+	let t = mtml.fromString(e, src, "unclosed.html")
+	testing.assertEq(null, t)
+	testing.assert(match("^\\[parse\\].*\\d+:\\d+", noteGet(t)) != null, "expected [parse] ... L:C")
+end)
+
+# --- Error spans: runtime unknown filter includes line:col ------------------
+
+testing.test("mtml/error spans: unknown filter shows line:col", fun(_: Null) do
+	let e = mtml.env({})
+	let src = "a\nb {{ 1 | nope }} c\nd"
+	let t = mtml.fromString(e, src, "unknown-filter.html")
+	testing.assert(t != null, "compile should succeed")
+	let out = mtml.render(e, t, {})
+	testing.assertEq(null, out)
+	let msg = toLower(noteGet(out))
+	testing.assert(match("render: unknown filter", msg) != null, "expected unknown filter")
+	testing.assert(match("\\d+:\\d+", msg) != null, "expected line:col in annotation")
+end)
+
+let testing = import("testing")
+let mtml = import("mtml")
+
+# 1) Unforgeable SafeHTML — forged shape must NOT bypass escaping
+testing.test("mtml/safehtml forgery escapes", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<div>{{ x }}</div>", "f.html")
+	let out = mtml.render(e, t, {x: {__safe_html__: true, html: "<img src=x onerror=1>"}})
+	testing.assertEq(null, out)
+	testing.assert(match("forged safehtml", toLower(noteGet(out))) != null, "expected forged SafeHTML annotation")
+end)
+
+# 1) Unforgeable SafeURL — forged shape must NOT bypass checks
+testing.test("mtml/safeurl forgery rejected", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<a href=\"{{ u }}\">go</a>", "fu.html")
+	let out = mtml.render(e, t, {u: {__safe_url__: true, url: "javascript:alert(1)"}})
+	testing.assertEq(null, out)
+end)
+
+# 2) Correct context: <script src="{{ ... }}"> is URL attribute, no tojson needed
+testing.test("mtml/script src attribute is URLAttr", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<script src=\"{{ u }}\"></script>", "scattr.html")
+	let out = mtml.render(e, t, {u: "https://cdn.ex/x.js"})
+	testing.assertEq("<script src=\"https://cdn.ex/x.js\"></script>", out)
+end)
+
+# 2) Still strict inside script content: requires tojson
+testing.test("mtml/script content requires tojson (still)", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<script>var x={{ v }}</script>", "sccontent.html")
+	let out = mtml.render(e, t, {v: "<b>"})
+	testing.assertEq(null, out)
+end)
+
+# 3) Re-validate SafeURL at render time (policy tightened: mailto disallowed)
+testing.test("mtml/safeurl revalidated at render", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "<a href=\"{{ u }}\">x</a>", "reval.html")
+	let out = mtml.render(e, t, {u: mtml.safeURL("mailto:sales@example.com")})
+	testing.assertEq(null, out)
+end)
+
+# 4A) Arity check: helper called with too many args -> annotated error
+testing.test("mtml/helper arity mismatch annotated", fun(_: Null) do
+	let e = mtml.env({})
+	let rep = fun(s: Str) do
+		fun(n: Int) -> Str do
+			"s"  # stub content, arity is what we care about
+		end
+	end
+	let _ = mtml.registerHelper(e, "repeat", rep)
+	let t = mtml.fromString(e, "{{ repeat(\"ha\", 3, \"oops\") }}", "arity.html")
+	let out = mtml.render(e, t, {})
+	testing.assertEq(null, out)
+	testing.assert(match("arity", toLower(noteGet(out))) != null, "expected arity in message")
+end)
+
+# 4B) Ternary laziness: untaken branch must NOT be evaluated
+testing.test("mtml/ternary untaken branch not evaluated", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "{{ 'ok' if ok else missing.deep.field }}", "tern-ok.html")
+	let out = mtml.render(e, t, {ok: true})
+	testing.assertEq("ok", out)
+end)
+
+# 4C) Ternary laziness: taken branch with missing should error
+testing.test("mtml/ternary taken branch errors", fun(_: Null) do
+	let e = mtml.env({})
+	let t = mtml.fromString(e, "{{ 'ok' if ok else missing.deep.field }}", "tern-bad.html")
+	let out = mtml.render(e, t, {ok: false})
+	testing.assertEq(null, out)
+end)

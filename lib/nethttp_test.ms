@@ -949,7 +949,6 @@ testing.test("nethttp/shutdown stops accepts", fun(_: Null) do
 	testing.assert(w == null or len(resp) == 0 or len(split(resp, "HTTP/1.1 200 OK")) == 1, "shutdown did not stop new accepts")
 end)
 
-
 # =========================================================
 # nethttp/headers case-insensitive (ingest + echo)
 # Expect: lowercase request header is accepted; response echoes canonical key with same value.
@@ -1071,10 +1070,7 @@ testing.test("nethttp/te chunked -> 400", fun(_: Null) do
 	let srv = http.serve(l, r, {})
 
 	let c = netConnect(addr)
-	let _ = write(c,
-		"POST /u HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
-		"4\r\nTest\r\n0\r\n\r\n"
-	)
+	let _ = write(c, "POST /u HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + "4\r\nTest\r\n0\r\n\r\n")
 	let _ = flush(c)
 	let resp = readAll(c)
 	close(c)
@@ -1097,9 +1093,7 @@ testing.test("nethttp/duplicate content-length mismatch", fun(_: Null) do
 	let srv = http.serve(l, r, {})
 
 	let c = netConnect(addr)
-	let _ = write(c,
-		"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc"
-	)
+	let _ = write(c, "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc")
 	let _ = flush(c)
 	let resp = readAll(c)
 	close(c)
@@ -1144,7 +1138,9 @@ testing.test("nethttp/start-line too long -> 414", fun(_: Null) do
 	let l = netListen(addr)
 	let srv = http.serve(l, r, {maxStartLineBytes: 64})
 
-	let big = "/" + join([ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ], "")
+	let big = "/" + join([
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	], "")
 	let c = netConnect(addr)
 	let _ = write(c, "GET " + big + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _ = flush(c)
@@ -1375,7 +1371,7 @@ testing.test("nethttp/HEAD auto value route", fun(_: Null) do
 
 	let addr = "127.0.0.1:18120"
 	let l = netListen(addr)
-	let srv = http.serve(l, r, {})    # default: no Date header (fine)
+	let srv = http.serve(l, r, {}) # default: no Date header (fine)
 
 	# Send HEAD (no body expected)
 	let c = netConnect(addr)

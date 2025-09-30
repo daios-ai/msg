@@ -305,7 +305,9 @@ testing.test("mtml/script requires tojson", fun(_: Null) do
 	let _ = mtml.installBuiltins(e)
 	let t2 = mtml.fromString(e, "<script>var x={{ v | tojson }}</script>", "script2.html")
 	# Expect JSON-escaped angle brackets inside the string literal
-	testing.assertEq("<script>var x=\"\\u003cb\\u003e\"</script>", mtml.render(e, t2, {v: "<b>"}))
+	testing.assertEq("<script>var x=\"\\u003cb\\u003e\"</script>", mtml.render(e, t2, {
+		v: "<b>"
+	}))
 end)
 
 # |safe must be string or already-safe

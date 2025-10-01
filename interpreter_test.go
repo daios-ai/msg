@@ -18,7 +18,7 @@ func mustEvalPersistent(t *testing.T, ip *Interpreter, src string) Value {
 
 func evalSrc(t *testing.T, src string) Value {
 	t.Helper()
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	v, err := ip.EvalSource(src)
 	if err != nil {
 		t.Fatalf("EvalSource error: %v\nsource:\n%s", err, src)
@@ -103,7 +103,7 @@ func wantStrWithAnnot(t *testing.T, v Value, s, ann string) {
 // New helpers for error-expecting paths (runtimeErrorsAsGoError=true).
 func evalSrcExpectError(t *testing.T, src string) error {
 	t.Helper()
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil\nsource:\n%s", src)
@@ -765,7 +765,7 @@ end
 range(5, 8)
 `
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	v, err := ip.EvalSource(src)
 	if err != nil {
 		t.Fatalf("eval error: %v", err)
@@ -1140,7 +1140,7 @@ o["name"]
 
 // Deep equality ignores key annotations.
 func Test_Interpreter_Map_DeepEqual_Ignores_KeyAnnots(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	ip.RegisterNative("__eq_maps",
 		[]ParamSpec{{"x", S{"id", "Any"}}, {"y", S{"id", "Any"}}},
 		S{"id", "Bool"},
@@ -1195,7 +1195,7 @@ arr
 }
 
 func Test_Interpreter_Annot_On_Assign_Persists_In_Env(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// let c = 299792458 with annotation
 	mustEvalPersistent(t, ip, "# speed of light\nlet c = 299792458")
@@ -1211,7 +1211,7 @@ func Test_Interpreter_Annot_On_Assign_Persists_In_Env(t *testing.T) {
 }
 
 func Test_Interpreter_Annot_On_Bare_Decl_Persists_As_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// annotated bare decl
 	mustEvalPersistent(t, ip, "# doc for x\nlet x")
@@ -1226,7 +1226,7 @@ func Test_Interpreter_Annot_On_Bare_Decl_Persists_As_AnnotatedNull(t *testing.T)
 }
 
 func Test_Interpreter_Annot_On_Reassign_Persists_On_Binding(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	mustEvalPersistent(t, ip, "let x = 1")
 	// annotated reassignment
@@ -1242,7 +1242,7 @@ func Test_Interpreter_Annot_On_Reassign_Persists_On_Binding(t *testing.T) {
 }
 
 func Test_Interpreter_Annot_On_LValue_Id_Persists(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, `let a = "x"`)
 	mustEvalPersistent(t, ip, "# temp note\na")
 	got := mustEvalPersistent(t, ip, "a")
@@ -1250,7 +1250,7 @@ func Test_Interpreter_Annot_On_LValue_Id_Persists(t *testing.T) {
 }
 
 func Test_Interpreter_Identity_Preserves_Annotation(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Annotated binding
 	mustEvalPersistent(t, ip, "# doc\nlet a = 42")
@@ -1269,7 +1269,7 @@ func Test_Interpreter_Identity_Preserves_Annotation(t *testing.T) {
 }
 
 func Test_Interpreter_Arithmetic_Does_Not_Propagate_Annotation(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	mustEvalPersistent(t, ip, "# golden ratio\nlet phi = (1 + 5) / 2")
 
@@ -1303,7 +1303,7 @@ func Test_Interpreter_Pretty_Does_Not_Show_Desugaring(t *testing.T) {
 }
 
 func Test_Interpreter_Type_And_Field_Notes_Appear_In_FormatValue(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Type-level + field-level annotations:
 	src := `
@@ -1334,7 +1334,7 @@ let Input = type {
 }
 
 func Test_Interpreter_Assign_Map_With_Computed_Index(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, `let obj = {name: "Pedro", age: 17}`)
 
 	// Success paths
@@ -1350,7 +1350,7 @@ func Test_Interpreter_Assign_Map_With_Computed_Index(t *testing.T) {
 }
 
 func Test_Interpreter_Assign_Array_With_Computed_Index(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, `let arr = ["Pedro", 17]`)
 
 	// Bracket with computed index
@@ -1371,7 +1371,7 @@ func Test_Interpreter_Assign_Array_With_Computed_Index(t *testing.T) {
 }
 
 func Test_Interpreter_Assign_Through_Nested_Computed_Keys(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, `
 		let key = "na" + "me"
 		let idx = 0 + 1
@@ -1432,7 +1432,7 @@ end
 	wantInt(t, evalSrc(t, src), 2)
 }
 func Test_Interpreter_For_Expr_Evaluated_Once_Array_WithPreAnnotation(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, "let calls\ncalls = 0")
 
 	// PRE annotation sits immediately above the for-loop.
@@ -1448,7 +1448,7 @@ end
 }
 
 func Test_Interpreter_For_Expr_Evaluated_Once_Map_WithPreAnnotation(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, "let mcalls\nmcalls = 0")
 
 	res := mustEvalPersistent(t, ip, `
@@ -1463,7 +1463,7 @@ end
 }
 
 func Test_Interpreter_For_Iterator_Function_Evaluated_Once(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, "let icalls\nicalls = 0")
 
 	res := mustEvalPersistent(t, ip, `
@@ -1651,7 +1651,7 @@ func Test_Interpreter_RuntimeErr_IndexExpr_Subexpression_Location(t *testing.T) 
 func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 	// Define f(a) that just returns a; the arg (1/0) errors before/at the arg CALL site,
 	// and the emitter marks the CALL at the argument node's path.
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, `let f = fun(a) do a end`)
 	err := evalPersistentExpectError(t, ip, `f(1/0)`)
 	wantErrContains(t, err, "division by zero")
@@ -1661,7 +1661,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 
 // func Test_Interpreter_RuntimeErr_FunBody_DivByZero_Persistent_MappedIntoBody(t *testing.T) {
 // 	// Define in one persistent eval, call in another — mirrors REPL.
-// 	ip := NewInterpreter()
+// 	ip, _ := NewInterpreter()
 // 	mustEvalPersistent(t, ip, `
 // let crashDiv = fun() do
 //   1 / 0
@@ -1676,7 +1676,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 // }
 
 // func Test_Interpreter_RuntimeErr_FunBody_IndexOOB_Persistent_MappedIntoBody(t *testing.T) {
-// 	ip := NewInterpreter()
+// 	ip, _ := NewInterpreter()
 // 	mustEvalPersistent(t, ip, `
 // let crashIdx = fun(a) do
 //   a[5]
@@ -1691,7 +1691,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 
 // func Test_Interpreter_RuntimeErr_Nested_Binary_In_Function_Maps_To_Inner(t *testing.T) {
 // 	// More complex body: ensure mapping doesn't collapse to line 1.
-// 	ip := NewInterpreter()
+// 	ip, _ := NewInterpreter()
 // 	mustEvalPersistent(t, ip, `
 // let g = fun() do
 //   let x = 10
@@ -1707,7 +1707,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 
 // func Test_Interpreter_RuntimeErr_For_Loop_Body_Mark_Inside(t *testing.T) {
 // 	// Ensure loop control flow keeps precise attribution inside the body.
-// 	ip := NewInterpreter()
+// 	ip, _ := NewInterpreter()
 // 	mustEvalPersistent(t, ip, `
 // let bad = fun() do
 //   for i in [1,2] do
@@ -1722,7 +1722,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 // }
 
 // func Test_Interpreter_RuntimeErr_If_Then_Else_Arm_Mark_Inside(t *testing.T) {
-// 	ip := NewInterpreter()
+// 	ip, _ := NewInterpreter()
 // 	mustEvalPersistent(t, ip, `
 // let h = fun(b) do
 //   if b then
@@ -1753,7 +1753,7 @@ func Test_Interpreter_RuntimeErr_CallArg_Subexpression_Location(t *testing.T) {
 //		wantErrContains(t, err, "at 1:7")
 //	}
 func Test_Interpreter_Annot_LValue_Id_Persists(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	// seed a
 	mustEvalPersistent(t, ip, "let a")
 	mustEvalPersistent(t, ip, "a = (8 + 5) * 4") // 52
@@ -1767,7 +1767,7 @@ func Test_Interpreter_Annot_LValue_Id_Persists(t *testing.T) {
 }
 
 func Test_Interpreter_Annot_LValue_Get_Persists_On_Map_Field(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, `let o = {"k": "v"}`)
 	// annotate property get
 	mustEvalPersistent(t, ip, "# key-doc\no.k")
@@ -1777,7 +1777,7 @@ func Test_Interpreter_Annot_LValue_Get_Persists_On_Map_Field(t *testing.T) {
 }
 
 func Test_Interpreter_Annot_LValue_Idx_Persists_On_Array_Slot(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mustEvalPersistent(t, ip, "let xs = [10, 20]")
 	// annotate element at index 1
 	mustEvalPersistent(t, ip, "# hot\nxs[1]")
@@ -1797,7 +1797,7 @@ func Test_Interpreter_Annot_NonLValue_Remains_Pure(t *testing.T) {
 }
 
 func Test_Interpreter_Annot_Decl_And_Assign_Still_Work(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	// Annotated declaration → a = #(doc) null
 	mustEvalPersistent(t, ip, "# doc\nlet a")
 	va := mustEvalPersistent(t, ip, "a")
@@ -1827,7 +1827,7 @@ func Test_Interpreter_Array_NegativeIndexing_OOB(t *testing.T) {
 }
 
 func Test_Interpreter_Array_Assignment_NegativeIndexing_OOB(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Setup and a valid negative write
 	v := mustEvalPersistent(t, ip, "let a = [10,20,30]\n a[-1] = 99\n a")
@@ -1923,7 +1923,7 @@ func Test_Interpreter_Type_Enum_BareIdentifier_IsError(t *testing.T) {
 }
 
 func Test_Interpreter_ZeroArity_Sugar_For_UserFun_And_Native(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Register a zero-arity native (should be lowered to _:Null)
 	ip.RegisterNative("z0", nil, S{"id", "Str"}, func(_ *Interpreter, ctx CallCtx) Value {

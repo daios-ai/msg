@@ -25,7 +25,7 @@ func typeSFromValue(t *testing.T, v Value) S {
 // -----------------------------
 
 func Test_Schema_MSPrimitives_ToJSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	cases := []struct {
@@ -51,7 +51,7 @@ func Test_Schema_MSPrimitives_ToJSON(t *testing.T) {
 }
 
 func Test_Schema_MSNullable_ToJSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	// Primitive nullable uses type: ["<t>", "null"]
@@ -74,7 +74,7 @@ func Test_Schema_MSNullable_ToJSON(t *testing.T) {
 }
 
 func Test_Schema_MSArray_ToJSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	tarr := S{"array", S{"id", "Num"}}
@@ -96,7 +96,7 @@ func Test_Schema_MSArray_ToJSON(t *testing.T) {
 }
 
 func Test_Schema_MSObject_ToJSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	tobj := S{"map",
@@ -120,7 +120,7 @@ func Test_Schema_MSObject_ToJSON(t *testing.T) {
 }
 
 func Test_Schema_MSEnum_ToJSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	tenum := S{"enum",
@@ -141,7 +141,7 @@ func Test_Schema_MSEnum_ToJSON(t *testing.T) {
 }
 
 func Test_Schema_MSAlias_ToJSON_WithDefs(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	// type User = { name!: Str, friend: User? }
@@ -187,7 +187,7 @@ func Test_Schema_MSAlias_ToJSON_WithDefs(t *testing.T) {
 }
 
 func Test_Schema_MSFunction_ToJSON_Widens(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 	fn := S{"binop", "->", S{"id", "Int"}, S{"id", "Str"}}
 	got := ip.TypeValueToJSONSchema(TypeValIn(fn, env), env)
@@ -202,7 +202,7 @@ func Test_Schema_MSFunction_ToJSON_Widens(t *testing.T) {
 // -----------------------------
 
 func Test_Schema_JSONPrimitives_ToMS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	cases := []struct {
 		js map[string]any
@@ -223,7 +223,7 @@ func Test_Schema_JSONPrimitives_ToMS(t *testing.T) {
 }
 
 func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// type: ["integer", "null"]
 	m1 := map[string]any{"type": []any{"integer", "null"}}
@@ -259,7 +259,7 @@ func Test_Schema_JSONNullablePatterns_ToMS(t *testing.T) {
 }
 
 func Test_Schema_JSONArray_ToMS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	js := map[string]any{"type": "array", "items": map[string]any{"type": "number"}}
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
@@ -277,7 +277,7 @@ func Test_Schema_JSONArray_ToMS(t *testing.T) {
 }
 
 func Test_Schema_JSONObject_ToMS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	schema := map[string]any{
 		"type": "object",
@@ -324,7 +324,7 @@ func Test_Schema_JSONObject_ToMS(t *testing.T) {
 }
 
 func Test_Schema_JSONEnum_ToMS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	js := map[string]any{
 		"enum": []any{
@@ -344,7 +344,7 @@ func Test_Schema_JSONEnum_ToMS(t *testing.T) {
 }
 
 func Test_Schema_JSONRefs_ToMS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// #/$defs/Name -> ("id","Name")
 	doc := map[string]any{
@@ -376,7 +376,7 @@ func Test_Schema_JSONRefs_ToMS(t *testing.T) {
 }
 
 func Test_Schema_JSONUnsupported_Unions_ToAny(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// anyOf with 3 branches => Any
 	js := map[string]any{
@@ -393,7 +393,7 @@ func Test_Schema_JSONUnsupported_Unions_ToAny(t *testing.T) {
 }
 
 func Test_Schema_JSONConstraints_Ignored(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	// pattern/minimum etc. should not force Any; base type remains
 	js := map[string]any{
 		"type":    "string",
@@ -410,7 +410,7 @@ func Test_Schema_JSONConstraints_Ignored(t *testing.T) {
 // -----------------------------
 
 func Test_Schema_Roundtrip_MS_to_JSON_to_MS(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	ms := S{"map",
@@ -426,7 +426,7 @@ func Test_Schema_Roundtrip_MS_to_JSON_to_MS(t *testing.T) {
 }
 
 func Test_Schema_Roundtrip_JSON_to_MS_to_JSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	js := map[string]any{
 		"type": "object",
@@ -510,7 +510,7 @@ func Test_Schema_Helper_JSONSchemaStringToObject(t *testing.T) {
 
 func Test_Schema_Enum_JSONNumber_IntVsNum(t *testing.T) {
 	// Ensure jsonLiteralToS: integral float -> Int; non-integral -> Num
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	js := map[string]any{"enum": []any{float64(2), float64(2.5)}}
 	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
@@ -530,7 +530,7 @@ func Test_Schema_Enum_JSONNumber_IntVsNum(t *testing.T) {
 // -----------------------------
 
 func Test_Schema_Alias_Roundtrip_Smoke(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	order := S{"map",
@@ -589,7 +589,7 @@ func Test_Schema_JSONPointer_EncodingDecoding(t *testing.T) {
 // -----------------------------
 
 func Test_Schema_JSON_ComplexOneOf_ToAny(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	doc := map[string]any{
 		"oneOf": []any{
 			map[string]any{"type": "string"},
@@ -660,7 +660,7 @@ func Test_Schema_Helper_JSONSchemaStringToObject_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse JSON schema string: %v", err)
 	}
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(m))
 	// For $ref to #/$defs/User, we map to ("id","User")
 	if !isId(ms, "User") {
@@ -700,7 +700,7 @@ func Test_Schema_JSON_Decoding_Smoke(t *testing.T) {
 }
 
 func Test_Schema_Annot_TopLevel_JSONDescription(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	ms := S{"annot", S{"str", "type for a person"},
 		S{"map",
@@ -747,7 +747,7 @@ func Test_Schema_Annot_TopLevel_JSONDescription(t *testing.T) {
 }
 
 func Test_Schema_AliasDescriptions_In_Defs(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	// Define aliases *as if* they were declared in MindScript with preceding # docs.
@@ -810,7 +810,7 @@ func Test_Schema_AliasDescriptions_In_Defs(t *testing.T) {
 }
 
 func Test_Schema_MapKeyAnnotation_To_PropertyDescription(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	// { #(Age in years.) age: Int }
@@ -832,7 +832,7 @@ func Test_Schema_MapKeyAnnotation_To_PropertyDescription(t *testing.T) {
 }
 
 func Test_Schema_NullableAlias_AnyOf_With_Ref(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	env := NewEnv(nil)
 
 	// Status alias (enum) with description.
@@ -873,7 +873,7 @@ func Test_Schema_NullableAlias_AnyOf_With_Ref(t *testing.T) {
 }
 
 func Test_Schema_JSON_To_MS_TopLevelDescription_Preserved(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	doc := map[string]any{
 		"type": "object",

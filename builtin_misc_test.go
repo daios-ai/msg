@@ -23,7 +23,7 @@ func approx(a, b, eps float64) bool {
 }
 
 func Test_Builtin_Misc_rand_seed_and_randInt_deterministic(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Produce a pair after a specific seed.
 	pair := func(seed int) (int64, int64) {
@@ -53,7 +53,7 @@ func Test_Builtin_Misc_rand_seed_and_randInt_deterministic(t *testing.T) {
 }
 
 func Test_Builtin_Misc_randFloat_range(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `randFloat(null)`)
 	if v.Tag != VTNum {
 		t.Fatalf("randFloat should return Num, got %#v", v)
@@ -65,7 +65,7 @@ func Test_Builtin_Misc_randFloat_range(t *testing.T) {
 }
 
 func Test_Builtin_Misc_str_basic_and_fallback(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Scalars
 	if s := evalWithIP(t, ip, `str(42)`); s.Tag != VTStr || s.Data.(string) != "42" {
@@ -100,7 +100,7 @@ func Test_Builtin_Misc_str_basic_and_fallback(t *testing.T) {
 }
 
 func Test_Builtin_Misc_int_num_bool_len(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// int
 	if v := evalWithIP(t, ip, `int(123)`); v.Tag != VTInt || v.Data.(int64) != 123 {
@@ -171,7 +171,7 @@ func Test_Builtin_Misc_int_num_bool_len(t *testing.T) {
 }
 
 func Test_Builtin_Misc_math_constants_and_funcs(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// constants
 	if v := evalWithIP(t, ip, `PI`); v.Tag != VTNum || !approx(v.Data.(float64), math.Pi, 1e-15) {
@@ -205,7 +205,7 @@ func Test_Builtin_Misc_math_constants_and_funcs(t *testing.T) {
 func Test_Builtin_Misc_exit(t *testing.T) {
 	// Run a child `go test` process that invokes exit(7) and verify exit code.
 	if os.Getenv("MS_EXIT_CHILD") == "1" {
-		ip, _ := NewRuntime()
+		ip, _ := NewInterpreter()
 		_, _ = ip.EvalSource(`exit(7)`) // terminates the process with code 7
 		t.Fatal("unreachable")          // should never be reached
 		return

@@ -16,7 +16,7 @@ func mustStr(t *testing.T, v Value) string {
 }
 
 func Test_Builtin_Crypto_sha256_KnownVectors(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// sha256("") (empty)
 	v0 := evalWithIP(t, ip, `sha256("")`)
@@ -44,7 +44,7 @@ func Test_Builtin_Crypto_sha256_KnownVectors(t *testing.T) {
 }
 
 func Test_Builtin_Crypto_hmacSha256_KnownVectors(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// HMAC-SHA256("key", "The quick brown fox jumps over the lazy dog")
 	v1 := evalWithIP(t, ip, `hmacSha256("key", "The quick brown fox jumps over the lazy dog")`)
@@ -68,7 +68,7 @@ func Test_Builtin_Crypto_hmacSha256_KnownVectors(t *testing.T) {
 }
 
 func Test_Builtin_Crypto_ctEqual_Basic(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Equal strings
 	v1 := evalWithIP(t, ip, `ctEqual("abc", "abc")`)
@@ -103,7 +103,7 @@ func Test_Builtin_Crypto_ctEqual_Basic(t *testing.T) {
 }
 
 func Test_Builtin_Crypto_randBytes_LengthAndError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// n = 0 → empty string
 	v0 := evalWithIP(t, ip, `randBytes(0)`)
@@ -123,7 +123,7 @@ func Test_Builtin_Crypto_randBytes_LengthAndError(t *testing.T) {
 }
 
 func Test_Builtin_Crypto_randBytes_NonDeterminism(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Two successive calls should almost surely differ
 	v1 := evalWithIP(t, ip, `randBytes(32)`)

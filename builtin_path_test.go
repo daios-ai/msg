@@ -21,7 +21,7 @@ func wantStrVal(t *testing.T, v Value, want string) {
 }
 
 func Test_PathBuiltins_pathJoin(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Simple join
 	v := evalWithIP(t, ip, `pathJoin(["a", "b", "c"])`)
@@ -41,7 +41,7 @@ func Test_PathBuiltins_pathJoin(t *testing.T) {
 }
 
 func Test_PathBuiltins_pathBase(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Empty path mirrors filepath.Base("")
 	v := evalWithIP(t, ip, `pathBase("")`)
@@ -65,7 +65,7 @@ func Test_PathBuiltins_pathBase(t *testing.T) {
 }
 
 func Test_PathBuiltins_pathDir(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Empty path
 	v := evalWithIP(t, ip, `pathDir("")`)
@@ -83,7 +83,7 @@ func Test_PathBuiltins_pathDir(t *testing.T) {
 }
 
 func Test_PathBuiltins_pathExt(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// A few common cases
 	for _, s := range []string{
@@ -104,7 +104,7 @@ func Test_PathBuiltins_pathExt(t *testing.T) {
 }
 
 func Test_PathBuiltins_pathClean(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Relative cleanup
 	s := filepath.Join("a", ".", "b", "..", "c", ".", ".", "d", "..")

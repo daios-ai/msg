@@ -8,7 +8,7 @@ import (
 // ----------------------------- tests -----------------------------
 
 func Test_Builtin_Introspection_noteGet_and_noteSet(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// noteGet on unannotated value → null
 	v := evalWithIP(t, ip, `noteGet(42)`)
@@ -36,7 +36,7 @@ func Test_Builtin_Introspection_noteGet_and_noteSet(t *testing.T) {
 }
 
 func Test_Builtin_Introspection_bindings_order_and_shadowing(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Force a NEW FRAME via a function so snapshot() is taken in the inner scope.
 	v := evalWithIP(t, ip, `
@@ -83,7 +83,7 @@ func Test_Builtin_Introspection_bindings_order_and_shadowing(t *testing.T) {
 }
 
 func Test_Builtin_Introspection_astParse_and_astEval_roundtrip(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Parse then eval simple expression
 	v := evalWithIP(t, ip, `
@@ -105,7 +105,7 @@ func Test_Builtin_Introspection_astParse_and_astEval_roundtrip(t *testing.T) {
 }
 
 func Test_Builtin_Introspection_astEval_operates_in_caller_scope(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// astEval should mutate caller's env (not a fresh child)
 	v := evalWithIP(t, ip, `
@@ -120,7 +120,7 @@ func Test_Builtin_Introspection_astEval_operates_in_caller_scope(t *testing.T) {
 }
 
 func Test_Builtin_Introspection_reflect_and_reify_roundtrip(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Round-trip a composite value
 	v := evalWithIP(t, ip, `
@@ -135,7 +135,7 @@ func Test_Builtin_Introspection_reflect_and_reify_roundtrip(t *testing.T) {
 }
 
 func Test_Builtin_Introspection_reify_persistent_scope(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// reify evaluates in persistent/global scope; definition should persist
 	v := evalWithIP(t, ip, `
@@ -149,7 +149,7 @@ func Test_Builtin_Introspection_reify_persistent_scope(t *testing.T) {
 }
 
 func Test_Builtin_Introspection_reify_malformed_is_hard_error(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Malformed runtime-S: ["id"] (missing name) → IxReify must HARD-fail.
 	_, err := ip.EvalSource(`reify(["id"])`)
@@ -186,7 +186,7 @@ func Test_Builtin_Introspection_IxRoundTrip(t *testing.T) {
 
 // Annotation preservation through reflect/reify (container + nested).
 func Test_Builtin_Introspection_Annotations_ReflectReify_Preserve(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let v = {a: noteSet("A", [noteSet("B", 1), 2])}
 		let rt = reflect(v)
@@ -207,7 +207,7 @@ func Test_Builtin_Introspection_Annotations_ReflectReify_Preserve(t *testing.T) 
 
 // Canonical module lowering in reflect; reify exports.
 func Test_Builtin_Introspection_Reflect_Module_CanonicalAssigns(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	rt := evalWithIP(t, ip, `
 		reflect(module "M" do
 			let a = 1
@@ -251,7 +251,7 @@ func Test_Builtin_Introspection_Reflect_Module_CanonicalAssigns(t *testing.T) {
 
 // Function reflection: scripted vs native; defaults to Any.
 func Test_Builtin_Introspection_Reflect_Functions_ScriptedAndNativeDefaults(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	scripted := evalWithIP(t, ip, `reflect(fun(x) do x end)`)
 	native := evalWithIP(t, ip, `reflect(str)`)
 
@@ -290,7 +290,7 @@ func Test_Builtin_Introspection_Reflect_Functions_ScriptedAndNativeDefaults(t *t
 
 // Oracle reflection: 4th child is an **expression** (not a block).
 func Test_Builtin_Introspection_Reflect_Oracle_SourceIsExpr(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	// Use a literal so reflection doesn't try to evaluate a free var.
 	rt := evalWithIP(t, ip, `reflect(oracle(x: Int) -> Int from [[1,1]])`)
 	s, err := IxFromS(rt)
@@ -308,7 +308,7 @@ func Test_Builtin_Introspection_Reflect_Oracle_SourceIsExpr(t *testing.T) {
 
 // Value maps never carry requiredness ("pair!" forbidden).
 func Test_Builtin_Introspection_Reflect_Map_NoPairBang(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	rt := evalWithIP(t, ip, `reflect({a: 1, b: 2})`)
 	s, err := IxFromS(rt)
 	if err != nil {
@@ -360,7 +360,7 @@ func Test_Builtin_Introspection_Validator_Enum_MemberExprOK(t *testing.T) {
 
 // Type/subtyping sanity check (spot checks).
 func Test_Builtin_Introspection_Types_Subtyping_Sanity(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	is := func(a, b S) bool { return ip.IsSubtype(a, b, nil) }
 
 	// Int <: Num

@@ -61,7 +61,7 @@ func contains(xs []string, s string) bool {
 }
 
 func Test_Builtin_Core_File_readFile_writeFile_RoundTrip(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hello.txt")
 	content := "héllo, 世界"
@@ -75,7 +75,7 @@ func Test_Builtin_Core_File_readFile_writeFile_RoundTrip(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_OpenWrite_ReadBack(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.txt")
 
@@ -91,7 +91,7 @@ func Test_Builtin_Core_File_OpenWrite_ReadBack(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_CloseFlushes(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "b.txt")
 
@@ -107,7 +107,7 @@ func Test_Builtin_Core_File_CloseFlushes(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_ReadN_EOF_Behavior(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.txt")
 	_ = os.WriteFile(path, []byte("hello"), 0o644)
@@ -128,7 +128,7 @@ func Test_Builtin_Core_File_ReadN_EOF_Behavior(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_ReadN_Negative_HardError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "d.txt")
 	_ = os.WriteFile(path, []byte("data"), 0o644)
@@ -141,7 +141,7 @@ func Test_Builtin_Core_File_ReadN_Negative_HardError(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_ReadLine_Simple(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "e.txt")
 	_ = os.WriteFile(path, []byte("a\nb\n"), 0o644)
@@ -166,7 +166,7 @@ func Test_Builtin_Core_File_ReadLine_Simple(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_OpenMode_ReadWrite_Contracts(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	pathR := filepath.Join(dir, "r.txt")
 	pathW := filepath.Join(dir, "w.txt")
@@ -188,7 +188,7 @@ func Test_Builtin_Core_File_OpenMode_ReadWrite_Contracts(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_OpenModes_TruncateAndAppend(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "modes.txt")
 
@@ -226,7 +226,7 @@ func Test_Builtin_Core_File_OpenModes_TruncateAndAppend(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_dirList_ContainsFiles(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	a := "a.txt"
 	b := "b.txt"
@@ -252,7 +252,7 @@ func Test_Builtin_Core_File_dirList_ContainsFiles(t *testing.T) {
 }
 
 func Test_Builtin_Core_File_readFile_NotExist_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nope.txt")
 
@@ -262,7 +262,7 @@ func Test_Builtin_Core_File_readFile_NotExist_AnnotatedNull(t *testing.T) {
 
 // open: invalid mode -> type error from enum check
 func Test_Builtin_File_Open_InvalidMode_TypeError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.txt")
 	_, err := ip.EvalSource(`open(` + msq(p) + `, "x")`)
@@ -272,7 +272,7 @@ func Test_Builtin_File_Open_InvalidMode_TypeError(t *testing.T) {
 
 // write: byte count is returned (multibyte)
 func Test_Builtin_File_Write_ByteCount_Multibyte(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "b.txt")
 
@@ -285,7 +285,7 @@ func Test_Builtin_File_Write_ByteCount_Multibyte(t *testing.T) {
 
 // flush: success path
 func Test_Builtin_File_Flush_Success(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "c.txt")
 	v := evalWithIP(t, ip, `
@@ -300,7 +300,7 @@ func Test_Builtin_File_Flush_Success(t *testing.T) {
 
 // readN: edge sizes (0 and exact size)
 func Test_Builtin_File_ReadN_Zero_And_Exact(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "d.txt")
 	_ = os.WriteFile(p, []byte("hello"), 0o644)
@@ -321,7 +321,7 @@ func Test_Builtin_File_ReadN_Zero_And_Exact(t *testing.T) {
 
 // readAll: empty file → ""
 func Test_Builtin_File_ReadAll_EmptyFile(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "e.txt")
 	_ = os.WriteFile(p, []byte(""), 0o644)
@@ -335,7 +335,7 @@ func Test_Builtin_File_ReadAll_EmptyFile(t *testing.T) {
 
 // readLine: CRLF trimming
 func Test_Builtin_File_ReadLine_CRLF(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "f.txt")
 	_ = os.WriteFile(p, []byte("a\r\nb\r\n"), 0o644)
@@ -360,7 +360,7 @@ func Test_Builtin_File_ReadLine_CRLF(t *testing.T) {
 
 // sprintf: mismatch returns marker string (current behavior) + valid case
 func Test_Builtin_File_Sprintf_Mismatch_ReturnsMarker(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	vBad := evalWithIP(t, ip, `sprintf("%d", ["x"])`)
 	if vBad.Tag != VTStr {
@@ -376,14 +376,14 @@ func Test_Builtin_File_Sprintf_Mismatch_ReturnsMarker(t *testing.T) {
 
 // printf: returns printed string
 func Test_Builtin_File_Printf_ReturnsString(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `printf("", [])`)
 	assertStr(t, v, "")
 }
 
 // writeFile: length results (empty and non-empty)
 func Test_Builtin_File_WriteFile_Lengths(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	p1 := filepath.Join(dir, "g1.txt")
 	p2 := filepath.Join(dir, "g2.txt")
@@ -397,7 +397,7 @@ func Test_Builtin_File_WriteFile_Lengths(t *testing.T) {
 
 // stat: file vs dir and missing path
 func Test_Builtin_File_Stat_FileDirAndMissing(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "h.txt")
 	_ = os.WriteFile(fp, []byte("hi"), 0o644)
@@ -431,7 +431,7 @@ func Test_Builtin_File_Stat_FileDirAndMissing(t *testing.T) {
 
 // mkdir: creates parents
 func Test_Builtin_File_Mkdir_Parents(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	base := t.TempDir()
 	deep := filepath.Join(base, "a", "b", "c")
 
@@ -447,7 +447,7 @@ func Test_Builtin_File_Mkdir_Parents(t *testing.T) {
 
 // rename + remove semantics
 func Test_Builtin_File_Rename_And_Remove(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	oldP := filepath.Join(dir, "i_old.txt")
 	newP := filepath.Join(dir, "i_new.txt")
@@ -471,7 +471,7 @@ func Test_Builtin_File_Rename_And_Remove(t *testing.T) {
 
 // cwd / chdir / tempDir
 func Test_Builtin_File_Cwd_Chdir_TempDir(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "sub")
 	_ = os.Mkdir(sub, 0o755)
@@ -496,7 +496,7 @@ func Test_Builtin_File_Cwd_Chdir_TempDir(t *testing.T) {
 
 // STDOUT: close (flush only) and flush explicitly
 func Test_Builtin_File_STDOUT_CloseAndFlush(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v1 := evalWithIP(t, ip, `close(STDOUT)`)
 	if v1.Tag != VTBool || v1.Data.(bool) != true {
 		t.Fatalf("close(STDOUT) expected Bool(true), got %#v", v1)

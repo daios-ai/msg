@@ -49,7 +49,7 @@ func chdir(t *testing.T, dir string) func() {
 
 // importCode(name, src) builds an isolated module (no cache registration).
 func Test_ImportCode_Simple(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 let m = importCode("mem.calc", "
@@ -72,7 +72,7 @@ func Test_FileImport_Simple_And_DefaultExt(t *testing.T) {
 let inc = fun(n: Int) -> Int do return(n + 1) end
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// import("m1") should find m1.ms via default extension
 	v := evalWithIP(t, ip, `
@@ -93,7 +93,7 @@ let b = import("b")
 let y = b.x + 2
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let a = import("a")
 a.y`)
@@ -119,7 +119,7 @@ func Test_FileImport_Search_MindScriptPath_LibSubdir(t *testing.T) {
 	_ = os.Setenv(MindScriptPath, root)
 	defer os.Setenv(MindScriptPath, old)
 
-	ip, err := NewRuntime()
+	ip, err := NewInterpreter()
 	if err != nil {
 		t.Fatalf("NewRuntime failed: %v", err)
 	}
@@ -139,7 +139,7 @@ func Test_FileImport_Cycle_TwoModules_Is_HardError(t *testing.T) {
 	_ = write(t, dir, "A.ms", `let b = import("B")`)
 	_ = write(t, dir, "B.ms", `let a = import("A")`)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`import("A")`)
 	if err == nil {
 		t.Fatalf("expected hard error (cycle), got nil")
@@ -162,7 +162,7 @@ func Test_FileImport_Parse_Runtime_And_Resolve_Errors(t *testing.T) {
 	_ = write(t, dir, "bad.ms", `let x = (1 +`)
 	_ = write(t, dir, "boom.ms", `1 / 0`)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// 1) Parse error → HARD (Go error). Must mention the file and "parse error".
@@ -232,7 +232,7 @@ func Test_FileImport_Parse_Runtime_And_Resolve_Errors(t *testing.T) {
 
 // Contractual mistakes (arity/type) are hard errors.
 func Test_ContractualMistakes_Are_Hard(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Too many arguments → hard error.
 	// (fun(x:Int) -> Int do x end)(1, 2)
@@ -262,7 +262,7 @@ func Test_SoftOperationalErrors_Are_Soft(t *testing.T) {
 	defer done()
 	defer chdir(t, dir)()
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Import of non-existent module → soft error (annotated null).
 	v, err := ip.EvalSource(`import("does_not_exist")`)
@@ -291,7 +291,7 @@ func Test_Module_MapLike_Writable_NoNamespaceCollision(t *testing.T) {
 let x = 2
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	// Use block-form if/then/else with 'end', per grammar.
 	v := evalWithIP(t, ip, `
 let x = 1
@@ -319,7 +319,7 @@ let x = 5
 let get = fun() -> Int do return(x) end
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	// Expect a*10 + b == 57 where a=get() before patch (5) and b after patch (7).
 	v := evalWithIP(t, ip, `
 let m = import("m")
@@ -342,7 +342,7 @@ let x = 41
 let inc = fun(n: Int) -> Int do return(n + 1) end
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Object pattern requires "key : pattern" entries (no shorthand).
 	v := evalWithIP(t, ip, `
@@ -368,7 +368,7 @@ let a = 1
 let b = 2
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let m = import("m")
 let total = 0
@@ -389,7 +389,7 @@ func Test_FileImport_Builtins_Accessible(t *testing.T) {
 let js = jsonStringify({a: 1})
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let u = import("util")
 u.js`)
@@ -404,7 +404,7 @@ func Test_Isolation_No_Leak_To_User_Global(t *testing.T) {
 
 	_ = write(t, dir, "mod.ms", `let hidden = 123`)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	// Import should not define "hidden" in the caller's env; referencing it is a hard error now.
 	_, err := ip.EvalSource(`
 let _ = import("mod")
@@ -429,7 +429,7 @@ func Test_HTTP_Import_Simple(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Explicit .ms
 	v1 := evalWithIP(t, ip, `
@@ -449,7 +449,7 @@ func Test_HTTP_Import_404_Is_Soft(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v, err := ip.EvalSource(`import("` + srv.URL + `/nope")`)
 	if err != nil {
 		t.Fatalf("expected soft error (annotated null) for 404, got hard error: %v", err)
@@ -472,7 +472,7 @@ func Test_Module_Cycle_Three_Is_HardError(t *testing.T) {
 	_ = write(t, dir, "B.ms", `let c = import("C")`)
 	_ = write(t, dir, "C.ms", `let a = import("A")`)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`import("A")`)
 	if err == nil {
 		t.Fatalf("expected hard error (cycle), got nil")
@@ -483,7 +483,7 @@ func Test_Module_Cycle_Three_Is_HardError(t *testing.T) {
 
 // importCode-driven cycle mem:A -> mem:B -> mem:A should be a HARD error.
 func Test_Module_ImportCode_Cycle_Is_HardError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// The body of A attempts to importCode B, whose body attempts to importCode A.
 	// Cycle detection uses canonical identities "mem:A" and "mem:B".
@@ -508,7 +508,7 @@ func Test_Module_Cache_Reimport_Sees_Mutation(t *testing.T) {
 
 	_ = write(t, dir, "m.ms", `let x = 7`)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let m1 = import("m")
 let before = m1.x
@@ -527,7 +527,7 @@ func Test_Module_HTTP_500_Is_Soft(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v, err := ip.EvalSource(`import("` + srv.URL + `/oops")`)
 	if err != nil {
 		t.Fatalf("expected soft error (annotated null) for HTTP 500, got hard error: %v", err)
@@ -560,7 +560,7 @@ func Test_Module_File_Imports_HTTP_DefaultExt(t *testing.T) {
 let x = r.val`
 	_ = write(t, dir, "a.ms", src)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let a = import("a")
 a.x`)
@@ -583,7 +583,7 @@ let mk = fun() do
 end
 `)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let m = import("pin")
 let f = m.mk()
@@ -603,7 +603,7 @@ func Test_Module_HTTP_ParseError_Is_Hard(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`import("` + srv.URL + `/bad.ms")`)
 	if err == nil {
 		t.Fatalf("expected hard parse error from HTTP import, got nil")
@@ -628,7 +628,7 @@ func Test_Module_Resolution_Prefers_Importer_Dir(t *testing.T) {
 	_ = write(t, sub, "a.ms", `let b = import("b")
 let y = b.x`)
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let a = import("sub/a")
 a.y`)
@@ -640,7 +640,7 @@ a.y`)
 // Retrying with the same name must NOT report an import cycle.
 // After a failure, using the same name for a successful module should work.
 func Test_Modules_InlineFailure_DoesNotStaleCacheAndRetry(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	bad := `let m = module "M" do 1/0 end`
 
@@ -674,7 +674,7 @@ func Test_Modules_InlineFailure_DoesNotStaleCacheAndRetry(t *testing.T) {
 // Successful inline modules are cached by canonical name: the second construction
 // with the same name returns the cached module (does not re-run the body).
 func Test_Modules_Inline_Success_CachesByName(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v1, err := ip.EvalPersistentSource(`let m1 = module "C" do let x = 1 end m1.x`)
 	if err != nil {

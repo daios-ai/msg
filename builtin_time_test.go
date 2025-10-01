@@ -7,7 +7,7 @@ import (
 )
 
 func Test_Builtin_Time_nowMillis_Reasonable(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	before := time.Now().UnixMilli()
 	v := evalWithIP(t, ip, `nowMillis()`)
@@ -25,7 +25,7 @@ func Test_Builtin_Time_nowMillis_Reasonable(t *testing.T) {
 }
 
 func Test_Builtin_Time_nowNanos_Reasonable(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	before := time.Now().UnixNano()
 	v := evalWithIP(t, ip, `nowNanos()`)
@@ -43,7 +43,7 @@ func Test_Builtin_Time_nowNanos_Reasonable(t *testing.T) {
 }
 
 func Test_Builtin_Time_nowNanos_ConsistentWithMillis(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	vms := evalWithIP(t, ip, `nowMillis()`)
 	vns := evalWithIP(t, ip, `nowNanos()`)
@@ -61,7 +61,7 @@ func Test_Builtin_Time_nowNanos_ConsistentWithMillis(t *testing.T) {
 }
 
 func Test_Builtin_Time_sleep_DelaysAtLeast(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	start := time.Now()
 	_ = evalWithIP(t, ip, `sleep(50)`) // 50 ms
@@ -73,7 +73,7 @@ func Test_Builtin_Time_sleep_DelaysAtLeast(t *testing.T) {
 }
 
 func Test_Builtin_Time_dateNow_ShapeAndRanges(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `dateNow()`)
 	m := mustMap(t, v)
@@ -139,7 +139,7 @@ func Test_Builtin_Time_dateNow_ShapeAndRanges(t *testing.T) {
 }
 
 func Test_Builtin_Time_timeFormatRFC3339_KnownEpoch(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// 2021-01-01T00:00:00Z in milliseconds
 	v := evalWithIP(t, ip, `timeFormatRFC3339(1609459200000)`)
@@ -154,7 +154,7 @@ func Test_Builtin_Time_timeFormatRFC3339_KnownEpoch(t *testing.T) {
 }
 
 func Test_Builtin_Time_timeFormatParse_Roundtrip(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Take a timestamp with a non-zero millisecond to verify the fraction survives.
 	msNow := time.Now().UnixMilli()
@@ -174,7 +174,7 @@ func Test_Builtin_Time_timeFormatParse_Roundtrip(t *testing.T) {
 }
 
 func Test_Builtin_Time_timeParseRFC3339_Fractional(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `timeParseRFC3339("2021-01-01T00:00:00.123Z")`)
 	if v.Tag != VTInt {
@@ -186,7 +186,7 @@ func Test_Builtin_Time_timeParseRFC3339_Fractional(t *testing.T) {
 }
 
 func Test_Builtin_Time_timeParseRFC3339_Invalid(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `timeParseRFC3339("not-a-time")`)
 	wantAnnotatedContains(t, v, "invalid rfc3339")

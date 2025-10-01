@@ -21,7 +21,7 @@ func wantErr(t *testing.T, err error) {
 // ---------------- Concurrency ergonomics tests ----------------
 
 func Test_Builtin_Concurrency_ChanOpen_BufferedAndUnbuffered(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Unbuffered: try-recv should be empty, blocking send/recv via procSpawn works.
 	v := evalWithIP(t, ip, `
@@ -74,7 +74,7 @@ let r2 = chanTryRecv(c)                # empty → ok=false
 }
 
 func Test_Builtin_Concurrency_TryRecv_OnClosedChannel(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 let c = chanOpen()
@@ -99,7 +99,7 @@ chanRecv(c)
 }
 
 func Test_Builtin_Concurrency_SendOnClosed_NoHardError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// chanTrySend after close should NOT be a hard error.
 	_, err := ip.EvalSource(`
@@ -123,13 +123,13 @@ chanSend(c, 1)
 }
 
 func Test_Builtin_Concurrency_ChanOpen_NegativeCap_HardError(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`chanOpen(-1)`)
 	wantErrContains(t, err, "cap must be >= 0")
 }
 
 func Test_Builtin_Concurrency_TimerAfter(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// timerAfter emits one tick then closes.
 	v := evalWithIP(t, ip, `
@@ -149,7 +149,7 @@ let second = chanRecv(c)
 }
 
 func Test_Builtin_Concurrency_Ticker_StopOnClose(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Read two ticks, ensure monotonic, then close and confirm closed behavior.
 	v := evalWithIP(t, ip, `
@@ -178,7 +178,7 @@ let after = chanRecv(c)
 }
 
 func Test_Builtin_Concurrency_ProcCancel_Smoke(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Spawn something that sleeps, then cancel; join should still eventually return.
 	out := evalWithIP(t, ip, `
@@ -198,7 +198,7 @@ procJoin(p)
 // ---------------- procJoinAll / procJoinAny ----------------
 
 func Test_Concurrency_ProcJoinAll_Basic(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 let f1 = fun() -> Int do 1 end
@@ -229,7 +229,7 @@ procJoinAll([p1, p2, p3])
 }
 
 func Test_Concurrency_ProcJoinAll_WithFailure(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 let ok = fun() -> Int do 7 end
@@ -253,7 +253,7 @@ procJoinAll(ps)
 }
 
 func Test_Concurrency_ProcJoinAny_FirstFinisher(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 let slow = fun() -> Int do
@@ -289,7 +289,7 @@ procJoinAny([p1, p2])
 // ---------------- stress: many isolates in parallel (no races) ----------------
 
 func Test_Concurrency_Stress_ProcJoinAll_NoDataRaces(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	const N = 60
 	// Build a small program that spawns N zero-arg funcs returning their index,
@@ -319,7 +319,7 @@ func Test_Concurrency_Stress_ProcJoinAll_NoDataRaces(t *testing.T) {
 // ---------------- stress: channel fan-in (producers/consumers) ----------------
 
 func Test_Concurrency_Stress_Channel_FanIn(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	const P = 6    // producers
 	const K = 20   // messages per producer
@@ -383,7 +383,7 @@ end
 // ---------------- procCancel remains best-effort ----------------
 
 func Test_Concurrency_ProcCancel_StillBestEffort(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// This test just exercises the API surface; cancellation is cooperative.
 	out := evalWithIP(t, ip, `
@@ -402,7 +402,7 @@ procJoin(p)
 
 // 1) chanTryRecv on empty, unbuffered → {ok:false, value:null}
 func Test_Builtin_Concurrency_TryRecv_OnEmptyUnbuffered(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let c = chanOpen()
 chanTryRecv(c)
@@ -420,7 +420,7 @@ chanTryRecv(c)
 
 // 2) chanClose is idempotent
 func Test_Builtin_Concurrency_ChanClose_Idempotent(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let c = chanOpen()
 chanClose(c)
@@ -434,7 +434,7 @@ chanClose(c)
 
 // 3) chanOpen type validation (wrong types → hard error)
 func Test_Builtin_Concurrency_ChanOpen_TypeValidation(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`chanOpen("1")`)
 	wantErr(t, err)
 	_, err = ip.EvalSource(`chanOpen(1.5)`)
@@ -443,14 +443,14 @@ func Test_Builtin_Concurrency_ChanOpen_TypeValidation(t *testing.T) {
 
 // 4) procSpawn argument validation (non-function → hard error)
 func Test_Builtin_Concurrency_ProcSpawn_ArgValidation(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`procSpawn(123)`)
 	wantErr(t, err)
 }
 
 // 5) procJoinAll([]) → []
 func Test_Builtin_Concurrency_ProcJoinAll_Empty(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `procJoinAll([])`)
 	if v.Tag != VTArray || len(v.Data.(*ArrayObject).Elems) != 0 {
 		t.Fatalf("procJoinAll([]) should return empty array, got %#v", v)
@@ -459,14 +459,14 @@ func Test_Builtin_Concurrency_ProcJoinAll_Empty(t *testing.T) {
 
 // 6) procJoinAny([]) → annotated null ("empty list")
 func Test_Builtin_Concurrency_ProcJoinAny_Empty(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `procJoinAny([])`)
 	wantAnnotatedContains(t, v, "empty list")
 }
 
 // 7) timerAfter(0) emits one tick immediately, then closed
 func Test_Builtin_Concurrency_TimerAfter_Zero(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let c = timerAfter(0)
 let first = chanRecv(c)
@@ -484,7 +484,7 @@ let second = chanRecv(c)
 
 // 8) ticker invalid ms (0 and negative) → hard errors
 func Test_Builtin_Concurrency_Ticker_InvalidArgs(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`ticker(0)`)
 	wantErrContains(t, err, "must be > 0")
 	_, err = ip.EvalSource(`ticker(-5)`)
@@ -493,7 +493,7 @@ func Test_Builtin_Concurrency_Ticker_InvalidArgs(t *testing.T) {
 
 // 9) chanTryRecv after close with buffered data
 func Test_Builtin_Concurrency_TryRecv_AfterCloseWithBufferedData(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let c = chanOpen(1)
 chanSend(c, "x")
@@ -525,7 +525,7 @@ let r2 = chanTryRecv(c)   # channel closed
 
 // 10) procJoinAny single element
 func Test_Builtin_Concurrency_ProcJoinAny_Single(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 let p = procSpawn(fun() -> Int do 123 end)
 procJoinAny([p])

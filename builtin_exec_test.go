@@ -72,7 +72,7 @@ func TestExecHelperProcess(t *testing.T) {
 }
 
 func Test_Builtin_Exec_SimpleStdout(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	ip.Global.Define("SELF", Str(os.Args[0]))
 
 	src := `
@@ -94,7 +94,7 @@ exec([SELF, "-test.run=TestExecHelperProcess", "--", "stdout"], {
 }
 
 func Test_Builtin_Exec_NonZeroExit_Stderr(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	ip.Global.Define("SELF", Str(os.Args[0]))
 
 	src := `
@@ -116,7 +116,7 @@ exec([SELF, "-test.run=TestExecHelperProcess", "--", "stderr"], {
 }
 
 func Test_Builtin_Exec_EnvOverlay(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	ip.Global.Define("SELF", Str(os.Args[0]))
 
 	src := `
@@ -135,7 +135,7 @@ exec([SELF, "-test.run=TestExecHelperProcess", "--", "env"], {
 }
 
 func Test_Builtin_Exec_Cwd(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	ip.Global.Define("SELF", Str(os.Args[0]))
 
 	tmp := t.TempDir()
@@ -156,7 +156,7 @@ exec([SELF, "-test.run=TestExecHelperProcess", "--", "cwd"], {
 }
 
 func Test_Builtin_Exec_Stdin(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	ip.Global.Define("SELF", Str(os.Args[0]))
 
 	src := `
@@ -173,7 +173,7 @@ exec([SELF, "-test.run=TestExecHelperProcess", "--", "stdin"], {
 }
 
 func Test_Builtin_Exec_SpawnError_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// An obviously invalid command name should fail to spawn on all platforms.
 	// IMPORTANT: exec is curried; pass the optional second arg explicitly to invoke now.

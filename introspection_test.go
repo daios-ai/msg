@@ -103,7 +103,7 @@ func Test_Introspection_IxFromS_NoValidation_IxReifyHardFails(t *testing.T) {
 	}
 
 	// 2) Reify/eval should hard-fail in the interpreter.
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	if _, err := ip.IxReify(rt); err == nil {
 		t.Fatalf("IxReify should fail when evaluating malformed S (hard error), got nil")
 	}
@@ -220,7 +220,7 @@ func Test_Introspection_Handle_SoftError(t *testing.T) {
 }
 
 func TestIxReify_SimpleProgram_Evaluates(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	// Program: ("binop","+ ", 2, 3) ⇒ 5
 	rt := vArray(
 		vStr("binop"), vStr("+"),
@@ -237,7 +237,7 @@ func TestIxReify_SimpleProgram_Evaluates(t *testing.T) {
 }
 
 func TestIxReify_Rejects_Handle(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.IxReify(vArray(vStr("handle")))
 	mustErr(t, err) // validator soft; IxReify escalates to hard error
 }
@@ -269,7 +269,7 @@ func ixMustCtorS(v Value) S {
 }
 
 func Test_Introspection_IxReflect_Module_Canonical(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Build a simple module via source, then reflect it.
 	src := `module "Refl" do
@@ -308,7 +308,7 @@ end`
 }
 
 func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Native "tick" increments Global["counter"].
 	ip.Global.Define("counter", vInt(0))
@@ -374,7 +374,7 @@ func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
 }
 
 func Test_Introspection_IxReify_Module_Nested_Canonical_Form(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Outer canonical exporting sub = (lowered inner module).
 	rt := vArray(
@@ -456,7 +456,7 @@ func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) 
 
 	rt := IxReflect(val)
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	got, err := ip.IxReify(rt)
 	if err != nil {
 		t.Fatalf("IxReify error: %v", err)
@@ -654,7 +654,7 @@ func Test_Introspection_Reflect_Annotation_OnFunAndModule(t *testing.T) {
 	}
 
 	// Module annotation
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	mv, _ := ip.EvalPersistentSource(`module "M" do end`)
 	mv.Annot = "<post"
 	gotM := IxReflect(mv)
@@ -761,7 +761,7 @@ func Test_Introspection_ValidateReports_ReifyHardFails(t *testing.T) {
 	if len(IxValidateS(S{"assign", S{"int", int64(0)}, S{"int", int64(1)}}).Data.(*ArrayObject).Elems) == 0 {
 		t.Fatalf("expected validator errors")
 	}
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	if _, err := ip.IxReify(rt); err == nil {
 		t.Fatalf("expected hard failure in IxReify")
 	}
@@ -821,7 +821,7 @@ func Test_Introspection_Noop_Validate_BadArity(t *testing.T) {
 }
 
 func Test_Interpreter_DeepEqual_ArraySelfCycle(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Build a self-cyclic array: a = []; a[0] = a
 	aObj := &ArrayObject{Elems: make([]Value, 1)}
@@ -845,7 +845,7 @@ func Test_Interpreter_DeepEqual_ArraySelfCycle(t *testing.T) {
 }
 
 func Test_Interpreter_DeepEqual_MapSelfCycle(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	// Build a self-cyclic map: m = {}; m['self'] = m
 	m1 := &MapObject{
@@ -882,7 +882,7 @@ func Test_Interpreter_DeepEqual_MapSelfCycle(t *testing.T) {
 }
 
 func Test_Interpreter_DeepEqual_IntVsNum(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 
 	if !ip.deepEqual(Int(3), Num(3.0)) {
 		t.Fatalf("expected Int(3) == Num(3.0)")

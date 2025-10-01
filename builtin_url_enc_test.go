@@ -54,7 +54,7 @@ func wantAnnotatedContains(t *testing.T, v Value, substr string) {
 }
 
 func Test_Builtin_Url_Enc_Base64_Roundtrip_And_Invalid(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Roundtrip simple ASCII
 	v := evalWithIP(t, ip, `base64Decode(base64Encode("hello"))`)
@@ -75,7 +75,7 @@ func Test_Builtin_Url_Enc_Base64_Roundtrip_And_Invalid(t *testing.T) {
 }
 
 func Test_Builtin_Url_Enc_Hex_Roundtrip_And_Invalid(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Encode
 	e := evalWithIP(t, ip, `hexEncode("AB")`)
@@ -103,7 +103,7 @@ func Test_Builtin_Url_Enc_Hex_Roundtrip_And_Invalid(t *testing.T) {
 }
 
 func Test_Builtin_Url_Enc_Query_Parse_Stringify_Roundtrip(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Parse with leading '?' and multiplicity; also percent-decoding
 	v := evalWithIP(t, ip, `urlQueryParse("?a=1&a=2&b=x&c=%E2%9C%93")`)
@@ -135,7 +135,7 @@ func Test_Builtin_Url_Enc_Query_Parse_Stringify_Roundtrip(t *testing.T) {
 }
 
 func Test_Builtin_Url_Enc_Parse_Struct(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	src := `urlParse("https://[2001:db8::1]:8443/a%20b?x=1&x=2&y=z#frag")`
 	v := evalWithIP(t, ip, src)
@@ -172,7 +172,7 @@ func Test_Builtin_Url_Enc_Parse_Struct(t *testing.T) {
 }
 
 func Test_Builtin_Url_Enc_Build_Struct(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Expect sorted keys and preserved value order for duplicates.
 	src := `
@@ -201,7 +201,7 @@ urlBuild({
 }
 
 func Test_Builtin_Url_Enc_Roundtrip_Parse_Build(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	s := `https://example.com:8080/p/a%20t/h?b=1&a=2&a=3#frag`
 	// Build from parse and ensure components are stable after re-parse.
@@ -242,7 +242,7 @@ func Test_Builtin_Url_Enc_Roundtrip_Parse_Build(t *testing.T) {
 }
 
 func Test_Builtin_Url_Enc_Parse_And_Query_InvalidInputs(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Invalid URL (%zz in path)
 	badURL := evalWithIP(t, ip, `urlParse("http://example.com/%zz")`)

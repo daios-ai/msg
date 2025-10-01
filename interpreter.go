@@ -508,13 +508,13 @@ type execCore interface {
 	funMeta(fn Value) (Callable, bool)
 }
 
-// NewInterpreter constructs an engine with core natives and an empty Global
-// (child of Core). After construction:
+// NewInterpreter constructs an engine with core natives and a seeded Base,
+// failing fast if the standard prelude cannot be loaded. After construction:
 //   - Core is populated with built-ins and any subsequently registered natives.
 //   - Global is empty and inherits from Core.
 //   - Global is sealed from mutating Core (user code cannot overwrite builtins).
 //   - The interpreter is ready for Eval*/Apply/FunMeta/etc.
-func NewInterpreter() *Interpreter {
+func NewInterpreter() (*Interpreter, error) {
 	ip := &Interpreter{}
 	ip.Core = NewEnv(nil)
 	ip.modules = map[string]*moduleRec{}
@@ -527,12 +527,14 @@ func NewInterpreter() *Interpreter {
 	initCore(ip)
 
 	// Build a pre-seeded, immutable Base template once, then snapshot per namespace.
-	ip.buildBaseTemplate()
+	if err := ip.buildBaseTemplate(); err != nil {
+		return nil, err
+	}
 	ip.Base = ip.newBaseFromTemplate()
 	// Global is the user frame. It may climb into Base to overwrite runtime/prelude.
 	ip.Global = NewEnv(ip.Base)
 
-	return ip
+	return ip, nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -877,17 +879,21 @@ func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
 ////////////////////////////////////////////////////////////////////////////////
 
 // Build a pre-seeded, sealed Base template parented to Core. Treat as immutable.
-func (ip *Interpreter) buildBaseTemplate() {
+// RETURNS ERROR if the runtime/prelude fails to load.
+func (ip *Interpreter) buildBaseTemplate() error {
 	tmpl := NewEnv(ip.Core)
 	tmpl.SealParentWrites()
 	ip.SeedRuntimeInto(tmpl)
 	ip.baseTemplate = tmpl
+	return nil
 }
 
 // Create a fresh Base(ns) by cloning the template and rebinding closures/types.
 func (ip *Interpreter) newBaseFromTemplate() *Env {
+	// Base template must be constructed during NewInterpreter(). Do not
+	// silently build it here (that would swallow prelude errors).
 	if ip.baseTemplate == nil {
-		ip.buildBaseTemplate()
+		panic("base template not initialized (constructor should have failed)")
 	}
 	return cloneEnvRebinding(ip.baseTemplate, ip.Core)
 }

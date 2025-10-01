@@ -9,8 +9,6 @@ import (
 
 // --- small helpers ----------------------------------------------------------
 
-func newIP() *Interpreter { return NewInterpreter() }
-
 func evalWithIP(t *testing.T, ip *Interpreter, src string) Value {
 	t.Helper()
 	v, err := ip.EvalSource(src)
@@ -50,7 +48,7 @@ func typeS(t *testing.T, ip *Interpreter, src string) S {
 // --- isType (runtime checking) ----------------------------------------------
 
 func Test_Types_IsType_ArrayNullable(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// value: [1, 3, null]
 	val := evalWithIP(t, ip, "[1,3,null]")
 	// type: [Int?]
@@ -62,7 +60,7 @@ func Test_Types_IsType_ArrayNullable(t *testing.T) {
 }
 
 func Test_Types_IsType_Map_Required_Optional(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Matches: required field present and typed; optional may be absent
 	val1 := evalWithIP(t, ip, `{name: "Ada"}`)
@@ -81,7 +79,7 @@ func Test_Types_IsType_Map_Required_Optional(t *testing.T) {
 // --- isSubtype (structural subtyping) ---------------------------------------
 
 func Test_Types_Subtype_Arrays_And_Nullable(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	intArr := typeS(t, ip, `[Int]`)
 	numArr := typeS(t, ip, `[Num]`)
 	if !ip.isSubtype(intArr, numArr, ip.Global) {
@@ -95,7 +93,7 @@ func Test_Types_Subtype_Arrays_And_Nullable(t *testing.T) {
 }
 
 func Test_Types_Subtype_Objects_RequiredPropagation(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// required(super) ⊆ required(sub)
 	sub := typeS(t, ip, `{name!: Str, age: Int}`) // requires name
 	super := typeS(t, ip, `{name!: Str}`)         // requires name
@@ -111,7 +109,7 @@ func Test_Types_Subtype_Objects_RequiredPropagation(t *testing.T) {
 }
 
 func Test_Types_Subtype_Functions_ContraParams_CoReturn(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// Parameter contravariance: Num->Str <: Int->Str (since Int <: Num).
 	sub := typeS(t, ip, `Num -> Str`)
 	super := typeS(t, ip, `Int -> Str`)
@@ -130,7 +128,7 @@ func Test_Types_Subtype_Functions_ContraParams_CoReturn(t *testing.T) {
 // --- Unification via valueToTypeS (typeOf-like inference) -------------------
 
 func Test_Types_Unify_Array_Inference_To_IntOptional(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `[1, 3, null]`)
 	got := ip.valueToTypeS(v, ip.Global)
 
@@ -141,7 +139,7 @@ func Test_Types_Unify_Array_Inference_To_IntOptional(t *testing.T) {
 }
 
 func Test_Types_Unify_Objects_Fieldwise(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// Unify [{"name":"a"}, {"age":1}]  ~> {name: Str, age: Int} (both optional)
 	v := evalWithIP(t, ip, `[ {name:"a"}, {age:1} ]`)
 	// Infer element type by unifying the two map element types:
@@ -161,7 +159,7 @@ func Test_Types_Unify_Objects_Fieldwise(t *testing.T) {
 
 // Was: ...AnnotatedNull; now contractual type mismatch → Go error.
 func Test_Types_Runtime_Param_Mismatch_GoError(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// (fun(x:Int)->Int do x end)("str")
 	src := `(fun(x: Int) -> Int do x end)("str")`
 	evalExpectError(t, ip, src, "type mismatch")
@@ -169,14 +167,14 @@ func Test_Types_Runtime_Param_Mismatch_GoError(t *testing.T) {
 
 // Was: ...AnnotatedNull; now return type mismatch → Go error.
 func Test_Types_Runtime_Return_Mismatch_GoError(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// fun()->Int returns "nope" (Str) → Go error
 	src := `(fun() -> Int do "nope" end)()`
 	evalExpectError(t, ip, src, "return type mismatch")
 }
 
 func Test_Types_Alias_Resolution_And_CycleGuard(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Persist the alias so resolveType can find it in ip.Global
 	if _, err := ip.EvalPersistentSource(`let Age = type Int`); err != nil {
@@ -207,7 +205,7 @@ func Test_Types_Alias_Resolution_And_CycleGuard(t *testing.T) {
 }
 
 func Test_Types_Map_ExtraFieldsAllowed(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	val := evalWithIP(t, ip, `{name:"Ada", age:36, lang:"EN"}`)
 	typ := typeS(t, ip, `{name!: Str}`)
 	if !ip.isType(val, typ, ip.Global) {
@@ -216,7 +214,7 @@ func Test_Types_Map_ExtraFieldsAllowed(t *testing.T) {
 }
 
 func Test_Types_IsType_FunctionValueAgainstType(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// With contravariant params: Num->Str <: Int->Str
 	fn := evalWithIP(t, ip, `fun(x: Num) -> Str do "ok" end`)
 	want := typeS(t, ip, `Int -> Str`)
@@ -226,7 +224,7 @@ func Test_Types_IsType_FunctionValueAgainstType(t *testing.T) {
 }
 
 func Test_Types_Unify_NullableRules(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	u1 := ip.unifyTypes(typeS(t, ip, `Null`), typeS(t, ip, `Int`), ip.Global)
 	if fmt.Sprintf("%#v", u1) != fmt.Sprintf("%#v", typeS(t, ip, `Int?`)) {
 		t.Fatalf("Null ⊔ Int = Int?; got %#v", u1)
@@ -239,7 +237,7 @@ func Test_Types_Unify_NullableRules(t *testing.T) {
 }
 
 func Test_Types_FunctionChains_SubtypeAndUnify(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	// Param contravariance across chains:
 	sub := typeS(t, ip, `Num -> Str -> Num`)
 	super := typeS(t, ip, `Int -> Str -> Num`)
@@ -260,7 +258,7 @@ func Test_Types_FunctionChains_SubtypeAndUnify(t *testing.T) {
 }
 
 func Test_Types_Unify_Functions_ParamGLB_ReturnLUB(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	f1 := typeS(t, ip, `Int -> Int`)
 	f2 := typeS(t, ip, `Num -> Num`)
 	u := ip.unifyTypes(f1, f2, ip.Global)
@@ -276,7 +274,7 @@ func Test_Types_Unify_Functions_ParamGLB_ReturnLUB(t *testing.T) {
 }
 
 func Test_Types_Unify_Functions_UnrelatedParams_YieldsAny(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	u := ip.unifyTypes(typeS(t, ip, `Int -> Num`), typeS(t, ip, `Str -> Num`), ip.Global)
 	if !equalLiteralS(u, typeS(t, ip, `Any`)) {
 		t.Fatalf("unifying functions with unrelated params should yield Any, got %#v", u)
@@ -284,7 +282,7 @@ func Test_Types_Unify_Functions_UnrelatedParams_YieldsAny(t *testing.T) {
 }
 
 func Test_Types_Unify_Functions_EnumParam_Meet(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	u := ip.unifyTypes(typeS(t, ip, `Str -> Str`), typeS(t, ip, `Enum["a","b"] -> Str`), ip.Global)
 	want := typeS(t, ip, `Enum["a","b"] -> Str`)
 	if !equalLiteralS(u, want) {
@@ -298,7 +296,7 @@ func Test_Types_Unify_Functions_EnumParam_Meet(t *testing.T) {
 }
 
 func Test_Types_Unify_Functions_NestedNullableReturns(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	u := ip.unifyTypes(typeS(t, ip, `Int -> (Int -> Int?)`), typeS(t, ip, `Num -> (Num -> Null)`), ip.Global)
 	// Param GLB: Int; inner param GLB: Int; inner return LUB: Int?
 	want := typeS(t, ip, `Int -> Int -> Int?`)
@@ -308,7 +306,7 @@ func Test_Types_Unify_Functions_NestedNullableReturns(t *testing.T) {
 }
 
 func Test_Types_ArrayShape_Robustness(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `[1,2,3]`)
 	// Simulate malformed type node: ("array", Int, Num)
 	mt := S{"array", S{"id", "Int"}, S{"id", "Num"}}
@@ -318,7 +316,7 @@ func Test_Types_ArrayShape_Robustness(t *testing.T) {
 }
 
 func Test_Types_Runtime_Param_AliasMismatch(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	evalWithIP(t, ip, `let Age = type Int`)
 	evalExpectError(t, ip, `(fun(x: Age) -> Int do x end)("nope")`, "type mismatch")
 }
@@ -326,7 +324,7 @@ func Test_Types_Runtime_Param_AliasMismatch(t *testing.T) {
 // --- Enums -------------------------------------------------------------------
 
 func Test_Types_Enum_IsType_StringLiterals(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	v1 := evalWithIP(t, ip, `"a"`)
 	v2 := evalWithIP(t, ip, `"b"`)
@@ -344,7 +342,7 @@ func Test_Types_Enum_IsType_StringLiterals(t *testing.T) {
 }
 
 func Test_Types_Enum_IsType_IntLiterals(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	v1 := evalWithIP(t, ip, `42`)
 	v2 := evalWithIP(t, ip, `7`)
@@ -357,7 +355,7 @@ func Test_Types_Enum_IsType_IntLiterals(t *testing.T) {
 }
 
 func Test_Types_Enum_Subtype_SetInclusion(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	sub := typeS(t, ip, `Enum["a","b"]`)
 	super := typeS(t, ip, `Enum["a","b","c"]`)
@@ -373,7 +371,7 @@ func Test_Types_Enum_Subtype_SetInclusion(t *testing.T) {
 }
 
 func Test_Types_Enum_Unify_Union(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	a := typeS(t, ip, `Enum["red","green"]`)
 	b := typeS(t, ip, `Enum["green","blue"]`)
@@ -386,7 +384,7 @@ func Test_Types_Enum_Unify_Union(t *testing.T) {
 }
 
 func Test_Types_Enum_Unify_WithStr_WidensToStr(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	e := typeS(t, ip, `Enum["x","y"]`)
 	s := typeS(t, ip, `Str`)
@@ -398,7 +396,7 @@ func Test_Types_Enum_Unify_WithStr_WidensToStr(t *testing.T) {
 }
 
 func Test_Types_Enum_Nullable(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// value may be null or one of the enum values
 	v1 := evalWithIP(t, ip, `null`)
@@ -414,7 +412,7 @@ func Test_Types_Enum_Nullable(t *testing.T) {
 // --- Enums with runtime enforcement -----------------------------------------
 
 func Test_Types_Runtime_Param_Enum_Ok_And_Mismatch(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	ok := evalWithIP(t, ip, `(fun(x: Enum["small","large"]) -> Str do "ok" end)("small")`)
 	if ok.Tag != VTStr || ok.Data.(string) != "ok" {
@@ -427,7 +425,7 @@ func Test_Types_Runtime_Param_Enum_Ok_And_Mismatch(t *testing.T) {
 // --- Aliases to enums --------------------------------------------------------
 
 func Test_Types_Alias_To_Enum(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	if _, err := ip.EvalPersistentSource(`let Color = type Enum["red","blue"]`); err != nil {
 		t.Fatalf("setup error: %v", err)
@@ -444,7 +442,7 @@ func Test_Types_Alias_To_Enum(t *testing.T) {
 // --- Arrays, nullables, and inference ---------------------------------------
 
 func Test_Types_ArrayOfEnum_IsType_And_Inference(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	val := evalWithIP(t, ip, `["a","b","a"]`)
 	tt := typeS(t, ip, `[Enum["a","b"]]`)
@@ -466,7 +464,7 @@ func Test_Types_ArrayOfEnum_IsType_And_Inference(t *testing.T) {
 }
 
 func Test_Types_NestedNullableArrays(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `[[1, null], null]`)
 	tok := typeS(t, ip, `[ [Int?]? ]`) // outer array of (nullable array of Int?)
@@ -478,7 +476,7 @@ func Test_Types_NestedNullableArrays(t *testing.T) {
 // --- Maps with enums and required/optional ----------------------------------
 
 func Test_Types_Map_Field_Enum_Required_Optional(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	v1 := evalWithIP(t, ip, `{name:"Ada", color:"red"}`)
 	v2 := evalWithIP(t, ip, `{name:"Ada"}`)
@@ -494,7 +492,7 @@ func Test_Types_Map_Field_Enum_Required_Optional(t *testing.T) {
 }
 
 func Test_Types_Unify_Maps_Required_AND_Rule(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	m1 := typeS(t, ip, `{a!: Int}`)
 	m2 := typeS(t, ip, `{a:  Num}`)
 	u := ip.unifyTypes(m1, m2, ip.Global)
@@ -508,7 +506,7 @@ func Test_Types_Unify_Maps_Required_AND_Rule(t *testing.T) {
 // --- Functions + enums, chained arrows --------------------------------------
 
 func Test_Types_Function_Param_Enum_Contravariance(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Param contravariance with enums:
 	// Str -> Str  <:  Enum["a"] -> Str  (since Enum["a"] <: Str)
@@ -520,7 +518,7 @@ func Test_Types_Function_Param_Enum_Contravariance(t *testing.T) {
 }
 
 func Test_Types_FunctionValue_Against_EnumParamType(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Provide a function with a broader param (Str),
 	// check it against a type expecting a narrower Enum[...] param.
@@ -532,7 +530,7 @@ func Test_Types_FunctionValue_Against_EnumParamType(t *testing.T) {
 }
 
 func Test_Types_Alias_State_With_Enum(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Define the alias persistently so resolveType can find it.
 	if _, err := ip.EvalPersistentSource(`let State = type {id: Int, status!: Enum["running","terminated"]}`); err != nil {
@@ -570,7 +568,7 @@ func Test_Types_Alias_State_With_Enum(t *testing.T) {
 // --- VTModule structural equivalence to maps --------------------------------
 
 func Test_Types_IsType_Module_As_Map(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Build a module with export: foo = 1
 	mo := &MapObject{
@@ -601,7 +599,7 @@ func Test_Types_IsType_Module_As_Map(t *testing.T) {
 }
 
 func Test_Types_ValueToType_Module_Inference(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Build a module with exports: x:"hi", n:2
 	mo := &MapObject{
@@ -629,7 +627,7 @@ func Test_Types_ValueToType_Module_Inference(t *testing.T) {
 	}
 }
 func Test_Types_IsType_Map_FieldAnnotations_Single(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Value with one field
 	val := evalWithIP(t, ip, `{root: "."}`)
@@ -645,7 +643,7 @@ Str}`)
 }
 
 func Test_Types_IsType_Map_FieldAnnotations_Combo(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Three values with increasing fields present
 	v0 := evalWithIP(t, ip, `{}`)
@@ -673,7 +671,7 @@ func Test_Types_IsType_Map_FieldAnnotations_Combo(t *testing.T) {
 }
 
 func Test_Types_Subtype_And_Unify_AnnotationTransparent(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Same shape; left has annotation on field type, right does not.
 	a := typeS(t, ip, `{x:
@@ -697,7 +695,7 @@ Int}`)
 }
 
 func Test_Types_ValueToType_Array_SelfCycle(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Build a self-referential array:
 	//   let a = [null]; a[0] = a; a
@@ -712,7 +710,7 @@ func Test_Types_ValueToType_Array_SelfCycle(t *testing.T) {
 }
 
 func Test_Types_ValueToType_Map_SelfCycle(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Self-referential map with an extra normal field:
 	//   let m = {}; m.self = m; m.x = 1; m
@@ -734,7 +732,7 @@ func Test_Types_ValueToType_Map_SelfCycle(t *testing.T) {
 }
 
 func Test_Types_IsType_Array_SelfCycle_NoHang(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Cyclic array again
 	v := evalWithIP(t, ip, "let a = [null]\na[0] = a\na")
@@ -753,7 +751,7 @@ func Test_Types_IsType_Array_SelfCycle_NoHang(t *testing.T) {
 }
 
 func Test_Types_IsType_Map_SelfCycle_NoHang(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Self-referential map with a valid required field
 	v := evalWithIP(t, ip, "let m = {}\nm.self = m\nm.x = 1\nm")
@@ -766,7 +764,7 @@ func Test_Types_IsType_Map_SelfCycle_NoHang(t *testing.T) {
 }
 
 func Test_Types_ResolveType_FunctionalCycle_NoHang(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// F = Int -> F
 	if _, err := ip.EvalPersistentSource(`let F = type Int -> F`); err != nil {
@@ -793,7 +791,7 @@ func Test_Types_ResolveType_FunctionalCycle_NoHang(t *testing.T) {
 // --- recursion / no-hang guards ---------------------------------------------
 
 func Test_Types_Runtime_Return_Check_Recursive_NoHang(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	src := `
 let T = type { f!: Null -> T }
@@ -824,7 +822,7 @@ mk()
 }
 
 func Test_Types_IsSubtype_Recursive_Function_Type_NoHang(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Persist the recursive alias: T = { f!: Null -> T }
 	if _, err := ip.EvalPersistentSource(`let T = type { f!: Null -> T }`); err != nil {
@@ -850,7 +848,7 @@ func Test_Types_IsSubtype_Recursive_Function_Type_NoHang(t *testing.T) {
 }
 
 func Test_Types_Recursive_MapFun_Coinductive(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Recursive alias: T = { f!: Null -> T }
 	if _, err := ip.EvalPersistentSource(`let T = type { f!: Null -> T }`); err != nil {
@@ -933,7 +931,7 @@ f({v: 1})
 // --- module aliases & recursive types ---------------------------------------
 
 func Test_Types_ModuleAlias_EqualityAndSubtype(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Make the module persistent so later evals & typeS can see M.
 	if _, err := ip.EvalPersistentSource(`
@@ -964,7 +962,7 @@ end`); err != nil {
 }
 
 func Test_Types_ModuleQualified_RecursiveParams_Accepts(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Define M persistently so later calls see it.
 	if _, err := ip.EvalPersistentSource(`
@@ -985,7 +983,7 @@ M.t(f1)
 }
 
 func Test_Types_InlineFunctionType_ExportedParam(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	if _, err := ip.EvalPersistentSource(`
 let M = module "M" do
@@ -1003,7 +1001,7 @@ M.w(f)
 }
 
 func Test_Types_Function_IsType_WithModuleAliases(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Persist the module first so typeS("M.S") can resolve it later.
 	if _, err := ip.EvalPersistentSource(`
@@ -1030,7 +1028,7 @@ fun(a: M.A, b: M.B) -> Null do null end
 }
 
 func Test_Types_ModuleAlias_LocalAliasCallsOK(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	src := `
 let M = module "M" do
   let A = type { x!: Int }
@@ -1057,7 +1055,7 @@ let A2 = M.A
 }
 
 func Test_Types_NestedModule_ResolveAndCallOK(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 	src := `
 let M = module "M" do
   let T = module "T" do
@@ -1076,7 +1074,7 @@ M.t(fun(a: M.T.A) -> Any do 0 end)
 }
 
 func Test_Types_ModuleAlias_LocalAliasEquality(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	// Persistent setup (matches REPL)
 	if _, err := ip.EvalPersistentSource(`
@@ -1117,7 +1115,7 @@ let S2 = M.S   # top-level alias to a module-exported type
 }
 
 func Test_Types_ModuleAlias_LocalAliasEquality_Min(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	if _, err := ip.EvalPersistentSource(`
 let M = module "M" do
@@ -1154,7 +1152,7 @@ let S2 = M.S
 }
 
 func Test_Types_NestedModule_TypePathResolves(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	if _, err := ip.EvalPersistentSource(`
 let M = module "M" do
@@ -1193,7 +1191,7 @@ end
 }
 
 func Test_Types_ModuleAlias_ReexportViaGlobalAlias(t *testing.T) {
-	ip := newIP()
+	ip, _ := NewInterpreter()
 
 	if _, err := ip.EvalPersistentSource(`
 let M = module "M" do

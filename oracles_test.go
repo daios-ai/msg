@@ -97,7 +97,7 @@ func countExamplesInPrompt(prompt string) int {
 // --- tests -------------------------------------------------------------------
 
 func Test_Oracle_StrSuccess(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
 
@@ -113,7 +113,7 @@ func Test_Oracle_StrSuccess(t *testing.T) {
 }
 
 func Test_Oracle_JSONSuccess_Object(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"name":"Marie Curie"}}`)
 
@@ -128,7 +128,7 @@ func Test_Oracle_JSONSuccess_Object(t *testing.T) {
 }
 
 func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `not-json`)
 
@@ -143,7 +143,7 @@ func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
 }
 
 func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"ok":true}`)
 
@@ -158,7 +158,7 @@ func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
 }
 
 func Test_Oracle_NullableBehavior_For_NonAny(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output": null}`)
 
@@ -175,7 +175,7 @@ func Test_Oracle_NullableBehavior_For_NonAny(t *testing.T) {
 }
 
 func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"wrong":42}}`)
 
@@ -190,7 +190,7 @@ func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"foo":123}}`)
 
@@ -205,7 +205,7 @@ func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
 }
 
 func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```json\n{\"output\":{\"name\":\"Rosalind Franklin\"}}\n```")
 
@@ -220,7 +220,7 @@ func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
 }
 
 func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
@@ -244,7 +244,7 @@ func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_ObjectResult_Parsed_OK(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"ok":true}}`)
 
@@ -259,7 +259,7 @@ func Test_Oracle_ObjectResult_Parsed_OK(t *testing.T) {
 }
 
 func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":{"ok":true}}`)
 
@@ -277,7 +277,7 @@ func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
 // --- examples handling via captured prompt -----------------------------------
 
 func Test_Oracle_Examples_Present_In_Prompt(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	var lastPrompt string
 	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
@@ -302,7 +302,7 @@ func Test_Oracle_Examples_Present_In_Prompt(t *testing.T) {
 }
 
 func Test_Oracle_Examples_From_Variable_Expr_In_Prompt(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	var lastPrompt string
 	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
@@ -327,7 +327,7 @@ func Test_Oracle_Examples_From_Variable_Expr_In_Prompt(t *testing.T) {
 }
 
 func Test_Oracle_Examples_From_Expression_In_Prompt(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	var lastPrompt string
 	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
@@ -351,7 +351,7 @@ func Test_Oracle_Examples_From_Expression_In_Prompt(t *testing.T) {
 // --- fenced / null literal edge cases ---------------------------------------
 
 func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
 
@@ -366,7 +366,7 @@ func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
 }
 
 func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
 
@@ -381,7 +381,7 @@ func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
 }
 
 func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerFakeOracle(ip, "null") // executor returns the literal string "null"
 
 	v, err := ip.EvalSource(`
@@ -395,7 +395,7 @@ func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, "this is not json at all")
 
@@ -410,7 +410,7 @@ func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerFakeOracle(ip, "null")
 
 	v, err := ip.EvalSource(`
@@ -425,7 +425,7 @@ func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
 
 // Already had a transport error test; add one more variant: backend returns empty -> annotated null
 func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
 
 	v, err := ip.EvalSource(`
@@ -443,7 +443,7 @@ func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	// Backend won't be reached if params fail type-checking (engine enforces)
 	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
 
@@ -473,7 +473,7 @@ func wantHardErrorContains(t *testing.T, err error, substr string) {
 // --- multi-input + type aliases (with schema descriptions) -------------------
 
 func Test_Oracle_MultiParam_With_Aliases_Success_And_Prompt(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	var lastPrompt string
@@ -518,7 +518,7 @@ func Test_Oracle_MultiParam_With_Aliases_Success_And_Prompt(t *testing.T) {
 }
 
 func Test_Oracle_TypeAlias_In_ReturnType_NullableOperationally(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	var lastPrompt string
@@ -546,7 +546,7 @@ func Test_Oracle_TypeAlias_In_ReturnType_NullableOperationally(t *testing.T) {
 }
 
 func Test_Oracle_Alias_ArrayParam_Success_And_Prompt(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	var lastPrompt string
@@ -574,7 +574,7 @@ func Test_Oracle_Alias_ArrayParam_Success_And_Prompt(t *testing.T) {
 }
 
 func Test_Oracle_Alias_Param_WrongShape_HardError(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":"ignored"}`) // should not be reached
 
@@ -591,7 +591,7 @@ func Test_Oracle_Alias_Param_WrongShape_HardError(t *testing.T) {
 }
 
 func Test_Oracles_TaskLine_UsesAnnotation_StraightCall(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	var gotPrompt string
@@ -628,7 +628,7 @@ func Test_Oracles_TaskLine_UsesAnnotation_StraightCall(t *testing.T) {
 }
 
 func Test_Oracles_TaskLine_UsesAnnotation_CurriedCall(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	var gotPrompt string
@@ -679,7 +679,7 @@ func wantAnnotNull(t *testing.T, v Value, substr string) {
 // --- lexical-resolution tests -----------------------------------------------
 
 func Test_Oracle_Hook_StrToStr_Typecheck(t *testing.T) {
-	ip, err := NewRuntime()
+	ip, err := NewInterpreter()
 	if err != nil {
 		t.Fatalf("NewRuntime error: %v", err)
 	}
@@ -697,7 +697,7 @@ func Test_Oracle_Hook_StrToStr_Typecheck(t *testing.T) {
 //  2. A user-space binding defined BEFORE the oracle is created is captured
 //     lexically and used by the oracle.
 func Test_Oracle_LexicalHook_UserSpaceBinding(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	v, err := ip.EvalSource(`
@@ -716,7 +716,7 @@ func Test_Oracle_LexicalHook_UserSpaceBinding(t *testing.T) {
 //  3. A call-site shadow (let __oracle_execute = ...) does NOT override the
 //     oracle's captured hook under pure lexical semantics.
 func Test_Oracle_LexicalHook_IgnoresCallSiteShadow(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 
 	// Install a fake backend in Core/Global *before* oracle definition so it’s
@@ -744,7 +744,7 @@ func Test_Oracle_LexicalHook_IgnoresCallSiteShadow(t *testing.T) {
 //  4. The captured hook works inside a spawned process because the function's
 //     closure chain is snapshotted into the child isolate.
 func Test_Oracle_LexicalHook_SpawnedProcess(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	registerJSONParse(ip)
 	registerFakeOracle(ip, `{"output":"Grace Hopper"}`)
 

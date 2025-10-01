@@ -104,7 +104,7 @@ func Test_ErrorWrap_Lex_ShowsCaretAndContext(t *testing.T) {
 func Test_Errors_Binop_DivZero_RHSLine(t *testing.T) {
 	// RHS is on line 2; caret should point there (we mark at RHS for the op).
 	src := "10 /\n 0"
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -123,7 +123,7 @@ func Test_Errors_Binop_DivZero_RHSLine(t *testing.T) {
 func Test_Errors_Unary_NotOperandLine(t *testing.T) {
 	// Operand is on line 2; caret should point at the operand (not the 'not').
 	src := "not\n  1"
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -144,7 +144,7 @@ func Test_Errors_If_ConditionLine(t *testing.T) {
 else
   do 0 end
 end`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -161,7 +161,7 @@ func Test_Errors_Assign_Index_LHSLine(t *testing.T) {
 	// Out-of-range assignment target is on line 2; caret should blame the LHS (arr[1]).
 	src := `let arr = [1]
 arr[1] = 0`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -181,7 +181,7 @@ func Test_Errors_Call_ArgTypeLine(t *testing.T) {
 f(
   true
 )`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -201,7 +201,7 @@ func Test_Errors_ReturnTypeMismatch_ReturnExprLine(t *testing.T) {
   return "bad"
 end
 f()`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -218,7 +218,7 @@ f()`
 func Test_Errors_And_LHS_ConditionLine(t *testing.T) {
 	// Non-boolean LHS for 'and' should point at the LHS line.
 	src := "1 and\n true"
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -235,7 +235,7 @@ func Test_Errors_MapProperty_UnknownKey_PropSite(t *testing.T) {
 	src := `let m = {a:1}
 m.nope`
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -253,7 +253,7 @@ m.nope`
 func Test_Errors_MapIndex_UnknownKey_IndexSite(t *testing.T) {
 	src := "let m = {a:1}\n" + `m["nope"]`
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -279,7 +279,7 @@ do
   1
 end`
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -299,7 +299,7 @@ func Test_Errors_ArrayIndex_NegativeWrap_NoError(t *testing.T) {
 	src := `let a = [10, 20, 30]
 a[-1]`
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	v, err := ip.EvalSource(src)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -316,7 +316,7 @@ func Test_Errors_EmptyArrayIndex_CaretOnIndex(t *testing.T) {
 	src := `let a = []
 a[0]`
 
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -340,7 +340,7 @@ func Test_Errors_ModZero_IntAndFloat_RHSLine(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ip := NewInterpreter()
+			ip, _ := NewInterpreter()
 			_, err := ip.EvalSource(tc.src)
 			if err == nil {
 				t.Fatalf("expected runtime error, got nil")
@@ -357,7 +357,7 @@ func Test_Errors_ModZero_IntAndFloat_RHSLine(t *testing.T) {
 func Test_Errors_And_BadRHS_CaretOnRHSLine(t *testing.T) {
 	// LHS true, RHS triggers a unary type error; blame should be on RHS line.
 	src := "true and\n not 1"
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -374,7 +374,7 @@ func Test_Errors_And_BadRHS_CaretOnRHSLine(t *testing.T) {
 func Test_Errors_Or_BadRHS_CaretOnRHSLine(t *testing.T) {
 	// LHS false, RHS triggers a unary type error; blame should be on RHS line.
 	src := "false or\n not 1"
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -391,7 +391,7 @@ func Test_Errors_Or_BadRHS_CaretOnRHSLine(t *testing.T) {
 func Test_Errors_Assign_PropertyOnNonMap_LHSLine(t *testing.T) {
 	// LHS is not a map/module; assignment should blame the LHS site.
 	src := `1.x = 2`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -408,7 +408,7 @@ func Test_Errors_ComputedIndex_OnNonIndexable_BlamedOnIndexExprLine(t *testing.T
 	// obj.(1) when obj is not array/map; caret should point at the computed index expr site.
 	src := `let x = 1
 x.(1)`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -425,7 +425,7 @@ func Test_Errors_Curried_TooManyArgs_BlamedOnExtraArg(t *testing.T) {
 	src := `let f = fun(x: Int) -> Int do x end
 f(1,
   2)`
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -514,7 +514,7 @@ func Test_Error_Parse_UnexpectedToken_CaretAtTokenStart(t *testing.T) {
 }
 
 func Test_Error_Runtime_Call_SecondArgCaret_LineAndColumn(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	src := `
 let f = fun(x: Int, y: Int) -> Int do x end
 f(1, "oops")
@@ -558,7 +558,7 @@ f(1, "oops")
 }
 
 func Test_Error_Runtime_TabCaret_Preserved(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	// Two real tabs, then an out-of-bounds index to trigger a runtime error;
 	// caret padding must preserve the tabs (no expansion).
 	src := "\t\t[][0]"
@@ -604,7 +604,7 @@ func Test_Errors_Module_IfAssert_Typed_CondLine(t *testing.T) {
 end
 M1.f(0)`
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -629,7 +629,7 @@ func Test_Errors_Module_IfAssert_Typed_CondLine_WithEarlierDef(t *testing.T) {
 end
 M2.f(0)`
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -656,7 +656,7 @@ func Test_Errors_Module_CallArgMark_Typed_SecondArgLine(t *testing.T) {
 end
 M3.f(0)`
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")
@@ -684,7 +684,7 @@ func Test_Errors_Module_CallArgMark_Untyped_SecondArgLine(t *testing.T) {
 end
 M3P.f(0)`
 
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(src)
 	if err == nil {
 		t.Fatalf("expected runtime error, got nil")

@@ -18,7 +18,7 @@ func entriesOf(t *testing.T, v Value) map[string]Value {
 // ---------------- JSON: parse & stringify ----------------
 
 func Test_Builtin_Json_Parse_And_Stringify_Roundtrip_Object(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 		let obj = {name:"Ada", age: 37, tags: ["a","b"], ok: true, misc: null}
@@ -46,13 +46,13 @@ func Test_Builtin_Json_Parse_And_Stringify_Roundtrip_Object(t *testing.T) {
 }
 
 func Test_Builtin_Json_Parse_Invalid_YieldsAnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `jsonParse("{ bad json }")`)
 	wantAnnotatedContains(t, v, "invalid json")
 }
 
 func Test_Builtin_Json_Number_Int_And_Float_Mapping(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// JSON numbers: integral → Int, non-integral → Num (float64)
 	out := evalWithIP(t, ip, `
@@ -69,7 +69,7 @@ func Test_Builtin_Json_Number_Int_And_Float_Mapping(t *testing.T) {
 }
 
 func Test_Builtin_Json_Stringify_Behavior(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	t.Run("SupportedValues_RoundTrip", func(t *testing.T) {
 		v := evalWithIP(t, ip, `
@@ -97,7 +97,7 @@ func Test_Builtin_Json_Stringify_Behavior(t *testing.T) {
 // ---------------- Type ⇄ JSON Schema ----------------
 
 func Test_Builtin_Json_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	src := `
 		let T = 
@@ -173,7 +173,7 @@ func Test_Builtin_Json_TypeToJSONSchema_DescriptionsAndRequired(t *testing.T) {
 }
 
 func Test_Builtin_Json_TypeStringToJSONSchema_Convenience(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	src := `
 		typeStringToJSONSchema("# the doc\n{ name!: Str, age: Int? }")
@@ -205,7 +205,7 @@ func Test_Builtin_Json_TypeStringToJSONSchema_Convenience(t *testing.T) {
 }
 
 func Test_Builtin_Json_JSONSchemaStringToType_Convenience(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	out, err := ip.EvalSource(`jsonSchemaStringToType("{\"type\":\"array\",\"items\":{\"type\":\"number\"}}")`)
 	if err != nil {
 		t.Fatalf("Eval error: %v", err)
@@ -219,7 +219,7 @@ func Test_Builtin_Json_JSONSchemaStringToType_Convenience(t *testing.T) {
 }
 
 func Test_Builtin_Json_TypeToJSONSchema_WithAliasAndDefs(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Person references itself via a nullable field, forcing $defs + $ref.
 	src := `
@@ -264,7 +264,7 @@ func Test_Builtin_Json_TypeToJSONSchema_WithAliasAndDefs(t *testing.T) {
 }
 
 func Test_Builtin_Json_Roundtrip_JSON_WithDefsAndRefs(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	src := `
 		let schema = {
@@ -313,7 +313,7 @@ func Test_Builtin_Json_Roundtrip_JSON_WithDefsAndRefs(t *testing.T) {
 // Error paths
 
 func Test_Builtin_Json_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Intentionally malformed type text (unterminated object) — soft failure (annotated null)
 	src := `typeStringToJSONSchema("{ name!: Str, ")`
@@ -327,7 +327,7 @@ func Test_Builtin_Json_typeStringToJSONSchema_BadType_YieldsAnnotatedNull(t *tes
 }
 
 func Test_Builtin_Json_JSONSchemaStringToType_BadJSON(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Bad JSON surfaces as a HARD error (native returns annotated null but signature expects Type)
 	_, err := ip.EvalSource(`jsonSchemaStringToType("{ invalid json }")`)
@@ -335,7 +335,7 @@ func Test_Builtin_Json_JSONSchemaStringToType_BadJSON(t *testing.T) {
 }
 
 func Test_Builtin_Json_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out, err := ip.EvalSource(`jsonSchemaToType("not an object")`)
 	if err != nil {
@@ -347,7 +347,7 @@ func Test_Builtin_Json_jsonSchemaToType_NonObjectInput_YieldsAny(t *testing.T) {
 }
 
 func Test_Builtin_Json_JSONSchemaToType_ImportsDefs_AsTypeAliases(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// $defs should be imported into the current environment as type aliases.
 	out, err := ip.EvalSource(`
@@ -371,7 +371,7 @@ func Test_Builtin_Json_JSONSchemaToType_ImportsDefs_AsTypeAliases(t *testing.T) 
 // ---------------- JSON: builtin jsonRepair ----------------
 
 func Test_Builting_Json_Repair_Fence_Comments_Unquoted_SingleQuotes(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	src := "```json\n{ a: 'z', nums: [1, 2,], /* trailing */ ok: true }\n```"
 	lit, err := json.Marshal(src) // produce a JSON-escaped string literal
@@ -402,7 +402,7 @@ func Test_Builting_Json_Repair_Fence_Comments_Unquoted_SingleQuotes(t *testing.T
 }
 
 func Test_Builting_Json_Repair_BracketBalancing(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
 		let v = jsonRepair("{\"a\":[1,2,3}")
@@ -420,13 +420,13 @@ func Test_Builting_Json_Repair_BracketBalancing(t *testing.T) {
 }
 
 func Test_Builting_Json_Repair_Invalid_YieldsAnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `jsonRepair("not json at all")`)
 	wantAnnotatedContains(t, v, "invalid json")
 }
 
 func Test_Builting_Json_Repair_NumberNormalization(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Leading dot, trailing dot, leading plus — normalize to valid numbers.
 	out := evalWithIP(t, ip, `

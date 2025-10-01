@@ -39,7 +39,7 @@ func mget(m *MapObject, k string) (Value, bool) { v, ok := m.Entries[k]; return 
 // ---------- tests ----------
 
 func Test_Builtin_Net_Connect_Echo(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	addr := freeLocalAddr(t)
 
@@ -80,7 +80,7 @@ func Test_Builtin_Net_Connect_Echo(t *testing.T) {
 }
 
 func Test_Builtin_Net_ListenAccept_GoClient(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	addr := freeLocalAddr(t)
 
@@ -122,7 +122,7 @@ func Test_Builtin_Net_ListenAccept_GoClient(t *testing.T) {
 }
 
 func Test_Builtin_Net_HTTP_GET_Buffered(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header()["X-Multi"] = []string{"a", "b"}
@@ -169,7 +169,7 @@ func Test_Builtin_Net_HTTP_GET_Buffered(t *testing.T) {
 }
 
 func Test_Builtin_Net_HTTP_POST_Body_Str(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	var gotMethod, gotBody string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +208,7 @@ func Test_Builtin_Net_HTTP_POST_Body_Str(t *testing.T) {
 }
 
 func Test_Builtin_Net_HTTP_POST_Body_Handle(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Prepare a file with content to upload via bodyH.
 	dir := t.TempDir()
@@ -241,7 +241,7 @@ func Test_Builtin_Net_HTTP_POST_Body_Handle(t *testing.T) {
 }
 
 func Test_Builtin_Net_HTTP_Stream_ReadAll(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	body := strings.Repeat("Z", 1024)
 
@@ -272,7 +272,7 @@ func Test_Builtin_Net_HTTP_Stream_ReadAll(t *testing.T) {
 }
 
 func Test_Builtin_Net_HTTP_Timeout_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond) // longer than client timeout
@@ -287,7 +287,7 @@ func Test_Builtin_Net_HTTP_Timeout_AnnotatedNull(t *testing.T) {
 }
 
 func Test_Builtin_Net_Connect_InvalidAddr_AnnotatedNull(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Assuming this port is closed; connection should fail quickly.
 	v := evalWithIP(t, ip, `netConnect("127.0.0.1:1")`)

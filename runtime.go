@@ -63,7 +63,8 @@ func (ip *Interpreter) RegisterRuntimeBuiltin(
 
 // SeedRuntimeInto installs the standard runtime natives and prelude into `target`.
 // This makes runtime symbols overrideable per-namespace (process/module).
-func (ip *Interpreter) SeedRuntimeInto(target *Env) {
+// RETURNS ERROR if prelude load fails (constructor MUST fail fast on this).
+func (ip *Interpreter) SeedRuntimeInto(target *Env) error {
 	// --- Register std natives into target (NOT Core) ---
 	// Change the register* functions to accept (ip, target) and use
 	// RegisterRuntimeBuiltin instead of RegisterNative inside those helpers.
@@ -88,24 +89,10 @@ func (ip *Interpreter) SeedRuntimeInto(target *Env) {
 
 	// --- Load prelude into the SAME target (overrideable within namespace) ---
 	// If you need to load from a different spec, make this configurable by caller.
-	_ = ip.LoadPreludeInto(target, "std.ms", "")
-}
-
-// NewRuntime returns a fully-initialized interpreter with the std runtime
-// installed into Global (overrideable) and engine intrinsics in Core (immutable).
-func NewRuntime() (*Interpreter, error) {
-	ip := NewInterpreter()
-
-	// (Already seeded into Base by NewInterpreter.) If you prefer explicit seeding:
-	//ip.SeedRuntimeInto(ip.Base)
-
-	// If prelude load needs error propagation, redo SeedRuntimeInto call
-	// without swallowing the error above.
-	if err := ip.LoadPreludeInto(ip.Base, "std.ms", ""); err != nil {
-		return nil, err
+	if err := ip.LoadPreludeInto(target, "std.ms", ""); err != nil {
+		return err
 	}
-
-	return ip, nil
+	return nil
 }
 
 // LoadPrelude resolves `spec` and evaluates it into the interpreter's Global

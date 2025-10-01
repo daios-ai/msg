@@ -6,7 +6,7 @@ import (
 )
 
 func Test_Builtin_Strings_Substr_Clamp_And_Unicode(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
       {
@@ -37,7 +37,7 @@ func Test_Builtin_Strings_Substr_Clamp_And_Unicode(t *testing.T) {
 }
 
 func Test_Builtin_Strings_Trim_UnicodeSpace(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
       {
@@ -60,7 +60,7 @@ func Test_Builtin_Strings_Trim_UnicodeSpace(t *testing.T) {
 }
 
 func Test_Builtin_Strings_Split_Empty_And_NotFound(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
       {
@@ -90,7 +90,7 @@ func Test_Builtin_Strings_Split_Empty_And_NotFound(t *testing.T) {
 }
 
 func Test_Builtin_Strings_Join_Basics(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
       {
@@ -109,7 +109,7 @@ func Test_Builtin_Strings_Join_Basics(t *testing.T) {
 }
 
 func Test_Builtin_Strings_ToLower_ToUpper(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
       {
@@ -128,7 +128,7 @@ func Test_Builtin_Strings_ToLower_ToUpper(t *testing.T) {
 }
 
 func Test_Builtin_Strings_Regex_Match_And_Replace(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	vm := evalWithIP(t, ip, `match("[a-z]+", "a12bc3")`)
 	if vm.Tag != VTArray {
@@ -147,7 +147,7 @@ func Test_Builtin_Strings_Regex_Match_And_Replace(t *testing.T) {
 }
 
 func Test_Builtin_Strings_Regex_InvalidPattern_ReturnTypeMismatch(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Current implementation returns annotated null on compile error,
 	// but the declared return types are non-optional, so the runtime
@@ -166,7 +166,7 @@ func Test_Builtin_Strings_Regex_InvalidPattern_ReturnTypeMismatch(t *testing.T) 
 }
 
 func Test_Builtin_Strings_Smoke_Combined(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	out := evalWithIP(t, ip, `
       {

@@ -6,7 +6,7 @@ import (
 )
 
 func Test_Builtin_Core_fail_and_try(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// fail(...) should surface a hard error when not wrapped in try.
 	_, err := ip.EvalSource(`panic("boom")`)
@@ -63,7 +63,7 @@ func Test_Builtin_Core_fail_and_try(t *testing.T) {
 }
 
 func Test_Builtin_Core_typeOf_and_isType_and_isSubtype(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// isType true/false paths
 	v := evalWithIP(t, ip, `isType(42, type Int)`)
@@ -93,7 +93,7 @@ func Test_Builtin_Core_typeOf_and_isType_and_isSubtype(t *testing.T) {
 }
 
 func Test_Builtin_Core_clone_deepcopy(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Clone must deep-copy arrays/maps and preserve order/annotations.
 	// We mutate the original after cloning and expect the clone to remain unchanged.
@@ -119,7 +119,7 @@ func Test_Builtin_Core_clone_deepcopy(t *testing.T) {
 }
 
 func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `snapshot(null)`)
 	if v.Tag != VTMap || v.Data == nil {
@@ -158,7 +158,7 @@ func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 }
 
 func Test_Builtin_Core_mapHas_and_mapDelete(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// mapHas present/absent
 	tr := evalWithIP(t, ip, `mapHas({ a: 1 }, "a")`)
@@ -190,7 +190,7 @@ func Test_Builtin_Core_mapHas_and_mapDelete(t *testing.T) {
 }
 
 func Test_Builtin_Core_import_and_importCode_paths(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// import: with no loader configured, must return annotated null
 	v := evalWithIP(t, ip, `import("does-not-exist")`)
@@ -212,7 +212,7 @@ func Test_Builtin_Core_import_and_importCode_paths(t *testing.T) {
 }
 
 func Test_Builtin_Core_assign_undefined_in_sealed_global(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Assign to an unknown name in a sealed Global should say "undefined variable".
 	_, err := ip.EvalSource(`totally_unknown_name = 1`)
@@ -220,7 +220,7 @@ func Test_Builtin_Core_assign_undefined_in_sealed_global(t *testing.T) {
 }
 
 func Test_Builtin_Core_let_shadow_builtin_ok(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Shadowing a builtin with let is allowed (local to the eval scope).
 	if _, err := ip.EvalSource(`let import = 123`); err != nil {
@@ -234,7 +234,7 @@ func Test_Builtin_Core_let_shadow_builtin_ok(t *testing.T) {
 }
 
 func Test_Builtin_Core_module_let_shadow_builtin_ok(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Inline module shadows a Core builtin with let → allowed.
 	v := evalWithIP(t, ip, `module "M2" do let import = 123 end`)
@@ -251,7 +251,7 @@ func Test_Builtin_Core_module_let_shadow_builtin_ok(t *testing.T) {
 }
 
 func Test_Builtin_Core_push_smoke(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let a = [1]
 		push(a, 2)
@@ -267,7 +267,7 @@ func Test_Builtin_Core_push_smoke(t *testing.T) {
 }
 
 func Test_Builtin_Core_unshift_smoke(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let a = [2]
 		unshift(a, 1)
@@ -283,7 +283,7 @@ func Test_Builtin_Core_unshift_smoke(t *testing.T) {
 }
 
 func Test_Builtin_Core_pop_smoke_and_contract(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	// normal pop
 	v := evalWithIP(t, ip, `
 		let a = [10, 20]
@@ -308,7 +308,7 @@ func Test_Builtin_Core_pop_smoke_and_contract(t *testing.T) {
 }
 
 func Test_Builtin_Core_shift_smoke_and_contract(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 	// normal shift
 	v := evalWithIP(t, ip, `
 		let a = [10, 20]
@@ -334,7 +334,7 @@ func Test_Builtin_Core_shift_smoke_and_contract(t *testing.T) {
 
 // Builtins now live in Global and are overrideable there.
 func Test_Builtin_Core_assign_builtin_is_overwritable_in_global(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	ip.SeedRuntimeInto(ip.Global)
 
 	// Overwrite a runtime builtin ("import") in Global.
@@ -354,7 +354,7 @@ func Test_Builtin_Core_assign_builtin_is_overwritable_in_global(t *testing.T) {
 
 // Overriding in a module's namespace is local and does not affect Global.
 func Test_Builtin_Core_assign_builtin_is_local_to_module(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	ip.SeedRuntimeInto(ip.Global)
 
 	// Create a module-like env, seeded like a real module namespace.
@@ -388,7 +388,7 @@ func Test_Builtin_Core_assign_builtin_is_local_to_module(t *testing.T) {
 
 // Core intrinsics remain protected: attempts to assign should fail with friendly error.
 func Test_Builtin_Core_core_intrinsic_cannot_be_assigned(t *testing.T) {
-	ip := NewInterpreter()
+	ip, _ := NewInterpreter()
 	ip.SeedRuntimeInto(ip.Global)
 
 	err := ip.Global.Set("__assign_set", Int(1)) // Core intrinsic installed by initCore

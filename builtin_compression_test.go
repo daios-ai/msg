@@ -9,7 +9,7 @@ import (
 )
 
 func Test_Builtin_Compression_RoundTrip_SmallText(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 		let s = "hello, world"
@@ -23,7 +23,7 @@ func Test_Builtin_Compression_RoundTrip_SmallText(t *testing.T) {
 }
 
 func Test_Builtin_Compression_RoundTrip_Empty(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	v := evalWithIP(t, ip, `
 		let s = ""
@@ -37,7 +37,7 @@ func Test_Builtin_Compression_RoundTrip_Empty(t *testing.T) {
 }
 
 func Test_Builtin_Compression_RoundTrip_UnicodeAndNUL(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Uses NUL (\u0000) and 😀 as surrogate-pair escapes (\uD83D\uDE00).
 	v := evalWithIP(t, ip, `
@@ -53,7 +53,7 @@ func Test_Builtin_Compression_RoundTrip_UnicodeAndNUL(t *testing.T) {
 }
 
 func Test_Builtin_Compression_RoundTrip_LargeFile(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Create a large temporary file (~512 KiB) with repetitive content.
 	td := t.TempDir()
@@ -88,7 +88,7 @@ func Test_Builtin_Compression_RoundTrip_LargeFile(t *testing.T) {
 }
 
 func Test_Builtin_Compression_Decompress_InvalidInput(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Invalid gzip payload should return annotated null (soft error).
 	v := evalWithIP(t, ip, `gzipDecompress("not a gzip stream")`)
@@ -96,7 +96,7 @@ func Test_Builtin_Compression_Decompress_InvalidInput(t *testing.T) {
 }
 
 func Test_Builtin_Compression_Compress_ContractViolation(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Type contract violation is caught by the interpreter's param checker.
 	_, err := ip.EvalSource(`gzipCompress(42)`)
@@ -104,7 +104,7 @@ func Test_Builtin_Compression_Compress_ContractViolation(t *testing.T) {
 }
 
 func Test_Builtin_Compression_Decompress_ContractViolation(t *testing.T) {
-	ip, _ := NewRuntime()
+	ip, _ := NewInterpreter()
 
 	// Same here: native body isn't entered.
 	_, err := ip.EvalSource(`gzipDecompress(123)`)

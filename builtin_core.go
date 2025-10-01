@@ -7,9 +7,10 @@ import (
 
 // ---- core built-ins ----------------------------------------------------
 
-func registerCoreBuiltins(ip *Interpreter) {
+func registerCoreBuiltins(ip *Interpreter, target *Env) {
 	// panic(message?: Str) -> Null (never returns; hard runtime error)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"panic",
 		[]ParamSpec{{Name: "message", Type: S{"unop", "?", S{"id", "Str"}}}},
 		S{"id", "Null"},
@@ -23,7 +24,7 @@ func registerCoreBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "panic", `Fail: throw a runtime error (hard fault).
+	setBuiltinDoc(target, "panic", `Fail: throw a runtime error (hard fault).
 
 Params:
   message: Str? — optional message (default "error")
@@ -32,7 +33,8 @@ Returns:
   Null (never returns)`)
 
 	// try(f: (Null -> Any)) -> { ok: Bool, value: Any }
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"try",
 		[]ParamSpec{{Name: "f", Type: S{"binop", "->", S{"id", "Null"}, S{"id", "Any"}}}},
 		S{"map", S{"pair!", S{"id", "ok"}, S{"id", "Bool"}},
@@ -83,7 +85,7 @@ Returns:
 			return out
 		},
 	)
-	setBuiltinDoc(ip, "try", `Run a zero-arg function and capture panics.
+	setBuiltinDoc(target, "try", `Run a zero-arg function and capture panics.
 
 Signature:
   try(f: (Null -> Any)) -> { ok: Bool, value: Any }
@@ -98,7 +100,8 @@ Notes:
     could still be an error.`)
 
 	// clone(x: Any) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"clone",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
@@ -106,7 +109,7 @@ Notes:
 			return cloneValue(ctx.Arg("x"))
 		},
 	)
-	setBuiltinDoc(ip, "clone", `Clone a value (deep-copy).
+	setBuiltinDoc(target, "clone", `Clone a value (deep-copy).
 
 For maps, preserves key order and per-key annotations. Primitive values are
 returned as-is. Functions, modules, and handles are not duplicated (identity
@@ -120,7 +123,8 @@ Returns:
 
 	// snapshot(_: Null) -> {}
 	// Returns a flattened map of all visible bindings (inner shadows outer).
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"snapshot",
 		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
 		S{"map"},
@@ -128,7 +132,7 @@ Returns:
 			return snapshotVisibleEnvAsMap(ctx.Env())
 		},
 	)
-	setBuiltinDoc(ip, "snapshot", `Return a map snapshot of the visible environment (including built-ins).
+	setBuiltinDoc(target, "snapshot", `Return a map snapshot of the visible environment (including built-ins).
 
 Behavior:
   • Captures a flattened view of the current frame and its parents (Core included).
@@ -143,7 +147,8 @@ Returns:
   {} — map of { name: value }`)
 
 	// typeOf(x: Any) -> Type
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"typeOf",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Type"},
@@ -152,7 +157,7 @@ Returns:
 			return TypeValIn(ip.ValueToType(x, ctx.Env()), ctx.Env())
 		},
 	)
-	setBuiltinDoc(ip, "typeOf", `Return the dynamic Type of a value.
+	setBuiltinDoc(target, "typeOf", `Return the dynamic Type of a value.
 
 This inspects a runtime value and produces its structural Type.
 Useful together with isType/isSubtype for ad-hoc validation.
@@ -163,7 +168,8 @@ Params:
 Returns: Type`)
 
 	// isType(x: Any, T: Type) -> Bool
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"isType",
 		[]ParamSpec{
 			{Name: "x", Type: S{"id", "Any"}},
@@ -179,7 +185,7 @@ Returns: Type`)
 			return Bool(ip.IsType(x, ip.resolveTypeValue(Tv, ctx.Env()), ctx.Env()))
 		},
 	)
-	setBuiltinDoc(ip, "isType", `Check whether a value conforms to a Type.
+	setBuiltinDoc(target, "isType", `Check whether a value conforms to a Type.
 
 Params:
   x: Any   — value to check
@@ -188,7 +194,8 @@ Params:
 Returns: Bool`)
 
 	// isSubtype(A: Type, B: Type) -> Bool
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"isSubtype",
 		[]ParamSpec{
 			{Name: "A", Type: S{"id", "Type"}},
@@ -206,7 +213,7 @@ Returns: Bool`)
 			return Bool(ip.IsSubtype(A, B, ctx.Env()))
 		},
 	)
-	setBuiltinDoc(ip, "isSubtype", `Structural subtype test: A <: B.
+	setBuiltinDoc(target, "isSubtype", `Structural subtype test: A <: B.
 
 Function types are compared structurally:
 - Parameters are contravariant
@@ -220,7 +227,8 @@ Params:
 Returns: Bool`)
 
 	// import(path: Str) -> Module (nullable on soft failure)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"import",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
@@ -249,7 +257,7 @@ Returns: Bool`)
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "import", `Load a module from filesystem or HTTP(S).
+	setBuiltinDoc(target, "import", `Load a module from filesystem or HTTP(S).
 
 Resolution rules:
   - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
@@ -262,7 +270,8 @@ Returns:
   Module (nullable) — the loaded module value; or null with an error annotation on soft failures.`)
 
 	// importCode(name: Str, src: Str) -> Module (nullable if user code returns annotated null)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"importCode",
 		[]ParamSpec{
 			{Name: "name", Type: S{"id", "Str"}},
@@ -291,7 +300,7 @@ Returns:
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "importCode", `Evaluate source text as a module in memory.
+	setBuiltinDoc(target, "importCode", `Evaluate source text as a module in memory.
 
 Parses 'src' and evaluates it as a module named 'name' (no caching).
 The module's environment is fresh and parented to Core.
@@ -306,7 +315,8 @@ Returns:
   user code intentionally returns a soft failure.`)
 
 	// mapHas(obj: {}, key: Str) -> Bool
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"mapHas",
 		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
 		S{"id", "Bool"},
@@ -321,7 +331,7 @@ Returns:
 			return Bool(ok)
 		},
 	)
-	setBuiltinDoc(ip, "mapHas", `Return true if a key exists in a map.
+	setBuiltinDoc(target, "mapHas", `Return true if a key exists in a map.
 
 Params:
   obj: {}  — a map value
@@ -331,7 +341,8 @@ Returns:
   Bool`)
 
 	// mapDelete(obj: {}, key: Str) -> {}
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"mapDelete",
 		[]ParamSpec{{Name: "obj", Type: S{"map"}}, {Name: "key", Type: S{"id", "Str"}}},
 		S{"map"}, // returns the (mutated) input map
@@ -360,7 +371,7 @@ Returns:
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "mapDelete", `Delete a property from a map (in place).
+	setBuiltinDoc(target, "mapDelete", `Delete a property from a map (in place).
 
 Preserves the key order and per-key annotations for the remaining entries.
 
@@ -374,7 +385,8 @@ Returns:
 	// --- Arrays: push/unshift/pop/shift (mutating) ------------------------
 
 	// push(arr: [Any], v: Any) -> [Any]
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"push",
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}, {Name: "v", Type: S{"id", "Any"}}},
 		S{"array", S{"id", "Any"}},
@@ -388,7 +400,7 @@ Returns:
 			return a
 		},
 	)
-	setBuiltinDoc(ip, "push", `Append an element to an array (in place).
+	setBuiltinDoc(target, "push", `Append an element to an array (in place).
 
 Params:
   arr: [Any] — array to mutate
@@ -398,7 +410,8 @@ Returns:
   [Any] — the same array (mutated)`)
 
 	// unshift(arr: [Any], v: Any) -> [Any]
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"unshift",
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}, {Name: "v", Type: S{"id", "Any"}}},
 		S{"array", S{"id", "Any"}},
@@ -413,7 +426,7 @@ Returns:
 			return a
 		},
 	)
-	setBuiltinDoc(ip, "unshift", `Prepend an element to an array (in place).
+	setBuiltinDoc(target, "unshift", `Prepend an element to an array (in place).
 
 Params:
   arr: [Any] — array to mutate
@@ -423,7 +436,8 @@ Returns:
   [Any] — the same array (mutated)`)
 
 	// pop(arr: [Any]) -> Any   (HARD error on empty)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pop",
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}},
 		S{"id", "Any"},
@@ -441,7 +455,7 @@ Returns:
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "pop", `Remove and return the last element of an array.
+	setBuiltinDoc(target, "pop", `Remove and return the last element of an array.
 
 Errors:
   • Throws a runtime error if the array is empty.
@@ -453,7 +467,8 @@ Returns:
   Any — the removed element`)
 
 	// shift(arr: [Any]) -> Any   (HARD error on empty)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"shift",
 		[]ParamSpec{{Name: "arr", Type: S{"array", S{"id", "Any"}}}},
 		S{"id", "Any"},
@@ -471,7 +486,7 @@ Returns:
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "shift", `Remove and return the first element of an array.
+	setBuiltinDoc(target, "shift", `Remove and return the first element of an array.
 
 Errors:
   • Throws a runtime error if the array is empty.

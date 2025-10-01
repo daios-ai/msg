@@ -11,8 +11,9 @@ import (
 
 // --- Utilities: time, rand, json --------------------------------------------
 
-func registerJsonBuiltins(ip *Interpreter) {
-	ip.RegisterNative(
+func registerJsonBuiltins(ip *Interpreter, target *Env) {
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"jsonParse",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
@@ -26,7 +27,7 @@ func registerJsonBuiltins(ip *Interpreter) {
 			return goJSONToValue(x)
 		},
 	)
-	setBuiltinDoc(ip, "jsonParse", `Parse a JSON string into MindScript values.
+	setBuiltinDoc(target, "jsonParse", `Parse a JSON string into MindScript values.
 
 Mapping rules:
   • null/bool/number/string map to Null/Bool/Int|Num/Str
@@ -42,7 +43,8 @@ Returns:
 
 	// ---- Permissive JSON repair/parse ------------------------------------------
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"jsonRepair",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
@@ -68,7 +70,7 @@ Returns:
 		},
 	)
 
-	setBuiltinDoc(ip, "jsonRepair", `Repair and parse messy JSON into MindScript values.
+	setBuiltinDoc(target, "jsonRepair", `Repair and parse messy JSON into MindScript values.
 
 Like jsonParse, but permissive. Accepts JSON wrapped in markdown fences and
 tolerates common issues: comments, trailing commas, unquoted keys, single-quoted
@@ -89,7 +91,8 @@ Returns:
 
 	// jsonStringify(x: Any) -> Str
 	// jsonStringify(x: Any) -> Str?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"jsonStringify",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -108,7 +111,7 @@ Returns:
 		},
 	)
 
-	setBuiltinDoc(ip, "jsonStringify", `Serialize a value to a compact JSON string.
+	setBuiltinDoc(target, "jsonStringify", `Serialize a value to a compact JSON string.
 
 Arrays and maps are emitted as JSON arrays/objects. Object key order is not
 guaranteed.
@@ -120,7 +123,8 @@ Returns:
   Str`)
 
 	// typeToJSONSchema(t: Type) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"typeToJSONSchema",
 		[]ParamSpec{{Name: "t", Type: S{"id", "Type"}}},
 		S{"id", "Any"},
@@ -130,7 +134,7 @@ Returns:
 			return goJSONToValue(js)
 		},
 	)
-	setBuiltinDoc(ip, "typeToJSONSchema", `Convert a MindScript Type to a JSON Schema object.
+	setBuiltinDoc(target, "typeToJSONSchema", `Convert a MindScript Type to a JSON Schema object.
 
 Params:
   t: Type
@@ -139,7 +143,8 @@ Returns:
   Any — JSON Schema as a map/array structure (use jsonStringify to serialize)`)
 
 	// jsonSchemaToType(schema: Any) -> Type?   (soft-error on unsupported schema)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"jsonSchemaToType",
 		[]ParamSpec{{Name: "schema", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Type"}},
@@ -176,7 +181,7 @@ Returns:
 			return tv
 		},
 	)
-	setBuiltinDoc(ip, "jsonSchemaToType", `Convert a JSON Schema object to a MindScript Type.
+	setBuiltinDoc(target, "jsonSchemaToType", `Convert a JSON Schema object to a MindScript Type.
 
 Notes:
   • Same-document $ref and common keywords are handled.
@@ -190,7 +195,8 @@ Returns:
   Type?`)
 
 	// typeStringToJSONSchema(src: Str) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"typeStringToJSONSchema",
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
@@ -206,7 +212,7 @@ Returns:
 			return goJSONToValue(js)
 		},
 	)
-	setBuiltinDoc(ip, "typeStringToJSONSchema", `Parse a MindScript type string and convert it to JSON Schema.
+	setBuiltinDoc(target, "typeStringToJSONSchema", `Parse a MindScript type string and convert it to JSON Schema.
 
 Params:
   src: Str — a single type expression (annotations map to "description")
@@ -215,7 +221,8 @@ Returns:
   Any — JSON Schema object`)
 
 	// jsonSchemaStringToType(src: Str) -> Type
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"jsonSchemaStringToType",
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"id", "Type"},
@@ -249,7 +256,7 @@ Returns:
 			return tv
 		},
 	)
-	setBuiltinDoc(ip, "jsonSchemaStringToType", `Parse a JSON Schema string and convert it to a MindScript Type.
+	setBuiltinDoc(target, "jsonSchemaStringToType", `Parse a JSON Schema string and convert it to a MindScript Type.
 
 Params:
   src: Str — JSON text

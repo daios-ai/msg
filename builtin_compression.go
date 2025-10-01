@@ -16,7 +16,7 @@ import (
 	"io"
 )
 
-func registerCompressionBuiltins(ip *Interpreter) {
+func registerCompressionBuiltins(ip *Interpreter, target *Env) {
 	// gzipCompress(data: Str) -> Str
 	// Compress data using gzip (default level).
 	//
@@ -29,7 +29,8 @@ func registerCompressionBuiltins(ip *Interpreter) {
 	// Notes:
 	// 	• Output is binary; treat as bytes stored in Str.
 	// 	• Implements RFC 1952 via Go's compress/gzip.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"gzipCompress",
 		[]ParamSpec{{Name: "data", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -56,7 +57,7 @@ func registerCompressionBuiltins(ip *Interpreter) {
 		},
 	)
 
-	setBuiltinDoc(ip, "gzipCompress", `Compress data using gzip (default level).
+	setBuiltinDoc(target, "gzipCompress", `Compress data using gzip (default level).
 
 Params:
 	data: Str — input bytes (may contain arbitrary bytes)
@@ -79,7 +80,8 @@ Notes:
 	//
 	// Notes:
 	// 	• Returns annotated null on invalid gzip headers, checksum mismatch, truncated input, etc.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"gzipDecompress",
 		[]ParamSpec{{Name: "data", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
@@ -104,7 +106,7 @@ Notes:
 		},
 	)
 
-	setBuiltinDoc(ip, "gzipDecompress", `Decompress a gzip payload.
+	setBuiltinDoc(target, "gzipDecompress", `Decompress a gzip payload.
 
 Params:
 	data: Str — gzip-compressed bytes

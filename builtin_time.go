@@ -18,30 +18,31 @@ import (
 	"time"
 )
 
-func registerTimeBuiltins(ip *Interpreter) {
+func registerTimeBuiltins(ip *Interpreter, target *Env) {
 	// nowMillis() -> Int
 	// Current wall-clock time in milliseconds since the Unix epoch.
-	ip.RegisterNative("nowMillis", nil, S{"id", "Int"}, func(_ *Interpreter, _ CallCtx) Value {
+	ip.RegisterRuntimeBuiltin(target, "nowMillis", nil, S{"id", "Int"}, func(_ *Interpreter, _ CallCtx) Value {
 		return Int(time.Now().UnixMilli())
 	})
-	setBuiltinDoc(ip, "nowMillis", `Current wall-clock time in milliseconds since the Unix epoch.
+	setBuiltinDoc(target, "nowMillis", `Current wall-clock time in milliseconds since the Unix epoch.
 
 Returns:
 	Int`)
 
 	// nowNanos() -> Int
 	// Current wall-clock time in nanoseconds since the Unix epoch.
-	ip.RegisterNative("nowNanos", nil, S{"id", "Int"}, func(_ *Interpreter, _ CallCtx) Value {
+	ip.RegisterRuntimeBuiltin(target, "nowNanos", nil, S{"id", "Int"}, func(_ *Interpreter, _ CallCtx) Value {
 		return Int(time.Now().UnixNano())
 	})
-	setBuiltinDoc(ip, "nowNanos", `Current wall-clock time in nanoseconds since the Unix epoch.
+	setBuiltinDoc(target, "nowNanos", `Current wall-clock time in nanoseconds since the Unix epoch.
 
 Returns:
 	Int`)
 
 	// sleep(ms: Int) -> Null
 	// Pause execution for a number of milliseconds.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"sleep",
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
 		S{"id", "Null"},
@@ -51,7 +52,7 @@ Returns:
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "sleep", `Pause execution for a number of milliseconds.
+	setBuiltinDoc(target, "sleep", `Pause execution for a number of milliseconds.
 
 Params:
 	ms: Int — milliseconds to sleep
@@ -61,7 +62,8 @@ Returns:
 
 	// dateNow() -> { year, month, day, hour, minute, second, millisecond }
 	// Current local date/time components.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"dateNow",
 		nil,
 		S{"map"}, // open-world object: {}
@@ -86,7 +88,7 @@ Returns:
 			return Value{Tag: VTMap, Data: mo}
 		},
 	)
-	setBuiltinDoc(ip, "dateNow", `Current local date/time components.
+	setBuiltinDoc(target, "dateNow", `Current local date/time components.
 
 Fields:
 	year, month(1–12), day(1–31),
@@ -98,7 +100,8 @@ Returns:
 
 	// timeFormatRFC3339(millis: Int) -> Str
 	// Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"timeFormatRFC3339",
 		[]ParamSpec{{Name: "millis", Type: S{"id", "Int"}}},
 		S{"id", "Str"},
@@ -109,7 +112,7 @@ Returns:
 			return Str(t.Format(time.RFC3339Nano))
 		},
 	)
-	setBuiltinDoc(ip, "timeFormatRFC3339", `Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
+	setBuiltinDoc(target, "timeFormatRFC3339", `Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
 
 Params:
 	millis: Int — milliseconds since the Unix epoch
@@ -123,7 +126,8 @@ Notes:
 	// timeParseRFC3339(s: Str) -> Int?
 	// Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
 	// Accepts both second-precision and fractional (nano) variants.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"timeParseRFC3339",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Int"}}, // Int?
@@ -139,7 +143,7 @@ Notes:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "timeParseRFC3339", `Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
+	setBuiltinDoc(target, "timeParseRFC3339", `Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
 
 Accepts both second-precision (RFC3339) and fractional (RFC3339Nano) forms.
 

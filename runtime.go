@@ -26,50 +26,98 @@ func asHandle(v Value, want string) *Handle {
 }
 
 // annotate a core builtin function value with a docstring
-func setBuiltinDoc(ip *Interpreter, name, doc string) {
-	if v, err := ip.Core.Get(name); err == nil {
-		ip.Core.Define(name, withAnnot(v, doc))
+func setBuiltinDoc(target *Env, name, doc string) {
+	if v, err := target.Get(name); err == nil {
+		target.Define(name, withAnnot(v, doc))
 	}
 }
 
-// NewRuntime returns a fully-initialized interpreter with std builtins.
+// RegisterRuntimeBuiltin registers a native host function into the interpreter's
+// host registry (ip.native) but BINDS the callable into the provided target env.
+// The function value's closure Env is ip.Core (so effects occur at call-site),
+// and NativeName triggers native dispatch. Unlike RegisterNative, this does NOT
+// write into Core, allowing per-namespace overrides.
+func (ip *Interpreter) RegisterRuntimeBuiltin(
+	target *Env, name string, params []ParamSpec, ret S, impl NativeImpl,
+) {
+	if ip.native == nil {
+		ip.native = map[string]NativeImpl{}
+	}
+	ip.native[name] = impl
+
+	names := make([]string, len(params))
+	types := make([]S, len(params))
+	for i, p := range params {
+		names[i], types[i] = p.Name, p.Type
+	}
+	fn := FunVal(&Fun{
+		Params:     names,
+		ParamTypes: types,
+		ReturnType: ret,
+		Body:       S{"native", name}, // sentinel
+		Env:        ip.Core,           // effects resolve at call-site
+		NativeName: name,
+	})
+	target.Define(name, fn)
+}
+
+// SeedRuntimeInto installs the standard runtime natives and prelude into `target`.
+// This makes runtime symbols overrideable per-namespace (process/module).
+func (ip *Interpreter) SeedRuntimeInto(target *Env) {
+	// --- Register std natives into target (NOT Core) ---
+	// Change the register* functions to accept (ip, target) and use
+	// RegisterRuntimeBuiltin instead of RegisterNative inside those helpers.
+	registerCoreBuiltins(ip, target)
+	registerIntrospectionBuiltins(ip, target)
+	registerCastBuiltins(ip, target)
+	registerIOBuiltins(ip, target)
+	registerOsBuiltins(ip, target)
+	registerNetBuiltins(ip, target)
+	registerConcurrencyBuiltins(ip, target)
+	registerProcessBuiltins(ip, target)
+	registerEncodingURLBuiltins(ip, target)
+	registerCryptoBuiltins(ip, target)
+	registerCompressionBuiltins(ip, target)
+	registerExecBuiltins(ip, target)
+	registerTimeBuiltins(ip, target)
+	registerPathBuiltins(ip, target)
+	registerJsonBuiltins(ip, target)
+	registerStringBuiltins(ip, target)
+	registerRandomBuiltins(ip, target)
+	registerMathBuiltins(ip, target)
+
+	// --- Load prelude into the SAME target (overrideable within namespace) ---
+	// If you need to load from a different spec, make this configurable by caller.
+	_ = ip.LoadPreludeInto(target, "std.ms", "")
+}
+
+// NewRuntime returns a fully-initialized interpreter with the std runtime
+// installed into Global (overrideable) and engine intrinsics in Core (immutable).
 func NewRuntime() (*Interpreter, error) {
 	ip := NewInterpreter()
 
-	// standard native builtins
-	registerCoreBuiltins(ip)
-	registerIntrospectionBuiltins(ip)
-	registerCastBuiltins(ip)
-	registerIOBuiltins(ip)
-	registerOsBuiltins(ip)
-	registerNetBuiltins(ip)
-	registerConcurrencyBuiltins(ip)
-	registerProcessBuiltins(ip)
-	registerEncodingURLBuiltins(ip)
-	registerCryptoBuiltins(ip)
-	registerCompressionBuiltins(ip)
-	registerExecBuiltins(ip)
-	registerTimeBuiltins(ip)
-	registerPathBuiltins(ip)
-	registerJsonBuiltins(ip)
-	registerStringBuiltins(ip)
-	registerRandomBuiltins(ip)
-	registerMathBuiltins(ip)
+	// (Already seeded into Base by NewInterpreter.) If you prefer explicit seeding:
+	//ip.SeedRuntimeInto(ip.Base)
 
-	if err := ip.LoadPrelude("std.ms", ""); err != nil {
+	// If prelude load needs error propagation, redo SeedRuntimeInto call
+	// without swallowing the error above.
+	if err := ip.LoadPreludeInto(ip.Base, "std.ms", ""); err != nil {
 		return nil, err
 	}
-
-	ip.Global.SealParentWrites()
 
 	return ip, nil
 }
 
-// LoadPrelude resolves `spec` (filesystem or absolute http(s) URL), parses it,
-// and executes the prelude directly in the interpreter's Core environment.
-// On success it returns nil. On failure it returns a descriptive error
-// (LEXICAL/PARSE/RUNTIME with caret snippets where available).
+// LoadPrelude resolves `spec` and evaluates it into the interpreter's Global
+// (kept for compatibility). Prefer LoadPreludeInto for explicit targets.
 func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
+	return ip.LoadPreludeInto(ip.Global, spec, importer)
+}
+
+// LoadPreludeInto resolves `spec`, parses it with spans, and evaluates it
+// into the provided `target` environment (NOT Core). Errors are pretty-printed.
+func (ip *Interpreter) LoadPreludeInto(target *Env, spec string, importer string) error {
+
 	// 1) Resolve + fetch
 	src, display, _, err := resolveAndFetch(spec, importer)
 	if err != nil {
@@ -88,9 +136,9 @@ func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
 		return perr
 	}
 
-	// 3) Evaluate in Core. We want real errors for VM runtime failures,
+	// 3) Evaluate in the provided target environment. We want real errors for VM runtime failures,
 	//    and we also want to treat annotated-null as an error.
-	v, rterr := ip.runTopWithSource(ast, ip.Core, false, &SourceRef{
+	v, rterr := ip.runTopWithSource(ast, target, false, &SourceRef{
 		Name:  display,
 		Src:   src,
 		Spans: spans,

@@ -7,9 +7,10 @@ import (
 	"unicode"
 )
 
-func registerStringBuiltins(ip *Interpreter) {
+func registerStringBuiltins(ip *Interpreter, target *Env) {
 	// substr(s, i, j)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"substr",
 		[]ParamSpec{{"s", S{"id", "Str"}}, {"i", S{"id", "Int"}}, {"j", S{"id", "Int"}}},
 		S{"id", "Str"},
@@ -33,7 +34,7 @@ func registerStringBuiltins(ip *Interpreter) {
 			return Str(string(r[i:j]))
 		},
 	)
-	setBuiltinDoc(ip, "substr", `Unicode-safe substring by rune index.
+	setBuiltinDoc(target, "substr", `Unicode-safe substring by rune index.
 
 Takes the half-open slice [i, j). Indices are clamped to bounds and negative
 values are treated as 0.
@@ -46,13 +47,14 @@ Params:
 Returns:
   Str`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"toLower",
 		[]ParamSpec{{"s", S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.Arg("s").Data.(string))) },
 	)
-	setBuiltinDoc(ip, "toLower", `Lowercase conversion (Unicode aware).
+	setBuiltinDoc(target, "toLower", `Lowercase conversion (Unicode aware).
 
 Params:
   s: Str
@@ -60,13 +62,14 @@ Params:
 Returns:
   Str`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"toUpper",
 		[]ParamSpec{{"s", S{"id", "Str"}}},
 		S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.Arg("s").Data.(string))) },
 	)
-	setBuiltinDoc(ip, "toUpper", `Uppercase conversion (Unicode aware).
+	setBuiltinDoc(target, "toUpper", `Uppercase conversion (Unicode aware).
 
 Params:
   s: Str
@@ -86,13 +89,15 @@ Returns:
 		}
 	}
 
-	ip.RegisterNative("strip",
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"strip",
 		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			return Str(trimFunc(true, true)(ctx.Arg("s").Data.(string)))
 		},
 	)
-	setBuiltinDoc(ip, "strip", `Remove leading and trailing whitespace (Unicode).
+	setBuiltinDoc(target, "strip", `Remove leading and trailing whitespace (Unicode).
 
 Params:
   s: Str
@@ -100,13 +105,15 @@ Params:
 Returns:
   Str`)
 
-	ip.RegisterNative("lstrip",
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"lstrip",
 		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			return Str(trimFunc(true, false)(ctx.Arg("s").Data.(string)))
 		},
 	)
-	setBuiltinDoc(ip, "lstrip", `Remove leading whitespace (Unicode).
+	setBuiltinDoc(target, "lstrip", `Remove leading whitespace (Unicode).
 
 Params:
   s: Str
@@ -114,13 +121,15 @@ Params:
 Returns:
   Str`)
 
-	ip.RegisterNative("rstrip",
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"rstrip",
 		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			return Str(trimFunc(false, true)(ctx.Arg("s").Data.(string)))
 		},
 	)
-	setBuiltinDoc(ip, "rstrip", `Remove trailing whitespace (Unicode).
+	setBuiltinDoc(target, "rstrip", `Remove trailing whitespace (Unicode).
 
 Params:
   s: Str
@@ -128,7 +137,8 @@ Params:
 Returns:
   Str`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"split",
 		[]ParamSpec{{"s", S{"id", "Str"}}, {"sep", S{"id", "Str"}}},
 		S{"array", S{"id", "Str"}},
@@ -143,7 +153,7 @@ Returns:
 			return Arr(out)
 		},
 	)
-	setBuiltinDoc(ip, "split", `Split a string on a separator (no regex).
+	setBuiltinDoc(target, "split", `Split a string on a separator (no regex).
 
 If sep is empty (""), splits between UTF-8 code points.
 
@@ -154,7 +164,8 @@ Params:
 Returns:
   [Str]`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"join",
 		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -168,7 +179,7 @@ Returns:
 			return Str(strings.Join(strs, sep))
 		},
 	)
-	setBuiltinDoc(ip, "join", `Join strings with a separator.
+	setBuiltinDoc(target, "join", `Join strings with a separator.
 
 Params:
   xs: [Str] — pieces to join
@@ -178,7 +189,8 @@ Returns:
   Str`)
 
 	// match(pattern: Str, s: Str) -> [Str]
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"match",
 		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
 		S{"array", S{"id", "Str"}},
@@ -198,7 +210,7 @@ Returns:
 			return Arr(out)
 		},
 	)
-	setBuiltinDoc(ip, "match", `Find all non-overlapping matches of a regex.
+	setBuiltinDoc(target, "match", `Find all non-overlapping matches of a regex.
 
 Params:
   pattern: Str — RE2-compatible regular expression
@@ -208,7 +220,8 @@ Returns:
   [Str] — matched substrings (no capture groups)`)
 
 	// replace(pattern: Str, repl: Str, s: Str) -> Str
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"replace",
 		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"replace", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -224,7 +237,7 @@ Returns:
 			return Str(re.ReplaceAllString(s, rep))
 		},
 	)
-	setBuiltinDoc(ip, "replace", `Replace all non-overlapping regex matches.
+	setBuiltinDoc(target, "replace", `Replace all non-overlapping regex matches.
 
 Params:
   pattern: Str — RE2-compatible regular expression

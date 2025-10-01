@@ -13,14 +13,15 @@ import (
 
 // --- Random Utilities ----------------------------------------------------
 
-func registerRandomBuiltins(ip *Interpreter) {
+func registerRandomBuiltins(ip *Interpreter, target *Env) {
 	// Instance-local RNG and mutex; closures capture these.
 	var (
 		rng   = rand.New(rand.NewSource(time.Now().UnixNano()))
 		rngMu sync.Mutex
 	)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"seedRand",
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Null"},
@@ -32,7 +33,7 @@ func registerRandomBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "seedRand", `Seed the pseudo-random number generator.
+	setBuiltinDoc(target, "seedRand", `Seed the pseudo-random number generator.
 
 Use a fixed seed for reproducible sequences.
 
@@ -42,7 +43,8 @@ Params:
 Returns:
 	Null`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"randInt",
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"id", "Int"},
@@ -63,7 +65,7 @@ Returns:
 			return Int(int64(res))
 		},
 	)
-	setBuiltinDoc(ip, "randInt", `Uniform random integer in [0, n).
+	setBuiltinDoc(target, "randInt", `Uniform random integer in [0, n).
 
 Params:
 	n: Int — upper bound (must be > 0)
@@ -71,7 +73,8 @@ Params:
 Returns:
 	Int`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"randFloat",
 		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
 		S{"id", "Num"},
@@ -82,7 +85,7 @@ Returns:
 			return Num(f)
 		},
 	)
-	setBuiltinDoc(ip, "randFloat", `Uniform random number in [0.0, 1.0).
+	setBuiltinDoc(target, "randFloat", `Uniform random number in [0.0, 1.0).
 
 Params:
 	_: Null
@@ -93,9 +96,10 @@ Returns:
 
 // --- Casting Utilities ----------------------------------------------------
 
-func registerCastBuiltins(ip *Interpreter) {
+func registerCastBuiltins(ip *Interpreter, target *Env) {
 	// pretty(src: Str) -> Str?   (caret-formatted parse errors as soft null)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"formatCode",
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -108,7 +112,7 @@ func registerCastBuiltins(ip *Interpreter) {
 			return Str(out)
 		},
 	)
-	setBuiltinDoc(ip, "formatCode", `Format source code.
+	setBuiltinDoc(target, "formatCode", `Format source code.
 
 Parses the input and pretty-prints it with normalized whitespace and minimal parentheses. Supports PRE/POST annotations (# ... lines above; trailing # ... forces newline). On parse failure, returns null with a caret-formatted error.
 
@@ -119,7 +123,8 @@ Returns:
 	Str?`)
 
 	// formatValue(x: Any) -> Str   (renders with annotations)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"formatValue",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Str"},
@@ -127,7 +132,7 @@ Returns:
 			return Str(FormatValue(ctx.Arg("x")))
 		},
 	)
-	setBuiltinDoc(ip, "formatValue", `Render a runtime value (with annotations).
+	setBuiltinDoc(target, "formatValue", `Render a runtime value (with annotations).
 
 Produces a stable, readable string: scalars are literal; arrays/maps inline when short, otherwise multi-line (maps sort keys). PRE annotations print as header lines; POST as trailing comments. Functions show as <fun: ...>, types as <type: ...>, modules as <module: ...>.
 
@@ -138,7 +143,8 @@ Returns:
 	Str`)
 
 	// str(x: Any) -> Str?   (ignores annotations; soft-error on unsupported)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"str",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -162,7 +168,7 @@ Returns:
 			return Str(FormatValue(clean))
 		},
 	)
-	setBuiltinDoc(ip, "str", `Convert to string if possible; otherwise err.
+	setBuiltinDoc(target, "str", `Convert to string if possible; otherwise err.
 
 Converts values of type Null, Bool, Int, Num, Str, [...], and {...}.
 
@@ -172,7 +178,8 @@ Params:
 Returns:
 	Str?`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"int",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
@@ -198,7 +205,7 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "int", `Convert to Int when possible; otherwise errs.
+	setBuiltinDoc(target, "int", `Convert to Int when possible; otherwise errs.
 
 Rules:
 	• Int → Int
@@ -213,7 +220,8 @@ Params:
 Returns:
 	Int?`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"num",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Num"}},
@@ -239,7 +247,7 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "num", `Convert to Num when possible; otherwise errs.
+	setBuiltinDoc(target, "num", `Convert to Num when possible; otherwise errs.
 
 Rules:
 	• Num → Num
@@ -254,7 +262,8 @@ Params:
 Returns:
 	Num?`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"bool",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
@@ -280,7 +289,7 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "bool", `Convert to Bool using common "truthiness" rules; otherwise errs.
+	setBuiltinDoc(target, "bool", `Convert to Bool using common "truthiness" rules; otherwise errs.
 
 Falsey:
 	• null
@@ -298,7 +307,8 @@ Params:
 Returns:
 	Bool?`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"len",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Int"}},
@@ -319,7 +329,7 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "len", `Length of a value.
+	setBuiltinDoc(target, "len", `Length of a value.
 
 Rules:
 	• [a, b, c] → 3
@@ -336,22 +346,23 @@ Returns:
 
 // --- Math Utilities ----------------------------------------------------
 
-func registerMathBuiltins(ip *Interpreter) {
+func registerMathBuiltins(ip *Interpreter, target *Env) {
 	// Constants
-	ip.Core.Define("PI", Num(math.Pi))
-	ip.Core.Define("E", Num(math.E))
-	setBuiltinDoc(ip, "PI", `Mathematical constant π.
+	target.Define("PI", Num(math.Pi))
+	target.Define("E", Num(math.E))
+	setBuiltinDoc(target, "PI", `Mathematical constant π.
 
 Returns:
 	Num`)
-	setBuiltinDoc(ip, "E", `Euler's number e.
+	setBuiltinDoc(target, "E", `Euler's number e.
 
 Returns:
 	Num`)
 
 	// Unary math helpers
 	un1 := func(name string, f func(float64) float64, doc string) {
-		ip.RegisterNative(
+		ip.RegisterRuntimeBuiltin(
+			target,
 			name,
 			[]ParamSpec{{Name: "x", Type: S{"id", "Num"}}},
 			S{"id", "Num"},
@@ -359,7 +370,7 @@ Returns:
 				return Num(f(ctx.Arg("x").Data.(float64)))
 			},
 		)
-		setBuiltinDoc(ip, name, doc)
+		setBuiltinDoc(target, name, doc)
 	}
 	un1("sin", math.Sin, `Sine of an angle in radians.
 
@@ -404,7 +415,8 @@ Params:
 Returns:
 	Num`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pow",
 		[]ParamSpec{
 			{Name: "base", Type: S{"id", "Num"}},
@@ -415,7 +427,7 @@ Returns:
 			return Num(math.Pow(ctx.Arg("base").Data.(float64), ctx.Arg("exp").Data.(float64)))
 		},
 	)
-	setBuiltinDoc(ip, "pow", `Power: base^exp.
+	setBuiltinDoc(target, "pow", `Power: base^exp.
 
 Params:
 	base: Num
@@ -427,9 +439,10 @@ Returns:
 
 // --- Process Utilities ----------------------------------------------------
 
-func registerProcessBuiltins(ip *Interpreter) {
+func registerProcessBuiltins(ip *Interpreter, target *Env) {
 	// exit(code:Int?) -> Null (terminates the host process)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"exit",
 		[]ParamSpec{{Name: "code", Type: S{"unop", "?", S{"id", "Int"}}}},
 		S{"id", "Null"},
@@ -443,7 +456,7 @@ func registerProcessBuiltins(ip *Interpreter) {
 			return Null // unreachable
 		},
 	)
-	setBuiltinDoc(ip, "exit", `Terminate the current process with an optional status code.
+	setBuiltinDoc(target, "exit", `Terminate the current process with an optional status code.
 
 By convention, 0 indicates success; non-zero indicates an error.
 

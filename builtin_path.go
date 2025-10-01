@@ -18,10 +18,11 @@ import (
 	"path/filepath"
 )
 
-func registerPathBuiltins(ip *Interpreter) {
+func registerPathBuiltins(ip *Interpreter, target *Env) {
 	// pathJoin(parts: [Str]) -> Str
 	// Join path elements using the OS-specific separator.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pathJoin",
 		[]ParamSpec{{Name: "parts", Type: S{"array", S{"id", "Str"}}}},
 		S{"id", "Str"},
@@ -41,7 +42,7 @@ func registerPathBuiltins(ip *Interpreter) {
 			return Str(filepath.Join(elems...))
 		},
 	)
-	setBuiltinDoc(ip, "pathJoin", `Join path elements using the OS-specific separator.
+	setBuiltinDoc(target, "pathJoin", `Join path elements using the OS-specific separator.
 
 Params:
 	parts: [Str] — path fragments
@@ -55,7 +56,8 @@ Notes:
 
 	// pathBase(path: Str) -> Str
 	// Return the last element of path. For empty string, returns ".".
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pathBase",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -64,7 +66,7 @@ Notes:
 			return Str(filepath.Base(p))
 		},
 	)
-	setBuiltinDoc(ip, "pathBase", `Return the last element of a path (OS-specific).
+	setBuiltinDoc(target, "pathBase", `Return the last element of a path (OS-specific).
 
 Params:
 	path: Str
@@ -77,7 +79,8 @@ Notes:
 
 	// pathDir(path: Str) -> Str
 	// Return all but the last element of path, typically the parent directory.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pathDir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -86,7 +89,7 @@ Notes:
 			return Str(filepath.Dir(p))
 		},
 	)
-	setBuiltinDoc(ip, "pathDir", `Return all but the last element of a path.
+	setBuiltinDoc(target, "pathDir", `Return all but the last element of a path.
 
 Params:
 	path: Str
@@ -99,7 +102,8 @@ Notes:
 
 	// pathExt(path: Str) -> Str
 	// Return the file name extension including the leading dot, or "" if none.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pathExt",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -108,7 +112,7 @@ Notes:
 			return Str(filepath.Ext(p))
 		},
 	)
-	setBuiltinDoc(ip, "pathExt", `Return the file extension (including the leading dot), or "" if none.
+	setBuiltinDoc(target, "pathExt", `Return the file extension (including the leading dot), or "" if none.
 
 Params:
 	path: Str
@@ -121,7 +125,8 @@ Notes:
 
 	// pathClean(path: Str) -> Str
 	// Clean up a path by applying lexical simplifications.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"pathClean",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -130,7 +135,7 @@ Notes:
 			return Str(filepath.Clean(p))
 		},
 	)
-	setBuiltinDoc(ip, "pathClean", `Clean a path by applying lexical simplifications.
+	setBuiltinDoc(target, "pathClean", `Clean a path by applying lexical simplifications.
 
 Params:
 	path: Str

@@ -211,14 +211,6 @@ func Test_Builtin_Core_import_and_importCode_paths(t *testing.T) {
 	}
 }
 
-func Test_Builtin_Core_assign_builtin_friendly_error(t *testing.T) {
-	ip, _ := NewRuntime()
-
-	// Attempt to override a Core builtin without let → friendly error.
-	_, err := ip.EvalSource(`import = 1`)
-	wantErrContains(t, err, "cannot assign to builtin: import")
-}
-
 func Test_Builtin_Core_assign_undefined_in_sealed_global(t *testing.T) {
 	ip, _ := NewRuntime()
 
@@ -239,27 +231,6 @@ func Test_Builtin_Core_let_shadow_builtin_ok(t *testing.T) {
 	if _, err := ip.EvalSource(`import("std")`); err != nil {
 		t.Fatalf("builtin import should remain usable, got error: %v", err)
 	}
-}
-
-func Test_Builtin_Core_assign_builtin_persistent_repl(t *testing.T) {
-	ip, _ := NewRuntime()
-
-	// In persistent (Global) scope, assigning to a Core name should also be blocked
-	// with the friendly message.
-	_, err := ip.EvalPersistentSource(`import = 1`)
-	wantErrContains(t, err, "cannot assign to builtin: import")
-
-	// But explicit let in Global is allowed (shadow locally in Global).
-	if _, err := ip.EvalPersistentSource(`let import = 123`); err != nil {
-		t.Fatalf("let shadow of builtin in Global should succeed, got error: %v", err)
-	}
-}
-func Test_Builtin_Core_module_cannot_assign_builtin(t *testing.T) {
-	ip, _ := NewRuntime()
-
-	// Inline module attempts to overwrite a Core builtin → friendly error.
-	_, err := ip.EvalSource(`module "M" do import = 1 end`)
-	wantErrContains(t, err, "cannot assign to builtin: import")
 }
 
 func Test_Builtin_Core_module_let_shadow_builtin_ok(t *testing.T) {
@@ -359,4 +330,72 @@ func Test_Builtin_Core_shift_smoke_and_contract(t *testing.T) {
 	// contractual error on empty
 	_, err := ip.EvalSource(`shift([])`)
 	wantErrContains(t, err, "shift on empty array")
+}
+
+// Builtins now live in Global and are overrideable there.
+func Test_Builtin_Core_assign_builtin_is_overwritable_in_global(t *testing.T) {
+	ip := NewInterpreter()
+	ip.SeedRuntimeInto(ip.Global)
+
+	// Overwrite a runtime builtin ("import") in Global.
+	if err := ip.Global.Set("import", Int(7)); err != nil {
+		t.Fatalf("unexpected error overwriting Global builtin: %v", err)
+	}
+
+	// Confirm the new binding is visible in this namespace.
+	v, err := ip.Global.Get("import")
+	if err != nil {
+		t.Fatalf("missing overwritten binding: %v", err)
+	}
+	if v.Tag != VTInt || v.Data.(int64) != 7 {
+		t.Fatalf("got %v, want Int(7)", v)
+	}
+}
+
+// Overriding in a module's namespace is local and does not affect Global.
+func Test_Builtin_Core_assign_builtin_is_local_to_module(t *testing.T) {
+	ip := NewInterpreter()
+	ip.SeedRuntimeInto(ip.Global)
+
+	// Create a module-like env, seeded like a real module namespace.
+	mod := NewEnv(ip.Core)
+	mod.SealParentWrites()
+	ip.SeedRuntimeInto(mod)
+
+	// Override "import" inside the module.
+	if err := mod.Set("import", Int(9)); err != nil {
+		t.Fatalf("unexpected error overwriting module builtin: %v", err)
+	}
+
+	// Module sees its override…
+	mv, err := mod.Get("import")
+	if err != nil {
+		t.Fatalf("module missing overwritten binding: %v", err)
+	}
+	if mv.Tag != VTInt || mv.Data.(int64) != 9 {
+		t.Fatalf("module got %v, want Int(9)", mv)
+	}
+
+	// …but Global remains independent (should not be Int(9)).
+	gv, err := ip.Global.Get("import")
+	if err != nil {
+		t.Fatalf("global missing builtin 'import': %v", err)
+	}
+	if gv.Tag == VTInt && gv.Data.(int64) == 9 {
+		t.Fatalf("global was affected by module override; want isolation")
+	}
+}
+
+// Core intrinsics remain protected: attempts to assign should fail with friendly error.
+func Test_Builtin_Core_core_intrinsic_cannot_be_assigned(t *testing.T) {
+	ip := NewInterpreter()
+	ip.SeedRuntimeInto(ip.Global)
+
+	err := ip.Global.Set("__assign_set", Int(1)) // Core intrinsic installed by initCore
+	if err == nil {
+		t.Fatalf("expected an error assigning to core intrinsic, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot assign to builtin: __assign_set") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

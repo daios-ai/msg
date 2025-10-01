@@ -58,12 +58,7 @@ func panicRt(msg string, src *SourceRef, line, col int) {
 //                          PRIVATE OPS FACADE (to API)
 ////////////////////////////////////////////////////////////////////////////////
 
-type opsImpl struct{ ip *Interpreter }
-
-func newOps(ip *Interpreter) opsCore { return &opsImpl{ip: ip} }
-
-func (o *opsImpl) initCore() {
-	ip := o.ip
+func initCore(ip *Interpreter) {
 	if ip.Core == nil {
 		ip.Core = NewEnv(nil)
 	}
@@ -1001,9 +996,10 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 		}
 	}
 
-	// Fresh env for the module (Core is parent so builtins are visible).
-	modEnv := NewEnv(ip.Core)
-	modEnv.SealParentWrites()
+	// Fresh env for the module using a fast snapshot of the pre-seeded Base.
+	modBase := ip.newBaseFromTemplate()
+	// User frame for the module (exports come from here). Allow overwriting into Base.
+	modEnv := NewEnv(modBase)
 
 	// SourceRef rooted at the module BODY path (absolute)
 	var sr *SourceRef

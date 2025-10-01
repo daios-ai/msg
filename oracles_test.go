@@ -678,21 +678,20 @@ func wantAnnotNull(t *testing.T, v Value, substr string) {
 
 // --- lexical-resolution tests -----------------------------------------------
 
-//  1. If no hook is visible in the oracle's lexical chain at definition time,
-//     the call returns annotated null (no Global fallback).
-func Test_Oracle_LexicalHook_Missing(t *testing.T) {
-	ip := NewInterpreter()
-	registerJSONParse(ip) // needed by oracle engine
-	// IMPORTANT: Do NOT register __oracle_execute anywhere.
+func Test_Oracle_Hook_StrToStr_Typecheck(t *testing.T) {
+	ip, err := NewRuntime()
+	if err != nil {
+		t.Fatalf("NewRuntime error: %v", err)
+	}
 
-	v, err := ip.EvalSource(`
-		let o = oracle() -> Str
-		o()
-	`)
+	// Evaluate in Global(ns): should see __oracle_execute via Global -> Base(ns) -> Core.
+	v, err := ip.EvalSource(`isType(__oracle_execute, type Str -> Str?)`)
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
-	wantAnnotNull(t, v, "oracle backend not configured")
+	if v.Tag != VTBool || v.Data.(bool) != true {
+		t.Fatalf("expected true for isType(__oracle_execute, type Str -> Str?), got: %#v", v)
+	}
 }
 
 //  2. A user-space binding defined BEFORE the oracle is created is captured

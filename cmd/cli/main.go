@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -458,17 +459,63 @@ func cmdFmt(args []string) int {
 // -----------------------------------------------------------------------------
 
 func cmdTest(args []string) int {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	path := fs.String("root", ".", "root directory to search")
-	par := fs.Bool("p", false, "run tests in parallel")
-	verb := fs.Bool("v", false, "verbose output (per-test RUN/PASS/FAIL)")
-	toMS := fs.Int("timeout", 0, "per-test timeout in ms (<=0 disables)")
-	_ = fs.Parse(args)
+	// Defaults
+	pathPrefix := "."
+	parallel := false
+	verbose := false
+	timeoutMs := 0
 
-	// If user passed a bare path as first arg, accept it like `go test ./...`
-	rem := fs.Args()
-	if len(rem) > 0 && *path == "." {
-		*path = rem[0]
+	// Tolerant manual parse so flags can appear before/after the path.
+	// Supports: -p, -v, -timeout=123, -timeout 123, and optional "--".
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+
+		// End-of-flags marker: next non-flag (if any) becomes the path prefix.
+		if a == "--" {
+			if i+1 < len(args) {
+				pathPrefix = args[i+1]
+			}
+			break
+		}
+
+		if strings.HasPrefix(a, "-") {
+			switch {
+			case a == "-p":
+				parallel = true
+			case a == "-v":
+				verbose = true
+			case strings.HasPrefix(a, "-timeout="):
+				val := strings.TrimPrefix(a, "-timeout=")
+				n, err := strconv.Atoi(val)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%s: invalid -timeout value %q\n", appName, val)
+					return 2
+				}
+				timeoutMs = n
+			case a == "-timeout":
+				if i+1 >= len(args) {
+					fmt.Fprintf(os.Stderr, "%s: -timeout requires a value\n", appName)
+					return 2
+				}
+				i++
+				val := args[i]
+				n, err := strconv.Atoi(val)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%s: invalid -timeout value %q\n", appName, val)
+					return 2
+				}
+				timeoutMs = n
+			default:
+				fmt.Fprintf(os.Stderr, "%s: unknown flag %q\n", appName, a)
+				return 2
+			}
+			continue
+		}
+
+		// First non-flag token → path prefix (if not already set by "--").
+		if pathPrefix == "." {
+			pathPrefix = a
+		}
 	}
 
 	ip, rtErr := mindscript.NewRuntime()
@@ -479,20 +526,25 @@ func cmdTest(args []string) int {
 	}
 
 	code := fmt.Sprintf(`import("testing").run({
-  root: %q,
+  pathPrefix: %q,
   parallel: %v,
   verbose: %v,
   timeoutMs: %d
-})`, *path, *par, *verb, *toMS)
+})`, pathPrefix, parallel, verbose, timeoutMs)
 
 	v, err := ip.EvalPersistentSource(code)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 1
 	}
-	// Assume testing.run returns Bool (true if all passed).
-	if v.Tag == mindscript.VTBool && v.Data.(bool) {
-		return 0
+
+	// testing.run returns Summary: {passed:Int, failed:Int, total:Int, durationMs:Int}
+	if v.Tag == mindscript.VTMap {
+		if mo, ok := v.Data.(*mindscript.MapObject); ok {
+			if f, ok := mo.Entries["failed"]; ok && f.Tag == mindscript.VTInt && f.Data.(int64) == 0 {
+				return 0
+			}
+		}
 	}
 	return 1
 }

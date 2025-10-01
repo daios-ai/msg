@@ -90,9 +90,10 @@ func decodeAndValidate(av Value) (S, Value) {
 
 // ---- registration -----------------------------------------------------------
 
-func registerIntrospectionBuiltins(ip *Interpreter) {
+func registerIntrospectionBuiltins(ip *Interpreter, target *Env) {
 	// noteGet(x: Any) -> Str?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"noteGet",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -104,7 +105,7 @@ func registerIntrospectionBuiltins(ip *Interpreter) {
 			return Str(v.Annot)
 		},
 	)
-	setBuiltinDoc(ip, "noteGet", `Get the annotation attached to a value, if any.
+	setBuiltinDoc(target, "noteGet", `Get the annotation attached to a value, if any.
 
 Params:
 	x: Any — any runtime value
@@ -114,7 +115,8 @@ Notes:
 	• See also: noteSet(text, value) to attach annotations programmatically.`)
 
 	// noteSet(text: Str, value: Any) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"noteSet",
 		[]ParamSpec{
 			{Name: "text", Type: S{"id", "Str"}},
@@ -128,7 +130,7 @@ Notes:
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "noteSet", `Attach or replace an annotation on a value.
+	setBuiltinDoc(target, "noteSet", `Attach or replace an annotation on a value.
 
 Params:
 	text: Str  — annotation text to attach
@@ -140,7 +142,8 @@ Notes:
 	• Annotations never affect equality but are rendered by printers.`)
 
 	// astParse(src: Str) -> []
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"astParse",
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"array"}},
@@ -157,7 +160,7 @@ Notes:
 			return IxToS(ast)
 		},
 	)
-	setBuiltinDoc(ip, "astParse", `Parse source code into runtime-S (VTArray).
+	setBuiltinDoc(target, "astParse", `Parse source code into runtime-S (VTArray).
 
 Params:
 	src: Str — MindScript source
@@ -167,7 +170,8 @@ Notes:
 	• Encoding is stable and round-trippable with astEval / reify.`)
 
 	// astEval(ast: []) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"astEval",
 		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
 		S{"id", "Any"},
@@ -184,7 +188,7 @@ Notes:
 			return res
 		},
 	)
-	setBuiltinDoc(ip, "astEval", `Evaluate a runtime-S AST in the caller's scope.
+	setBuiltinDoc(target, "astEval", `Evaluate a runtime-S AST in the caller's scope.
 
 Params:
 	ast: [] — runtime-S AST (["tag", ...])
@@ -192,7 +196,8 @@ Returns:
 	Any — evaluation result (or error)`)
 
 	// astFormat(ast: []) -> Str
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"astFormat",
 		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -205,7 +210,7 @@ Returns:
 			return Str(FormatSExpr(sexpr))
 		},
 	)
-	setBuiltinDoc(ip, "astFormat", `Format a runtime-S AST into stable source.
+	setBuiltinDoc(target, "astFormat", `Format a runtime-S AST into stable source.
 
 Params:
 	ast: [] — runtime-S AST
@@ -214,7 +219,8 @@ Returns:
 
 	// astValidate(ast: []) -> [ {path!:Str, code!:Str, message!:Str, got!:Str, expect!:Str} ]
 	// Always returns an array (possibly empty). Never returns annotated-null.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"astValidate",
 		[]ParamSpec{{Name: "ast", Type: S{"array"}}},
 		S{"array"},
@@ -233,7 +239,7 @@ Returns:
 			return IxValidateS(sexpr)
 		},
 	)
-	setBuiltinDoc(ip, "astValidate", `Validate a runtime-S AST.
+	setBuiltinDoc(target, "astValidate", `Validate a runtime-S AST.
 
 Params:
   ast: [] — runtime-S AST
@@ -243,7 +249,8 @@ Returns:
     • On failure, one or more error objects. (Shape/decode errors produce one entry with code "E_RUNTIME_SHAPE".)`)
 
 	// reflect(val: Any) -> []
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"reflect",
 		[]ParamSpec{{Name: "val", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"array"}},
@@ -251,7 +258,7 @@ Returns:
 			return IxReflect(ctx.Arg("val"))
 		},
 	)
-	setBuiltinDoc(ip, "reflect", `Reflect a value into constructor code (runtime-S).
+	setBuiltinDoc(target, "reflect", `Reflect a value into constructor code (runtime-S).
 
 Params:
 	val: Any — value to reflect
@@ -261,7 +268,8 @@ Soft errors:
 	• Opaque handles/unknowns → annotated-null`)
 
 	// reify(rt: []) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"reify",
 		[]ParamSpec{{Name: "rt", Type: S{"array"}}},
 		S{"id", "Any"},
@@ -278,7 +286,7 @@ Soft errors:
 			return val
 		},
 	)
-	setBuiltinDoc(ip, "reify", `Decode and evaluate constructor code (runtime-S).
+	setBuiltinDoc(target, "reify", `Decode and evaluate constructor code (runtime-S).
 
 Params:
 	rt: [] — constructor code produced by reflect(...) or astParse(...)

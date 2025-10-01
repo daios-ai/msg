@@ -47,8 +47,9 @@ type netListenerH struct {
 
 // --- OS primitives ----------------------------------------
 
-func registerOsBuiltins(ip *Interpreter) {
-	ip.RegisterNative(
+func registerOsBuiltins(ip *Interpreter, target *Env) {
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"osEnv",
 		[]ParamSpec{{Name: "name", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -60,14 +61,15 @@ func registerOsBuiltins(ip *Interpreter) {
 			return Null
 		},
 	)
-	setBuiltinDoc(ip, "osEnv", `Read an environment variable.
+	setBuiltinDoc(target, "osEnv", `Read an environment variable.
 
 Params:
 	name: Str
 Returns:
 	Str? (null if unset)`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"osSetEnv",
 		[]ParamSpec{
 			{Name: "name", Type: S{"id", "Str"}},
@@ -90,7 +92,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "osSetEnv", `Set or unset an environment variable.
+	setBuiltinDoc(target, "osSetEnv", `Set or unset an environment variable.
 
 If value is null (or omitted), the variable is unset.
 
@@ -102,7 +104,8 @@ Returns:
 	Bool? (annotated null on OS error)`)
 
 	// stat(path) -> { isDir!:Bool, size!:Int, modTimeMillis!:Int, mode!:Int }?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"stat",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{
@@ -131,7 +134,7 @@ Returns:
 			return Value{Tag: VTMap, Data: mo}
 		},
 	)
-	setBuiltinDoc(ip, "stat", `File status (like ls -l metadata).
+	setBuiltinDoc(target, "stat", `File status (like ls -l metadata).
 
 Params:
 	path: Str
@@ -140,7 +143,8 @@ Returns:
 	{ isDir!: Bool, size!: Int, modTimeMillis!: Int, mode!: Int }?,
 	or annotated null on error (e.g., not found).`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"mkdir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
@@ -153,7 +157,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "mkdir", `Create a directory (creating parents as needed).
+	setBuiltinDoc(target, "mkdir", `Create a directory (creating parents as needed).
 
 Params:
 	path: Str
@@ -161,7 +165,8 @@ Params:
 Returns:
 	Bool? (annotated null on error)`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"rename",
 		[]ParamSpec{
 			{Name: "old", Type: S{"id", "Str"}},
@@ -177,7 +182,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "rename", `Rename (move) a file or directory.
+	setBuiltinDoc(target, "rename", `Rename (move) a file or directory.
 
 Params:
 	old: Str
@@ -186,7 +191,8 @@ Params:
 Returns:
 	Bool? (annotated null on error)`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"remove",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
@@ -199,7 +205,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "remove", `Delete a file or an empty directory.
+	setBuiltinDoc(target, "remove", `Delete a file or an empty directory.
 
 Params:
 	path: Str
@@ -207,7 +213,8 @@ Params:
 Returns:
 	Bool? (annotated null on error). Note: fails for non-empty directories.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"cwd",
 		[]ParamSpec{},
 		S{"unop", "?", S{"id", "Str"}},
@@ -219,12 +226,13 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "cwd", `Get the current working directory.
+	setBuiltinDoc(target, "cwd", `Get the current working directory.
 
 Returns:
 	Str? (annotated null on error)`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chdir",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
@@ -236,7 +244,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "chdir", `Change the current working directory.
+	setBuiltinDoc(target, "chdir", `Change the current working directory.
 
 Params:
 	path: Str
@@ -244,7 +252,8 @@ Params:
 Returns:
 	Bool? (annotated null on error)`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"tempDir",
 		[]ParamSpec{},
 		S{"id", "Str"},
@@ -252,7 +261,7 @@ Returns:
 			return Str(os.TempDir())
 		},
 	)
-	setBuiltinDoc(ip, "tempDir", `Return the system temporary directory.
+	setBuiltinDoc(target, "tempDir", `Return the system temporary directory.
 
 Returns:
 	Str`)
@@ -260,7 +269,7 @@ Returns:
 
 // --- I/O primitives (file & network) ----------------------------------------
 
-func registerIOBuiltins(ip *Interpreter) {
+func registerIOBuiltins(ip *Interpreter, target *Env) {
 	openFile := func(path, mode string) (*fileH, error) {
 		var flag int
 		switch mode {
@@ -355,17 +364,18 @@ func registerIOBuiltins(ip *Interpreter) {
 		isStd: true,
 	}
 
-	ip.Core.Define("STDIN", HandleVal("file", stdinH))
-	ip.Core.Define("STDOUT", HandleVal("file", stdoutH))
-	ip.Core.Define("STDERR", HandleVal("file", stderrH))
+	target.Define("STDIN", HandleVal("file", stdinH))
+	target.Define("STDOUT", HandleVal("file", stdoutH))
+	target.Define("STDERR", HandleVal("file", stderrH))
 
-	setBuiltinDoc(ip, "STDIN", `Readable handle for the process standard input.`)
-	setBuiltinDoc(ip, "STDOUT", `Writable handle for the process standard output.`)
-	setBuiltinDoc(ip, "STDERR", `Writable handle for the process standard error.`)
+	setBuiltinDoc(target, "STDIN", `Readable handle for the process standard input.`)
+	setBuiltinDoc(target, "STDOUT", `Writable handle for the process standard output.`)
+	setBuiltinDoc(target, "STDERR", `Writable handle for the process standard error.`)
 
 	// ---------- File & stream I/O
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"open",
 		[]ParamSpec{
 			{Name: "path", Type: S{"id", "Str"}},
@@ -388,7 +398,7 @@ func registerIOBuiltins(ip *Interpreter) {
 			return HandleVal("file", h)
 		},
 	)
-	setBuiltinDoc(ip, "open", `Open a file and return a handle.
+	setBuiltinDoc(target, "open", `Open a file and return a handle.
 
 Modes:
 	"r"  — read-only
@@ -405,7 +415,8 @@ Returns:
 	or null (annotated) on I/O failure.`)
 
 	// close(h: Any) -> Bool?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"close",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
@@ -454,7 +465,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "close", `Close a file, network connection, or listener handle.
+	setBuiltinDoc(target, "close", `Close a file, network connection, or listener handle.
 
 Flushes buffered output (if any) before closing.
 Never closes STDIN/STDOUT/STDERR; they are only flushed.
@@ -463,7 +474,8 @@ Returns annotated null on I/O failure; hard-errors on misuse.
 Returns:
 	Bool?`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"readAll",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -476,12 +488,13 @@ Returns:
 			return Str(string(b))
 		},
 	)
-	setBuiltinDoc(ip, "readAll", `Read all remaining bytes from a handle.
+	setBuiltinDoc(target, "readAll", `Read all remaining bytes from a handle.
 
 Blocks until EOF and returns the data as Str.
 Returns null (annotated) on I/O error.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"readN",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}, {Name: "n", Type: S{"id", "Int"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -500,12 +513,13 @@ Returns null (annotated) on I/O error.`)
 			return Str(string(buf[:k]))
 		},
 	)
-	setBuiltinDoc(ip, "readN", `Read up to n bytes from a handle.
+	setBuiltinDoc(target, "readN", `Read up to n bytes from a handle.
 
 May return fewer than n bytes at EOF. Returns data as Str.
 Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"readLine",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -522,11 +536,12 @@ Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 			return Str(strings.TrimRight(s, "\r\n"))
 		},
 	)
-	setBuiltinDoc(ip, "readLine", `Read one line from a handle (without the trailing newline).
+	setBuiltinDoc(target, "readLine", `Read one line from a handle (without the trailing newline).
 
 Returns null at EOF. Returns null (annotated) on I/O error.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"write",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}, {Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Int"}},
@@ -540,12 +555,13 @@ Returns null at EOF. Returns null (annotated) on I/O error.`)
 			return Int(int64(n))
 		},
 	)
-	setBuiltinDoc(ip, "write", `Write a string to a file or network handle.
+	setBuiltinDoc(target, "write", `Write a string to a file or network handle.
 
 Returns the number of bytes written as Int, or null (annotated) on I/O error.
 Output is buffered; call flush to ensure delivery.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"flush",
 		[]ParamSpec{{Name: "h", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}}, // Bool?
@@ -557,7 +573,7 @@ Output is buffered; call flush to ensure delivery.`)
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "flush", `Flush buffered output for a handle.
+	setBuiltinDoc(target, "flush", `Flush buffered output for a handle.
 
 Ensures written data is visible to readers/peers.
 Returns annotated null on I/O error.
@@ -565,7 +581,8 @@ Returns annotated null on I/O error.
 Returns:
 	Bool?`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"readFile",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
@@ -578,7 +595,7 @@ Returns:
 			return Str(string(b))
 		},
 	)
-	setBuiltinDoc(ip, "readFile", `Read an entire file into a string.
+	setBuiltinDoc(target, "readFile", `Read an entire file into a string.
 
 Params:
 	path: Str
@@ -586,7 +603,8 @@ Params:
 Returns:
 	Str, or null (annotated) on I/O error.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"writeFile",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}, {Name: "data", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Int"}},
@@ -600,12 +618,13 @@ Returns:
 			return Int(int64(len(data)))
 		},
 	)
-	setBuiltinDoc(ip, "writeFile", `Write a string to a file (overwriting if it exists).
+	setBuiltinDoc(target, "writeFile", `Write a string to a file (overwriting if it exists).
 
 Creates the file if necessary with mode 0644.
 Returns the number of bytes written as Int, or null (annotated) on I/O error.`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"dirList",
 		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"array", S{"id", "Str"}}},
@@ -622,7 +641,7 @@ Returns the number of bytes written as Int, or null (annotated) on I/O error.`)
 			return Arr(out)
 		},
 	)
-	setBuiltinDoc(ip, "dirList", `List directory entries as an array of names.
+	setBuiltinDoc(target, "dirList", `List directory entries as an array of names.
 
 Params:
 	path: Str
@@ -631,7 +650,8 @@ Returns:
 	[Str], or null (annotated) on I/O error (e.g., permission denied).`)
 
 	// sprintf(fmt: Str, args: [Any]) -> Str?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"sprintf",
 		[]ParamSpec{
 			{Name: "fmt", Type: S{"id", "Str"}},
@@ -653,7 +673,7 @@ Returns:
 			return Str(out)
 		},
 	)
-	setBuiltinDoc(ip, "sprintf", `Format a string with printf-style verbs.
+	setBuiltinDoc(target, "sprintf", `Format a string with printf-style verbs.
 
 Supports Go-style verbs like %s, %v, %d, %f, etc.
 Args are passed as an array: sprintf("%s = %v", ["x", 42])
@@ -667,7 +687,8 @@ Returns:
 
 	// printf(fmt: Str, args: [Any]) -> Str?
 	// NOTE: Writes through the same buffered STDOUT handle used by write/flush to avoid interleaving.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"printf",
 		[]ParamSpec{
 			{Name: "fmt", Type: S{"id", "Str"}},
@@ -698,7 +719,7 @@ Returns:
 			return Str(out)
 		},
 	)
-	setBuiltinDoc(ip, "printf", `Print a formatted string to standard output.
+	setBuiltinDoc(target, "printf", `Print a formatted string to standard output.
 
 Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
 Caller controls newlines:

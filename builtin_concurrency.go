@@ -153,9 +153,10 @@ func deepCloneValue(ctx *cloneCtx, v Value, targetCore *Env) Value {
 
 // ---------------------------------------------------------------------------
 
-func registerConcurrencyBuiltins(ip *Interpreter) {
+func registerConcurrencyBuiltins(ip *Interpreter, target *Env) {
 	// procSpawn(f) -> proc handle
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"procSpawn",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
@@ -215,7 +216,7 @@ func registerConcurrencyBuiltins(ip *Interpreter) {
 			return HandleVal("proc", pr)
 		},
 	)
-	setBuiltinDoc(ip, "procSpawn", `Run a function concurrently in an isolated process (clone of the current interpreter).
+	setBuiltinDoc(target, "procSpawn", `Run a function concurrently in an isolated process (clone of the current interpreter).
 
 The function's closure environment is deep-snapshotted into the child isolate.
 Results are retrieved via procJoin. Cancellation is cooperative; see procCancel / procCancelled.
@@ -227,7 +228,8 @@ Returns:
 	Any   # proc handle (opaque)`)
 
 	// procJoin(p) -> Any
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"procJoin",
 		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
@@ -237,7 +239,7 @@ Returns:
 			return pr.result
 		},
 	)
-	setBuiltinDoc(ip, "procJoin", `Wait for a process to finish and return its result.
+	setBuiltinDoc(target, "procJoin", `Wait for a process to finish and return its result.
 
 Params:
 	p: Any   # proc handle
@@ -246,7 +248,8 @@ Returns:
 	Any`)
 
 	// procCancel(p) -> Bool | Null(err)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"procCancel",
 		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
@@ -268,7 +271,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "procCancel", `Request cooperative cancellation of a process (best effort).
+	setBuiltinDoc(target, "procCancel", `Request cooperative cancellation of a process (best effort).
 
 See also: procCancelled.
 
@@ -279,7 +282,8 @@ Returns:
 	Bool?   # true if cancellation was newly requested; Null(err) if already cancelled`)
 
 	// procCancelled(p) -> Bool
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"procCancelled",
 		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
 		S{"id", "Bool"},
@@ -293,7 +297,7 @@ Returns:
 			}
 		},
 	)
-	setBuiltinDoc(ip, "procCancelled", `Check whether cancellation was requested for a process.
+	setBuiltinDoc(target, "procCancelled", `Check whether cancellation was requested for a process.
 
 See also: procCancel.
 
@@ -304,7 +308,8 @@ Returns:
 	Bool`)
 
 	// procJoinAll(ps:[proc]) -> [Any]
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"procJoinAll",
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
 		S{"array", S{"id", "Any"}},
@@ -319,7 +324,7 @@ Returns:
 			return Arr(out)
 		},
 	)
-	setBuiltinDoc(ip, "procJoinAll", `Wait for all processes to finish and return their results in order.
+	setBuiltinDoc(target, "procJoinAll", `Wait for all processes to finish and return their results in order.
 
 Params:
 	ps: [Any]   # list of proc handles
@@ -328,7 +333,8 @@ Returns:
 	[Any]`)
 
 	// procJoinAny(ps:[proc]) -> { index:Int, value:Any }?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"procJoinAny",
 		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
 		S{"unop", "?", S{"map"}},
@@ -358,7 +364,7 @@ Returns:
 			return Value{Tag: VTMap, Data: mo}
 		},
 	)
-	setBuiltinDoc(ip, "procJoinAny", `Wait for any process to finish; return its index and value.
+	setBuiltinDoc(target, "procJoinAny", `Wait for any process to finish; return its index and value.
 
 Params:
 	ps: [Any]   # list of proc handles (non-empty)
@@ -371,7 +377,8 @@ Errors:
 
 	// ------------------ Channels ------------------
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chanOpen",
 		[]ParamSpec{{Name: "cap", Type: S{"unop", "?", S{"id", "Int"}}}},
 		S{"id", "Any"},
@@ -386,7 +393,7 @@ Errors:
 			return HandleVal("chan", &chanBox{ch: make(chan Value, int(capacity))})
 		},
 	)
-	setBuiltinDoc(ip, "chanOpen", `Create a new channel for Values.
+	setBuiltinDoc(target, "chanOpen", `Create a new channel for Values.
 
 When cap > 0, the channel is buffered.
 
@@ -397,7 +404,8 @@ Returns:
 	Any   # channel handle (opaque)`)
 
 	// chanSend(c, x) -> Bool?  (true on success; Null("channel closed") on error)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chanSend",
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
@@ -419,7 +427,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "chanSend", `Send a value on a channel (blocking).
+	setBuiltinDoc(target, "chanSend", `Send a value on a channel (blocking).
 
 Params:
 	c: Any   # channel handle
@@ -429,7 +437,8 @@ Returns:
 	Bool?   # true on success; Null("channel closed") if the channel is closed`)
 
 	// chanRecv(c) -> Any?  (Null("channel closed") if closed and empty)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chanRecv",
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
@@ -442,7 +451,7 @@ Returns:
 			return v
 		},
 	)
-	setBuiltinDoc(ip, "chanRecv", `Receive a value from a channel (blocking).
+	setBuiltinDoc(target, "chanRecv", `Receive a value from a channel (blocking).
 
 Params:
 	c: Any   # channel handle
@@ -454,7 +463,8 @@ Errors:
 	annotated Null with message "channel closed" if the channel is closed and empty`)
 
 	// chanTrySend(c, x) -> Bool
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chanTrySend",
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Bool"},
@@ -478,7 +488,7 @@ Errors:
 			return Bool(sent)
 		},
 	)
-	setBuiltinDoc(ip, "chanTrySend", `Attempt a non-blocking send on a channel.
+	setBuiltinDoc(target, "chanTrySend", `Attempt a non-blocking send on a channel.
 
 Params:
 	c: Any   # channel handle
@@ -488,7 +498,8 @@ Returns:
 	Bool   # true if sent, false if would block`)
 
 	// chanTryRecv(c) -> { ok:Bool, value:Any }
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chanTryRecv",
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"map"},
@@ -516,7 +527,7 @@ Returns:
 			return Value{Tag: VTMap, Data: out}
 		},
 	)
-	setBuiltinDoc(ip, "chanTryRecv", `Attempt a non-blocking receive from a channel.
+	setBuiltinDoc(target, "chanTryRecv", `Attempt a non-blocking receive from a channel.
 
 If a value is immediately available, returns {ok:true, value:V}.
 If the channel is closed and empty, returns {ok:true, value: <annotated null "channel closed">}.
@@ -529,7 +540,8 @@ Returns:
 	{ ok: Bool, value: Any }`)
 
 	// chanClose(c) -> Bool?  (true on first close; Null("channel already closed") otherwise)
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"chanClose",
 		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
@@ -550,7 +562,7 @@ Returns:
 			return Bool(true)
 		},
 	)
-	setBuiltinDoc(ip, "chanClose", `Close a channel (idempotent).
+	setBuiltinDoc(target, "chanClose", `Close a channel (idempotent).
 
 On first close returns true; on subsequent closes returns Null("channel already closed").
 
@@ -562,7 +574,8 @@ Returns:
 
 	// ------------------ Timers ------------------
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"timerAfter",
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
 		S{"id", "Any"},
@@ -582,7 +595,7 @@ Returns:
 			return HandleVal("chan", cb)
 		},
 	)
-	setBuiltinDoc(ip, "timerAfter", `Create a channel that emits one tick after a delay, then closes.
+	setBuiltinDoc(target, "timerAfter", `Create a channel that emits one tick after a delay, then closes.
 
 The tick payload is the Unix timestamp in milliseconds (Int).
 
@@ -595,7 +608,8 @@ Returns:
 Errors:
 	annotated Null if ms < 0`)
 
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"ticker",
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
 		S{"id", "Any"},
@@ -626,7 +640,7 @@ Errors:
 			return HandleVal("chan", cb)
 		},
 	)
-	setBuiltinDoc(ip, "ticker", `Create a channel that emits periodic ticks until closed by the consumer.
+	setBuiltinDoc(target, "ticker", `Create a channel that emits periodic ticks until closed by the consumer.
 
 The tick payload is the Unix timestamp in milliseconds (Int).
 Call chanClose on the returned channel to stop the ticker goroutine.

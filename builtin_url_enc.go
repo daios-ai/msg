@@ -30,7 +30,7 @@ import (
 	"strings"
 )
 
-func registerEncodingURLBuiltins(ip *Interpreter) {
+func registerEncodingURLBuiltins(ip *Interpreter, target *Env) {
 	annNull := func(msg string) Value {
 		v := Null
 		v.Annot = msg
@@ -38,7 +38,8 @@ func registerEncodingURLBuiltins(ip *Interpreter) {
 	}
 
 	// base64Encode(x: Str) -> Str
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"base64Encode",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -51,7 +52,7 @@ func registerEncodingURLBuiltins(ip *Interpreter) {
 			return Str(out)
 		},
 	)
-	setBuiltinDoc(ip, "base64Encode", `Base64-encode bytes from a string.
+	setBuiltinDoc(target, "base64Encode", `Base64-encode bytes from a string.
 
 Params:
 	x: Str — input bytes (string may contain arbitrary bytes)
@@ -60,7 +61,8 @@ Returns:
 	Str — standard Base64 with '=' padding (RFC 4648).`)
 
 	// base64Decode(s: Str) -> Str?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"base64Decode",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
@@ -76,7 +78,7 @@ Returns:
 			return Str(string(b))
 		},
 	)
-	setBuiltinDoc(ip, "base64Decode", `Decode a standard Base64 string.
+	setBuiltinDoc(target, "base64Decode", `Decode a standard Base64 string.
 
 Params:
 	s: Str — standard Base64 with '=' padding
@@ -85,7 +87,8 @@ Returns:
 	Str? — decoded bytes as Str, or null (annotated) on invalid input.`)
 
 	// hexEncode(x: Str) -> Str
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"hexEncode",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -98,7 +101,7 @@ Returns:
 			return Str(out)
 		},
 	)
-	setBuiltinDoc(ip, "hexEncode", `Hex-encode bytes to a lowercase hexadecimal string.
+	setBuiltinDoc(target, "hexEncode", `Hex-encode bytes to a lowercase hexadecimal string.
 
 Params:
 	x: Str — input bytes
@@ -107,7 +110,8 @@ Returns:
 	Str — lowercase hex (two chars per byte).`)
 
 	// hexDecode(s: Str) -> Str?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"hexDecode",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
@@ -124,7 +128,7 @@ Returns:
 			return Str(string(b))
 		},
 	)
-	setBuiltinDoc(ip, "hexDecode", `Decode a hexadecimal string.
+	setBuiltinDoc(target, "hexDecode", `Decode a hexadecimal string.
 
 Params:
 	s: Str — hex string (case-insensitive), even length
@@ -133,7 +137,8 @@ Returns:
 	Str? — decoded bytes as Str, or null (annotated) on invalid input.`)
 
 	// urlParse(s: Str) -> { scheme, host, port?, path, query:{}, fragment? }?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"urlParse",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"map"}},
@@ -193,7 +198,7 @@ Returns:
 			return Value{Tag: VTMap, Data: out}
 		},
 	)
-	setBuiltinDoc(ip, "urlParse", `Parse a URL into components.
+	setBuiltinDoc(target, "urlParse", `Parse a URL into components.
 
 Params:
 	s: Str — URL string
@@ -213,7 +218,8 @@ Notes:
 	• IPv6 hosts are returned without brackets in 'host'.`)
 
 	// urlBuild(u: { scheme, host, port?, path?, query:{}, fragment? }) -> Str
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"urlBuild",
 		[]ParamSpec{{Name: "u", Type: S{"map"}}},
 		S{"id", "Str"},
@@ -318,7 +324,7 @@ Notes:
 			return Str(out)
 		},
 	)
-	setBuiltinDoc(ip, "urlBuild", `Build a URL string from components.
+	setBuiltinDoc(target, "urlBuild", `Build a URL string from components.
 
 Params:
 	u: {
@@ -338,7 +344,8 @@ Notes:
 	• 'query' values accept Str or [Str].`)
 
 	// urlQueryParse(s: Str) -> {}?
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"urlQueryParse",
 		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"map"}},
@@ -371,7 +378,7 @@ Notes:
 			return Value{Tag: VTMap, Data: out}
 		},
 	)
-	setBuiltinDoc(ip, "urlQueryParse", `Parse a URL query string into a map.
+	setBuiltinDoc(target, "urlQueryParse", `Parse a URL query string into a map.
 
 Params:
 	s: Str — query string with or without the leading '?'
@@ -383,7 +390,8 @@ Notes:
 	• Percent-decoding is applied to keys and values.`)
 
 	// urlQueryString(q: {}) -> Str
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"urlQueryString",
 		[]ParamSpec{{Name: "q", Type: S{"map"}}},
 		S{"id", "Str"},
@@ -414,7 +422,7 @@ Notes:
 			return Str(qs.Encode())
 		},
 	)
-	setBuiltinDoc(ip, "urlQueryString", `Serialize a query map to 'application/x-www-form-urlencoded'.
+	setBuiltinDoc(target, "urlQueryString", `Serialize a query map to 'application/x-www-form-urlencoded'.
 
 Params:
 	q: {} — map Str -> Str|[Str]

@@ -68,17 +68,10 @@ func headersToMap(h http.Header) Value {
 	return Map(hm)
 }
 
-// helper: optional string field extraction from {Str: Any}
-func getOptionalStr(m *MapObject, key string) (string, bool) {
-	if v, ok := m.Entries[key]; ok && v.Tag == VTStr {
-		return v.Data.(string), true
-	}
-	return "", false
-}
-
-func registerNetBuiltins(ip *Interpreter) {
+func registerNetBuiltins(ip *Interpreter, target *Env) {
 	// netConnect("host:port") -> "net" handle
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"netConnect",
 		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
@@ -95,13 +88,14 @@ func registerNetBuiltins(ip *Interpreter) {
 			})
 		},
 	)
-	setBuiltinDoc(ip, "netConnect", `Open a TCP connection to "host:port".
+	setBuiltinDoc(target, "netConnect", `Open a TCP connection to "host:port".
 
 Returns a network handle usable with read*/write/flush/close,
 or null (annotated) on network error.`)
 
 	// netListen("host:port") -> "listener" handle
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"netListen",
 		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
@@ -114,13 +108,14 @@ or null (annotated) on network error.`)
 			return HandleVal("listener", &netListenerH{ln: ln})
 		},
 	)
-	setBuiltinDoc(ip, "netListen", `Listen on a TCP address "host:port".
+	setBuiltinDoc(target, "netListen", `Listen on a TCP address "host:port".
 
 Returns a listener handle for netAccept. Use close(listener) to stop listening.
 Returns null (annotated) on bind/listen error.`)
 
 	// netAccept(listener) -> "net" handle
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"netAccept",
 		[]ParamSpec{{Name: "l", Type: S{"id", "Any"}}},
 		S{"id", "Any"},
@@ -137,7 +132,7 @@ Returns null (annotated) on bind/listen error.`)
 			})
 		},
 	)
-	setBuiltinDoc(ip, "netAccept", `Accept one TCP connection from a listener.
+	setBuiltinDoc(target, "netAccept", `Accept one TCP connection from a listener.
 
 Blocks until a client connects. Returns a network handle,
 or null (annotated) on accept error.`)
@@ -170,7 +165,8 @@ or null (annotated) on accept error.`)
 	// -----------------------------------------
 	// http: buffered body (as text)
 	// -----------------------------------------
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"http",
 		[]ParamSpec{{Name: "req", Type: httpReqT}},
 		httpRespT,
@@ -273,7 +269,7 @@ or null (annotated) on accept error.`)
 			return Map(out)
 		},
 	)
-	setBuiltinDoc(ip, "http", `Make an HTTP request (buffered).
+	setBuiltinDoc(target, "http", `Make an HTTP request (buffered).
 
 Input:
 	req: {
@@ -299,7 +295,8 @@ Output:
 	// -----------------------------------------
 	// httpStream: streaming body (as a "net" handle)
 	// -----------------------------------------
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"httpStream",
 		[]ParamSpec{{Name: "req", Type: httpReqT}},
 		httpRespT,
@@ -402,7 +399,7 @@ Output:
 			return Map(out)
 		},
 	)
-	setBuiltinDoc(ip, "httpStream", `Make an HTTP request (streaming).
+	setBuiltinDoc(target, "httpStream", `Make an HTTP request (streaming).
 
 Input:
 	req: {

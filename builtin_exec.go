@@ -22,8 +22,9 @@ import (
 	"strings"
 )
 
-func registerExecBuiltins(ip *Interpreter) {
-	ip.RegisterNative(
+func registerExecBuiltins(ip *Interpreter, target *Env) {
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"exec",
 		[]ParamSpec{
 			// cmd: [Str]
@@ -146,7 +147,7 @@ func registerExecBuiltins(ip *Interpreter) {
 		},
 	)
 
-	setBuiltinDoc(ip, "exec", `Run an external program.
+	setBuiltinDoc(target, "exec", `Run an external program.
 
 Executes a command synchronously and returns its exit status and captured output.
 Contract mistakes (types/shapes) are hard errors; spawn failures return an annotated null.

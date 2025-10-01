@@ -20,10 +20,11 @@ import (
 	"crypto/subtle"
 )
 
-func registerCryptoBuiltins(ip *Interpreter) {
+func registerCryptoBuiltins(ip *Interpreter, target *Env) {
 	// randBytes(n: Int) -> Str?
 	// Return n cryptographically secure random bytes.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"randBytes",
 		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
 		S{"unop", "?", S{"id", "Str"}}, // Str?
@@ -43,7 +44,7 @@ func registerCryptoBuiltins(ip *Interpreter) {
 			return Str(string(buf))
 		},
 	)
-	setBuiltinDoc(ip, "randBytes", `Uniform cryptographically secure random bytes.
+	setBuiltinDoc(target, "randBytes", `Uniform cryptographically secure random bytes.
 
 Params:
 	n: Int — number of bytes (>= 0)
@@ -57,7 +58,8 @@ Notes:
 
 	// sha256(x: Str) -> Str
 	// Return the SHA-256 digest (raw 32 bytes).
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"sha256",
 		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
 		S{"id", "Str"},
@@ -67,7 +69,7 @@ Notes:
 			return Str(string(sum[:]))
 		},
 	)
-	setBuiltinDoc(ip, "sha256", `SHA-256 digest (raw bytes).
+	setBuiltinDoc(target, "sha256", `SHA-256 digest (raw bytes).
 
 Params:
 	x: Str — input bytes (may be arbitrary, not necessarily UTF-8)
@@ -77,7 +79,8 @@ Returns:
 
 	// hmacSha256(key: Str, msg: Str) -> Str
 	// Return HMAC-SHA256(key, msg) (raw 32 bytes).
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"hmacSha256",
 		[]ParamSpec{
 			{Name: "key", Type: S{"id", "Str"}},
@@ -93,7 +96,7 @@ Returns:
 			return Str(string(mac))
 		},
 	)
-	setBuiltinDoc(ip, "hmacSha256", `HMAC-SHA256 authentication tag (raw bytes).
+	setBuiltinDoc(target, "hmacSha256", `HMAC-SHA256 authentication tag (raw bytes).
 
 Params:
 	key: Str — secret key (raw bytes)
@@ -107,7 +110,8 @@ Notes:
 
 	// ctEqual(a: Str, b: Str) -> Bool
 	// Constant-time equality compare for byte strings.
-	ip.RegisterNative(
+	ip.RegisterRuntimeBuiltin(
+		target,
 		"ctEqual",
 		[]ParamSpec{
 			{Name: "a", Type: S{"id", "Str"}},
@@ -121,7 +125,7 @@ Notes:
 			return Bool(ok)
 		},
 	)
-	setBuiltinDoc(ip, "ctEqual", `Constant-time equality for byte strings.
+	setBuiltinDoc(target, "ctEqual", `Constant-time equality for byte strings.
 
 Params:
 	a: Str

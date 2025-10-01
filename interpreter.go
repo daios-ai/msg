@@ -478,8 +478,12 @@ func (h *ProcessHandle) Join() (Value, error) {
 //     whose message is a pretty, caret-labeled snippet via `FormatError`.
 type Interpreter struct {
 	// Publicly visible environments:
-	Global *Env // program-global environment (persistent across EvalPersistent*)
-	Core   *Env // built-ins; parent of Global (read-only to user code)
+	Global *Env // user-visible namespace (per-interpreter)
+	Base   *Env // per-namespace runtime/prelude layer (overwritable)
+	Core   *Env // engine-critical intrinsics (read-only)
+
+	// Immutable, pre-seeded Base template used for fast namespace snapshots.
+	baseTemplate *Env
 
 	// Private internals (opaque to callers):
 	modules   map[string]*moduleRec // private module system (defined elsewhere)
@@ -490,7 +494,6 @@ type Interpreter struct {
 
 	// Private facades implemented in private files:
 	_exec execCore
-	_ops  opsCore
 }
 
 // Private contracts the internals satisfy (wired by NewInterpreter).
@@ -505,10 +508,6 @@ type execCore interface {
 	funMeta(fn Value) (Callable, bool)
 }
 
-type opsCore interface {
-	initCore()
-}
-
 // NewInterpreter constructs an engine with core natives and an empty Global
 // (child of Core). After construction:
 //   - Core is populated with built-ins and any subsequently registered natives.
@@ -518,20 +517,20 @@ type opsCore interface {
 func NewInterpreter() *Interpreter {
 	ip := &Interpreter{}
 	ip.Core = NewEnv(nil)
-	ip.Global = NewEnv(ip.Core)
 	ip.modules = map[string]*moduleRec{}
 	ip.native = map[string]NativeImpl{}
 
 	// Wire private implementations (defined in private files).
 	ip._exec = newExec(ip)
-	ip._ops = newOps(ip)
 
 	// Install core built-ins.
-	ip._ops.initCore()
+	initCore(ip)
 
-	// Make Core effectively read-only to user code by sealing the child frame:
-	// assignments in Global won't climb into Core.
-	ip.Global.SealParentWrites()
+	// Build a pre-seeded, immutable Base template once, then snapshot per namespace.
+	ip.buildBaseTemplate()
+	ip.Base = ip.newBaseFromTemplate()
+	// Global is the user frame. It may climb into Base to overwrite runtime/prelude.
+	ip.Global = NewEnv(ip.Base)
 
 	return ip
 }
@@ -790,12 +789,18 @@ func AsMapValue(v Value) Value {
 //     registered natives) by rebuilding a function value for the clone’s Core.
 //   - We intentionally do not duplicate Global or module cache state.
 func (ip *Interpreter) Clone() *Interpreter {
-	// Start from a clean engine (built-ins installed, empty Global).
-	cl := NewInterpreter()
+	// Fast snapshot: share Core (read-only), reuse baseTemplate, make fresh Base/Global.
+	cl := &Interpreter{}
+	cl.Core = ip.Core
+	cl.modules = map[string]*moduleRec{}
+	cl.native = make(map[string]NativeImpl, len(ip.native))
+	cl._exec = newExec(cl)
+	cl.baseTemplate = ip.baseTemplate
+	cl.Base = cl.newBaseFromTemplate()
+	cl.Global = NewEnv(cl.Base)
 
 	// Copy the native registry (name -> implementation) so the clone invokes
 	// the same host functions, but through its own *Interpreter.
-	cl.native = make(map[string]NativeImpl, len(ip.native))
 	for name, impl := range ip.native {
 		cl.native[name] = impl
 
@@ -826,9 +831,6 @@ func (ip *Interpreter) Clone() *Interpreter {
 		nv.Annot = orig.Annot // preserve documentation if present
 		cl.Core.Define(name, nv)
 	}
-
-	// Fresh, empty persistent scope for the clone.
-	cl.Global = NewEnv(cl.Core)
 
 	// Fresh module cache/loader state (no sharing).
 	cl.modules = map[string]*moduleRec{}
@@ -869,3 +871,80 @@ func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
 }
 
 //// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                    BASE TEMPLATE + SNAPSHOT HELPERS (PRIVATE)
+////////////////////////////////////////////////////////////////////////////////
+
+// Build a pre-seeded, sealed Base template parented to Core. Treat as immutable.
+func (ip *Interpreter) buildBaseTemplate() {
+	tmpl := NewEnv(ip.Core)
+	tmpl.SealParentWrites()
+	ip.SeedRuntimeInto(tmpl)
+	ip.baseTemplate = tmpl
+}
+
+// Create a fresh Base(ns) by cloning the template and rebinding closures/types.
+func (ip *Interpreter) newBaseFromTemplate() *Env {
+	if ip.baseTemplate == nil {
+		ip.buildBaseTemplate()
+	}
+	return cloneEnvRebinding(ip.baseTemplate, ip.Core)
+}
+
+// cloneEnvRebinding clones src into a new Env with newParent, rebinding
+// closures and type envs that referenced src -> to the new Env.
+func cloneEnvRebinding(src *Env, newParent *Env) *Env {
+	dst := NewEnv(newParent)
+	dst.sealParentWrites = src.sealParentWrites
+	dst.table = make(map[string]Value, len(src.table))
+	for k, v := range src.table {
+		dst.table[k] = rebindValue(v, src, dst)
+	}
+	return dst
+}
+
+// rebindValue: for functions/types captured in 'from', re-pin to 'to';
+// detach arrays/maps to avoid cross-namespace aliasing. Primitives pass through.
+func rebindValue(v Value, from, to *Env) Value {
+	switch v.Tag {
+	case VTFun:
+		f := *v.Data.(*Fun) // copy struct
+		if f.Env == from {
+			f.Env = to
+		}
+		nv := FunVal(&f)
+		nv.Annot = v.Annot
+		return nv
+	case VTType:
+		tv := *v.Data.(*TypeValue)
+		if tv.Env == nil || tv.Env == from {
+			tv.Env = to
+		}
+		return Value{Tag: VTType, Data: &tv, Annot: v.Annot}
+	case VTArray:
+		src := v.Data.(*ArrayObject).Elems
+		out := make([]Value, len(src))
+		for i := range src {
+			out[i] = rebindValue(src[i], from, to)
+		}
+		return Arr(out)
+	case VTMap:
+		sm := v.Data.(*MapObject)
+		nm := &MapObject{
+			Entries: make(map[string]Value, len(sm.Entries)),
+			KeyAnn:  make(map[string]string, len(sm.KeyAnn)),
+			Keys:    append([]string(nil), sm.Keys...),
+		}
+		for k, vv := range sm.Entries {
+			nm.Entries[k] = rebindValue(vv, from, to)
+		}
+		for k, a := range sm.KeyAnn {
+			nm.KeyAnn[k] = a
+		}
+		nv := Value{Tag: VTMap, Data: nm, Annot: v.Annot}
+		return nv
+	default:
+		return v
+	}
+}

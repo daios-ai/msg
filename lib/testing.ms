@@ -8,7 +8,7 @@
 # 
 # Running:
 # let testing = import("testing")
-# testing.run({ root: ".", verbose: false, parallel: false, timeoutMs: 0 })
+# testing.run({ pathPrefix: ".", verbose: false, parallel: false, timeoutMs: 0 })
 
 # =========================
 # Internal state
@@ -252,7 +252,7 @@ end
 # =========================
 
 let RunnerOpts = type {
-	root: Str, # directory to search (default ".")
+	pathPrefix: Str, # run tests whose paths start with this prefix (dir or file)
 	parallel: Bool, # run tests concurrently
 	verbose: Bool, # Go-style per-test RUN/PASS/FAIL lines
 	timeoutMs: Int # per-test timeout in ms (<=0 or null disables)
@@ -312,6 +312,17 @@ let _endsWith = fun(s: Str, suffix: Str) -> Bool do
 	return substr(s, n - m, n) == suffix
 end
 
+let _startsWith = fun(s: Str, prefix: Str) -> Bool do
+	let n = len(prefix)
+	if n == 0 then
+		return true
+	end
+	if len(s) < n then
+		return false
+	end
+	return substr(s, 0, n) == prefix
+end
+
 let _isTestFile = fun(path: Str) -> Bool do
 	return _endsWith(pathBase(path), "_test.ms")
 end
@@ -324,6 +335,12 @@ let _isAbs = fun(p: Str) -> Bool do
 		return true
 	end
 	return len(match("^[A-Za-z]:[\\\\/]", p)) > 0
+end
+
+let _cleanAbs = fun(p: Str) -> Str do
+	let base = if cwd() == null then "." else cwd() end
+	let abs = if _isAbs(p) then p else pathJoin([base, p]) end
+	return pathClean(abs)
 end
 
 let _walk = fun(dir: Str) -> [Str] do
@@ -349,32 +366,23 @@ let _walk = fun(dir: Str) -> [Str] do
 	return out
 end
 
-let _discover = fun(root: Str) -> [Str] do
-	let base = if cwd() == null then
-		"."
+let _discoverByPrefix = fun(prefix: Str) -> [Str] do
+	let pref = _cleanAbs(prefix)
+	let st = stat(pref)
+	let root = if st != null and st.isDir then
+		pref
 	else
-		cwd()
+		pathDir(pref)
 	end
-	let rootPath = if _isAbs(root) then
-		pathClean(root)
-	else
-		pathClean(pathJoin([base, root]))
-	end
-
-	let st = stat(rootPath)
-	if st == null or not st.isDir then
-		return []
-	end
-
-	let all = _walk(rootPath)
-	let ts = []
+	let all = _walk(root)
+	let out = []
 	for f in all do
-		if _isTestFile(f) then
-			ts = ts + [f]
+		let abs = pathClean(f)
+		if _startsWith(abs, pref) and _isTestFile(abs) then
+			out = out + [abs]
 		end
 	end
-
-	return _sortStrs(ts)
+	return _sortStrs(out)
 end
 
 # Load test files fresh each run: cache-bust with importCode + unique name.
@@ -401,7 +409,7 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 			loaded = loaded + 1
 		else
 			# caret-formatted by try(); print verbatim
-			errorMessage = noteGet(r.value)
+			let errorMessage = noteGet(r.value)
 			printf("FAIL import %s\n%s\n", [f, errorMessage])
 		end
 	end
@@ -433,37 +441,37 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 	let base = if timeoutMs == null or int(timeoutMs) <= 0 then
 		_exec(null)
 	else
-		let done = chanOpen(1)
-
-		let tp = procSpawn(fun(_: Null) -> Null do
-			chanSend(done, _exec(null))
+		# Run the test in one process.
+		let tp = procSpawn(fun(_: Null) -> {} do
+			return _exec(null)
 		end)
 
-		let tt = procSpawn(fun(_: Null) -> Null do
+		# Run a timer in another; when it fires, return a timeout result.
+		let tt = procSpawn(fun(_: Null) -> {} do
 			let t = timerAfter(int(timeoutMs))
 			chanRecv(t)
-			chanSend(done, {
+			return {
 				ok: false,
 				timeout: true,
 				error: sprintf("timeout after %dms", [int(timeoutMs)])
-			})
+			}
 		end)
 
-		let res = chanRecv(done)
+		# Wait for whichever finishes first.
+		let win = procJoinAny([tp, tt])
 
-		# Prefer cancelling the loser, then close and join both for hygiene.
-		if mapHas(res, "timeout") and bool(res.timeout) then
-			procCancel(tp)
-		else
+		# Cancel and safely join the loser.
+		if win.index == 0 then
 			procCancel(tt)
+			procJoin(tt)
+		else
+			procCancel(tp)
+			procJoin(tp)
 		end
-		chanClose(done)
-		# Best-effort joins (ignore results)
-		procJoin(tp)
-		procJoin(tt)
 
-		res
+		win.value
 	end
+
 
 	let dur = nowMillis() - t0
 	let ok = base.ok
@@ -586,8 +594,8 @@ end
 
 # Run: reset registry, discover tests, load fresh modules, run, print summary.
 let run = fun(opts: RunnerOpts) -> Summary do
-	let root = if mapHas(opts, "root") and opts.root != null then
-		opts.root
+	let prefix = if mapHas(opts, "pathPrefix") and opts.pathPrefix != null then
+		opts.pathPrefix
 	else
 		"."
 	end
@@ -609,7 +617,7 @@ let run = fun(opts: RunnerOpts) -> Summary do
 
 	reset(null)
 
-	let files = _discover(root)
+	let files = _discoverByPrefix(prefix)
 	if verbose then
 		printf("found %d test file(s)\n", [len(files)])
 	end

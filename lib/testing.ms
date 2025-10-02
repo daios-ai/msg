@@ -3,7 +3,7 @@
 # Usage in *_test.ms:
 # let testing = import("testing")
 # testing.test("adds", fun(_: Null) -> Any do
-# 	testing.assertEq(2 + 2, 4)
+# 	testing.assert(true, null)
 # end)
 #
 # Running:
@@ -19,6 +19,14 @@ let _origins = {} # concrete tests: test("name", ...)
 let _caseOrigins = {} # case groups: cases("prefix", ...)
 
 # Return the recorded origin for a test name, with cases("x") fallback for "x/NN".
+# 
+# Find the source file and line number where a test or its case-group was declared.
+# 
+# Args:
+#	name: Str — test name, possibly "prefix/NN" for subtests
+# 
+# Return:
+#	{}? — map {file!: Str, line!: Int} or null if unknown
 let _originOf = fun(name: Str) -> {}? do
 	if mapHas(_origins, name) then
 		return _origins[name]
@@ -34,15 +42,23 @@ let _originOf = fun(name: Str) -> {}? do
 			end
 		end
 	end
-	return
+	return null
 end
 
 # =========================
 # Small helpers
 # =========================
 
-# Stable value rendering: JSON if possible, else str, else formatValue (never null).
-let _repr = fun(x) -> Str do
+# Stable value rendering: JSON if possible, else str, else formatValue.
+#
+# Produce a stable textual representation of any value for diffs and messages.
+#
+# Args:
+#	x: Any — value to render
+#
+# Return:
+#	Str — string form (never null)
+let _repr = fun(x: Any) -> Str do
 	let j = jsonStringify(x)
 	if j != null then
 		return j
@@ -55,6 +71,15 @@ let _repr = fun(x) -> Str do
 end
 
 # Minimal substring check.
+#
+# Test whether 'needle' occurs in 'hay'.
+#
+# Args:
+#	hay: Str
+#	needle: Str
+#
+# Return:
+#	Bool — true if found (empty needle always true)
 let _contains = fun(hay: Str, needle: Str) -> Bool do
 	if len(needle) == 0 then
 		return true
@@ -62,7 +87,15 @@ let _contains = fun(hay: Str, needle: Str) -> Bool do
 	return len(split(hay, needle)) > 1
 end
 
-# In-place insertion sort for strings (single place only, used for determinism).
+# In-place insertion sort for strings (determinism).
+#
+# Sort an array of strings lexicographically, mutating the array.
+#
+# Args:
+#	xs: [Str]
+#
+# Return:
+#	[Str] — the same array, sorted
 let _sortStrs = fun(xs: [Str]) -> [Str] do
 	let n = len(xs)
 	let i = 0
@@ -79,61 +112,21 @@ let _sortStrs = fun(xs: [Str]) -> [Str] do
 	return xs
 end
 
-# Redirect STDOUT/STDERR while running f, capture both streams, then restore.
-let _captureIO = fun(f: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
-	let base = tempDir()
-	let tag = sprintf("%d", [nowNanos()])
-	let pOut = pathJoin([base, sprintf("cap.%s.out", [tag])])
-	let pErr = pathJoin([base, sprintf("cap.%s.err", [tag])])
-
-	let hOut = open(pOut, "w")
-	let hErr = open(pErr, "w")
-	if hOut == null or hErr == null then
-		panic("capture open failed")
-	end
-
-	let so = STDOUT
-	let se = STDERR
-	STDOUT = hOut
-	STDERR = hErr
-
-	let r = try(fun(_: Null) do f(null) end)
-
-	flush(STDOUT)
-	flush(STDERR)
-	close(STDOUT)
-	close(STDERR)
-	STDOUT = so
-	STDERR = se
-
-	let o = readFile(pOut)
-	let e = readFile(pErr)
-	remove(pOut)
-	remove(pErr)
-
-	return {
-		ok: r.ok,
-		out: if o == null then "" else o end,
-		err: if e == null then "" else e end,
-		error: if r.ok then null else noteGet(r.value) end
-	}
-end
-
-# Silence all output while evaluating f; rethrow errors verbatim.
-let _silence = fun(f: Null -> Any) -> Null do
-	let r = _captureIO(f)
-	if r.ok then
-		return null
-	end
-	panic(r.error)
-end
-
 # =========================
 # Public API — assertions & registry
 # =========================
 
-# Register a test (name must be unique). Tests are (Null)->Any.
-let test = fun(name: Str, fn) -> Bool do
+# Register a test.
+#
+# Register a unique test function under a string name. The function must have type (Null)->Any.
+#
+# Args:
+#	name: Str — unique test name
+#	fn: (Null)->Any — test body
+#
+# Return:
+#	Bool — true on success; panics on duplicate name or bad type
+let test = fun(name: Str, fn: Null -> Any) -> Bool do
 	if not isType(fn, type Null -> Any) then
 		panic(sprintf("test(%s): second argument must be a function of type (Null)->Any", [
 			_repr(name)
@@ -146,12 +139,28 @@ let test = fun(name: Str, fn) -> Bool do
 	return true
 end
 
-# Return a shallow copy of the registry.
+# View registered tests.
+#
+# Return a shallow clone of the current test registry.
+#
+# Args:
+#	_: Null
+#
+# Return:
+#	{Str: Any} — map name -> function
 let tests = fun(_: Null) -> {Str: Any} do
 	return clone(_tests)
 end
 
-# Reset the registry.
+# Reset registry.
+#
+# Remove all registered tests.
+#
+# Args:
+#	_: Null
+#
+# Return:
+#	Bool — true when done
 let reset = fun(_: Null) -> Bool do
 	let keys = []
 	for [k, _] in _tests do
@@ -164,6 +173,15 @@ let reset = fun(_: Null) -> Bool do
 end
 
 # Boolean assertion.
+#
+# Assert that a condition is true; panic with message if false.
+#
+# Args:
+#	ok: Bool — condition
+#	msg: Str? — optional message
+#
+# Return:
+#	Bool — true if ok, otherwise panics
 let assert = fun(ok: Bool, msg: Str?) -> Bool do
 	if not ok then
 		if msg == null then
@@ -174,8 +192,17 @@ let assert = fun(ok: Bool, msg: Str?) -> Bool do
 	return true
 end
 
-# Equality assertion (pretty-prints values).
-let assertEq = fun(want, got) -> Bool do
+# Equality assertion.
+#
+# Assert deep equality; panic with pretty diff on mismatch.
+#
+# Args:
+#	want: Any
+#	got: Any
+#
+# Return:
+#	Bool — true if equal, otherwise panics
+let assertEq = fun(want: Any, got: Any) -> Bool do
 	if want == got then
 		return true
 	end
@@ -183,7 +210,16 @@ let assertEq = fun(want, got) -> Bool do
 end
 
 # Runtime type assertion.
-let assertType = fun(v, T: Type) -> Bool do
+#
+# Assert that value satisfies a Type; panic with readable message on mismatch.
+#
+# Args:
+#	v: Any — value
+#	T: Type — required type
+#
+# Return:
+#	Bool — true if satisfied, otherwise panics
+let assertType = fun(v: Any, T: Type) -> Bool do
 	if isType(v, T) then
 		return true
 	end
@@ -193,17 +229,24 @@ let assertType = fun(v, T: Type) -> Bool do
 	]))
 end
 
-# Expect a hard failure; optionally assert error's first line contains substring.
-let assertThrows = fun(fn, sub: Str?) -> Bool do
+# Panic expectation.
+#
+# Run a zero-arg function and expect it to panic; optionally require a substring in the first line.
+#
+# Args:
+#	fn: (Null)->Any — function expected to panic
+#	sub: Str? — required substring in first line (empty means any message)
+#
+# Return:
+#	Bool — true if a panic occurred and matched; otherwise panics
+let assertThrows = fun(fn: Null -> Any, sub: Str?) -> Bool do
 	if not isType(fn, type Null -> Any) then
 		panic("assertThrows: argument must be a function of type (Null)->Any")
 	end
-
 	let r = try(fun(_: Null) do fn(null) end)
 	if r.ok then
 		panic(sprintf("expected failure, got success with value: %s", [_repr(r.value)]))
 	end
-
 	if sub != null then
 		let e = noteGet(r.value)
 		let parts = split(e, "\n")
@@ -215,12 +258,21 @@ let assertThrows = fun(fn, sub: Str?) -> Bool do
 			]))
 		end
 	end
-
 	return true
 end
 
-# Table-driven subtests: registers name/0, name/1, ...
-let cases = fun(name: Str, xs: [Any], fn) -> Int do
+# Table-driven subtests.
+#
+# Register subtests as name/0, name/1, ... by applying fn to each element.
+#
+# Args:
+#	name: Str — prefix
+#	xs: [Any] — cases
+#	fn: Any -> Any — single-argument function
+#
+# Return:
+#	Int — number of registered cases; panics if fn has wrong type
+let cases = fun(name: Str, xs: [Any], fn: Any -> Any) -> Int do
 	if not isType(fn, type Any -> Any) then
 		panic(sprintf("cases(%s): fn must be a function taking one argument", [_repr(name)]))
 	end
@@ -229,18 +281,27 @@ let cases = fun(name: Str, xs: [Any], fn) -> Int do
 	for _ in xs do
 		let sub = sprintf("%s/%d", [name, i])
 		let x = xs[i]
-		test(sub, fun(_: Null) do fn(x) end)
+		test(sub, fun(_: Null) -> Any do fn(x) end)
 		i = i + 1
 	end
 	return n
 end
 
-# Snapshot (golden) testing for values (write on update=true).
-let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
+# Snapshot (golden) testing for values.
+#
+# Compare 'value' against file contents; when update=true, overwrite the file.
+#
+# Args:
+#	path: Str — file path
+#	value: Any — expected value
+#	update: Bool? — overwrite when true
+#
+# Return:
+#	Bool — true on success; panics on mismatch or IO failure
+let snapshot = fun(path: Str, value: Any, update: Bool?) -> Bool do
 	let want = _repr(value)
 	let have = readFile(path)
 	let doUpdate = update != null and bool(update)
-
 	if have == null then
 		if doUpdate then
 			let n = writeFile(path, want)
@@ -251,11 +312,10 @@ let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
 		end
 		panic(sprintf("snapshot missing (pass update=true to write): %s", [path]))
 	end
-
 	if have != want then
 		if doUpdate then
-			let n = writeFile(path, want)
-			if n == null then
+			let n2 = writeFile(path, want)
+			if n2 == null then
 				panic(sprintf("snapshot write failed: %s", [path]))
 			end
 			return true
@@ -266,15 +326,32 @@ let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
 			want
 		]))
 	end
-
 	return true
 end
 
-let snapshotUpdate = fun(path: Str, value) -> Bool do
+# Snapshot overwrite helper.
+#
+# Write the golden snapshot unconditionally.
+#
+# Args:
+#	path: Str
+#	value: Any
+#
+# Return:
+#	Bool — true after write
+let snapshotUpdate = fun(path: Str, value: Any) -> Bool do
 	return snapshot(path, value, true)
 end
 
 # Seed RNG.
+#
+# Seed the pseudo-random generator and echo the seed for chaining.
+#
+# Args:
+#	n: Int — seed
+#
+# Return:
+#	Int — the same seed
 let seed = fun(n: Int) -> Int do
 	seedRand(n)
 	return n
@@ -297,16 +374,22 @@ let Summary = type {passed: Int, failed: Int, total: Int, durationMs: Int}
 # Discovery & loading
 # =========================
 
-# Scan source text to record where tests/cases are declared.
-# Returns number of registrations indexed.
+# Index tests in source text.
+#
+# Scan source lines to record locations of test("...") and cases("...").
+#
+# Args:
+#	file: Str — filename
+#	src: Str — file contents
+#
+# Return:
+#	Int — number of registrations indexed
 let _indexTests = fun(file: Str, src: Str) -> Int do
 	let lines = split(src, "\n")
 	let i = 0
 	let found = 0
 	for _ in lines do
 		let line = lines[i]
-
-		# test("name", ...)  or  T.test("name", ...)
 		let p1 = split(line, "test(\"")
 		if len(p1) > 1 then
 			let tail = p1[1]
@@ -316,8 +399,6 @@ let _indexTests = fun(file: Str, src: Str) -> Int do
 				found = found + 1
 			end
 		end
-
-		# cases("prefix", ...)  or  T.cases("prefix", ...)
 		let p2 = split(line, "cases(\"")
 		if len(p2) > 1 then
 			let tail2 = p2[1]
@@ -327,12 +408,19 @@ let _indexTests = fun(file: Str, src: Str) -> Int do
 				found = found + 1
 			end
 		end
-
 		i = i + 1
 	end
 	return found
 end
 
+# EndsWith helper.
+#
+# Args:
+#	s: Str
+#	suffix: Str
+#
+# Return:
+#	Bool — true if s ends with suffix
 let _endsWith = fun(s: Str, suffix: Str) -> Bool do
 	let n = len(s)
 	let m = len(suffix)
@@ -345,6 +433,14 @@ let _endsWith = fun(s: Str, suffix: Str) -> Bool do
 	return substr(s, n - m, n) == suffix
 end
 
+# StartsWith helper.
+#
+# Args:
+#	s: Str
+#	prefix: Str
+#
+# Return:
+#	Bool — true if s starts with prefix
 let _startsWith = fun(s: Str, prefix: Str) -> Bool do
 	let n = len(prefix)
 	if n == 0 then
@@ -356,10 +452,24 @@ let _startsWith = fun(s: Str, prefix: Str) -> Bool do
 	return substr(s, 0, n) == prefix
 end
 
+# Test file predicate.
+#
+# Args:
+#	path: Str
+#
+# Return:
+#	Bool — true if basename ends with "_test.ms"
 let _isTestFile = fun(path: Str) -> Bool do
 	return _endsWith(pathBase(path), "_test.ms")
 end
 
+# Absolute path check.
+#
+# Args:
+#	p: Str
+#
+# Return:
+#	Bool — true if absolute (POSIX/Windows)
 let _isAbs = fun(p: Str) -> Bool do
 	if len(p) > 0 and substr(p, 0, 1) == "/" then
 		return true
@@ -370,12 +480,28 @@ let _isAbs = fun(p: Str) -> Bool do
 	return len(match("^[A-Za-z]:[\\\\/]", p)) > 0
 end
 
+# Clean absolute path.
+#
+# Args:
+#	p: Str
+#
+# Return:
+#	Str — absolute, cleaned path
 let _cleanAbs = fun(p: Str) -> Str do
 	let base = if cwd() == null then "." else cwd() end
 	let abs = if _isAbs(p) then p else pathJoin([base, p]) end
 	return pathClean(abs)
 end
 
+# Recursive directory walk.
+#
+# Collect all paths within a directory tree.
+#
+# Args:
+#	dir: Str
+#
+# Return:
+#	[Str] — list of paths
 let _walk = fun(dir: Str) -> [Str] do
 	let entries = dirList(dir)
 	if entries == null then
@@ -399,6 +525,15 @@ let _walk = fun(dir: Str) -> [Str] do
 	return out
 end
 
+# Discover test files by prefix.
+#
+# Return sorted absolute paths for files whose absolute path starts with prefix and end with "_test.ms".
+#
+# Args:
+#	prefix: Str — directory or file path (absolute or relative)
+#
+# Return:
+#	[Str] — sorted test file paths
 let _discoverByPrefix = fun(prefix: Str) -> [Str] do
 	let pref = _cleanAbs(prefix)
 	let st = stat(pref)
@@ -414,8 +549,16 @@ let _discoverByPrefix = fun(prefix: Str) -> [Str] do
 	return _sortStrs(out)
 end
 
-# Load test files fresh each run: cache-bust with importCode + unique name.
-# Silence import-time output to prevent leakage.
+# Load test files fresh each run.
+#
+# Import test modules with unique names to avoid cache; index test origins; log import failures.
+#
+# Args:
+#	files: [Str] — list of absolute paths
+#	verbose: Bool — emit discovery logs
+#
+# Return:
+#	Int — number of successfully loaded files
 let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 	let loaded = 0
 	for f in files do
@@ -427,14 +570,10 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 			printf("FAIL read %s\n", [f])
 			continue
 		end
-
 		_indexTests(f, src)
-
 		let name = sprintf("testing:%s:%d", [f, nowNanos()])
 		let r = try(fun(_: Null) do
-			_silence(fun(_: Null) do
-				importCode(name, src)
-			end)
+			importCode(name, src)
 		end)
 		if r.ok then
 			loaded = loaded + 1
@@ -450,31 +589,31 @@ end
 # Execution
 # =========================
 
-# _capProc: run fn in its own process, capturing all STDOUT/STDERR.
-let _capProc = fun(fn: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
-	let p = procSpawn(fun(_: Null) -> {} do
-		_captureIO(fn)
-	end)
-	return procJoin(p)
-end
-
-# Run a single test with optional timeout.
-# Returns: { name, ok, durationMs, error?, timeout? }
-# emit controls whether this function prints status lines.
-let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> {} do
+# Run a single test.
+#
+# Execute one test function with optional timeout; print per-test lines based on verbosity.
+#
+# Args:
+#	name: Str — test name
+#	fn: Any — function (Null)->Any
+#	timeoutMs: Int? — per-test timeout in ms (<=0 or null disables)
+#	verbose: Bool — print RUN/PASS/FAIL lines
+#	emit: Bool — whether this function prints status lines
+#
+# Return:
+#	{} — { name: Str, ok: Bool, durationMs: Int, error: Str?, timeout: Bool }
+let _runOne = fun(name: Str, fn: Any, timeoutMs: Int?, verbose: Bool, emit: Bool) -> {} do
 	if emit and verbose then
 		printf("=== RUN   %s\n", [name])
 	end
 	let t0 = nowMillis()
-
 	let _exec = fun(_: Null) -> {} do
-		let c = _capProc(fun(_: Null) -> Any do fn(null) end)
-		if c.ok then
+		let r = try(fun(_: Null) do fn(null) end)
+		if r.ok then
 			return {ok: true}
 		end
-		return {ok: false, error: c.error}
+		return {ok: false, error: noteGet(r.value)}
 	end
-
 	let base = if timeoutMs == null or int(timeoutMs) <= 0 then
 		_exec(null)
 	else
@@ -494,12 +633,10 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> 
 		end
 		win.value
 	end
-
 	let dur = nowMillis() - t0
 	let ok = base.ok
 	let isTimeout = mapHas(base, "timeout") and bool(base.timeout)
 	let err = if mapHas(base, "error") and base.error != null then base.error else "" end
-
 	let _printOriginIfAny = fun(_: Null) -> Null do
 		let o = _originOf(name)
 		if o != null then
@@ -507,7 +644,6 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> 
 		end
 		null
 	end
-
 	if emit then
 		if verbose then
 			if ok then
@@ -523,12 +659,11 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> 
 				printf("=== RUN   %s\n", [name])
 				_printOriginIfAny(null)
 				printf("%s\n", [err])
-				let tag = if isTimeout then "TIMEOUT" else "FAIL" end
-				printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+				let tag2 = if isTimeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag2, name, int(dur)])
 			end
 		end
 	end
-
 	return {
 		name: name,
 		ok: ok,
@@ -538,27 +673,34 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> 
 	}
 end
 
-# Run all registered tests. In parallel mode, only the parent prints.
+# Run all registered tests.
+#
+# Execute tests sequentially or in parallel; aggregate a summary.
+#
+# Args:
+#	parallel: Bool — run concurrently
+#	timeoutMs: Int? — per-test timeout (<=0 or null disables)
+#	verbose: Bool — print per-test lines even on pass
+#
+# Return:
+#	Summary — {passed, failed, total, durationMs}
 let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 	let start = nowMillis()
 	let passed = 0
 	let failed = 0
 	let total = 0
-
 	let reg = tests(null)
 	let names = []
 	for [k, _] in reg do
 		names = names + [k]
 	end
 	names = _sortStrs(names)
-
 	if parallel then
 		if verbose then
 			for name in names do
 				printf("=== RUN   %s\n", [name])
 			end
 		end
-
 		let ps = []
 		for name in names do
 			let fn = reg[name]
@@ -569,7 +711,6 @@ let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 			]
 			total = total + 1
 		end
-
 		let results = procJoinAll(ps)
 		let i = 0
 		while i < len(results) do
@@ -605,7 +746,6 @@ let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 			end
 		end
 	end
-
 	let dur = nowMillis() - start
 	return {passed: passed, failed: failed, total: total, durationMs: dur}
 end
@@ -614,29 +754,32 @@ end
 # Public API — runner
 # =========================
 
-# Run: reset registry, discover tests, load fresh modules, run, print summary.
+# Run the test suite.
+#
+# Reset registry, discover tests by pathPrefix, import fresh modules, run tests, print a summary line.
+#
+# Args:
+#	opts: RunnerOpts — {pathPrefix, parallel, verbose, timeoutMs}
+#
+# Return:
+#	Summary — execution summary
 let run = fun(opts: RunnerOpts) -> Summary do
 	let prefix = if mapHas(opts, "pathPrefix") and opts.pathPrefix != null then opts.pathPrefix else "." end
 	let verbose = if mapHas(opts, "verbose") and opts.verbose != null then bool(opts.verbose) else false end
 	let parallel = if mapHas(opts, "parallel") and opts.parallel != null then bool(opts.parallel) else false end
 	let timeoutMs = if mapHas(opts, "timeoutMs") and opts.timeoutMs != null then int(opts.timeoutMs) else null end
-
 	reset(null)
-
 	let files = _discoverByPrefix(prefix)
 	if verbose then
 		printf("found %d test file(s)\n", [len(files)])
 	end
 	let _ = _loadTests(files, verbose)
-
 	let summary = _runAll(parallel, timeoutMs, verbose)
-
 	printf("ok: %d  fail: %d  total: %d  durationMs: %d\n", [
 		summary.passed,
 		summary.failed,
 		summary.total,
 		summary.durationMs
 	])
-
 	return summary
 end

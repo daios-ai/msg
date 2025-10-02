@@ -1,429 +1,914 @@
-=== BEGIN FILE: oracles.go ===
-// oracles.go — Oracle execution & prompt building (PUBLIC API + PRIVATE impl)
-//
-// WHAT THIS FILE DOES
-// ===================
-// MindScript “oracles” are functions whose execution is delegated to an external
-// backend (e.g., an LLM). When an oracle is called at runtime, the interpreter:
-//
-//  1. Builds a **prompt** that captures:
-//     • the oracle’s instruction (taken from the function Value’s .Annot),
-//     • the declared input type (parameter 0) and declared *success* return type,
-//     • optional example pairs [input, output] for few-shot guidance,
-//     • the current call’s concrete input,
-//     and records that prompt internally (for debugging and testing).
-//
-//  2. Calls a pluggable backend hook in user space:
-//     __oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any])
-//     which must return either:
-//     • Str — raw JSON (no fences) shaped like {"output": <value>}, or
-//     • Null — to signal failure.
-//     The interpreter parses the JSON via the host-provided global function
-//     jsonParse : Str -> Any (from the standard library).
-//
-//  3. Validates the extracted value against the oracle’s **operational** return
-//     type, which is the declared success type widened to **nullable** (`T?`).
-//     On mismatch or parse failure, an *annotated null* Value is returned.
-//
-// Everything in this file is **private** implementation that the public
-// interpreter uses internally when executing oracle functions (see Interpreter
-// in interpreter.go). Public callers never need to invoke those directly.
-//
-// DEPENDENCIES (OTHER FILES)
-// --------------------------
-// • interpreter.go
-//   - type Interpreter (fields: Global, etc.)
-//   - Value model (Value, ValueTag, constructors like Str/Arr/Map, Fun, Env)
-//   - Thin call/eval surface (*Interpreter.Apply, resolveType, isType, etc.)
-//   - Annotated-null helpers (annotNull), SourceRef handling.
-//
-// • types.go
-//   - Type S-expressions and helpers (mapTypeFields, equalS, litToValue).
-//
-// • schema.go
-//   - (*Interpreter) TypeValueToJSONSchema(...) to render JSON Schema for types.
-//
-// • std/lib.ms (MindScript standard library in user space)
-//   - jsonParse : Str -> Any  — required for parsing model JSON.
-//
-// • Runtime hooks (user space, optional/required):
-//   - REQUIRED:  __oracle_execute(prompt: Str) -> Str | Null
-//   - OPTIONAL:  __oracle_build_prompt(instruction: Str, inType: Type, outType: Type, examples: [Any]) -> Str
-//
-// NOTE
-// ----
-// Oracles are **operationally nullable**: a declared return type T is validated
-// as T? at runtime. The backend must produce boxed JSON {"output": <value>}.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// PUBLIC API
-// ──────────────────────────────────────────────────────────────────────────────
-package mindscript
+=== BEGIN FILE: lib/testing.ms ===
+# testing.ms — minimal testing toolkit + simple test runner
+#
+# Usage in *_test.ms:
+# let testing = import("testing")
+# testing.test("adds", fun(_: Null) -> Any do
+# 	testing.assertEq(2 + 2, 4)
+# end)
+#
+# Running:
+# let testing = import("testing")
+# testing.run({ pathPrefix: ".", verbose: false, parallel: false, timeoutMs: 0 })
 
-import (
-	"encoding/json"
-	"strings"
-)
+# =========================
+# Internal state
+# =========================
 
-/* ===========================
-   PUBLIC
-   =========================== */
+let _tests = {} # name -> (Null)->Any
+let _origins = {} # concrete tests: test("name", ...)
+let _caseOrigins = {} # case groups: cases("prefix", ...)
 
-//// END_OF_PUBLIC
-
-/* ===========================
-   PRIVATE IMPLEMENTATION
-   =========================== */
-
-// execOracle is the primary oracle call engine used by the interpreter when an
-// oracle function is invoked. It builds the prompt, calls the backend hook,
-// parses & validates, and returns a nullable Value (success or annotated failure).
-func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
-	if funVal.Tag != VTFun {
-		return annotNull("oracle: not a function")
-	}
-	f := funVal.Data.(*Fun)
-
-	// Recover declared signature from hidden closure bindings.
-	var paramNames []string
-	var declTypes []S
-	if f.Env != nil {
-		if nv, err := f.Env.Get("$__sig_names"); err == nil && nv.Tag == VTArray {
-			for _, v := range nv.Data.(*ArrayObject).Elems {
-				if v.Tag == VTStr {
-					paramNames = append(paramNames, v.Data.(string))
-				}
-			}
-		}
-		if tv, err := f.Env.Get("$__sig_types"); err == nil && tv.Tag == VTArray {
-			for _, v := range tv.Data.(*ArrayObject).Elems {
-				if v.Tag == VTType {
-					if tvv, ok := v.Data.(*TypeValue); ok {
-						declTypes = append(declTypes, tvv.Ast)
-					}
-				}
-			}
-		}
-	}
-
-	// Build runtime boxes and the prompt.
-	inArgsVal := valueMapFromArgs(ctx, paramNames) // VTMap holding current call args
-
-	inTypesVal := Arr(func() []Value {
-		arr := make([]Value, len(declTypes))
-		for i := range declTypes {
-			arr[i] = TypeValIn(declTypes[i], f.Env)
-		}
-		return arr
-	}())
-
-	// Boxed output type: {"output": T}, where T is the declared success type (non-nullable here).
-	outBoxTypeS := S{"map", S{"pair!", S{"str", "output"}, stripNullable(f.ReturnType)}}
-
-	exPairs := boxExamplesAsMaps(f.Examples, paramNames)
-	examplesVal := Arr(exPairs)
-
-	instructionVal := Str(strings.TrimSpace(funVal.Annot))
-
-	// Build prompt text (prefers user hook when available) and record it.
-	prompt := ip.buildOraclePrompt(
-		instructionVal,
-		inArgsVal,
-		inTypesVal,
-		TypeValIn(outBoxTypeS, f.Env),
-		examplesVal,
-		f.Env,
-	)
-
-	// Locate executor hook strictly via the oracle's lexical environment.
-	hook, err := f.Env.Get("__oracle_execute")
-	if err != nil || hook.Tag != VTFun {
-		return annotNull("oracle backend not configured (define __oracle_execute)")
-	}
-	res := ip.Apply(hook, []Value{Str(prompt)})
-
-	// Backend can signal failure with null.
-	if res.Tag == VTNull {
-		return res
-	}
-	if res.Tag != VTStr {
-		return annotNull("oracle executor must return a string (raw model output) or null")
-	}
-
-	// Parse returned JSON and validate it matches {"output": T?}.
-	raw := strings.TrimSpace(res.Data.(string))
-	decoded, _, _ := jsonRepair(raw)
-	if decoded == nil {
-		return annotNull("oracle output was not valid JSON")
-	}
-	v := goJSONToValue(decoded)
-	if v.Tag != VTMap {
-		v = Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": v},
-			KeyAnn:  map[string]string{}, Keys: []string{"output"},
-		}}
-	}
-	mo := v.Data.(*MapObject)
-	out, ok := mo.Entries["output"]
-	if !ok || !ip.isType(out, ensureNullableUnlessAny(f.ReturnType), f.Env) {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	return out
-}
-
-// buildOraclePrompt builds the prompt from Value-boxed parts.
-// instruction: Str
-// input:       Any (VTMap of call arguments)
-// inTypes:     [Type] (declared param types, in order)
-// outType:     Type   (boxed {"output": T})
-// examples:    [Any]  (each item is [inputMap, outputMap] or {"input":..,"output":..})
-func (ip *Interpreter) buildOraclePrompt(
-	instruction Value,
-	input Value,
-	inTypes Value,
-	outType Value,
-	examples Value,
-	env *Env,
-) string {
-	// Derive input map type S from (names, declared types).
-	names := []string{}
-	if input.Tag == VTMap {
-		mo := input.Data.(*MapObject)
-		names = append(names, mo.Keys...)
-		// for _, k := range mo.Keys {
-		// 	names = append(names, k)
-		// }
-	}
-	declTypes := []S{}
-	if inTypes.Tag == VTArray {
-		for _, v := range inTypes.Data.(*ArrayObject).Elems {
-			if v.Tag == VTType {
-				if tv, ok := v.Data.(*TypeValue); ok {
-					declTypes = append(declTypes, tv.Ast)
-				}
-			}
-		}
-	}
-	inMapTypeS := mapTypeFromParams(names, declTypes)
-
-	// Pretty-print schemas.
-	toSchemaString := func(tv Value) string {
-		s := ip.TypeValueToJSONSchema(tv, env)
-		b, err := json.MarshalIndent(s, "", "  ")
-		if err != nil {
-			return "{}"
-		}
-		return string(b)
-	}
-	inputSchema := toSchemaString(TypeValIn(inMapTypeS, env))
-	outputSchema := toSchemaString(outType)
-
-	// JSON stringifier (with spaces after ":" and ",").
-	toJSON := func(v Value) string {
-		j, err := valueToGoJSON(v)
-		if err != nil {
-			return "null"
-		}
-		b, err := json.Marshal(j)
-		if err != nil {
-			return "null"
-		}
-		s := string(b)
-		s = strings.ReplaceAll(s, ":", ": ")
-		s = strings.ReplaceAll(s, ",", ", ")
-		return s
-	}
-
-	var bld strings.Builder
-
-	// Header & guidance.
-	bld.WriteString("PROMPT:\n")
-	bld.WriteString("Please follow the instruction to the best of your ability:\n")
-	bld.WriteString("for every input, provide an output that solves the task and\n")
-	bld.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
-	bld.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
-
-	// Schemas.
-	bld.WriteString("INPUT JSON SCHEMA:\n\n")
-	bld.WriteString(indentBlock(inputSchema, 2))
-	bld.WriteString("\n\n")
-
-	bld.WriteString("OUTPUT JSON SCHEMA:\n\n")
-	bld.WriteString(indentBlock(outputSchema, 2))
-	bld.WriteString("\n\n")
-
-	// Instruction / task line.
-	taskLine := "Given the input, determine the output."
-	if instruction.Tag == VTStr && strings.TrimSpace(instruction.Data.(string)) != "" {
-		taskLine = strings.TrimSpace(instruction.Data.(string))
-	}
-
-	bld.WriteString("TASK:\n\n")
-	bld.WriteString(taskLine + "\n\n")
-
-	// Examples.
-	if examples.Tag == VTArray {
-		for _, ex := range examples.Data.(*ArrayObject).Elems {
-			if ex.Tag != VTArray {
-				continue
-			}
-			pair := ex.Data.(*ArrayObject).Elems
-			if len(pair) != 2 {
-				continue
-			}
-			inVal, outVal := pair[0], pair[1]
-
-			bld.WriteString("INPUT:\n\n")
-			bld.WriteString(toJSON(inVal) + "\n\n")
-			bld.WriteString("OUTPUT:\n\n")
-			bld.WriteString(toJSON(outVal) + "\n\n")
-		}
-	}
-
-	// Final TASK with current call's input.
-	bld.WriteString("INPUT:\n\n")
-	bld.WriteString(toJSON(input) + "\n\n")
-	bld.WriteString("OUTPUT:\n")
-
-	return bld.String()
-}
-
-// ------------- Helpers -----------------------------------
-
-// Build a map type S from parameter names and declared types.
-func mapTypeFromParams(names []string, types []S) S {
-	m := S{"map"}
-	for i := 0; i < len(names) && i < len(types); i++ {
-		m = append(m, S{"pair!", S{"str", names[i]}, types[i]})
-	}
-	return m
-}
-
-// Box current call arguments (from ctx) into a map Value conforming to the input map type.
-func valueMapFromArgs(ctx CallCtx, names []string) Value {
-	entries := make(map[string]Value, len(names))
-	keys := make([]string, 0, len(names))
-	for _, name := range names {
-		v := ctx.Arg(name) // if missing, omit/zero-value
-		entries[name] = v
-		keys = append(keys, name)
-	}
-	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: map[string]string{}, Keys: keys}}
-}
-
-// Box examples: each example is [inVal, outVal]; normalize to maps for prompt rendering:
-// input → map[name]=..., output → {"output": outVal}.
-// Accepts a VTArray of pairs (or Null → returns empty).
-func boxExamplesAsMaps(exs Value, names []string) []Value {
-	out := []Value{}
-	if exs.Tag != VTArray {
-		return out
-	}
-	for _, ex := range exs.Data.(*ArrayObject).Elems {
-		if ex.Tag != VTArray {
-			continue
-		}
-		pair := ex.Data.(*ArrayObject).Elems
-		if len(pair) != 2 {
-			continue
-		}
-		inV, outV := pair[0], pair[1]
-
-		// Normalize input to a map using param order.
-		inMap := map[string]Value{}
-		keys := []string{}
-		if inV.Tag == VTArray {
-			xs := inV.Data.(*ArrayObject).Elems
-			for i := 0; i < len(xs) && i < len(names); i++ {
-				inMap[names[i]] = xs[i]
-				keys = append(keys, names[i])
-			}
-		} else {
-			// Single-arg case: use first name if available.
-			if len(names) > 0 {
-				inMap[names[0]] = inV
-				keys = append(keys, names[0])
-			}
-		}
-		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, KeyAnn: map[string]string{}, Keys: keys}}
-
-		outVal := Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": outV},
-			KeyAnn:  map[string]string{},
-			Keys:    []string{"output"},
-		}}
-
-		out = append(out, Arr([]Value{inVal, outVal}))
-	}
-	return out
-}
-
-// indentBlock prefixes each line with n spaces (prompt formatting).
-func indentBlock(s string, n int) string {
-	pad := strings.Repeat(" ", n)
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = pad + lines[i]
-	}
-	return strings.Join(lines, "\n")
-}
-
-// Nullable helpers and small utilities.
-
-func ensureNullableUnlessAny(t S) S {
-	if isAnyType(t) || isNullable(t) {
-		return t
-	}
-	return S{"unop", "?", t}
-}
-func isAnyType(t S) bool  { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
-func isNullable(t S) bool { return len(t) >= 3 && t[0] == "unop" && t[1] == "?" }
-func stripNullable(t S) S {
-	for isNullable(t) {
-		t = t[2].(S)
-	}
-	return t
-}
-func unwrapFenced(s string) string {
-	if strings.HasPrefix(s, "```") {
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			s = s[i+1:]
-		} else {
-			return s
-		}
-		if j := strings.LastIndex(s, "```"); j >= 0 {
-			s = s[:j]
-		}
-		s = strings.TrimSpace(s)
-	}
-	return s
-}
-
-// callGlobal1 invokes a global unary function by name and traps runtime errors,
-// returning the value and a non-empty error string when a failure is produced.
-func (ip *Interpreter) callGlobal1(name string, arg Value) (v Value, errStr string) {
-	fn, err := ip.Global.Get(name)
-	if err != nil || fn.Tag != VTFun {
-		v = annotNull(name + " is not available; load the standard library")
-		errStr = "missing"
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case rtErr:
-				v = annotNull(e.msg)
-			default:
-				v = annotNull("runtime error")
-			}
-			errStr = v.Annot
-		}
-	}()
-	v = ip.Apply(fn, []Value{arg})
-	if v.Tag == VTNull && v.Annot != "" {
-		errStr = v.Annot
-	}
+# Return the recorded origin for a test name, with cases("x") fallback for "x/NN".
+let _originOf = fun(name: Str) -> {}? do
+	if mapHas(_origins, name) then
+		return _origins[name]
+	end
+	let parts = split(name, "/")
+	let n = len(parts)
+	if n >= 2 then
+		let last = parts[n - 1]
+		if len(match("^[0-9]+$", last)) > 0 then
+			let parent = join(slice(parts, 0, n - 1), "/")
+			if mapHas(_caseOrigins, parent) then
+				return _caseOrigins[parent]
+			end
+		end
+	end
 	return
+end
+
+# =========================
+# Small helpers
+# =========================
+
+# Stable value rendering: JSON if possible, else str, else formatValue (never null).
+let _repr = fun(x) -> Str do
+	let j = jsonStringify(x)
+	if j != null then
+		return j
+	end
+	let s = str(x)
+	if s != null then
+		return s
+	end
+	return formatValue(x)
+end
+
+# Minimal substring check.
+let _contains = fun(hay: Str, needle: Str) -> Bool do
+	if len(needle) == 0 then
+		return true
+	end
+	return len(split(hay, needle)) > 1
+end
+
+# In-place insertion sort for strings (single place only, used for determinism).
+let _sortStrs = fun(xs: [Str]) -> [Str] do
+	let n = len(xs)
+	let i = 0
+	while i < n do
+		let j = i
+		while j > 0 and xs[j - 1] > xs[j] do
+			let tmp = xs[j - 1]
+			xs[j - 1] = xs[j]
+			xs[j] = tmp
+			j = j - 1
+		end
+		i = i + 1
+	end
+	return xs
+end
+
+# Redirect STDOUT/STDERR while running f, capture both streams, then restore.
+let _captureIO = fun(f: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
+	let base = tempDir()
+	let tag = sprintf("%d", [nowNanos()])
+	let pOut = pathJoin([base, sprintf("cap.%s.out", [tag])])
+	let pErr = pathJoin([base, sprintf("cap.%s.err", [tag])])
+
+	let hOut = open(pOut, "w")
+	let hErr = open(pErr, "w")
+	if hOut == null or hErr == null then
+		panic("capture open failed")
+	end
+
+	let so = STDOUT
+	let se = STDERR
+	STDOUT = hOut
+	STDERR = hErr
+
+	let r = try(fun(_: Null) do f(null) end)
+
+	flush(STDOUT)
+	flush(STDERR)
+	close(STDOUT)
+	close(STDERR)
+	STDOUT = so
+	STDERR = se
+
+	let o = readFile(pOut)
+	let e = readFile(pErr)
+	remove(pOut)
+	remove(pErr)
+
+	return {
+		ok: r.ok,
+		out: if o == null then "" else o end,
+		err: if e == null then "" else e end,
+		error: if r.ok then null else noteGet(r.value) end
+	}
+end
+
+# Silence all output while evaluating f; rethrow errors verbatim.
+let _silence = fun(f: Null -> Any) -> Null do
+	let r = _captureIO(f)
+	if r.ok then
+		return null
+	end
+	panic(r.error)
+end
+
+# =========================
+# Public API — assertions & registry
+# =========================
+
+# Register a test (name must be unique). Tests are (Null)->Any.
+let test = fun(name: Str, fn) -> Bool do
+	if not isType(fn, type Null -> Any) then
+		panic(sprintf("test(%s): second argument must be a function of type (Null)->Any", [
+			_repr(name)
+		]))
+	end
+	if mapHas(_tests, name) then
+		panic(sprintf("duplicate test name: %s", [_repr(name)]))
+	end
+	_tests[name] = fn
+	return true
+end
+
+# Return a shallow copy of the registry.
+let tests = fun(_: Null) -> {Str: Any} do
+	return clone(_tests)
+end
+
+# Reset the registry.
+let reset = fun(_: Null) -> Bool do
+	let keys = []
+	for [k, _] in _tests do
+		keys = keys + [k]
+	end
+	for k in keys do
+		mapDelete(_tests, k)
+	end
+	return true
+end
+
+# Boolean assertion.
+let assert = fun(ok: Bool, msg: Str?) -> Bool do
+	if not ok then
+		if msg == null then
+			panic("assertion failed")
+		end
+		panic(msg)
+	end
+	return true
+end
+
+# Equality assertion (pretty-prints values).
+let assertEq = fun(want, got) -> Bool do
+	if want == got then
+		return true
+	end
+	panic(sprintf("not equal:\nwant: %s\ngot:  %s", [_repr(want), _repr(got)]))
+end
+
+# Runtime type assertion.
+let assertType = fun(v, T: Type) -> Bool do
+	if isType(v, T) then
+		return true
+	end
+	panic(sprintf("type mismatch:\nvalue: %s\ndoes not satisfy: %s", [
+		_repr(v),
+		str(T)
+	]))
+end
+
+# Expect a hard failure; optionally assert error's first line contains substring.
+let assertThrows = fun(fn, sub: Str?) -> Bool do
+	if not isType(fn, type Null -> Any) then
+		panic("assertThrows: argument must be a function of type (Null)->Any")
+	end
+
+	let r = try(fun(_: Null) do fn(null) end)
+	if r.ok then
+		panic(sprintf("expected failure, got success with value: %s", [_repr(r.value)]))
+	end
+
+	if sub != null then
+		let e = noteGet(r.value)
+		let parts = split(e, "\n")
+		let first = if len(parts) == 0 then e else parts[0] end
+		if not _contains(first, sub) then
+			panic(sprintf("failure did not contain substring.\nwant in: %s\ngot:\n%s", [
+				_repr(sub),
+				e
+			]))
+		end
+	end
+
+	return true
+end
+
+# Table-driven subtests: registers name/0, name/1, ...
+let cases = fun(name: Str, xs: [Any], fn) -> Int do
+	if not isType(fn, type Any -> Any) then
+		panic(sprintf("cases(%s): fn must be a function taking one argument", [_repr(name)]))
+	end
+	let n = len(xs)
+	let i = 0
+	for _ in xs do
+		let sub = sprintf("%s/%d", [name, i])
+		let x = xs[i]
+		test(sub, fun(_: Null) do fn(x) end)
+		i = i + 1
+	end
+	return n
+end
+
+# Snapshot (golden) testing for values (write on update=true).
+let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
+	let want = _repr(value)
+	let have = readFile(path)
+	let doUpdate = update != null and bool(update)
+
+	if have == null then
+		if doUpdate then
+			let n = writeFile(path, want)
+			if n == null then
+				panic(sprintf("snapshot write failed: %s", [path]))
+			end
+			return true
+		end
+		panic(sprintf("snapshot missing (pass update=true to write): %s", [path]))
+	end
+
+	if have != want then
+		if doUpdate then
+			let n = writeFile(path, want)
+			if n == null then
+				panic(sprintf("snapshot write failed: %s", [path]))
+			end
+			return true
+		end
+		panic(sprintf("snapshot mismatch:\nfile: %s\n--- have ---\n%s\n--- want ---\n%s\n(pass update=true to overwrite)", [
+			path,
+			have,
+			want
+		]))
+	end
+
+	return true
+end
+
+let snapshotUpdate = fun(path: Str, value) -> Bool do
+	return snapshot(path, value, true)
+end
+
+# Seed RNG.
+let seed = fun(n: Int) -> Int do
+	seedRand(n)
+	return n
+end
+
+# =========================
+# Runner types
+# =========================
+
+let RunnerOpts = type {
+	pathPrefix: Str, # run tests whose paths start with this prefix (dir or file)
+	parallel: Bool, # run tests concurrently
+	verbose: Bool, # Go-style per-test RUN/PASS/FAIL lines
+	timeoutMs: Int # per-test timeout in ms (<=0 or null disables)
 }
-=== END FILE: oracles.go ===
+
+let Summary = type {passed: Int, failed: Int, total: Int, durationMs: Int}
+
+# =========================
+# Discovery & loading
+# =========================
+
+# Scan source text to record where tests/cases are declared.
+# Returns number of registrations indexed.
+let _indexTests = fun(file: Str, src: Str) -> Int do
+	let lines = split(src, "\n")
+	let i = 0
+	let found = 0
+	for _ in lines do
+		let line = lines[i]
+
+		# test("name", ...)  or  T.test("name", ...)
+		let p1 = split(line, "test(\"")
+		if len(p1) > 1 then
+			let tail = p1[1]
+			let name = split(tail, "\"")[0]
+			if len(name) > 0 then
+				_origins[name] = {file: file, line: i + 1}
+				found = found + 1
+			end
+		end
+
+		# cases("prefix", ...)  or  T.cases("prefix", ...)
+		let p2 = split(line, "cases(\"")
+		if len(p2) > 1 then
+			let tail2 = p2[1]
+			let prefix = split(tail2, "\"")[0]
+			if len(prefix) > 0 then
+				_caseOrigins[prefix] = {file: file, line: i + 1}
+				found = found + 1
+			end
+		end
+
+		i = i + 1
+	end
+	return found
+end
+
+let _endsWith = fun(s: Str, suffix: Str) -> Bool do
+	let n = len(s)
+	let m = len(suffix)
+	if m == 0 then
+		return true
+	end
+	if n < m then
+		return false
+	end
+	return substr(s, n - m, n) == suffix
+end
+
+let _startsWith = fun(s: Str, prefix: Str) -> Bool do
+	let n = len(prefix)
+	if n == 0 then
+		return true
+	end
+	if len(s) < n then
+		return false
+	end
+	return substr(s, 0, n) == prefix
+end
+
+let _isTestFile = fun(path: Str) -> Bool do
+	return _endsWith(pathBase(path), "_test.ms")
+end
+
+let _isAbs = fun(p: Str) -> Bool do
+	if len(p) > 0 and substr(p, 0, 1) == "/" then
+		return true
+	end
+	if len(p) >= 2 and substr(p, 0, 2) == "\\\\" then
+		return true
+	end
+	return len(match("^[A-Za-z]:[\\\\/]", p)) > 0
+end
+
+let _cleanAbs = fun(p: Str) -> Str do
+	let base = if cwd() == null then "." else cwd() end
+	let abs = if _isAbs(p) then p else pathJoin([base, p]) end
+	return pathClean(abs)
+end
+
+let _walk = fun(dir: Str) -> [Str] do
+	let entries = dirList(dir)
+	if entries == null then
+		return []
+	end
+	let out = []
+	for entry in entries do
+		let p = pathJoin([dir, entry])
+		let st = stat(p)
+		if st == null then
+			continue
+		elif st.isDir then
+			let rec = _walk(p)
+			for q in rec do
+				out = out + [q]
+			end
+		else
+			out = out + [p]
+		end
+	end
+	return out
+end
+
+let _discoverByPrefix = fun(prefix: Str) -> [Str] do
+	let pref = _cleanAbs(prefix)
+	let st = stat(pref)
+	let root = if st != null and st.isDir then pref else pathDir(pref) end
+	let all = _walk(root)
+	let out = []
+	for f in all do
+		let abs = pathClean(f)
+		if _startsWith(abs, pref) and _isTestFile(abs) then
+			out = out + [abs]
+		end
+	end
+	return _sortStrs(out)
+end
+
+# Load test files fresh each run: cache-bust with importCode + unique name.
+# Silence import-time output to prevent leakage.
+let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
+	let loaded = 0
+	for f in files do
+		if verbose then
+			printf("discover: %s\n", [f])
+		end
+		let src = readFile(f)
+		if src == null then
+			printf("FAIL read %s\n", [f])
+			continue
+		end
+
+		_indexTests(f, src)
+
+		let name = sprintf("testing:%s:%d", [f, nowNanos()])
+		let r = try(fun(_: Null) do
+			_silence(fun(_: Null) do
+				importCode(name, src)
+			end)
+		end)
+		if r.ok then
+			loaded = loaded + 1
+		else
+			let errorMessage = noteGet(r.value)
+			printf("FAIL import %s\n%s\n", [f, errorMessage])
+		end
+	end
+	return loaded
+end
+
+# =========================
+# Execution
+# =========================
+
+# _capProc: run fn in its own process, capturing all STDOUT/STDERR.
+let _capProc = fun(fn: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
+	let p = procSpawn(fun(_: Null) -> {} do
+		_captureIO(fn)
+	end)
+	return procJoin(p)
+end
+
+# Run a single test with optional timeout.
+# Returns: { name, ok, durationMs, error?, timeout? }
+# emit controls whether this function prints status lines.
+let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> {} do
+	if emit and verbose then
+		printf("=== RUN   %s\n", [name])
+	end
+	let t0 = nowMillis()
+
+	let _exec = fun(_: Null) -> {} do
+		let c = _capProc(fun(_: Null) -> Any do fn(null) end)
+		if c.ok then
+			return {ok: true}
+		end
+		return {ok: false, error: c.error}
+	end
+
+	let base = if timeoutMs == null or int(timeoutMs) <= 0 then
+		_exec(null)
+	else
+		let tp = procSpawn(fun(_: Null) -> {} do _exec(null) end)
+		let tt = procSpawn(fun(_: Null) -> {} do
+			let t = timerAfter(int(timeoutMs))
+			chanRecv(t)
+			{ok: false, timeout: true, error: sprintf("timeout after %dms", [int(timeoutMs)])}
+		end)
+		let win = procJoinAny([tp, tt])
+		if win.index == 0 then
+			procCancel(tt)
+			procJoin(tt)
+		else
+			procCancel(tp)
+			procJoin(tp)
+		end
+		win.value
+	end
+
+	let dur = nowMillis() - t0
+	let ok = base.ok
+	let isTimeout = mapHas(base, "timeout") and bool(base.timeout)
+	let err = if mapHas(base, "error") and base.error != null then base.error else "" end
+
+	let _printOriginIfAny = fun(_: Null) -> Null do
+		let o = _originOf(name)
+		if o != null then
+			printf("    AT    %s:%d (test)\n", [o.file, int(o.line)])
+		end
+		null
+	end
+
+	if emit then
+		if verbose then
+			if ok then
+				printf("--- PASS: %s (%dms)\n", [name, int(dur)])
+			else
+				_printOriginIfAny(null)
+				printf("%s\n", [err])
+				let tag = if isTimeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+			end
+		else
+			if not ok then
+				printf("=== RUN   %s\n", [name])
+				_printOriginIfAny(null)
+				printf("%s\n", [err])
+				let tag = if isTimeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+			end
+		end
+	end
+
+	return {
+		name: name,
+		ok: ok,
+		durationMs: dur,
+		error: if not ok then err else null end,
+		timeout: isTimeout
+	}
+end
+
+# Run all registered tests. In parallel mode, only the parent prints.
+let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
+	let start = nowMillis()
+	let passed = 0
+	let failed = 0
+	let total = 0
+
+	let reg = tests(null)
+	let names = []
+	for [k, _] in reg do
+		names = names + [k]
+	end
+	names = _sortStrs(names)
+
+	if parallel then
+		if verbose then
+			for name in names do
+				printf("=== RUN   %s\n", [name])
+			end
+		end
+
+		let ps = []
+		for name in names do
+			let fn = reg[name]
+			ps = ps + [
+				procSpawn(fun(_: Null) -> {} do
+					_runOne(name, fn, timeoutMs, verbose, false)
+				end)
+			]
+			total = total + 1
+		end
+
+		let results = procJoinAll(ps)
+		let i = 0
+		while i < len(results) do
+			let res = results[i]
+			if res.ok then
+				passed = passed + 1
+				if verbose then
+					printf("--- PASS: %s (%dms)\n", [res.name, int(res.durationMs)])
+				end
+			else
+				failed = failed + 1
+				let o = _originOf(res.name)
+				if o != null then
+					printf("    AT    %s:%d (test)\n", [o.file, int(o.line)])
+				end
+				if res.error != null then
+					printf("%s\n", [res.error])
+				end
+				let tag = if res.timeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag, res.name, int(res.durationMs)])
+			end
+			i = i + 1
+		end
+	else
+		for name in names do
+			let fn = reg[name]
+			total = total + 1
+			let res = _runOne(name, fn, timeoutMs, verbose, true)
+			if res.ok then
+				passed = passed + 1
+			else
+				failed = failed + 1
+			end
+		end
+	end
+
+	let dur = nowMillis() - start
+	return {passed: passed, failed: failed, total: total, durationMs: dur}
+end
+
+# =========================
+# Public API — runner
+# =========================
+
+# Run: reset registry, discover tests, load fresh modules, run, print summary.
+let run = fun(opts: RunnerOpts) -> Summary do
+	let prefix = if mapHas(opts, "pathPrefix") and opts.pathPrefix != null then opts.pathPrefix else "." end
+	let verbose = if mapHas(opts, "verbose") and opts.verbose != null then bool(opts.verbose) else false end
+	let parallel = if mapHas(opts, "parallel") and opts.parallel != null then bool(opts.parallel) else false end
+	let timeoutMs = if mapHas(opts, "timeoutMs") and opts.timeoutMs != null then int(opts.timeoutMs) else null end
+
+	reset(null)
+
+	let files = _discoverByPrefix(prefix)
+	if verbose then
+		printf("found %d test file(s)\n", [len(files)])
+	end
+	let _ = _loadTests(files, verbose)
+
+	let summary = _runAll(parallel, timeoutMs, verbose)
+
+	printf("ok: %d  fail: %d  total: %d  durationMs: %d\n", [
+		summary.passed,
+		summary.failed,
+		summary.total,
+		summary.durationMs
+	])
+
+	return summary
+end
+=== END FILE: lib/testing.ms ===
+
+=== BEGIN FILE: lib/testing_test.ms ===
+# Tests for testing.ms (orthogonal, minimal).
+# Imports and uses the testing module explicitly.
+let T = import("testing")
+
+# --- assert(ok, msg?) ------------------------------------------------------
+
+T.test("testing/assert/true", fun(_: Null) do
+	T.assert(true, null)
+end)
+
+T.test("testing/assert/false-default-msg", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assert(false, null)
+	end, "assertion failed")
+end)
+
+T.test("testing/assert/false-custom-msg", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assert(false, "nope")
+	end, "nope")
+end)
+
+# --- assertEq(want, got) ---------------------------------------------------
+
+T.test("testing/assertEq/equal-scalars", fun(_: Null) do
+	T.assertEq(42, 42)
+end)
+
+T.test("testing/assertEq/equal-deep-map", fun(_: Null) do
+	T.assertEq({a: 1, b: [2, 3]}, {b: [2, 3], a: 1})
+end)
+
+T.test("testing/assertEq/equal-deep-array", fun(_: Null) do
+	T.assertEq([1, 2, {x: 3}], [1, 2, {x: 3}])
+end)
+
+T.test("testing/assertEq/mismatch-diffs", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertEq(1, 2)
+	end, "not equal")
+end)
+
+# --- assertType(v, T) ------------------------------------------------------
+# Use typeOf(...) to avoid referencing bare names like Int/Any.
+
+T.test("testing/assertType/match", fun(_: Null) do
+	# Expect an array-of-Int — infer its Type from a value.
+	T.assertType([1, 2], typeOf([1]))
+end)
+
+T.test("testing/assertType/mismatch", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		# Expect Int (infer from 0), but pass a Num (3.14)
+		T.assertType(3.14, typeOf(0))
+	end, "type mismatch")
+end)
+
+# --- assertThrows(fn, sub?) ------------------------------------------------
+
+T.test("testing/assertThrows/catches-fail", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		panic("boom")
+	end, "boom")
+end)
+
+T.test("testing/assertThrows/requires-function", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertThrows(123, null)
+	end, "argument must be a function")
+end)
+
+T.test("testing/assertThrows/fails-when-no-throw", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertThrows(fun(_: Null) do
+			42
+		end, null)
+	end, "expected failure, got success")
+end)
+
+T.test("testing/assertThrows/substring-mismatch", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertThrows(fun(_: Null) do
+			panic("actual message")
+		end, "different substring")
+	end, "did not contain substring")
+end)
+
+# --- test(name, fn) API ----------------------------------------------------
+
+T.test("testing/test/register-returns-true", fun(_: Null) do
+	let ok = T.test("testing/register/ok", fun(_: Null) do
+		T.assert(true, null)
+	end)
+	T.assertEq(true, ok)
+end)
+
+T.test("testing/test/duplicate-name-fails", fun(_: Null) do
+	T.test("testing/register/dup", fun(_: Null) do
+		null
+	end)
+	T.assertThrows(fun(_: Null) do
+		T.test("testing/register/dup", fun(_: Null) do
+			null
+		end)
+	end, "duplicate test name")
+end)
+
+T.test("testing/test/second-arg-must-be-fn", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.test("testing/register/not-fn", 7)
+	end, "must be a function")
+end)
+
+# --- cases(name, xs, fn) ---------------------------------------------------
+
+T.test("testing/cases/registers-n-subtests", fun(_: Null) do
+	let n = T.cases("testing/table/smoke", [10, 20], fun(x) do
+		T.assert(x != null, null)
+	end)
+	T.assertEq(2, n)
+end)
+
+T.test("testing/cases/empty", fun(_: Null) do
+	let n = T.cases("testing/table/empty", [], fun(_) do
+		null
+	end)
+	T.assertEq(0, n)
+end)
+
+T.test("testing/cases/requires-one-arg-fn", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.cases("testing/table/bad-fn", [1], 123)
+	end, "fn must be a function")
+end)
+
+# --- snapshot(path, value[, update]) ---------------------------------------
+
+# Helper to build a unique temp filepath (in the OS temp dir).
+let _tmpPath = fun(prefix: Str, suffix: Str) -> Str do
+	let base = tempDir()
+	let stamp = sprintf("%d", [nowMillis()])
+	pathJoin([base, sprintf("%s.%s%s", [prefix, stamp, suffix])])
+end
+
+T.test("testing/snapshot/write-and-read", fun(_: Null) do
+	let path = _tmpPath("snapshot.write-read", ".json")
+	T.snapshotUpdate(path, {hello: "world", n: 7})
+	T.assert(T.snapshot(path, {hello: "world", n: 7}, null), null)
+	remove(path) # cleanup
+
+end)
+
+T.test("testing/snapshot/mismatch-detected", fun(_: Null) do
+	let path = _tmpPath("snapshot.mismatch", ".json")
+	T.snapshotUpdate(path, [1, 2, 3])
+	T.assertThrows(fun(_: Null) do
+		T.snapshot(path, [1, 2, 4], null)
+	end, "snapshot mismatch")
+	remove(path) # cleanup
+
+end)
+
+# --- seed(n) & RNG reproducibility -----------------------------------------
+
+T.test("testing/seed/reproducible-int", fun(_: Null) do
+	T.seed(12345)
+	let a = randInt(1000000)
+	T.seed(12345)
+	let b = randInt(1000000)
+	T.assertEq(a, b)
+end)
+
+T.test("testing/seed/reproducible-float", fun(_: Null) do
+	T.seed(424242)
+	let a = randFloat(null)
+	T.seed(424242)
+	let b = randFloat(null)
+	T.assertEq(a, b)
+end)
+
+# --- tests() view & registry isolation -------------------------------------
+
+T.test("testing/tests/returns-map-clone", fun(_: Null) do
+	let m = T.tests(null)
+	T.assertType(m, type {})
+	m["__probe__"] = 1
+	let m2 = T.tests(null)
+	T.assertEq(false, mapHas(m2, "__probe__"))
+end)
+
+# --- assert: return value ---------------------------------------------------
+
+T.test("testing/assert/returns-true", fun(_: Null) do
+	let ok = T.assert(true, null)
+	T.assertEq(true, ok)
+end)
+
+# --- assertEq: int vs float equality ---------------------------------------
+
+T.test("testing/assertEq/int-vs-float-equal", fun(_: Null) do
+	T.assertEq(2, 2.0)
+end)
+
+# --- assertThrows: empty substring means "any message" ----------------------
+
+T.test("testing/assertThrows/empty-substring-ok", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		panic("some failure message")
+	end, "")
+end)
+
+# --- assertType: subtyping & function values --------------------------------
+
+T.test("testing/assertType/subtyping-Int-to-Num", fun(_: Null) do
+	# 42:Int should satisfy Num.
+	T.assertType(42, typeOf(0.0))
+end)
+
+T.test("testing/assertType/function-value", fun(_: Null) do
+	let f = fun(_: Null) do
+		null
+	end
+	T.assertType(f, typeOf(f))
+end)
+
+# --- cases: ensure subtest names are registered -----------------------------
+
+T.test("testing/cases/registrations-visible", fun(_: Null) do
+	let base = "testing/table/vis"
+	let _ = T.cases(base, [7, 8], fun(_) do
+		null
+	end)
+	let m = T.tests(null)
+	T.assertEq(true, mapHas(m, sprintf("%s/0", [base])))
+	T.assertEq(true, mapHas(m, sprintf("%s/1", [base])))
+end)
+
+# --- snapshot: overwrite on update -----------------------------------------
+
+T.test("testing/snapshot/update-overwrites", fun(_: Null) do
+	let path = _tmpPath("snapshot.overwrite", ".json")
+	T.snapshotUpdate(path, {v: 1})
+	T.assertThrows(fun(_: Null) do
+		T.snapshot(path, {v: 2}, null)
+	end, "snapshot mismatch")
+	T.snapshotUpdate(path, {v: 2})
+	T.assert(T.snapshot(path, {v: 2}, null), null)
+	remove(path) # cleanup
+
+end)
+
+# --- reset: clears registry -------------------------------------------------
+
+T.test("testing/reset/clears", fun(_: Null) do
+	let before = T.tests(null)
+	# Should be >= existing tests in this suite; just assert it's a map with some size.
+	T.assert(len(before) != null and len(before) >= 0, null)
+	T.reset(null)
+	let after = T.tests(null)
+	T.assertEq(0, len(after))
+end)
+
+# --- seed: returns echo value ----------------------------------------------
+
+T.test("testing/seed/echo", fun(_: Null) do
+	T.assertEq(123, T.seed(123))
+end)=== END FILE: lib/testing_test.ms ===
 

@@ -66,7 +66,7 @@ end)
 T.test("testing/assertThrows/requires-function", fun(_: Null) do
 	T.assertThrows(fun(_: Null) do
 		T.assertThrows(123, null)
-	end, "argument must be a function")
+	end, "type mismatch in parameter 'fn'")
 end)
 
 T.test("testing/assertThrows/fails-when-no-throw", fun(_: Null) do
@@ -108,7 +108,7 @@ end)
 T.test("testing/test/second-arg-must-be-fn", fun(_: Null) do
 	T.assertThrows(fun(_: Null) do
 		T.test("testing/register/not-fn", 7)
-	end, "must be a function")
+	end, "type mismatch in parameter 'fn'")
 end)
 
 # --- cases(name, xs, fn) ---------------------------------------------------
@@ -130,7 +130,7 @@ end)
 T.test("testing/cases/requires-one-arg-fn", fun(_: Null) do
 	T.assertThrows(fun(_: Null) do
 		T.cases("testing/table/bad-fn", [1], 123)
-	end, "fn must be a function")
+	end, "type mismatch in parameter 'fn'")
 end)
 
 # --- snapshot(path, value[, update]) ---------------------------------------

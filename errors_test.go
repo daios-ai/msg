@@ -700,7 +700,7 @@ M3P.f(0)`
 }
 
 func countNodes(n S) int {
-	if n == nil || len(n) == 0 {
+	if len(n) == 0 {
 		return 0
 	}
 	c := 1 // count this node

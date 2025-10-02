@@ -130,15 +130,6 @@ func wantErrContains(t *testing.T, err error, substr string) {
 	}
 }
 
-// elems returns the array elements (failing the test if v is not an array).
-func elems(t *testing.T, v Value) []Value {
-	t.Helper()
-	if v.Tag != VTArray {
-		t.Fatalf("want array, got %#v", v)
-	}
-	return v.Data.(*ArrayObject).Elems
-}
-
 // --- tests -----------------------------------------------------------------
 
 func Test_Interpreter_Literals(t *testing.T) {
@@ -1946,4 +1937,63 @@ f()
 
 	// And the explicit-null call must also work.
 	wantBool(t, mustEvalPersistent(t, ip, `f(null)`), true)
+}
+
+func Test_Interpreter_Handle_Equality_Alias_STDOUT(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Sanity: a symbol equals itself.
+	wantBool(t, mustEvalPersistent(t, ip, "STDOUT == STDOUT"), true)
+
+	// Aliasing: new is a second reference to the exact same handle.
+	mustEvalPersistent(t, ip, "let new = STDOUT")
+	wantBool(t, mustEvalPersistent(t, ip, "new == STDOUT"), true)
+	wantBool(t, mustEvalPersistent(t, ip, "new != STDOUT"), false)
+}
+
+func Test_Interpreter_Handle_Equality_Distinct_SameKind(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Register a tiny native that returns a fresh opaque handle each call.
+	ip.RegisterNative("mkHandle", nil, S{"id", "Any"}, func(_ *Interpreter, _ CallCtx) Value {
+		// Each call returns a distinct *Handle pointer (identity should differ).
+		return HandleVal("test-handle", &struct{}{})
+	})
+
+	// Two different handles of the same kind are NOT equal (identity semantics).
+	wantBool(t, mustEvalPersistent(t, ip, `
+let a = mkHandle()
+let b = mkHandle()
+a == b
+`), false)
+
+	// Reflexivity still holds: a handle equals itself.
+	wantBool(t, mustEvalPersistent(t, ip, `
+let a = mkHandle()
+a == a
+`), true)
+
+	// And inequality mirrors equality.
+	wantBool(t, mustEvalPersistent(t, ip, `
+let a = mkHandle()
+let b = mkHandle()
+a != b
+`), true)
+}
+
+func Test_Interpreter_Handle_Equality_Mixed_With_NonHandles(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Comparing a handle to a non-handle is false.
+	// (Keeps equality orthogonal across unrelated tags.)
+	wantBool(t, mustEvalPersistent(t, ip, `
+let h = STDOUT
+h == 42
+`), false)
+
+	// Also ensure inequality is true here.
+	wantBool(t, mustEvalPersistent(t, ip, `
+let h = STDOUT
+h != 42
+`), true)
 }

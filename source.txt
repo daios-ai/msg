@@ -1,585 +1,934 @@
-=== BEGIN FILE: vm.go ===
-// vm.go: minimal bytecode virtual machine for MindScript.
-//
-// OVERVIEW
-// --------
-// This file implements a compact, goroutine-safe-by-isolation, stack-based VM
-// that executes MindScript bytecode ("Chunk") and returns a result Value.
-// The VM is *internal to the package*: it exposes only the Chunk container;
-// everything else (opcodes, instruction encoding, VM loop) is private.
-//
-// Concurrency model (Lua-style isolates)
-// -------------------------------------
-//   - A single *Interpreter is **not re-entrant**. Do not invoke its methods from
-//     multiple goroutines at the same time.
-//   - For parallelism, create multiple *Interpreter instances (or use Clone if
-//     provided) and run each in its own goroutine. Each instance maintains its own
-//     Core/Global envs, module cache, current source tracking, and VM state.
-//   - This file has no package-level mutable state; all VM state is per-run and
-//     per-Interpreter. As long as an Interpreter isn't shared concurrently, there
-//     are no data races here.
-//   - Host natives may spin goroutines, but they must not touch a *shared*
-//     Interpreter/Env concurrently. Use isolated instances to run work in parallel.
-//
-// Execution model
-//   - The interpreter (see interpreter.go) lowers S-expr AST into a Chunk using
-//     a small emitter. This VM then executes that Chunk in a given lexical Env.
-//   - The VM keeps the public engine surface stable by delegating CALL to
-//     Interpreter.Apply semantics via a private helper (applyArgsScoped). That
-//     preserves currying, native dispatch, type checks, and call-site scoping.
-//   - Runtime errors inside the VM are reported as annotated null Values and
-//     surfaced via a vmRuntimeError status to the interpreter. The vmResult also
-//     carries the instruction PC where the error occurred so the interpreter can
-//     map it back to a source (line, col) using Chunk.Marks and SourceRef.
-//
-// Instruction encoding (private)
-//   - 32-bit instruction: [ opcode:8 | imm:24 ].
-//   - Opcodes cover constants/globals, stack ops, property/index access,
-//     arithmetic/compare/unary, control flow, and calls.
-//   - The emitter constructs instruction words via `pack`. Decoding uses `uop`
-//     and `uimm`. These are all private to the package.
-//
-// Data & semantics used by the VM
-//   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
-//   - Env (lexical chain) for resolving globals
-//   - Interpreter methods: deepEqual, applyArgsScoped
-//   - Negative array indices count from the end (Python-like -1 is last, -len is first),
-//     but indices < -len (and ≥ len) are out of bounds.
-//   - Property access on maps/modules; index access on arrays/maps
-//   - Numeric ops preserve integers where possible; division/mod guard zero;
-//     string relational comparisons are supported for <, <=, >, >=.
-//   - Control flow: Return yields vmReturn with a Value; fallthrough yields vmOK.
-//
-// DEPENDENCIES (other files)
-// --------------------------
-// • interpreter.go
-//   - Value/ValueTag/Null/Arr/Bool/Int/Num, MapObject, Env
-//   - (ip *Interpreter).deepEqual, (ip *Interpreter).applyArgsScoped
-//   - errNull, isNumber, toFloat helpers
-//
-// • modules.go (not shown here)
-//   - Module type and (m *Module).get(name) (used for VTModule property lookups)
-//
-// • parser.go / lexer.go (indirect; produce AST for the emitter that targets this VM)
-// • types.go (indirect; equality of types via deepEqual resolution)
-//
-// PUBLIC vs PRIVATE
-// -----------------
-// PUBLIC  : Chunk (bytecode container) — the only stable surface exported here.
-// PRIVATE : opcodes, instruction packing, VM loop/state, vmResult/status, helpers.
-package mindscript
+=== BEGIN FILE: lib/testing.ms ===
+# testing.ms — minimal testing toolkit + simple test runner
+# 
+# Usage in *_test.ms:
+# let testing = import("testing")
+# testing.test("adds", fun(_: Null) -> Any do
+# testing.assertEq(2 + 2, 4)
+# end)
+# 
+# Running:
+# let testing = import("testing")
+# testing.run({ pathPrefix: ".", verbose: false, parallel: false, timeoutMs: 0 })
 
-import (
-	"fmt"
-	"math"
-)
+# =========================
+# Internal state
+# =========================
 
-////////////////////////////////////////////////////////////////////////////////
-//                                   PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
+let _tests = {} # name -> (Null)->Any name -> { file!: Str, line!: Int }
 
-// SourceRef attaches source text and an optional SpanIndex to bytecode.
-type SourceRef struct {
-	Name     string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
-	Src      string     // full text
-	Spans    *SpanIndex // may be nil when unknown
-	PathBase NodePath   // optional absolute prefix for marks emitted in this chunk
+let _origins = {} # concrete tests: test("name", ...)
+
+let _caseOrigins = {} # case groups:   cases("prefix", ...)
+
+# Return the recorded origin for a test name, with cases("x") fallback for "x/NN".
+let _originOf = fun(name: Str) -> {}? do
+	if mapHas(_origins, name) then
+		return _origins[name]
+	end
+	# subtest fallback: prefix/NN  (NN = digits)
+	let parts = split(name, "/")
+	let n = len(parts)
+	if n >= 2 then
+		let last = parts[n - 1]
+		if len(match("^[0-9]+$", last)) > 0 then
+			let parent = join(slice(parts, 0, n - 1), "/")
+			if mapHas(_caseOrigins, parent) then
+				return _caseOrigins[parent]
+			end
+		end
+	end
+	return
+end
+
+# =========================
+# Small helpers
+# =========================
+
+# Stable value rendering: JSON if possible, else str, else formatValue (never null).
+let _repr = fun(x) -> Str do
+	let j = jsonStringify(x)
+	if j != null then
+		return j
+	end
+	let s = str(x)
+	if s != null then
+		return s
+	end
+	return formatValue(x)
+end
+
+# Minimal substring check.
+let _contains = fun(hay: Str, needle: Str) -> Bool do
+	if len(needle) == 0 then
+		return true
+	end
+	return len(split(hay, needle)) > 1
+end
+
+# In-place insertion sort for strings (single place only, used for determinism).
+let _sortStrs = fun(xs: [Str]) -> [Str] do
+	let n = len(xs)
+	let i = 0
+	while i < n do
+		let j = i
+		while j > 0 and xs[j - 1] > xs[j] do
+			let tmp = xs[j - 1]
+			xs[j - 1] = xs[j]
+			xs[j] = tmp
+			j = j - 1
+		end
+		i = i + 1
+	end
+	return xs
+end
+
+# =========================
+# Public API — assertions & registry
+# =========================
+
+# Register a test (name must be unique). Tests are (Null)->Any.
+let test = fun(name: Str, fn) -> Bool do
+	if not isType(fn, type Null -> Any) then
+		panic(sprintf("test(%s): second argument must be a function of type (Null)->Any", [
+			_repr(name)
+		]))
+	end
+	if mapHas(_tests, name) then
+		panic(sprintf("duplicate test name: %s", [_repr(name)]))
+	end
+	_tests[name] = fn
+	return true
+end
+
+# Return a shallow copy of the registry.
+let tests = fun(_: Null) -> {Str: Any} do
+	return clone(_tests)
+end
+
+# Reset the registry.
+let reset = fun(_: Null) -> Bool do
+	let keys = []
+	for [k, _] in _tests do
+		keys = keys + [k]
+	end
+	for k in keys do
+		mapDelete(_tests, k)
+	end
+	return true
+end
+
+# Boolean assertion.
+let assert = fun(ok: Bool, msg: Str?) -> Bool do
+	if not ok then
+		if msg == null then
+			panic("assertion failed")
+		end
+		panic(msg)
+	end
+	return true
+end
+
+# Equality assertion (pretty-prints values).
+let assertEq = fun(want, got) -> Bool do
+	if want == got then
+		return true
+	end
+	panic(sprintf("not equal:\nwant: %s\ngot:  %s", [_repr(want), _repr(got)]))
+end
+
+# Runtime type assertion.
+let assertType = fun(v, T: Type) -> Bool do
+	if isType(v, T) then
+		return true
+	end
+	panic(sprintf("type mismatch:\nvalue: %s\ndoes not satisfy: %s", [
+		_repr(v),
+		str(T)
+	]))
+end
+
+# Expect a hard failure; optionally assert error's first line contains substring.
+let assertThrows = fun(fn, sub: Str?) -> Bool do
+	if not isType(fn, type Null -> Any) then
+		panic("assertThrows: argument must be a function of type (Null)->Any")
+	end
+
+	let r = try(fun(_: Null) do
+		fn(null)
+	end)
+	if r.ok then
+		panic(sprintf("expected failure, got success with value: %s", [
+			_repr(r.value)
+		]))
+	end
+
+	if sub != null then
+		let e = noteGet(r.value)
+		# first line only (avoid matches in the caret frame)
+		let parts = split(e, "\n")
+		let first = if len(parts) == 0 then
+			e
+		else
+			parts[0]
+		end
+		if not _contains(first, sub) then
+			panic(sprintf("failure did not contain substring.\nwant in: %s\ngot:\n%s", [
+				_repr(sub),
+				e
+			]))
+		end
+	end
+
+	return true
+end
+
+# Table-driven subtests: registers name/0, name/1, ...
+let cases = fun(name: Str, xs: [Any], fn) -> Int do
+	if not isType(fn, type Any -> Any) then
+		panic(sprintf("cases(%s): fn must be a function taking one argument", [
+			_repr(name)
+		]))
+	end
+	let n = len(xs)
+	let i = 0
+	for _ in xs do
+		let sub = sprintf("%s/%d", [name, i])
+		let x = xs[i]
+		test(sub, fun(_: Null) do
+			fn(x)
+		end)
+		i = i + 1
+	end
+	return n
+end
+
+# Snapshot (golden) testing for values (write on update=true).
+let snapshot = fun(path: Str, value, update: Bool?) -> Bool do
+	let want = _repr(value)
+	let have = readFile(path)
+	let doUpdate = update != null and bool(update)
+
+	if have == null then
+		if doUpdate then
+			let n = writeFile(path, want)
+			if n == null then
+				panic(sprintf("snapshot write failed: %s", [path]))
+			end
+			return true
+		end
+		panic(sprintf("snapshot missing (pass update=true to write): %s", [path]))
+	end
+
+	if have != want then
+		if doUpdate then
+			let n = writeFile(path, want)
+			if n == null then
+				panic(sprintf("snapshot write failed: %s", [path]))
+			end
+			return true
+		end
+		panic(sprintf("snapshot mismatch:\nfile: %s\n--- have ---\n%s\n--- want ---\n%s\n(pass update=true to overwrite)", [
+			path,
+			have,
+			want
+		]))
+	end
+
+	return true
+end
+
+let snapshotUpdate = fun(path: Str, value) -> Bool do
+	return snapshot(path, value, true)
+end
+
+# Seed RNG.
+let seed = fun(n: Int) -> Int do
+	seedRand(n)
+	return n
+end
+
+# =========================
+# Runner types
+# =========================
+
+let RunnerOpts = type {
+	pathPrefix: Str, # run tests whose paths start with this prefix (dir or file)
+	parallel: Bool, # run tests concurrently
+	verbose: Bool, # Go-style per-test RUN/PASS/FAIL lines
+	timeoutMs: Int # per-test timeout in ms (<=0 or null disables)
 }
 
-// PCMark associates an instruction index with an AST node path.
-type PCMark struct {
-	PC   int
-	Path NodePath
-}
+let Summary = type {passed: Int, failed: Int, total: Int, durationMs: Int}
 
-// Chunk is an immutable bytecode container executed by the VM.
-//
-// Layout:
-//
-//	Code   — instruction stream; each instruction is a 32-bit word where the
-//	         high 8 bits encode the opcode and the low 24 bits hold an unsigned
-//	         immediate (operand). The encoding details are private to the VM.
-//	Consts — constant pool referenced by instructions (e.g., opConst pushes
-//	         Consts[k], opLoadGlobal/opGetProp carry string names as VTStr).
-//	Src    — optional source reference (used for caret-runtime errors).
-//	Marks  — PC→AST path marks for mapping instructions back to source spans.
-//
-// Producer & consumer:
-//   - Produced by the internal emitter (see interpreter.go) from an S-expr AST.
-//   - Consumed only by the VM entry (private) to execute code in an Env.
-//
-// Stability contract:
-//   - The existence of Chunk and its fields is stable for code that needs to
-//     hand bytecode across subsystems within this package. The instruction set
-//     and encoding are *not* public API.
-type Chunk struct {
-	Code   []uint32
-	Consts []Value
-	Src    *SourceRef
-	Marks  []PCMark
-}
+# =========================
+# Discovery & loading
+# =========================
 
-//// END_OF_PUBLIC
+# Scan source text to record where tests/cases are declared.
+# Returns number of registrations indexed.
+let _indexTests = fun(file: Str, src: Str) -> Int do
+	let lines = split(src, "\n")
+	let i = 0
+	let found = 0
+	for _ in lines do
+		let line = lines[i]
 
-////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
+		# test("name", ...)  or  T.test("name", ...)
+		let p1 = split(line, "test(\"")
+		if len(p1) > 1 then
+			let tail = p1[1]
+			let name = split(tail, "\"")[0]
+			if len(name) > 0 then
+				_origins[name] = {file: file, line: i + 1}
+				found = found + 1
+			end
+		end
 
-/************* Instruction encoding (private) *************/
+		# cases("prefix", ...)  or  T.cases("prefix", ...)
+		let p2 = split(line, "cases(\"")
+		if len(p2) > 1 then
+			let tail2 = p2[1]
+			let prefix = split(tail2, "\"")[0]
+			if len(prefix) > 0 then
+				_caseOrigins[prefix] = {file: file, line: i + 1}
+				found = found + 1
+			end
+		end
 
-type opcode uint8
+		i = i + 1
+	end
+	return found
+end
 
-const (
-	opNop opcode = iota
+let _endsWith = fun(s: Str, suffix: Str) -> Bool do
+	let n = len(s)
+	let m = len(suffix)
+	if m == 0 then
+		return true
+	end
+	if n < m then
+		return false
+	end
+	return substr(s, n - m, n) == suffix
+end
 
-	// constants & globals
-	opConst      // push consts[k]
-	opLoadGlobal // push Env[name];  imm = const index (name as VTStr)
+let _startsWith = fun(s: Str, prefix: Str) -> Bool do
+	let n = len(prefix)
+	if n == 0 then
+		return true
+	end
+	if len(s) < n then
+		return false
+	end
+	return substr(s, 0, n) == prefix
+end
 
-	// stack/values
-	opMakeArr // pop N → array; imm = N
-	opPop     // pop and discard top of stack
+let _isTestFile = fun(path: Str) -> Bool do
+	return _endsWith(pathBase(path), "_test.ms")
+end
 
-	// property & index
-	opGetProp // obj.get(name);   imm = const index (name as VTStr)
-	opGetIdx  // pop idx,obj → push obj[idx]
+let _isAbs = fun(p: Str) -> Bool do
+	if len(p) > 0 and substr(p, 0, 1) == "/" then
+		return true
+	end
+	if len(p) >= 2 and substr(p, 0, 2) == "\\\\" then
+		return true
+	end
+	return len(match("^[A-Za-z]:[\\\\/]", p)) > 0
+end
 
-	// arithmetic / compare / unary
-	opSub
-	opMul
-	opDiv
-	opMod
-	opEq
-	opNe
-	opLt
-	opLe
-	opGt
-	opGe
-	opNeg
-	opNot
+let _cleanAbs = fun(p: Str) -> Str do
+	let base = if cwd() == null then "." else cwd() end
+	let abs = if _isAbs(p) then p else pathJoin([base, p]) end
+	return pathClean(abs)
+end
 
-	// control flow
-	opJump        // ip = imm
-	opJumpIfFalse // pop cond; if false => ip = imm
-	opReturn      // pop v; signal Return with v
+let _walk = fun(dir: Str) -> [Str] do
+	let entries = dirList(dir)
+	if entries == null then
+		return []
+	end
+	let out = []
+	for entry in entries do
+		let p = pathJoin([dir, entry])
+		let st = stat(p)
+		if st == null then
+			continue
+		elif st.isDir then
+			let rec = _walk(p)
+			for q in rec do
+				out = out + [q]
+			end
+		else
+			out = out + [p]
+		end
+	end
+	return out
+end
 
-	// calls/closures
-	opCall // argc = imm; pops argc args then callee; pushes result
-)
+let _discoverByPrefix = fun(prefix: Str) -> [Str] do
+	let pref = _cleanAbs(prefix)
+	let st = stat(pref)
+	let root = if st != null and st.isDir then
+		pref
+	else
+		pathDir(pref)
+	end
+	let all = _walk(root)
+	let out = []
+	for f in all do
+		let abs = pathClean(f)
+		if _startsWith(abs, pref) and _isTestFile(abs) then
+			out = out + [abs]
+		end
+	end
+	return _sortStrs(out)
+end
 
-// pack/unpack helpers
-func pack(op opcode, imm uint32) uint32 { return uint32(op)<<24 | (imm & 0xFFFFFF) }
-func uop(i uint32) opcode               { return opcode(i >> 24) }
-func uimm(i uint32) uint32              { return i & 0xFFFFFF }
+# Load test files fresh each run: cache-bust with importCode + unique name.
+let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
+	let loaded = 0
+	for f in files do
+		if verbose then
+			printf("discover: %s\n", [f])
+		end
+		let src = readFile(f)
+		if src == null then
+			printf("FAIL read %s\n", [f])
+			continue
+		end
 
-// unwrap a VTMap to *MapObject (nil if not a map)
-func asMap(v Value) *MapObject {
-	if v.Tag != VTMap {
-		return nil
-	}
-	return v.Data.(*MapObject)
-}
+		# origins index
+		_indexTests(f, src)
 
-/************* VM status/result (private) *************/
+		let name = sprintf("testing:%s:%d", [f, nowNanos()])
+		let r = try(fun(_: Null) do
+			importCode(name, src)
+		end)
+		if r.ok then
+			loaded = loaded + 1
+		else
+			# caret-formatted by try(); print verbatim
+			let errorMessage = noteGet(r.value)
+			printf("FAIL import %s\n%s\n", [f, errorMessage])
+		end
+	end
+	return loaded
+end
 
-type vmStatus int
-
-const (
-	vmOK vmStatus = iota
-	vmReturn
-	vmRuntimeError
-)
-
-type vmResult struct {
-	status vmStatus
-	value  Value
-	pc     int // instruction index where the status was produced (best-effort)
-}
-
-/************* VM state & helpers (private) *************/
-
-type vm struct {
-	ip    *Interpreter
-	chunk *Chunk
-	env   *Env
-	stack []Value
-	sp    int
-	iptr  int
-}
-
-func (m *vm) push(v Value) {
-	if m.sp >= len(m.stack) {
-		newCap := len(m.stack) * 2
-		if newCap == 0 {
-			newCap = 16
+# _capProc: run fn in its own process, capturing all STDOUT/STDERR via write()
+let _capProc = fun(fn: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
+	let p = procSpawn(fun(_: Null) -> {} do
+		let out = ""
+		let err = ""
+		let w0 = write
+		write = fun(h, s: Str) -> Int? do
+			if h == STDOUT then
+				out = out + s
+				return len(s)
+			end
+			if h == STDERR then
+				err = err + s
+				return len(s)
+			end
+			return w0(h, s)
+		end
+		let r = try(fun(_: Null) do fn(null) end)
+		return {
+			ok: r.ok,
+			out: out,
+			err: err,
+			error: if r.ok then null else noteGet(r.value) end
 		}
-		ns := make([]Value, newCap)
-		copy(ns, m.stack)
-		m.stack = ns
+	end)
+	return procJoin(p)
+end
+
+
+# =========================
+# Execution
+# =========================
+
+# Run a single test with optional timeout.
+# Returns: { name, ok, durationMs, error?, timeout? }
+let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
+	if verbose then
+		printf("=== RUN   %s\n", [name])
+	end
+	let t0 = nowMillis()
+
+	let _exec = fun(_: Null) -> {} do
+		let c = _capProc(fun(_: Null) -> Any do fn(null) end)
+		if c.ok then
+			return {ok: true}
+		end
+		return {ok: false, error: c.error}
+	end
+
+	let base = if timeoutMs == null or int(timeoutMs) <= 0 then
+		_exec(null)
+	else
+		# Run the test in one process.
+		let tp = procSpawn(fun(_: Null) -> {} do
+			return _exec(null)
+		end)
+
+		# Run a timer in another; when it fires, return a timeout result.
+		let tt = procSpawn(fun(_: Null) -> {} do
+			let t = timerAfter(int(timeoutMs))
+			chanRecv(t)
+			return {
+				ok: false,
+				timeout: true,
+				error: sprintf("timeout after %dms", [int(timeoutMs)])
+			}
+		end)
+
+		# Wait for whichever finishes first.
+		let win = procJoinAny([tp, tt])
+
+		# Cancel and safely join the loser.
+		if win.index == 0 then
+			procCancel(tt)
+			procJoin(tt)
+		else
+			procCancel(tp)
+			procJoin(tp)
+		end
+
+		win.value
+	end
+
+
+	let dur = nowMillis() - t0
+	let ok = base.ok
+	let isTimeout = mapHas(base, "timeout") and bool(base.timeout)
+	let err = if mapHas(base, "error") and base.error != null then
+		base.error
+	else
+		""
+	end
+
+	# origin hint printed for failures (both verbose and quiet)
+	let _printOriginIfAny = fun(_: Null) -> Null do
+		let o = _originOf(name)
+		if o != null then
+			printf("    AT    %s:%d (test)\n", [o.file, int(o.line)])
+		end
+		null
+	end
+
+	if verbose then
+		if ok then
+			# PASS: we already printed "=== RUN" at the top; close with PASS.
+			printf("--- PASS: %s (%dms)\n", [name, int(dur)])
+		else
+			# FAILURE: show origin, then engine error blob, then close with FAIL/TIMEOUT.
+			_printOriginIfAny(null)
+			printf("%s\n", [err])
+			let tag = if isTimeout then
+				"TIMEOUT"
+			else
+				"FAIL"
+			end
+			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+		end
+	else
+		if not ok then
+			# Quiet mode: print RUN, origin, error blob, then FAIL/TIMEOUT (same framing as verbose).
+			printf("=== RUN   %s\n", [name])
+			_printOriginIfAny(null)
+			printf("%s\n", [err])
+			let tag = if isTimeout then
+				"TIMEOUT"
+			else
+				"FAIL"
+			end
+			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+		end
+	end
+
+	return {
+		name: name,
+		ok: ok,
+		durationMs: dur,
+		error: if not ok then
+			err
+		else
+			null
+		end,
+		timeout: isTimeout
 	}
-	m.stack[m.sp] = v
-	m.sp++
-}
+end
 
-func (m *vm) pop() Value {
-	if m.sp == 0 {
-		return errNull("stack underflow")
-	}
-	m.sp--
-	return m.stack[m.sp]
-}
+# Run all registered tests.
+let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
+	let start = nowMillis()
+	let passed = 0
+	let failed = 0
+	let total = 0
 
-func (m *vm) top() Value {
-	if m.sp == 0 {
-		return Null
-	}
-	return m.stack[m.sp-1]
-}
+	let reg = tests(null)
 
-// fail returns a vmRuntimeError with the PC set to the currently executing
-// instruction (iptr-1, since iptr has advanced past the fetched instruction).
-func (m *vm) fail(msg string) vmResult {
-	return vmResult{status: vmRuntimeError, value: errNull(msg), pc: m.iptr - 1}
-}
+	let names = []
+	for [k, _] in reg do
+		names = names + [k]
+	end
+	names = _sortStrs(names)
 
-// Numeric helpers (mirror interpreter semantics)
-func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
-	// numbers
-	if isNumber(a) && isNumber(b) {
-		lf, rf := toFloat(a), toFloat(b)
-		bothInt := a.Tag == VTInt && b.Tag == VTInt
-		switch op {
-		case opSub:
-			if bothInt {
-				return Int(a.Data.(int64) - b.Data.(int64)), nil
-			}
-			return Num(lf - rf), nil
-		case opMul:
-			if bothInt {
-				return Int(a.Data.(int64) * b.Data.(int64)), nil
-			}
-			return Num(lf * rf), nil
-		case opDiv:
-			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
-				res := m.fail("division by zero")
-				return Null, &res
-			}
-			if bothInt {
-				return Int(a.Data.(int64) / b.Data.(int64)), nil
-			}
-			return Num(lf / rf), nil
-		case opMod:
-			// guard zero (match division error text)
-			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
-				res := m.fail("modulo by zero")
-				return Null, &res
-			}
-			if bothInt {
-				return Int(a.Data.(int64) % b.Data.(int64)), nil
-			}
-			return Num(math.Mod(lf, rf)), nil
-		case opLt:
-			if bothInt {
-				return Bool(a.Data.(int64) < b.Data.(int64)), nil
-			}
-			return Bool(lf < rf), nil
-		case opLe:
-			if bothInt {
-				return Bool(a.Data.(int64) <= b.Data.(int64)), nil
-			}
-			return Bool(lf <= rf), nil
-		case opGt:
-			if bothInt {
-				return Bool(a.Data.(int64) > b.Data.(int64)), nil
-			}
-			return Bool(lf > rf), nil
-		case opGe:
-			if bothInt {
-				return Bool(a.Data.(int64) >= b.Data.(int64)), nil
-			}
-			return Bool(lf >= rf), nil
-		}
-	}
+	if parallel then
+		let ps = []
+		for name in names do
+			let fn = reg[name]
+			ps = ps + [
+				procSpawn(fun(_: Null) -> {} do
+					return _runOne(name, fn, timeoutMs, verbose)
+				end)
+			]
+			total = total + 1
+		end
+		let results = procJoinAll(ps)
+		let i = 0
+		while i < len(results) do
+			let res = results[i]
+			if res.ok then
+				passed = passed + 1
+			else
+				failed = failed + 1
+			end
+			i = i + 1
+		end
+	else
+		for name in names do
+			let fn = reg[name]
+			total = total + 1
+			let res = _runOne(name, fn, timeoutMs, verbose)
+			if res.ok then
+				passed = passed + 1
+			else
+				failed = failed + 1
+			end
+		end
+	end
 
-	// string comparisons
-	if a.Tag == VTStr && b.Tag == VTStr {
-		as, bs := a.Data.(string), b.Data.(string)
-		switch op {
-		case opLt:
-			return Bool(as < bs), nil
-		case opLe:
-			return Bool(as <= bs), nil
-		case opGt:
-			return Bool(as > bs), nil
-		case opGe:
-			return Bool(as >= bs), nil
-		}
-	}
-	res := m.fail("bad numeric operator")
-	return Value{}, &res
-}
+	let dur = nowMillis() - start
+	return {passed: passed, failed: failed, total: total, durationMs: dur}
+end
 
-/************* VM entry point (private) *************/
+# =========================
+# Public API — runner
+# =========================
 
-// runChunk executes a bytecode Chunk in the provided environment.
-// It implements the full instruction set and returns:
-//   - vmOK           with the top-of-stack (or Null) if the program fell through,
-//   - vmReturn       with the explicit return value,
-//   - vmRuntimeError with an annotated-null explaining the error, plus a PC.
-//
-// Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
-// currying, native dispatch, type checks, and call-site scoping.
-//
-// Concurrency: this method uses the *Interpreter instance* provided on the vm.
-// Do not call it concurrently on the same Interpreter from multiple goroutines.
-func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
-	m := &vm{
-		ip:    ip,
-		chunk: chunk,
-		// evaluate in the provided environment (global-chain root for this run)
-		env:   env,
-		stack: make([]Value, 0, initStackCap),
-	}
+# Run: reset registry, discover tests, load fresh modules, run, print summary.
+let run = fun(opts: RunnerOpts) -> Summary do
+	let prefix = if mapHas(opts, "pathPrefix") and opts.pathPrefix != null then
+		opts.pathPrefix
+	else
+		"."
+	end
+	let verbose = if mapHas(opts, "verbose") and opts.verbose != null then
+		bool(opts.verbose)
+	else
+		false
+	end
+	let parallel = if mapHas(opts, "parallel") and opts.parallel != null then
+		bool(opts.parallel)
+	else
+		false
+	end
+	let timeoutMs = if mapHas(opts, "timeoutMs") and opts.timeoutMs != null then
+		int(opts.timeoutMs)
+	else
+		null
+	end
 
-	defer func() {
-		if r := recover(); r != nil {
-			// Structured inner-source error? Re-throw so the outer trampoline can
-			// surface it with the callee's SourceRef and exact (line,col).
-			if e, ok := r.(rtErr); ok {
-				if e.src != nil && e.line > 0 && e.col > 0 {
-					panic(e) // propagate structured inner-caret error
-				}
-				res.status = vmRuntimeError
-				res.value = annotNull(e.msg)
-				res.pc = m.iptr - 1
-				return
-			}
-			panic(r) // rethrow non-runtime panics
-		}
-	}()
+	reset(null)
 
-	code := chunk.Code
-	consts := chunk.Consts
+	let files = _discoverByPrefix(prefix)
+	if verbose then
+		printf("found %d test file(s)\n", [len(files)])
+	end
+	let _ = _loadTests(files, verbose)
 
-	for m.iptr < len(code) {
-		raw := code[m.iptr]
-		m.iptr++
-		opc := uop(raw)
-		imm := uimm(raw)
+	let summary = _runAll(parallel, timeoutMs, verbose)
 
-		switch opc {
+	printf("ok: %d  fail: %d  total: %d  durationMs: %d\n", [
+		summary.passed,
+		summary.failed,
+		summary.total,
+		summary.durationMs
+	])
 
-		case opNop:
-			// no-op
+	return summary
+end=== END FILE: lib/testing.ms ===
 
-		// ---- constants & globals ----
-		case opConst:
-			if int(imm) >= len(consts) {
-				return m.fail("const index out of range")
-			}
-			m.push(consts[imm])
+=== BEGIN FILE: lib/testing_test.ms ===
+# Tests for testing.ms (orthogonal, minimal).
+# Imports and uses the testing module explicitly.
+let T = import("testing")
 
-		case opLoadGlobal:
-			if int(imm) >= len(consts) {
-				return m.fail("name index out of range")
-			}
-			k := consts[imm]
-			if k.Tag != VTStr {
-				return m.fail("global name must be string const")
-			}
-			v, err := m.env.Get(k.Data.(string))
-			if err != nil {
-				return m.fail(err.Error())
-			}
-			m.push(v)
+# --- assert(ok, msg?) ------------------------------------------------------
 
-		// ---- arrays ----
-		case opMakeArr:
-			n := int(imm)
-			if n < 0 || n > m.sp {
-				return m.fail("bad array length")
-			}
-			start := m.sp - n
-			elems := make([]Value, n)
-			copy(elems, m.stack[start:m.sp])
-			m.sp = start
-			m.push(Arr(elems))
+T.test("testing/assert/true", fun(_: Null) do
+	T.assert(true, null)
+end)
 
-		// ---- pop value from stack ----
-		case opPop:
-			if m.sp == 0 {
-				return m.fail("pop on empty stack")
-			}
-			m.sp--
+T.test("testing/assert/false-default-msg", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assert(false, null)
+	end, "assertion failed")
+end)
 
-		// ---- properties / indices ----
-		case opGetProp:
-			if int(imm) >= len(consts) {
-				return m.fail("name index out of range")
-			}
-			k := consts[imm]
-			if k.Tag != VTStr {
-				return m.fail("property name must be string const")
-			}
-			obj := m.pop()
-			key := k.Data.(string)
+T.test("testing/assert/false-custom-msg", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assert(false, "nope")
+	end, "nope")
+end)
 
-			// Map lookup: use MapObject entries (annotation on keys is meta)
-			if obj.Tag == VTMap {
-				mo := asMap(obj)
-				if mo == nil {
-					return m.fail("property get requires map or module with string key")
-				}
-				if v, ok := mo.Entries[key]; ok {
-					m.push(v)
-					break
-				}
-				return m.fail(fmt.Sprintf("unknown property %q", key))
-			}
+# --- assertEq(want, got) ---------------------------------------------------
 
-			// Module export lookup
-			if obj.Tag == VTModule {
-				mod := obj.Data.(*Module)
-				if v, ok := mod.get(key); ok {
-					m.push(v)
-					break
-				}
-				return m.fail(fmt.Sprintf("unknown property %q on module", key))
-			}
+T.test("testing/assertEq/equal-scalars", fun(_: Null) do
+	T.assertEq(42, 42)
+end)
 
-			return m.fail("property get requires map or module with string key")
+T.test("testing/assertEq/equal-deep-map", fun(_: Null) do
+	T.assertEq({a: 1, b: [2, 3]}, {b: [2, 3], a: 1})
+end)
 
-		case opGetIdx:
-			idx := m.pop()
-			obj := m.pop()
+T.test("testing/assertEq/equal-deep-array", fun(_: Null) do
+	T.assertEq([1, 2, {x: 3}], [1, 2, {x: 3}])
+end)
 
-			// array[int]
-			if obj.Tag == VTArray && idx.Tag == VTInt {
-				ao := obj.Data.(*ArrayObject)
-				xs := ao.Elems
-				if len(xs) == 0 {
-					return m.fail("index on empty array")
-				}
-				i := int(idx.Data.(int64))
-				if i < 0 {
-					i = len(xs) + i // -1 -> last, -len -> 0
-				}
-				if i < 0 || i >= len(xs) {
-					return m.fail("array index out of range")
-				}
-				m.push(xs[i])
-				break
-			}
+T.test("testing/assertEq/mismatch-diffs", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertEq(1, 2)
+	end, "not equal")
+end)
 
-			// map[string]
-			if obj.Tag == VTMap && idx.Tag == VTStr {
-				mo := asMap(obj)
-				if mo == nil {
-					return m.fail("index requires array[int] or map[string]")
-				}
-				k := idx.Data.(string)
-				if v, ok := mo.Entries[k]; ok {
-					m.push(v)
-					break
-				}
-				return m.fail(fmt.Sprintf("unknown key %q", k))
-			}
+# --- assertType(v, T) ------------------------------------------------------
+# Use typeOf(...) to avoid referencing bare names like Int/Any.
 
-			return m.fail("index requires array[int] or map[string]")
+T.test("testing/assertType/match", fun(_: Null) do
+	# Expect an array-of-Int — infer its Type from a value.
+	T.assertType([1, 2], typeOf([1]))
+end)
 
-		// ---- arithmetic / compare / unary ----
-		case opSub, opMul, opDiv, opMod, opLt, opLe, opGt, opGe:
-			b := m.pop()
-			a := m.pop()
-			if out, failRes := m.binNum(opc, a, b); failRes != nil {
-				return *failRes
-			} else {
-				m.push(out)
-			}
+T.test("testing/assertType/mismatch", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		# Expect Int (infer from 0), but pass a Num (3.14)
+		T.assertType(3.14, typeOf(0))
+	end, "type mismatch")
+end)
 
-		case opEq, opNe:
-			b := m.pop()
-			a := m.pop()
-			eq := m.ip.deepEqual(a, b)
-			if opc == opEq {
-				m.push(Bool(eq))
-			} else {
-				m.push(Bool(!eq))
-			}
+# --- assertThrows(fn, sub?) ------------------------------------------------
 
-		case opNeg:
-			x := m.pop()
-			switch x.Tag {
-			case VTInt:
-				m.push(Int(-x.Data.(int64)))
-			case VTNum:
-				m.push(Num(-x.Data.(float64)))
-			default:
-				return m.fail("unary - expects number")
-			}
+T.test("testing/assertThrows/catches-fail", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		panic("boom")
+	end, "boom")
+end)
 
-		case opNot:
-			x := m.pop()
-			if x.Tag != VTBool {
-				return m.fail("not expects boolean")
-			}
-			m.push(Bool(!x.Data.(bool)))
+T.test("testing/assertThrows/requires-function", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertThrows(123, null)
+	end, "argument must be a function")
+end)
 
-		// ---- control flow ----
-		case opJump:
-			m.iptr = int(imm)
+T.test("testing/assertThrows/fails-when-no-throw", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertThrows(fun(_: Null) do
+			42
+		end, null)
+	end, "expected failure, got success")
+end)
 
-		case opJumpIfFalse:
-			cond := m.pop()
-			if cond.Tag != VTBool {
-				return m.fail("condition must be boolean")
-			}
-			if !cond.Data.(bool) {
-				m.iptr = int(imm)
-			}
+T.test("testing/assertThrows/substring-mismatch", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.assertThrows(fun(_: Null) do
+			panic("actual message")
+		end, "different substring")
+	end, "did not contain substring")
+end)
 
-		case opReturn:
-			var v Value = Null
-			if m.sp > 0 {
-				v = m.pop()
-			}
-			return vmResult{status: vmReturn, value: v, pc: m.iptr - 1}
+# --- test(name, fn) API ----------------------------------------------------
 
-		// ---- calls ----
-		case opCall:
-			nargs := int(imm)
+T.test("testing/test/register-returns-true", fun(_: Null) do
+	let ok = T.test("testing/register/ok", fun(_: Null) do
+		T.assert(true, null)
+	end)
+	T.assertEq(true, ok)
+end)
 
-			// Stack layout (top on the right):
-			// [..., callee, arg1, ..., argN]
-			calleeIdx := m.sp - nargs - 1
-			if calleeIdx < 0 {
-				return m.fail("stack underflow in call")
-			}
-			callee := m.stack[calleeIdx]
+T.test("testing/test/duplicate-name-fails", fun(_: Null) do
+	T.test("testing/register/dup", fun(_: Null) do
+		null
+	end)
+	T.assertThrows(fun(_: Null) do
+		T.test("testing/register/dup", fun(_: Null) do
+			null
+		end)
+	end, "duplicate test name")
+end)
 
-			// Collect args in order
-			args := make([]Value, nargs)
-			copy(args, m.stack[calleeIdx+1:m.sp])
+T.test("testing/test/second-arg-must-be-fn", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.test("testing/register/not-fn", 7)
+	end, "must be a function")
+end)
 
-			// Pop callee + args
-			m.sp = calleeIdx
-			m.stack = m.stack[:m.sp]
+# --- cases(name, xs, fn) ---------------------------------------------------
 
-			// Use current frame env as the call-site (for natives & closures)
-			res := m.ip.applyArgsScoped(callee, args, m.env)
+T.test("testing/cases/registers-n-subtests", fun(_: Null) do
+	let n = T.cases("testing/table/smoke", [10, 20], fun(x) do
+		T.assert(x != null, null)
+	end)
+	T.assertEq(2, n)
+end)
 
-			// Push result
-			m.push(res)
+T.test("testing/cases/empty", fun(_: Null) do
+	let n = T.cases("testing/table/empty", [], fun(_) do
+		null
+	end)
+	T.assertEq(0, n)
+end)
 
-		default:
-			return m.fail("unknown opcode")
-		}
-	}
+T.test("testing/cases/requires-one-arg-fn", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		T.cases("testing/table/bad-fn", [1], 123)
+	end, "fn must be a function")
+end)
 
-	if m.sp == 0 {
-		return vmResult{status: vmOK, value: Null, pc: m.iptr - 1}
-	}
-	return vmResult{status: vmOK, value: m.top(), pc: m.iptr - 1}
-}
-=== END FILE: vm.go ===
+# --- snapshot(path, value[, update]) ---------------------------------------
+
+# Helper to build a unique temp filepath (in the OS temp dir).
+let _tmpPath = fun(prefix: Str, suffix: Str) -> Str do
+	let base = tempDir()
+	let stamp = sprintf("%d", [nowMillis()])
+	pathJoin([base, sprintf("%s.%s%s", [prefix, stamp, suffix])])
+end
+
+T.test("testing/snapshot/write-and-read", fun(_: Null) do
+	let path = _tmpPath("snapshot.write-read", ".json")
+	T.snapshotUpdate(path, {hello: "world", n: 7})
+	T.assert(T.snapshot(path, {hello: "world", n: 7}, null), null)
+	remove(path) # cleanup
+
+end)
+
+T.test("testing/snapshot/mismatch-detected", fun(_: Null) do
+	let path = _tmpPath("snapshot.mismatch", ".json")
+	T.snapshotUpdate(path, [1, 2, 3])
+	T.assertThrows(fun(_: Null) do
+		T.snapshot(path, [1, 2, 4], null)
+	end, "snapshot mismatch")
+	remove(path) # cleanup
+
+end)
+
+# --- seed(n) & RNG reproducibility -----------------------------------------
+
+T.test("testing/seed/reproducible-int", fun(_: Null) do
+	T.seed(12345)
+	let a = randInt(1000000)
+	T.seed(12345)
+	let b = randInt(1000000)
+	T.assertEq(a, b)
+end)
+
+T.test("testing/seed/reproducible-float", fun(_: Null) do
+	T.seed(424242)
+	let a = randFloat(null)
+	T.seed(424242)
+	let b = randFloat(null)
+	T.assertEq(a, b)
+end)
+
+# --- tests() view & registry isolation -------------------------------------
+
+T.test("testing/tests/returns-map-clone", fun(_: Null) do
+	let m = T.tests(null)
+	T.assertType(m, type {})
+	m["__probe__"] = 1
+	let m2 = T.tests(null)
+	T.assertEq(false, mapHas(m2, "__probe__"))
+end)
+
+# --- assert: return value ---------------------------------------------------
+
+T.test("testing/assert/returns-true", fun(_: Null) do
+	let ok = T.assert(true, null)
+	T.assertEq(true, ok)
+end)
+
+# --- assertEq: int vs float equality ---------------------------------------
+
+T.test("testing/assertEq/int-vs-float-equal", fun(_: Null) do
+	T.assertEq(2, 2.0)
+end)
+
+# --- assertThrows: empty substring means "any message" ----------------------
+
+T.test("testing/assertThrows/empty-substring-ok", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		panic("some failure message")
+	end, "")
+end)
+
+# --- assertType: subtyping & function values --------------------------------
+
+T.test("testing/assertType/subtyping-Int-to-Num", fun(_: Null) do
+	# 42:Int should satisfy Num.
+	T.assertType(42, typeOf(0.0))
+end)
+
+T.test("testing/assertType/function-value", fun(_: Null) do
+	let f = fun(_: Null) do
+		null
+	end
+	T.assertType(f, typeOf(f))
+end)
+
+# --- cases: ensure subtest names are registered -----------------------------
+
+T.test("testing/cases/registrations-visible", fun(_: Null) do
+	let base = "testing/table/vis"
+	let _ = T.cases(base, [7, 8], fun(_) do
+		null
+	end)
+	let m = T.tests(null)
+	T.assertEq(true, mapHas(m, sprintf("%s/0", [base])))
+	T.assertEq(true, mapHas(m, sprintf("%s/1", [base])))
+end)
+
+# --- snapshot: overwrite on update -----------------------------------------
+
+T.test("testing/snapshot/update-overwrites", fun(_: Null) do
+	let path = _tmpPath("snapshot.overwrite", ".json")
+	T.snapshotUpdate(path, {v: 1})
+	T.assertThrows(fun(_: Null) do
+		T.snapshot(path, {v: 2}, null)
+	end, "snapshot mismatch")
+	T.snapshotUpdate(path, {v: 2})
+	T.assert(T.snapshot(path, {v: 2}, null), null)
+	remove(path) # cleanup
+
+end)
+
+# --- reset: clears registry -------------------------------------------------
+
+T.test("testing/reset/clears", fun(_: Null) do
+	let before = T.tests(null)
+	# Should be >= existing tests in this suite; just assert it's a map with some size.
+	T.assert(len(before) != null and len(before) >= 0, null)
+	T.reset(null)
+	let after = T.tests(null)
+	T.assertEq(0, len(after))
+end)
+
+# --- seed: returns echo value ----------------------------------------------
+
+T.test("testing/seed/echo", fun(_: Null) do
+	T.assertEq(123, T.seed(123))
+end)=== END FILE: lib/testing_test.ms ===
 

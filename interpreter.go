@@ -791,54 +791,23 @@ func AsMapValue(v Value) Value {
 //     registered natives) by rebuilding a function value for the clone’s Core.
 //   - We intentionally do not duplicate Global or module cache state.
 func (ip *Interpreter) Clone() *Interpreter {
-	// Fast snapshot: share Core (read-only), reuse baseTemplate, make fresh Base/Global.
 	cl := &Interpreter{}
-	cl.Core = ip.Core
+	// Deep-clone Core into a new map; rebind closures/types from ip.Core -> cl.Core
+	cl.Core = cloneEnvRebinding(ip.Core, nil)
+
 	cl.modules = map[string]*moduleRec{}
 	cl.native = make(map[string]NativeImpl, len(ip.native))
-	cl._exec = newExec(cl)
-	cl.baseTemplate = ip.baseTemplate
-	cl.Base = cl.newBaseFromTemplate()
-	cl.Global = NewEnv(cl.Base)
-
-	// Copy the native registry (name -> implementation) so the clone invokes
-	// the same host functions, but through its own *Interpreter.
 	for name, impl := range ip.native {
 		cl.native[name] = impl
-
-		// Rebuild the function binding in the clone's Core using the original
-		// function's signature and docs, but rebind the closure env to cl.Core.
-		orig, err := ip.Core.Get(name)
-		if err != nil || orig.Tag != VTFun {
-			// If it's missing or not a function (unexpected), leave the clone's
-			// built-in as initialized by NewInterpreter().
-			continue
-		}
-		of := orig.Data.(*Fun)
-
-		nf := &Fun{
-			Params:     append([]string(nil), of.Params...),
-			ParamTypes: append([]S(nil), of.ParamTypes...),
-			ReturnType: of.ReturnType, // S-expr; treated as immutable schema
-			Body:       of.Body,       // natives use the ("native", name) sentinel
-			Env:        cl.Core,       // IMPORTANT: rebind to clone's Core
-			Chunk:      nil,           // no JIT chunk for natives
-			NativeName: of.NativeName,
-			IsOracle:   of.IsOracle,
-			Examples:   of.Examples,
-			HiddenNull: of.HiddenNull,
-			Src:        of.Src, // optional; safe to share for diagnostics
-		}
-		nv := FunVal(nf)
-		nv.Annot = orig.Annot // preserve documentation if present
-		cl.Core.Define(name, nv)
 	}
+	cl._exec = newExec(cl)
+	cl.baseTemplate = ip.baseTemplate
+	cl.Base = cl.newBaseFromTemplate() // this rebinds Base to the clone’s Core
+	cl.Global = NewEnv(cl.Base)
 
-	// Fresh module cache/loader state (no sharing).
-	cl.modules = map[string]*moduleRec{}
+	// No need to re-define natives into cl.Core: cloneEnvRebinding already copied them
 	cl.loadStack = nil
 	cl.currentSrc = nil
-
 	return cl
 }
 

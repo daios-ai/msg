@@ -416,6 +416,35 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 	return loaded
 end
 
+# _capProc: run fn in its own process, capturing all STDOUT/STDERR via write()
+let _capProc = fun(fn: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
+	let p = procSpawn(fun(_: Null) -> {} do
+		let out = ""
+		let err = ""
+		let w0 = write
+		write = fun(h, s: Str) -> Int? do
+			if h == STDOUT then
+				out = out + s
+				return len(s)
+			end
+			if h == STDERR then
+				err = err + s
+				return len(s)
+			end
+			return w0(h, s)
+		end
+		let r = try(fun(_: Null) do fn(null) end)
+		return {
+			ok: r.ok,
+			out: out,
+			err: err,
+			error: if r.ok then null else noteGet(r.value) end
+		}
+	end)
+	return procJoin(p)
+end
+
+
 # =========================
 # Execution
 # =========================
@@ -429,13 +458,11 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 	let t0 = nowMillis()
 
 	let _exec = fun(_: Null) -> {} do
-		let r = try(fun(_: Null) do
-			fn(null)
-		end)
-		if r.ok then
+		let c = _capProc(fun(_: Null) -> Any do fn(null) end)
+		if c.ok then
 			return {ok: true}
 		end
-		return {ok: false, error: noteGet(r.value)}
+		return {ok: false, error: c.error}
 	end
 
 	let base = if timeoutMs == null or int(timeoutMs) <= 0 then

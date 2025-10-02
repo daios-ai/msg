@@ -1997,3 +1997,188 @@ let h = STDOUT
 h != 42
 `), true)
 }
+
+func Test_Interpreter_LateBinding_GlobalValue(t *testing.T) {
+	ip, _ := NewInterpreter()
+	mustEvalPersistent(t, ip, `
+let x = "a"
+let f = fun() -> Str do
+  return(x)
+end
+`)
+	wantStr(t, mustEvalPersistent(t, ip, `f()`), "a")
+
+	mustEvalPersistent(t, ip, `
+x = "b"
+`)
+	wantStr(t, mustEvalPersistent(t, ip, `f()`), "b")
+}
+
+func Test_Interpreter_LateBinding_AfterCurrying(t *testing.T) {
+	ip, _ := NewInterpreter()
+	mustEvalPersistent(t, ip, `
+let seed = 2
+let f = fun(a: Int, b: Int) -> Int do
+  return(a + b + seed)
+end
+let g = f(1)
+`)
+	// g is a 1-arg function (b:Int) -> Int, capturing 'seed' late-bound
+	wantInt(t, mustEvalPersistent(t, ip, `g(1)`), 4) // 1 + 1 + 2
+
+	mustEvalPersistent(t, ip, `
+seed = 10
+`)
+	wantInt(t, mustEvalPersistent(t, ip, `g(1)`), 12) // 1 + 1 + 10
+}
+
+func Test_Interpreter_MonkeyPatch_Function_Used_Inside_Closure(t *testing.T) {
+	ip, _ := NewInterpreter()
+	mustEvalPersistent(t, ip, `
+let plus = fun(x: Int, y: Int) -> Int do
+  return(x + y)
+end
+let add2 = fun(x: Int) -> Int do
+  return(plus(x, 2))
+end
+`)
+	wantInt(t, mustEvalPersistent(t, ip, `add2(3)`), 5)
+
+	// Monkey-patch 'plus' and ensure existing closure observes it.
+	mustEvalPersistent(t, ip, `
+plus = fun(x: Int, y: Int) -> Int do
+  return(x - y)
+end
+`)
+	wantInt(t, mustEvalPersistent(t, ip, `add2(3)`), 1)
+}
+
+func Test_Interpreter_Native_Uses_CallSite_Scope_For_SideEffects(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Register a tiny native: emit(text: Str) appends to array bound at OUT in the call-site env.
+	ip.RegisterNative("emit",
+		[]ParamSpec{{Name: "text", Type: S{"id", "Str"}}}, S{"id", "Null"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			out, err := ctx.Env().Get("OUT")
+			if err != nil || out.Tag != VTArray {
+				return annotNull("OUT must be an array")
+			}
+			arr := out.Data.(*ArrayObject)
+			arr.Elems = append(arr.Elems, Str(ctx.Arg("text").Data.(string)))
+			return Null
+		})
+
+	mustEvalPersistent(t, ip, `
+let OUT = []
+let say = fun(s: Str) -> Null do
+  emit(s)
+  return(null)
+end
+`)
+
+	// First call writes into current OUT
+	mustEvalPersistent(t, ip, `say("a")`)
+	out1, _ := ip.Global.Get("OUT")
+	if out1.Tag != VTArray || len(out1.Data.(*ArrayObject).Elems) != 1 {
+		t.Fatalf("want OUT len 1 after first call, got %#v", out1)
+	}
+	wantStr(t, out1.Data.(*ArrayObject).Elems[0], "a")
+
+	// Redirect OUT to a new array; say should now write there instead
+	mustEvalPersistent(t, ip, `OUT = []`)
+	mustEvalPersistent(t, ip, `say("b")`)
+	out2, _ := ip.Global.Get("OUT")
+	if out2.Tag != VTArray || len(out2.Data.(*ArrayObject).Elems) != 1 {
+		t.Fatalf("want OUT len 1 after redirect, got %#v", out2)
+	}
+	wantStr(t, out2.Data.(*ArrayObject).Elems[0], "b")
+
+	// Ensure the original array still contains only "a"
+	if out1.Tag != VTArray || len(out1.Data.(*ArrayObject).Elems) != 1 {
+		t.Fatalf("original OUT array mutated unexpectedly: %#v", out1)
+	}
+	wantStr(t, out1.Data.(*ArrayObject).Elems[0], "a")
+}
+
+func Test_Interpreter_Redirect_STDOUT_By_MonkeyPatch(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Reuse/define 'emit' native.
+	ip.RegisterNative("emit",
+		[]ParamSpec{{Name: "text", Type: S{"id", "Str"}}}, S{"id", "Null"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			out, err := ctx.Env().Get("OUT")
+			if err != nil || out.Tag != VTArray {
+				return annotNull("OUT must be an array")
+			}
+			arr := out.Data.(*ArrayObject)
+			arr.Elems = append(arr.Elems, Str(ctx.Arg("text").Data.(string)))
+			return Null
+		})
+
+	mustEvalPersistent(t, ip, `
+let OUT1 = []
+let OUT2 = []
+let OUT = OUT1
+let println = fun(s: Str) -> Null do
+  emit(s)
+  return(null)
+end
+`)
+
+	// Write to OUT1
+	mustEvalPersistent(t, ip, `println("hello")`)
+	out1, _ := ip.Global.Get("OUT1")
+	if out1.Tag != VTArray || len(out1.Data.(*ArrayObject).Elems) != 1 {
+		t.Fatalf("want OUT1 len 1, got %#v", out1)
+	}
+	wantStr(t, out1.Data.(*ArrayObject).Elems[0], "hello")
+
+	// Redirect and write to OUT2
+	mustEvalPersistent(t, ip, `OUT = OUT2`)
+	mustEvalPersistent(t, ip, `println("world")`)
+	out2, _ := ip.Global.Get("OUT2")
+	if out2.Tag != VTArray || len(out2.Data.(*ArrayObject).Elems) != 1 {
+		t.Fatalf("want OUT2 len 1, got %#v", out2)
+	}
+	wantStr(t, out2.Data.(*ArrayObject).Elems[0], "world")
+
+	// OUT1 unchanged
+	if len(out1.Data.(*ArrayObject).Elems) != 1 {
+		t.Fatalf("OUT1 mutated after redirect: %#v", out1)
+	}
+}
+
+func Test_Interpreter_Clone_Isolates_Base_And_Global(t *testing.T) {
+	ip1, _ := NewInterpreter()
+	mustEvalPersistent(t, ip1, `
+let x = 1
+let f = fun() -> Int do
+  return(x)
+end
+`)
+	ip2 := ip1.Clone()
+
+	// Late binding in ip1
+	mustEvalPersistent(t, ip1, `x = 2`)
+	wantInt(t, mustEvalPersistent(t, ip1, `f()`), 2)
+
+	// ip2 shouldn't see ip1's Global
+	if _, err := ip2.EvalPersistentSource(`f()`); err == nil {
+		t.Fatal("expected ip2 to not have f defined")
+	}
+
+	// Define ip2's own bindings; it should be isolated
+	mustEvalPersistent(t, ip2, `
+let x = 100
+let f = fun() -> Int do
+  return(x)
+end
+`)
+	wantInt(t, mustEvalPersistent(t, ip2, `f()`), 100)
+
+	// Changing ip1 no longer affects ip2
+	mustEvalPersistent(t, ip1, `x = 999`)
+	wantInt(t, mustEvalPersistent(t, ip2, `f()`), 100)
+}

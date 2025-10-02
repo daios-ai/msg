@@ -83,26 +83,12 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	}
 	f := funVal.Data.(*Fun)
 
-	// Recover declared signature from hidden closure bindings.
-	var paramNames []string
-	var declTypes []S
-	if f.Env != nil {
-		if nv, err := f.Env.Get("$__sig_names"); err == nil && nv.Tag == VTArray {
-			for _, v := range nv.Data.(*ArrayObject).Elems {
-				if v.Tag == VTStr {
-					paramNames = append(paramNames, v.Data.(string))
-				}
-			}
-		}
-		if tv, err := f.Env.Get("$__sig_types"); err == nil && tv.Tag == VTArray {
-			for _, v := range tv.Data.(*ArrayObject).Elems {
-				if v.Tag == VTType {
-					if tvv, ok := v.Data.(*TypeValue); ok {
-						declTypes = append(declTypes, tvv.Ast)
-					}
-				}
-			}
-		}
+	// Recover original declaration signature from Fun.Sig (stable across currying).
+	paramNames := f.Params
+	declTypes := f.ParamTypes
+	if f.Sig != nil {
+		paramNames = f.Sig.Names
+		declTypes = f.Sig.Types
 	}
 
 	// Build runtime boxes and the prompt.

@@ -67,13 +67,33 @@ end
 # # Console I/O
 # # -----------------------------
 
+# Print a formatted string to standard output.
+# 
+# Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
+# Caller controls newlines:
+# printf("%s = %v\n", ["x", 42])
+# 
+# Params:
+# fmt:  Str
+# args: [Any]
+# 
+# Returns:
+# Str? — the printed string, or null (annotated) on write error.
+let printf = fun(fmt: Str, args: [Any]) -> Str? do
+	let out = sprintf(fmt, args)
+	write(STDOUT, out)
+	flush(STDOUT)
+	out
+end
+
 # Print a value and return it.
 # 
 # Prints the string form of `x` without a trailing newline, and returns `x`.
 # Args: x: Any
 # Returns: Any
 let print = fun(x) do
-	printf("%s", [str(x)])
+	write(STDOUT, sprintf("%s", [str(x)]))
+	flush(STDOUT)
 	x
 end
 
@@ -83,7 +103,8 @@ end
 # Args: x: Any
 # Returns: Any
 let println = fun(x) do
-	printf("%s\n", [str(x)])
+	write(STDOUT, sprintf("%s\n", [str(x)]))
+	flush(STDOUT)
 	x
 end
 

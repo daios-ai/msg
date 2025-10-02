@@ -293,6 +293,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 			Src:        f.Src,
 			IsOracle:   f.IsOracle,
 			Examples:   f.Examples,
+			Sig:        f.Sig, // preserve original declaration signature across currying
 		})
 		next.Annot = fnVal.Annot
 		return next
@@ -310,6 +311,7 @@ func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Val
 		IsOracle:   f.IsOracle,
 		Examples:   f.Examples,
 		Src:        f.Src,
+		Sig:        f.Sig, // preserve for execution
 	}
 	execVal := FunVal(execFun)
 	execVal.Annot = fnVal.Annot

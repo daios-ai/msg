@@ -320,6 +320,17 @@ type Fun struct {
 	Examples Value // VTArray of [input, output] pairs, or Null when none
 
 	Src *SourceRef // source metadata (optional)
+
+	// Original declaration signature (names/types): tools/oracles can
+	// reference it even after currying changes Params.
+	Sig *SigMeta
+}
+
+// SigMeta is an immutable, engine-internal carrier of the original signature.
+// It replaces the old $__sig_names / $__sig_types closure bindings for oracles.
+type SigMeta struct {
+	Names []string // original parameter names, in order
+	Types []S      // original declared parameter types, in order
 }
 
 // FunVal wraps *Fun into a Value (Tag=VTFun).
@@ -390,7 +401,7 @@ func (e *Env) Get(name string) (Value, error) {
 	}
 	// If the miss is a type atom/ctor, explain how to obtain a runtime Type.
 	if isBuiltinTypeAtom(name) {
-		return Value{}, fmt.Errorf("'%s' is a type expression, not a value. Use 'type %s' to obtain a runtime Type, or use it in a type annotation.", name, name)
+		return Value{}, fmt.Errorf("'%s' is a type expression, not a value. Use 'type %s' to obtain a runtime Type, or use it in a type annotation", name, name)
 	}
 	return Value{}, fmt.Errorf("undefined variable: %s", name)
 }
@@ -761,6 +772,10 @@ func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, im
 		Env:        ip.Core,
 		NativeName: name,
 		HiddenNull: hidden, // <-- set this
+		Sig: &SigMeta{
+			Names: append([]string{}, names...),
+			Types: append([]S{}, types...),
+		},
 	}))
 }
 
@@ -774,40 +789,43 @@ func AsMapValue(v Value) Value {
 	return v
 }
 
-// Clone creates a new Interpreter isolate that shares no mutable runtime state
-// with the original. It has a fresh Core+Global, an empty module cache, and a
-// copied native registry. All registered natives are rebound into the clone’s
-// Core with the same signatures/docs, but their closure env is set to the
-// clone’s Core. Global/user state and module caches are NOT copied.
-//
-// Concurrency model (Lua-style):
-//   - Each *Interpreter is single-threaded; run many clones in parallel.
-//   - Call Clone() before you start running code to avoid racing with
-//     RegisterNative calls on the original.
+// Clone creates an isolated Interpreter that shares no mutable runtime state
+// with the original. It shares the read-only Core, reuses the prebuilt
+// baseTemplate, creates a fresh Base + Global, and copies the native registry
+// (name -> implementation) without mutating Core.
 //
 // Notes:
-//   - Built-ins are installed via initCore() in NewInterpreter(). We then
-//     overlay every native known to the source interpreter (including any user-
-//     registered natives) by rebuilding a function value for the clone’s Core.
-//   - We intentionally do not duplicate Global or module cache state.
+//   - Core is shared and treated as immutable after init (no writes here).
+//   - Base is recreated from the immutable template; Global is a fresh child.
+//   - Module cache and loader state are fresh per-clone.
+//   - The exec facade is rebound to the clone.
 func (ip *Interpreter) Clone() *Interpreter {
+	// New interpreter shell
 	cl := &Interpreter{}
-	// Deep-clone Core into a new map; rebind closures/types from ip.Core -> cl.Core
-	cl.Core = cloneEnvRebinding(ip.Core, nil)
 
+	// Share read-only Core; do not mutate it here.
+	cl.Core = ip.Core
+
+	// Fresh per-clone state
 	cl.modules = map[string]*moduleRec{}
 	cl.native = make(map[string]NativeImpl, len(ip.native))
+	cl._exec = newExec(cl)
+
+	// Reuse immutable template to create a fresh Base, then make a fresh Global.
+	cl.baseTemplate = ip.baseTemplate
+	cl.Base = cl.newBaseFromTemplate()
+	cl.Global = NewEnv(cl.Base)
+
+	// Copy native registry implementations for this clone (no Core writes).
 	for name, impl := range ip.native {
 		cl.native[name] = impl
 	}
-	cl._exec = newExec(cl)
-	cl.baseTemplate = ip.baseTemplate
-	cl.Base = cl.newBaseFromTemplate() // this rebinds Base to the clone’s Core
-	cl.Global = NewEnv(cl.Base)
 
-	// No need to re-define natives into cl.Core: cloneEnvRebinding already copied them
+	// Fresh loader/source tracking
+	cl.modules = map[string]*moduleRec{}
 	cl.loadStack = nil
 	cl.currentSrc = nil
+
 	return cl
 }
 
@@ -868,7 +886,10 @@ func (ip *Interpreter) newBaseFromTemplate() *Env {
 }
 
 // cloneEnvRebinding clones src into a new Env with newParent, rebinding
-// closures and type envs that referenced src -> to the new Env.
+// closures and type envs that *directly* referenced src -> to the new Env.
+// We do not rebuild entire env chains anymore; functions/types now capture
+// the real parent env (Base/module), so a simple pointer equality rebind
+// is sufficient and avoids deep recursion/stack growth.
 func cloneEnvRebinding(src *Env, newParent *Env) *Env {
 	dst := NewEnv(newParent)
 	dst.sealParentWrites = src.sealParentWrites
@@ -879,12 +900,13 @@ func cloneEnvRebinding(src *Env, newParent *Env) *Env {
 	return dst
 }
 
-// rebindValue: for functions/types captured in 'from', re-pin to 'to';
-// detach arrays/maps to avoid cross-namespace aliasing. Primitives pass through.
+// rebindValue: if a function/type closes over 'from', re-pin to 'to'.
+// For arrays/maps we deep-copy the container shape and rebind contained values
+// (to avoid aliasing across namespaces). Primitives pass through unchanged.
 func rebindValue(v Value, from, to *Env) Value {
 	switch v.Tag {
 	case VTFun:
-		f := *v.Data.(*Fun) // copy struct
+		f := *v.Data.(*Fun) // copy
 		if f.Env == from {
 			f.Env = to
 		}
@@ -892,7 +914,8 @@ func rebindValue(v Value, from, to *Env) Value {
 		nv.Annot = v.Annot
 		return nv
 	case VTType:
-		tv := *v.Data.(*TypeValue)
+		tv := *v.Data.(*TypeValue) // copy
+		// Pin envs that were defined in the template (or env-less) to 'to'.
 		if tv.Env == nil || tv.Env == from {
 			tv.Env = to
 		}

@@ -332,30 +332,21 @@ func initCore(ip *Interpreter) {
 			// Unbox function BODY from AST handle ----
 			bodyAst := expectAST(bodyAny, "__make_fun")
 
-			// Build closure env that carries hidden signature metadata
-			closure := NewEnv(ctx.Env())
-			nameVals := make([]Value, len(names))
-			for i, n := range names {
-				nameVals[i] = Str(n)
-			}
-			typeVals := make([]Value, len(types))
-			for i, t := range types {
-				typeVals[i] = TypeValIn(t, closure)
-			}
-			closure.Define("$__sig_names", Arr(nameVals))
-			closure.Define("$__sig_types", Arr(typeVals))
-
-			// Construct the function with this closure
+			// Construct the function closing over the **parent env directly** (no extra frame).
 			return FunVal(&Fun{
 				Params:     names,
 				ParamTypes: types,
 				ReturnType: retAst,
 				Body:       bodyAst,
-				Env:        closure, // <-- use the closure with hidden signature
+				Env:        ctx.Env(), // <-- direct parent; makes globals late-bind correctly
 				HiddenNull: hidden,
 				IsOracle:   isOr,
 				Examples:   examples,
 				Src:        sr,
+				Sig: &SigMeta{
+					Names: append([]string{}, names...),
+					Types: append([]S{}, types...),
+				},
 			})
 		})
 

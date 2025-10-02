@@ -1,11 +1,11 @@
 # testing.ms — minimal testing toolkit + simple test runner
-# 
+#
 # Usage in *_test.ms:
 # let testing = import("testing")
 # testing.test("adds", fun(_: Null) -> Any do
-# testing.assertEq(2 + 2, 4)
+# 	testing.assertEq(2 + 2, 4)
 # end)
-# 
+#
 # Running:
 # let testing = import("testing")
 # testing.run({ pathPrefix: ".", verbose: false, parallel: false, timeoutMs: 0 })
@@ -14,18 +14,15 @@
 # Internal state
 # =========================
 
-let _tests = {} # name -> (Null)->Any name -> { file!: Str, line!: Int }
-
+let _tests = {} # name -> (Null)->Any
 let _origins = {} # concrete tests: test("name", ...)
-
-let _caseOrigins = {} # case groups:   cases("prefix", ...)
+let _caseOrigins = {} # case groups: cases("prefix", ...)
 
 # Return the recorded origin for a test name, with cases("x") fallback for "x/NN".
 let _originOf = fun(name: Str) -> {}? do
 	if mapHas(_origins, name) then
 		return _origins[name]
 	end
-	# subtest fallback: prefix/NN  (NN = digits)
 	let parts = split(name, "/")
 	let n = len(parts)
 	if n >= 2 then
@@ -80,6 +77,55 @@ let _sortStrs = fun(xs: [Str]) -> [Str] do
 		i = i + 1
 	end
 	return xs
+end
+
+# Redirect STDOUT/STDERR while running f, capture both streams, then restore.
+let _captureIO = fun(f: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
+	let base = tempDir()
+	let tag = sprintf("%d", [nowNanos()])
+	let pOut = pathJoin([base, sprintf("cap.%s.out", [tag])])
+	let pErr = pathJoin([base, sprintf("cap.%s.err", [tag])])
+
+	let hOut = open(pOut, "w")
+	let hErr = open(pErr, "w")
+	if hOut == null or hErr == null then
+		panic("capture open failed")
+	end
+
+	let so = STDOUT
+	let se = STDERR
+	STDOUT = hOut
+	STDERR = hErr
+
+	let r = try(fun(_: Null) do f(null) end)
+
+	flush(STDOUT)
+	flush(STDERR)
+	close(STDOUT)
+	close(STDERR)
+	STDOUT = so
+	STDERR = se
+
+	let o = readFile(pOut)
+	let e = readFile(pErr)
+	remove(pOut)
+	remove(pErr)
+
+	return {
+		ok: r.ok,
+		out: if o == null then "" else o end,
+		err: if e == null then "" else e end,
+		error: if r.ok then null else noteGet(r.value) end
+	}
+end
+
+# Silence all output while evaluating f; rethrow errors verbatim.
+let _silence = fun(f: Null -> Any) -> Null do
+	let r = _captureIO(f)
+	if r.ok then
+		return null
+	end
+	panic(r.error)
 end
 
 # =========================
@@ -153,24 +199,15 @@ let assertThrows = fun(fn, sub: Str?) -> Bool do
 		panic("assertThrows: argument must be a function of type (Null)->Any")
 	end
 
-	let r = try(fun(_: Null) do
-		fn(null)
-	end)
+	let r = try(fun(_: Null) do fn(null) end)
 	if r.ok then
-		panic(sprintf("expected failure, got success with value: %s", [
-			_repr(r.value)
-		]))
+		panic(sprintf("expected failure, got success with value: %s", [_repr(r.value)]))
 	end
 
 	if sub != null then
 		let e = noteGet(r.value)
-		# first line only (avoid matches in the caret frame)
 		let parts = split(e, "\n")
-		let first = if len(parts) == 0 then
-			e
-		else
-			parts[0]
-		end
+		let first = if len(parts) == 0 then e else parts[0] end
 		if not _contains(first, sub) then
 			panic(sprintf("failure did not contain substring.\nwant in: %s\ngot:\n%s", [
 				_repr(sub),
@@ -185,18 +222,14 @@ end
 # Table-driven subtests: registers name/0, name/1, ...
 let cases = fun(name: Str, xs: [Any], fn) -> Int do
 	if not isType(fn, type Any -> Any) then
-		panic(sprintf("cases(%s): fn must be a function taking one argument", [
-			_repr(name)
-		]))
+		panic(sprintf("cases(%s): fn must be a function taking one argument", [_repr(name)]))
 	end
 	let n = len(xs)
 	let i = 0
 	for _ in xs do
 		let sub = sprintf("%s/%d", [name, i])
 		let x = xs[i]
-		test(sub, fun(_: Null) do
-			fn(x)
-		end)
+		test(sub, fun(_: Null) do fn(x) end)
 		i = i + 1
 	end
 	return n
@@ -369,11 +402,7 @@ end
 let _discoverByPrefix = fun(prefix: Str) -> [Str] do
 	let pref = _cleanAbs(prefix)
 	let st = stat(pref)
-	let root = if st != null and st.isDir then
-		pref
-	else
-		pathDir(pref)
-	end
+	let root = if st != null and st.isDir then pref else pathDir(pref) end
 	let all = _walk(root)
 	let out = []
 	for f in all do
@@ -386,6 +415,7 @@ let _discoverByPrefix = fun(prefix: Str) -> [Str] do
 end
 
 # Load test files fresh each run: cache-bust with importCode + unique name.
+# Silence import-time output to prevent leakage.
 let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 	let loaded = 0
 	for f in files do
@@ -398,17 +428,17 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 			continue
 		end
 
-		# origins index
 		_indexTests(f, src)
 
 		let name = sprintf("testing:%s:%d", [f, nowNanos()])
 		let r = try(fun(_: Null) do
-			importCode(name, src)
+			_silence(fun(_: Null) do
+				importCode(name, src)
+			end)
 		end)
 		if r.ok then
 			loaded = loaded + 1
 		else
-			# caret-formatted by try(); print verbatim
 			let errorMessage = noteGet(r.value)
 			printf("FAIL import %s\n%s\n", [f, errorMessage])
 		end
@@ -416,43 +446,23 @@ let _loadTests = fun(files: [Str], verbose: Bool) -> Int do
 	return loaded
 end
 
-# _capProc: run fn in its own process, capturing all STDOUT/STDERR via write()
-let _capProc = fun(fn: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
-	let p = procSpawn(fun(_: Null) -> {} do
-		let out = ""
-		let err = ""
-		let w0 = write
-		write = fun(h, s: Str) -> Int? do
-			if h == STDOUT then
-				out = out + s
-				return len(s)
-			end
-			if h == STDERR then
-				err = err + s
-				return len(s)
-			end
-			return w0(h, s)
-		end
-		let r = try(fun(_: Null) do fn(null) end)
-		return {
-			ok: r.ok,
-			out: out,
-			err: err,
-			error: if r.ok then null else noteGet(r.value) end
-		}
-	end)
-	return procJoin(p)
-end
-
-
 # =========================
 # Execution
 # =========================
 
+# _capProc: run fn in its own process, capturing all STDOUT/STDERR.
+let _capProc = fun(fn: Null -> Any) -> {ok!: Bool, out!: Str, err!: Str, error: Str?} do
+	let p = procSpawn(fun(_: Null) -> {} do
+		_captureIO(fn)
+	end)
+	return procJoin(p)
+end
+
 # Run a single test with optional timeout.
 # Returns: { name, ok, durationMs, error?, timeout? }
-let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
-	if verbose then
+# emit controls whether this function prints status lines.
+let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool, emit: Bool) -> {} do
+	if emit and verbose then
 		printf("=== RUN   %s\n", [name])
 	end
 	let t0 = nowMillis()
@@ -468,26 +478,13 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 	let base = if timeoutMs == null or int(timeoutMs) <= 0 then
 		_exec(null)
 	else
-		# Run the test in one process.
-		let tp = procSpawn(fun(_: Null) -> {} do
-			return _exec(null)
-		end)
-
-		# Run a timer in another; when it fires, return a timeout result.
+		let tp = procSpawn(fun(_: Null) -> {} do _exec(null) end)
 		let tt = procSpawn(fun(_: Null) -> {} do
 			let t = timerAfter(int(timeoutMs))
 			chanRecv(t)
-			return {
-				ok: false,
-				timeout: true,
-				error: sprintf("timeout after %dms", [int(timeoutMs)])
-			}
+			{ok: false, timeout: true, error: sprintf("timeout after %dms", [int(timeoutMs)])}
 		end)
-
-		# Wait for whichever finishes first.
 		let win = procJoinAny([tp, tt])
-
-		# Cancel and safely join the loser.
 		if win.index == 0 then
 			procCancel(tt)
 			procJoin(tt)
@@ -495,21 +492,14 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 			procCancel(tp)
 			procJoin(tp)
 		end
-
 		win.value
 	end
-
 
 	let dur = nowMillis() - t0
 	let ok = base.ok
 	let isTimeout = mapHas(base, "timeout") and bool(base.timeout)
-	let err = if mapHas(base, "error") and base.error != null then
-		base.error
-	else
-		""
-	end
+	let err = if mapHas(base, "error") and base.error != null then base.error else "" end
 
-	# origin hint printed for failures (both verbose and quiet)
 	let _printOriginIfAny = fun(_: Null) -> Null do
 		let o = _originOf(name)
 		if o != null then
@@ -518,33 +508,24 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 		null
 	end
 
-	if verbose then
-		if ok then
-			# PASS: we already printed "=== RUN" at the top; close with PASS.
-			printf("--- PASS: %s (%dms)\n", [name, int(dur)])
+	if emit then
+		if verbose then
+			if ok then
+				printf("--- PASS: %s (%dms)\n", [name, int(dur)])
+			else
+				_printOriginIfAny(null)
+				printf("%s\n", [err])
+				let tag = if isTimeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
+			end
 		else
-			# FAILURE: show origin, then engine error blob, then close with FAIL/TIMEOUT.
-			_printOriginIfAny(null)
-			printf("%s\n", [err])
-			let tag = if isTimeout then
-				"TIMEOUT"
-			else
-				"FAIL"
+			if not ok then
+				printf("=== RUN   %s\n", [name])
+				_printOriginIfAny(null)
+				printf("%s\n", [err])
+				let tag = if isTimeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
 			end
-			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
-		end
-	else
-		if not ok then
-			# Quiet mode: print RUN, origin, error blob, then FAIL/TIMEOUT (same framing as verbose).
-			printf("=== RUN   %s\n", [name])
-			_printOriginIfAny(null)
-			printf("%s\n", [err])
-			let tag = if isTimeout then
-				"TIMEOUT"
-			else
-				"FAIL"
-			end
-			printf("--- %s: %s (%dms)\n", [tag, name, int(dur)])
 		end
 	end
 
@@ -552,16 +533,12 @@ let _runOne = fun(name: Str, fn, timeoutMs: Int?, verbose: Bool) -> {} do
 		name: name,
 		ok: ok,
 		durationMs: dur,
-		error: if not ok then
-			err
-		else
-			null
-		end,
+		error: if not ok then err else null end,
 		timeout: isTimeout
 	}
 end
 
-# Run all registered tests.
+# Run all registered tests. In parallel mode, only the parent prints.
 let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 	let start = nowMillis()
 	let passed = 0
@@ -569,7 +546,6 @@ let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 	let total = 0
 
 	let reg = tests(null)
-
 	let names = []
 	for [k, _] in reg do
 		names = names + [k]
@@ -577,24 +553,43 @@ let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 	names = _sortStrs(names)
 
 	if parallel then
+		if verbose then
+			for name in names do
+				printf("=== RUN   %s\n", [name])
+			end
+		end
+
 		let ps = []
 		for name in names do
 			let fn = reg[name]
 			ps = ps + [
 				procSpawn(fun(_: Null) -> {} do
-					return _runOne(name, fn, timeoutMs, verbose)
+					_runOne(name, fn, timeoutMs, verbose, false)
 				end)
 			]
 			total = total + 1
 		end
+
 		let results = procJoinAll(ps)
 		let i = 0
 		while i < len(results) do
 			let res = results[i]
 			if res.ok then
 				passed = passed + 1
+				if verbose then
+					printf("--- PASS: %s (%dms)\n", [res.name, int(res.durationMs)])
+				end
 			else
 				failed = failed + 1
+				let o = _originOf(res.name)
+				if o != null then
+					printf("    AT    %s:%d (test)\n", [o.file, int(o.line)])
+				end
+				if res.error != null then
+					printf("%s\n", [res.error])
+				end
+				let tag = if res.timeout then "TIMEOUT" else "FAIL" end
+				printf("--- %s: %s (%dms)\n", [tag, res.name, int(res.durationMs)])
 			end
 			i = i + 1
 		end
@@ -602,7 +597,7 @@ let _runAll = fun(parallel: Bool, timeoutMs: Int?, verbose: Bool) -> Summary do
 		for name in names do
 			let fn = reg[name]
 			total = total + 1
-			let res = _runOne(name, fn, timeoutMs, verbose)
+			let res = _runOne(name, fn, timeoutMs, verbose, true)
 			if res.ok then
 				passed = passed + 1
 			else
@@ -621,26 +616,10 @@ end
 
 # Run: reset registry, discover tests, load fresh modules, run, print summary.
 let run = fun(opts: RunnerOpts) -> Summary do
-	let prefix = if mapHas(opts, "pathPrefix") and opts.pathPrefix != null then
-		opts.pathPrefix
-	else
-		"."
-	end
-	let verbose = if mapHas(opts, "verbose") and opts.verbose != null then
-		bool(opts.verbose)
-	else
-		false
-	end
-	let parallel = if mapHas(opts, "parallel") and opts.parallel != null then
-		bool(opts.parallel)
-	else
-		false
-	end
-	let timeoutMs = if mapHas(opts, "timeoutMs") and opts.timeoutMs != null then
-		int(opts.timeoutMs)
-	else
-		null
-	end
+	let prefix = if mapHas(opts, "pathPrefix") and opts.pathPrefix != null then opts.pathPrefix else "." end
+	let verbose = if mapHas(opts, "verbose") and opts.verbose != null then bool(opts.verbose) else false end
+	let parallel = if mapHas(opts, "parallel") and opts.parallel != null then bool(opts.parallel) else false end
+	let timeoutMs = if mapHas(opts, "timeoutMs") and opts.timeoutMs != null then int(opts.timeoutMs) else null end
 
 	reset(null)
 

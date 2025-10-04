@@ -414,7 +414,6 @@ jsonStringify: <fun: x:Any -> Str?> — Serialize a value to a compact JSON stri
 keys: <fun: obj:{} -> Null -> Str?> — Iterator over keys of an object.
 len: <fun: x:Any -> Int?> — Length of a value.
 list: <fun: it:(Null -> Any?) -> [Any]> — Collect an iterator into an array.
-llm: <module: llm> — Load the llm module, install its executor, and select a default backend/model.
 log: <fun: x:Num -> Num> — Natural logarithm (base e).
 lstrip: <fun: s:Str -> Str> — Remove leading whitespace (Unicode).
 map: <fun: f:(Any -> Any) -> it:(Null -> Any?) -> Null -> Any?> — Map over an iterator (lazy transform).
@@ -483,6 +482,7 @@ sin: <fun: x:Num -> Num> — Sine of an angle in radians.
 sleep: <fun: ms:Int -> Null> — Pause execution for a number of milliseconds.
 slice: <fun: xs:[Any] -> s:Int -> e:Int -> [Any]> — Slice an array [s, e).
 snapshot: <fun: _:Null -> {}> — Return a map snapshot of the visible environment (including built-ins).
+sort: <fun: arr:[Any] -> cmp:((Any, Any) -> Int) -> [Any]> — Sort an array in-place using a comparison function.
 split: <fun: s:Str -> sep:Str -> [Str]> — Split a string on a separator (no regex).
 sprintf: <fun: fmt:Str -> args:[Any] -> Str?> — Format a string with printf-style verbs.
 sqrt: <fun: x:Num -> Num> — Square root.

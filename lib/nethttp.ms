@@ -9,16 +9,25 @@
 # - Internals never return null on success; boundary helpers may return annotated null
 #
 # Public surface:
-#   router(), route(), routeStream(), mount(), contract(), openapiDoc(), testClient()
+#   router(opts?), route(), routeStream(), mount(), contract(), testClient()
 #   serve(), shutdown()
 #   mwRecover(), mwRequestID(), mwTimeout(), mwCors(), mwAccessLog()
 #
-# Streaming & backpressure (this refactor):
+# Docs (FastAPI-style):
+# - Full OpenAPI 3.1 is generated automatically and exposed at /openapi.json by default.
+# - Disable or change the path via router({docs:{enabled:false|true, path, info, servers, opts}}).
+#
+# Streaming & backpressure:
 # - True streaming responses for stream routes via socket-backed Responder
 # - Chunked transfer when length unknown; Content-Length when known
 # - Backpressure honored via socket writes (no in-memory growth)
 # - Request: Transfer-Encoding: chunked still rejected (documented)
 # - Expect: 100-continue preflight (route shape / limits) before reading body
+
+
+let oapi = import("openapi")
+
+
 
 # =========================
 # Public types (data-only)
@@ -606,6 +615,27 @@ let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Co
 	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
 end
 
+let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {} do
+	let out = {
+		method: _normMethod(method),
+		pattern: pattern,
+		style: style,
+		summary: if mapHas(c, "summary") and c.summary != null then c.summary else null end,
+		description: if mapHas(c, "description") and c.description != null then c.description else null end,
+		tags: if mapHas(c, "tags") and c.tags != null then c.tags else null end,
+		deprecated: if mapHas(c, "deprecated") and c.deprecated != null then bool(c.deprecated) else null end,
+		operationId: if mapHas(c, "operationId") and c.operationId != null then c.operationId else null end,
+		security: if mapHas(c, "security") and c.security != null then c.security else null end,
+		x: if mapHas(c, "x") and c.x != null then c.x else null end	
+	}
+	# Only attach 'contract' when it has meaningful content; empty {} would fail RouteSpec type.
+	if mapHas(c, "path") or mapHas(c, "query") or mapHas(c, "headers") or mapHas(c, "cookies") or mapHas(c, "body") or mapHas(c, "responses") then
+		out.contract = c
+	end
+	out
+end
+
+
 let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 	let nParts = len(parts)
 	let nReq = len(reqSegs)
@@ -643,6 +673,8 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 	{params: params, matched: if hasCatch then last else nParts end}
 end
 
+
+
 # Create a new router.
 #
 # Summary:
@@ -657,10 +689,26 @@ end
 # Args:
 #   _: Null — Unused.
 # Return: {} — Router instance.
-let router = fun(_: Null) -> {} do
+let router = fun(opts: {}?) -> {} do
+	let o = if opts == null then {} else opts end
+	let dIn = if mapHas(o, "docs") and o.docs != null then o.docs else {} end
+	let docs = {
+		enabled: if mapHas(dIn, "enabled") and dIn.enabled != null then bool(dIn.enabled) else true end,
+		path: if mapHas(dIn, "path") and dIn.path != null then dIn.path else "/openapi.json" end,
+		info: if mapHas(dIn, "info") and dIn.info != null then dIn.info else {title: "API", version: "0.1.0"} end,
+		servers: if mapHas(dIn, "servers") and dIn.servers != null then dIn.servers else [] end,
+		opts: if mapHas(dIn, "opts") and dIn.opts != null then dIn.opts else {} end
+	}
+
 	let _routes = []
 	let _mws = []
 	let _mounts = []
+	let _specRoutes = []
+
+	let _buildSpec = fun(_: Null) -> {} do
+		oapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
+	end
+
 
 	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
 		if len(a) < len(b) then
@@ -949,6 +997,7 @@ let router = fun(_: Null) -> {} do
 				let _ = res.end()
 				null
 			end
+			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "value", c)]
 			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
 			true
 		end,
@@ -974,6 +1023,7 @@ let router = fun(_: Null) -> {} do
 				end
 				null
 			end
+			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "stream", c)]
 			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
 			true
 		end,
@@ -1066,6 +1116,12 @@ let router = fun(_: Null) -> {} do
 			_preflight(req)
 		end
 	}
+	if docs.enabled then
+	api.route("GET", docs.path, contract({responses: {"200": type Any}}), fun(req, ctx) do
+		json(200, _buildSpec(null))
+	end)
+	end
+
 	api
 end
 
@@ -1750,30 +1806,4 @@ let _connLoop = fun(conn, router, server) -> Null do
 	close(conn)
 	server.conns = _removeConn(server.conns, conn)
 	null
-end
-
-# =========================
-# OpenAPI (contract-based, minimal)
-# =========================
-
-# Generate a minimal OpenAPI-like doc from registered routes.
-#
-# Summary:
-#   Produces a lightweight structure listing method, pattern, and style for each route.
-#   This is not a full OpenAPI 3 document—intended for quick inspection/testing.
-# Args:
-#   r: {} — Router instance.
-#   info: {} — Arbitrary info block, e.g., {title: "API", version: "1.0.0"}.
-#   servers: [Str]? — Optional server URLs.
-# Return: {}? — {info, servers, routes:[{method, pattern, style}]} or null # <not a router>.
-let openapiDoc = fun(r, info: {}, servers: [Str]?) -> {}? do
-	if not mapHas(r, "_dump") then
-		return null # <not a router>
-	end
-	let dump = r._dump()
-	let rs = []
-	for rr in dump.routes do
-		rs = rs + [{method: rr.method, pattern: rr.pattern, style: rr.style}]
-	end
-	{info: info, servers: if servers == null then [] else servers end, routes: rs}
 end

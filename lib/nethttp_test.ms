@@ -307,21 +307,16 @@ testing.test("nethttp/openapi basic", fun(_: Null) do
 		null
 	end)
 
-	let doc = http.openapiDoc(r, {title: "API", version: "1.0.0"}, [
-		"http://localhost"
-	])
-
-	testing.assert(doc != null, "openapi null")
-	let s = str(doc)
-	testing.assert(len(split(s, "/a/{id}")) > 1 or len(split(s, "\"/a/{id}\"")) > 1, "missing /a/{id} in doc")
+	# auto-generated docs must be exposed at /openapi.json
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/openapi.json"})
+	testing.assert(res.status == 200, "openapi status != 200")
+	testing.assert(len(res.body) > 0, "openapi body empty")
+	testing.assert(
+		len(split(res.body, "/a/{id}")) > 1 or len(split(res.body, "\"/a/{id}\"")) > 1,
+		"missing /a/{id} in openapi.json"
+	)
 end)
-
-# -------------------------
-# Extended server tests
-# -------------------------
-
-let testing = import("testing")
-let http = import("nethttp")
 
 # =========================================================
 # A) PATH: coercion failure -> 422

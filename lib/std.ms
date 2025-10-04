@@ -297,6 +297,53 @@ let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
 	out
 end
 
+# Sort an array in-place using a comparison function.
+# Args: arr:[Any] - array to sort (modified in-place)
+#       cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
+# Return: [Any] - the sorted array (same reference)
+let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
+	let swap = fun(i: Int, j: Int) -> Null do
+		let t = arr[i]
+		arr[i] = arr[j]
+		arr[j] = t
+		null
+	end
+	
+	let partition = fun(lo: Int, hi: Int) -> [Int] do
+		let pivot = arr[lo]
+		let lt = lo
+		let gt = hi
+		let i = lo
+		while i <= gt do
+			let c = cmp(arr[i], pivot)
+			if c < 0 then
+				swap(lt, i)
+				lt = lt + 1
+				i = i + 1
+			elif c > 0 then
+				swap(i, gt)
+				gt = gt - 1
+			else
+				i = i + 1
+			end
+		end
+		[lt, gt]
+	end
+	
+	let qsort = fun(lo: Int, hi: Int) -> Null do
+		if lo >= hi then
+			return null
+		end
+		let [lt, gt] = partition(lo, hi)
+		qsort(lo, lt - 1)
+		qsort(gt + 1, hi)
+		null
+	end
+	
+	qsort(0, len(arr) - 1)
+	arr
+end
+
 # # -----------------------------
 # # Objects (maps)
 # # -----------------------------

@@ -162,6 +162,18 @@ let _getHeader = fun(h: {}, name: Str) -> Str? do
 	null
 end
 
+let _setErr = fun(ctx: {}, r: {}) -> Null do
+	if ctx == null then
+		return
+	end
+	if mapHas(r, "error") and r.error != null then
+		ctx._errorDump = r.error
+	else
+		ctx._errorDump = "panic"
+	end
+	null
+end
+
 # Wrap a route contract (marker).
 #
 # Summary:
@@ -615,25 +627,54 @@ let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Co
 	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
 end
 
+# Build a well-typed RouteSpec for openapi.spec
 let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {} do
 	let out = {
 		method: _normMethod(method),
 		pattern: pattern,
-		style: style,
-		summary: if mapHas(c, "summary") and c.summary != null then c.summary else null end,
-		description: if mapHas(c, "description") and c.description != null then c.description else null end,
-		tags: if mapHas(c, "tags") and c.tags != null then c.tags else null end,
-		deprecated: if mapHas(c, "deprecated") and c.deprecated != null then bool(c.deprecated) else null end,
-		operationId: if mapHas(c, "operationId") and c.operationId != null then c.operationId else null end,
-		security: if mapHas(c, "security") and c.security != null then c.security else null end,
-		x: if mapHas(c, "x") and c.x != null then c.x else null end	
+		style: style
 	}
-	# Only attach 'contract' when it has meaningful content; empty {} would fail RouteSpec type.
+
+	# Optional metadata — copy only when well-typed
+	if mapHas(c, "summary") and c.summary != null and isType(c.summary, type Str) then
+		out.summary = c.summary
+	end
+	if mapHas(c, "description") and c.description != null and isType(c.description, type Str) then
+		out.description = c.description
+	end
+	if mapHas(c, "tags") and c.tags != null and isType(c.tags, type [Str]) then
+		out.tags = c.tags
+	end
+	if mapHas(c, "deprecated") and c.deprecated != null then
+		# Normalize to Bool (RouteSpec requires Bool if present)
+		out.deprecated = bool(c.deprecated)
+	end
+	if mapHas(c, "operationId") and c.operationId != null and isType(c.operationId, type Str) then
+		out.operationId = c.operationId
+	end
+
+	# Security can be a single object or an array of objects. RouteSpec expects [ {} ]?
+	if mapHas(c, "security") and c.security != null then
+		if isType(c.security, type [ {} ]) then
+			out.security = c.security
+		elif isType(c.security, type {}) then
+			out.security = [c.security]
+		end
+	end
+
+	# Vendor extensions (must be a map or null)
+	if mapHas(c, "x") and c.x != null and isType(c.x, type {}) then
+		out.x = c.x
+	end
+
+	# Only attach contract when it has meaningful content; avoids empty {} violating RouteSpec
 	if mapHas(c, "path") or mapHas(c, "query") or mapHas(c, "headers") or mapHas(c, "cookies") or mapHas(c, "body") or mapHas(c, "responses") then
 		out.contract = c
 	end
+
 	out
 end
+
 
 
 let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
@@ -708,7 +749,6 @@ let router = fun(opts: {}?) -> {} do
 	let _buildSpec = fun(_: Null) -> {} do
 		oapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
 	end
-
 
 	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
 		if len(a) < len(b) then
@@ -1017,6 +1057,7 @@ let router = fun(opts: {}?) -> {} do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do handler(req, res, ctx) end)
 				if not r.ok then
+					_setErr(ctx, r)
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
 					let _ = res.end()
@@ -1098,6 +1139,7 @@ let router = fun(opts: {}?) -> {} do
 				let call = _compose(r.call)
 				let t = try(fun(_: Null) do call(rq, sock.api, ctx) end)
 				if not t.ok then
+					_setErr(ctx, t)
 					let _ = write(conn, sprintf("HTTP/1.1 500 %s\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\ninternal server error", [_reason(500)]))
 					let _ = flush(conn)
 					return {streamed: true}
@@ -1186,6 +1228,7 @@ end
 #
 # Summary:
 #   Wraps next and catches panics (via try), returning "internal server error".
+#   Also records a short panic reason on ctx._errorDump (for mwAccessLog).
 # Args:
 #   _: Null — Unused.
 # Return: _Mw — Middleware function.
@@ -1194,9 +1237,11 @@ let mwRecover = fun(_: Null) -> _Mw do
 		return fun(req: Request, res: Responder, ctx: {}) -> Null do
 			let r = try(fun(_: Null) do next(req, res, ctx) end)
 			if not r.ok then
+				_setErr(ctx, r)    # NEW
 				res.status(500).setHeader("Content-Type", "text/plain")
 				let _ = res.write("internal server error")
 				let _ = res.end()
+				return
 			end
 			null
 		end
@@ -1372,6 +1417,11 @@ end
 #
 # Summary:
 #   Proxies status/write to measure bytes; writes a single line via printf.
+# Format:
+#   "METHOD /path?query" <status> <n>bytes <dur>ms OK|FAIL
+#   On FAIL, an error dump line follows.
+# Color:
+#   Set to enable ANSI colors (green OK, red FAIL, dim dump).
 # Args:
 #   _: Null — Unused.
 # Return: _Mw — Middleware function.
@@ -1410,11 +1460,29 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 			next(req, proxy, ctx)
 
 			let dur = nowMillis() - t0
-			printf("%s \"%s %s\" %d %d %dms\n", ["-", req.method, req.url.path, int(status.v), int(bytes.v), int(dur)])
+			let pathq = req.url.path + if req.url.query == null then "" else "?" + req.url.query end
+			let ok = status.v < 500
+			let tag = if ok then "OK" else "FAIL" end
+
+			let colorOn = true
+			let GRN = if colorOn then "\u001b[32m" else "" end
+			let RED = if colorOn then "\u001b[31m" else "" end
+			let DIM = if colorOn then "\u001b[2m"  else "" end
+			let RST = if colorOn then "\u001b[0m"  else "" end
+			let tagC = if ok then GRN + tag + RST else RED + tag + RST end
+
+			printf("\"%s %s\" %d %dbytes %dms %s\n", [
+				req.method, pathq, int(status.v), int(bytes.v), int(dur), tagC
+			])
+
+			if not ok and mapHas(ctx, "_errorDump") and ctx._errorDump != null then
+				printf("%s%s%s\n", [DIM, str(ctx._errorDump), RST])
+			end
 			null
 		end
 	end
 end
+
 
 # =========================
 # Server lifecycle (HTTP/1.1 MVP)

@@ -616,25 +616,54 @@ let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Co
 	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
 end
 
+# Build a well-typed RouteSpec for openapi.spec
 let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {} do
 	let out = {
 		method: _normMethod(method),
 		pattern: pattern,
-		style: style,
-		summary: if mapHas(c, "summary") and c.summary != null then c.summary else null end,
-		description: if mapHas(c, "description") and c.description != null then c.description else null end,
-		tags: if mapHas(c, "tags") and c.tags != null then c.tags else null end,
-		deprecated: if mapHas(c, "deprecated") and c.deprecated != null then bool(c.deprecated) else null end,
-		operationId: if mapHas(c, "operationId") and c.operationId != null then c.operationId else null end,
-		security: if mapHas(c, "security") and c.security != null then c.security else null end,
-		x: if mapHas(c, "x") and c.x != null then c.x else null end	
+		style: style
 	}
-	# Only attach 'contract' when it has meaningful content; empty {} would fail RouteSpec type.
+
+	# Optional metadata — copy only when well-typed
+	if mapHas(c, "summary") and c.summary != null and isType(c.summary, type Str) then
+		out.summary = c.summary
+	end
+	if mapHas(c, "description") and c.description != null and isType(c.description, type Str) then
+		out.description = c.description
+	end
+	if mapHas(c, "tags") and c.tags != null and isType(c.tags, type [Str]) then
+		out.tags = c.tags
+	end
+	if mapHas(c, "deprecated") and c.deprecated != null then
+		# Normalize to Bool (RouteSpec requires Bool if present)
+		out.deprecated = bool(c.deprecated)
+	end
+	if mapHas(c, "operationId") and c.operationId != null and isType(c.operationId, type Str) then
+		out.operationId = c.operationId
+	end
+
+	# Security can be a single object or an array of objects. RouteSpec expects [ {} ]?
+	if mapHas(c, "security") and c.security != null then
+		if isType(c.security, type [ {} ]) then
+			out.security = c.security
+		elif isType(c.security, type {}) then
+			out.security = [c.security]
+		end
+	end
+
+	# Vendor extensions (must be a map or null)
+	if mapHas(c, "x") and c.x != null and isType(c.x, type {}) then
+		out.x = c.x
+	end
+
+	# Only attach contract when it has meaningful content; avoids empty {} violating RouteSpec
 	if mapHas(c, "path") or mapHas(c, "query") or mapHas(c, "headers") or mapHas(c, "cookies") or mapHas(c, "body") or mapHas(c, "responses") then
 		out.contract = c
 	end
+
 	out
 end
+
 
 
 let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
@@ -709,7 +738,6 @@ let router = fun(opts: {}?) -> {} do
 	let _buildSpec = fun(_: Null) -> {} do
 		oapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
 	end
-
 
 	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
 		if len(a) < len(b) then
@@ -1118,7 +1146,7 @@ let router = fun(opts: {}?) -> {} do
 		end
 	}
 	if docs.enabled then
-	api.route("GET", docs.path, contract({responses: {"200": type {}}}), fun(req, ctx) do
+	api.route("GET", docs.path, contract({responses: {"200": type Any}}), fun(req, ctx) do
 		json(200, _buildSpec(null))
 	end)
 	end
@@ -2724,14 +2752,6 @@ testing.test("nethttp/openapi basic", fun(_: Null) do
 		"missing /a/{id} in openapi.json"
 	)
 end)
-
-
-# -------------------------
-# Extended server tests
-# -------------------------
-
-let testing = import("testing")
-let http = import("nethttp")
 
 # =========================================================
 # A) PATH: coercion failure -> 422

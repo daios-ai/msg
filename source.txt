@@ -1324,6 +1324,16 @@ let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
 	{params: params, matched: if hasCatch then last else nParts end}
 end
 
+let _getHeader = fun(h: {}, name: Str) -> Str? do
+	let want = toLower(name)
+	for [k, v] in h do
+		if toLower(k) == want then
+			return v
+		end
+	end
+	null
+end
+
 # Create a new router.
 #
 # Summary:
@@ -2107,6 +2117,9 @@ end
 #
 # NOTE: Split from nethttp.ms without behavior changes.
 
+let core = import("nethttp/router")
+let _getHeader = core._getHeader
+
 let _ServerHandle = type {listener: Any, stop: {closed: Bool}, conns: [Any], opts: {}}
 
 let _reason = fun(code: Int) -> Str do
@@ -2136,16 +2149,6 @@ end
 
 let _validHeaderValue = fun(v: Str) -> Bool do
 	match("\r|\n", v) == []
-end
-
-let _getHeader = fun(h: {}, name: Str) -> Str? do
-	let want = toLower(name)
-	for [k, v] in h do
-		if toLower(k) == want then
-			return v
-		end
-	end
-	null
 end
 
 let _readLineLimited = fun(c, remaining: Int?) -> Str? do

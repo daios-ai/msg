@@ -11,18 +11,6 @@ let _Mw       = core._Mw
 let _getHeader = core._getHeader
 let _setErr    = core._setErr
 
-
-let _getHeader = fun(h: {}, name: Str) -> Str? do
-	let want = toLower(name)
-	for [k, v] in h do
-		if toLower(k) == want then
-			return v
-		end
-	end
-	null
-end
-
-
 # Recover middleware — converts handler panics to 500 responses.
 #
 # Summary:

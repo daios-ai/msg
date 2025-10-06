@@ -1,7 +1,6 @@
 # nethttp/router — routing, contracts, binding, responders, OpenAPI hook
 #
-# NOTE: This file is a straight split from lib/nethttp.ms. Behavior is unchanged.
-# Keep code minimal and consistent with existing tests.
+# NOTE: Behavior is unchanged. This pass only tightens types and clarifies docs.
 
 let oapi = import("nethttp/openapi")
 
@@ -10,40 +9,21 @@ let oapi = import("nethttp/openapi")
 # =========================
 
 # HTTP request value passed to handlers.
-#
-# Fields:
-#   method: Str — Uppercase HTTP method, e.g. "GET".
-#   url: {scheme: Str?, host: Str?, path: Str, query: Str?} — Parsed request-target parts.
-#   headers: {} — Map of request headers (case-preserving on ingest).
-#   body: Any — Raw request body as Str (server) or readable handle (test/client).
-#   pathParams: {}? — Raw `{name}` path parameters (strings), prior to contract binding.
-# Return: type
 let Request = type {
-	method: Str,
-	url: {scheme: Str?, host: Str?, path: Str, query: Str?},
-	headers: {},
-	body: Any,
+	method!: Str,
+	url!: {scheme: Str?, host: Str?, path!: Str, query: Str?},
+	headers!: {},
+	body!: Any,
 	pathParams: {}?
 }
 
 # Streaming responder interface for handlers.
-#
-# Methods:
-#   status(code: Int) -> Responder — Set status (before head write); chainable.
-#   setHeader(k: Str, v: Str) -> Responder — Set header (before head write); chainable.
-#   write(chunk: Str) -> Int? — Write a body chunk; returns bytes written or null # <write failed>.
-#   flush(_: Null) -> Bool? — Flush downstream buffers; null # <write failed> on error.
-#   end(_: Null) -> Bool? — Finish response; null # <write failed> on error.
-# Behavior:
-#   - For streaming routes, head is emitted lazily on first write/status/header.
-#   - If Content-Length is absent, Transfer-Encoding: chunked is used.
-# Return: type
 let Responder = type {
-	status: Int -> Responder,
-	setHeader: Str -> Str -> Responder,
-	write: Str -> Int?,
-	flush: Null -> Bool?,
-	end: Null -> Bool?
+	status!: Int -> Responder,
+	setHeader!: Str -> Str -> Responder,
+	write!: Str -> Int?,
+	flush!: Null -> Bool?,
+	end!: Null -> Bool?
 }
 
 let _Response = type {status!: Int, headers!: {}, body!: Str}
@@ -56,13 +36,9 @@ let _HttpError = type {
 }
 
 # A marker wrapper for route contracts (path/query/body/responses).
-#
-# Purpose:
-#   Use contract({...}) to declare schemas for binding/validation at route time.
-# Return: type (opaque)
 let Contract = type {}
 
-let _Ctx = type {req: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
+let _Ctx = type {req!: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
 
 let _StreamFn = type Request -> Responder -> {} -> Null
 let _Mw = type _StreamFn -> _StreamFn
@@ -112,12 +88,12 @@ let _makeURL = fun(path: Str, query: Str?) -> {} do
 	{scheme: null, host: null, path: path, query: query}
 end
 
-let _json = fun(v) -> Str? do
+let _json = fun(v: Any) -> Str? do
 	let s = jsonStringify(v)
 	if s != null then
 		return s
 	end
-	null # <json stringify failed>
+	null
 end
 
 let _setErr = fun(ctx: {}, r: {}) -> Null do
@@ -133,12 +109,6 @@ let _setErr = fun(ctx: {}, r: {}) -> Null do
 end
 
 # Wrap a route contract (marker).
-#
-# Summary:
-#   Returns the same object, labeled as a Contract for readability at callsites.
-# Args:
-#   c: Contract — A map describing path/query/body/responses (types).
-# Return: Contract
 let contract = fun(c: Contract) -> Contract do
 	c
 end
@@ -147,25 +117,10 @@ end
 # Error helpers (public)
 # =========================
 
-# Create a structured HTTP error response for value routes.
-#
-# Summary:
-#   Returns a special object recognized by router value handlers to emit the given status and body.
-# Args:
-#   status: Int — HTTP status code.
-#   message: Str — Plaintext/error message body.
-# Return: {} — Structured error marker (not a panic).
 let raise = fun(status: Int, message: Str) -> {} do
 	{__http_error__: true, status: status, body: message, headers: {}}
 end
 
-# Create a structured HTTP error with custom headers.
-#
-# Args:
-#   status: Int — HTTP status code.
-#   message: Str — Error message body.
-#   headers: {} — Additional headers to include in the response.
-# Return: {} — Structured error marker.
 let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
 	{__http_error__: true, status: status, body: message, headers: headers}
 end
@@ -180,7 +135,7 @@ let _rawBody = fun(req: Request) -> Str? do
 	end
 	let s = readAll(req.body)
 	if s == null then
-		return null # <read body failed>
+		return null
 	end
 	s
 end
@@ -199,7 +154,7 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 		if pj != null and isType(pj, type Int) then
 			return pj
 		end
-		return null # <bad int>
+		return null
 	end
 	if isSubtype(T, type Num) then
 		let n = num(s)
@@ -210,7 +165,7 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 		if pj != null and (isType(pj, type Num) or isType(pj, type Int)) then
 			return pj
 		end
-		return null # <bad num>
+		return null
 	end
 	if isSubtype(T, type Bool) then
 		let sl = toLower(s)
@@ -224,19 +179,19 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 		if pj != null and isType(pj, type Bool) then
 			return pj
 		end
-		return null # <bad bool>
+		return null
 	end
-	null # <unsupported scalar type>
+	null
 end
 
 let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 	let rt = reflect(T)
 	if rt == null then
-		return null # <reflect failed>
+		return null
 	end
 	let node = rt[1]
 	if node[0] != "map" then
-		return null # <only object types supported for query>
+		return null
 	end
 
 	let out = {}
@@ -252,7 +207,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 
 		if vs == null or len(vs) == 0 then
 			if tag == "pair!" then
-				return null # <missing key: {k}>
+				return null
 			end
 			i = i + 1
 			continue
@@ -269,7 +224,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 						let s = str(pj[j])
 						let u = _coerceScalar(s, U)
 						if u == null then
-							return null # <bad element for {k}>
+							return null
 						end
 						arr = arr + [u]
 						j = j + 1
@@ -284,7 +239,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 			while j2 < len(vs) do
 				let u2 = _coerceScalar(vs[j2], U)
 				if u2 == null then
-					return null # <bad element for {k}>
+					return null
 				end
 				arr2 = arr2 + [u2]
 				j2 = j2 + 1
@@ -297,7 +252,7 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		let s = vs[len(vs) - 1]
 		let v = _coerceScalar(s, Tk)
 		if v == null then
-			return null # <coercion failed: {k}>
+			return null
 		end
 		out[k] = v
 		i = i + 1
@@ -306,13 +261,13 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 	if isType(out, T) then
 		return out
 	end
-	null # <query validation failed>
+	null
 end
 
 let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
 	let qm = urlQueryParse(if req.url.query == null then "" else req.url.query end)
 	if qm == null then
-		return null # <invalid query string>
+		return null
 	end
 	_bindQueryMap(qm, TQ)
 end
@@ -333,11 +288,11 @@ end
 let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 	let rt = reflect(TP)
 	if rt == null then
-		return null # <reflect failed>
+		return null
 	end
 	let node = rt[1]
 	if node[0] != "map" then
-		return null # <path must be object type>
+		return null
 	end
 	let out = {}
 	let entries = slice(node, 1, len(node))
@@ -350,14 +305,14 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		let raw = if mapHas(ps, k) then ps[k] else null end
 		if raw == null then
 			if tag == "pair!" then
-				return null # <missing key: {k}>
+				return null
 			end
 			i = i + 1
 			continue
 		end
 		let v = _coerceScalar(raw, Tk)
 		if v == null then
-			return null # <coercion failed: {k}>
+			return null
 		end
 		out[k] = v
 		i = i + 1
@@ -365,46 +320,48 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 	if isType(out, TP) then
 		return out
 	end
-	null # <path validation failed>
+	null
 end
 
 let _bindBody = fun(req: Request, TB: Type) -> Any? do
 	let raw = _rawBody(req)
 	if raw == null then
-		return null # <read body failed>
+		return null
 	end
 	let v = jsonParse(raw)
 	if v == null then
-		return null # <invalid json>
+		return null
 	end
 	if not isType(v, TB) then
-		return null # <validation failed: expected body to satisfy {str(TB)}>
+		return null
 	end
 	v
 end
 
-let _validationJSON = fun(where: Str, reason: Str) -> Str do
-	let obj = {error: "validation", detail: [{in: where, reason: reason}]}
+# Build a compact JSON validation payload.
+# reason may be absent (null) when a binder failed without a note.
+let _validationJSON = fun(where: Str, reason: Str?) -> Str do
+	let msg =
+		if reason == null then
+			"<validation failed>"
+		else
+			reason
+		end
+	let obj = {error: "validation", detail: [{in: where, reason: msg}]}
 	let s = _json(obj)
 	if s == null then
-		return "{\"error\":\"validation\"}"
+		"{\"error\":\"validation\"}"
+	else
+		s
 	end
-	s
 end
+
 
 # =========================
 # Response helpers (for value handlers)
 # =========================
 
-# Send JSON from a value route.
-#
-# Summary:
-#   Serializes the value to JSON and returns a buffered response with Content-Type set.
-# Args:
-#   status: Int — HTTP status code.
-#   value: Any — Value to encode as JSON.
-# Return: {} — Buffered response or {status:500,"json encode error"} on encode failure.
-let json = fun(status: Int, value) -> {} do
+let json = fun(status: Int, value: Any) -> {} do
 	let s = _json(value)
 	if s == null then
 		return {status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error"}
@@ -412,33 +369,14 @@ let json = fun(status: Int, value) -> {} do
 	{status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s}
 end
 
-# Send plaintext from a value route.
-#
-# Args:
-#   status: Int — HTTP status code.
-#   s: Str — Body.
-# Return: {} — Buffered response with text/plain Content-Type.
 let text = fun(status: Int, s: Str) -> {} do
 	{status: status, headers: {"Content-Type": "text/plain"}, body: s}
 end
 
-# Send 204 No Content from a value route.
-#
-# Args:
-#   _: Null — Unused.
-# Return: {} — Buffered response with empty body.
 let noContent = fun(_: Null) -> {} do
 	{status: 204, headers: {}, body: ""}
 end
 
-# Send an internal redirect (path-only) from a value route.
-#
-# Summary:
-#   Only absolute-path locations are allowed (e.g., "/new"). External absolute URLs are rejected with 400.
-# Args:
-#   status: Int — Redirect code (e.g., 302).
-#   location: Str — Absolute path starting with "/".
-# Return: {} — Buffered response or {status:400,"bad redirect"}.
 let redirect = fun(status: Int, location: Str) -> {} do
 	if len(location) == 0 or substr(location, 0, 1) != "/" then
 		return {status: 400, headers: {"Content-Type": "text/plain"}, body: "bad redirect"}
@@ -450,7 +388,7 @@ end
 # Buffered responder (for value routes, tests)
 # =========================
 
-let _newResponder = fun() -> {res: _Response, api: Responder} do
+let _newResponder = fun(_: Null) -> {res!: _Response, api!: Responder} do
 	let state = {status: 200, headers: {}, body: ""}
 	let api = {}
 	api.status = fun(code: Int) -> Responder do
@@ -495,7 +433,7 @@ let _reason = fun(code: Int) -> Str do
 	"OK"
 end
 
-let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
+let _newSockResponder = fun(conn: Any, opts: {}) -> {api!: Responder, state!: {}} do
 	let st = {status: 200, headers: {}, wroteHead: false, chunked: false, ended: false}
 	let _emitHead = fun(_: Null) -> Bool do
 		if st.wroteHead then
@@ -542,26 +480,26 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 		if st.ended then
 			return 0
 		end
-		if not _emitHead() then
-			return null # <write head failed>
+		if not _emitHead(null) then
+			return null
 		end
 		if st.chunked then
 			let pre = sprintf("%x\r\n", [len(chunk)])
 			if write(conn, pre) == null then
-				return null # <write failed>
+				return null
 			end
 			if write(conn, chunk) == null then
-				return null # <write failed>
+				return null
 			end
 			if write(conn, "\r\n") == null then
-				return null # <write failed>
+				return null
 			end
 			let _ = flush(conn)
 			len(chunk)
 		else
 			let n = write(conn, chunk)
 			if n == null then
-				return null # <write failed>
+				return null
 			end
 			let _ = flush(conn)
 			n
@@ -575,13 +513,13 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 			return true
 		end
 		if not st.wroteHead then
-			if not _emitHead() then
+			if not _emitHead(null) then
 				return true
 			end
 		end
 		if st.chunked then
 			if write(conn, "0\r\n\r\n") == null then
-				return null # <write failed>
+				return null
 			end
 		end
 		let _ = flush(conn)
@@ -602,7 +540,6 @@ let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Co
 	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
 end
 
-# Build a well-typed RouteSpec for openapi.spec
 let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {} do
 	let out = {
 		method: _normMethod(method),
@@ -610,7 +547,6 @@ let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {}
 		style: style
 	}
 
-	# Optional metadata — copy only when well-typed
 	if mapHas(c, "summary") and c.summary != null and isType(c.summary, type Str) then
 		out.summary = c.summary
 	end
@@ -627,7 +563,6 @@ let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {}
 		out.operationId = c.operationId
 	end
 
-	# Security can be a single object or an array of objects. RouteSpec expects [ {} ]?
 	if mapHas(c, "security") and c.security != null then
 		if isType(c.security, type [ {} ]) then
 			out.security = c.security
@@ -636,12 +571,10 @@ let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {}
 		end
 	end
 
-	# Vendor extensions (must be a map or null)
 	if mapHas(c, "x") and c.x != null and isType(c.x, type {}) then
 		out.x = c.x
 	end
 
-	# Only attach contract when it has meaningful content; avoids empty {} violating RouteSpec
 	if mapHas(c, "path") or mapHas(c, "query") or mapHas(c, "headers") or mapHas(c, "cookies") or mapHas(c, "body") or mapHas(c, "responses") then
 		out.contract = c
 	end
@@ -696,20 +629,7 @@ let _getHeader = fun(h: {}, name: Str) -> Str? do
 	null
 end
 
-# Create a new router.
-#
-# Summary:
-#   Builds a closure-backed router with registration for value/stream routes, middleware, and mounts.
-# Methods on returned object:
-#   route(method: Str, pattern: Str, c: Contract, handler) -> Bool
-#   routeStream(method: Str, pattern: Str, c: Contract, handler) -> Bool
-#   mount(prefix: Str, childRouter) -> Bool
-#   use(mw: _Mw) -> Bool
-#   _entryCall(req: Request) -> {status!: Int, headers!: {}, body!: Str}
-#   _entryCallStream(req: Request, conn, opts: {}) -> {}?
-# Args:
-#   _: Null — Unused.
-# Return: {} — Router instance.
+# Create a new router (APIs typed; logic preserved).
 let router = fun(opts: {}?) -> {} do
 	let o = if opts == null then {} else opts end
 	let dIn = if mapHas(o, "docs") and o.docs != null then o.docs else {} end
@@ -813,16 +733,15 @@ let router = fun(opts: {}?) -> {} do
 		h
 	end
 
-	# Run middleware for a synthesized response (buffered)
 	let _emitViaMw = fun(req: Request, ctx: {}, status: Int, headers: {}, body: Str) -> _Response do
-		let pack = _newResponder()
+		let pack = _newResponder(null)
 		let h = fun(_: Request, res: Responder, _: {}) -> Null do
 			for [k, v] in headers do
 				res.setHeader(k, v)
 			end
 			res.status(status)
 			let _ = res.write(body)
-			let _ = res.end()
+			let _ = res.end(null)
 			null
 		end
 		let call = _compose(h)
@@ -830,8 +749,7 @@ let router = fun(opts: {}?) -> {} do
 		{status: pack.res.status, headers: pack.res.headers, body: pack.res.body}
 	end
 
-	# Run middleware for a synthesized response (streaming)
-	let _emitStreamViaMw = fun(req: Request, ctx: {}, conn, opts: {}, status: Int, headers: {}, body: Str) -> Null do
+	let _emitStreamViaMw = fun(req: Request, ctx: {}, conn: Any, opts: {}, status: Int, headers: {}, body: Str) -> Null do
 		let sock = _newSockResponder(conn, opts)
 		let h = fun(_: Request, res: Responder, _: {}) -> Null do
 			for [k, v] in headers do
@@ -839,7 +757,7 @@ let router = fun(opts: {}?) -> {} do
 			end
 			res.status(status)
 			let _ = res.write(body)
-			let _ = res.end()
+			let _ = res.end(null)
 			null
 		end
 		let call = _compose(h)
@@ -940,7 +858,7 @@ let router = fun(opts: {}?) -> {} do
 			ctx.body = B
 		end
 
-		let pack = _newResponder()
+		let pack = _newResponder(null)
 		let call = _compose(r.call)
 
 		let t = try(fun(_: Null) do call(rq, pack.api, ctx) end)
@@ -952,7 +870,6 @@ let router = fun(opts: {}?) -> {} do
 		{status: pack.res.status, headers: pack.res.headers, body: pack.res.body}
 	end
 
-	# Preflight used by server for Expect: 100-continue (no body binding here)
 	let _preflight = fun(req: Request) -> {ok!: Bool} do
 		let m = _matchLocal(req.method, req.url.path)
 		if m == null then
@@ -980,33 +897,21 @@ let router = fun(opts: {}?) -> {} do
 	let api = {
 		__kind: "nethttp.router",
 
-		# Register a buffered (value) route with contract binding.
-		#
-		# Summary:
-		#   Handler returns either a buffered {_Response}, a structured http error (raise*),
-		#   any JSON-encodable value (auto 200 + application/json), or null (treated as 500).
-		#   If 'responses' is present in contract, the response payload is type-checked.
-		# Args:
-		#   method: Str — "GET", "POST", ...
-		#   pattern: Str — e.g., "/users/{id}", "/v1/", "{*tail}" at end for catch-all.
-		#   c: Contract — {path?:Type, query?:Type, body?:Type, responses?:{code->Type}}
-		#   handler: (req: Request, ctx: {}) -> Any — Value-returning handler.
-		# Return: Bool — true when registered.
-		route: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
+		route: fun(method: Str, pattern: Str, c: Contract, handler: Request -> {} -> Any) -> Bool do
 			let parts = _splitPath(pattern)
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do handler(req, ctx) end)
 				if not r.ok then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
-					let _ = res.end()
+					let _ = res.end(null)
 					return
 				end
 				let out = r.value
 				if out == null then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("handler returned null")
-					let _ = res.end()
+					let _ = res.end(null)
 					return
 				end
 				if isType(out, _HttpError) then
@@ -1017,7 +922,7 @@ let router = fun(opts: {}?) -> {} do
 					end
 					res.status(out.status)
 					let _ = res.write(rt)
-					let _ = res.end()
+					let _ = res.end(null)
 					return
 				end
 				if isType(out, _Response) then
@@ -1026,7 +931,7 @@ let router = fun(opts: {}?) -> {} do
 						if not _checkResponse(out.status, payload, c.responses) then
 							res.status(500).setHeader("Content-Type", "application/json")
 							let _ = res.write(_validationJSON("response", "response-validation failed"))
-							let _ = res.end()
+							let _ = res.end(null)
 							return
 						end
 					end
@@ -1035,27 +940,27 @@ let router = fun(opts: {}?) -> {} do
 					end
 					res.status(out.status)
 					let _ = res.write(out.body)
-					let _ = res.end()
+					let _ = res.end(null)
 					return
 				end
 				let js = _json(out)
 				if js == null then
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("json encode error")
-					let _ = res.end()
+					let _ = res.end(null)
 					return
 				end
 				if mapHas(c, "responses") and c.responses != null then
 					if not _checkResponse(200, out, c.responses) then
 						res.status(500).setHeader("Content-Type", "application/json")
 						let _ = res.write(_validationJSON("response", "response-validation failed"))
-						let _ = res.end()
+						let _ = res.end(null)
 						return
 					end
 				end
 				res.setHeader("Content-Type", "application/json; charset=utf-8").status(200)
 				let _ = res.write(js)
-				let _ = res.end()
+				let _ = res.end(null)
 				null
 			end
 			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "value", c)]
@@ -1063,25 +968,14 @@ let router = fun(opts: {}?) -> {} do
 			true
 		end,
 
-		# Register a streaming route with contract binding.
-		#
-		# Summary:
-		#   Handler receives a streaming Responder; must write/end explicitly.
-		#   Note: HEAD is NOT auto-mapped to GET for streaming routes (405 unless registered).
-		# Args:
-		#   method: Str — HTTP method.
-		#   pattern: Str — Route pattern (may include {name}, {*tail}).
-		#   c: Contract — Path/query/body types and optional responses (ignored for streaming).
-		#   handler: (req: Request, res: Responder, ctx: {}) -> Null
-		# Return: Bool — true when registered.
-		routeStream: fun(method: Str, pattern: Str, c: Contract, handler) -> Bool do
+		routeStream: fun(method: Str, pattern: Str, c: Contract, handler: Request -> Responder -> {} -> Null) -> Bool do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do handler(req, res, ctx) end)
 				if not r.ok then
 					_setErr(ctx, r)
 					res.status(500).setHeader("Content-Type", "text/plain")
 					let _ = res.write("internal server error")
-					let _ = res.end()
+					let _ = res.end(null)
 				end
 				null
 			end
@@ -1090,22 +984,11 @@ let router = fun(opts: {}?) -> {} do
 			true
 		end,
 
-		# Mount a child router at a path prefix.
-		#
-		# Args:
-		#   prefix: Str — e.g., "/api", "/v1/users".
-		#   child: {} — Another router() instance.
-		# Return: Bool — true when mounted.
-		mount: fun(prefix: Str, child) -> Bool do
+		mount: fun(prefix: Str, child: {}) -> Bool do
 			_mounts = _mounts + [{prefixParts: _splitPath(prefix), child: child}]
 			true
 		end,
 
-		# Install middleware (applied outer-to-inner in registration order).
-		#
-		# Args:
-		#   mw: _Mw — Middleware transformer: next:_StreamFn -> _StreamFn.
-		# Return: Bool — true when installed.
 		use: fun(mw: _Mw) -> Bool do
 			_mws = _mws + [mw]
 			true
@@ -1115,7 +998,7 @@ let router = fun(opts: {}?) -> {} do
 			_entryCore(req)
 		end,
 
-		_entryCallStream: fun(req: Request, conn, opts: {}) -> {}? do
+		_entryCallStream: fun(req: Request, conn: Any, opts: {}) -> {}? do
 			let m = _matchLocal(req.method, req.url.path)
 			if m == null then
 				return null
@@ -1164,10 +1047,10 @@ let router = fun(opts: {}?) -> {} do
 			if not t.ok then
 				_setErr(ctx, t)
 				let _ = sock.api.status(500).setHeader("Content-Type", "text/plain").write("internal server error")
-				let _ = sock.api.end()
+				let _ = sock.api.end(null)
 				return {streamed: true}
 			end
-			let _ = sock.api.end()
+			let _ = sock.api.end(null)
 			{streamed: true}
 		end,
 
@@ -1180,9 +1063,9 @@ let router = fun(opts: {}?) -> {} do
 		end
 	}
 	if docs.enabled then
-	api.route("GET", docs.path, contract({responses: {"200": type Any}}), fun(req, ctx) do
-		json(200, _buildSpec(null))
-	end)
+		api.route("GET", docs.path, contract({responses: {"200": type Any}}), fun(req: Request, ctx: {}) do
+			json(200, _buildSpec(null))
+		end)
 	end
 
 	api
@@ -1192,7 +1075,7 @@ end
 # Response validation (contract responses)
 # =========================
 
-let _checkResponse = fun(status: Int, out, respMap: {}) -> Bool do
+let _checkResponse = fun(status: Int, out: Any, respMap: {}) -> Bool do
 	if respMap == null then
 		return true
 	end
@@ -1210,16 +1093,7 @@ end
 # Test client (buffered)
 # =========================
 
-# Create a buffered in-memory test client for a router.
-#
-# Summary:
-#   Simulates HTTP calls without sockets; routes through the router’s entry points.
-# Methods on return:
-#   call(req: {method?:Str, path?:Str, headers?:{}, body?:Str}) -> {status:Int, headers:{}, body:Str}
-# Args:
-#   r: {} — Router instance created by router().
-# Return: {} — {call: fun} test client.
-let testClient = fun(r) -> {} do
+let testClient = fun(r: {}) -> {} do
 	let call = fun(req: {}) -> {} do
 		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
 		let pathStr = if mapHas(req, "path") and req.path != null then req.path else "/" end
@@ -1234,8 +1108,8 @@ let testClient = fun(r) -> {} do
 			q = join(slice(parts, 1, len(parts)), "?")
 		end
 
-		let R = {method: _normMethod(method), url: _makeURL(p, q), headers: headers, body: body, pathParams: {}}
-		let res = r._entryCall(R)
+		let RQ = {method: _normMethod(method), url: _makeURL(p, q), headers: headers, body: body, pathParams: {}}
+		let res = r._entryCall(RQ)
 		{status: res.status, headers: res.headers, body: res.body}
 	end
 	{call: call}

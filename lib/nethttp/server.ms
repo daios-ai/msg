@@ -1,64 +1,81 @@
 # Server lifecycle (HTTP/1.1 MVP)
 #
 # NOTE: Split from nethttp.ms without behavior changes.
+# This pass tightens types only.
 
 let core = import("nethttp/router")
 let _getHeader = core._getHeader
 
-let _ServerHandle = type {listener: Any, stop: {closed: Bool}, conns: [Any], opts: {}}
+let _ServerHandle = type {listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}
 
 let _reason = fun(code: Int) -> Str do
-	if code == 200 then return "OK" end
-	if code == 204 then return "No Content" end
-	if code == 302 then return "Found" end
-	if code == 400 then return "Bad Request" end
-	if code == 401 then return "Unauthorized" end
-	if code == 404 then return "Not Found" end
-	if code == 405 then return "Method Not Allowed" end
-	if code == 413 then return "Payload Too Large" end
-	if code == 414 then return "URI Too Long" end
-	if code == 422 then return "Unprocessable Entity" end
-	if code == 431 then return "Request Header Fields Too Large" end
-	if code == 500 then return "Internal Server Error" end
-	if code == 504 then return "Gateway Timeout" end
-	"OK"
+	if code == 200 then
+		"OK"
+	elif code == 204 then
+		"No Content"
+	elif code == 302 then
+		"Found"
+	elif code == 400 then
+		"Bad Request"
+	elif code == 401 then
+		"Unauthorized"
+	elif code == 404 then
+		"Not Found"
+	elif code == 405 then
+		"Method Not Allowed"
+	elif code == 413 then
+		"Payload Too Large"
+	elif code == 414 then
+		"URI Too Long"
+	elif code == 422 then
+		"Unprocessable Entity"
+	elif code == 431 then
+		"Request Header Fields Too Large"
+	elif code == 500 then
+		"Internal Server Error"
+	elif code == 504 then
+		"Gateway Timeout"
+	else
+		"OK"
+	end
 end
 
 let _trimCR = fun(s: Str) -> Str do
 	let n = len(s)
 	if n > 0 and substr(s, n - 1, n) == "\r" then
-		return substr(s, 0, n - 1)
+		substr(s, 0, n - 1)
+	else
+		s
 	end
-	s
 end
 
 let _validHeaderValue = fun(v: Str) -> Bool do
 	match("\r|\n", v) == []
 end
 
-let _readLineLimited = fun(c, remaining: Int?) -> Str? do
+let _readLineLimited = fun(c: Any, remaining: Int?) -> Str? do
 	let line = readLine(c)
 	if line == null then
-		return
+		return null
 	end
 	let s = _trimCR(line)
 	if remaining != null then
 		let left = int(remaining) - len(s) - 2
 		if left < 0 then
-			return
+			return null
 		end
 	end
 	s
 end
 
-let _readHeaders = fun(c, maxBytes: Int, maxCount: Int?) -> {}? do
+let _readHeaders = fun(c: Any, maxBytes: Int, maxCount: Int?) -> {}? do
 	let headers = {}
 	let budget = maxBytes
 	let count = 0
 	while true do
 		let line = _readLineLimited(c, budget)
 		if line == null then
-			return
+			return null
 		end
 		if len(line) == 0 then
 			break
@@ -69,7 +86,7 @@ let _readHeaders = fun(c, maxBytes: Int, maxCount: Int?) -> {}? do
 		end
 		let parts = split(line, ":")
 		if len(parts) < 2 then
-			return
+			return null
 		end
 		let key = parts[0]
 		let value = strip(join(slice(parts, 1, len(parts)), ":"))
@@ -82,7 +99,7 @@ let _readHeaders = fun(c, maxBytes: Int, maxCount: Int?) -> {}? do
 	headers
 end
 
-let _parseTarget = fun(t: Str) -> {} do
+let _parseTarget = fun(t: Str) -> {path!: Str, query: Str?, absolute: Bool?} do
 	if match("^[a-zA-Z][a-zA-Z0-9+.-]*://", t) != [] then
 		return {absolute: true, path: "/", query: null}
 	end
@@ -96,29 +113,29 @@ let _parseTarget = fun(t: Str) -> {} do
 	{path: path, query: query}
 end
 
-let _readBodyContentLength = fun(c, n: Int, cap: Int) -> Str? do
+let _readBodyContentLength = fun(c: Any, n: Int, cap: Int) -> Str? do
 	let want = if n > cap then cap else n end
 	let buf = ""
 	let remaining = want
 	while remaining > 0 do
 		let chunk = readN(c, remaining)
 		if chunk == null then
-			return
+			return null
 		end
 		buf = buf + chunk
 		remaining = remaining - len(chunk)
 		if len(chunk) == 0 then
-			return
+			return null
 		end
 	end
 	buf
 end
 
 # Headers-only parse; body is read later (after 100-continue if any)
-let _readRequest = fun(conn, opts: {}) -> {}? do
+let _readRequest = fun(conn: Any, opts: {}) -> {}? do
 	let line = readLine(conn)
 	if line == null then
-		return
+		return null
 	end
 	let reqLine = _trimCR(line)
 	if len(reqLine) > 0 and mapHas(opts, "maxStartLineBytes") and opts.maxStartLineBytes != null and len(reqLine) > int(opts.maxStartLineBytes) then
@@ -126,20 +143,20 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	end
 	let parts = split(reqLine, " ")
 	if len(parts) != 3 then
-		return
+		return null
 	end
 	let method = toUpper(parts[0])
 	let target = parts[1]
 	let proto = parts[2]
 	if proto != "HTTP/1.1" then
-		return
+		return null
 	end
 
 	let maxHdr = int(opts.maxHeaderBytes)
 	let maxCnt = if mapHas(opts, "maxHeaders") then opts.maxHeaders else null end
 	let hdrs = _readHeaders(conn, maxHdr, maxCnt)
 	if hdrs == null then
-		return
+		return null
 	end
 	if mapHas(hdrs, "__too_many__") then
 		return {tooManyHeaders: true}
@@ -167,7 +184,7 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	if mapHas(hdrs, "Content-Length") then
 		let n = int(hdrs["Content-Length"])
 		if n == null or n < 0 then
-			return
+			return null
 		end
 		wantCL = n
 	end
@@ -179,7 +196,7 @@ let _readRequest = fun(conn, opts: {}) -> {}? do
 	}
 end
 
-let _writeResponse = fun(conn, res: {status!: Int, headers!: {}, body!: Str}, opts: {}) -> Bool do
+let _writeResponse = fun(conn: Any, res: {status!: Int, headers!: {}, body!: Str}, opts: {}) -> Bool do
 	let status = int(res.status)
 	let headers = clone(res.headers)
 	let body = if res.body == null then "" else res.body end
@@ -216,7 +233,7 @@ let _writeResponse = fun(conn, res: {status!: Int, headers!: {}, body!: Str}, op
 	true
 end
 
-let _removeConn = fun(arr: [Any], c) -> [Any] do
+let _removeConn = fun(arr: [Any], c: Any) -> [Any] do
 	let out = []
 	let i = 0
 	while i < len(arr) do
@@ -229,7 +246,7 @@ let _removeConn = fun(arr: [Any], c) -> [Any] do
 	out
 end
 
-let _connLoop = fun(conn, rtr, server) -> Null do
+let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 	while true do
 		let rr = _readRequest(conn, server.opts)
 		if rr == null then
@@ -316,30 +333,12 @@ let _connLoop = fun(conn, rtr, server) -> Null do
 end
 
 # Start an HTTP/1.1 server with a router.
-#
-# Summary:
-#   Accepts TCP connections from 'listener', parses requests with limits, and dispatches
-#   to the router. Supports Expect: 100-continue preflight and keep-alive.
-# Args:
-#   listener: Any — TCP listener handle (from netListen).
-#   r: {} — Router instance built by router().
-#   opts: {} — {
-#     readHeaderTimeoutMs?: Int,
-#     writeTimeoutMs?: Int,
-#     idleTimeoutMs?: Int,
-#     maxHeaderBytes?: Int = 8192,
-#     maxHeaders?: Int?,
-#     maxBodyBytes?: Int = 1048576,
-#     maxStartLineBytes?: Int?,
-#     addDateHeader?: Bool?
-#   }
-# Return: {}? — Server handle or null # <serve: ...> on configuration errors.
-let serve = fun(listener, r, opts: {}) -> {}? do
+let serve = fun(listener: Any, r: {}, opts: {}) -> _ServerHandle? do
 	if listener == null then
-		return null # <serve: missing listener>
+		return null
 	end
 	if not mapHas(r, "_entryCall") then
-		return null # <serve: not a router>
+		return null
 	end
 
 	if not mapHas(opts, "readHeaderTimeoutMs") or opts.readHeaderTimeoutMs == null then opts.readHeaderTimeoutMs = 0 end
@@ -368,12 +367,7 @@ let serve = fun(listener, r, opts: {}) -> {}? do
 end
 
 # Gracefully shut down a server, closing the listener and active connections.
-#
-# Args:
-#   server: {}? — Handle returned by serve(); null is a no-op.
-#   timeoutMs: Int? — Currently unused; reserved for future graceful drains.
-# Return: Bool — true after resources are closed/cleared.
-let shutdown = fun(server, timeoutMs: Int?) -> Bool do
+let shutdown = fun(server: _ServerHandle?, timeoutMs: Int?) -> Bool do
 	if server == null then
 		return true
 	end
@@ -389,7 +383,4 @@ let shutdown = fun(server, timeoutMs: Int?) -> Bool do
 	true
 end
 
-{
-	serve: serve,
-	shutdown: shutdown
-}
+

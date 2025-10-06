@@ -1,53 +1,49 @@
-# openapi — build OpenAPI 3.1 from generic RouteSpec[]
+# openapi — build OpenAPI 3.1 from RouteSpec[]
 
 # -------------------------------------------------
-# Types
+# Types (strict but open)
 # -------------------------------------------------
 
 let RouteContract = type {
-	path: Type,
-	query: Type,
-	headers: Type,
-	cookies: Type,
-	body: Any,
-	responses: {}
+	path: Type?,
+	query: Type?,
+	headers: Type?,
+	cookies: Type?,
+	body: Any?,           # router accepts Type or object; we normalize here
+	responses: {}?        # code -> Any (Type or object)
 }
 
 let RouteSpec = type {
 	method!: Str,
 	pattern!: Str,
-	style!: Str,
-	contract: RouteContract,
-	summary: Str,
-	description: Str,
-	tags: [Str],
-	deprecated: Bool,
-	operationId: Str,
+	style!: Str,          # "value" | "stream"
+	contract: RouteContract?,
+	summary: Str?,
+	description: Str?,
+	tags: [Str]?,
+	deprecated: Bool?,
+	operationId: Str?,
 	security: [ {} ]?,
 	x: {}?
+}
+
+let Info = type {
+	title!: Str,
+	version!: Str,
+	description: Str?
 }
 
 let SpecOpts = type {
-	validationErrorSchema: Type,
-	securitySchemes: {},
+	validationErrorSchema: Type?,
+	securitySchemes: {}?,
 	security: [ {} ]?,
 	x: {}?
 }
 
 # -------------------------------------------------
-# Helpers
+# Helpers (small and focused)
 # -------------------------------------------------
 
-# Parse path segments, skipping empty and "."
-#
-# Returns an array of non-empty path segments. Ensures the path starts
-# with a slash and excludes "." entries.
-#
-# Args:
-# 	p: Str — raw path string (may be relative or absolute).
-#
-# Return:
-# 	[Str] — list of path segments.
 let _segs = fun(p: Str) -> [Str] do
 	let s = if len(p) == 0 or substr(p, 0, 1) != "/" then "/" + p else p end
 	let xs = split(s, "/")
@@ -63,16 +59,6 @@ let _segs = fun(p: Str) -> [Str] do
 	out
 end
 
-# Normalize path: convert {*name} to {name}
-#
-# Ensures consistent catch-all representation by stripping the leading
-# asterisk inside path parameter braces.
-#
-# Args:
-# 	p: Str — path template.
-#
-# Return:
-# 	Str — normalized path template.
 let _norm = fun(p: Str) -> Str do
 	let xs = _segs(p)
 	let out = []
@@ -89,16 +75,6 @@ let _norm = fun(p: Str) -> Str do
 	"/" + join(out, "/")
 end
 
-# Extract parameter names from path template
-#
-# Scans a path template and returns the list of parameter names,
-# converting catch-all parameters like `{*tail}` to `tail`.
-#
-# Args:
-# 	p: Str — path template.
-#
-# Return:
-# 	[Str] — parameter names in appearance order.
 let _paramNames = fun(p: Str) -> [Str] do
 	let xs = _segs(p)
 	let out = []
@@ -114,16 +90,6 @@ let _paramNames = fun(p: Str) -> [Str] do
 	out
 end
 
-# Extract map fields from Type via reflection
-#
-# Reflects a structural map Type and returns its fields with their
-# names, requiredness, and field Types. Returns null if T is not a map.
-#
-# Args:
-# 	T: Type — a structural map Type.
-#
-# Return:
-# 	[{name!: Str, req!: Bool, T!: Type}]? — field metadata array or null.
 let _mapFields = fun(T: Type) -> [ {name!: Str, req!: Bool, T!: Type} ]? do
 	let rt = reflect(T)
 	if rt == null or rt[1][0] != "map" then
@@ -140,19 +106,6 @@ let _mapFields = fun(T: Type) -> [ {name!: Str, req!: Bool, T!: Type} ]? do
 	out
 end
 
-# Register Type in components and return $ref
-#
-# Deduplicates component schemas by a stable uid derived from reflection.
-# Registers (or reuses) a name in `components.schemas` and returns a
-# $ref object that points to the registered schema.
-#
-# Args:
-# 	reg: {} — registry map: uid -> component name.
-# 	comps: {} — components.schemas map to populate.
-# 	T: Type — Type to register.
-#
-# Return:
-# 	{} — a JSON Reference object: { "$ref": "#/components/schemas/Name" }.
 let _ref = fun(reg: {}, comps: {}, T: Type) -> {} do
 	let k = str(uid(reflect(T)))
 	if mapHas(reg, k) then
@@ -165,22 +118,9 @@ let _ref = fun(reg: {}, comps: {}, T: Type) -> {} do
 	{"$ref": "#/components/schemas/" + name}
 end
 
-# Sort parameters: path < query < header < cookie, then by name
-#
-# Produces a stable, deterministic ordering for parameter objects.
-#
-# Args:
-# 	ps: [ {} ] — unsorted parameter list.
-#
-# Return:
-# 	[ {} ] — sorted copy of the parameter list.
 let _sortParams = fun(ps: [ {} ]) -> [ {} ] do
 	let rank = fun(where: Str) -> Int do
-		if where == "path" then return 0 end
-		if where == "query" then return 1 end
-		if where == "header" then return 2 end
-		if where == "cookie" then return 3 end
-		9
+		if where == "path" then 0 elif where == "query" then 1 elif where == "header" then 2 elif where == "cookie" then 3 else 9 end
 	end
 	sort(clone(ps), fun(a: Any) -> Any -> Int do
 		fun(b: Any) -> Int do
@@ -195,16 +135,6 @@ let _sortParams = fun(ps: [ {} ]) -> [ {} ] do
 	end)
 end
 
-# Sort object keys lexicographically
-#
-# Returns a new object with keys inserted in ascending lexical order.
-# This yields deterministic key order for emission/inspection.
-#
-# Args:
-# 	m: {} — input map.
-#
-# Return:
-# 	{} — new map with keys in sorted order.
 let _sortKeys = fun(m: {}) -> {} do
 	let ks = sort(list(keys(m)), fun(a: Any) -> Any -> Int do
 		fun(b: Any) -> Int do
@@ -212,30 +142,15 @@ let _sortKeys = fun(m: {}) -> {} do
 		end
 	end)
 	let out = {}
-	let k = 0
-	while k < len(ks) do
-		let key = ks[k]
-		out[key] = m[key]
-		k = k + 1
+	let i = 0
+	while i < len(ks) do
+		let k = ks[i]
+		out[k] = m[k]
+		i = i + 1
 	end
 	out
 end
 
-# Add parameters from map Type to parameter list
-#
-# Expands a structural map Type into OpenAPI Parameter Objects at the
-# given location (path/query/header/cookie). Applies style/explode hints
-# for arrays of scalars and map-like query objects.
-#
-# Args:
-# 	ps: [ {} ] — accumulated parameter list.
-# 	where: Str — location: "path" | "query" | "header" | "cookie".
-# 	T: Type — structural map Type to project.
-# 	reg: {} — schema registry.
-# 	comps: {} — components.schemas destination.
-#
-# Return:
-# 	[ {} ] — extended parameter list.
 let _addParams = fun(ps: [ {} ], where: Str, T: Type, reg: {}, comps: {}) -> [ {} ] do
 	let fs = _mapFields(T)
 	if fs == null then
@@ -254,23 +169,19 @@ let _addParams = fun(ps: [ {} ], where: Str, T: Type, reg: {}, comps: {}) -> [ {
 		if where == "cookie" then
 			p.style = "form"
 			p.explode = true
-		end
-		if where == "query" then
-			p.explode = null
+		elif where == "query" then
 			let rt = reflect(f.T)
 			if rt != null and rt[1][0] == "array" then
-				let elemRt = rt[1][1]
-				let elem = reify(["type", elemRt])
-				let elemRefl = reflect(elem)
-				if elemRefl != null and elemRefl[1][0] == "id" then
-					let n = elemRefl[1][1]
+				let U = reify(["type", rt[1][1]])
+				let ur = reflect(U)
+				if ur != null and ur[1][0] == "id" then
+					let n = ur[1][1]
 					if n == "Str" or n == "Int" or n == "Num" or n == "Bool" then
 						p.style = "form"
 						p.explode = true
 					end
 				end
-			end
-			if rt != null and rt[1][0] == "map" then
+			elif rt != null and rt[1][0] == "map" then
 				p.style = "deepObject"
 				p.explode = true
 			end
@@ -281,17 +192,6 @@ let _addParams = fun(ps: [ {} ], where: Str, T: Type, reg: {}, comps: {}) -> [ {
 	out
 end
 
-# Synthesize path params from template when contract.path is absent
-#
-# Generates required path parameters using the path template itself,
-# defaulting each schema to string.
-#
-# Args:
-# 	ps: [ {} ] — accumulated parameter list.
-# 	pat: Str — normalized path template.
-#
-# Return:
-# 	[ {} ] — extended parameter list with synthesized path params.
 let _synthPath = fun(ps: [ {} ], pat: Str) -> [ {} ] do
 	let ns = _paramNames(pat)
 	let out = ps
@@ -303,19 +203,7 @@ let _synthPath = fun(ps: [ {} ], pat: Str) -> [ {} ] do
 	out
 end
 
-# Build requestBody from contract.body
-#
-# Accepts either a Type (treated as required application/json) or a
-# structured descriptor supporting `required`, `contentType`, `schema`,
-# single `example` or map `examples`, or a direct `content` map.
-#
-# Args:
-# 	def: Any — body definition (Type or object form).
-# 	reg: {} — schema registry.
-# 	comps: {} — components.schemas destination.
-#
-# Return:
-# 	{} — OpenAPI Request Body Object.
+# Request body builder
 let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
 	if isType(def, type Type) then
 		return {required: true, content: {"application/json": {schema: _ref(reg, comps, def)}}}
@@ -329,38 +217,22 @@ let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
 		end
 		return {required: req, content: m}
 	end
-	let sc = if mapHas(def, "schema") and def.schema != null then
-		_ref(reg, comps, def.schema)
-	else
-		if ct == "application/octet-stream" then {type: "string", format: "binary"} else {} end
-	end
+	let sc =
+		if mapHas(def, "schema") and def.schema != null then _ref(reg, comps, def.schema)
+		elif ct == "application/octet-stream" then {type: "string", format: "binary"}
+		else {} end
 	let entry = {schema: sc}
 	if mapHas(def, "examples") and def.examples != null then
 		entry.examples = def.examples
-	else
-		if mapHas(def, "example") and def.example != null then
-			entry.example = def.example
-		end
+	elif mapHas(def, "example") and def.example != null then
+		entry.example = def.example
 	end
 	let m2 = {}
 	m2[ct] = entry
 	{required: req, content: m2}
 end
 
-# Build response object
-#
-# Supports Type shorthand, object forms with `description`, `headers`,
-# single `example` / map `examples` paired with `contentType`, or a
-# full `content` map. Special-cases 204 to force `content: null`.
-#
-# Args:
-# 	code: Str — HTTP status code string.
-# 	v: Any — response descriptor or Type.
-# 	reg: {} — schema registry.
-# 	comps: {} — components.schemas destination.
-#
-# Return:
-# 	{} — OpenAPI Response Object.
+# Response builder
 let _resp = fun(code: Str, v: Any, reg: {}, comps: {}) -> {} do
 	if code == "204" then
 		return {description: "No Content", content: null}
@@ -393,10 +265,8 @@ let _resp = fun(code: Str, v: Any, reg: {}, comps: {}) -> {} do
 		let entry = {schema: sc}
 		if mapHas(v, "examples") and v.examples != null then
 			entry.examples = v.examples
-		else
-			if mapHas(v, "example") and v.example != null then
-				entry.example = v.example
-			end
+		elif mapHas(v, "example") and v.example != null then
+			entry.example = v.example
 		end
 		let ct2 = {}
 		ct2[v.contentType] = entry
@@ -405,16 +275,6 @@ let _resp = fun(code: Str, v: Any, reg: {}, comps: {}) -> {} do
 	out
 end
 
-# Default responses based on route style
-#
-# Provides fallback response shapes when a route specifies no explicit
-# responses: JSON for value routes, text for stream routes.
-#
-# Args:
-# 	style: Str — route style ("value" or "stream").
-#
-# Return:
-# 	{} — map of status code to Response Object.
 let _defRes = fun(style: Str) -> {} do
 	if style == "stream" then
 		return {"200": {description: "OK", content: {"text/plain": {schema: {type: "string"}}}}}
@@ -422,17 +282,6 @@ let _defRes = fun(style: Str) -> {} do
 	{"200": {description: "OK", content: {"application/json": {schema: {}}}}}
 end
 
-# Generate operationId from method and path
-#
-# Synthesizes a stable operationId in the form `method_segment_segment`,
-# converting invalid characters to underscores.
-#
-# Args:
-# 	m: Str — HTTP method.
-# 	p: Str — path template.
-#
-# Return:
-# 	Str — synthesized operationId.
 let _opId = fun(m: Str, p: Str) -> Str do
 	let s = toLower(m) + "_" + join(_segs(p), "_")
 	let out = ""
@@ -450,25 +299,7 @@ end
 # Public: build OpenAPI doc from RouteSpec[]
 # -------------------------------------------------
 
-# Build an OpenAPI 3.1 document from RouteSpec definitions.
-#
-# Constructs a deterministic OpenAPI 3.1.0 document from a list of
-# RouteSpec entries. It normalizes paths, derives parameters from
-# structural Types (including synthesis from path templates), builds
-# request bodies and responses (with sensible defaults), deduplicates
-# component schemas, mirrors HEAD for value GETs, emits OPTIONS, and
-# applies route/root security and vendor extensions.
-#
-# Args:
-# 	routes: [RouteSpec] — list of route specifications.
-# 	info: {} — OpenAPI `info` object (title, version, etc.).
-# 	servers: [Str]? — optional server URLs (omitted -> empty list).
-# 	opts: SpecOpts? — optional spec options (validation error schema,
-# 		security schemes/requirements, vendor extensions).
-#
-# Return:
-# 	{} — OpenAPI 3.1 document object.
-let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) -> {} do
+let spec = fun(routes: [RouteSpec], info: Info, servers: [Str]?, opts: SpecOpts?) -> {} do
 	let paths = {}
 	let comps = {}
 	let reg = {}
@@ -481,6 +312,7 @@ let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) 
 			paths[pat] = {}
 		end
 		let c = if mapHas(r, "contract") and r.contract != null then r.contract else {} end
+
 		let ps = []
 		let hasC = false
 		if mapHas(c, "path") and c.path != null then
@@ -503,11 +335,13 @@ let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) 
 			ps = _synthPath(ps, pat)
 		end
 		ps = _sortParams(ps)
+
 		let rb = null
 		if mapHas(c, "body") and c.body != null then
 			rb = _reqBody(c.body, reg, comps)
 			hasC = true
 		end
+
 		let rs = if mapHas(c, "responses") and c.responses != null then {} else _defRes(r.style) end
 		if mapHas(c, "responses") and c.responses != null then
 			for [k, v] in c.responses do
@@ -515,32 +349,19 @@ let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) 
 			end
 		end
 		if hasC and not mapHas(rs, "422") then
-			let sch = if mapHas(o, "validationErrorSchema") and o.validationErrorSchema != null then
-				_ref(reg, comps, o.validationErrorSchema)
-			else
-				{type: "object"}
-			end
+			let sch =
+				if mapHas(o, "validationErrorSchema") and o.validationErrorSchema != null then _ref(reg, comps, o.validationErrorSchema)
+				else {type: "object"} end
 			rs["422"] = {description: "Validation Error", content: {"application/json": {schema: sch}}}
 		end
-		let op = {parameters: ps, responses: rs, operationId: _opId(r.method, pat), security: null}
-		if mapHas(r, "security") and r.security != null then
-			op.security = r.security
-		end
-		if mapHas(r, "summary") and r.summary != null then
-			op.summary = r.summary
-		end
-		if mapHas(r, "description") and r.description != null then
-			op.description = r.description
-		end
-		if mapHas(r, "tags") and r.tags != null then
-			op.tags = r.tags
-		end
-		if mapHas(r, "deprecated") and r.deprecated != null then
-			op.deprecated = bool(r.deprecated)
-		end
-		if mapHas(r, "operationId") and r.operationId != null then
-			op.operationId = r.operationId
-		end
+
+		let op = {parameters: ps, responses: rs, operationId: _opId(r.method, pat)}
+		if mapHas(r, "security") and r.security != null then op.security = r.security end
+		if mapHas(r, "summary") and r.summary != null then op.summary = r.summary end
+		if mapHas(r, "description") and r.description != null then op.description = r.description end
+		if mapHas(r, "tags") and r.tags != null then op.tags = r.tags end
+		if mapHas(r, "deprecated") and r.deprecated != null then op.deprecated = bool(r.deprecated) end
+		if mapHas(r, "operationId") and r.operationId != null then op.operationId = r.operationId end
 		if mapHas(r, "x") and r.x != null then
 			for [kx, vx] in r.x do
 				op[kx] = vx
@@ -549,6 +370,7 @@ let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) 
 		if rb != null then
 			op.requestBody = rb
 		end
+
 		let m = toLower(r.method)
 		paths[pat][m] = op
 		if r.style == "value" and m == "get" then
@@ -559,6 +381,7 @@ let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) 
 		end
 		i = i + 1
 	end
+
 	let sv = []
 	if servers != null then
 		let j = 0
@@ -567,10 +390,12 @@ let spec = fun(routes: [RouteSpec], info: {}, servers: [Str]?, opts: SpecOpts?) 
 			j = j + 1
 		end
 	end
+
 	let compsOut = {schemas: comps}
 	if mapHas(o, "securitySchemes") and o.securitySchemes != null then
 		compsOut.securitySchemes = o.securitySchemes
 	end
+
 	let doc = {
 		openapi: "3.1.0",
 		jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema",

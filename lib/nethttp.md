@@ -1,437 +1,395 @@
-# nethttp.ms — A Practical Guide
+# **nethttp** for building HTTP services
 
-This tutorial walks you through building HTTP services with **nethttp.ms** — a streaming‑first web toolkit for MindScript. You’ll learn how to define routes, validate inputs with contracts, stream responses, plug in middleware, spin up the TCP server, and test everything in‑memory.
+Build fast, streaming-friendly HTTP services in MindScript with a tiny, predictable API.
 
-> TL;DR: `router()` gives you value routes (`route`) and streaming routes (`routeStream`). Attach **contracts** to bind/validate `path`, `query`, and `body` before your handler runs (422 on failure). Use helpers like `json(...)`, `text(...)`, `redirect(...)`, or `raise(...)`. Add middleware (`mwRecover`, `mwRequestID`, `mwTimeout`, `mwCors`, `mwAccessLog`). Start a server with `serve(...)`, and shut it down with `shutdown(...)`.
+You’ll start from “hello world,” then add validation, streaming, middleware, OpenAPI docs, a TCP server, and tests. Along the way you’ll learn how routing works, what contracts do, how the server behaves under edge cases, and how to structure an app you can ship.
 
 ---
 
-## 1) Quick Start
+## 0. What is `nethttp`?
+
+`nethttp` is three pieces that fit together:
+
+1. A **router** that matches paths, binds & validates inputs (“contracts”), and can run either buffered value handlers or streaming handlers.
+
+2. **Middleware** designed for streaming—so you can still time out, recover, inject request IDs, add CORS headers, and log, even when a route is writing gradually.
+
+3. A minimal **HTTP/1.1 server** that wires sockets to the router. It favors clarity and safety: no request chunked uploads, strict header limits, and clear error codes.
+
+There’s also an **OpenAPI exporter** automatically exposed at `/openapi.json`, so your routes can be introspected by tools.
+
+Import everything from one façade:
+
+```mindscript
+let http = import("nethttp")
+```
+
+Public surface (you’ll use these all manual long):
+`router(opts?)`, `contract(obj)`, `testClient(router)`
+`json(status, v)`, `text(status, s)`, `noContent(null)`, `redirect(status, "/path")`, `raise(status, msg)`
+`mwRecover()`, `mwRequestID(name)`, `mwTimeout(ms)`, `mwCors(opts)`, `mwAccessLog()`
+`serve(listener, router, opts)`, `shutdown(server, timeoutMs?)`
+
+---
+
+## 1. Your First Route
+
+Let’s return a greeting and see the router’s basics.
 
 ```mindscript
 let http = import("nethttp")
 
-let r = http.router()
+let r = http.router()  # also serves GET /openapi.json by default
 
-# Value route: buffers output and returns a response or JSON from a value
 r.route("GET", "/hello/{name}", http.contract({
-	path: type { name: Str }
+  path: type { name: Str }   # declare we expect a string path segment
 }), fun(req, ctx) do
-	http.text(200, "hi " + ctx.path.name)
+  http.text(200, "hi " + ctx.path.name)
 end)
+```
 
-# Run a tiny server
+**How it works**
+
+* `route` registers a **value** handler (buffered). You return either:
+
+  * a response built with `http.text/json/noContent/redirect`, or
+  * *any* JSON-encodable value (which becomes `200` + JSON).
+* The **contract** runs *before* your code. Here it binds the `{name}` segment into `ctx.path.name`. If it can’t coerce the type, the router answers **422** automatically.
+
+Try it live:
+
+```mindscript
 let addr = "127.0.0.1:8080"
 let l = netListen(addr)
 let srv = http.serve(l, r, { addDateHeader: true })
 
-# ... later
+# ... visit http://127.0.0.1:8080/hello/Ada
+
 let _ = http.shutdown(srv, 0)
 ```
 
-Open `http://127.0.0.1:8080/hello/Ada` → `hi Ada`.
+> Tip: The router mounts **`GET /openapi.json`** automatically—use it to see what it inferred from your contracts. We’ll customize it later.
 
 ---
 
-## 2) Core Concepts
+## 2. Contracts: Binding and Validation, Explained
 
-### 2.1 Router
-
-`router()` returns an object that lets you register routes, mount child routers, and install middleware:
-
-* `route(method, pattern, contract, handler)` → **value** (buffered) routes
-* `routeStream(method, pattern, contract, handler)` → **streaming** routes
-* `mount(prefix, childRouter)` → mount a sub‑router under a path
-* `use(mw)` → add middleware (outer‑to‑inner)
-
-### 2.2 Contracts (Input Schemas)
-
-A **contract** declares the shape of the inputs to bind **before** your handler runs:
+A **contract** is a plain object that tells the router how to bind & validate **path**, **query**, **body**, and (optionally) what your **responses** should look like.
 
 ```mindscript
 http.contract({
-	path:  type { id!: Int },
-	query: type { q: Str, page: Int },
-	body:  type { name!: Str, age: Int },
-	responses: { "200": type { ok!: Bool } } # optional response validation
+  path:  type { id!: Int },                         # /items/{id}
+  query: type { filter: Str, page: Int },           # ?filter=...&page=...
+  body:  type { name!: Str, price: Num },           # JSON request body
+  responses: { "200": type { ok!: Bool } }          # optional response schema check
 })
 ```
 
-* If binding or validation fails, the router returns **422** with a JSON error body.
-* Bound values appear in `ctx.path`, `ctx.query`, and `ctx.body`.
+* If path/query/body binding fails, the router answers **422** with a compact JSON error.
+* If you declare `responses` for a status and your handler returns the wrong shape, the router answers **500** (it’s a server bug, not a client error).
+* Bound values live in `ctx.path`, `ctx.query`, `ctx.body`. The raw request object is `req` (includes `method`, `url`, `headers`, `body`, `pathParams`).
 
-### 2.3 Value vs Streaming Routes
-
-* **Value routes** compute a result and the framework **buffers** it into an HTTP response.
-* **Streaming routes** receive a `Responder` and **must** write and end explicitly.
-
-**Responder API** (streaming):
-
-```
-status(code:Int) -> Responder
-setHeader(k:Str, v:Str) -> Responder
-write(chunk:Str) -> Int?
-flush(null) -> Bool?
-end(null) -> Bool?
-```
-
-Headers are sent lazily on the first `status/setHeader/write`. If `Content-Length` is unknown, `Transfer-Encoding: chunked` is used automatically.
+**Query arrays** are convenient: `?tag=a&tag=b` or `?tag=["a","b"]` both bind to `type { tag: [Str] }`. Scalars coerce from string or JSON scalar where sensible (`Int`, `Num`, `Bool`, `Str`).
 
 ---
 
-## 3) Defining Routes
+## 3. Value vs Streaming: Pick the Right Tool
 
-### 3.1 Path Parameters & Catch‑All
+### Value route (buffered)
 
-```mindscript
-r.route("GET", "/users/{id}", http.contract({ path: type { id: Int } }), fun(req, ctx) do
-	http.json(200, { ok: true, id: ctx.path.id })
-end)
-
-r.routeStream("GET", "/files/{*tail}", http.contract({}), fun(req, res, ctx) -> Null do
-	res.status(200).setHeader("Content-Type", "text/plain")
-	let _ = res.write("tail= " + ctx.req.pathParams.tail)
-	res.end(null)
-	null
-end)
-```
-
-Notes:
-
-* Matching uses a normalized path (`/a//b`, `/a/./b` match `/a/b`).
-* **Percent‑encoding is not auto‑decoded** for path params; you receive raw segments.
-
-### 3.2 Query Binding (including arrays)
-
-```mindscript
-r.route("GET", "/search", http.contract({
-	query: type { q: Str, tag: [Str], limit: Int }
-}), fun(req, ctx) do
-	http.json(200, { q: ctx.query.q, tags: ctx.query.tag, limit: ctx.query.limit })
-end)
-```
-
-Accepts both repeated params (`?tag=a&tag=b`) and a JSON array in a single param (`?tag=["a","b"]`). Scalars coerce from strings or JSON scalars when possible.
-
-### 3.3 JSON Body Binding
+Use this when you’re returning a JSON document or short text:
 
 ```mindscript
 r.route("POST", "/echo", http.contract({ body: type { msg: Str } }), fun(req, ctx) do
-	http.json(200, { ok: true, msg: ctx.body.msg })
+  http.json(200, { ok: true, msg: ctx.body.msg })
 end)
 ```
 
-Invalid JSON or schema mismatches yield **422** automatically.
+If your handler returns *any* JSON-encodable value, the router will serialize it as `application/json; charset=utf-8`.
 
-### 3.4 Response Validation (optional)
+**HEAD support:** all value `GET` routes get `HEAD` automatically (same headers, empty body). You don’t need to register a separate route.
 
-```mindscript
-r.route("GET", "/health", http.contract({
-	responses: { "200": type { ok!: Bool } }
-}), fun(req, ctx) do
-	http.json(200, { ok: true }) # if wrong shape -> 500
-end)
-```
+### Streaming route
 
----
-
-## 4) Producing Responses (Value Routes)
-
-Choose one of the following:
-
-* Return a **buffered response** directly:
-
-  ```mindscript
-  http.text(200, "ok")
-  http.json(200, { ok: true })
-  http.noContent(null)            # 204
-  http.redirect(302, "/new")    # path‑only, external URLs rejected
-  ```
-* Return **any JSON‑encodable value** → auto `200` with `application/json`.
-* Return a **structured error** (no panic):
-
-  ```mindscript
-  http.raise(401, "unauthorized")
-  http.raiseWithHeaders(429, "slow down", { "Retry-After": "5" })
-  ```
-
-If your handler returns `null` or JSON encoding fails, nethttp sends **500**.
-
-> **HEAD**: value routes automatically support `HEAD` (same headers, empty body). Streaming routes return **405** for `HEAD` unless you register a specific `HEAD` route.
-
----
-
-## 5) Streaming Responses
+Use streaming when you want to start sending data early, keep latency low, or produce large/long-lived responses.
 
 ```mindscript
 r.routeStream("GET", "/ticks", http.contract({}), fun(req, res, ctx) -> Null do
-	res.status(200).setHeader("Content-Type", "text/plain")
-	let _ = res.write("tick 0\n")
-	sleep(10)
-	let _ = res.write("tick 1\n")
-	sleep(10)
-	let _ = res.write("tick 2\n")
-	res.end(null)
-	null
+  res.status(200).setHeader("Content-Type", "text/plain")
+  let _ = res.write("tick 0\n")
+  sleep(10)
+  let _ = res.write("tick 1\n")
+  sleep(10)
+  let _ = res.write("tick 2\n")
+  res.end(null)
+  null
 end)
 ```
 
-* If you don’t set `Content-Length`, the server uses **chunked** encoding and appends the proper terminator.
-* Backpressure is honored because writes go directly to the socket.
+`res.write` pushes bytes to the socket. If you didn’t set a `Content-Length`, the server switches to **chunked** encoding automatically and appends the proper terminator.
+
+**HEAD on streaming:** not auto-supported. If a client sends `HEAD /ticks`, they’ll get **405** with `Allow: GET` unless you add an explicit HEAD route.
 
 ---
 
-## 6) Middleware
+## 4. Middleware: Cross-cutting, Streaming-Safe
 
-Install middleware with `router.use(mw)`; they wrap handlers **outer‑to‑inner**.
+Middleware wraps handlers (outermost → innermost). All built-ins are streaming-aware.
 
-* **Recover**: convert panics to 500
+```mindscript
+r.use(http.mwRecover())                # panics → 500
+r.use(http.mwRequestID("X-Request-ID"))# propagate/inject request id header
+r.use(http.mwTimeout(250))             # 504 if no bytes written by 250ms
+r.use(http.mwCors({ origin: "*", credentials: true }))  # CORS headers + OPTIONS
+r.use(http.mwAccessLog())              # status/bytes/duration after response
+```
 
-  ```mindscript
-  r.use(http.mwRecover())
-  ```
-* **Request ID**: propagate or inject an ID
+**Timeout semantics:** if *nothing* is written before the deadline (not even headers), the middleware emits **504**. Any write “marks progress” and disables the auto-timeout.
 
-  ```mindscript
-  r.use(http.mwRequestID("X-Request-ID"))
-  ```
-* **Timeout**: if no bytes are written by the deadline → 504
+**CORS DETAILS**
 
-  ```mindscript
-  r.use(http.mwTimeout(250)) # ms from request start
-  ```
-* **CORS**: adds ACA* headers; handles `OPTIONS`
-
-  ```mindscript
-  r.use(http.mwCors({ origin: "*", credentials: true }))
-  ```
-* **Access Log**: prints one line per request
-
-  ```mindscript
-  r.use(http.mwAccessLog())
-  ```
-
-**Note:** For `OPTIONS` requests, the router will:
-
-* Return **204** for known path shapes (or when any middleware is installed, to support generic preflight).
-* Return **404** for unknown paths (when no middleware suggests otherwise).
+* With `credentials:true`, the middleware reflects the request `Origin` and sets `Vary: Origin`.
+* `OPTIONS` handling: for known path *shapes* the router returns **204**. If **any** middleware is installed, unknown shapes also get **204** (useful for generic preflights). With no middleware, unknown shapes return **404**.
 
 ---
 
-## 7) Mounting Routers
+## 5. Mounting: Compose Routers
 
-Compose APIs by mounting:
+Build modular APIs by mounting sub-routers:
 
 ```mindscript
 let root = http.router()
 let v1 = http.router()
 
 v1.route("GET", "/ping", http.contract({}), fun(req, ctx) do
-	http.text(200, "pong")
+  http.text(200, "pong")
 end)
 
-root.mount("/v1", v1)
+root.mount("/v1", v1)   # GET /v1/ping
 ```
 
-`GET /v1/ping` now resolves to the child router.
+The child router sees paths without the parent prefix; the outer middleware stack still applies.
 
 ---
 
-## 8) Server Lifecycle
+## 6. Server: What the Wire Looks Like
 
-### 8.1 Starting
+Start a server by binding a listener and passing your router:
 
 ```mindscript
 let l = netListen("127.0.0.1:8080")
 let srv = http.serve(l, r, {
-	maxHeaderBytes: 8192,
-	maxBodyBytes: 1048576,
-	maxHeaders: null,
-	addDateHeader: false,
-	readHeaderTimeoutMs: 0,
-	writeTimeoutMs: 0,
-	idleTimeoutMs: 0
+  maxHeaderBytes: 8192,        # defaults shown here
+  maxBodyBytes: 1048576,
+  maxStartLineBytes: null,
+  maxHeaders: null,
+  addDateHeader: false,
+  readHeaderTimeoutMs: 0,
+  writeTimeoutMs: 0,
+  idleTimeoutMs: 0
 })
 ```
 
-* Request‑side `Transfer-Encoding: chunked` is **rejected** (400).
-* Conflicting `Content-Length` values → **400**.
-* Over‑budget headers → **400**; header count limit → **431**.
-* Overly long start line → **414**.
-* Absolute‑form targets (`GET http://host/path HTTP/1.1`) → **400**.
-* `Expect: 100-continue`: nethttp preflights **path/query** against the route before reading the body.
-
-### 8.2 Shutting Down
+Shut down:
 
 ```mindscript
 let _ = http.shutdown(srv, 0)
 ```
 
-Closes the listener and active connections; further connects will fail or produce no valid response.
+**Intentional constraints (so your service is predictable):**
+
+* Request **Transfer-Encoding: chunked** is rejected: **400**. Only `Content-Length` uploads are accepted (up to `maxBodyBytes`).
+* Conflicting duplicate `Content-Length` → **400**.
+* Header size overflow → **400**; header **count** overflow → **431**.
+* Start line too long → **414**.
+* Absolute-form targets (`GET http://host/path HTTP/1.1`) → **400**.
+* `Expect: 100-continue`: the router **preflights** path/query against the matching route before reading the body.
+
+**Reason phrases** are clean (e.g., `422 Unprocessable Entity`, `302 Found`).
+**Date header** is off by default—toggle with `addDateHeader: true`.
 
 ---
 
-## 9) Testing Without Sockets
+## 7. OpenAPI: First-class, Auto-generated
 
-Use the in‑memory **test client** to exercise your routes deterministically:
+By default, a router serves **`GET /openapi.json`**. You can customize or disable it when creating the router:
+
+```mindscript
+let r = http.router({
+  docs: {
+    enabled: true,
+    path: "/openapi.json",
+    info: { title: "Shop API", version: "1.0.0", description: "Demo" },
+    servers: ["http://127.0.0.1:8080"],
+    opts: {
+      # validationErrorSchema: type {...},   # set a custom 422 schema
+      # securitySchemes: { ... },            # components.securitySchemes
+      # security: [ { ... } ],               # global security requirement
+      # x: { team: "payments" }              # vendor extensions
+    }
+  }
+})
+```
+
+What ends up in the document?
+
+* Paths and methods from your registrations (`route`, `routeStream`).
+* Parameters synthesized from your **contracts** (and from the pattern itself for `{id}` segments).
+* Request bodies built from `body` contracts (defaulting to `application/json` unless you specify others).
+* Responses from your explicit `responses`, or a sensible default when omitted. If a contract is present but no `422` is listed, a validation error response is auto-added.
+* `HEAD` is added for value `GET` routes.
+* Component schemas are `$ref`’d and de-duplicated.
+
+This is a **full OpenAPI 3.1** doc—connect it to UI tooling, client generation, or validation pipelines.
+
+---
+
+## 8. Testing Without Sockets
+
+The test client calls the router as if it were behind the server, without opening ports:
 
 ```mindscript
 let c = http.testClient(r)
 
 let res1 = c.call({ method: "GET", path: "/hello/Ada" })
-# -> { status, headers, body }
+# -> { status: 200, headers: {...}, body: "hi Ada" }
 
 let res2 = c.call({
-	method: "POST",
-	path: "/echo",
-	headers: { "Content-Type": "application/json" },
-	body: "{\"msg\":\"hi\"}"
+  method: "POST",
+  path: "/echo",
+  headers: { "Content-Type": "application/json" },
+  body: "{\"msg\":\"hi\"}"
 })
+# -> body: {"ok":true,"msg":"hi"}
 ```
+
+Use this for unit tests: deterministic, fast, and validates your contracts and middleware logic.
 
 ---
 
-## 10) Recipes
+## 9. Building a Small Service (End-to-End)
 
-### 10.1 JSON CRUD Skeleton
+Let’s assemble CRUD, streaming updates, CORS, timeouts, logging, and docs.
 
 ```mindscript
 let http = import("nethttp")
-let r = http.router()
 
-let ID = type { id!: Int }
-let UserIn = type { name!: Str, age: Int }
+# ---------- Router with docs ----------
+let r = http.router({
+  docs: {
+    enabled: true,
+    info: { title: "Users API", version: "1.0.0" },
+    servers: ["http://127.0.0.1:8080"]
+  }
+})
+
+# ---------- Middleware ----------
+r.use(http.mwRecover())
+r.use(http.mwRequestID("X-Request-ID"))
+r.use(http.mwTimeout(500))
+r.use(http.mwCors({ origin: "*", credentials: true }))
+r.use(http.mwAccessLog())
+
+# ---------- Types ----------
+let ID      = type { id!: Int }
+let UserIn  = type { name!: Str, age: Int }
 let UserOut = type { id!: Int, name!: Str, age: Int }
 
+# ---------- Routes ----------
 # Create
-r.route("POST", "/users", http.contract({ body: UserIn, responses: { "200": UserOut } }), fun(req, ctx) do
-	# pretend persistence
-	http.json(200, { id: 1, name: ctx.body.name, age: ctx.body.age })
+r.route("POST", "/users", http.contract({
+  body: UserIn,
+  responses: {"200": UserOut}
+}), fun(req, ctx) do
+  http.json(200, { id: 1, name: ctx.body.name, age: ctx.body.age })
 end)
 
 # Read
-r.route("GET", "/users/{id}", http.contract({ path: ID, responses: { "200": UserOut } }), fun(req, ctx) do
-	http.json(200, { id: ctx.path.id, name: "Ada", age: 36 })
+r.route("GET", "/users/{id}", http.contract({
+  path: ID,
+  responses: {"200": UserOut}
+}), fun(req, ctx) do
+  http.json(200, { id: ctx.path.id, name: "Ada", age: 36 })
 end)
 
 # Update
-r.route("PUT", "/users/{id}", http.contract({ path: ID, body: UserIn, responses: { "200": UserOut } }), fun(req, ctx) do
-	http.json(200, { id: ctx.path.id, name: ctx.body.name, age: ctx.body.age })
+r.route("PUT", "/users/{id}", http.contract({
+  path: ID,
+  body: UserIn,
+  responses: {"200": UserOut}
+}), fun(req, ctx) do
+  http.json(200, { id: ctx.path.id, name: ctx.body.name, age: ctx.body.age })
 end)
 
 # Delete
 r.route("DELETE", "/users/{id}", http.contract({ path: ID }), fun(req, ctx) do
-	http.noContent(null)
+  http.noContent(null)
 end)
-```
 
-### 10.2 Streaming “SSE‑like” Text
-
-```mindscript
-r.routeStream("GET", "/events", http.contract({}), fun(req, res, ctx) -> Null do
-	res.status(200).setHeader("Content-Type", "text/plain")
-	let _ = res.write("event: ready\n\n")
-	let _ = res.flush(null)
-	# emit a few ticks
-	let i = 0
-	while i < 3 do
-		let _ = res.write(sprintf("data: tick %d\n\n", [i]))
-		sleep(100)
-		i = i + 1
-	end
-	res.end(null)
-	null
+# Streaming progress
+r.routeStream("GET", "/users/{id}/events", http.contract({ path: ID }), fun(req, res, ctx) -> Null do
+  res.status(200).setHeader("Content-Type", "text/plain")
+  let _ = res.write("start\n")
+  sleep(50)
+  let _ = res.write("working\n")
+  sleep(50)
+  let _ = res.write("done\n")
+  res.end(null)
+  null
 end)
+
+# ---------- Server ----------
+let l = netListen("127.0.0.1:8080")
+let srv = http.serve(l, r, { addDateHeader: true })
+
+# visit:
+#   GET  /openapi.json
+#   POST /users         {"name":"Grace","age":35}
+#   GET  /users/1
+#   GET  /users/1/events
+
+# ...later
+let _ = http.shutdown(srv, 0)
 ```
 
-### 10.3 CORS With Credentials
+What you get:
 
-```mindscript
-r.use(http.mwCors({ origin: "*", credentials: true }))
-```
-
-Reflects the request `Origin` in `Access-Control-Allow-Origin` and sets `Vary: Origin`.
-
-### 10.4 Timeouts (Return 504 if Nothing Is Written)
-
-```mindscript
-r.use(http.mwTimeout(200))
-
-r.route("GET", "/slow", http.contract({}), fun(req, ctx) do
-	sleep(500)
-	http.text(200, "(too late)")
-end)
-```
-
-### 10.5 Request ID
-
-```mindscript
-r.use(http.mwRequestID("X-Request-ID"))
-```
-
-If a client sends `x-request-id: foo` (any case), the same value is echoed with canonical casing.
+* Input validation with helpful **422** when clients send bad data.
+* Safe streaming with a deadline (504 if the handler stays silent).
+* CORS that reflects the `Origin` when credentials are enabled.
+* Request IDs in and out (case-insensitive header handling).
+* Access logs that summarize each request with duration and status.
+* A live **OpenAPI** endpoint your tools can consume.
 
 ---
 
-## 11) OpenAPI‑like Introspection (Minimal)
+## 10. Operational Notes (Deep Cuts)
 
-```mindscript
-let doc = http.openapiDoc(r, { title: "API", version: "1.0.0" }, ["http://localhost"])
-# -> { info, servers, routes: [{ method, pattern, style }] }
-```
-
-This is a **lightweight** document intended for quick inspection/testing, not a full OpenAPI 3 spec.
-
----
-
-## 12) Operational Notes & Gotchas
-
-* **HEAD** auto‑mapping applies **only** to value routes; streaming routes require explicit `HEAD` registration (or else 405).
-* **Request bodies**: only `Content-Length` is supported; `Transfer-Encoding: chunked` requests are rejected (400).
-* **Redirects**: `http.redirect(302, "/somewhere")` only allows **absolute paths**. External URLs are rejected (400).
-* **Header safety**: CRLF in header values → 400; invalid values are blocked.
-* **Reason phrases**: common statuses return polished phrases (e.g., 302 **Found**, 422 **Unprocessable Entity**).
-* **CORS**: installing `mwCors` also makes generic `OPTIONS` preflights succeed (204) even if there’s no matching method handler.
-* **Error semantics**: input validation issues → 422; panics become 500 if `mwRecover` is installed, otherwise the framework still returns a 500 for unhandled panics.
+* **Path matching**: `{*tail}` is a catch-all; otherwise patterns must match segment-by-segment. For matching, repeated slashes and `.` segments are normalized. The **raw** segments are still passed to your handler.
+* **Percent-encoding** in path params is **not** decoded—you get exactly what was on the wire (e.g., `%2F` remains `%2F`).
+* **Redirects** are path-only: `http.redirect(302, "/new")`. External URLs are rejected with **400** (guards against header injection and open redirects).
+* **Header safety**: CR/LF in header values → **400**. The server will bail out early instead of sending a poisoned response.
+* **Allow header**: when a path shape exists but the method doesn’t, the server replies **405** and lists permitted methods in `Allow`.
 
 ---
 
-## 13) Troubleshooting Checklist
+## 11. Troubleshooting
 
-* **422 on requests?** Check your contract types and that inputs are JSON or coercible strings (for scalars) and arrays (for repeated params or JSON arrays).
-* **405 with `Allow`**? You hit the path shape but not the method; register the method or inspect the `Allow` header to see what’s supported.
-* **HEAD returns body**? Make sure you’re not using a streaming route; value routes auto‑suppress bodies for `HEAD`.
-* **Timeouts firing (504)**? If you install `mwTimeout`, ensure your handler writes **something** before the deadline (even headers) to mark progress.
-* **Chunked client uploads failing**? chunked requests are not supported; send a `Content-Length`.
-
----
-
-## 14) API Reference (Public Surface)
-
-* **Construction & Composition**
-
-  * `router()`, `mount(prefix, child)`, `use(mw)`
-* **Routing**
-
-  * `route(method, pattern, contract, handler)`
-  * `routeStream(method, pattern, contract, handler)`
-  * `contract(map)` (marker wrapper)
-* **Response Helpers (value routes)**
-
-  * `json(status, value)`, `text(status, s)`, `noContent(null)`, `redirect(status, path)`
-  * `raise(status, message)`, `raiseWithHeaders(status, message, headers)`
-* **Server**
-
-  * `serve(listener, router, opts)`, `shutdown(server, timeoutMs)`
-* **Introspection & Testing**
-
-  * `openapiDoc(router, info, servers?)`
-  * `testClient(router)` → `{ call: fun(req) -> {status, headers, body} }`
+* *I keep getting 422s.* Re-check the contract. Are you coercing `Int` from a non-numeric string? For arrays, either repeat the param or send a JSON array in one param.
+* *My streaming route 504s with the timeout middleware.* Write something early—headers or a small chunk—to mark progress.
+* *Why is my HEAD returning the whole body?* Ensure the route is a **value** route. Streaming routes don’t auto-support HEAD.
+* *Client uploads via TE: chunked fail.* Correct—unsupported by design. Send `Content-Length` and keep under `maxBodyBytes`.
 
 ---
 
-## 15) Closing Thoughts
+## 12. Reference (for when you forget names)
 
-**nethttp.ms** aims to be small, predictable, and streaming‑friendly. Lean on **contracts** for correctness, **middleware** for cross‑cutting concerns, and **streaming routes** when you need backpressure and low latency. Use the **test client** for quick, deterministic unit tests, and turn on the **access log** when you’re debugging in development.
+* **Router**: `router(opts?)`, `.route`, `.routeStream`, `.mount`, `.use`
+* **Contracts**: `contract({ path?, query?, body?, responses? })`
+* **Responder** (streaming): `status`, `setHeader`, `write`, `flush`, `end`
+* **Helpers**: `json`, `text`, `noContent`, `redirect`, `raise`
+* **Server**: `serve(listener, router, opts)`, `shutdown(server, timeoutMs?)`
+* **Testing**: `testClient(router) -> { call(req) -> {status, headers, body} }`
+* **Docs**: `GET /openapi.json` (configurable via `router({docs:{...}})`)
 
 

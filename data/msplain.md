@@ -1,3 +1,7 @@
+Below is the **updated & improved** manual. I kept the exact section structure and folded in all the language pitfalls you highlighted, with focused “good/bad” examples where they help most (no new sections added).
+
+---
+
 # MindScript Language Manual (Human-Oriented)
 
 MindScript is a compact, expression-oriented language for two kinds of computation: deductive (ordinary, deterministic functions) and inductive (first-class oracles backed by models or external sources). It pairs formal, structural types with informal annotations (human text that guides oracles) while keeping syntax clean and readable.
@@ -22,13 +26,23 @@ MindScript is a compact, expression-oriented language for two kinds of computati
 
 * Indentation uses **tabs** (not spaces) for canonical formatting.
 * Canonicalized output ends with exactly **one** trailing newline.
+* **No semicolons.** MindScript never uses `;` as a statement separator.
+
+  ```mindscript
+  # Good
+  let x = 1
+  x = x + 1
+
+  # Bad (syntax error)
+  let x = 1; x = x + 1
+  ```
 
 ### 2.2 Comments & annotations
 
 MindScript uses a single, unified comment system that also carries metadata:
 
 * **PRE annotations (header comments)**: one or more lines starting with `#` immediately **above** the construct they describe.
-* **POST annotations (inline trailing)**: ` # …` placed at the **end** of the line for a construct. POST **forces a newline** after it.
+* **POST annotations (inline trailing)**: ` # …` placed at the **end** of the line for a construct. POST **forces a newline** after it and is part of the value’s metadata.
 
 **After-separator rule (important):**
 
@@ -58,6 +72,19 @@ MindScript uses a single, unified comment system that also carries metadata:
 }
 ```
 
+**POST swallows to end-of-line (common pitfall):**
+
+```mindscript
+# Good
+if x then "ok" else "bad" end
+
+# Pitfall: POST ends the current line, so you still need 'end' on its own line.
+if x then "ok" else "bad" # note: POST here forces newline
+end
+```
+
+Annotations are **first-class metadata**: they are attached to values and **do not affect logic** (ignored by equality/subtyping), but can be read with `noteGet`.
+
 ---
 
 ## 3) Values
@@ -81,10 +108,46 @@ Composite:
 
 Base types: `Any | Null | Bool | Int | Num | Str | Type`
 Nullable: `T?`
-Arrays: `[T]`
+Arrays: `[T]` ( **monomorphic**; not heterogeneous)
 Open maps (string keys): `{ field!: T, other: U }` — `!` marks **required** fields; others are optional.
 Enums (literal sets): `Enum[ lit1, lit2, ... ]` where literals can be scalars, arrays, or maps.
-Functions & oracles: `(A, B) -> R` (right-associative; `(A) -> (B) -> R` flattens to `(A, B) -> R`).
+Functions & oracles: `(A, B) -> R` (right-associative; semantically curried).
+
+**No general sum types.** Use `Any` (top type) or nullable `T?`. When the type is omitted, it is `Any`.
+
+**Only values have a type.** Variables are untyped containers; **types apply to values** and to function/oracle signatures (checked at runtime).
+
+**Types themselves are values** of type `Type`.
+
+**Function values are curried.** A surface type `(A, B) -> R` is equivalent to `A -> B -> R`.
+
+**Internal structure can be annotated** (use PRE/POST around fields to document semantics).
+
+**Duck typing encouraged.** Constrain exactly what a function needs in its signature; the runtime checks conformance.
+
+**Nullable & optional fields (guidance):**
+
+* `{age: Int}` → optional field; when present must be `Int`.
+* `{age: Int?}` → optional **or** `null` when present; use sparingly (omissible + nullable can be semantically muddy).
+* Prefer either **optional** or **nullable**, not both at once, unless truly needed.
+
+**Examples (with pitfalls)**
+
+```mindscript
+# Arrays are monomorphic
+let ok: [Str] = ["a", "b"]
+# Bad (heterogeneous): ["a", 1]
+
+# Open maps; '!' means required
+let Person = type { name!: Str, age: Int }
+
+# Optional vs nullable
+let A = type { note: Str }     # optional string (when present, must be Str)
+let B = type { note: Str? }    # optional; when present can be Str or null  # use cautiously
+
+# Function is curried (semantics)
+let Add = type (Int, Int) -> Int   # == Int -> Int -> Int
+```
 
 **Subtyping (informal):**
 
@@ -95,16 +158,6 @@ Functions & oracles: `(A, B) -> R` (right-associative; `(A) -> (B) -> R` flatten
 * Enums by member subset
 * Functions/oracles: parameters **contravariant**, return **covariant**
 * `Any` is top
-
-**Examples**
-
-```mindscript
-type Ints = [Int]
-type Person = { name!: Str, age: Int }
-type Method = (Str, Num) -> Bool
-type MaybeText = Str?
-type Verb = Enum[ "GET", "POST" ]
-```
 
 ---
 
@@ -162,13 +215,12 @@ let x = 1
 x = 2
 ```
 
-There are no named declarations. Functions, types, modules, etc. are all
-anonymous and need to be bound to a variable for later reference.
+There are no named declarations. **Functions and types are anonymous**; to name them you **bind to a variable**:
 
 ```mindscript
-let f = fun() do true end
-let T = type {name: Str}
-let m = module "m" do ... end
+let f = fun(n: Int) -> Int do n + 1 end
+let T = type {name!: Str}
+let m = module "m" do end
 ```
 
 **Sugar (surface syntax only):**
@@ -195,6 +247,7 @@ end   # => 2
 ### 7.2 If / elif / else
 
 ```mindscript
+# Good (always close with 'end')
 if cond then
 	doSomething()
 elif other then
@@ -202,6 +255,10 @@ elif other then
 else
 	default()
 end
+
+# Bad (missing 'end' → syntax error)
+if cond then
+	doSomething()
 ```
 
 ### 7.3 While
@@ -255,12 +312,26 @@ fun(n: Int) -> Int do
 end
 ```
 
-* Parameter and return types should be explicit in public APIs.
+* **Prefer explicit parameter and return types** in public APIs.
+
+  ```mindscript
+  # Good
+  fun echo(x: Str) -> Str do x end
+
+  # Discouraged (defaults to Any)
+  fun echo(x) do x end
+  ```
 * Omissions default to `Any` in the surface grammar but are **not** printed by canonical formatters:
 
   * `fun(x) do ... end` means `x: Any`
   * `-> Any` may be omitted when returning `Any`
-* Calls are **curried** semantically, but the surface form is standard calls: `f(a)(b)` is allowed; `f(a, b)` is conventional.
+* Calls are **curried** semantically (right-associative):
+
+  ```mindscript
+  let add = fun(a: Int, b: Int) -> Int do a + b end
+  let inc = add(1)   # inc : Int -> Int
+  inc(41)            # => 42
+  ```
 * The **actual** returned value must conform to the declared return type; otherwise the runtime **panics**.
 
 ### 8.2 Oracles (typed generative calls)
@@ -331,7 +402,7 @@ fun(n: Int) -> Int? do
 end
 ```
 
-**Panics** are exceptional (lexer/parser/runtime) and abort execution. Use `try` to recover (see §12).
+**Panics** are exceptional (lexer/parser/runtime) and abort execution. Use `try` to recover (see §12/§15 helpers).
 
 Guidelines:
 
@@ -350,6 +421,13 @@ Guidelines:
 ---
 
 ## 12) Standard Library (Practical Reference)
+
+> Conversions like `int/num/bool/str` **return `null` on failure**; attach a POST note if needed.
+
+```mindscript
+int("42")     # 42
+int("oops")   # null # <invalid int>
+```
 
 Types below use MindScript notation; `?` indicates a nullable (error-capable) result.
 
@@ -642,17 +720,18 @@ end
 * **Annotations**: use PRE for docs; use concise POST for machine-readable signals and pipeline logs.
 * **Canonicalization**: omit default `: Any` parameters and `-> Any` returns in source; formatters remove redundant parens and trailing commas, normalize quoting, and sort map keys in type/value printers for stability.
 * **Avoid panics** in library code; prefer returning `null` with a clear POST reason.
+* **Favor duck typing**: function signatures should state only what’s required; rely on structural checks at call time.
 
 ---
 
 ## 18) Quick Reference (Cheat Sheet)
 
 ```mindscript
-# Declaration & assignment
+# Declaration & assignment (no semicolons)
 let x = 1
 x = x + 1
 
-# Arrays & maps
+# Arrays & maps (arrays are monomorphic)
 let xs = [1, 2, 3]
 let m  = { name: "Ada", age: 36 }
 
@@ -660,15 +739,13 @@ let m  = { name: "Ada", age: 36 }
 xs[0]; xs[-1]
 m.name; m["not-ident"]
 
-# Functions (types optional; default Any)
+# Functions (prefer explicit types; semantically curried)
 fun inc(n: Int) -> Int do n + 1 end
-inc(41)
-inc()   # lowers to inc(null)
+let add = fun(a: Int, b: Int) -> Int do a + b end
+add(1)(41)  # 42
 
-# Control
+# Control (always close with 'end')
 if cond then A() elif other then B() else C() end
-while test() do step() end
-for x in xs do use(x) end
 
 # Return/break/continue
 return          # lowers to return null
@@ -678,6 +755,7 @@ continue        # lowers to continue null
 # Types
 let Pair = type { left!: Int, right!: Int }
 let F = type Int -> Num -> Str
+let Person = type { name!: Str, age: Int? }  # avoid omissible+nullable unless needed
 
 # Oracles
 oracle getColor() -> Enum["red","green","blue"]

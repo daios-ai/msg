@@ -205,7 +205,7 @@ end
 # Summary:
 #   Proxies status/write to measure bytes; writes a single line via printf.
 # Format:
-#   "METHOD /path?query" <status> <n>bytes <dur>ms OK|FAIL
+#   "METHOD ROUTE" BYTESbytes TIMEms STATUS OK|FAIL
 #   On FAIL, an error dump line follows.
 # Color:
 #   Set to enable ANSI colors (green OK, red FAIL, dim dump).
@@ -247,8 +247,8 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 			next(req, proxy, ctx)
 
 			let dur = nowMillis() - t0
-			let pathq = req.url.path + if req.url.query == null then "" else "?" + req.url.query end
-			let ok = status.v < 500
+			let route = req.url.path + if req.url.query == null then "" else "?" + req.url.query end
+			let ok = status.v < 400
 			let tag = if ok then "OK" else "FAIL" end
 
 			let colorOn = true
@@ -256,10 +256,12 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 			let RED = if colorOn then "\u001b[31m" else "" end
 			let DIM = if colorOn then "\u001b[2m"  else "" end
 			let RST = if colorOn then "\u001b[0m"  else "" end
-			let tagC = if ok then GRN + tag + RST else RED + tag + RST end
 
-			printf("\"%s %s\" %d %dbytes %dms %s\n", [
-				req.method, pathq, int(status.v), int(bytes.v), int(dur), tagC
+			let tagC = if ok then GRN + tag + RST else RED + tag + RST end
+			let statusC = if ok then GRN + str(int(status.v)) + RST else RED + str(int(status.v)) + RST end
+
+			printf("\"%s %s\" %dbytes %dms %s %s\n", [
+				req.method, route, int(bytes.v), int(dur), statusC, tagC
 			])
 
 			if not ok and mapHas(ctx, "_errorDump") and ctx._errorDump != null then
@@ -269,3 +271,4 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 		end
 	end
 end
+

@@ -813,6 +813,40 @@ let router = fun(opts: {}?) -> {} do
 		h
 	end
 
+	# Run middleware for a synthesized response (buffered)
+	let _emitViaMw = fun(req: Request, ctx: {}, status: Int, headers: {}, body: Str) -> _Response do
+		let pack = _newResponder()
+		let h = fun(_: Request, res: Responder, _: {}) -> Null do
+			for [k, v] in headers do
+				res.setHeader(k, v)
+			end
+			res.status(status)
+			let _ = res.write(body)
+			let _ = res.end()
+			null
+		end
+		let call = _compose(h)
+		let _ = call(req, pack.api, ctx)
+		{status: pack.res.status, headers: pack.res.headers, body: pack.res.body}
+	end
+
+	# Run middleware for a synthesized response (streaming)
+	let _emitStreamViaMw = fun(req: Request, ctx: {}, conn, opts: {}, status: Int, headers: {}, body: Str) -> Null do
+		let sock = _newSockResponder(conn, opts)
+		let h = fun(_: Request, res: Responder, _: {}) -> Null do
+			for [k, v] in headers do
+				res.setHeader(k, v)
+			end
+			res.status(status)
+			let _ = res.write(body)
+			let _ = res.end()
+			null
+		end
+		let call = _compose(h)
+		let _ = call(req, sock.api, ctx)
+		null
+	end
+
 	let _delegateToMount = fun(req: Request) -> _Response? do
 		let segs = _splitPath(req.url.path)
 		for m in _mounts do
@@ -853,21 +887,25 @@ let router = fun(opts: {}?) -> {} do
 			if delegated != null then
 				return delegated
 			end
+
+			let ctx = {req: req}
 			if _normMethod(req.method) == "OPTIONS" then
 				let allowed = _allowedMethodsLocal(req.url.path)
 				if len(allowed) > 0 then
-					return {status: 204, headers: {"Allow": join(allowed, ", ")}, body: ""}
+					return _emitViaMw(req, ctx, 204, {"Allow": join(allowed, ", ")}, "")
 				end
 				if len(_mws) > 0 then
-					return {status: 204, headers: {}, body: ""}
+					return _emitViaMw(req, ctx, 204, {}, "")
 				end
-				return {status: 404, headers: {"Content-Type": "text/plain"}, body: "not found"}
+				ctx._errorDump = "not found"
+				return _emitViaMw(req, ctx, 404, {"Content-Type": "text/plain"}, "not found")
 			end
 			if _pathExistsLocal(req.url.path) then
-				let allowed405 = _allowedMethodsLocal(req.url.path)
-				return {status: 405, headers: {"Content-Type": "text/plain", "Allow": join(allowed405, ", ")}, body: "method not allowed"}
+				ctx._errorDump = "method not allowed"
+				return _emitViaMw(req, ctx, 405, {"Content-Type": "text/plain", "Allow": join(_allowedMethodsLocal(req.url.path), ", ")}, "method not allowed")
 			end
-			return {status: 404, headers: {"Content-Type": "text/plain"}, body: "not found"}
+			ctx._errorDump = "not found"
+			return _emitViaMw(req, ctx, 404, {"Content-Type": "text/plain"}, "not found")
 		end
 
 		let r = m.route
@@ -880,21 +918,24 @@ let router = fun(opts: {}?) -> {} do
 		if mapHas(C, "path") and C.path != null then
 			let P = _bindPath(rq.pathParams, C.path)
 			if P == null then
-				return {status: 422, headers: {"Content-Type": "application/json; charset=utf-8"}, body: _validationJSON("path", noteGet(P))}
+				ctx._errorDump = "validation error in path: " + str(noteGet(P))
+				return _emitViaMw(rq, ctx, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("path", noteGet(P)))
 			end
 			ctx.path = P
 		end
 		if mapHas(C, "query") and C.query != null then
 			let Q = _bindQueryFromReq(rq, C.query)
 			if Q == null then
-				return {status: 422, headers: {"Content-Type": "application/json; charset=utf-8"}, body: _validationJSON("query", noteGet(Q))}
+				ctx._errorDump = "validation error in query: " + str(noteGet(Q))
+				return _emitViaMw(rq, ctx, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("query", noteGet(Q)))
 			end
 			ctx.query = Q
 		end
 		if mapHas(C, "body") and C.body != null then
 			let B = _bindBody(rq, C.body)
 			if B == null then
-				return {status: 422, headers: {"Content-Type": "application/json; charset=utf-8"}, body: _validationJSON("body", noteGet(B))}
+				ctx._errorDump = "validation error in body: " + str(noteGet(B))
+				return _emitViaMw(rq, ctx, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("body", noteGet(B)))
 			end
 			ctx.body = B
 		end
@@ -904,6 +945,7 @@ let router = fun(opts: {}?) -> {} do
 
 		let t = try(fun(_: Null) do call(rq, pack.api, ctx) end)
 		if not t.ok then
+			ctx._errorDump = "panic"
 			return {status: 500, headers: {"Content-Type": "text/plain"}, body: "internal server error"}
 		end
 
@@ -1079,16 +1121,20 @@ let router = fun(opts: {}?) -> {} do
 				return null
 			end
 			let r = m.route
+			if r.style != "stream" then
+				return null
+			end
+
 			let params = if mapHas(m, "params") and m.params != null then m.params else {} end
 			let C = if mapHas(r, "contract") then r.contract else {} end
 			let rq = {method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: params}
 			let ctx = {req: rq}
+
 			if mapHas(C, "path") and C.path != null then
 				let P = _bindPath(rq.pathParams, C.path)
 				if P == null then
-					let s = _validationJSON("path", noteGet(P))
-					let _ = write(conn, sprintf("HTTP/1.1 422 %s\r\nContent-Length: %d\r\nContent-Type: application/json; charset=utf-8\r\n\r\n%s", [_reason(422), len(s), s]))
-					let _ = flush(conn)
+					ctx._errorDump = "validation error in path: " + str(noteGet(P))
+					_emitStreamViaMw(rq, ctx, conn, opts, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("path", noteGet(P)))
 					return {streamed: true}
 				end
 				ctx.path = P
@@ -1096,9 +1142,8 @@ let router = fun(opts: {}?) -> {} do
 			if mapHas(C, "query") and C.query != null then
 				let Q = _bindQueryFromReq(rq, C.query)
 				if Q == null then
-					let s = _validationJSON("query", noteGet(Q))
-					let _ = write(conn, sprintf("HTTP/1.1 422 %s\r\nContent-Length: %d\r\nContent-Type: application/json; charset=utf-8\r\n\r\n%s", [_reason(422), len(s), s]))
-					let _ = flush(conn)
+					ctx._errorDump = "validation error in query: " + str(noteGet(Q))
+					_emitStreamViaMw(rq, ctx, conn, opts, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("query", noteGet(Q)))
 					return {streamed: true}
 				end
 				ctx.query = Q
@@ -1106,27 +1151,24 @@ let router = fun(opts: {}?) -> {} do
 			if mapHas(C, "body") and C.body != null then
 				let B = _bindBody(rq, C.body)
 				if B == null then
-					let s = _validationJSON("body", noteGet(B))
-					let _ = write(conn, sprintf("HTTP/1.1 422 %s\r\nContent-Length: %d\r\nContent-Type: application/json; charset=utf-8\r\n\r\n%s", [_reason(422), len(s), s]))
-					let _ = flush(conn)
+					ctx._errorDump = "validation error in body: " + str(noteGet(B))
+					_emitStreamViaMw(rq, ctx, conn, opts, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("body", noteGet(B)))
 					return {streamed: true}
 				end
 				ctx.body = B
 			end
-			if r.style == "stream" then
-				let sock = _newSockResponder(conn, opts)
-				let call = _compose(r.call)
-				let t = try(fun(_: Null) do call(rq, sock.api, ctx) end)
-				if not t.ok then
-					_setErr(ctx, t)
-					let _ = write(conn, sprintf("HTTP/1.1 500 %s\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\ninternal server error", [_reason(500)]))
-					let _ = flush(conn)
-					return {streamed: true}
-				end
+
+			let sock = _newSockResponder(conn, opts)
+			let call = _compose(r.call)
+			let t = try(fun(_: Null) do call(rq, sock.api, ctx) end)
+			if not t.ok then
+				_setErr(ctx, t)
+				let _ = sock.api.status(500).setHeader("Content-Type", "text/plain").write("internal server error")
 				let _ = sock.api.end()
 				return {streamed: true}
 			end
-			_entryCore(req)
+			let _ = sock.api.end()
+			{streamed: true}
 		end,
 
 		_dump: fun(_: Null) -> {} do

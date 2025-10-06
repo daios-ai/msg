@@ -1412,3 +1412,37 @@ testing.test("nethttp/HEAD streaming -> 405", fun(_: Null) do
 	testing.assert(len(split(resp, "HTTP/1.1 405 Method Not Allowed")) > 1, "expected 405 for HEAD on streaming route")
 	testing.assert(len(split(resp, "\nAllow: GET")) > 1, "Allow header should list GET")
 end)
+
+# =========================================================
+# nethttp/accesslog 404 catch-all does not alter response
+# Ensures middleware path executes for unknown routes.
+# =========================================================
+testing.test("nethttp/accesslog 404 catch-all", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.use(http.mwAccessLog())
+	r.use(http.mwRecover())
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/no-such"})
+	testing.assertEq(404, res.status)
+end)
+
+# =========================================================
+# nethttp/accesslog 422 catch-all for validation errors
+# Router + access log must still emit proper 422 response.
+# =========================================================
+testing.test("nethttp/accesslog 422 catch-all", fun(_: Null) do
+	let http = import("nethttp")
+
+	let r = http.router()
+	r.use(http.mwAccessLog())
+	r.route("GET", "/q", http.contract({query: type {n: Int}}), fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+
+	let c = http.testClient(r)
+	let res = c.call({method: "GET", path: "/q?n=oops"})
+	testing.assertEq(422, res.status)
+end)

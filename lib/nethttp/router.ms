@@ -1,14 +1,17 @@
 # nethttp/router — routing, contracts, binding, responders, OpenAPI hook
 #
-# NOTE: Behavior is unchanged. This pass only tightens types and clarifies docs.
+# This module implements a path router for value and streaming handlers.
+# It provides request/response helpers, automatic binding/validation
+# for path/query/body via contracts, response validation (optional),
+# test utilities, and OpenAPI export support.
 
-let oapi = import("nethttp/openapi")
+let openapi = import("nethttp/openapi")
 
 # =========================
 # Public types (data-only)
 # =========================
 
-# HTTP request value passed to handlers.
+# Request — immutable request value passed to handlers.
 let Request = type {
 	method!: Str,
 	url!: {scheme: Str?, host: Str?, path!: Str, query: Str?},
@@ -17,7 +20,7 @@ let Request = type {
 	pathParams: {}?
 }
 
-# Streaming responder interface for handlers.
+# Responder — streaming response interface for handlers.
 let Responder = type {
 	status!: Int -> Responder,
 	setHeader!: Str -> Str -> Responder,
@@ -26,8 +29,10 @@ let Responder = type {
 	end!: Null -> Bool?
 }
 
+# _Response — buffered response shape used by helpers and value routes.
 let _Response = type {status!: Int, headers!: {}, body!: Str}
 
+# _HttpError — structured error returned by helpers like raise().
 let _HttpError = type {
 	__http_error__!: Bool,
 	status!: Int,
@@ -35,16 +40,17 @@ let _HttpError = type {
 	headers!: {}
 }
 
-# A marker wrapper for route contracts (path/query/body/responses).
+# Contract — marker wrapper for route contracts (path/query/body/responses).
 let Contract = type {}
 
+# _Ctx — per-request context passed to handlers (bound values live here).
 let _Ctx = type {req!: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
 
 let _StreamFn = type Request -> Responder -> {} -> Null
 let _Mw = type _StreamFn -> _StreamFn
 
 # =========================
-# Utilities
+# Utilities (private)
 # =========================
 
 let _normMethod = fun(m: Str) -> Str do
@@ -108,7 +114,16 @@ let _setErr = fun(ctx: {}, r: {}) -> Null do
 	null
 end
 
-# Wrap a route contract (marker).
+# contract — Wrap a route contract (marker).
+#
+# Summary:
+# 	Return the given contract marker. This is a no-op wrapper that
+# 	just signals intent at call sites.
+#
+# Args:
+# 	c: Contract — Route contract object.
+# Return:
+# 	Contract — The same contract marker.
 let contract = fun(c: Contract) -> Contract do
 	c
 end
@@ -117,16 +132,36 @@ end
 # Error helpers (public)
 # =========================
 
+# raise — Build a structured HTTP error result.
+#
+# Summary:
+# 	Create a typed error object to be returned by value handlers.
+# 	The router will convert it into an HTTP response with the given
+# 	status and body, plus optional headers (empty here).
+#
+# Args:
+# 	status: Int — HTTP status code (e.g., 401).
+# 	message: Str — Response body as plain text.
+# Return:
+# 	{} — Structured error object (HttpError-like).
 let raise = fun(status: Int, message: Str) -> {} do
 	{__http_error__: true, status: status, body: message, headers: {}}
 end
 
+# raiseWithHeaders — Build a structured HTTP error with headers.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	message: Str — Response body as plain text.
+# 	headers: {} — Headers to set on the response.
+# Return:
+# 	{} — Structured error object.
 let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
 	{__http_error__: true, status: status, body: message, headers: headers}
 end
 
 # =========================
-# Binding helpers (internal)
+# Binding helpers (private)
 # =========================
 
 let _rawBody = fun(req: Request) -> Str? do
@@ -343,7 +378,7 @@ end
 let _validationJSON = fun(where: Str, reason: Str?) -> Str do
 	let msg =
 		if reason == null then
-			"<validation failed>"
+			"validation failed"
 		else
 			reason
 		end
@@ -356,11 +391,17 @@ let _validationJSON = fun(where: Str, reason: Str?) -> Str do
 	end
 end
 
-
 # =========================
-# Response helpers (for value handlers)
+# Response helpers (value handlers)
 # =========================
 
+# json — Build an application/json response with status code.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	value: Any — JSON-serializable value.
+# Return:
+# 	{} — Buffered response (status/headers/body).
 let json = fun(status: Int, value: Any) -> {} do
 	let s = _json(value)
 	if s == null then
@@ -369,14 +410,34 @@ let json = fun(status: Int, value: Any) -> {} do
 	{status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s}
 end
 
+# text — Build a text/plain response with status code.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	s: Str — Response body.
+# Return:
+# 	{} — Buffered response.
 let text = fun(status: Int, s: Str) -> {} do
 	{status: status, headers: {"Content-Type": "text/plain"}, body: s}
 end
 
+# noContent — Build a 204 No Content response.
+#
+# Args:
+# 	_: Null — Unused.
+# Return:
+# 	{} — Buffered response with empty body.
 let noContent = fun(_: Null) -> {} do
 	{status: 204, headers: {}, body: ""}
 end
 
+# redirect — Build a redirect response with Location header.
+#
+# Args:
+# 	status: Int — Redirect status (e.g., 302).
+# 	location: Str — Absolute path starting with "/".
+# Return:
+# 	{} — Buffered response; 400 if invalid location.
 let redirect = fun(status: Int, location: Str) -> {} do
 	if len(location) == 0 or substr(location, 0, 1) != "/" then
 		return {status: 400, headers: {"Content-Type": "text/plain"}, body: "bad redirect"}
@@ -534,7 +595,7 @@ end
 # Router (closure-backed)
 # =========================
 
-let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
+let _makeRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
 	let m = _normMethod(method)
 	let isPrefix = len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
 	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
@@ -629,7 +690,23 @@ let _getHeader = fun(h: {}, name: Str) -> Str? do
 	null
 end
 
-# Create a new router (APIs typed; logic preserved).
+# router — Create a new router.
+#
+# Summary:
+# 	Construct a router instance supporting value and streaming routes,
+# 	middleware composition, nested mounting, and OpenAPI export.
+#
+# Args:
+# 	opts: {}? — Optional:
+# 		docs?: {
+# 			enabled?: Bool (default true),
+# 			path?: Str (default "/openapi.json"),
+# 			info?: openapi.Info (default {title:"API", version:"0.1.0"}),
+# 			servers?: [Str] (default []),
+# 			opts?: openapi.SpecOpts (default {})
+# 		}
+# Return:
+# 	{} — Router instance with route/routeStream/mount/use/test helpers.
 let router = fun(opts: {}?) -> {} do
 	let o = if opts == null then {} else opts end
 	let dIn = if mapHas(o, "docs") and o.docs != null then o.docs else {} end
@@ -647,7 +724,7 @@ let router = fun(opts: {}?) -> {} do
 	let _specRoutes = []
 
 	let _buildSpec = fun(_: Null) -> {} do
-		oapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
+		openapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
 	end
 
 	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
@@ -897,6 +974,15 @@ let router = fun(opts: {}?) -> {} do
 	let api = {
 		__kind: "nethttp.router",
 
+		# route — Register a value route that returns a buffered result.
+		#
+		# Args:
+		# 	method: Str — HTTP method (GET/POST/...).
+		# 	pattern: Str — Path pattern (supports {param} and {*catch}).
+		# 	c: Contract — Optional contract (binding/validation).
+		# 	handler: Request -> {} -> Any — Returns Any or _Response/_HttpError.
+		# Return:
+		# 	Bool — true on success.
 		route: fun(method: Str, pattern: Str, c: Contract, handler: Request -> {} -> Any) -> Bool do
 			let parts = _splitPath(pattern)
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -964,10 +1050,19 @@ let router = fun(opts: {}?) -> {} do
 				null
 			end
 			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "value", c)]
-			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
+			_routes = _routes + [_makeRoute(method, pattern, stream, "value", c)]
 			true
 		end,
 
+		# routeStream — Register a streaming route.
+		#
+		# Args:
+		# 	method: Str — HTTP method.
+		# 	pattern: Str — Path pattern.
+		# 	c: Contract — Optional contract.
+		# 	handler: Request -> Responder -> {} -> Null — Performs streaming writes.
+		# Return:
+		# 	Bool — true on success.
 		routeStream: fun(method: Str, pattern: Str, c: Contract, handler: Request -> Responder -> {} -> Null) -> Bool do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do handler(req, res, ctx) end)
@@ -980,24 +1075,39 @@ let router = fun(opts: {}?) -> {} do
 				null
 			end
 			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "stream", c)]
-			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
+			_routes = _routes + [_makeRoute(method, pattern, stream, "stream", c)]
 			true
 		end,
 
+		# mount — Mount a child router at a fixed prefix.
+		#
+		# Args:
+		# 	prefix: Str — Path prefix (e.g., "/v1").
+		# 	child: {} — Router returned by router().
+		# Return:
+		# 	Bool — true on success.
 		mount: fun(prefix: Str, child: {}) -> Bool do
 			_mounts = _mounts + [{prefixParts: _splitPath(prefix), child: child}]
 			true
 		end,
 
+		# use — Register a streaming-friendly middleware.
+		#
+		# Args:
+		# 	mw: _Mw — Middleware function.
+		# Return:
+		# 	Bool — true on success.
 		use: fun(mw: _Mw) -> Bool do
 			_mws = _mws + [mw]
 			true
 		end,
 
+		# _entryCall — Buffered entrypoint used by the server and tests.
 		_entryCall: fun(req: Request) -> _Response do
 			_entryCore(req)
 		end,
 
+		# _entryCallStream — Streaming entrypoint for server-side use.
 		_entryCallStream: fun(req: Request, conn: Any, opts: {}) -> {}? do
 			let m = _matchLocal(req.method, req.url.path)
 			if m == null then
@@ -1054,10 +1164,12 @@ let router = fun(opts: {}?) -> {} do
 			{streamed: true}
 		end,
 
+		# _dump — Internal debugging: returns routes and middleware stacks.
 		_dump: fun(_: Null) -> {} do
 			{routes: _routes, mws: _mws}
 		end,
 
+		# _preflight — Lightweight contract-only check used for 100-continue.
 		_preflight: fun(req: Request) -> {ok!: Bool} do
 			_preflight(req)
 		end
@@ -1093,6 +1205,15 @@ end
 # Test client (buffered)
 # =========================
 
+# testClient — Build a buffered test client for a router.
+#
+# Summary:
+# 	Allows issuing synthetic requests against a router without sockets.
+#
+# Args:
+# 	r: {} — Router returned by router().
+# Return:
+# 	{} — {call!: (req:{method?:Str, path?:Str, headers?:{}, body?:Str}) -> {status:Int, headers:{}, body:Str}}
 let testClient = fun(r: {}) -> {} do
 	let call = fun(req: {}) -> {} do
 		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end

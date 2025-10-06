@@ -1,17 +1,33 @@
 # nethttp/middleware — streaming-friendly middleware built on router core
+#
+# This module provides common streaming-compatible middleware:
+#   - mwRecover: convert handler panics to 500 responses
+#   - mwRequestID: inject/propagate a request identifier header
+#   - mwTimeout: emit 504 if nothing was written before a deadline
+#   - mwCors: add CORS headers and handle OPTIONS preflights
+#   - mwAccessLog: log method/route/status/bytes/duration after responses
 
-let core = import("nethttp/router")
+let router = import("nethttp/router")
 
-# Reuse core types and helpers
-let Request   = core.Request
-let Responder = core.Responder
-let _StreamFn = core._StreamFn
-let _Mw       = core._Mw
+# Re-exported core types and internal helpers (private to this module).
+let Request   = router.Request
+let Responder = router.Responder
+let _StreamFn = router._StreamFn
+let _Mw       = router._Mw
 
-let _getHeader = core._getHeader
-let _setErr    = core._setErr
+let _getHeader = router._getHeader
+let _setErr    = router._setErr
 
-# Recover middleware — converts handler panics to 500 responses.
+# mwRecover — Recover from panics and return 500.
+#
+# Summary:
+# 	Wraps a streaming handler to catch panics and convert them to
+# 	"500 internal server error" responses. Intended as the first middleware.
+#
+# Args:
+# 	_: Null — Unused marker.
+# Return:
+# 	_Mw — Middleware function: (_StreamFn) -> _StreamFn.
 let mwRecover = fun(_: Null) -> _Mw do
 	fun(next: _StreamFn) -> _StreamFn do
 		fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -28,7 +44,16 @@ let mwRecover = fun(_: Null) -> _Mw do
 	end
 end
 
-# Request ID middleware — injects/propagates a request identifier.
+# mwRequestID — Inject or propagate a request identifier.
+#
+# Summary:
+# 	Sets a request/response header with a request id. If the incoming request
+# 	already has the header, it is propagated; otherwise a new id is generated.
+#
+# Args:
+# 	headerName: Str — Header key to use (e.g., "X-Request-ID").
+# Return:
+# 	_Mw — Middleware function.
 let mwRequestID = fun(headerName: Str) -> _Mw do
 	let name = headerName
 	fun(next: _StreamFn) -> _StreamFn do
@@ -43,7 +68,16 @@ let mwRequestID = fun(headerName: Str) -> _Mw do
 	end
 end
 
-# Timeout middleware — emits 504 if no bytes were written by the deadline.
+# mwTimeout — Emit 504 if no bytes were written before the deadline.
+#
+# Summary:
+# 	Tracks writes on the response; if the deadline passes and no bytes
+# 	were sent, it emits a "504 timeout" response automatically.
+#
+# Args:
+# 	ms: Int — Timeout in milliseconds.
+# Return:
+# 	_Mw — Middleware function.
 let mwTimeout = fun(ms: Int) -> _Mw do
 	let dur = ms
 	fun(next: _StreamFn) -> _StreamFn do
@@ -130,8 +164,22 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 	end
 end
 
-# CORS middleware — adds Access-Control-* headers and handles OPTIONS.
-# opts: {origin: Str?, methods: [Str]?, headers: [Str]?, credentials: Bool?}
+# mwCors — Add CORS headers and handle OPTIONS preflights.
+#
+# Summary:
+# 	Sets Access-Control-* headers on all responses and short-circuits
+# 	OPTIONS requests with 204 No Content. When credentials are enabled,
+# 	the Origin is reflected and Vary: Origin is set.
+#
+# Args:
+# 	opts: {} — {
+# 		origin?: Str (default "*"),
+# 		methods?: [Str] (default "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+# 		headers?: [Str] (default "Content-Type, Authorization"),
+# 		credentials?: Bool (default false)
+# 	}
+# Return:
+# 	_Mw — Middleware function.
 let mwCors = fun(opts: {}) -> _Mw do
 	let originOpt = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
 	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
@@ -169,7 +217,17 @@ let mwCors = fun(opts: {}) -> _Mw do
 	end
 end
 
-# Access log middleware — logs after response with status/bytes/duration.
+# mwAccessLog — Log status, bytes, and duration after responses.
+#
+# Summary:
+# 	Wraps a handler to record method/route/bytes/status/duration and prints
+# 	a colored single-line entry after the response completes. Non-2xx
+# 	responses also print an error context if available.
+#
+# Args:
+# 	_: Null — Unused marker.
+# Return:
+# 	_Mw — Middleware function.
 let mwAccessLog = fun(_: Null) -> _Mw do
 	fun(next: _StreamFn) -> _StreamFn do
 		fun(req: Request, res: Responder, ctx: {}) -> Null do

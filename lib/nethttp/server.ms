@@ -1,13 +1,16 @@
-# Server lifecycle (HTTP/1.1 MVP)
+# nethttp/server — HTTP/1.1 server lifecycle (minimal viable implementation)
 #
-# NOTE: Split from nethttp.ms without behavior changes.
-# This pass tightens types only.
+# This module wires a router to a plain TCP listener and serves HTTP/1.1.
+# Behavior mirrors the original implementation; only naming, docs, and comments
+# were polished to follow conventions.
 
-let core = import("nethttp/router")
-let _getHeader = core._getHeader
+let router = import("nethttp/router")
+let _getHeader = router._getHeader
 
+# Private server handle state.
 let _ServerHandle = type {listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}
 
+# Map status code to reason phrase (polished list; logic unchanged).
 let _reason = fun(code: Int) -> Str do
 	if code == 200 then
 		"OK"
@@ -40,6 +43,7 @@ let _reason = fun(code: Int) -> Str do
 	end
 end
 
+# Trim a trailing CR from a line (HTTP/1.x CRLF handling).
 let _trimCR = fun(s: Str) -> Str do
 	let n = len(s)
 	if n > 0 and substr(s, n - 1, n) == "\r" then
@@ -49,10 +53,12 @@ let _trimCR = fun(s: Str) -> Str do
 	end
 end
 
+# Header value must not contain CR/LF.
 let _validHeaderValue = fun(v: Str) -> Bool do
 	match("\r|\n", v) == []
 end
 
+# Read a single line and enforce a remaining-byte budget (if provided).
 let _readLineLimited = fun(c: Any, remaining: Int?) -> Str? do
 	let line = readLine(c)
 	if line == null then
@@ -68,6 +74,8 @@ let _readLineLimited = fun(c: Any, remaining: Int?) -> Str? do
 	s
 end
 
+# Read request headers up to byte and count limits.
+# Returns map of headers, or special keys "__too_many__" / "__cl_conflict__".
 let _readHeaders = fun(c: Any, maxBytes: Int, maxCount: Int?) -> {}? do
 	let headers = {}
 	let budget = maxBytes
@@ -99,6 +107,7 @@ let _readHeaders = fun(c: Any, maxBytes: Int, maxCount: Int?) -> {}? do
 	headers
 end
 
+# Parse the request-target into path/query. Absolute-form is rejected higher up.
 let _parseTarget = fun(t: Str) -> {path!: Str, query: Str?, absolute: Bool?} do
 	if match("^[a-zA-Z][a-zA-Z0-9+.-]*://", t) != [] then
 		return {absolute: true, path: "/", query: null}
@@ -113,6 +122,7 @@ let _parseTarget = fun(t: Str) -> {path!: Str, query: Str?, absolute: Bool?} do
 	{path: path, query: query}
 end
 
+# Read request body using Content-Length with a hard cap.
 let _readBodyContentLength = fun(c: Any, n: Int, cap: Int) -> Str? do
 	let want = if n > cap then cap else n end
 	let buf = ""
@@ -131,7 +141,9 @@ let _readBodyContentLength = fun(c: Any, n: Int, cap: Int) -> Str? do
 	buf
 end
 
-# Headers-only parse; body is read later (after 100-continue if any)
+# Headers-only request parse; body is handled later (after 100-continue if any).
+# On success returns {req, wantCL, keepAlive}; on structured errors returns a map
+# with flags handled by the caller.
 let _readRequest = fun(conn: Any, opts: {}) -> {}? do
 	let line = readLine(conn)
 	if line == null then
@@ -196,6 +208,7 @@ let _readRequest = fun(conn: Any, opts: {}) -> {}? do
 	}
 end
 
+# Write a complete response (status line, headers, body). Validates header values.
 let _writeResponse = fun(conn: Any, res: {status!: Int, headers!: {}, body!: Str}, opts: {}) -> Bool do
 	let status = int(res.status)
 	let headers = clone(res.headers)
@@ -233,6 +246,7 @@ let _writeResponse = fun(conn: Any, res: {status!: Int, headers!: {}, body!: Str
 	true
 end
 
+# Remove a connection from the active list (by identity).
 let _removeConn = fun(arr: [Any], c: Any) -> [Any] do
 	let out = []
 	let i = 0
@@ -246,6 +260,7 @@ let _removeConn = fun(arr: [Any], c: Any) -> [Any] do
 	out
 end
 
+# Handle a single TCP connection: parse->route->respond loop.
 let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 	while true do
 		let rr = _readRequest(conn, server.opts)
@@ -309,7 +324,7 @@ let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 
 		# Buffered value route
 		let out = rtr._entryCall(req)
-		# Auto-HEAD for value routes: same headers (with accurate Content-Length), no body
+		# Auto-HEAD for value routes: same headers (accurate Content-Length), no body
 		if req.method == "HEAD" then
 			let hdr = clone(out.headers)
 			if not mapHas(hdr, "Content-Length") then
@@ -332,7 +347,28 @@ let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 	null
 end
 
-# Start an HTTP/1.1 server with a router.
+# serve — Start an HTTP/1.1 server with a router on a TCP listener.
+#
+# Summary:
+# 	Spawns an accept loop and per-connection handler loops. Supports basic
+# 	limits (headers/body/start-line), 100-continue preflight, value and
+# 	stream routes, keep-alive, and optional Date header injection.
+#
+# Args:
+# 	listener: Any — TCP listener handle returned by netListen.
+# 	r: {} — A router value created by nethttp/router.
+# 	opts: {} — {
+# 		readHeaderTimeoutMs?: Int,
+# 		writeTimeoutMs?: Int,
+# 		idleTimeoutMs?: Int,
+# 		maxHeaderBytes?: Int (default 8192),
+# 		maxBodyBytes?: Int (default 1048576),
+# 		maxStartLineBytes?: Int?,
+# 		maxHeaders?: Int?,
+# 		addDateHeader?: Bool?  # when true, adds Date header to responses
+# 	}
+# Return:
+# 	_ServerHandle? — Handle used for shutdown; null on invalid inputs.
 let serve = fun(listener: Any, r: {}, opts: {}) -> _ServerHandle? do
 	if listener == null then
 		return null
@@ -366,7 +402,17 @@ let serve = fun(listener: Any, r: {}, opts: {}) -> _ServerHandle? do
 	server
 end
 
-# Gracefully shut down a server, closing the listener and active connections.
+# shutdown — Gracefully stop the server and close active connections.
+#
+# Summary:
+# 	Stops new accepts, closes the listener, and best-effort closes all
+# 	active connections. No wait on in-flight work is enforced here.
+#
+# Args:
+# 	server: _ServerHandle? — Handle returned by serve.
+# 	timeoutMs: Int? — Unused placeholder for future coordination.
+# Return:
+# 	Bool — true when the shutdown sequence ran (idempotent).
 let shutdown = fun(server: _ServerHandle?, timeoutMs: Int?) -> Bool do
 	if server == null then
 		return true
@@ -382,5 +428,3 @@ let shutdown = fun(server: _ServerHandle?, timeoutMs: Int?) -> Bool do
 	server.conns = []
 	true
 end
-
-

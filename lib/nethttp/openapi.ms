@@ -1,18 +1,25 @@
-# openapi — build OpenAPI 3.1 from RouteSpec[]
+# openapi — build an OpenAPI 3.1 document from RouteSpec[]
+#
+# This module converts a router’s structured route metadata into an
+# OpenAPI 3.1 document. It does not inspect handlers; it only uses the
+# provided route specifications and contracts.
 
 # -------------------------------------------------
-# Types (strict but open)
+# Public types (data-only)
 # -------------------------------------------------
 
+# RouteContract — optional bind/validation contract per route.
+# Fields are Types or open objects as noted. Missing fields mean “no constraint”.
 let RouteContract = type {
 	path: Type?,
 	query: Type?,
 	headers: Type?,
 	cookies: Type?,
-	body: Any?,           # router accepts Type or object; we normalize here
+	body: Any?,           # Router accepts Type or object; normalized here.
 	responses: {}?        # code -> Any (Type or object)
 }
 
+# RouteSpec — a single route’s public metadata used to generate OpenAPI.
 let RouteSpec = type {
 	method!: Str,
 	pattern!: Str,
@@ -27,12 +34,14 @@ let RouteSpec = type {
 	x: {}?
 }
 
+# Info — top-level OpenAPI info block.
 let Info = type {
 	title!: Str,
 	version!: Str,
 	description: Str?
 }
 
+# SpecOpts — optional module-wide OpenAPI options.
 let SpecOpts = type {
 	validationErrorSchema: Type?,
 	securitySchemes: {}?,
@@ -41,7 +50,7 @@ let SpecOpts = type {
 }
 
 # -------------------------------------------------
-# Helpers (small and focused)
+# Internal helpers
 # -------------------------------------------------
 
 let _segs = fun(p: Str) -> [Str] do
@@ -203,7 +212,7 @@ let _synthPath = fun(ps: [ {} ], pat: Str) -> [ {} ] do
 	out
 end
 
-# Request body builder
+# Build the OpenAPI requestBody entry from a declared body definition.
 let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
 	if isType(def, type Type) then
 		return {required: true, content: {"application/json": {schema: _ref(reg, comps, def)}}}
@@ -232,7 +241,7 @@ let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
 	{required: req, content: m2}
 end
 
-# Response builder
+# Build one OpenAPI response entry for a status code and value.
 let _resp = fun(code: Str, v: Any, reg: {}, comps: {}) -> {} do
 	if code == "204" then
 		return {description: "No Content", content: null}
@@ -296,9 +305,22 @@ let _opId = fun(m: Str, p: Str) -> Str do
 end
 
 # -------------------------------------------------
-# Public: build OpenAPI doc from RouteSpec[]
+# Public API
 # -------------------------------------------------
 
+# spec — Build an OpenAPI 3.1 document for a set of routes.
+#
+# Args:
+# 	routes: [RouteSpec] — Collected route specs (value/stream).
+# 	info: Info — Top-level API info (title/version/description).
+# 	servers: [Str]? — Optional server URLs (e.g., "https://api.example.com").
+# 	opts: SpecOpts? — Optional OpenAPI generation options:
+# 		- validationErrorSchema?: Type — schema for 422 responses.
+# 		- securitySchemes?: {} — OpenAPI components.securitySchemes.
+# 		- security?: [ {} ] — Global security requirement objects.
+# 		- x?: {} — Vendor extensions added to top-level doc.
+# Return:
+# 	{} — Fully formed OpenAPI 3.1 document.
 let spec = fun(routes: [RouteSpec], info: Info, servers: [Str]?, opts: SpecOpts?) -> {} do
 	let paths = {}
 	let comps = {}

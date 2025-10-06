@@ -1,8 +1,10 @@
 === BEGIN FILE: lib/nethttp.ms ===
-# nethttp — façade module
+# nethttp — public façade for router, middleware, and server
 #
-# LESS IS MORE: this file only wires the split modules together and
-# preserves the original public surface without changing behavior.
+# Provides a stable, minimal API by re-exporting selected symbols from:
+# - nethttp/router
+# - nethttp/middleware
+# - nethttp/server
 #
 # Public surface:
 #   router(opts?), contract(), testClient()
@@ -10,66 +12,203 @@
 #   serve(), shutdown()
 #   mwRecover(), mwRequestID(), mwTimeout(), mwCors(), mwAccessLog()
 
-let R = import("nethttp/router")
-let M = import("nethttp/middleware")
-let S = import("nethttp/server")
+let router = import("nethttp/router")
+let mw = import("nethttp/middleware")
+let server = import("nethttp/server")
 
 # =========================
 # Types (re-export)
 # =========================
 
-let Request   = R.Request         # type alias
-let Responder = R.Responder       # type alias
-let Contract  = R.Contract        # type alias
+# HTTP request shape passed to handlers (re-exported).
+let Request = router.Request
+
+# Streaming responder interface presented to handlers (re-exported).
+let Responder = router.Responder
+
+# Marker type for route contracts (re-exported).
+let Contract = router.Contract
 
 # =========================
 # Router / contracts / helpers / tests (re-export)
 # =========================
 
-let router     = R.router         # ({}?) -> {}
-let contract   = R.contract       # Contract -> Contract
-let testClient = R.testClient     # ({}) -> {call!: {} -> {}}
+# Create a new router.
+# 
+# Args:
+# 	opts: {}? — Optional router options:
+# 		- docs.enabled?: Bool (default true)
+# 		- docs.path?: Str (default "/openapi.json")
+# 		- docs.info?: {title!: Str, version!: Str, description?: Str}
+# 		- docs.servers?: [Str]
+# 		- docs.opts?: {}
+# Return:
+# 	{} — Router instance with route/routeStream/mount/use methods.
+let makeRouter = router.router
 
-let json       = R.json           # Int -> Any -> {}
-let text       = R.text           # Int -> Str -> {}
-let noContent  = R.noContent      # Null -> {}
-let redirect   = R.redirect       # Int -> Str -> {}
-let raise      = R.raise          # Int -> Str -> {}
+# Wrap a route contract to mark path/query/headers/cookies/body/responses.
+#
+# Args:
+# 	c: Contract — Contract object describing bindings and response types.
+# Return:
+# 	Contract — Same contract (marker wrapper).
+let contract = router.contract
+
+# Build a simple, in-memory test client for a router.
+#
+# Args:
+# 	r: {} — Router instance.
+# Return:
+# 	{call!: {} -> {status!: Int, headers!: {}, body!: Str}} — Test client.
+let testClient = router.testClient
+
+# Create a JSON response with status code.
+#
+# Args:
+# 	status: Int — HTTP status.
+# 	value: Any — Value to JSON-encode as body.
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let json = router.json
+
+# Create a plain-text response with status code.
+#
+# Args:
+# 	status: Int — HTTP status.
+# 	s: Str — Response body as text.
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let text = router.text
+
+# Create a 204 No Content response.
+#
+# Args:
+# 	_: Null — Placeholder (unused).
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let noContent = router.noContent
+
+# Create a redirect response (path-only policy).
+#
+# Args:
+# 	status: Int — Redirect status (e.g., 302).
+# 	location: Str — Absolute path starting with '/'.
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let redirect = router.redirect
+
+# Create a structured HTTP error to be returned by handlers.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	message: Str — Text body.
+# Return:
+# 	{__http_error__!: Bool, status!: Int, body!: Str, headers!: {}} — Error object.
+let raise = router.raise
 
 # =========================
 # Middleware (re-export)
 # =========================
 
-let mwRecover   = M.mwRecover     # Null -> (R._StreamFn -> R._StreamFn)
-let mwRequestID = M.mwRequestID   # Str -> (R._StreamFn -> R._StreamFn)
-let mwTimeout   = M.mwTimeout     # Int -> (R._StreamFn -> R._StreamFn)
-let mwCors      = M.mwCors        # {} -> (R._StreamFn -> R._StreamFn)
-let mwAccessLog = M.mwAccessLog   # Null -> (R._StreamFn -> R._StreamFn)
+# Recover from handler panics and return 500.
+#
+# Args:
+# 	_: Null — Placeholder (unused).
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwRecover = mw.mwRecover
+
+# Inject or propagate a request ID via a header.
+#
+# Args:
+# 	headerName: Str — Header name to use (e.g., "X-Request-ID").
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwRequestID = mw.mwRequestID
+
+# Emit 504 if no bytes are written by the deadline.
+#
+# Args:
+# 	ms: Int — Timeout in milliseconds.
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwTimeout = mw.mwTimeout
+
+# Add CORS headers and handle OPTIONS.
+#
+# Args:
+# 	opts: {} — {origin?: Str, methods?: [Str], headers?: [Str], credentials?: Bool}
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwCors = mw.mwCors
+
+# Access log after response with status/bytes/duration.
+#
+# Args:
+# 	_: Null — Placeholder (unused).
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwAccessLog = mw.mwAccessLog
 
 # =========================
 # Server lifecycle (re-export)
 # =========================
 
-let serve    = S.serve            # Any -> {} -> {} -> {}?
-let shutdown = S.shutdown         # {}? -> Int? -> Bool
+# Serve HTTP/1.1 with the given listener and router.
+#
+# Args:
+# 	listener: Any — TCP listener handle from netListen("host:port").
+# 	r: {} — Router instance produced by makeRouter().
+# 	opts: {} — Server options:
+# 		- readHeaderTimeoutMs?: Int
+# 		- writeTimeoutMs?: Int
+# 		- idleTimeoutMs?: Int
+# 		- maxHeaderBytes?: Int (default 8192)
+# 		- maxBodyBytes?: Int (default 1048576)
+# 		- maxStartLineBytes?: Int?
+# 		- maxHeaders?: Int?
+# 		- addDateHeader?: Bool?
+# Return:
+# 	{listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}? — Server handle, or null on error.
+let serve = server.serve
+
+# Gracefully shut down a server, closing the listener and active connections.
+#
+# Args:
+# 	srv: {listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}? — Server handle or null.
+# 	timeoutMs: Int? — Optional timeout (currently best-effort).
+# Return:
+# 	Bool — True when shutdown is complete or server was null.
+let shutdown = server.shutdown
+
+# Back-compat exported name (router constructor) — maintained for users of the old surface.
+# Prefer makeRouter() for clarity; both reference the same function.
+let router = makeRouter
 === END FILE: lib/nethttp.ms ===
 
 === BEGIN FILE: lib/nethttp/openapi.ms ===
-# openapi — build OpenAPI 3.1 from RouteSpec[]
+# openapi — build an OpenAPI 3.1 document from RouteSpec[]
+#
+# This module converts a router’s structured route metadata into an
+# OpenAPI 3.1 document. It does not inspect handlers; it only uses the
+# provided route specifications and contracts.
 
 # -------------------------------------------------
-# Types (strict but open)
+# Public types (data-only)
 # -------------------------------------------------
 
+# RouteContract — optional bind/validation contract per route.
+# Fields are Types or open objects as noted. Missing fields mean “no constraint”.
 let RouteContract = type {
 	path: Type?,
 	query: Type?,
 	headers: Type?,
 	cookies: Type?,
-	body: Any?,           # router accepts Type or object; we normalize here
+	body: Any?,           # Router accepts Type or object; normalized here.
 	responses: {}?        # code -> Any (Type or object)
 }
 
+# RouteSpec — a single route’s public metadata used to generate OpenAPI.
 let RouteSpec = type {
 	method!: Str,
 	pattern!: Str,
@@ -84,12 +223,14 @@ let RouteSpec = type {
 	x: {}?
 }
 
+# Info — top-level OpenAPI info block.
 let Info = type {
 	title!: Str,
 	version!: Str,
 	description: Str?
 }
 
+# SpecOpts — optional module-wide OpenAPI options.
 let SpecOpts = type {
 	validationErrorSchema: Type?,
 	securitySchemes: {}?,
@@ -98,7 +239,7 @@ let SpecOpts = type {
 }
 
 # -------------------------------------------------
-# Helpers (small and focused)
+# Internal helpers
 # -------------------------------------------------
 
 let _segs = fun(p: Str) -> [Str] do
@@ -260,7 +401,7 @@ let _synthPath = fun(ps: [ {} ], pat: Str) -> [ {} ] do
 	out
 end
 
-# Request body builder
+# Build the OpenAPI requestBody entry from a declared body definition.
 let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
 	if isType(def, type Type) then
 		return {required: true, content: {"application/json": {schema: _ref(reg, comps, def)}}}
@@ -289,7 +430,7 @@ let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
 	{required: req, content: m2}
 end
 
-# Response builder
+# Build one OpenAPI response entry for a status code and value.
 let _resp = fun(code: Str, v: Any, reg: {}, comps: {}) -> {} do
 	if code == "204" then
 		return {description: "No Content", content: null}
@@ -353,9 +494,22 @@ let _opId = fun(m: Str, p: Str) -> Str do
 end
 
 # -------------------------------------------------
-# Public: build OpenAPI doc from RouteSpec[]
+# Public API
 # -------------------------------------------------
 
+# spec — Build an OpenAPI 3.1 document for a set of routes.
+#
+# Args:
+# 	routes: [RouteSpec] — Collected route specs (value/stream).
+# 	info: Info — Top-level API info (title/version/description).
+# 	servers: [Str]? — Optional server URLs (e.g., "https://api.example.com").
+# 	opts: SpecOpts? — Optional OpenAPI generation options:
+# 		- validationErrorSchema?: Type — schema for 422 responses.
+# 		- securitySchemes?: {} — OpenAPI components.securitySchemes.
+# 		- security?: [ {} ] — Global security requirement objects.
+# 		- x?: {} — Vendor extensions added to top-level doc.
+# Return:
+# 	{} — Fully formed OpenAPI 3.1 document.
 let spec = fun(routes: [RouteSpec], info: Info, servers: [Str]?, opts: SpecOpts?) -> {} do
 	let paths = {}
 	let comps = {}
@@ -476,15 +630,18 @@ end
 === BEGIN FILE: lib/nethttp/router.ms ===
 # nethttp/router — routing, contracts, binding, responders, OpenAPI hook
 #
-# NOTE: Behavior is unchanged. This pass only tightens types and clarifies docs.
+# This module implements a path router for value and streaming handlers.
+# It provides request/response helpers, automatic binding/validation
+# for path/query/body via contracts, response validation (optional),
+# test utilities, and OpenAPI export support.
 
-let oapi = import("nethttp/openapi")
+let openapi = import("nethttp/openapi")
 
 # =========================
 # Public types (data-only)
 # =========================
 
-# HTTP request value passed to handlers.
+# Request — immutable request value passed to handlers.
 let Request = type {
 	method!: Str,
 	url!: {scheme: Str?, host: Str?, path!: Str, query: Str?},
@@ -493,7 +650,7 @@ let Request = type {
 	pathParams: {}?
 }
 
-# Streaming responder interface for handlers.
+# Responder — streaming response interface for handlers.
 let Responder = type {
 	status!: Int -> Responder,
 	setHeader!: Str -> Str -> Responder,
@@ -502,8 +659,10 @@ let Responder = type {
 	end!: Null -> Bool?
 }
 
+# _Response — buffered response shape used by helpers and value routes.
 let _Response = type {status!: Int, headers!: {}, body!: Str}
 
+# _HttpError — structured error returned by helpers like raise().
 let _HttpError = type {
 	__http_error__!: Bool,
 	status!: Int,
@@ -511,16 +670,17 @@ let _HttpError = type {
 	headers!: {}
 }
 
-# A marker wrapper for route contracts (path/query/body/responses).
+# Contract — marker wrapper for route contracts (path/query/body/responses).
 let Contract = type {}
 
+# _Ctx — per-request context passed to handlers (bound values live here).
 let _Ctx = type {req!: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
 
 let _StreamFn = type Request -> Responder -> {} -> Null
 let _Mw = type _StreamFn -> _StreamFn
 
 # =========================
-# Utilities
+# Utilities (private)
 # =========================
 
 let _normMethod = fun(m: Str) -> Str do
@@ -584,7 +744,16 @@ let _setErr = fun(ctx: {}, r: {}) -> Null do
 	null
 end
 
-# Wrap a route contract (marker).
+# contract — Wrap a route contract (marker).
+#
+# Summary:
+# 	Return the given contract marker. This is a no-op wrapper that
+# 	just signals intent at call sites.
+#
+# Args:
+# 	c: Contract — Route contract object.
+# Return:
+# 	Contract — The same contract marker.
 let contract = fun(c: Contract) -> Contract do
 	c
 end
@@ -593,16 +762,36 @@ end
 # Error helpers (public)
 # =========================
 
+# raise — Build a structured HTTP error result.
+#
+# Summary:
+# 	Create a typed error object to be returned by value handlers.
+# 	The router will convert it into an HTTP response with the given
+# 	status and body, plus optional headers (empty here).
+#
+# Args:
+# 	status: Int — HTTP status code (e.g., 401).
+# 	message: Str — Response body as plain text.
+# Return:
+# 	{} — Structured error object (HttpError-like).
 let raise = fun(status: Int, message: Str) -> {} do
 	{__http_error__: true, status: status, body: message, headers: {}}
 end
 
+# raiseWithHeaders — Build a structured HTTP error with headers.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	message: Str — Response body as plain text.
+# 	headers: {} — Headers to set on the response.
+# Return:
+# 	{} — Structured error object.
 let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
 	{__http_error__: true, status: status, body: message, headers: headers}
 end
 
 # =========================
-# Binding helpers (internal)
+# Binding helpers (private)
 # =========================
 
 let _rawBody = fun(req: Request) -> Str? do
@@ -819,7 +1008,7 @@ end
 let _validationJSON = fun(where: Str, reason: Str?) -> Str do
 	let msg =
 		if reason == null then
-			"<validation failed>"
+			"validation failed"
 		else
 			reason
 		end
@@ -832,11 +1021,17 @@ let _validationJSON = fun(where: Str, reason: Str?) -> Str do
 	end
 end
 
-
 # =========================
-# Response helpers (for value handlers)
+# Response helpers (value handlers)
 # =========================
 
+# json — Build an application/json response with status code.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	value: Any — JSON-serializable value.
+# Return:
+# 	{} — Buffered response (status/headers/body).
 let json = fun(status: Int, value: Any) -> {} do
 	let s = _json(value)
 	if s == null then
@@ -845,14 +1040,34 @@ let json = fun(status: Int, value: Any) -> {} do
 	{status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s}
 end
 
+# text — Build a text/plain response with status code.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	s: Str — Response body.
+# Return:
+# 	{} — Buffered response.
 let text = fun(status: Int, s: Str) -> {} do
 	{status: status, headers: {"Content-Type": "text/plain"}, body: s}
 end
 
+# noContent — Build a 204 No Content response.
+#
+# Args:
+# 	_: Null — Unused.
+# Return:
+# 	{} — Buffered response with empty body.
 let noContent = fun(_: Null) -> {} do
 	{status: 204, headers: {}, body: ""}
 end
 
+# redirect — Build a redirect response with Location header.
+#
+# Args:
+# 	status: Int — Redirect status (e.g., 302).
+# 	location: Str — Absolute path starting with "/".
+# Return:
+# 	{} — Buffered response; 400 if invalid location.
 let redirect = fun(status: Int, location: Str) -> {} do
 	if len(location) == 0 or substr(location, 0, 1) != "/" then
 		return {status: 400, headers: {"Content-Type": "text/plain"}, body: "bad redirect"}
@@ -1010,7 +1225,7 @@ end
 # Router (closure-backed)
 # =========================
 
-let _mkRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
+let _makeRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
 	let m = _normMethod(method)
 	let isPrefix = len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
 	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
@@ -1105,7 +1320,23 @@ let _getHeader = fun(h: {}, name: Str) -> Str? do
 	null
 end
 
-# Create a new router (APIs typed; logic preserved).
+# router — Create a new router.
+#
+# Summary:
+# 	Construct a router instance supporting value and streaming routes,
+# 	middleware composition, nested mounting, and OpenAPI export.
+#
+# Args:
+# 	opts: {}? — Optional:
+# 		docs?: {
+# 			enabled?: Bool (default true),
+# 			path?: Str (default "/openapi.json"),
+# 			info?: openapi.Info (default {title:"API", version:"0.1.0"}),
+# 			servers?: [Str] (default []),
+# 			opts?: openapi.SpecOpts (default {})
+# 		}
+# Return:
+# 	{} — Router instance with route/routeStream/mount/use/test helpers.
 let router = fun(opts: {}?) -> {} do
 	let o = if opts == null then {} else opts end
 	let dIn = if mapHas(o, "docs") and o.docs != null then o.docs else {} end
@@ -1123,7 +1354,7 @@ let router = fun(opts: {}?) -> {} do
 	let _specRoutes = []
 
 	let _buildSpec = fun(_: Null) -> {} do
-		oapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
+		openapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
 	end
 
 	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
@@ -1373,6 +1604,15 @@ let router = fun(opts: {}?) -> {} do
 	let api = {
 		__kind: "nethttp.router",
 
+		# route — Register a value route that returns a buffered result.
+		#
+		# Args:
+		# 	method: Str — HTTP method (GET/POST/...).
+		# 	pattern: Str — Path pattern (supports {param} and {*catch}).
+		# 	c: Contract — Optional contract (binding/validation).
+		# 	handler: Request -> {} -> Any — Returns Any or _Response/_HttpError.
+		# Return:
+		# 	Bool — true on success.
 		route: fun(method: Str, pattern: Str, c: Contract, handler: Request -> {} -> Any) -> Bool do
 			let parts = _splitPath(pattern)
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -1440,10 +1680,19 @@ let router = fun(opts: {}?) -> {} do
 				null
 			end
 			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "value", c)]
-			_routes = _routes + [_mkRoute(method, pattern, stream, "value", c)]
+			_routes = _routes + [_makeRoute(method, pattern, stream, "value", c)]
 			true
 		end,
 
+		# routeStream — Register a streaming route.
+		#
+		# Args:
+		# 	method: Str — HTTP method.
+		# 	pattern: Str — Path pattern.
+		# 	c: Contract — Optional contract.
+		# 	handler: Request -> Responder -> {} -> Null — Performs streaming writes.
+		# Return:
+		# 	Bool — true on success.
 		routeStream: fun(method: Str, pattern: Str, c: Contract, handler: Request -> Responder -> {} -> Null) -> Bool do
 			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
 				let r = try(fun(_: Null) do handler(req, res, ctx) end)
@@ -1456,24 +1705,39 @@ let router = fun(opts: {}?) -> {} do
 				null
 			end
 			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "stream", c)]
-			_routes = _routes + [_mkRoute(method, pattern, stream, "stream", c)]
+			_routes = _routes + [_makeRoute(method, pattern, stream, "stream", c)]
 			true
 		end,
 
+		# mount — Mount a child router at a fixed prefix.
+		#
+		# Args:
+		# 	prefix: Str — Path prefix (e.g., "/v1").
+		# 	child: {} — Router returned by router().
+		# Return:
+		# 	Bool — true on success.
 		mount: fun(prefix: Str, child: {}) -> Bool do
 			_mounts = _mounts + [{prefixParts: _splitPath(prefix), child: child}]
 			true
 		end,
 
+		# use — Register a streaming-friendly middleware.
+		#
+		# Args:
+		# 	mw: _Mw — Middleware function.
+		# Return:
+		# 	Bool — true on success.
 		use: fun(mw: _Mw) -> Bool do
 			_mws = _mws + [mw]
 			true
 		end,
 
+		# _entryCall — Buffered entrypoint used by the server and tests.
 		_entryCall: fun(req: Request) -> _Response do
 			_entryCore(req)
 		end,
 
+		# _entryCallStream — Streaming entrypoint for server-side use.
 		_entryCallStream: fun(req: Request, conn: Any, opts: {}) -> {}? do
 			let m = _matchLocal(req.method, req.url.path)
 			if m == null then
@@ -1530,10 +1794,12 @@ let router = fun(opts: {}?) -> {} do
 			{streamed: true}
 		end,
 
+		# _dump — Internal debugging: returns routes and middleware stacks.
 		_dump: fun(_: Null) -> {} do
 			{routes: _routes, mws: _mws}
 		end,
 
+		# _preflight — Lightweight contract-only check used for 100-continue.
 		_preflight: fun(req: Request) -> {ok!: Bool} do
 			_preflight(req)
 		end
@@ -1569,6 +1835,15 @@ end
 # Test client (buffered)
 # =========================
 
+# testClient — Build a buffered test client for a router.
+#
+# Summary:
+# 	Allows issuing synthetic requests against a router without sockets.
+#
+# Args:
+# 	r: {} — Router returned by router().
+# Return:
+# 	{} — {call!: (req:{method?:Str, path?:Str, headers?:{}, body?:Str}) -> {status:Int, headers:{}, body:Str}}
 let testClient = fun(r: {}) -> {} do
 	let call = fun(req: {}) -> {} do
 		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
@@ -1594,19 +1869,35 @@ end
 
 === BEGIN FILE: lib/nethttp/middleware.ms ===
 # nethttp/middleware — streaming-friendly middleware built on router core
+#
+# This module provides common streaming-compatible middleware:
+#   - mwRecover: convert handler panics to 500 responses
+#   - mwRequestID: inject/propagate a request identifier header
+#   - mwTimeout: emit 504 if nothing was written before a deadline
+#   - mwCors: add CORS headers and handle OPTIONS preflights
+#   - mwAccessLog: log method/route/status/bytes/duration after responses
 
-let core = import("nethttp/router")
+let router = import("nethttp/router")
 
-# Reuse core types and helpers
-let Request   = core.Request
-let Responder = core.Responder
-let _StreamFn = core._StreamFn
-let _Mw       = core._Mw
+# Re-exported core types and internal helpers (private to this module).
+let Request   = router.Request
+let Responder = router.Responder
+let _StreamFn = router._StreamFn
+let _Mw       = router._Mw
 
-let _getHeader = core._getHeader
-let _setErr    = core._setErr
+let _getHeader = router._getHeader
+let _setErr    = router._setErr
 
-# Recover middleware — converts handler panics to 500 responses.
+# mwRecover — Recover from panics and return 500.
+#
+# Summary:
+# 	Wraps a streaming handler to catch panics and convert them to
+# 	"500 internal server error" responses. Intended as the first middleware.
+#
+# Args:
+# 	_: Null — Unused marker.
+# Return:
+# 	_Mw — Middleware function: (_StreamFn) -> _StreamFn.
 let mwRecover = fun(_: Null) -> _Mw do
 	fun(next: _StreamFn) -> _StreamFn do
 		fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -1623,7 +1914,16 @@ let mwRecover = fun(_: Null) -> _Mw do
 	end
 end
 
-# Request ID middleware — injects/propagates a request identifier.
+# mwRequestID — Inject or propagate a request identifier.
+#
+# Summary:
+# 	Sets a request/response header with a request id. If the incoming request
+# 	already has the header, it is propagated; otherwise a new id is generated.
+#
+# Args:
+# 	headerName: Str — Header key to use (e.g., "X-Request-ID").
+# Return:
+# 	_Mw — Middleware function.
 let mwRequestID = fun(headerName: Str) -> _Mw do
 	let name = headerName
 	fun(next: _StreamFn) -> _StreamFn do
@@ -1638,7 +1938,16 @@ let mwRequestID = fun(headerName: Str) -> _Mw do
 	end
 end
 
-# Timeout middleware — emits 504 if no bytes were written by the deadline.
+# mwTimeout — Emit 504 if no bytes were written before the deadline.
+#
+# Summary:
+# 	Tracks writes on the response; if the deadline passes and no bytes
+# 	were sent, it emits a "504 timeout" response automatically.
+#
+# Args:
+# 	ms: Int — Timeout in milliseconds.
+# Return:
+# 	_Mw — Middleware function.
 let mwTimeout = fun(ms: Int) -> _Mw do
 	let dur = ms
 	fun(next: _StreamFn) -> _StreamFn do
@@ -1725,8 +2034,22 @@ let mwTimeout = fun(ms: Int) -> _Mw do
 	end
 end
 
-# CORS middleware — adds Access-Control-* headers and handles OPTIONS.
-# opts: {origin: Str?, methods: [Str]?, headers: [Str]?, credentials: Bool?}
+# mwCors — Add CORS headers and handle OPTIONS preflights.
+#
+# Summary:
+# 	Sets Access-Control-* headers on all responses and short-circuits
+# 	OPTIONS requests with 204 No Content. When credentials are enabled,
+# 	the Origin is reflected and Vary: Origin is set.
+#
+# Args:
+# 	opts: {} — {
+# 		origin?: Str (default "*"),
+# 		methods?: [Str] (default "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+# 		headers?: [Str] (default "Content-Type, Authorization"),
+# 		credentials?: Bool (default false)
+# 	}
+# Return:
+# 	_Mw — Middleware function.
 let mwCors = fun(opts: {}) -> _Mw do
 	let originOpt = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
 	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
@@ -1764,7 +2087,17 @@ let mwCors = fun(opts: {}) -> _Mw do
 	end
 end
 
-# Access log middleware — logs after response with status/bytes/duration.
+# mwAccessLog — Log status, bytes, and duration after responses.
+#
+# Summary:
+# 	Wraps a handler to record method/route/bytes/status/duration and prints
+# 	a colored single-line entry after the response completes. Non-2xx
+# 	responses also print an error context if available.
+#
+# Args:
+# 	_: Null — Unused marker.
+# Return:
+# 	_Mw — Middleware function.
 let mwAccessLog = fun(_: Null) -> _Mw do
 	fun(next: _StreamFn) -> _StreamFn do
 		fun(req: Request, res: Responder, ctx: {}) -> Null do
@@ -1827,16 +2160,19 @@ end
 === END FILE: lib/nethttp/middleware.ms ===
 
 === BEGIN FILE: lib/nethttp/server.ms ===
-# Server lifecycle (HTTP/1.1 MVP)
+# nethttp/server — HTTP/1.1 server lifecycle (minimal viable implementation)
 #
-# NOTE: Split from nethttp.ms without behavior changes.
-# This pass tightens types only.
+# This module wires a router to a plain TCP listener and serves HTTP/1.1.
+# Behavior mirrors the original implementation; only naming, docs, and comments
+# were polished to follow conventions.
 
-let core = import("nethttp/router")
-let _getHeader = core._getHeader
+let router = import("nethttp/router")
+let _getHeader = router._getHeader
 
+# Private server handle state.
 let _ServerHandle = type {listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}
 
+# Map status code to reason phrase (polished list; logic unchanged).
 let _reason = fun(code: Int) -> Str do
 	if code == 200 then
 		"OK"
@@ -1869,6 +2205,7 @@ let _reason = fun(code: Int) -> Str do
 	end
 end
 
+# Trim a trailing CR from a line (HTTP/1.x CRLF handling).
 let _trimCR = fun(s: Str) -> Str do
 	let n = len(s)
 	if n > 0 and substr(s, n - 1, n) == "\r" then
@@ -1878,10 +2215,12 @@ let _trimCR = fun(s: Str) -> Str do
 	end
 end
 
+# Header value must not contain CR/LF.
 let _validHeaderValue = fun(v: Str) -> Bool do
 	match("\r|\n", v) == []
 end
 
+# Read a single line and enforce a remaining-byte budget (if provided).
 let _readLineLimited = fun(c: Any, remaining: Int?) -> Str? do
 	let line = readLine(c)
 	if line == null then
@@ -1897,6 +2236,8 @@ let _readLineLimited = fun(c: Any, remaining: Int?) -> Str? do
 	s
 end
 
+# Read request headers up to byte and count limits.
+# Returns map of headers, or special keys "__too_many__" / "__cl_conflict__".
 let _readHeaders = fun(c: Any, maxBytes: Int, maxCount: Int?) -> {}? do
 	let headers = {}
 	let budget = maxBytes
@@ -1928,6 +2269,7 @@ let _readHeaders = fun(c: Any, maxBytes: Int, maxCount: Int?) -> {}? do
 	headers
 end
 
+# Parse the request-target into path/query. Absolute-form is rejected higher up.
 let _parseTarget = fun(t: Str) -> {path!: Str, query: Str?, absolute: Bool?} do
 	if match("^[a-zA-Z][a-zA-Z0-9+.-]*://", t) != [] then
 		return {absolute: true, path: "/", query: null}
@@ -1942,6 +2284,7 @@ let _parseTarget = fun(t: Str) -> {path!: Str, query: Str?, absolute: Bool?} do
 	{path: path, query: query}
 end
 
+# Read request body using Content-Length with a hard cap.
 let _readBodyContentLength = fun(c: Any, n: Int, cap: Int) -> Str? do
 	let want = if n > cap then cap else n end
 	let buf = ""
@@ -1960,7 +2303,9 @@ let _readBodyContentLength = fun(c: Any, n: Int, cap: Int) -> Str? do
 	buf
 end
 
-# Headers-only parse; body is read later (after 100-continue if any)
+# Headers-only request parse; body is handled later (after 100-continue if any).
+# On success returns {req, wantCL, keepAlive}; on structured errors returns a map
+# with flags handled by the caller.
 let _readRequest = fun(conn: Any, opts: {}) -> {}? do
 	let line = readLine(conn)
 	if line == null then
@@ -2025,6 +2370,7 @@ let _readRequest = fun(conn: Any, opts: {}) -> {}? do
 	}
 end
 
+# Write a complete response (status line, headers, body). Validates header values.
 let _writeResponse = fun(conn: Any, res: {status!: Int, headers!: {}, body!: Str}, opts: {}) -> Bool do
 	let status = int(res.status)
 	let headers = clone(res.headers)
@@ -2062,6 +2408,7 @@ let _writeResponse = fun(conn: Any, res: {status!: Int, headers!: {}, body!: Str
 	true
 end
 
+# Remove a connection from the active list (by identity).
 let _removeConn = fun(arr: [Any], c: Any) -> [Any] do
 	let out = []
 	let i = 0
@@ -2075,6 +2422,7 @@ let _removeConn = fun(arr: [Any], c: Any) -> [Any] do
 	out
 end
 
+# Handle a single TCP connection: parse->route->respond loop.
 let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 	while true do
 		let rr = _readRequest(conn, server.opts)
@@ -2138,7 +2486,7 @@ let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 
 		# Buffered value route
 		let out = rtr._entryCall(req)
-		# Auto-HEAD for value routes: same headers (with accurate Content-Length), no body
+		# Auto-HEAD for value routes: same headers (accurate Content-Length), no body
 		if req.method == "HEAD" then
 			let hdr = clone(out.headers)
 			if not mapHas(hdr, "Content-Length") then
@@ -2161,7 +2509,28 @@ let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
 	null
 end
 
-# Start an HTTP/1.1 server with a router.
+# serve — Start an HTTP/1.1 server with a router on a TCP listener.
+#
+# Summary:
+# 	Spawns an accept loop and per-connection handler loops. Supports basic
+# 	limits (headers/body/start-line), 100-continue preflight, value and
+# 	stream routes, keep-alive, and optional Date header injection.
+#
+# Args:
+# 	listener: Any — TCP listener handle returned by netListen.
+# 	r: {} — A router value created by nethttp/router.
+# 	opts: {} — {
+# 		readHeaderTimeoutMs?: Int,
+# 		writeTimeoutMs?: Int,
+# 		idleTimeoutMs?: Int,
+# 		maxHeaderBytes?: Int (default 8192),
+# 		maxBodyBytes?: Int (default 1048576),
+# 		maxStartLineBytes?: Int?,
+# 		maxHeaders?: Int?,
+# 		addDateHeader?: Bool?  # when true, adds Date header to responses
+# 	}
+# Return:
+# 	_ServerHandle? — Handle used for shutdown; null on invalid inputs.
 let serve = fun(listener: Any, r: {}, opts: {}) -> _ServerHandle? do
 	if listener == null then
 		return null
@@ -2195,7 +2564,17 @@ let serve = fun(listener: Any, r: {}, opts: {}) -> _ServerHandle? do
 	server
 end
 
-# Gracefully shut down a server, closing the listener and active connections.
+# shutdown — Gracefully stop the server and close active connections.
+#
+# Summary:
+# 	Stops new accepts, closes the listener, and best-effort closes all
+# 	active connections. No wait on in-flight work is enforced here.
+#
+# Args:
+# 	server: _ServerHandle? — Handle returned by serve.
+# 	timeoutMs: Int? — Unused placeholder for future coordination.
+# Return:
+# 	Bool — true when the shutdown sequence ran (idempotent).
 let shutdown = fun(server: _ServerHandle?, timeoutMs: Int?) -> Bool do
 	if server == null then
 		return true
@@ -2211,8 +2590,6 @@ let shutdown = fun(server: _ServerHandle?, timeoutMs: Int?) -> Bool do
 	server.conns = []
 	true
 end
-
-
 === END FILE: lib/nethttp/server.ms ===
 
 === BEGIN FILE: lib/nethttp_test.ms ===

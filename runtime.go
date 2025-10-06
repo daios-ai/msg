@@ -95,12 +95,6 @@ func (ip *Interpreter) SeedRuntimeInto(target *Env) error {
 	return nil
 }
 
-// LoadPrelude resolves `spec` and evaluates it into the interpreter's Global
-// (kept for compatibility). Prefer LoadPreludeInto for explicit targets.
-func (ip *Interpreter) LoadPrelude(spec string, importer string) error {
-	return ip.LoadPreludeInto(ip.Global, spec, importer)
-}
-
 // LoadPreludeInto resolves `spec`, parses it with spans, and evaluates it
 // into the provided `target` environment (NOT Core). Errors are pretty-printed.
 func (ip *Interpreter) LoadPreludeInto(target *Env, spec string, importer string) error {

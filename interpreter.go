@@ -870,7 +870,13 @@ func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
 func (ip *Interpreter) buildBaseTemplate() error {
 	tmpl := NewEnv(ip.Core)
 	tmpl.SealParentWrites()
+
+	ip.baseTemplate = tmpl
+
 	ip.SeedRuntimeInto(tmpl)
+	if err := ip.SeedRuntimeInto(tmpl); err != nil {
+		return err
+	}
 	ip.baseTemplate = tmpl
 	return nil
 }

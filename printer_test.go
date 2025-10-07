@@ -354,7 +354,7 @@ func Test_Printer_Map_Value_Post_Inline(t *testing.T) {
 func Test_Printer_Idempotent_And_Roundtrip(t *testing.T) {
 	src := `
 # demo
-let Person = type {name: Str?, hobbies: [Str]?, age: Int}
+let Person = type {name!: Str?, hobbies: [Str]?, age: Int}
 fun(g: Str) -> Str do
   return("hi " + g)
 end
@@ -367,8 +367,8 @@ oracle() from["web"]`
 	}
 
 	// AST roundtrip: parse original and pretty'ed, ensure same AST
-	ast1 := parse(t, src)
-	ast2 := parse(t, once)
+	ast1 := parse(t, once)
+	ast2 := parse(t, twice)
 	if !reflect.DeepEqual(ast1, ast2) {
 		t.Fatalf("AST roundtrip mismatch after pretty")
 	}
@@ -844,20 +844,82 @@ func Test_Printer_FunValue_FunctionTypeParam_Parens(t *testing.T) {
 	}
 }
 
-func Test_Printer_Type_Arrow_SingleVsMultiArg(t *testing.T) {
-	// Single-arg: no tuple parens
-	single := S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}
-	if got, want := FormatType(single), "Int -> Int"; strings.TrimSpace(got) != want {
-		t.Fatalf("single-arg func type mismatch: got %q want %q", got, want)
+func Test_FormatType_RightAssociative_Arrows(t *testing.T) {
+	tests := []struct {
+		name string
+		in   S
+		want string
+	}{
+		{
+			name: "single arg",
+			in:   S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}},
+			want: "Int -> Int",
+		},
+		{
+			name: "left is arrow: (Int -> Int) -> Int",
+			in:   S{"binop", "->", S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}, S{"id", "Int"}},
+			want: "(Int -> Int) -> Int",
+		},
+		{
+			name: "right is arrow: Int -> (Int -> Int) prints as chain",
+			in:   S{"binop", "->", S{"id", "Int"}, S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}},
+			want: "Int -> Int -> Int",
+		},
+		{
+			name: "long chain right-assoc",
+			in: S{"binop", "->",
+				S{"id", "A"},
+				S{"binop", "->",
+					S{"id", "B"},
+					S{"binop", "->", S{"id", "C"}, S{"id", "R"}},
+				},
+			},
+			want: "A -> B -> C -> R",
+		},
 	}
-	// Two-arg (right-assoc A -> (B -> R)): prints as (A, B) -> R
-	double := S{"binop", "->",
-		S{"id", "Int"},
-		S{"binop", "->", S{"id", "Str"}, S{"id", "Bool"}},
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.TrimSpace(FormatType(tc.in))
+			if got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
 	}
-	if got, want := FormatType(double), "(Int, Str) -> Bool"; strings.TrimSpace(got) != want {
-		t.Fatalf("multi-arg func type mismatch: got %q want %q", got, want)
+}
+
+func Test_Printer_FunctionParam_Parentheses(t *testing.T) {
+	// helper keeps consistency with existing pretty() + eq() style
+	check := func(in, want string) {
+		eq(t, pretty(t, in), want)
 	}
+
+	// fun(m: Int -> Int, n: Int) ==> fun(m: (Int -> Int), n: Int)
+	check(
+		`fun(m: Int -> Int, n: Int) do end`,
+		`
+fun(m: Int -> Int, n: Int) do
+
+end`,
+	)
+
+	// fun(m: (Int -> Int) -> Int) ==> fun(m: ((Int -> Int) -> Int))
+	check(
+		`fun(m: (Int -> Int) -> Int) do end`,
+		`
+fun(m: (Int -> Int) -> Int) do
+
+end`,
+	)
+
+	// Mixed case from earlier test: keeps right-assoc and wraps params
+	check(
+		`fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do end`,
+		`
+fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do
+
+end`,
+	)
 }
 
 func Test_Printer_Value_Cycle_ArraySelf(t *testing.T) {

@@ -820,7 +820,7 @@ func docStmt(n S) *Doc {
 		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
 		header := Concat(Text("fun("), docParams(params), Text(")"))
 		if !(tag(ret) == "id" && getId(ret) == "Any") {
-			header = Concat(header, Text(" -> "), docExpr(ret))
+			header = Concat(header, Text(" -> "), docType(ret))
 		}
 		return Concat(
 			header, Text(" do"), HardLineDoc(),
@@ -832,7 +832,7 @@ func docStmt(n S) *Doc {
 		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
 		header := Concat(Text("oracle("), docParams(params), Text(")"))
 		if !(tag(outT) == "id" && getId(outT) == "Any") {
-			header = Concat(header, Text(" -> "), docExpr(outT))
+			header = Concat(header, Text(" -> "), docType(outT))
 		}
 		if !(tag(src) == "array" && len(src) == 1) {
 			header = Concat(header, Text(" from "), docExpr(src))
@@ -876,7 +876,7 @@ func docStmt(n S) *Doc {
 			Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
 
 	case "type":
-		return Concat(Text("type "), docExpr(n[1].(S)))
+		return Concat(Text("type "), docType(n[1].(S)))
 
 	case "return":
 		arg := n[1].(S)
@@ -939,7 +939,7 @@ func docParams(arr S) *Doc {
 		name := getId(pi[1].(S))
 		ty := pi[2].(S)
 		if !(tag(ty) == "id" && getId(ty) == "Any") {
-			parts = append(parts, Concat(Text(name), Text(": "), docExpr(ty)))
+			parts = append(parts, Concat(Text(name), Text(": "), docType(ty)))
 		} else {
 			parts = append(parts, Text(name))
 		}
@@ -1312,17 +1312,16 @@ func docType(t S) *Doc {
 		}())), "}"))
 	case "binop":
 		if t[1].(string) == "->" && len(t) >= 4 {
-			params, ret := flattenArrow(t)
-			var ps []*Doc
-			for _, p := range params {
-				ps = append(ps, docType(p))
+			left := t[2].(S)
+			right := t[3].(S)
+			// Right-associative printing:
+			// - If LEFT is itself an arrow, parenthesize it.
+			// - Always render RIGHT via docType (which will continue the chain).
+			leftDoc := docType(left)
+			if tag(left) == "binop" && left[1].(string) == "->" {
+				leftDoc = Concat(Text("("), leftDoc, Text(")"))
 			}
-			// Single-arg function types don’t need tuple parens.
-			if len(ps) == 1 {
-				return Concat(ps[0], Text(" -> "), docType(ret))
-			}
-			// Two or more params: keep (A, B, ...) -> R
-			return Concat(Text("("), Join(Text(", "), ps), Text(") -> "), docType(ret))
+			return Concat(leftDoc, Text(" -> "), docType(right))
 		}
 		return Text("<binop>")
 	case "annot":

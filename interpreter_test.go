@@ -2255,3 +2255,52 @@ let ok = 1
 		t.Fatalf("interpreter not fully initialized: %#v", ip)
 	}
 }
+
+func Test_Interpreter_TypeNameResolution_InErrors(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Define a module with a recursive type and a function using the unqualified name.
+	mustEvalPersistent(t, ip, `
+let m = module "M" do
+	let Node = type {id!: Int, next: Node}
+	let f = fun(n: Node) -> Int do n.id end
+end
+`)
+
+	// Calling m.f({}) should mention "expected Node", not "<type>".
+	err := evalPersistentExpectError(t, ip, `m.f({})`)
+	wantErrContains(t, err, "expected Node")
+	if strings.Contains(err.Error(), "<type>") {
+		t.Fatalf("error should not print '<type>': %v", err)
+	}
+
+	// Positive: valid object passes and returns id.
+	wantInt(t, mustEvalPersistent(t, ip, `m.f({id: 34})`), 34)
+}
+
+func Test_Interpreter_QualifiedTypeName_InErrors_And_Fun_Print(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Reuse the same module from the previous test setup.
+	mustEvalPersistent(t, ip, `
+let m = module "M" do
+	let Node = type {id!: Int, next: Node}
+end
+`)
+
+	// Define a function referring to the qualified type m.Node.
+	v := mustEvalPersistent(t, ip, `let f = fun(n: m.Node) -> Int do n.id end`)
+
+	// The function's pretty string should contain the qualified name "m.Node".
+	sig := FormatValue(v)
+	if !strings.Contains(sig, "m.Node") {
+		t.Fatalf("want function signature to contain qualified name 'm.Node', got %q", sig)
+	}
+
+	// Calling f({}) should mention "expected m.Node", not "<type>".
+	err := evalPersistentExpectError(t, ip, `f({})`)
+	wantErrContains(t, err, "expected m.Node")
+	if strings.Contains(err.Error(), "<type>") {
+		t.Fatalf("error should not print '<type>': %v", err)
+	}
+}

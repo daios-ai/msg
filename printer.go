@@ -1236,6 +1236,12 @@ func docType(t S) *Doc {
 	switch tag(t) {
 	case "id":
 		return Text(getStr(t))
+	case "get":
+		recv := t[1].(S)
+		prop := t[2].(S)[1].(string)
+		// Reuse docType for the receiver so nested gets print as a.b.c
+		// If the receiver were ever non-type-ish, docType will fall back gracefully.
+		return Concat(docType(recv), Text("."), idOrQuoted(prop))
 	case "unop":
 		if t[1].(string) == "?" {
 			return Concat(docType(t[2].(S)), Text("?"))

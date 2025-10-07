@@ -620,12 +620,9 @@ end
 # # -----------------------------
 
 # Load the llm module, install its executor, and select a default backend/model.
-# 
-# Adjust these defaults to match your environment; they can be overridden later.
+
+# The LLM module.
 let llm = import("llm")
-
-# llm.init()
-
 oracleInstall(llm.exec)
 llm.useBackend("openai-responses")
 llm.useModel("gpt-5")

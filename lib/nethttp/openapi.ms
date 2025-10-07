@@ -23,7 +23,7 @@ let RouteContract = type {
 let RouteSpec = type {
 	method!: Str,
 	pattern!: Str,
-	style!: Str,          # "value" | "stream"
+	style!: Enum["value", "stream"],
 	contract: RouteContract?,
 	summary: Str?,
 	description: Str?,

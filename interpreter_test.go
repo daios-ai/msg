@@ -1,6 +1,8 @@
 package mindscript
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -2181,4 +2183,75 @@ end
 	// Changing ip1 no longer affects ip2
 	mustEvalPersistent(t, ip1, `x = 999`)
 	wantInt(t, mustEvalPersistent(t, ip2, `f()`), 100)
+}
+
+func Test_Interpreter_Constructor_Prelude_Imports_Module_FailsGracefully(t *testing.T) {
+	// Arrange a temp MSGPATH/lib with:
+	//   - llm.ms: exists (so import hits nativeMakeModule -> newBaseFromTemplate)
+	//   - std.ms: imports llm, then triggers a runtime error
+	t.Setenv(MindScriptPath, t.TempDir())
+	lib := filepath.Join(os.Getenv(MindScriptPath), "lib")
+	if err := os.MkdirAll(lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	llm := `# llm backend stub
+let X = 42
+`
+	if err := os.WriteFile(filepath.Join(lib, "llm.ms"), []byte(llm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	std := `# std prelude (test)
+let llm = import("llm")
+doesNotExist()   # force a hard runtime error after a successful import
+`
+	if err := os.WriteFile(filepath.Join(lib, "std.ms"), []byte(std), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act: construct the interpreter (this seeds prelude).
+	ip, err := NewInterpreter()
+
+	// Assert: constructor must fail (no panic) with a pretty-printed error.
+	if err == nil {
+		t.Fatalf("expected constructor to fail due to prelude runtime error, got ip=%v, err=nil", ip)
+	}
+	wantErrContains(t, err, "std.ms")  // should reference the prelude file
+	wantErrContains(t, err, "runtime") // caret-style runtime error message
+}
+
+func Test_Interpreter_Constructor_Prelude_Imports_Module_Succeeds(t *testing.T) {
+	// Arrange a temp MSGPATH/lib with a benign prelude that imports a module.
+	t.Setenv(MindScriptPath, t.TempDir())
+	lib := filepath.Join(os.Getenv(MindScriptPath), "lib")
+	if err := os.MkdirAll(lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	llm := `# llm backend stub
+let X = 42
+`
+	if err := os.WriteFile(filepath.Join(lib, "llm.ms"), []byte(llm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	std := `# std prelude (test)
+let llm = import("llm")
+let ok = 1
+`
+	if err := os.WriteFile(filepath.Join(lib, "std.ms"), []byte(std), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act
+	ip, err := NewInterpreter()
+
+	// Assert
+	if err != nil {
+		t.Fatalf("unexpected constructor error:\n%s", err)
+	}
+	if ip == nil || ip.Global == nil || ip.Base == nil || ip.Core == nil {
+		t.Fatalf("interpreter not fully initialized: %#v", ip)
+	}
 }

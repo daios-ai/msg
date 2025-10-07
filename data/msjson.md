@@ -1,19 +1,19 @@
-# JSON-MindScript Manual
+# JSON-MindScript Manual (Revised, MindScript-aligned)
 
-**JSON-MindScript** is a machine-readable, JSON-formatted, S-expressions language. Every construct is an expression and every source file is **strict JSON**.
+**JSON-MindScript** is a strict-JSON, machine-readable S-expressions language. Every construct is an expression, every file is **pure JSON**, and evaluation is **strict left-to-right**. It supports **deductive** (deterministic functions) and **inductive** (first-class **oracles**) computation. Structural **types are first-class**. Documentation and machine metadata travel via **annotations**.
 
-It supports two kinds of computation: **deductive** (deterministic functions) and **inductive** (first-class **oracles** backed by models or external sources). Structural types are first-class. Documentation and machine metadata are carried via **annotations**.
+Canonical output ends with exactly **one** trailing newline.
 
 ---
 
 ## 1) Parsing & File Rules
 
-* Sources must be **pure JSON**. No comments, trailing commas, or JSON5/JSONC features.
-* Implementations must reject invalid JSON *before* evaluation.
+* Source files are **pure JSON**: no comments, trailing commas, JSON5/JSONC, etc.
+* Implementations **must** reject invalid JSON **before** evaluation.
 
 **Self-test:** the file should pass a vanilla JSON parser (e.g., `jq -e .`).
 
-**Invalid examples (do not copy):**
+**Invalid (do not copy):**
 
 ```json
 ["array",
@@ -32,8 +32,8 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 ## 2) Evaluation Model (Strict, Expression-Oriented)
 
-* **Everything is an expression.** A block returns the last subexpression (or `["null"]` if empty).
-* **Strict left-to-right evaluation** for receivers, operands, and arguments.
+* **Everything is an expression.** Blocks return the last subexpression (or `["null"]` if empty).
+* **Strict L→R evaluation** for receivers, operands, and arguments.
 * **Assignment** evaluates to the assigned value.
 
 ---
@@ -50,18 +50,20 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 **Arrays**
 
-* `["array", v1, v2, ...]` — 0-based; negative indices count from end.
+* `["array", v1, v2, ...]` — 0-based; negative indices count from the end.
+* **Monomorphic**: all elements share one type; violations panic at construction/update.
 
 **Maps (string-keyed)**
 
 * `["map", ["pair", ["str","k"], v], ...]`
-* `["pair!", ["str","k"], v]` is used only in **type** positions to mark “required”.
-* Later duplicate keys overwrite earlier ones.
-* Order of keys is preserved for display/iteration; ignored for equality/subtyping.
+* In **type** positions, `["pair!", ["str","k"], T]` marks **required**.
+* Later duplicate keys **overwrite** earlier ones.
+* Insertion order is preserved for display/iteration; ignored by equality/subtyping.
 
 **Functions**
 
 * `["fun", paramsArray, retTypeOrAny, bodyBlock]`
+* **No zero-arity functions**: every function/oracle has **≥1 parameter**.
 
 **Oracles**
 
@@ -86,29 +88,34 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 **Unary**
 
 * Arithmetic / logic: `["unop","-", x]`, `["unop","not", x]`
-* Nullable type constructor (type-level): `["unop","?", T]` → `T?` (see §9)
+* Nullable **type constructor**: `["unop","?", T]` → `T?` (see §9)
 
 **Binary**
 
-* Arithmetic: `"+" "-" "*" "/" "%"`.
+* Arithmetic: `"+" "-" "*" "/" "%"`
 
-  * **Numeric tower:** `Int` (int64) and `Num` (float64).
-  * **Promotion:** only when **one operand is `Num`**.
-  * `/` returns `Num`.
-  * `%` follows dividend sign.
-  * **Division by zero panics.**
-* Comparisons: `"<" "<=" ">" ">="` — only **number–number** (Int and Num mix OK) or **string–string**; other mixes **panic**.
-* Equality: `"==" "!="` — deep for arrays/maps; numbers by value (`2 == 2.0` is true); annotations are ignored.
-* Boolean: `"and" "or"` — short-circuit; operands must be `Bool`.
+  * **Numeric tower**: `Int` (int64), `Num` (float64).
+  * **Promotion**: only when **one operand is `Num`**.
+  * **Division**: `Int/Int` → **Int** (e.g., `1/2 == 0`); otherwise → **Num**.
+  * **Modulo**: sign follows the **dividend**.
+  * **Divide-by-zero**: **panic**.
+* Comparisons: `"<" "<=" ">" ">="` — only **number–number** (Int & Num mix OK) or **string–string**; other mixes **panic**.
+* Equality: `"==" "!="` — deep for arrays/maps; numbers by value (`2 == 2.0` true); annotations ignored.
+* Boolean: `"and" "or"` — short-circuit; operands must be `Bool` (no implicit truthiness here).
 
 **Access & call**
 
 * Property: `["get", obj, ["str","name"]]`
 * Index array: `["idx", arr, i]` (0-based; negatives from end)
 * Index map: `["idx", map, ["str","k"]]`
-* Call: `["call", callee, a1, ...]` (L→R evaluation)
+* **Call**: `["call", callee, a1, ...]` (L→R evaluation) — **must include ≥1 argument** (see “No zero-arity” below).
 
-**Panics for invalid operations**: invalid receiver/target, missing key, out-of-bounds index, illegal comparison, division by zero.
+**No zero-arity calls**
+
+* `["call", f]` is **invalid**.
+* To “run” a callable with no meaningful input, declare **one parameter** (e.g., `Any` or `Null`) and **pass an argument** (often `["null"]`).
+
+**Panics** for invalid operations: invalid receiver/target, missing key, out-of-bounds index, illegal comparison, divide-by-zero, arity overflow.
 
 **Examples**
 
@@ -117,7 +124,11 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 ```
 
 ```json
-["binop","and", ["bool", false], ["call", ["id","expensive"]]]
+["binop","/", ["int",1], ["int",2]]      // => Int 0
+```
+
+```json
+["binop","/", ["int",3], ["num",2.0]]    // => Num 1.5
 ```
 
 ```json
@@ -125,19 +136,15 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 ```
 
 ```json
-["get", ["id","obj"], ["str","field"]]
-```
-
-```json
-["call", ["id","sqrt"], ["num",9.0]]
+["binop","and", ["bool", false], ["call", ["id","expensive"], ["null"]]]
 ```
 
 ---
 
 ## 5) Collections
 
-* **Arrays:** 0-based; `-1` refers to the last element; negatives count from end.
-* **Maps:** string keys; open-world (unknown keys may exist and be ignored by types); later duplicates overwrite.
+* **Arrays**: 0-based; `-1` is the last element; negatives count from end; **monomorphic**.
+* **Maps**: string keys; open-world; later duplicates overwrite.
 
 **Examples**
 
@@ -165,15 +172,15 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 **Patterns**
 
-* Decl name: `["decl","x"]`
+* Name declaration: `["decl","x"]`
 * Array destructure: `["darr", p1, p2, ...]`
 * Object destructure: `["dobj", ["pair", ["str","k"], subPattern], ...]`
 
 **Binding vs update**
 
-* **Bind:** target is a *pattern* → introduces names.
-* **Update:** target is an l-value (`"id"|"get"|"idx"`) → updates existing.
-  Updating an unbound name, invalid property, or invalid index **panics**.
+* **Bind** when target is a *pattern* → introduces names.
+* **Update** when target is an l-value (`"id"|"get"|"idx"`) → updates existing.
+  Updating an unbound name/invalid property/index **panics**.
 
 **Destructuring semantics**
 
@@ -182,7 +189,7 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 **Assignment result**
 
-* `["assign", target, value]` evaluates to the assigned **value**.
+* `["assign", target, value]` evaluates to the **assigned value**.
 
 **Examples**
 
@@ -221,12 +228,12 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 **Block**
 
-* `["block", e1, e2, ...]` → value of the last expression, or `["null"]` if empty.
+* `["block", e1, e2, ...]` → value of last expression (or `["null"]` if empty).
 
 **If / elif / else**
 
-* Form: `["if", ["pair", cond1, thenBlock1], ["pair", cond2, thenBlock2], ..., elseBlock]`
-  The `elseBlock` is required (use `["block"]` for empty).
+* `["if", ["pair", cond1, thenBlock1], ["pair", cond2, thenBlock2], ..., elseBlock]`
+  `elseBlock` required (use `["block"]` for empty).
 
 **While**
 
@@ -241,12 +248,11 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
   * Modules yield exported bindings (name/value).
   * Host iterables may end by panicking or naturally.
 
-**Early exits**
+**Early exits** (exactly one value; use `["null"]` for “empty”)
 
 * `["return", value]`
 * `["break", value]`
 * `["continue", value]`
-  Exactly **one** value is required; use `["null"]` for an “empty” payload.
 
 **Examples**
 
@@ -283,14 +289,42 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 ## 8) Errors vs Panics
 
-* **Error**: a *regular* result that uses a nullable type `T?` with `["annot", ["str","<msg>"], ["null"]]`. This is the idiomatic way to signal problems.
-* **Panic**: an exceptional condition in the lexer/parser/runtime (e.g., invalid index, missing key, out-of-range, type violation, **division by zero**, illegal comparison). Panics abort evaluation unless captured.
+* **Error**: an intentional result using a **nullable type** `T?` with `["annot", ["str","<msg>"], ["null"]]`.
+* **Panic**: exceptional runtime fault (e.g., invalid index, missing key, type/arity **overflow** violation, illegal comparison, divide-by-zero). Panics abort evaluation unless captured.
 
-**Capturing panics**
+**Capturing panics — `try`**
 
-* `["call", ["id","try"], expr]` catches panics and returns a map:
-  `{ ok!: Bool, value: Any, error: Str? }`
-  When `ok=false`, `error` contains a message; otherwise `error` is `null` or absent.
+* `["call", ["id","try"], expr]` returns **exactly** `{ ok!: Bool, value!: Any }`.
+  When `ok=false`, `value` carries implementation-defined panic info (there is **no** `error` field).
+
+**Quick table**
+
+| Situation                       | Behavior                                    |
+| ------------------------------- | ------------------------------------------- |
+| Oracle output doesn’t match `R` | Return `["annot","<reason>",["null"]]`      |
+| Oracle unavailable              | Return `["annot","<unavailable>",["null"]]` |
+| **Arity underflow**             | Returns a **function** awaiting the rest    |
+| **Arity overflow**              | **Panic** (capture via `try`)               |
+| Missing map key / OOB index     | **Panic**                                   |
+| Divide by zero                  | **Panic**                                   |
+
+**Example**
+
+```json
+["block",
+  ["assign", ["decl","r1"],
+    ["call", ["id","try"],
+      ["block", ["binop","/", ["int",1], ["int",0]]]
+    ]
+  ],
+  ["assign", ["decl","r2"],
+    ["call", ["id","try"],
+      ["block", ["int",42]]
+    ]
+  ],
+  ["array", ["id","r1"], ["id","r2"]]
+]
+```
 
 ---
 
@@ -303,10 +337,11 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 **Nullable**
 
 * `["unop","?", T]` renders as `T?`.
+* **Special case:** **`Any? = Any`**. That is, `["unop","?", ["id","Any"]]` ≡ `["id","Any"]`.
 
 **Arrays**
 
-* `["array", T]`
+* `["array", T]` (monomorphic element type)
 
 **Maps (open)**
 
@@ -316,6 +351,7 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 **Enums**
 
 * `["enum", lit1, lit2, ...]` — literals may be scalars, arrays, or maps
+* (If empty enums are disallowed in your implementation, treat `["enum"]` as invalid.)
 
 **Functions & Oracles**
 
@@ -327,14 +363,14 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 * `Int <: Num`
 * `T?` matches `Null` or `T`
 * Arrays covariant by element type
-* Maps fieldwise; requiredness may only become **more required**, not less
+* Maps fieldwise; **requiredness may only become more required** in **type–type** comparison
 * Enums by member subset
-* Functions/oracles: parameters **contravariant**, return **covariant**
+* Functions/oracles: params **contravariant**, return **covariant**
 * `Any` is top
 
-**Type operations (inference, guidance)**
+**Value conformance vs requiredness**
 
-* **LUB (⊔):** `Any` absorbs; `Int ⊔ Num = Num`; arrays elementwise; maps fieldwise (required OR); enums union; functions/oracles pointwise (param GLB, return LUB), else `Any`.
+* `isType(x, T)` ignores requiredness/optionality bits (they apply to **type–type** subtyping, not value checks).
 
 **Examples**
 
@@ -342,10 +378,9 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 ["type", ["id","Int"]]
 ```
 
-```json
+````json
 ["type", ["array", ["unop","?", ["id","Str"]]]]
-```
-
+``]
 ```json
 ["type",
   ["map",
@@ -353,7 +388,7 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
     ["pair",  ["str","age"],  ["id","Int"]]
   ]
 ]
-```
+````
 
 ```json
 ["type", ["enum", ["str","GET"], ["str","POST"]]]
@@ -365,12 +400,12 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 
 **Form**
 
-* `["annot", ["str","text"], value]` — human-oriented documentation
+* `["annot", ["str","text"], value]` — human-oriented docs
 * `["annot", ["str","<text>"], value]` — machine metadata (e.g., error reason)
 
 **Semantics**
 
-* Evaluates `value` and returns its exact result and type.
+* Evaluates `value` and returns the same result and type.
 * Ignored for equality and subtyping.
 
 **Placement patterns**
@@ -397,9 +432,9 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 ["annot", ["str","<not found>"], ["null"]]
 ```
 
-**Pretty-printing guidance (to surface syntax)**
+**Pretty-printing guidance (surface syntax)**
 
-* An annotation that conceptually *follows* a value on the same logical line should be rendered as a **trailing annotation** on that value. When following separators (`,` or `:`), it attaches to the last value before the separator for display.
+* An annotation that logically *follows* a value on a line should render as a **trailing annotation** on that value. When following separators (`,` or `:`), it attaches to the last value before the separator for display.
 
 ---
 
@@ -408,8 +443,10 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 `["module", nameExpr, bodyBlock]` yields a **module value**:
 
 * Behaves like a **map** for typing/iteration.
-* **Namespace encapsulation:** module body has its own scope; outer bindings are not visible unless passed in.
+* **Namespace encapsulation:** the body has its own scope.
 * **Writability:** `get`/`set` reflect **exports**; writes update the export table (overwrites allowed).
+* **Import semantics:** multiple imports of the **same module** get the **same instance**.
+* **Write locality:** writes affect **only the current runtime**.
 
 **Example**
 
@@ -425,6 +462,7 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
       ]
     ]
   ],
+  ["assign", ["get", ["id","M"], ["str","x"]], ["int",99]],
   ["get", ["id","M"], ["str","x"]]
 ]
 ```
@@ -445,11 +483,49 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
 **Rules**
 
 * Each argument must be a **subtype** of its parameter type.
-* The **actual returned value** must be a subtype of the declared return type.
+* The actual returned value must be a subtype of the declared return type.
 * Violations **panic**.
 * Calls are **curried** semantically; JSON call form is `["call", f, a1, ...]`.
+* **No zero-arity**: declarations have **≥1 parameter**.
 
-**Oracles (typed generative calls)**
+**Arity behavior**
+
+* **Underflow** (fewer args): returns a **function** awaiting remaining arguments.
+* **Overflow** (too many args): **panic**.
+
+**Underflow example**
+
+```json
+["block",
+  ["assign", ["decl","add2"],
+    ["fun",
+      ["array",
+        ["pair", ["id","a"], ["id","Int"]],
+        ["pair", ["id","b"], ["id","Int"]]
+      ],
+      ["id","Int"],
+      ["block", ["binop","+", ["id","a"], ["id","b"]]]
+    ]
+  ],
+  ["assign", ["decl","add2_10"], ["call", ["id","add2"], ["int",10]]],
+  ["call", ["id","add2_10"], ["int",5]]
+]
+```
+
+**Overflow example (captured)**
+
+```json
+["call", ["id","try"],
+  ["call", ["id","add2"], ["int",1], ["int",2], ["int",3]]
+]
+```
+
+**Zero-arg sugar note (surface vs JSON)**
+In surface MindScript, `f()` lowers to `f(null)` (implying the function has **one** parameter). In JSON, you **must** pass the argument explicitly: `["call", f, ["null"]]`.
+
+### Oracles (typed inductive calls)
+
+**Declaration**
 
 ```json
 ["oracle",
@@ -463,18 +539,83 @@ It supports two kinds of computation: **deductive** (deterministic functions) an
   ]?]
 ```
 
-Calling rules:
+**Calling rules**
 
 * Parameter arity/types are **checked**; mismatch **panics**.
-* Output is treated as `R?` at the boundary: if the generated candidate conforms to `R`, return it; otherwise return `["annot", ["str","<reason>"], ["null"]]`. Unavailability or mismatch of the model output does not cause a panic.
+* **Automatic nullable boundary:** calls **never panic for result** — treat output as `R?`. If the candidate conforms to `R`, return it; else return `["annot", "<reason>", ["null"]]`.
+
+**Examples**
+
+*A. Oracle with typed output & doc (one param that accepts `null`)*
+
+```json
+["assign", ["decl","chooseColor"],
+  ["oracle",
+    ["array", ["pair", ["id","_"], ["id","Any"]]],    // one parameter
+    ["type", ["enum", ["str","red"], ["str","green"], ["str","blue"]]],
+    ["map", ["pair", ["str","doc"], ["str","Pick a primary color."]]]
+  ]
+]
+```
+
+Call:
+
+```json
+["call", ["id","chooseColor"], ["null"]]
+```
+
+*B. Oracle with examples*
+
+```json
+["assign", ["decl","numberToWord"],
+  ["oracle",
+    ["array", ["pair", ["id","n"], ["id","Int"]]],
+    ["id","Str"],
+    ["map",
+      ["pair", ["str","doc"], ["str","Say the English word for a small integer."]],
+      ["pair", ["str","examples"],
+        ["array",
+          ["array", ["array", ["int",0]], ["str","zero"]],
+          ["array", ["array", ["int",1]], ["str","one"]],
+          ["array", ["array", ["int",2]], ["str","two"]]
+        ]
+      ]
+    ]
+  ]
+]
+```
+
+*C. Failure path → annotated null (`R?`)*
+
+```json
+["assign", ["decl","cc"],
+  ["oracle",
+    ["array", ["pair", ["id","name"], ["id","Str"]]],
+    ["id","Str"],
+    ["map", ["pair", ["str","doc"], ["str","ISO 3166-1 alpha-2 code."]]]
+  ]
+],
+["call", ["id","cc"], ["str","Wakanda"]]
+// => ["annot", ["str","<unrecognized country>"], ["null"]]
+```
 
 ---
 
 ## 13) Equality, Comparison & Truthiness
 
-* `==` / `!=` are deep for arrays and maps (map key order ignored). Numbers compare by value; `2 == 2.0` is true.
-* `< <= > >=` only allow number–number or string–string comparisons; anything else **panics**.
-* **Truthiness** (for `bool` coercion): **falsey** = `null`, `0`, `0.0`, `""`, `[]`, `{}`; everything else is truthy for ints, nums, strings, arrays, maps. Non-convertible values cause `bool(x)` to return an **error** (`Bool?`).
+* `==` / `!=` deep for arrays/maps (map key order ignored). Numbers by value; `2 == 2.0` is true.
+* `< <= > >=` only allow number–number or string–string; otherwise **panic**.
+* **Truthiness** for `bool` coercion: **falsey** = `null`, `0`, `0.0`, `""`, `[]`, `{}`; everything else truthy.
+* **Non-convertibles**: `bool(function)` and `bool(type)` return **`Bool?`** as an **annotated null** (not `false`).
+
+**Example**
+
+```json
+["call", ["id","bool"],
+  ["fun", ["array", ["pair", ["id","_"], ["id","Any"]]], ["id","Any"], ["block", ["null"]]]
+]
+// => ["annot", ["str","<non-convertible to Bool>"], ["null"]]
+```
 
 ---
 
@@ -482,27 +623,29 @@ Calling rules:
 
 * Names: modules `snake_case`; funcs/vars `camelCase`; types `PascalCase`; consts `SCREAMING_SNAKE_CASE`; private `_prefix`.
 * Docs: public functions carry a concise `annot` docstring (one-line summary; blank line; Args/Return; error notes if any).
-* Types: public APIs declare explicit param & return types; use `T?` only when an error/absence is possible.
-* No “void”: every expression yields a value; avoid exposing raw `["null"]` in public APIs unless type is `T?`.
+* Types: public APIs use explicit param & return types; use `T?` only when error/absence is possible.
+* No “void”: every expression yields a value; avoid exposing raw `["null"]` unless type is `T?`.
 * **Indentation:** tabs.
-* **Canonical pretty-printers** should end files with **exactly one trailing newline**.
+* **Formatters** should end files with **exactly one trailing newline**.
 
 ---
 
 ## 15) Simplifying Assumptions (Runtime)
 
 * **Int** is **int64**; **Num** is **float64**.
-* Numeric promotion only when one operand is `Num`. `/` returns `Num`. `%` follows dividend sign.
-* Maps are open-world; requiredness is a type property.
-* **Missing map key** / **array out-of-bounds** **panic**.
-* Annotations never affect equality or subtyping.
-* Modules act like maps; `get`/`set` reflect exports; namespaces are encapsulated.
+* **Promotion** only when one operand is `Num`.
+* **Division**: `Int/Int` → **Int**; otherwise → **Num**.
+* **Modulo** sign follows dividend.
+* **Maps** are open-world; requiredness is a type property.
+* **Missing key** / **array OOB** **panic**.
+* **Annotations** never affect equality or subtyping.
+* **Modules** act like maps; multiple imports share the **same instance**; writes are **local to the current runtime**.
 
 ---
 
 ## 16) Built-in Functions (Practical Reference)
 
-Types below use MindScript type notation; `?` = nullable (error possible). When a function may **panic**, it is noted.
+Types below use MindScript type notation; `?` = nullable (soft error). When a function may **panic**, it is noted. **`try` is corrected** per §8.
 
 ```
 E: 2.718281828459045 — Euler's number e.
@@ -535,7 +678,7 @@ dateNow: <fun: _:Null -> {}> — Current local date/time components.
 dir: <fun: x:{} -> [Str]> — Directory listing of visible fields/functions.
 dirList: <fun: path:Str -> [Str]?> — List directory entries as an array of names.
 error: <fun: msg:Str -> Null> — Produce an annotated null (soft error).
-exec: }?> — Run an external program.
+exec: <fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> { status!: Int, stderr!: Str, stdout!: Str }?> — Run an external program.
 exit: <fun: code:Int? -> Null> — Terminate the current process with an optional status code.
 exp: <fun: x:Num -> Num> — Exponential function e^x.
 filter: <fun: cond:(Any -> Bool) -> it:(Null -> Any?) -> Null -> Any?> — Filter an iterator (lazy predicate).
@@ -547,8 +690,8 @@ gzipDecompress: <fun: data:Str -> Str?> — Decompress a gzip payload.
 hexDecode: <fun: s:Str -> Str?> — Decode a hexadecimal string.
 hexEncode: <fun: x:Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
 hmacSha256: <fun: key:Str -> msg:Str -> Str> — HMAC-SHA256 authentication tag (raw bytes).
-http: }?> — Make an HTTP request (buffered).
-httpStream: }?> — Make an HTTP request (streaming).
+http: <fun: req:{ body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str } -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
+httpStream: <fun: req:{ body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str } -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
 import: <fun: path:Str -> Any> — Load a module from filesystem or HTTP(S).
 importCode: <fun: name:Str -> src:Str -> Any> — Evaluate source text as a module in memory.
 importUrl: <fun: url:Str -> {}?> — Import a module from a URL.
@@ -565,6 +708,7 @@ jsonStringify: <fun: x:Any -> Str?> — Serialize a value to a compact JSON stri
 keys: <fun: obj:{} -> Null -> Str?> — Iterator over keys of an object.
 len: <fun: x:Any -> Int?> — Length of a value.
 list: <fun: it:(Null -> Any?) -> [Any]> — Collect an iterator into an array.
+llm: <module: llm> — The LLM module.
 log: <fun: x:Num -> Num> — Natural logarithm (base e).
 lstrip: <fun: s:Str -> Str> — Remove leading whitespace (Unicode).
 map: <fun: f:(Any -> Any) -> it:(Null -> Any?) -> Null -> Any?> — Map over an iterator (lazy transform).
@@ -618,14 +762,14 @@ readAll: <fun: h:Any -> Str?> — Read all remaining bytes from a handle.
 readFile: <fun: path:Str -> Str?> — Read an entire file into a string.
 readLine: <fun: h:Any -> Str?> — Read one line from a handle (without the trailing newline).
 readN: <fun: h:Any -> n:Int -> Str?> — Read up to n bytes from a handle.
-reduce: <fun: f:((Any, Any) -> Any) -> it:(Null -> Any?) -> Any?> — Fold an iterator with a binary function.
+reduce: <fun: f:(Any -> Any -> Any) -> it:(Null -> Any?) -> Any?> — Fold an iterator with a binary function.
 reflect: <fun: val:Any -> [Any]?> — Reflect a value into constructor code (runtime-S).
 reify: <fun: rt:[Any] -> Any> — Decode and evaluate constructor code (runtime-S).
 remove: <fun: path:Str -> Bool?> — Delete a file or an empty directory.
 rename: <fun: old:Str -> new:Str -> Bool?> — Rename (move) a file or directory.
 replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str> — Replace all non-overlapping regex matches.
 rstrip: <fun: s:Str -> Str> — Remove trailing whitespace (Unicode).
-runtime: } — 
+runtime: { argv: [], isEntry: true, path: "/home/pedro/Documents/Projects/msg/builtins.ms" } — 
 seedRand: <fun: n:Int -> Null> — Seed the pseudo-random number generator.
 sha256: <fun: x:Str -> Str> — SHA-256 digest (raw bytes).
 shift: <fun: arr:[Any] -> Any> — Remove and return the first element of an array.
@@ -633,7 +777,7 @@ sin: <fun: x:Num -> Num> — Sine of an angle in radians.
 sleep: <fun: ms:Int -> Null> — Pause execution for a number of milliseconds.
 slice: <fun: xs:[Any] -> s:Int -> e:Int -> [Any]> — Slice an array [s, e).
 snapshot: <fun: _:Null -> {}> — Return a map snapshot of the visible environment (including built-ins).
-sort: <fun: arr:[Any] -> cmp:((Any, Any) -> Int) -> [Any]> — Sort an array in-place using a comparison function.
+sort: <fun: arr:[Any] -> cmp:(Any -> Any -> Int) -> [Any]> — Sort an array in-place using a comparison function.
 split: <fun: s:Str -> sep:Str -> [Str]> — Split a string on a separator (no regex).
 sprintf: <fun: fmt:Str -> args:[Any] -> Str?> — Format a string with printf-style verbs.
 sqrt: <fun: x:Num -> Num> — Square root.
@@ -684,10 +828,10 @@ writeFile: <fun: path:Str -> data:Str -> Int?> — Write a string to a file (ove
 **Short-circuit boolean**
 
 ```json
-["binop","and", ["bool", false], ["call", ["id","f"]]]
+["binop","and", ["bool", false], ["call", ["id","f"], ["null"]]]
 ```
 
-**Encapsulated, writable module**
+**Encapsulated, writable module (shared import; local write)**
 
 ```json
 ["block",
@@ -720,9 +864,19 @@ writeFile: <fun: path:Str -> data:Str -> Int?> — Write a string to a file (ove
 ]
 ```
 
+**Division and modulo**
+
+```json
+["binop","/", ["int",7], ["int",3]]   // => Int 2
+```
+
+```json
+["binop","%", ["int",3], ["int",-2]]  // => Int 1 (dividend sign)
+```
+
 ---
 
-## 18) Code Examples (Quick Start)
+## 18) Quick Start Examples
 
 **Increment**
 
@@ -756,16 +910,52 @@ writeFile: <fun: path:Str -> data:Str -> Int?> — Write a string to a file (ove
 ]
 ```
 
-**Oracle with typed output**
+**Oracle with typed output & examples**
 
 ```json
-["assign", ["decl","chooseColor"],
+["assign", ["decl","numberToWord"],
   ["oracle",
-    ["array"],
-    ["type", ["enum", ["str","red"], ["str","green"], ["str","blue"]]],
-    ["map", ["pair", ["str","doc"], ["str","Pick a primary color."]]]
+    ["array", ["pair", ["id","n"], ["id","Int"]]],
+    ["id","Str"],
+    ["map",
+      ["pair", ["str","doc"], ["str","Say the English word for a small integer."]],
+      ["pair", ["str","examples"],
+        ["array",
+          ["array", ["array", ["int",0]], ["str","zero"]],
+          ["array", ["array", ["int",1]], ["str","one"]],
+          ["array", ["array", ["int",2]], ["str","two"]]
+        ]
+      ]
+    ]
   ]
 ]
 ```
 
----
+**Oracle (nullable boundary)**
+
+```json
+["assign", ["decl","chooseColor"],
+  ["oracle",
+    ["array", ["pair", ["id","_"], ["id","Any"]]],
+    ["type", ["enum", ["str","red"], ["str","green"], ["str","blue"]]],
+    ["map", ["pair", ["str","doc"], ["str","Pick a primary color."]]]
+  ]
+],
+["call", ["id","chooseColor"], ["null"]]
+```
+
+**Arity underflow (currying)**
+
+```json
+["assign", ["decl","add2_10"], ["call", ["id","sum"], ["int",10]]]
+```
+
+**Arity overflow (panic, captured)**
+
+```json
+["call", ["id","try"],
+  ["call", ["id","sum"], ["int",1], ["int",2], ["int",3]]
+]
+```
+
+**End of Manual.**

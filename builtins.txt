@@ -28,7 +28,7 @@ dateNow: <fun: _:Null -> {}> — Current local date/time components.
 dir: <fun: x:{} -> [Str]> — Directory listing of visible fields/functions.
 dirList: <fun: path:Str -> [Str]?> — List directory entries as an array of names.
 error: <fun: msg:Str -> Null> — Produce an annotated null (soft error).
-exec: }?> — Run an external program.
+exec: <fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> { status!: Int, stderr!: Str, stdout!: Str }?> — Run an external program.
 exit: <fun: code:Int? -> Null> — Terminate the current process with an optional status code.
 exp: <fun: x:Num -> Num> — Exponential function e^x.
 filter: <fun: cond:(Any -> Bool) -> it:(Null -> Any?) -> Null -> Any?> — Filter an iterator (lazy predicate).
@@ -40,8 +40,8 @@ gzipDecompress: <fun: data:Str -> Str?> — Decompress a gzip payload.
 hexDecode: <fun: s:Str -> Str?> — Decode a hexadecimal string.
 hexEncode: <fun: x:Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
 hmacSha256: <fun: key:Str -> msg:Str -> Str> — HMAC-SHA256 authentication tag (raw bytes).
-http: }?> — Make an HTTP request (buffered).
-httpStream: }?> — Make an HTTP request (streaming).
+http: <fun: req:{ body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str } -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
+httpStream: <fun: req:{ body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str } -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
 import: <fun: path:Str -> Any> — Load a module from filesystem or HTTP(S).
 importCode: <fun: name:Str -> src:Str -> Any> — Evaluate source text as a module in memory.
 importUrl: <fun: url:Str -> {}?> — Import a module from a URL.
@@ -58,6 +58,7 @@ jsonStringify: <fun: x:Any -> Str?> — Serialize a value to a compact JSON stri
 keys: <fun: obj:{} -> Null -> Str?> — Iterator over keys of an object.
 len: <fun: x:Any -> Int?> — Length of a value.
 list: <fun: it:(Null -> Any?) -> [Any]> — Collect an iterator into an array.
+llm: <module: llm> — The LLM module.
 log: <fun: x:Num -> Num> — Natural logarithm (base e).
 lstrip: <fun: s:Str -> Str> — Remove leading whitespace (Unicode).
 map: <fun: f:(Any -> Any) -> it:(Null -> Any?) -> Null -> Any?> — Map over an iterator (lazy transform).
@@ -111,14 +112,14 @@ readAll: <fun: h:Any -> Str?> — Read all remaining bytes from a handle.
 readFile: <fun: path:Str -> Str?> — Read an entire file into a string.
 readLine: <fun: h:Any -> Str?> — Read one line from a handle (without the trailing newline).
 readN: <fun: h:Any -> n:Int -> Str?> — Read up to n bytes from a handle.
-reduce: <fun: f:((Any, Any) -> Any) -> it:(Null -> Any?) -> Any?> — Fold an iterator with a binary function.
+reduce: <fun: f:(Any -> Any -> Any) -> it:(Null -> Any?) -> Any?> — Fold an iterator with a binary function.
 reflect: <fun: val:Any -> [Any]?> — Reflect a value into constructor code (runtime-S).
 reify: <fun: rt:[Any] -> Any> — Decode and evaluate constructor code (runtime-S).
 remove: <fun: path:Str -> Bool?> — Delete a file or an empty directory.
 rename: <fun: old:Str -> new:Str -> Bool?> — Rename (move) a file or directory.
 replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str> — Replace all non-overlapping regex matches.
 rstrip: <fun: s:Str -> Str> — Remove trailing whitespace (Unicode).
-runtime: } — 
+runtime: { argv: [], isEntry: true, path: "/home/pedro/Documents/Projects/msg/builtins.ms" } — 
 seedRand: <fun: n:Int -> Null> — Seed the pseudo-random number generator.
 sha256: <fun: x:Str -> Str> — SHA-256 digest (raw bytes).
 shift: <fun: arr:[Any] -> Any> — Remove and return the first element of an array.
@@ -126,7 +127,7 @@ sin: <fun: x:Num -> Num> — Sine of an angle in radians.
 sleep: <fun: ms:Int -> Null> — Pause execution for a number of milliseconds.
 slice: <fun: xs:[Any] -> s:Int -> e:Int -> [Any]> — Slice an array [s, e).
 snapshot: <fun: _:Null -> {}> — Return a map snapshot of the visible environment (including built-ins).
-sort: <fun: arr:[Any] -> cmp:((Any, Any) -> Int) -> [Any]> — Sort an array in-place using a comparison function.
+sort: <fun: arr:[Any] -> cmp:(Any -> Any -> Int) -> [Any]> — Sort an array in-place using a comparison function.
 split: <fun: s:Str -> sep:Str -> [Str]> — Split a string on a separator (no regex).
 sprintf: <fun: fmt:Str -> args:[Any] -> Str?> — Format a string with printf-style verbs.
 sqrt: <fun: x:Num -> Num> — Square root.

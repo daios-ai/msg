@@ -791,3 +791,67 @@ func Test_Lexer_Interactive_IncompleteString_AnchorsAtOpeningQuote(t *testing.T)
 	src := "\"hello"
 	checkIncErr(t, src, 1, 1, "string was not terminated")
 }
+func Test_Lexer_Semicolon_IsNotAToken_ActsLikeNewline(t *testing.T) {
+	src := `foo();bar()`
+	got := wantTypes(t, src, []TokenType{
+		ID, CLROUND, RROUND, // foo()
+		ID, CLROUND, RROUND, // bar()
+	})
+	// Ensure line advanced across the semicolon even without an actual '\n'.
+	var fooIDIdx, barIDIdx int = -1, -1
+	for i, tok := range got {
+		if tok.Type == ID && tok.Literal == "foo" {
+			fooIDIdx = i
+			break
+		}
+	}
+	for i := fooIDIdx + 1; i < len(got); i++ {
+		if got[i].Type == ID && got[i].Literal == "bar" {
+			barIDIdx = i
+			break
+		}
+	}
+	if fooIDIdx < 0 || barIDIdx < 0 {
+		t.Fatalf("did not find foo/bar IDs; tokens=%v", got)
+	}
+	if got[barIDIdx].Line != got[fooIDIdx].Line+1 {
+		t.Fatalf("semicolon should advance line: foo at L%d, bar at L%d", got[fooIDIdx].Line, got[barIDIdx].Line)
+	}
+}
+
+func Test_Lexer_Semicolon_Forces_LROUND_LSQUARE(t *testing.T) {
+	// After a semicolon, '(' and '[' should be treated as if preceded by whitespace:
+	// '(' -> LROUND, '[' -> LSQUARE.
+	src := `a; (x); b; [y]`
+	got := wantTypes(t, src, []TokenType{
+		ID,                 // a
+		LROUND, ID, RROUND, // (x)  <-- LROUND (not CLROUND)
+		ID,                   // b
+		LSQUARE, ID, RSQUARE, // [y] <-- LSQUARE (not CLSQUARE)
+	})
+
+	// Sanity: ensure we actually got LROUND/LSQUARE, not their "close" variants.
+	if got[1].Type != LROUND {
+		t.Fatalf("expected '(' after semicolon to be LROUND, got %v", got[1].Type)
+	}
+	// Find the '[' we expect (last three tokens before EOF in got-without-EOF).
+	// Already asserted by wantTypes order, but keep an explicit check for clarity.
+	last := len(got) - 2 // RSQUARE index
+	if !(got[last-2].Type == LSQUARE && got[last-1].Type == ID && got[last].Type == RSQUARE) {
+		t.Fatalf("expected trailing LSQUARE ID RSQUARE after semicolon; got %v %v %v", got[last-2].Type, got[last-1].Type, got[last].Type)
+	}
+}
+
+func Test_Lexer_Semicolon_DoesNotTerminate_Annotation(t *testing.T) {
+	src := "# one; two\nid"
+	got := wantTypes(t, src, []TokenType{
+		ANNOTATION,
+		ID,
+	})
+	if got[0].Literal.(string) != "one; two" {
+		t.Fatalf("annotation should include semicolon; got %q", got[0].Literal)
+	}
+	if got[1].Literal.(string) != "id" {
+		t.Fatalf("expected following identifier 'id', got %v (%q)", got[1].Type, got[1].Literal)
+	}
+}

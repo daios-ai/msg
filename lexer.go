@@ -467,7 +467,7 @@ func (l *Lexer) immediateWhitespaceBefore() bool {
 		return false
 	}
 	switch l.src[l.start-1] {
-	case ' ', '\t', '\n', '\r':
+	case ' ', '\t', '\n', '\r', ';':
 		return true
 	default:
 		return false
@@ -959,6 +959,17 @@ func (l *Lexer) scanToken() (Token, error) {
 			// Lone newline (or newline followed by non-hws) → skip it as whitespace and loop.
 			l.advance()
 			l.start = l.cur
+			continue
+		}
+
+		// Treat semicolons exactly like newlines for layout/same-line logic.
+		// They are NOT tokens; we "lower" them to line breaks.
+		if b, _ := l.peek(); b == ';' {
+			// Consume ';' and advance line/col as if it were '\n'.
+			l.advance()     // move past ';'
+			l.line++        // start a new line
+			l.col = 0       // reset column
+			l.start = l.cur // next token starts after the semicolon
 			continue
 		}
 

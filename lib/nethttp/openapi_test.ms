@@ -1,6 +1,6 @@
 let testing = import("testing")
 let http = import("nethttp")
-let oapi = import("openapi")
+let oapi = import("nethttp/openapi")
 
 # Helper: build a minimal RouteSpec (kept small on purpose)
 let _r = fun(method: Str, path: Str, style: Str, c: {}) -> {} do

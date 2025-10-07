@@ -1,2824 +1,3365 @@
-=== BEGIN FILE: lexer.go ===
-// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
-// MindScript language. It converts a source string into a linear stream of
-// tokens with accurate source positions and rich literal decoding.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// HIGH-LEVEL OVERVIEW
-//
-// The lexer scans left→right and emits Token values, always ending with EOF.
-// Each token carries:
-//   - Type     — a TokenType enum
-//   - Lexeme   — the exact source slice (verbatim characters from the input)
-//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
-//   - Line/Col — 1-based line and 0-based column of the token’s *start*
-//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
-//
-// Whitespace-sensitive delimiters:
-//
-//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
-//	whether there is immediate whitespace before the delimiter:
-//
-//	  '('  → LROUND  if there IS preceding whitespace
-//	         CLROUND if there is NO preceding whitespace
-//	  '['  → LSQUARE if there IS preceding whitespace
-//	         CLSQUARE if there is NO preceding whitespace
-//
-// Consequences (user-facing syntax):
-//   - Calls and parameter lists require NO space before '(':
-//     f(x)           // call: uses CLROUND
-//     fun(x: T)      // function params: uses CLROUND
-//     oracle(x: T)   // oracle params: uses CLROUND
-//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
-//     parameter list; the parser will error.
-//   - Indexing requires NO space before '[':
-//     arr[i]         // indexing: uses CLSQUARE
-//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
-//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
-//     CLROUND participates in call/juxtaposition chains.
-//
-// The '.' character is context-sensitive:
-//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
-//     produced.
-//   - Otherwise it is PERIOD (typically for property access).
-//
-// IDENTIFIERS & KEYWORDS
-//
-//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
-//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
-//	After a PERIOD, both identifiers *and* quoted strings are treated as
-//	property names and forced to ID (even if the text is a keyword). This allows:
-//	    obj."then"   // ID with Literal="then"
-//	    obj.then     // ID with Literal="then"
-//
-// LITERALS
-//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
-//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
-//     bytes in the lexeme are validated and decoded.
-//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
-//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
-//   - BOOLEAN — “true” or “false” (Literal: bool).
-//   - NULL    — “null” (Literal: nil).
-//
-// ANNOTATIONS
-//   - Hash-line annotations: one or more consecutive lines where, after optional
-//     indentation, the first non-space is '#'. The leading '#' (and at most one
-//     optional following space) are stripped; lines are joined with '\n', and a
-//     single ANNOTATION token is emitted. A blank/non-# line ends the block.
-//
-// ERRORS (start-of-token anchoring)
-//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
-//     reported as *Error* with precise location anchored to the **start** of the
-//     offending token (the token that is being scanned).
-//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings produce *IncompleteError* (still anchored to the token start).
-//
-// OUTPUT
-//   - Scan returns the full token slice *including* the terminal EOF token.
-//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
-//     includes the quotes and escapes), while Literal carries the decoded value.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-//
-// FILE ORGANIZATION
-//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
-//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
-//
-// The PUBLIC API docs below are intentionally exhaustive so the behavior is
-// understandable without reading the implementation.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-package mindscript
+=== BEGIN FILE: lib/nethttp.ms ===
+# nethttp — public façade for router, middleware, and server
+#
+# Provides a stable, minimal API by re-exporting selected symbols from:
+# - nethttp/router
+# - nethttp/middleware
+# - nethttp/server
+#
+# Public surface:
+#   router(opts?), contract(), testClient()
+#   json(), text(), noContent(), redirect(), raise()
+#   serve(), shutdown()
+#   mwRecover(), mwRequestID(), mwTimeout(), mwCors(), mwAccessLog()
 
-import (
-	"errors"
-	"fmt"
-	"strconv"
-	"strings"
-	"unicode/utf16"
-	"unicode/utf8"
-)
+let router = import("nethttp/router")
+let mw = import("nethttp/middleware")
+let server = import("nethttp/server")
 
-////////////////////////////////////////////////////////////////////////////////
-//                               PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
+# =========================
+# Types (re-export)
+# =========================
 
-// TokenType is the enumeration of all token kinds the lexer can emit.
-// Most names are self-explanatory; groups are listed for clarity.
-//
-// Special:
-//
-//	EOF     — end-of-file sentinel (always the final token)
-//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
-//
-// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
-//
-//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
-//	RROUND            — ')'
-//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
-//	RSQUARE           — ']'
-//	LCURLY, RCURLY    — '{', '}'
-//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
-//
-// Operators:
-//
-//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
-//	ASSIGN                      — '='
-//	EQ, NEQ                     — '==', '!='
-//	LESS, LESS_EQ               — '<',  '<='
-//	GREATER, GREATER_EQ         — '>',  '>='
-//	BANG                        — '!' (used by the language in object/type literals)
-//	ARROW                       — '->'
-//
-// Literals & identifiers:
-//
-//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
-//
-// Keywords (produced when the identifier text equals these words, except when
-// forced to an ID after PERIOD/property access):
-//
-//	AND, OR, NOT,
-//	LET, DO, END, RETURN, BREAK, CONTINUE,
-//	IF, THEN, ELIF, ELSE,
-//	FUNCTION, ORACLE, MODULE,
-//	FOR, IN, FROM, WHILE,
-//	TYPECONS, TYPE, ENUM
-//
-// Annotation:
-//
-//	ANNOTATION — emitted for multi-line blocks starting with '#'.
-type TokenType int
+# HTTP request shape passed to handlers (re-exported).
+let Request = router.Request
 
-const (
-	// Special
-	EOF TokenType = iota
-	ILLEGAL
+# Streaming responder interface presented to handlers (re-exported).
+let Responder = router.Responder
 
-	// Punctuation
-	LROUND   // "(" when preceded by whitespace
-	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
-	RROUND   // ")"
-	LSQUARE  // "["
-	CLSQUARE // "[" when not preceded by whitespace (index-close)
-	RSQUARE  // "]"
-	LCURLY   // "{"
-	RCURLY   // "}"
-	COLON    // ":"
-	COMMA    // ","
-	PERIOD   // "."
-	QUESTION // "?"
+# Marker type for route contracts (re-exported).
+let Contract = router.Contract
 
-	// Operators
-	PLUS
-	MINUS
-	MULT
-	DIV
-	MOD
-	ASSIGN // "="
-	EQ     // "=="
-	NEQ    // "!="
-	LESS
-	LESS_EQ
-	GREATER
-	GREATER_EQ
-	BANG  // "!" (required-field marker in object/type literals)
-	ARROW // "->"
+# =========================
+# Router / contracts / helpers / tests (re-export)
+# =========================
 
-	// Literals & identifiers
-	ID
-	STRING
-	INTEGER
-	NUMBER
-	BOOLEAN
-	NULL
+# Create a new router.
+# 
+# Args:
+# 	opts: {}? — Optional router options:
+# 		- docs.enabled?: Bool (default true)
+# 		- docs.path?: Str (default "/openapi.json")
+# 		- docs.info?: {title!: Str, version!: Str, description?: Str}
+# 		- docs.servers?: [Str]
+# 		- docs.opts?: {}
+# Return:
+# 	{} — Router instance with route/routeStream/mount/use methods.
+let makeRouter = router.router
 
-	// Keywords
-	AND
-	OR
-	NOT
-	LET
-	DO
-	END
-	RETURN
-	BREAK
-	CONTINUE
-	IF
-	THEN
-	ELIF
-	ELSE
-	FUNCTION
-	ORACLE
-	MODULE
-	FOR
-	IN
-	FROM
-	WHILE
-	TYPECONS
-	TYPE
-	ENUM
+# Wrap a route contract to mark path/query/headers/cookies/body/responses.
+#
+# Args:
+# 	c: Contract — Contract object describing bindings and response types.
+# Return:
+# 	Contract — Same contract (marker wrapper).
+let contract = router.contract
 
-	// Annotation token (from lines starting with '#')
-	ANNOTATION
-	NOOP
-)
+# Build a simple, in-memory test client for a router.
+#
+# Args:
+# 	r: {} — Router instance.
+# Return:
+# 	{call!: {} -> {status!: Int, headers!: {}, body!: Str}} — Test client.
+let testClient = router.testClient
 
-// Token is a single lexical unit produced by the lexer.
-//
-// Fields:
-//
-//	Type    — the TokenType kind.
-//	Lexeme  — the exact source slice comprising the token (verbatim, including
-//	          quotes for strings, escape sequences, etc.).
-//	Literal — a decoded value for literal tokens:
-//	          • STRING  → Go string with escapes and surrogate pairs resolved
-//	          • INTEGER → int64
-//	          • NUMBER  → float64
-//	          • BOOLEAN → bool
-//	          • NULL    → nil
-//	          Non-literal tokens usually carry nil or an unmodified string
-//	          (keywords may store their text; property IDs store the property name).
-//	Line    — 1-based line number at which this token starts.
-//	Col     — 0-based column index at which this token starts.
-//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
-type Token struct {
-	Type      TokenType
-	Lexeme    string
-	Literal   interface{}
-	Line      int
-	Col       int
-	StartByte int
-	EndByte   int
+# Create a JSON response with status code.
+#
+# Args:
+# 	status: Int — HTTP status.
+# 	value: Any — Value to JSON-encode as body.
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let json = router.json
+
+# Create a plain-text response with status code.
+#
+# Args:
+# 	status: Int — HTTP status.
+# 	s: Str — Response body as text.
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let text = router.text
+
+# Create a 204 No Content response.
+#
+# Args:
+# 	_: Null — Placeholder (unused).
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let noContent = router.noContent
+
+# Create a redirect response (path-only policy).
+#
+# Args:
+# 	status: Int — Redirect status (e.g., 302).
+# 	location: Str — Absolute path starting with '/'.
+# Return:
+# 	{status!: Int, headers!: {}, body!: Str} — Response object.
+let redirect = router.redirect
+
+# Create a structured HTTP error to be returned by handlers.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	message: Str — Text body.
+# Return:
+# 	{__http_error__!: Bool, status!: Int, body!: Str, headers!: {}} — Error object.
+let raise = router.raise
+
+# =========================
+# Middleware (re-export)
+# =========================
+
+# Recover from handler panics and return 500.
+#
+# Args:
+# 	_: Null — Placeholder (unused).
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwRecover = mw.mwRecover
+
+# Inject or propagate a request ID via a header.
+#
+# Args:
+# 	headerName: Str — Header name to use (e.g., "X-Request-ID").
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwRequestID = mw.mwRequestID
+
+# Emit 504 if no bytes are written by the deadline.
+#
+# Args:
+# 	ms: Int — Timeout in milliseconds.
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwTimeout = mw.mwTimeout
+
+# Add CORS headers and handle OPTIONS.
+#
+# Args:
+# 	opts: {} — {origin?: Str, methods?: [Str], headers?: [Str], credentials?: Bool}
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwCors = mw.mwCors
+
+# Access log after response with status/bytes/duration.
+#
+# Args:
+# 	_: Null — Placeholder (unused).
+# Return:
+# 	(_StreamFn -> _StreamFn) — Middleware function.
+let mwAccessLog = mw.mwAccessLog
+
+# =========================
+# Server lifecycle (re-export)
+# =========================
+
+# Serve HTTP/1.1 with the given listener and router.
+#
+# Args:
+# 	listener: Any — TCP listener handle from netListen("host:port").
+# 	r: {} — Router instance produced by makeRouter().
+# 	opts: {} — Server options:
+# 		- readHeaderTimeoutMs?: Int
+# 		- writeTimeoutMs?: Int
+# 		- idleTimeoutMs?: Int
+# 		- maxHeaderBytes?: Int (default 8192)
+# 		- maxBodyBytes?: Int (default 1048576)
+# 		- maxStartLineBytes?: Int?
+# 		- maxHeaders?: Int?
+# 		- addDateHeader?: Bool?
+# Return:
+# 	{listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}? — Server handle, or null on error.
+let serve = server.serve
+
+# Gracefully shut down a server, closing the listener and active connections.
+#
+# Args:
+# 	srv: {listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}? — Server handle or null.
+# 	timeoutMs: Int? — Optional timeout (currently best-effort).
+# Return:
+# 	Bool — True when shutdown is complete or server was null.
+let shutdown = server.shutdown
+
+# Back-compat exported name (router constructor) — maintained for users of the old surface.
+# Prefer makeRouter() for clarity; both reference the same function.
+let router = makeRouter
+=== END FILE: lib/nethttp.ms ===
+
+=== BEGIN FILE: lib/nethttp/middleware.ms ===
+# nethttp/middleware — streaming-friendly middleware built on router core
+#
+# This module provides common streaming-compatible middleware:
+#   - mwRecover: convert handler panics to 500 responses
+#   - mwRequestID: inject/propagate a request identifier header
+#   - mwTimeout: emit 504 if nothing was written before a deadline
+#   - mwCors: add CORS headers and handle OPTIONS preflights
+#   - mwAccessLog: log method/route/status/bytes/duration after responses
+
+let router = import("nethttp/router")
+
+# Re-exported core types and internal helpers (private to this module).
+let Request   = router.Request
+let Responder = router.Responder
+let _StreamFn = router._StreamFn
+let _Mw       = router._Mw
+
+let _getHeader = router._getHeader
+let _setErr    = router._setErr
+
+# mwRecover — Recover from panics and return 500.
+#
+# Summary:
+# 	Wraps a streaming handler to catch panics and convert them to
+# 	"500 internal server error" responses. Intended as the first middleware.
+#
+# Args:
+# 	_: Null — Unused marker.
+# Return:
+# 	_Mw — Middleware function: (_StreamFn) -> _StreamFn.
+let mwRecover = fun(_: Null) -> _Mw do
+	fun(next: _StreamFn) -> _StreamFn do
+		fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let r = try(fun(_: Null) do next(req, res, ctx) end)
+			if not r.ok then
+				_setErr(ctx, r)
+				res.status(500).setHeader("Content-Type", "text/plain")
+				let _ = res.write("internal server error")
+				let _ = res.end(null)
+				return
+			end
+			null
+		end
+	end
+end
+
+# mwRequestID — Inject or propagate a request identifier.
+#
+# Summary:
+# 	Sets a request/response header with a request id. If the incoming request
+# 	already has the header, it is propagated; otherwise a new id is generated.
+#
+# Args:
+# 	headerName: Str — Header key to use (e.g., "X-Request-ID").
+# Return:
+# 	_Mw — Middleware function.
+let mwRequestID = fun(headerName: Str) -> _Mw do
+	let name = headerName
+	fun(next: _StreamFn) -> _StreamFn do
+		fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let seen = _getHeader(req.headers, name)
+			let id = if seen != null then seen else sprintf("r-%d", [nowNanos()]) end
+			req.headers[name] = id
+			res.setHeader(name, id)
+			next(req, res, ctx)
+			null
+		end
+	end
+end
+
+# mwTimeout — Emit 504 if no bytes were written before the deadline.
+#
+# Summary:
+# 	Tracks writes on the response; if the deadline passes and no bytes
+# 	were sent, it emits a "504 timeout" response automatically.
+#
+# Args:
+# 	ms: Int — Timeout in milliseconds.
+# Return:
+# 	_Mw — Middleware function.
+let mwTimeout = fun(ms: Int) -> _Mw do
+	let dur = ms
+	fun(next: _StreamFn) -> _StreamFn do
+		fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let deadline = nowMillis() + dur
+			let closed = {v: false}
+			let wrote  = {v: false}
+			ctx.deadlineMs = deadline
+
+			let closeTimeout = fun(_: Null) -> Null do
+				if closed.v then
+					return
+				end
+				res.status(504).setHeader("Content-Type", "text/plain")
+				let _ = res.write("timeout")
+				let _ = res.end(null)
+				closed.v = true
+				null
+			end
+
+			let timedOut = fun(_: Null) -> Bool do
+				nowMillis() > deadline
+			end
+
+			let proxy = {}
+			proxy.status = fun(code: Int) -> Responder do
+				if closed.v then
+					return proxy
+				end
+				wrote.v = true
+				res.status(code)
+				proxy
+			end
+			proxy.setHeader = fun(k: Str, v: Str) -> Responder do
+				if closed.v then
+					return proxy
+				end
+				if timedOut(null) and not wrote.v then
+					closeTimeout(null)
+					return proxy
+				end
+				wrote.v = true
+				res.setHeader(k, v)
+				proxy
+			end
+			proxy.write = fun(chunk: Str) -> Int? do
+				if closed.v then
+					return 0
+				end
+				if timedOut(null) and not wrote.v then
+					closeTimeout(null)
+					return 0
+				end
+				wrote.v = true
+				res.write(chunk)
+			end
+			proxy.flush = fun(_: Null) -> Bool? do
+				if closed.v then
+					return true
+				end
+				if timedOut(null) and not wrote.v then
+					closeTimeout(null)
+					return true
+				end
+				res.flush(null)
+			end
+			proxy.end = fun(_: Null) -> Bool? do
+				if closed.v then
+					return true
+				end
+				if timedOut(null) and not wrote.v then
+					closeTimeout(null)
+					return true
+				end
+				res.end(null)
+			end
+
+			next(req, proxy, ctx)
+			if not closed.v and not wrote.v and timedOut(null) then
+				closeTimeout(null)
+			end
+			null
+		end
+	end
+end
+
+# mwCors — Add CORS headers and handle OPTIONS preflights.
+#
+# Summary:
+# 	Sets Access-Control-* headers on all responses and short-circuits
+# 	OPTIONS requests with 204 No Content. When credentials are enabled,
+# 	the Origin is reflected and Vary: Origin is set.
+#
+# Args:
+# 	opts: {} — {
+# 		origin?: Str (default "*"),
+# 		methods?: [Str] (default "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+# 		headers?: [Str] (default "Content-Type, Authorization"),
+# 		credentials?: Bool (default false)
+# 	}
+# Return:
+# 	_Mw — Middleware function.
+let mwCors = fun(opts: {}) -> _Mw do
+	let originOpt = if mapHas(opts, "origin") and opts.origin != null then opts.origin else "*" end
+	let methods = if mapHas(opts, "methods") and opts.methods != null then join(opts.methods, ", ") else "GET, POST, PUT, PATCH, DELETE, OPTIONS" end
+	let allowH = if mapHas(opts, "headers") and opts.headers != null then join(opts.headers, ", ") else "Content-Type, Authorization" end
+	let credsOn = mapHas(opts, "credentials") and opts.credentials != null and bool(opts.credentials)
+
+	fun(next: _StreamFn) -> _StreamFn do
+		fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let reqOrigin = _getHeader(req.headers, "Origin")
+			let allowOrigin =
+				if credsOn then
+					if originOpt == "*" then
+						if reqOrigin != null then reqOrigin else "*" end
+					else
+						originOpt
+					end
+				else
+					originOpt
+				end
+			res.setHeader("Access-Control-Allow-Origin", allowOrigin)
+			res.setHeader("Access-Control-Allow-Methods", methods)
+			res.setHeader("Access-Control-Allow-Headers", allowH)
+			res.setHeader("Access-Control-Allow-Credentials", if credsOn then "true" else "false" end)
+			if credsOn then
+				res.setHeader("Vary", "Origin")
+			end
+			if req.method == "OPTIONS" then
+				res.status(204)
+				let _ = res.end(null)
+				return
+			end
+			next(req, res, ctx)
+			null
+		end
+	end
+end
+
+# mwAccessLog — Log status, bytes, and duration after responses.
+#
+# Summary:
+# 	Wraps a handler to record method/route/bytes/status/duration and prints
+# 	a colored single-line entry after the response completes. Non-2xx
+# 	responses also print an error context if available.
+#
+# Args:
+# 	_: Null — Unused marker.
+# Return:
+# 	_Mw — Middleware function.
+let mwAccessLog = fun(_: Null) -> _Mw do
+	fun(next: _StreamFn) -> _StreamFn do
+		fun(req: Request, res: Responder, ctx: {}) -> Null do
+			let t0 = nowMillis()
+			let status = {v: 200}
+			let bytes  = {v: 0}
+
+			let orig = res
+			let proxy = {}
+			proxy.status = fun(code: Int) -> Responder do
+				status.v = code
+				orig.status(code)
+				proxy
+			end
+			proxy.setHeader = fun(k: Str, v: Str) -> Responder do
+				orig.setHeader(k, v)
+				proxy
+			end
+			proxy.write = fun(chunk: Str) -> Int? do
+				let n = orig.write(chunk)
+				if n != null then
+					bytes.v = bytes.v + int(n)
+				end
+				n
+			end
+			proxy.flush = fun(_: Null) -> Bool? do
+				orig.flush(null)
+			end
+			proxy.end = fun(_: Null) -> Bool? do
+				orig.end(null)
+			end
+
+			next(req, proxy, ctx)
+
+			let dur = nowMillis() - t0
+			let route = req.url.path + if req.url.query == null then "" else "?" + req.url.query end
+			let ok = status.v < 400
+			let tag = if ok then "OK" else "FAIL" end
+
+			let colorOn = true
+			let GRN = if colorOn then "\u001b[32m" else "" end
+			let RED = if colorOn then "\u001b[31m" else "" end
+			let DIM = if colorOn then "\u001b[2m"  else "" end
+			let RST = if colorOn then "\u001b[0m"  else "" end
+
+			let tagC = if ok then GRN + tag + RST else RED + tag + RST end
+			let statusC = if ok then GRN + str(int(status.v)) + RST else RED + str(int(status.v)) + RST end
+
+			printf("\"%s %s\" %dbytes %dms %s %s\n", [
+				req.method, route, int(bytes.v), int(dur), statusC, tagC
+			])
+
+			if not ok and mapHas(ctx, "_errorDump") and ctx._errorDump != null then
+				printf("%s%s%s\n", [DIM, str(ctx._errorDump), RST])
+			end
+			null
+		end
+	end
+end
+=== END FILE: lib/nethttp/middleware.ms ===
+
+=== BEGIN FILE: lib/nethttp/openapi.ms ===
+# openapi — build an OpenAPI 3.1 document from RouteSpec[]
+#
+# This module converts a router’s structured route metadata into an
+# OpenAPI 3.1 document. It does not inspect handlers; it only uses the
+# provided route specifications and contracts.
+
+# -------------------------------------------------
+# Public types (data-only)
+# -------------------------------------------------
+
+# RouteContract — optional bind/validation contract per route.
+# Fields are Types or open objects as noted. Missing fields mean “no constraint”.
+let RouteContract = type {
+	path: Type?,
+	query: Type?,
+	headers: Type?,
+	cookies: Type?,
+	body: Any?,           # Router accepts Type or object; normalized here.
+	responses: {}?        # code -> Any (Type or object)
 }
 
-// HARD errors produced by the lexer use the unified *Error type defined in
-// errors.go. See DiagLex and DiagIncomplete.
-//
-// In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
-// when input ends inside an unterminated construct (e.g., string literal).
-//
-// **Error locations:** All lexing errors (both hard and incomplete) are anchored
-// to the **start of the offending token** (the token whose scanning raised
-// the error). This makes diagnostics stable and easy to map to spans.
-
-// Lexer is a streaming tokenizer for MindScript.
-//
-// Construction:
-//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
-//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
-//     produce IncompleteError.
-//
-// Semantics:
-//   - Scan() returns the full token slice including EOF. It never panics for
-//     malformed input; instead it returns (nil, error).
-//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
-//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
-//     either preceding whitespace *or* the previous token cannot be a left operand.
-//     Otherwise '.' is PERIOD used for property access.
-//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
-//     even if it matches a keyword.
-//
-// Positioning:
-//   - Line numbers are 1-based; column indices are 0-based.
-//   - A token’s position is captured at the start of scanning that token.
-type Lexer struct {
-	// public type with no exported fields; use constructors + Scan()
-	src    string
-	start  int // start index of current token
-	cur    int // current index
-	line   int // 1-based
-	col    int // 0-based column within line
-	tokens []Token
-
-	// precise token start position
-	tokStartLine int
-	tokStartCol  int
-
-	// interactive mode: produce IncompleteError for unterminated constructs at EOF
-	interactive bool
+# RouteSpec — a single route’s public metadata used to generate OpenAPI.
+let RouteSpec = type {
+	method!: Str,
+	pattern!: Str,
+	style!: Enum["value", "stream"],
+	contract: RouteContract?,
+	summary: Str?,
+	description: Str?,
+	tags: [Str]?,
+	deprecated: Bool?,
+	operationId: Str?,
+	security: [ {} ]?,
+	x: {}?
 }
 
-// NewLexer creates a new lexer for the given source in normal mode.
-func NewLexer(src string) *Lexer {
-	return &Lexer{
-		src: src,
-		// very rough guess to reduce reslices on big files
-		tokens: make([]Token, 0, len(src)/4),
-		line:   1,
-		col:    0,
-	}
+# Info — top-level OpenAPI info block.
+let Info = type {
+	title!: Str,
+	version!: Str,
+	description: Str?
 }
 
-// NewLexerInteractive creates a lexer in interactive mode.
-// Unterminated strings return IncompleteError at EOF, allowing REPLs to request more input.
-func NewLexerInteractive(src string) *Lexer {
-	return &Lexer{
-		src:         src,
-		tokens:      make([]Token, 0, len(src)/4),
-		line:        1,
-		col:         0,
-		interactive: true,
-	}
+# SpecOpts — optional module-wide OpenAPI options.
+let SpecOpts = type {
+	validationErrorSchema: Type?,
+	securitySchemes: {}?,
+	security: [ {} ]?,
+	x: {}?
 }
 
-// Scan tokenizes the entire source string and returns the resulting slice of
-// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
-//
-// Error behavior summary:
-//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
-//   - Interactive mode: returns *IncompleteError at EOF if a construct is
-//     unterminated; other issues still return *LexError.
-//
-// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
-// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
-func (l *Lexer) Scan() ([]Token, error) {
-	for {
-		tok, err := l.scanToken()
-		if err != nil {
-			return nil, err
+# -------------------------------------------------
+# Internal helpers
+# -------------------------------------------------
+
+let _segs = fun(p: Str) -> [Str] do
+	let s = if len(p) == 0 or substr(p, 0, 1) != "/" then "/" + p else p end
+	let xs = split(s, "/")
+	let out = []
+	let i = 0
+	while i < len(xs) do
+		let g = xs[i]
+		if len(g) > 0 and g != "." then
+			out = out + [g]
+		end
+		i = i + 1
+	end
+	out
+end
+
+let _norm = fun(p: Str) -> Str do
+	let xs = _segs(p)
+	let out = []
+	let i = 0
+	while i < len(xs) do
+		let g = xs[i]
+		if len(g) >= 3 and substr(g, 0, 2) == "{*" and substr(g, len(g) - 1, len(g)) == "}" then
+			out = out + ["{" + substr(g, 2, len(g))]
+		else
+			out = out + [g]
+		end
+		i = i + 1
+	end
+	"/" + join(out, "/")
+end
+
+let _paramNames = fun(p: Str) -> [Str] do
+	let xs = _segs(p)
+	let out = []
+	let i = 0
+	while i < len(xs) do
+		let g = xs[i]
+		if len(g) >= 2 and substr(g, 0, 1) == "{" and substr(g, len(g) - 1, len(g)) == "}" then
+			let n = substr(g, 1, len(g) - 1)
+			out = out + [if len(n) > 0 and substr(n, 0, 1) == "*" then substr(n, 1, len(n)) else n end]
+		end
+		i = i + 1
+	end
+	out
+end
+
+let _mapFields = fun(T: Type) -> [ {name!: Str, req!: Bool, T!: Type} ]? do
+	let rt = reflect(T)
+	if rt == null or rt[1][0] != "map" then
+		return null
+	end
+	let es = slice(rt[1], 1, len(rt[1]))
+	let out = []
+	let i = 0
+	while i < len(es) do
+		let e = es[i]
+		out = out + [{name: e[1][1], req: e[0] == "pair!", T: reify(["type", e[2]])}]
+		i = i + 1
+	end
+	out
+end
+
+let _ref = fun(reg: {}, comps: {}, T: Type) -> {} do
+	let k = str(uid(reflect(T)))
+	if mapHas(reg, k) then
+		return {"$ref": "#/components/schemas/" + reg[k]}
+	end
+	let name = "T" + replace("-", "0", k)
+	reg[k] = name
+	let js = typeToJSONSchema(T)
+	comps[name] = if js == null then {} else js end
+	{"$ref": "#/components/schemas/" + name}
+end
+
+let _sortParams = fun(ps: [ {} ]) -> [ {} ] do
+	let rank = fun(where: Str) -> Int do
+		if where == "path" then 0 elif where == "query" then 1 elif where == "header" then 2 elif where == "cookie" then 3 else 9 end
+	end
+	sort(clone(ps), fun(a: Any) -> Any -> Int do
+		fun(b: Any) -> Int do
+			let ra = rank(a.in)
+			let rb = rank(b.in)
+			if ra != rb then
+				if ra < rb then -1 else 1 end
+			else
+				if a.name < b.name then -1 elif a.name > b.name then 1 else 0 end
+			end
+		end
+	end)
+end
+
+let _sortKeys = fun(m: {}) -> {} do
+	let ks = sort(list(keys(m)), fun(a: Any) -> Any -> Int do
+		fun(b: Any) -> Int do
+			if a < b then -1 elif a > b then 1 else 0 end
+		end
+	end)
+	let out = {}
+	let i = 0
+	while i < len(ks) do
+		let k = ks[i]
+		out[k] = m[k]
+		i = i + 1
+	end
+	out
+end
+
+let _addParams = fun(ps: [ {} ], where: Str, T: Type, reg: {}, comps: {}) -> [ {} ] do
+	let fs = _mapFields(T)
+	if fs == null then
+		return ps
+	end
+	let out = ps
+	let i = 0
+	while i < len(fs) do
+		let f = fs[i]
+		let p = {
+			name: f.name,
+			in: where,
+			required: if where == "path" then true else f.req end,
+			schema: _ref(reg, comps, f.T)
 		}
-		if tok.Type == EOF {
-			return l.tokens, nil
-		}
+		if where == "cookie" then
+			p.style = "form"
+			p.explode = true
+		elif where == "query" then
+			let rt = reflect(f.T)
+			if rt != null and rt[1][0] == "array" then
+				let U = reify(["type", rt[1][1]])
+				let ur = reflect(U)
+				if ur != null and ur[1][0] == "id" then
+					let n = ur[1][1]
+					if n == "Str" or n == "Int" or n == "Num" or n == "Bool" then
+						p.style = "form"
+						p.explode = true
+					end
+				end
+			elif rt != null and rt[1][0] == "map" then
+				p.style = "deepObject"
+				p.explode = true
+			end
+		end
+		out = out + [p]
+		i = i + 1
+	end
+	out
+end
+
+let _synthPath = fun(ps: [ {} ], pat: Str) -> [ {} ] do
+	let ns = _paramNames(pat)
+	let out = ps
+	let i = 0
+	while i < len(ns) do
+		out = out + [{name: ns[i], in: "path", required: true, schema: {type: "string"}}]
+		i = i + 1
+	end
+	out
+end
+
+# Build the OpenAPI requestBody entry from a declared body definition.
+let _reqBody = fun(def: Any, reg: {}, comps: {}) -> {} do
+	if isType(def, type Type) then
+		return {required: true, content: {"application/json": {schema: _ref(reg, comps, def)}}}
+	end
+	let req = if mapHas(def, "required") and def.required != null then bool(def.required) else true end
+	let ct = if mapHas(def, "contentType") and def.contentType != null then def.contentType else "application/json" end
+	if mapHas(def, "content") and def.content != null then
+		let m = {}
+		for [k, v] in def.content do
+			m[k] = {schema: _ref(reg, comps, v)}
+		end
+		return {required: req, content: m}
+	end
+	let sc =
+		if mapHas(def, "schema") and def.schema != null then _ref(reg, comps, def.schema)
+		elif ct == "application/octet-stream" then {type: "string", format: "binary"}
+		else {} end
+	let entry = {schema: sc}
+	if mapHas(def, "examples") and def.examples != null then
+		entry.examples = def.examples
+	elif mapHas(def, "example") and def.example != null then
+		entry.example = def.example
+	end
+	let m2 = {}
+	m2[ct] = entry
+	{required: req, content: m2}
+end
+
+# Build one OpenAPI response entry for a status code and value.
+let _resp = fun(code: Str, v: Any, reg: {}, comps: {}) -> {} do
+	if code == "204" then
+		return {description: "No Content", content: null}
+	end
+	if isType(v, type Type) then
+		return {description: "OK", content: {"application/json": {schema: _ref(reg, comps, v)}}}
+	end
+	if not isType(v, type {}) then
+		return {description: "OK"}
+	end
+	let d = if mapHas(v, "description") and v.description != null then v.description else "OK" end
+	let out = {description: d}
+	if mapHas(v, "headers") and v.headers != null then
+		let hs = {}
+		for [hk, hv] in v.headers do
+			hs[hk] = {schema: _ref(reg, comps, hv)}
+		end
+		out.headers = hs
+	end
+	if mapHas(v, "content") and v.content != null then
+		let ct = {}
+		for [ck, cv] in v.content do
+			ct[ck] = {schema: _ref(reg, comps, cv)}
+		end
+		out.content = ct
+		return out
+	end
+	if mapHas(v, "contentType") and v.contentType != null then
+		let sc = if mapHas(v, "schema") and v.schema != null then _ref(reg, comps, v.schema) else {} end
+		let entry = {schema: sc}
+		if mapHas(v, "examples") and v.examples != null then
+			entry.examples = v.examples
+		elif mapHas(v, "example") and v.example != null then
+			entry.example = v.example
+		end
+		let ct2 = {}
+		ct2[v.contentType] = entry
+		out.content = ct2
+	end
+	out
+end
+
+let _defRes = fun(style: Str) -> {} do
+	if style == "stream" then
+		return {"200": {description: "OK", content: {"text/plain": {schema: {type: "string"}}}}}
+	end
+	{"200": {description: "OK", content: {"application/json": {schema: {}}}}}
+end
+
+let _opId = fun(m: Str, p: Str) -> Str do
+	let s = toLower(m) + "_" + join(_segs(p), "_")
+	let out = ""
+	let i = 0
+	while i < len(s) do
+		let ch = substr(s, i, i + 1)
+		let ok = (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_"
+		out = out + if ch == "{" or ch == "}" or ch == "*" or not ok then "_" else ch end
+		i = i + 1
+	end
+	out
+end
+
+# -------------------------------------------------
+# Public API
+# -------------------------------------------------
+
+# spec — Build an OpenAPI 3.1 document for a set of routes.
+#
+# Args:
+# 	routes: [RouteSpec] — Collected route specs (value/stream).
+# 	info: Info — Top-level API info (title/version/description).
+# 	servers: [Str]? — Optional server URLs (e.g., "https://api.example.com").
+# 	opts: SpecOpts? — Optional OpenAPI generation options:
+# 		- validationErrorSchema?: Type — schema for 422 responses.
+# 		- securitySchemes?: {} — OpenAPI components.securitySchemes.
+# 		- security?: [ {} ] — Global security requirement objects.
+# 		- x?: {} — Vendor extensions added to top-level doc.
+# Return:
+# 	{} — Fully formed OpenAPI 3.1 document.
+let spec = fun(routes: [RouteSpec], info: Info, servers: [Str]?, opts: SpecOpts?) -> {} do
+	let paths = {}
+	let comps = {}
+	let reg = {}
+	let o = if opts == null then {} else opts end
+	let i = 0
+	while i < len(routes) do
+		let r = routes[i]
+		let pat = _norm(r.pattern)
+		if not mapHas(paths, pat) then
+			paths[pat] = {}
+		end
+		let c = if mapHas(r, "contract") and r.contract != null then r.contract else {} end
+
+		let ps = []
+		let hasC = false
+		if mapHas(c, "path") and c.path != null then
+			ps = _addParams(ps, "path", c.path, reg, comps)
+			hasC = true
+		end
+		if mapHas(c, "query") and c.query != null then
+			ps = _addParams(ps, "query", c.query, reg, comps)
+			hasC = true
+		end
+		if mapHas(c, "headers") and c.headers != null then
+			ps = _addParams(ps, "header", c.headers, reg, comps)
+			hasC = true
+		end
+		if mapHas(c, "cookies") and c.cookies != null then
+			ps = _addParams(ps, "cookie", c.cookies, reg, comps)
+			hasC = true
+		end
+		if not mapHas(c, "path") or c.path == null then
+			ps = _synthPath(ps, pat)
+		end
+		ps = _sortParams(ps)
+
+		let rb = null
+		if mapHas(c, "body") and c.body != null then
+			rb = _reqBody(c.body, reg, comps)
+			hasC = true
+		end
+
+		let rs = if mapHas(c, "responses") and c.responses != null then {} else _defRes(r.style) end
+		if mapHas(c, "responses") and c.responses != null then
+			for [k, v] in c.responses do
+				rs[str(k)] = _resp(str(k), v, reg, comps)
+			end
+		end
+		if hasC and not mapHas(rs, "422") then
+			let sch =
+				if mapHas(o, "validationErrorSchema") and o.validationErrorSchema != null then _ref(reg, comps, o.validationErrorSchema)
+				else {type: "object"} end
+			rs["422"] = {description: "Validation Error", content: {"application/json": {schema: sch}}}
+		end
+
+		let op = {parameters: ps, responses: rs, operationId: _opId(r.method, pat)}
+		if mapHas(r, "security") and r.security != null then op.security = r.security end
+		if mapHas(r, "summary") and r.summary != null then op.summary = r.summary end
+		if mapHas(r, "description") and r.description != null then op.description = r.description end
+		if mapHas(r, "tags") and r.tags != null then op.tags = r.tags end
+		if mapHas(r, "deprecated") and r.deprecated != null then op.deprecated = bool(r.deprecated) end
+		if mapHas(r, "operationId") and r.operationId != null then op.operationId = r.operationId end
+		if mapHas(r, "x") and r.x != null then
+			for [kx, vx] in r.x do
+				op[kx] = vx
+			end
+		end
+		if rb != null then
+			op.requestBody = rb
+		end
+
+		let m = toLower(r.method)
+		paths[pat][m] = op
+		if r.style == "value" and m == "get" then
+			paths[pat]["head"] = {parameters: ps, responses: rs, operationId: _opId("HEAD", pat)}
+		end
+		if not mapHas(paths[pat], "options") then
+			paths[pat]["options"] = {parameters: ps, responses: {"204": {description: "No Content"}}}
+		end
+		i = i + 1
+	end
+
+	let sv = []
+	if servers != null then
+		let j = 0
+		while j < len(servers) do
+			sv = sv + [{url: servers[j]}]
+			j = j + 1
+		end
+	end
+
+	let compsOut = {schemas: comps}
+	if mapHas(o, "securitySchemes") and o.securitySchemes != null then
+		compsOut.securitySchemes = o.securitySchemes
+	end
+
+	let doc = {
+		openapi: "3.1.0",
+		jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema",
+		info: info,
+		servers: sv,
+		paths: _sortKeys(paths),
+		components: compsOut
 	}
+	if mapHas(o, "security") and o.security != null then
+		doc.security = o.security
+	end
+	if mapHas(o, "x") and o.x != null then
+		for [kx, vx] in o.x do
+			doc[kx] = vx
+		end
+	end
+	doc
+end
+=== END FILE: lib/nethttp/openapi.ms ===
+
+=== BEGIN FILE: lib/nethttp/openapi_test.ms ===
+let testing = import("testing")
+let http = import("nethttp")
+let oapi = import("nethttp/openapi")
+
+# Helper: build a minimal RouteSpec (kept small on purpose)
+let _r = fun(method: Str, path: Str, style: Str, c: {}) -> {} do
+	{method: method, pattern: path, style: style, contract: c}
+end
+
+# Helper: build RouteSpec[] from a nethttp router dump
+let _routesFrom = fun(r) -> [ {} ] do
+	let d = r._dump()
+	let out = []
+	let i = 0
+	while i < len(d.routes) do
+		let rr = d.routes[i]
+		out = out + [{
+			method: rr.method,
+			pattern: rr.pattern,
+			style: rr.style,
+			contract: if mapHas(rr, "contract") then rr.contract else {} end
+		}]
+		i = i + 1
+	end
+	out
+end
+
+# Helper: always call openapi.spec with opts (defaults to {})
+let _spec = fun(routes: [ {} ], info: {}, servers: [Str]?, opts: {}?) -> {} do
+	oapi.spec(routes, info, servers, if opts == null then {} else opts end)
+end
+
+# 1) returns 3.1 doc with info/servers
+testing.test("openapi/basic doc", fun(_: Null) do
+	let r = http.router()
+	let doc = _spec(_routesFrom(r), {title: "API", version: "1"}, ["http://x"], null)
+	testing.assert(doc != null, "null doc")
+	testing.assertEq("3.1.0", doc.openapi)
+	testing.assertEq("API", doc.info.title)
+	testing.assertEq("http://x", doc.servers[0].url)
+end)
+
+# 3) path+method present (lowercased)
+testing.test("openapi/paths and methods", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/ping", {}, fun(req, ctx) do http.text(200, "pong") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	testing.assert(d.paths["/ping"] != null, "missing path")
+	testing.assert(d.paths["/ping"].get != null, "missing get op")
+end)
+
+# 4) path params -> in: path, required: true
+testing.test("openapi/path params required", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/u/{id}", {path: type {id: Int}}, fun(req, ctx) do http.text(200, "ok") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let ps = d.paths["/u/{id}"].get.parameters
+	testing.assertEq(1, len(ps))
+	testing.assertEq("path", ps[0].in)
+	testing.assertEq(true, ps[0].required)
+	testing.assert(ps[0].schema["$ref"] != null, "no $ref for path")
+end)
+
+# 5) query params preserve optional vs required
+testing.test("openapi/query required flags", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/q", {query: type {a!: Int, b: Str}}, fun(req, ctx) do http.text(200, "ok") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let ps = d.paths["/q"].get.parameters
+	testing.assertEq(2, len(ps))
+	let reqA = if ps[0].name == "a" then ps[0] else ps[1] end
+	let optB = if ps[0].name == "b" then ps[0] else ps[1] end
+	testing.assertEq(true, reqA.required)
+	testing.assertEq(false, optB.required)
+end)
+
+# 6) requestBody appears for body schema (application/json)
+testing.test("openapi/request body json", fun(_: Null) do
+	let r = http.router()
+	r.route("POST", "/echo", {body: type {msg: Str}}, fun(req, ctx) do http.text(200, "ok") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let rb = d.paths["/echo"].post.requestBody
+	testing.assert(rb != null, "missing requestBody")
+	testing.assert(rb.required, "request not required")
+	testing.assert(rb.content["application/json"] != null, "missing json ct")
+	testing.assert(rb.content["application/json"].schema["$ref"] != null, "missing ref")
+end)
+
+# 7) default responses for value route (200, json)
+testing.test("openapi/default value response", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/auto", {}, fun(req, ctx) do http.text(200, "ok") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let rs = d.paths["/auto"].get.responses
+	testing.assert(rs["200"] != null, "missing 200")
+	testing.assert(rs["200"].content["application/json"] != null, "missing json content")
+end)
+
+# 8) default responses for stream route (200, text/plain string)
+testing.test("openapi/default stream response", fun(_: Null) do
+	let r = http.router()
+	r.routeStream("GET", "/s", {}, fun(req, res, ctx) -> Null do res.status(200).write("x") res.end(null) null end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let rs = d.paths["/s"].get.responses["200"]
+	testing.assert(rs != null, "missing 200")
+	testing.assert(rs.content["text/plain"] != null, "missing text/plain")
+	testing.assertEq("string", rs.content["text/plain"].schema.type)
+end)
+
+# 9) explicit response Type -> json schema $ref
+testing.test("openapi/response type ref", fun(_: Null) do
+	let R = type {ok: Bool}
+	let r = http.router()
+	r.route("GET", "/r", {responses: {"200": R}}, fun(req, ctx) do http.json(200, {ok: true}) end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let s = d.paths["/r"].get.responses["200"].content["application/json"].schema
+	testing.assert(s["$ref"] != null, "missing ref")
+end)
+
+# 10) 204 response -> no content
+testing.test("openapi/204 no content", fun(_: Null) do
+	let r = http.router()
+	r.route("DELETE", "/x", {responses: {"204": type {}}}, fun(req, ctx) do http.noContent(null) end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let r204 = d.paths["/x"].delete.responses["204"]
+	testing.assert(r204 != null, "missing 204")
+	testing.assert(r204.content == null, "204 must not have content")
+end)
+
+# 11) response object with headers + custom contentType
+testing.test("openapi/response headers+contentType", fun(_: Null) do
+	let r = http.router()
+	r.route(
+		"GET",
+		"/h",
+		{responses: {"200": {description: "D", headers: {"X-Rate": type Int}, contentType: "text/plain", schema: type Str}}},
+		fun(req, ctx) do http.text(200, "ok") end
+	)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let rr = d.paths["/h"].get.responses["200"]
+	testing.assertEq("D", rr.description)
+	testing.assert(rr.headers["X-Rate"].schema["$ref"] != null, "header schema ref")
+	testing.assert(rr.content["text/plain"] != null, "missing ct")
+end)
+
+# 12) $ref dedup for reused Type
+testing.test("openapi/ref dedup", fun(_: Null) do
+	let T = type {id: Int}
+	let r = http.router()
+	r.route("POST", "/a", {body: T, responses: {"200": T}}, fun(req, ctx) do
+		http.json(200, {id: 1})
+	end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let comps = d.components.schemas
+	testing.assertEq(1, len(comps))
+end)
+
+# 13) components names look like T<uid>
+testing.test("openapi/component name prefix", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/c", {query: type {q: Int}}, fun(req, ctx) do
+		http.text(200, "ok")
+	end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let m = d.components.schemas
+	testing.assert(len(m) >= 1, "no comps")
+	let ks = list(keys(m))
+	testing.assert(substr(ks[0], 0, 1) == "T", "bad comp name")
+end)
+
+# 14) servers optional -> empty array
+testing.test("openapi/servers optional empty", fun(_: Null) do
+	let r = http.router()
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, null, null)
+	testing.assertEq(0, len(d.servers))
+end)
+
+# catch-all path normalized ({*tail} -> {tail}) + param present
+testing.test("openapi/catch-all normalized", fun(_: Null) do
+	let r = http.router()
+	r.routeStream("GET", "/time/{*tail}", {}, fun(req, res, ctx) -> Null do res.status(200).end(null) null end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	testing.assert(d.paths["/time/{tail}"] != null, "missing normalized path")
+	let ps = d.paths["/time/{tail}"].get.parameters
+	testing.assertEq("path", ps[0].in)
+	testing.assertEq("tail", ps[0].name)
+	testing.assert(ps[0].required, "tail must be required")
+end)
+
+# HEAD mirrored for value GET
+testing.test("openapi/head mirror for get", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/h", {}, fun(req, ctx) do http.text(200, "ok") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	testing.assert(d.paths["/h"].head != null, "missing head op")
+end)
+
+# builtin 422 response for any route with a contract
+testing.test("openapi/builtin 422", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/q", {query: type {n: Int}}, fun(req, ctx) do http.text(200, "ok") end)
+	let rs = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/q"].get.responses
+	testing.assert(rs["422"] != null, "missing 422")
+	testing.assert(rs["422"].content["application/json"] != null, "422 must be json")
+end)
+
+# synthesize path params from template when contract.path absent
+testing.test("openapi/path param synth", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/u/{id}", {}, fun(req, ctx) do http.text(200, "ok") end)
+	let ps = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/u/{id}"].get.parameters
+	testing.assertEq(1, len(ps))
+	testing.assertEq("path", ps[0].in)
+	testing.assertEq("id", ps[0].name)
+	testing.assert(ps[0].required, "id must be required")
+end)
+
+# query array hints: style=form, explode=true
+testing.test("openapi/query array style", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/tags", {query: type {tag: [Int]}}, fun(req, ctx) do http.text(200, "ok") end)
+	let ps = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/tags"].get.parameters
+	let p = if ps[0].name == "tag" then ps[0] else ps[1] end
+	testing.assertEq("form", p.style)
+	testing.assert(p.explode, "explode must be true")
+end)
+
+# requestBody options: required=false + custom contentType
+testing.test("openapi/request body opts", fun(_: Null) do
+	let r = http.router()
+	r.route("POST", "/echo", {body: {required: false, contentType: "text/plain", schema: type Str}}, fun(req, ctx) do http.text(200, "ok") end)
+	let rb = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/echo"].post.requestBody
+	testing.assert(rb != null, "missing requestBody")
+	testing.assertEq(false, rb.required)
+	testing.assert(rb.content["text/plain"] != null, "missing text/plain")
+end)
+
+# stream override response content type (e.g., SSE)
+testing.test("openapi/stream response override", fun(_: Null) do
+	let r = http.router()
+	r.routeStream(
+		"GET",
+		"/sse",
+		{responses: {"200": {contentType: "text/event-stream", schema: type Str}}},
+		fun(req, res, ctx) -> Null do res.status(200).end(null) null end
+	)
+	let rs = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/sse"].get.responses["200"]
+	testing.assert(rs.content["text/event-stream"] != null, "missing event-stream")
+end)
+
+# multi-content response on same status
+testing.test("openapi/multi content response", fun(_: Null) do
+	let r = http.router()
+	r.route(
+		"GET",
+		"/multi",
+		{responses: {"200": {content: {"application/json": type {ok: Bool}, "text/plain": type Str}}}},
+		fun(req, ctx) do http.text(200, "ok") end
+	)
+	let rs = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/multi"].get.responses["200"].content
+	testing.assert(rs["application/json"] != null, "json content missing")
+	testing.assert(rs["text/plain"] != null, "text content missing")
+end)
+
+# jsonSchemaDialect at root
+testing.test("openapi/json schema dialect", fun(_: Null) do
+	let r = http.router()
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	testing.assertEq("https://json-schema.org/draft/2020-12/schema", d.jsonSchemaDialect)
+end)
+
+# operationId synthesized
+testing.test("openapi/operationId", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/ping", {}, fun(req, ctx) do http.text(200, "pong") end)
+	let op = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null).paths["/ping"].get
+	testing.assert(op.operationId != null, "missing operationId")
+end)
+
+# options op for known shapes (204)
+testing.test("openapi/options 204 op", fun(_: Null) do
+	let r = http.router()
+	r.route("GET", "/p/{x}", {}, fun(req, ctx) do http.text(200, "ok") end)
+	let d = _spec(_routesFrom(r), {title: "t", version: "v"}, [], null)
+	let op = d.paths["/p/{x}"].options
+	testing.assert(op != null, "missing options op")
+	testing.assert(op.responses["204"] != null, "missing 204 on options")
+end)
+
+# pure RouteSpec usage (no nethttp)
+testing.test("openapi/spec from RouteSpec only", fun(_: Null) do
+	let routes = [{
+		method: "POST",
+		pattern: "/echo/{id}",
+		style: "value",
+		contract: {
+			path: type {id: Int},
+			query: type {q!: Str},
+			body: type {msg: Str},
+			responses: {"200": type {ok: Bool}}
+		}
+	}]
+	let d = _spec(routes, {title: "t", version: "v"}, ["http://x"], null)
+	testing.assert(d.paths["/echo/{id}"].post != null, "missing post op")
+	testing.assert(d.paths["/echo/{id}"].post.requestBody != null, "missing rb")
+	testing.assert(d.paths["/echo/{id}"].post.responses["200"] != null, "missing 200")
+end)
+
+let testing = import("testing")
+let openapi = import("openapi")
+
+# 1) PATH PARAMS — declared vs synthesized (no duplicates)
+testing.test("openapi/path params declared_vs_synth", fun(_: Null) do
+	let routes = [
+		{method: "GET", pattern: "/u/{id}", style: "value", contract: {path: type {id: Int}}},
+		{method: "GET", pattern: "/v/{name}", style: "value"}  # synth as Str
+	]
+	let doc = _spec(routes, {title: "t", version: "1"}, [], null)
+	let p1 = doc.paths["/u/{id}"].get.parameters
+	let p2 = doc.paths["/v/{name}"].get.parameters
+	testing.assertEq(1, len(p1))               # no dupes
+	testing.assertEq("id", p1[0].name)
+	testing.assertEq("name", p2[0].name)
+	testing.assertEq("path", p2[0].in)
+	testing.assertEq("string", p2[0].schema.type)  # synthesized as Str
+end)
+
+# 2) QUERY — explode only for scalar arrays
+testing.test("openapi/query explode scalar_arrays_only", fun(_: Null) do
+	let Q = type { tag: [Str], obj: [ {a!: Int} ] }
+	let routes = [{method: "GET", pattern: "/q", style: "value", contract: {query: Q}}]
+	let doc = _spec(routes, {title: "t", version: "1"}, [], null)
+	let ps = doc.paths["/q"].get.parameters
+	let tag = null
+	let obj = null
+	let i = 0
+	while i < len(ps) do
+		if ps[i].name == "tag" then tag = ps[i] end
+		if ps[i].name == "obj" then obj = ps[i] end
+		i = i + 1
+	end
+	testing.assert(tag != null, "missing tag")
+	testing.assertEq(true, tag.explode)                 # scalar array
+	testing.assert(obj != null, "missing obj")
+	testing.assert(obj.explode == null or obj.explode == false, "obj should not explode")
+end)
+
+# 3) RESPONSES — support 'default' key
+testing.test("openapi/responses default_key", fun(_: Null) do
+	let routes = [{
+		method: "GET",
+		pattern: "/r",
+		style: "value",
+		contract: {responses: {default: type {ok!: Bool}}}
+	}]
+	let doc = _spec(routes, {title: "t", version: "1"}, [], null)
+	let rs = doc.paths["/r"].get.responses
+	testing.assert(mapHas(rs, "default"), "missing default response")
+end)
+
+# 4) 204 — force no content
+testing.test("openapi/204 no_content", fun(_: Null) do
+	let routes = [{
+		method: "GET",
+		pattern: "/n",
+		style: "value",
+		contract: {responses: {"204": {description: "done"}}}
+	}]
+	let doc = _spec(routes, {title: "t", version: "1"}, [], null)
+	let r204 = doc.paths["/n"].get.responses["204"]
+	testing.assertEq(null, r204.content)
+end)
+
+# 5) DETERMINISM — parameters order: path before query; query names sorted
+testing.test("openapi/params deterministic_order", fun(_: Null) do
+	let routes = [{
+		method: "GET",
+		pattern: "/o/{z}",
+		style: "value",
+		contract: {path: type {z: Str}, query: type {b: Int, a: Int}}
+	}]
+	let doc = _spec(routes, {title: "t", version: "1"}, [], null)
+	let ps = doc.paths["/o/{z}"].get.parameters
+	testing.assertEq("path", ps[0].in)
+	testing.assertEq("z", ps[0].name)
+	# collect query names in listed order
+	let qs = []
+	let i = 0
+	while i < len(ps) do
+		if ps[i].in == "query" then qs = qs + [ps[i].name] end
+		i = i + 1
+	end
+	testing.assertEq(2, len(qs))
+	testing.assertEq("a", qs[0])  # alpha
+	testing.assertEq("b", qs[1])
+end)
+
+let testing = import("testing")
+let oapi2 = import("openapi")
+
+# helper: make a tiny route
+let _r = fun(method: Str, path: Str, style: Str, c: {}) -> {} do
+	{method: method, pattern: path, style: style, contract: c}
+end
+
+# 1) Deterministic component names across two runs
+testing.test("openapi/deterministic component names", fun(_: Null) do
+	let T = type {id: Int}
+	let routes = [_r("GET", "/a", "value", {responses: {"200": T}})]
+	let d1 = _spec(routes, {title: "t", version: "1"}, [], null)
+	let d2 = _spec(routes, {title: "t", version: "1"}, [], null)
+	let k1 = list(keys(d1.components.schemas))[0]
+	let k2 = list(keys(d2.components.schemas))[0]
+	testing.assertEq(k1, k2)
+end)
+
+# 2) Components keys sorted alpha (determinism)
+testing.test("openapi/components sorted", fun(_: Null) do
+	let A = type {a: Int}
+	let B = type {b: Int}
+	let routes = [
+		_r("GET", "/a", "value", {responses: {"200": A}}),
+		_r("GET", "/b", "value", {responses: {"200": B}})
+	]
+	let d = _spec(routes, {title: "t", version: "1"}, [], null)
+	let ks = list(keys(d.components.schemas))
+	testing.assert(len(ks) >= 2, "needs 2 comps")
+	testing.assert(ks[0] <= ks[1], "not alpha")
+end)
+
+# 3) Route metadata: summary/description/tags/deprecated/operationId override
+testing.test("openapi/route metadata passthrough", fun(_: Null) do
+	let routes = [{
+		method: "GET",
+		pattern: "/m",
+		style: "value",
+		contract: {},
+		summary: "S",
+		description: "D",
+		tags: ["t1", "t2"],
+		deprecated: true,
+		operationId: "customOp"
+	}]
+	let op = _spec(routes, {title: "t", version: "1"}, [], null).paths["/m"].get
+	testing.assertEq("S", op.summary)
+	testing.assertEq("D", op.description)
+	testing.assertEq(true, op.deprecated)
+	testing.assertEq("customOp", op.operationId)
+	testing.assertEq(2, len(op.tags))
+end)
+
+# 4) Security: root schemes + root requirement + per-route clear
+testing.test("openapi/security root_and_override", fun(_: Null) do
+	let routes = [
+		{method: "GET", pattern: "/a", style: "value", contract: {}},         # inherits root security
+		{method: "GET", pattern: "/b", style: "value", contract: {}, security: []}  # clears
+	]
+	let d = _spec(routes, {title: "t", version: "1"}, [], {
+		securitySchemes: {apiKeyAuth: {type: "apiKey", name: "X-API-Key", in: "header"}},
+		security: [{apiKeyAuth: []}]
+	})
+	let opA = d.paths["/a"].get
+	let opB = d.paths["/b"].get
+	testing.assert(d.components.securitySchemes.apiKeyAuth != null, "missing scheme")
+	testing.assert(opA.security == null, "should inherit root")
+	testing.assertEq(1, len(d.security))
+	testing.assertEq(0, len(opB.security))  # explicit clear
+end)
+
+# 5) Request body: application/octet-stream -> string/binary
+testing.test("openapi/body octet-stream binary", fun(_: Null) do
+	let routes = [_r("POST", "/bin", "value", {body: {contentType: "application/octet-stream"}})]
+	let rb = _spec(routes, {title: "t", version: "1"}, [], null).paths["/bin"].post.requestBody
+	let sch = rb.content["application/octet-stream"].schema
+	testing.assertEq("string", sch.type)
+	testing.assertEq("binary", sch.format)
+end)
+
+# 6) Request body: multipart/form-data with schema
+testing.test("openapi/body multipart with schema", fun(_: Null) do
+	let F = type {name!: Str}
+	let routes = [_r("POST", "/up", "value", {body: {contentType: "multipart/form-data", schema: F}})]
+	let rb = _spec(routes, {title: "t", version: "1"}, [], null).paths["/up"].post.requestBody
+	let s = rb.content["multipart/form-data"].schema
+	testing.assert(s["$ref"] != null, "multipart schema missing ref")
+end)
+
+# 7) Builtin 422 uses override schema when provided
+testing.test("openapi/422 override schema", fun(_: Null) do
+	let Err = type {error!: Str, detail: [ {} ]}
+	let routes = [_r("GET", "/q", "value", {query: type {n!: Int}})]
+	let rs = _spec(routes, {title: "t", version: "1"}, [], {validationErrorSchema: Err}).paths["/q"].get.responses
+	let sch = rs["422"].content["application/json"].schema
+	testing.assert(sch["$ref"] != null, "missing 422 ref")
+end)
+
+# 8) Headers and cookies contract -> parameters in header/cookie
+testing.test("openapi/headers and cookies params", fun(_: Null) do
+	let routes = [_r("GET", "/p", "value", {
+		headers: type { "X-Req": Str },
+		cookies: type { session: Str }
+	})]
+	let ps = _spec(routes, {title: "t", version: "1"}, [], null).paths["/p"].get.parameters
+	let seenH = false
+	let seenC = false
+	let i = 0
+	while i < len(ps) do
+		if ps[i].in == "header" and ps[i].name == "X-Req" then seenH = true end
+		if ps[i].in == "cookie" and ps[i].name == "session" then seenC = true end
+		i = i + 1
+	end
+	testing.assert(seenH, "missing header param")
+	testing.assert(seenC, "missing cookie param")
+end)
+
+# 9) Query object param -> deepObject style
+testing.test("openapi/query object deepObject", fun(_: Null) do
+	let Q = type { obj: {a!: Int} }
+	let routes = [_r("GET", "/q", "value", {query: Q})]
+	let ps = _spec(routes, {title: "t", version: "1"}, [], null).paths["/q"].get.parameters
+	let obj = if ps[0].name == "obj" then ps[0] else ps[1] end
+	testing.assertEq("query", obj.in)
+	testing.assertEq("deepObject", obj.style)
+	testing.assert(obj.explode, "explode should be true")
+end)
+
+# 10) Response key normalization: numeric and default preserved; 204 no content
+testing.test("openapi/responses normalize and 204", fun(_: Null) do
+	let routes = [_r("GET", "/r", "value", {responses: {"200": type {ok: Bool}, default: type {msg: Str}, "204": {description: "done"}}})]
+	let rs = _spec(routes, {title: "t", version: "1"}, [], null).paths["/r"].get.responses
+	testing.assert(rs["200"] != null, "missing 200")
+	testing.assert(rs["default"] != null, "missing default")
+	testing.assertEq(null, rs["204"].content)
+end)
+
+# 11) Vendor extensions at route and root (x-*)
+testing.test("openapi/vendor extensions passthrough", fun(_: Null) do
+	let routes = [{
+		method: "GET",
+		pattern: "/x",
+		style: "value",
+		contract: {},
+		x: {"x-route": true}
+	}]
+	let d = _spec(routes, {title: "t", version: "1"}, [], {x: {"x-root": 1}})
+	let op = d.paths["/x"].get
+	testing.assertEq(true, op["x-route"])
+	testing.assertEq(1, d["x-root"])
+end)
+
+# 12) Examples on requestBody and response (single example)
+testing.test("openapi/examples rb_and_resp", fun(_: Null) do
+	let B = type {msg!: Str}
+	let R = type {ok!: Bool}
+	let routes = [_r("POST", "/e", "value", {
+		body: {schema: B, example: {msg: "hi"}},
+		responses: {"200": {schema: R, contentType: "application/json", example: {ok: true}}}
+	})]
+	let d = _spec(routes, {title: "t", version: "1"}, [], null)
+	let rbEx = d.paths["/e"].post.requestBody.content["application/json"].example
+	let rsEx = d.paths["/e"].post.responses["200"].content["application/json"].example
+	testing.assert(rbEx != null, "missing rb example")
+	testing.assert(rsEx != null, "missing resp example")
+end)
+
+# 13) Info passthrough: license/contact/terms
+testing.test("openapi/info passthrough", fun(_: Null) do
+	let info = {
+		title: "t",
+		version: "1",
+		license: {name: "MIT"},
+		contact: {name: "c"},
+		termsOfService: "https://tos"
+	}
+	let d = _spec([], info, [], null)
+	testing.assertEq("MIT", d.info.license.name)
+	testing.assertEq("c", d.info.contact.name)
+	testing.assertEq("https://tos", d.info.termsOfService)
+end)
+
+# 1) Deterministic: paths keys sorted (lexicographic)
+testing.test("openapi/deterministic paths order", fun(_: Null) do
+	let routes = [
+		_r("GET", "/b", "value", {}),
+		_r("GET", "/a", "value", {})
+	]
+	let d = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let ks = list(keys(d.paths))
+
+	# Map key order is unspecified; sort for deterministic assertions.
+	let s = clone(ks)
+	let i = 1
+	while i < len(s) do
+		let j = i
+		while j > 0 and s[j] < s[j - 1] do
+			let t = s[j - 1]
+			s[j - 1] = s[j]
+			s[j] = t
+			j = j - 1
+		end
+		i = i + 1
+	end
+
+	testing.assertEq(2, len(s))
+	testing.assertEq("/a", s[0])
+	testing.assertEq("/b", s[1])
+end)
+
+
+# 2) OPTIONS: real route is preserved (stub must not overwrite)
+testing.test("openapi/options route preserved", fun(_: Null) do
+	let routes = [
+		{method: "OPTIONS", pattern: "/x", style: "value", contract: {}, summary: "real"},
+		_r("GET", "/x", "value", {})
+	]
+	let d = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let op = d.paths["/x"].options
+	testing.assert(op != null, "missing options op")
+	testing.assertEq("real", op.summary)
+end)
+
+# 3) Cookies: default style=form, explode=true
+testing.test("openapi/cookie defaults", fun(_: Null) do
+	let routes = [_r("GET", "/p", "value", {cookies: type {session: Str}})]
+	let ps = oapi.spec(routes, {title: "t", version: "1"}, [], {}).paths["/p"].get.parameters
+	testing.assertEq(1, len(ps))
+	testing.assertEq("cookie", ps[0].in)
+	testing.assertEq("session", ps[0].name)
+	testing.assertEq("form", ps[0].style)
+	testing.assert(ps[0].explode, "cookie explode should be true")
+end)
+
+# 5) Components determinism: same inputs -> same component keys
+testing.test("openapi/components deterministic", fun(_: Null) do
+	let T = type {id: Int}
+	let routes = [_r("GET", "/a", "value", {responses: {"200": T}})]
+	let d1 = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let d2 = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let k1 = list(keys(d1.components.schemas))
+	let k2 = list(keys(d2.components.schemas))
+	testing.assertEq(len(k1), len(k2))
+	testing.assertEq(k1[0], k2[0])
+end)
+
+# 6) No path param dupes: declared vs synthesized
+testing.test("openapi/path params no_dupe", fun(_: Null) do
+	let routes = [_r("GET", "/u/{id}", "value", {path: type {id: Int}})]
+	let ps = oapi.spec(routes, {title: "t", version: "1"}, [], {}).paths["/u/{id}"].get.parameters
+	testing.assertEq(1, len(ps))
+	testing.assertEq("path", ps[0].in)
+	testing.assertEq("id", ps[0].name)
+	testing.assert(ps[0].required, "id must be required")
+end)
+
+# 7) Built-in 422 injected when any contract present (query here)
+testing.test("openapi/builtin 422 present", fun(_: Null) do
+	let routes = [_r("GET", "/q", "value", {query: type {n!: Int}})]
+	let rs = oapi.spec(routes, {title: "t", version: "1"}, [], {}).paths["/q"].get.responses
+	testing.assert(rs["422"] != null, "missing 422")
+	testing.assert(rs["422"].content["application/json"] != null, "422 must be json")
+end)
+
+# Single media-type example -> emit `example`, not `examples`
+testing.test("openapi/examples mediaType single_example", fun(_: Null) do
+	let routes = [{
+		method: "POST",
+		pattern: "/e1",
+		style: "value",
+		contract: {
+			body: {contentType: "application/json", schema: type {msg!: Str}, example: {msg: "hi"}},
+			responses: {"200": {contentType: "application/json", schema: type {ok!: Bool}, example: {ok: true}}}
+		}
+	}]
+	let d = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let rb = d.paths["/e1"].post.requestBody.content["application/json"]
+	let rs = d.paths["/e1"].post.responses["200"].content["application/json"]
+
+    testing.assert(mapHas(rb, "example"), "rb.example missing")
+    testing.assert(not mapHas(rb, "examples"), "rb.examples should be absent")
+    testing.assert(mapHas(rs, "example"), "resp.example missing")
+    testing.assert(not mapHas(rs, "examples"), "resp.examples should be absent")
+end)
+
+# Map of named examples -> emit `examples`, not `example`
+testing.test("openapi/examples mediaType examples_map", fun(_: Null) do
+	let routes = [{
+		method: "POST",
+		pattern: "/e2",
+		style: "value",
+		contract: {
+			body: {contentType: "application/json", schema: type {msg!: Str}, examples: {a: {value: {msg: "hi"}}, b: {value: {msg: "yo"}}}},
+			responses: {"200": {contentType: "application/json", schema: type {ok!: Bool}, examples: {ok: {value: {ok: true}}}}}
+		}
+	}]
+	let d = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let rb = d.paths["/e2"].post.requestBody.content["application/json"]
+	let rs = d.paths["/e2"].post.responses["200"].content["application/json"]
+
+	testing.assert(mapHas(rb, "examples"), "rb.examples missing")
+    testing.assert(not mapHas(rb, "example"), "rb.example should be absent")
+    testing.assert(mapHas(rs, "examples"), "resp.examples missing")
+    testing.assert(not mapHas(rs, "example"), "resp.example should be absent")
+end)
+
+# Paths should be emitted already sorted (no client-side sorting needed)
+testing.test("openapi/paths emitted sorted", fun(_: Null) do
+	let routes = [
+		{method: "GET", pattern: "/b", style: "value", contract: {}},
+		{method: "GET", pattern: "/a", style: "value", contract: {}}
+	]
+	let d = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let ks = list(keys(d.paths))
+	testing.assertEq(2, len(ks))
+	testing.assertEq("/a", ks[0])
+	testing.assertEq("/b", ks[1])
+end)
+
+# responses: numeric codes ascend; "default" last (check via sorted key list)
+testing.test("openapi/responses ordered numeric_then_default", fun(_: Null) do
+	let routes = [{
+		method: "GET",
+		pattern: "/r",
+		style: "value",
+		contract: {responses: {"404": type {x: Int}, "200": type {y: Int}, default: type {z: Int}}}
+	}]
+	let rs = oapi.spec(routes, {title: "t", version: "1"}, [], {}).paths["/r"].get.responses
+	let ks = list(keys(rs))
+
+	# insertion sort with tiny comparator
+	let less = fun(a: Str, b: Str) -> Bool do
+		let ia = int(a) let ib = int(b)
+		if ia != null and ib != null then return ia < ib end
+		if ia != null then return true end
+		if ib != null then return false end
+		if a == "default" then return false end
+		if b == "default" then return true end
+		a < b
+	end
+	let i = 1
+	while i < len(ks) do
+		let j = i
+		while j > 0 and less(ks[j], ks[j - 1]) do
+			let t = ks[j - 1] ks[j - 1] = ks[j] ks[j] = t
+			j = j - 1
+		end
+		i = i + 1
+	end
+
+	testing.assertEq(3, len(ks))
+	testing.assertEq("200", ks[0])
+	testing.assertEq("404", ks[1])
+	testing.assertEq("default", ks[2])
+end)
+
+
+# If a user provides an explicit 422 response, it must be preserved (no override)
+testing.test("openapi/422 explicit preserved", fun(_: Null) do
+	let Err = type {error!: Str}
+	let routes = [{
+		method: "GET",
+		pattern: "/q",
+		style: "value",
+		contract: {query: type {n!: Int}, responses: {"422": {description: "mine", contentType: "application/json", schema: Err}}}
+	}]
+	let d = oapi.spec(routes, {title: "t", version: "1"}, [], {})
+	let r422 = d.paths["/q"].get.responses["422"]
+	testing.assert(r422 != null, "missing 422")
+	testing.assertEq("mine", r422.description)
+end)=== END FILE: lib/nethttp/openapi_test.ms ===
+
+=== BEGIN FILE: lib/nethttp/router.ms ===
+# nethttp/router — routing, contracts, binding, responders, OpenAPI hook
+#
+# This module implements a path router for value and streaming handlers.
+# It provides request/response helpers, automatic binding/validation
+# for path/query/body via contracts, response validation (optional),
+# test utilities, and OpenAPI export support.
+
+let openapi = import("nethttp/openapi")
+
+# =========================
+# Public types (data-only)
+# =========================
+
+# Request — immutable request value passed to handlers.
+let Request = type {
+	method!: Str,
+	url!: {scheme: Str?, host: Str?, path!: Str, query: Str?},
+	headers!: {},
+	body!: Any,
+	pathParams: {}?
 }
 
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                            PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-// ---------------- keywords map (private) ----------------
-
-var keywords = map[string]TokenType{
-	"null":     NULL,
-	"false":    BOOLEAN,
-	"true":     BOOLEAN,
-	"and":      AND,
-	"or":       OR,
-	"not":      NOT,
-	"let":      LET,
-	"do":       DO,
-	"end":      END,
-	"return":   RETURN,
-	"break":    BREAK,
-	"continue": CONTINUE,
-	"if":       IF,
-	"then":     THEN,
-	"elif":     ELIF,
-	"else":     ELSE,
-	"fun":      FUNCTION,
-	"oracle":   ORACLE,
-	"module":   MODULE,
-	"for":      FOR,
-	"in":       IN,
-	"from":     FROM,
-	"while":    WHILE,
-	"type":     TYPECONS,
-	"Type":     TYPE,
-	"Null":     TYPE,
-	"Str":      TYPE,
-	"Int":      TYPE,
-	"Num":      TYPE,
-	"Bool":     TYPE,
-	"Any":      TYPE,
-	"Enum":     ENUM,
+# Responder — streaming response interface for handlers.
+let Responder = type {
+	status!: Int -> Responder,
+	setHeader!: Str -> Str -> Responder,
+	write!: Str -> Int?,
+	flush!: Null -> Bool?,
+	end!: Null -> Bool?
 }
 
-// ---------------- core scanning helpers ----------------
+# _Response — buffered response shape used by helpers and value routes.
+let _Response = type {status!: Int, headers!: {}, body!: Str}
 
-func (l *Lexer) isAtEnd() bool { return l.cur >= len(l.src) }
-
-func (l *Lexer) peek() (byte, bool) {
-	if l.isAtEnd() {
-		return 0, false
-	}
-	return l.src[l.cur], true
+# _HttpError — structured error returned by helpers like raise().
+let _HttpError = type {
+	__http_error__!: Bool,
+	status!: Int,
+	body!: Str,
+	headers!: {}
 }
 
-func (l *Lexer) peekN(n int) (byte, bool) {
-	idx := l.cur + n
-	if idx >= len(l.src) {
-		return 0, false
-	}
-	return l.src[idx], true
-}
-
-func (l *Lexer) advance() (byte, bool) {
-	if l.isAtEnd() {
-		return 0, false
-	}
-	ch := l.src[l.cur]
-	l.cur++
-	if ch == '\n' {
-		l.line++
-		l.col = 0
-	} else {
-		l.col++
-	}
-	return ch, true
-}
-
-func (l *Lexer) rewindToStart() {
-	// We rewind only within the bounds of the current token start; line/col are kept
-	// for error arrows (OK since we set tokStartLine/Col before scanning).
-	l.cur = l.start
-}
-
-func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
-	lex := l.src[l.start:l.cur]
-	tok := Token{
-		Type:      tt,
-		Lexeme:    lex,
-		Literal:   lit,
-		Line:      l.tokStartLine,
-		Col:       l.tokStartCol,
-		StartByte: l.start,
-		EndByte:   l.cur,
-	}
-	l.tokens = append(l.tokens, tok)
-	l.start = l.cur
-	return tok
-}
-
-func (l *Lexer) previousToken() *Token {
-	if len(l.tokens) == 0 {
-		return nil
-	}
-	return &l.tokens[len(l.tokens)-1]
-}
-
-func (l *Lexer) skipHorizontalWhitespace() {
-	for !l.isAtEnd() {
-		ch, _ := l.peek()
-		switch ch {
-		case ' ', '\t', '\r':
-			l.advance()
-			l.start = l.cur
-		default:
-			return
-		}
-	}
-}
-
-// immediateWhitespaceBefore reports whether the byte immediately preceding the
-// current token start is ASCII whitespace. Called *after* skipWhitespace.
-func (l *Lexer) immediateWhitespaceBefore() bool {
-	if l.start == 0 {
-		return false
-	}
-	switch l.src[l.start-1] {
-	case ' ', '\t', '\n', '\r', ';':
-		return true
-	default:
-		return false
-	}
-}
-
-// ---------------- small predicates ----------------
-
-func canBeLeftOperand(t TokenType) bool {
-	switch t {
-	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
-		TYPE, ENUM,
-		RROUND, RSQUARE, RCURLY,
-		QUESTION:
-		return true
-	default:
-		return false
-	}
-}
-
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-func isHex(b byte) bool {
-	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
-}
-func isAlpha(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' }
-func isAlphaNum(b byte) bool {
-	return (b >= 'a' && b <= 'z') ||
-		(b >= 'A' && b <= 'Z') ||
-		(b >= '0' && b <= '9') ||
-		b == '_'
-}
-
-func (l *Lexer) afterDotIsProperty() bool {
-	p := l.previousToken()
-	return p != nil && p.Type == PERIOD
-}
-
-// ---------------- error builders (start-of-token anchored) ----------------
-
-func (l *Lexer) err(msg string) error {
-	// All lexer diagnostics are anchored to the start of the *current* token,
-	// which is the most stable and helpful position for tools and users.
-	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
-}
-
-func (l *Lexer) errIncomplete(msg string) error {
-	// Report need-more-input conditions in interactive mode, anchored to token start.
-	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
-}
-
-// ---------------- scanners ----------------
-
-// scanString parses a JSON-style string literal (single or double quotes).
-func (l *Lexer) scanString() (string, error) {
-	del := l.src[l.start]
-	if del != '"' && del != '\'' {
-		return "", l.err("internal: scanString without quote")
-	}
-	// consume the delimiter
-	l.advance()
-
-	var out []rune
-	for !l.isAtEnd() {
-		ch, _ := l.advance()
-		if ch == byte(del) {
-			return string(out), nil
-		}
-		if ch == '\\' {
-			if l.isAtEnd() {
-				if l.interactive {
-					return "", l.errIncomplete("unfinished escape sequence")
-				}
-				return "", l.err("unfinished escape sequence")
-			}
-			esc, _ := l.advance()
-			switch esc {
-			case '"':
-				out = append(out, '"')
-			case '\'':
-				out = append(out, '\'')
-			case '\\':
-				out = append(out, '\\')
-			case '/':
-				out = append(out, '/')
-			case 'b':
-				out = append(out, '\b')
-			case 'f':
-				out = append(out, '\f')
-			case 'n':
-				out = append(out, '\n')
-			case 'r':
-				out = append(out, '\r')
-			case 't':
-				out = append(out, '\t')
-			case 'u':
-				// expect 4 hex digits
-				toHex := func(b byte) int {
-					switch {
-					case b >= '0' && b <= '9':
-						return int(b - '0')
-					case b >= 'a' && b <= 'f':
-						return 10 + int(b-'a')
-					case b >= 'A' && b <= 'F':
-						return 10 + int(b-'A')
-					default:
-						return -1
-					}
-				}
-				val := 0
-				for i := 0; i < 4; i++ {
-					b, ok := l.peek()
-					if !ok {
-						if l.interactive {
-							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
-						}
-						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
-					}
-					d := toHex(b)
-					if d < 0 {
-						return "", l.err("invalid unicode escape")
-					}
-					val = (val << 4) | d
-					l.advance()
-				}
-				r := rune(val)
-
-				// handle surrogate pair \uD800-\uDBFF followed by \uDC00-\uDFFF
-				if 0xD800 <= r && r <= 0xDBFF {
-					saveCur := l.cur
-					saveLine, saveCol := l.line, l.col
-					if b1, ok := l.peek(); ok && b1 == '\\' {
-						l.advance()
-						if b2, ok := l.peek(); ok && b2 == 'u' {
-							l.advance()
-							val2 := 0
-							for i := 0; i < 4; i++ {
-								b, ok := l.peek()
-								if !ok {
-									if l.interactive {
-										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
-									}
-									return "", l.err("unicode surrogate pair low was not terminated")
-								}
-								d := toHex(b)
-								if d < 0 {
-									return "", l.err("invalid unicode surrogate pair low")
-								}
-								val2 = (val2 << 4) | d
-								l.advance()
-							}
-							r2 := rune(val2)
-							if 0xDC00 <= r2 && r2 <= 0xDFFF {
-								cp := utf16.DecodeRune(r, r2)
-								out = append(out, cp)
-								continue
-							}
-						}
-					}
-					// not a valid pair; rewind and just emit r
-					l.cur = saveCur
-					l.line, l.col = saveLine, saveCol
-				}
-				out = append(out, r)
-			default:
-				return "", l.err(fmt.Sprintf("invalid escape sequence: \\%c", esc))
-			}
-			continue
-		}
-		// normal char; ensure it’s valid UTF-8 boundary (source may be UTF-8)
-		if ch < utf8.RuneSelf {
-			out = append(out, rune(ch))
-			continue
-		}
-		// If we see a non-ASCII byte here, the source itself is UTF-8; back up one byte and decode rune.
-		l.cur-- // step back 1 byte to let utf8.DecodeRuneInString read from correct start
-		r, size := utf8.DecodeRuneInString(l.src[l.cur:])
-		if r == utf8.RuneError && size == 1 {
-			return "", l.err("invalid UTF-8 in source")
-		}
-		out = append(out, r)
-		l.cur += size
-		l.col += size - 1
-	}
-	if l.interactive {
-		return "", l.errIncomplete("string was not terminated")
-	}
-	return "", l.err("string was not terminated")
-}
-
-// scanIdentifier parses [A-Za-z_][A-Za-z0-9_]*
-func (l *Lexer) scanIdentifier() string {
-	for {
-		b, ok := l.peek()
-		if !ok || !isAlphaNum(b) {
-			break
-		}
-		l.advance()
-	}
-	return l.src[l.start:l.cur]
-}
-
-// scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
-// Precondition: current position is at l.start and the first rune is either a digit
-// or a '.' that has already been verified to start a number.
-func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
-	sawDigits := false
-	sawDot := false
-	sawExp := false
-
-	// integral part (optional for leading '.')
-	for {
-		b, ok := l.peek()
-		if !ok || !isDigit(b) {
-			break
-		}
-		l.advance()
-		sawDigits = true
-	}
-
-	// fractional part
-	if b, ok := l.peek(); ok && b == '.' {
-		// Do NOT consume '.' if we're after a property PERIOD (obj.<digits>)
-		// OR if the next char is also '.' (e.g. "1..2").
-		if !(l.afterDotIsProperty()) {
-			if b2, ok2 := l.peekN(1); !(ok2 && b2 == '.') {
-				l.advance() // consume '.'
-				sawDot = true
-				for {
-					b2, ok2 := l.peek()
-					if !ok2 || !isDigit(b2) {
-						break
-					}
-					l.advance()
-					sawDigits = true
-				}
-			}
-		}
-	}
-
-	// exponent part: ([eE][+-]?digits)?
-	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
-		save := l.cur
-		l.advance() // consume e/E
-		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
-			l.advance()
-		}
-		if b3, ok := l.peek(); ok && isDigit(b3) {
-			sawExp = true
-			for {
-				b4, ok := l.peek()
-				if !ok || !isDigit(b4) {
-					break
-				}
-				l.advance()
-			}
-		} else {
-			l.cur = save // no exponent
-		}
-	}
-
-	if !sawDigits {
-		return ILLEGAL, nil, l.err("malformed number")
-	}
-
-	lex := l.src[l.start:l.cur]
-	if !sawDot && !sawExp {
-		v, convErr := strconv.ParseInt(lex, 10, 64)
-		if convErr != nil {
-			return ILLEGAL, nil, l.err("invalid integer literal")
-		}
-		return INTEGER, v, nil
-	}
-	vf, convErr := strconv.ParseFloat(lex, 64)
-	if convErr != nil {
-		return ILLEGAL, nil, l.err("invalid float literal")
-	}
-	return NUMBER, vf, nil
-}
-
-// scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
-// Terminates on blank line or a line that does not begin (after spaces) with '#'.
-func (l *Lexer) scanAnnotation() (string, error) {
-	var bldr strings.Builder
-
-	// helper: check if the *next* line (after current '\n') starts with '#'
-	nextLineStartsWithHash := func() bool {
-		// we are currently positioned at the '\n' (unconsumed)
-		probe := l.cur + 1
-		for probe < len(l.src) {
-			c := l.src[probe]
-			if c == ' ' || c == '\t' || c == '\r' {
-				probe++
-				continue
-			}
-			break
-		}
-		return probe < len(l.src) && l.src[probe] == '#'
-	}
-
-	// Trim at most one ASCII space (NOT tab) after the first '#'.
-	if b, ok := l.peek(); ok && b == ' ' {
-		l.advance()
-	}
-
-	// ----- capture first line, but DO NOT consume its trailing '\n' -----
-	for {
-		b, ok := l.peek()
-		if !ok || b == '\n' {
-			// do not l.advance() here; leave '\n' in the stream
-			bldr.WriteByte('\n')
-			break
-		}
-		bldr.WriteByte(b)
-		l.advance()
-	}
-
-	// If there is another annotation line, consume the '\n' now and continue.
-	if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
-		l.advance() // consume newline to move to start of the next line
-	} else {
-		// single-line block; leave the '\n' unconsumed
-		s := bldr.String()
-		if len(s) == 0 {
-			return "", errors.New("incomplete annotation")
-		}
-		for len(s) > 0 && s[len(s)-1] == '\n' {
-			s = s[:len(s)-1]
-		}
-		return s, nil
-	}
-
-	// ----- capture subsequent '#'-prefixed lines -----
-	consumeHashOnLine := func() (bool, error) {
-		for {
-			b, ok := l.peek()
-			if !ok || b == '\n' {
-				break
-			}
-			if b == ' ' || b == '\t' || b == '\r' {
-				l.advance()
-				continue
-			}
-			break
-		}
-		b, ok := l.peek()
-		if !ok || b != '#' {
-			return false, nil
-		}
-		l.advance() // '#'
-		// Trim at most one ASCII space (NOT tab) after '#'
-		if b2, ok2 := l.peek(); ok2 && b2 == ' ' {
-			l.advance()
-		}
-		return true, nil
-	}
-
-	for {
-		save := l.cur
-		cont, err := consumeHashOnLine()
-		if err != nil {
-			return "", err
-		}
-		if !cont {
-			l.cur = save
-			break
-		}
-
-		// read rest of line, but DO NOT consume trailing '\n'
-		for {
-			b, ok := l.peek()
-			if !ok || b == '\n' {
-				bldr.WriteByte('\n')
-				break
-			}
-			bldr.WriteByte(b)
-			l.advance()
-		}
-
-		// If another '#'-line follows, eat this '\n' and continue; else stop (leave '\n').
-		if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
-			l.advance() // consume newline to move to next line
-		} else {
-			break // leave final '\n' unconsumed
-		}
-	}
-
-	s := bldr.String()
-	if len(s) == 0 {
-		return "", errors.New("incomplete annotation")
-	}
-	for len(s) > 0 && s[len(s)-1] == '\n' {
-		s = s[:len(s)-1]
-	}
-	return s, nil
-}
-
-// --- hash/comment helpers ---
-
-// handleSingleHash processes '#' annotations (inline or multiline).
-// Returns (producedAnnotation, text, err).
-func (l *Lexer) handleSingleHash() (bool, string, error) {
-	annot, err := l.scanAnnotation()
-	if err != nil {
-		return false, "", l.err("incomplete annotation")
-	}
-	return true, annot, nil
-}
-
-// scanNoopIfPresent emits a NOOP token if the source at the current position
-// matches: '\n' ( hws* '\n' )+  where hws ∈ {' ', '\r', '\t'}.
-func (l *Lexer) scanNoopIfPresent() (Token, bool) {
-	b, ok := l.peek()
-	if !ok || b != '\n' {
-		return Token{}, false
-	}
-
-	// Snapshot so we can roll back on non-match (i.e., if we don't see at least one repetition).
-	saveCur, saveLine, saveCol, saveStart := l.cur, l.line, l.col, l.start
-
-	// Token starts here.
-	l.tokStartLine = l.line
-	l.tokStartCol = l.col
-	l.start = l.cur
-
-	// Consume the initial newline.
-	l.advance()
-
-	matchedReps := 0
-	for {
-		// Consume zero or more horizontal whitespace chars.
-		for {
-			nb, ok := l.peek()
-			if !ok || (nb != ' ' && nb != '\t' && nb != '\r') {
-				break
-			}
-			l.advance()
-		}
-		// Require a newline to complete one (hws* '\n') repetition.
-		nb, ok := l.peek()
-		if ok && nb == '\n' {
-			l.advance()
-			matchedReps++
-			continue
-		}
-		break
-	}
-
-	if matchedReps >= 1 {
-		return l.addToken(NOOP, nil), true
-	}
-
-	// Not a full match: restore and report no-op not present.
-	l.cur, l.line, l.col, l.start = saveCur, saveLine, saveCol, saveStart
-	return Token{}, false
-}
-
-// --- misc helpers ---
-
-func (l *Lexer) dotStartsNumber() bool {
-	b, ok := l.peek()
-	if !ok || !isDigit(b) {
-		return false
-	}
-	prev := l.previousToken()
-	if l.immediateWhitespaceBefore() || prev == nil || !canBeLeftOperand(prev.Type) {
-		return true
-	}
-	return false
-}
-
-// ---------------- main tokenization ----------------
-
-func (l *Lexer) scanToken() (Token, error) {
-	for {
-		l.skipHorizontalWhitespace()
-		l.tokStartLine = l.line
-		l.tokStartCol = l.col
-		l.start = l.cur
-
-		if l.isAtEnd() {
-			return l.addToken(EOF, nil), nil
-		}
-
-		// No-op (blank lines)
-		if b, _ := l.peek(); b == '\n' {
-			if tok, ok := l.scanNoopIfPresent(); ok {
-				return tok, nil
-			}
-			// Lone newline (or newline followed by non-hws) → skip it as whitespace and loop.
-			l.advance()
-			l.start = l.cur
-			continue
-		}
-
-		// Treat semicolons exactly like newlines for layout/same-line logic.
-		// They are NOT tokens; we "lower" them to line breaks.
-		if b, _ := l.peek(); b == ';' {
-			// Consume ';' and advance line/col as if it were '\n'.
-			l.advance()     // move past ';'
-			l.line++        // start a new line
-			l.col = 0       // reset column
-			l.start = l.cur // next token starts after the semicolon
-			continue
-		}
-
-		ch, _ := l.advance()
-
-		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
-		switch ch {
-		case '(':
-			if l.immediateWhitespaceBefore() {
-				return l.addToken(LROUND, "("), nil
-			}
-			return l.addToken(CLROUND, "("), nil
-		case ')':
-			return l.addToken(RROUND, ")"), nil
-		case '[':
-			if l.immediateWhitespaceBefore() {
-				return l.addToken(LSQUARE, "["), nil
-			}
-			return l.addToken(CLSQUARE, "["), nil
-		case ']':
-			return l.addToken(RSQUARE, "]"), nil
-		case '{':
-			return l.addToken(LCURLY, "{"), nil
-		case '}':
-			return l.addToken(RCURLY, "}"), nil
-		case '+':
-			return l.addToken(PLUS, "+"), nil
-		case '*':
-			return l.addToken(MULT, "*"), nil
-		case '/':
-			return l.addToken(DIV, "/"), nil
-		case '%':
-			return l.addToken(MOD, "%"), nil
-		case ':':
-			return l.addToken(COLON, ":"), nil
-		case ',':
-			return l.addToken(COMMA, ","), nil
-		case '?':
-			return l.addToken(QUESTION, "?"), nil
-		}
-
-		// '.' : either decimal-starting float or PERIOD
-		if ch == '.' {
-			if l.dotStartsNumber() {
-				l.rewindToStart()
-				tt, lit, err := l.scanNumber()
-				if err != nil {
-					return Token{}, err
-				}
-				return l.addToken(tt, lit), nil
-			}
-			return l.addToken(PERIOD, "."), nil
-		}
-
-		// Two-char operators and fallbacks
-		switch ch {
-		case '-':
-			if b, ok := l.peek(); ok && b == '>' {
-				l.advance()
-				return l.addToken(ARROW, "->"), nil
-			}
-			return l.addToken(MINUS, "-"), nil
-		case '=':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(EQ, "=="), nil
-			}
-			return l.addToken(ASSIGN, "="), nil
-		case '!':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(NEQ, "!="), nil
-			}
-			return l.addToken(BANG, "!"), nil
-		case '<':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(LESS_EQ, "<="), nil
-			}
-			return l.addToken(LESS, "<"), nil
-		case '>':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(GREATER_EQ, ">="), nil
-			}
-			return l.addToken(GREATER, ">"), nil
-		}
-
-		// Annotations
-		if ch == '#' {
-			ok, text, err := l.handleSingleHash()
-			if err != nil {
-				return Token{}, err
-			}
-			if ok {
-				return l.addToken(ANNOTATION, text), nil
-			}
-		}
-
-		// Strings
-		if ch == '"' || ch == '\'' {
-			l.rewindToStart()
-			text, err := l.scanString()
-			if err != nil {
-				return Token{}, err
-			}
-			// After '.' a quoted key becomes ID (property name)
-			if l.afterDotIsProperty() {
-				return l.addToken(ID, text), nil
-			}
-			return l.addToken(STRING, text), nil
-		}
-
-		// Numbers (starting with digit)
-		if isDigit(ch) {
-			l.rewindToStart()
-			tt, lit, err := l.scanNumber()
-			if err != nil {
-				return Token{}, err
-			}
-			return l.addToken(tt, lit), nil
-		}
-
-		// Identifiers / Keywords
-		if isAlpha(ch) {
-			l.rewindToStart()
-			lex := l.scanIdentifier()
-			// After '.', treat as property name (ID)
-			if l.afterDotIsProperty() {
-				return l.addToken(ID, lex), nil
-			}
-			if tt, ok := keywords[lex]; ok {
-				switch tt {
-				case NULL:
-					return l.addToken(NULL, nil), nil
-				case BOOLEAN:
-					if lex == "true" {
-						return l.addToken(BOOLEAN, true), nil
-					}
-					return l.addToken(BOOLEAN, false), nil
-				default:
-					return l.addToken(tt, nil), nil
-				}
-			}
-			return l.addToken(ID, lex), nil
-		}
-
-		return Token{}, l.err(fmt.Sprintf("unexpected character: %q", ch))
-	}
-}
-=== END FILE: lexer.go ===
-
-=== BEGIN FILE: parser.go ===
-// parser.go — Pratt parser for MindScript that produces compact S-expressions.
-//
-// OVERVIEW
-// --------
-// This module implements the newline-aware Pratt parser for the MindScript
-// language. It consumes the token stream produced by the *whitespace-sensitive*
-// lexer (see lexer.go) and builds a compact, Lisp-style S-expression (AST).
-//
-// Design goals:
-//   - Keep the grammar readable via precedence rules (Pratt parser).
-//   - Encode the AST in a tiny, serialisable structure (S-expressions).
-//   - Respect whitespace-sensitive signals emitted by the lexer:
-//   - '(' can be LROUND or CLROUND; only CLROUND participates in calls.
-//   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
-//   - '.' is PERIOD unless it started a number in the lexer.
-//   - multi-line '#' annotations become ANNOTATION tokens.
-//   - blank-line runs may be emitted as NOOP tokens.
-//   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
-//     at EOF instead of hard parse errors, suitable for REPLs.
-//
-// Annotation model (lowest precedence):
-//   - PRE annotation decorates the expression to its right.
-//   - POST annotation decorates the expression to its left and can also appear
-//     after a comma or a colon (binding to the element/key/value on the left).
-//   - PRE and POST cannot stack. If both apply to the same expression, they are
-//     merged into a single PRE with text "pre\npost".
-//
-// Nodes & Spans
-// -------------
-// The AST is a tree of S-expressions: []any whose first element is a string tag.
-// **This list is the most important reference.**
-//
-//	("block", n1, n2, ...)
-//	("noop")
-//
-// Literals & identifiers:
-//
-//	("id",   string)              // identifier (includes property names coerced to ID by lexer rules)
-//	("int",  int64)               // from INTEGER
-//	("num",  float64)             // from NUMBER
-//	("str",  string)              // decoded literal
-//	("bool", bool)                // from BOOLEAN
-//	("null")                      // from NULL
-//	("type", expr)                // from 'type' ...
-//
-// Operators / expressions:
-//
-//	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
-//	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
-//	("assign", target, value)     // "=" (right-assoc)
-//
-// Property / call / index:
-//
-//	("call", callee, arg1, arg2, ...)
-//	("get",  obj, ("str", name))             // obj.name or obj."name"
-//	("idx",  obj, indexExpr)                 // obj[expr] or obj.(expr) or obj.12
-//
-// Collections:
-//
-//	("array", e1, e2, ...)
-//	("map",   ("pair",  keyStrExpr, value)*)
-//	("map",   ("pair!", keyStrExpr, value)*) // required-field (key! : value)
-//	("enum",  item1, item2, ...)             // from Enum[ ... ]
-//
-// Functions, modules, control, loops:
-//
-//	("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
-//	("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)
-//	("module",  nameExpr, bodyBlock)
-//	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)
-//	("while", cond, bodyBlock)
-//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
-//	("return", value)  // value may be "null" per newline semantics
-//	("break",  value)  // value may be "null"
-//	("continue", value)// value may be "null"
-//
-// Declaration patterns (used by 'let' and 'for' targets):
-//
-//	("decl", name)
-//	("darr", p1, p2, ...)
-//	("dobj", ("pair", keyStrExpr, subPattern), ...)
-//
-// Annotations:
-//
-//	("annot", ("str", textOr<text>), wrappedNode)
-//	   • PRE  text stored as-is
-//	   • POST text stored with leading "<"
-//	   • PRE+POST becomes PRE with "pre\npost" (no POST stacking)
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// SPAN EMISSION INVARIANT (CRITICAL)
-// ----------------------------------
-// **This file now centralizes AST construction and span emission.**
-//
-//   - Every AST node is constructed through `mk*` helpers that *atomically*
-//     append exactly one span for that node.
-//   - Spans are appended in strict **post-order** of the final AST (children
-//     first, then parent), left-to-right among siblings.
-//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule:
-//     child's span first, then the wrapper's span.
-//   - Nodes that are synthesized with no concrete tokens (e.g. default type
-//     `Any`) still receive a placeholder `Span{}` via `mk*` (using tok=-1).
-//   - The root block’s span is appended last.
-//
-// The helpers in this file enforce the invariant mechanically at every construct.
-//
-// Dependencies
-// ------------
-//   - lexer.go
-//   - errors.go (*Error, DiagParse, DiagIncomplete, IsIncomplete)
-//   - spans.go (Span, SpanIndex, BuildSpanIndexPostOrder)
-package mindscript
-
-import (
-	"fmt"
-	"strings"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                                  PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
-
-type S = []any
-
-func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
-
-// ParseSExpr parses a complete MindScript source string and returns its AST.
-func ParseSExpr(src string) (S, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, err
-	}
-	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
-}
-
-// ParseSExprWithSpans parses like ParseSExpr and also returns a *SpanIndex,
-// with spans recorded in strict post-order per the invariant.
-func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, nil, err
-	}
-	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	ast, perr := p.program()
-	if perr != nil {
-		return nil, nil, perr
-	}
-	idx := BuildSpanIndexPostOrder(ast, p.post)
-	return ast, idx, nil
-}
-
-// ParseSExprInteractive parses in REPL-friendly mode.
-// Unterminated constructs at EOF produce *Error{Kind:DiagIncomplete}.
-func ParseSExprInteractive(src string) (S, error) {
-	lex := NewLexerInteractive(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, err
-	}
-	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
-}
-
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-///////////////////////////// PRIVATE IMPLEMENTATION ///////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-
-type parser struct {
-	toks        []Token
-	i           int
-	interactive bool
-
-	post             []Span // strictly post-order: one span per node, appended after children
-	lastSpanStartTok int
-	lastSpanEndTok   int
-	src              string
-}
-
-// ─────────────────────────── token basics & helpers ─────────────────────────
-
-func (p *parser) atEnd() bool { return p.peek().Type == EOF }
-func (p *parser) peek() Token {
-	if p.i >= len(p.toks) {
-		return p.toks[len(p.toks)-1]
-	}
-	return p.toks[p.i]
-}
-func (p *parser) prev() Token { return p.toks[p.i-1] }
-
-func (p *parser) match(tt ...TokenType) bool {
-	if p.atEnd() {
-		return false
-	}
-	for _, t := range tt {
-		if p.peek().Type == t {
-			p.i++
-			return true
-		}
-	}
-	return false
-}
-
-func (p *parser) need(t TokenType, msg string) (Token, error) {
-	if p.match(t) {
-		return p.prev(), nil
-	}
-	g := p.peek()
-	if g.Type == EOF {
-		line, col := p.posAfterLastSpan()
-		kind := DiagParse
-		if p.interactive {
-			kind = DiagIncomplete
-		}
-		return Token{}, &Error{Kind: kind, Msg: msg, Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
-}
-
-func (p *parser) expect(t TokenType, msg string) (Token, error) {
-	p.skipNoops()
-	return p.need(t, msg)
-}
-func (p *parser) expectClose(t TokenType, msg string) error {
-	p.skipNoops()
-	_, err := p.need(t, msg)
-	return err
-}
-
-func (p *parser) posAtByte(b int) (int, int) {
-	if b < 0 {
-		g := p.peek()
-		return g.Line, g.Col + 1
-	}
-	if b > len(p.src) {
-		b = len(p.src)
-	}
-	line := 1 + strings.Count(p.src[:b], "\n")
-	lastNL := strings.LastIndex(p.src[:b], "\n")
-	if lastNL < 0 {
-		return line, b + 1
-	}
-	return line, b - lastNL
-}
-func (p *parser) posAfterLastSpan() (int, int) {
-	if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
-		endB := p.toks[p.lastSpanEndTok].EndByte
-		return p.posAtByte(endB)
-	}
-	g := p.peek()
-	return g.Line, g.Col + 1
-}
-
-func tokText(t Token) string {
-	if s, ok := t.Literal.(string); ok {
+# Contract — marker wrapper for route contracts (path/query/body/responses).
+let Contract = type {}
+
+# _Ctx — per-request context passed to handlers (bound values live here).
+let _Ctx = type {req!: Request, path: {}, query: {}, body: Any, deadlineMs: Int?}
+
+let _StreamFn = type Request -> Responder -> {} -> Null
+let _Mw = type _StreamFn -> _StreamFn
+
+# =========================
+# Utilities (private)
+# =========================
+
+let _normMethod = fun(m: Str) -> Str do
+	toUpper(m)
+end
+
+let _splitPath = fun(p: Str) -> [Str] do
+	let s = if len(p) == 0 or substr(p, 0, 1) != "/" then "/" + p else p end
+	let raw = split(s, "/")
+	let out = []
+	let i = 0
+	while i < len(raw) do
+		let seg = raw[i]
+		if len(seg) > 0 and seg != "." then
+			out = out + [seg]
+		end
+		i = i + 1
+	end
+	out
+end
+
+let _isParamSeg = fun(seg: Str) -> Bool do
+	let n = len(seg)
+	n >= 2 and substr(seg, 0, 1) == "{" and substr(seg, n - 1, n) == "}"
+end
+
+let _isCatchSeg = fun(seg: Str) -> Bool do
+	let n = len(seg)
+	n >= 3 and substr(seg, 0, 1) == "{" and substr(seg, 1, 2) == "*" and substr(seg, n - 1, n) == "}"
+end
+
+let _paramName = fun(seg: Str) -> Str do
+	let name = substr(seg, 1, len(seg) - 1)
+	if len(name) > 0 and substr(name, 0, 1) == "*" then
+		return substr(name, 1, len(name))
+	end
+	name
+end
+
+let _makeURL = fun(path: Str, query: Str?) -> {} do
+	{scheme: null, host: null, path: path, query: query}
+end
+
+let _json = fun(v: Any) -> Str? do
+	let s = jsonStringify(v)
+	if s != null then
 		return s
-	}
-	return t.Lexeme
-}
-
-func (p *parser) skipNoops() {
-	for !p.atEnd() && p.peek().Type == NOOP {
-		p.i++
-	}
-}
-
-// ───────────────────────── precedence / associativity ──────────────────────
-
-func lbp(t TokenType) (int, bool) {
-	switch t {
-	case ARROW:
-		return 15, true
-	case MULT, DIV, MOD:
-		return 70, true
-	case PLUS, MINUS:
-		return 60, true
-	case LESS, LESS_EQ, GREATER, GREATER_EQ:
-		return 50, true
-	case EQ, NEQ:
-		return 40, true
-	case AND:
-		return 30, true
-	case OR:
-		return 20, true
-	case ASSIGN:
-		return 10, true
-	}
-	return 0, false
-}
-func isRightAssoc(tt TokenType) bool { return tt == ASSIGN || tt == ARROW }
-
-// ───────────────────────────── span emission (core) ─────────────────────────
-//
-// Centralized helpers. **All** node construction goes through these, which
-// also append exactly one span for the node (post-order).
-//
-// Rules:
-//   - For leaves tied to a concrete token, pass tok≥0 (start=end=tok).
-//   - For synthetic leaves (e.g. default "Any"), pass tok=-1 to emit Span{}.
-//   - For parents, pass the token range [startTok, endTok] that covers the node.
-//   - Helpers also update (lastSpanStartTok,lastSpanEndTok) to the node’s range,
-//     so callers can compose larger parent ranges deterministically.
-
-func (p *parser) appendNodeSpanByTok(startTok, endTok int) {
-	if startTok >= 0 && endTok >= startTok &&
-		startTok < len(p.toks) && endTok < len(p.toks) {
-		p.post = append(p.post, Span{
-			StartByte: p.toks[startTok].StartByte,
-			EndByte:   p.toks[endTok].EndByte,
-		})
-	} else {
-		p.post = append(p.post, Span{})
-	}
-	p.lastSpanStartTok = startTok
-	p.lastSpanEndTok = endTok
-}
-
-// mkLeaf builds a leaf node whose span is a single token (tok). If tok<0,
-// a placeholder empty span is appended (keeps post-order cardinality intact).
-func (p *parser) mkLeaf(tag string, tok int, parts ...any) S {
-	n := L(tag, parts...)
-	p.appendNodeSpanByTok(tok, tok)
-	return n
-}
-
-// mk builds a parent node after its children were already constructed.
-// It appends exactly one span for the parent covering [startTok,endTok].
-func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
-	n := L(tag, parts...)
-	p.appendNodeSpanByTok(startTok, endTok)
-	return n
-}
-
-// ───────────────────────────── NOOP / annotation utils ─────────────────────
-
-func tokenCanEndExpr(tt TokenType) bool {
-	switch tt {
-	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
-		TYPE, ENUM,
-		RROUND, RSQUARE, RCURLY,
-		QUESTION,
-		END:
-		return true
-	default:
-		return false
-	}
-}
-
-func (p *parser) nextTokenIsOnSameLine(as Token) bool {
-	if p.atEnd() {
-		return false
-	}
-	return p.peek().Line == as.Line
-}
-
-func (p *parser) isPreAnnotationAt(idx int) bool {
-	if idx <= 0 || idx >= len(p.toks) {
-		return true
-	}
-	ann := p.toks[idx]
-	for j := idx - 1; j >= 0; j-- {
-		t := p.toks[j]
-		if t.Line < ann.Line {
-			break
-		}
-		if t.Line == ann.Line {
-			if t.Type == COMMA || t.Type == COLON {
-				continue
-			}
-			return !tokenCanEndExpr(t.Type)
-		}
-	}
-	return true
-}
-
-func isAnnot(n S) (isAnnot, isPost bool) {
-	if len(n) < 2 {
-		return false, false
-	}
-	tag, _ := n[0].(string)
-	if tag != "annot" {
-		return false, false
-	}
-	if child, ok := n[1].(S); ok && len(child) >= 2 && child[0] == "str" {
-		if s, ok := child[1].(string); ok && len(s) > 0 && s[0] == '<' {
-			return true, true
-		}
-		return true, false
-	}
-	return true, false
-}
-
-func mergePreWithPostText(preAnnot S, postTxt string) S {
-	if len(preAnnot) >= 2 {
-		if c, ok := preAnnot[1].(S); ok && len(c) >= 2 && c[0] == "str" {
-			if s, ok := c[1].(string); ok {
-				if postTxt != "" {
-					if s == "" {
-						c[1] = postTxt
-					} else {
-						c[1] = s + "\n" + postTxt
-					}
-				}
-			}
-		}
-	}
-	return preAnnot
-}
-
-// Attach at most one trailing POST to `base`. (Used at top-level and list items)
-func (p *parser) afterExprMaybePost(base S, baseStartTok int) (S, error) {
-	n, _, err := p.absorbOneTrailingPostAnnot(base, baseStartTok)
-	return n, err
-}
-
-// absorbOneTrailingPostAnnot applies one POST annotation to `base`.
-// **Span order**: (1) POST child "str" leaf; (2) wrapping "annot" node.
-func (p *parser) absorbOneTrailingPostAnnot(base S, baseStartTok int) (S, bool, error) {
-	if p.atEnd() || p.peek().Type != ANNOTATION || p.isPreAnnotationAt(p.i) {
-		return base, false, nil
-	}
-	aTok := p.i
-	a := p.peek()
-	p.i++
-
-	postTxt := ""
-	if s, ok := a.Literal.(string); ok {
-		postTxt = s
-	}
-
-	// Disallow stacked POSTs.
-	if !p.atEnd() && p.peek().Type == ANNOTATION && !p.isPreAnnotationAt(p.i) {
-		line, col := p.posAtByte(p.peek().StartByte)
-		return nil, false, &Error{Kind: DiagParse, Line: line, Col: col, Msg: "multiple consecutive post-annotations are not allowed; combine them"}
-	}
-
-	// If base is already PRE, merge and return the same node.
-	if ok, isPost := isAnnot(base); ok && !isPost {
-		base = mergePreWithPostText(base, postTxt)
-		p.skipNoops()
-		return base, true, nil
-	}
-
-	// Normal POST: (1) child "str" span, (2) parent "annot" span.
-	child := p.mkLeaf("str", aTok, "<"+postTxt)
-	base = p.mk("annot", baseStartTok, aTok, child, base)
-	p.skipNoops()
-	return base, true, nil
-}
-
-// ───────────────────────── program / blocks ────────────────────────────
-
-func (p *parser) program() (S, error) {
-	var items []any
-	for !p.atEnd() {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		startTok := p.lastSpanStartTok
-		if ne, err := p.afterExprMaybePost(e, startTok); err != nil {
-			return nil, err
-		} else {
-			e = ne
-		}
-		items = append(items, e)
-	}
-	rootStart := 0
-	rootEnd := len(p.toks) - 2 // last non-EOF
-	if rootEnd < rootStart || len(p.toks) == 0 {
-		return p.mk("block", -1, -1 /*empty*/), nil
-	}
-	return p.mk("block", rootStart, rootEnd, items...), nil
-}
-
-// blockUntil parses statements until a stop token is seen.
-// Span append happens once for the "block" node, after its children.
-func (p *parser) blockUntil(stops ...TokenType) (S, error) {
-	stop := map[TokenType]bool{}
-	for _, s := range stops {
-		stop[s] = true
-	}
-	var items []any
-	startTok := p.i
-	consumedAny := false
-
-	for !p.atEnd() && !stop[p.peek().Type] {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		baseStartTok := p.lastSpanStartTok
-		if ne, err := p.afterExprMaybePost(e, baseStartTok); err != nil {
-			return nil, err
-		} else {
-			e = ne
-		}
-		items = append(items, e)
-		consumedAny = true
-	}
-	if consumedAny {
-		return p.mk("block", startTok, p.i-1, items...), nil
-	}
-	return p.mk("block", -1, -1 /*empty*/), nil
-}
-
-func (p *parser) parseBlock(requireDo bool) (S, error) {
-	if requireDo {
-		if _, err := p.need(DO, "expected 'do'"); err != nil {
-			return nil, err
-		}
-	}
-	b, err := p.blockUntil(END)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-// ───────────────────────────── tiny node helpers ───────────────────────────
-
-func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
-	switch t.Type {
-	case ID, TYPE:
-		return p.mkLeaf("id", start, tokText(t)), true
-	case INTEGER:
-		return p.mkLeaf("int", start, t.Literal), true
-	case NUMBER:
-		return p.mkLeaf("num", start, t.Literal), true
-	case STRING:
-		return p.mkLeaf("str", start, t.Literal), true
-	case BOOLEAN:
-		return p.mkLeaf("bool", start, t.Literal), true
-	case NULL:
-		return p.mkLeaf("null", start), true
-	}
-	return nil, false
-}
-
-// ───────────────────────────── prefix / postfix / infix ────────────────────
-
-func (p *parser) expr(minBP int) (S, error) {
-	tokIndexOfThis := p.i
-	t := p.peek()
-	p.i++
-
-	var left S
-	leftStartTok := tokIndexOfThis
-
-	// ---- prefix ----
-	if n, ok := p.tryLiteralOrId(t, tokIndexOfThis); ok {
-		left = n
-	} else {
-		switch t.Type {
-		case NOOP:
-			left = p.mkLeaf("noop", tokIndexOfThis)
-
-		case ENUM:
-			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
-				p.i++ // consume '[' or CLSQUARE
-				arr, err := p.arrayLiteralAfterOpen()
-				if err != nil {
-					return nil, err
-				}
-				items := make([]any, 0, len(arr)-1)
-				for i := 1; i < len(arr); i++ {
-					items = append(items, arr[i])
-				}
-				left = p.mk("enum", tokIndexOfThis, p.i-1, items...)
-			} else {
-				left = p.mkLeaf("id", tokIndexOfThis, tokText(t))
-			}
-
-		case MINUS, NOT:
-			if err := p.needExprAfter(t, "expected expression after unary operator"); err != nil {
-				return nil, err
-			}
-			r, err := p.expr(80)
-			if err != nil {
-				return nil, err
-			}
-			endTok := p.lastSpanEndTok
-			if endTok < 0 {
-				endTok = tokIndexOfThis
-			}
-			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
-
-		case LROUND, CLROUND:
-			inner, err := p.parseGrouping()
-			if err != nil {
-				return nil, err
-			}
-			left = inner
-			leftStartTok = tokIndexOfThis
-
-		case LSQUARE, CLSQUARE:
-			a, err := p.arrayLiteralAfterOpen()
-			if err != nil {
-				return nil, err
-			}
-			left = a
-			leftStartTok = tokIndexOfThis
-
-		case LCURLY:
-			mp, err := p.mapLiteralAfterOpen(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = mp
-			leftStartTok = tokIndexOfThis
-
-		case FUNCTION:
-			fn, endTok, err := p.funExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			_ = endTok
-			left = fn
-			leftStartTok = tokIndexOfThis
-
-		case ORACLE:
-			orc, endTok, err := p.oracleExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			_ = endTok
-			left = orc
-			leftStartTok = tokIndexOfThis
-
-		case MODULE:
-			if err := p.needExprAfter(t, "expected module name expression"); err != nil {
-				return nil, err
-			}
-			name, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			body, err := p.parseBlock(true)
-			if err != nil {
-				return nil, err
-			}
-			left = p.mk("module", tokIndexOfThis, p.i-1, name, body)
-			leftStartTok = tokIndexOfThis
-
-		case RETURN, BREAK, CONTINUE:
-			n, err := p.parseControl(t, tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = n
-			leftStartTok = tokIndexOfThis
-
-		case IF:
-			thenIf, err := p.ifExpr()
-			if err != nil {
-				return nil, err
-			}
-			left = p.mk("if", tokIndexOfThis, p.i-1, thenIf[1:]...)
-			leftStartTok = tokIndexOfThis
-
-		case DO:
-			body, err := p.parseBlock(false)
-			if err != nil {
-				return nil, err
-			}
-			left = body
-			leftStartTok = tokIndexOfThis
-
-		case FOR:
-			f, err := p.forExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = f
-			leftStartTok = tokIndexOfThis
-
-		case WHILE:
-			w, err := p.whileExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = w
-			leftStartTok = tokIndexOfThis
-
-		case LET:
-			pat, err := p.declPattern()
-			if err != nil {
-				return nil, err
-			}
-			left = pat
-			base := unwrapAnnots(pat)
-			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
-				j := p.i
-				for j < len(p.toks) && p.toks[j].Type == ANNOTATION && !p.isPreAnnotationAt(j) {
-					j++
-				}
-				if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
-					g := p.peek()
-					if p.interactive && g.Type == EOF {
-						line, col := p.posAfterLastSpan()
-						return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-					}
-					line, col := p.posAtByte(g.StartByte)
-					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-				}
-			}
-			leftStartTok = tokIndexOfThis
-
-		case TYPECONS:
-			if err := p.needExprAfter(t, "expected type expression after 'type'"); err != nil {
-				return nil, err
-			}
-			x, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			left = p.mk("type", tokIndexOfThis, p.lastSpanEndTok, x)
-			leftStartTok = tokIndexOfThis
-
-		case ANNOTATION:
-			pre := p.isPreAnnotationAt(p.i - 1)
-			txt := ""
-			if s, ok := t.Literal.(string); ok {
-				txt = s
-			}
-
-			if pre {
-				// forbid stacked PREs
-				if !p.atEnd() && p.peek().Type == ANNOTATION && p.isPreAnnotationAt(p.i) {
-					next := p.peek()
-					line, col := p.posAtByte(next.StartByte)
-					return nil, &Error{
-						Kind: DiagParse, Line: line, Col: col,
-						Msg: "multiple consecutive pre-annotations are not allowed; combine them",
-					}
-				}
-
-				// If EOF in normal mode: PRE wraps NOOP (degenerate case)
-				if p.atEnd() && !p.interactive {
-					child := p.mkLeaf("str", tokIndexOfThis, txt)
-					node := p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, p.mkLeaf("noop", -1))
-					left = node
-					leftStartTok = tokIndexOfThis
-					break
-				}
-				if p.atEnd() && p.interactive {
-					line, col := p.posAtByte(t.StartByte)
-					return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
-				}
-
-				// SPECIAL: PRE preceding a control form binds to the control's value.
-				nt := p.peek()
-				if nt.Type == RETURN || nt.Type == BREAK || nt.Type == CONTINUE {
-					p.i++ // consume control token
-					valueTokStart := p.i
-					var val S
-					if p.nextTokenIsOnSameLine(nt) {
-						if err := p.needExprAfter(nt, "expected value after control"); err != nil {
-							return nil, err
-						}
-						x, err := p.expr(0)
-						if err != nil {
-							return nil, err
-						}
-						if nx, _, err := p.absorbOneTrailingPostAnnot(x, valueTokStart); err != nil {
-							return nil, err
-						} else {
-							val = nx
-						}
-					} else {
-						val = p.mkLeaf("null", -1)
-					}
-					annChild := p.mkLeaf("str", tokIndexOfThis, txt)
-					ann := p.mk("annot", tokIndexOfThis, p.lastSpanEndTok, annChild, val)
-
-					tag := "return"
-					if nt.Type == BREAK {
-						tag = "break"
-					} else if nt.Type == CONTINUE {
-						tag = "continue"
-					}
-					left = p.mk(tag, tokIndexOfThis, p.lastSpanEndTok, ann)
-					leftStartTok = tokIndexOfThis
-					break
-				}
-
-				// General PRE wrap (non-control)
-				operand, err := p.expr(0)
-				if err != nil {
-					return nil, err
-				}
-				child := p.mkLeaf("str", tokIndexOfThis, txt) // PRE child
-				left = p.mk("annot", tokIndexOfThis, p.lastSpanEndTok, child, operand)
-				leftStartTok = tokIndexOfThis
-
-				// Optionally absorb one immediate POST into this PRE (merge txt)
-				if nleft, _, err := p.absorbOneTrailingPostAnnot(left, tokIndexOfThis); err != nil {
-					return nil, err
-				} else {
-					left = nleft
-				}
-				return left, nil
-			}
-
-			// POST in prefix position is an error.
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: line, Col: col}
-
-		default:
-			if t.Type == EOF && p.interactive {
-				line, col := p.posAfterLastSpan()
-				return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
-			}
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
-		}
-	}
-
-	// ---- postfix chain ----
-	for {
-		n, ok, err := p.parseOnePostfix(left, leftStartTok)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			break
-		}
-		left = n
-	}
-
-	// ---- infix ops ----
-	for {
-		op := p.peek()
-		bp, ok := lbp(op.Type)
-		if !ok || bp < minBP {
-			break
-		}
-		p.i++
-
-		nextBP := bp + 1
-		if isRightAssoc(op.Type) {
-			nextBP = bp
-		}
-
-		if op.Type == ASSIGN && !assignable(left) {
-			line, col := p.posAtByte(op.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
-		}
-
-		if err := p.needExprAfter(op, "expected expression after operator"); err != nil {
-			return nil, err
-		}
-		right, err := p.expr(nextBP)
-		if err != nil {
-			return nil, err
-		}
-		endTok := p.lastSpanEndTok
-		if op.Type == ASSIGN {
-			left = p.mk("assign", leftStartTok, endTok, left, right)
-		} else {
-			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, right)
-		}
-	}
-
-	return left, nil
-}
-
-func (p *parser) needExprAfter(tok Token, msg string) error {
-	if p.atEnd() && p.interactive {
-		line, col := p.posAtByte(tok.StartByte)
-		return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
-	}
-	return nil
-}
-
-// parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
-func (p *parser) parseGrouping() (S, error) {
-	p.skipNoops()
-	inner, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	p.skipNoops()
-	if _, err := p.need(RROUND, "expected ')'"); err != nil {
-		return nil, err
-	}
-	return inner, nil
-}
-
-// ───────────────────────── unified postfix dispatcher ──────────────────────
-//
-// Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
-// **Span order** is enforced: children were already appended during their parse.
-// We append exactly one span for the new wrapper node (unop '?', call, idx, get).
-
-func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
-	switch p.peek().Type {
-	case QUESTION:
-		qtok := p.i
-		p.i++
-		n := p.mk("unop", leftStartTok, qtok, "?", left)
-		return n, true, nil
-
-	case CLROUND:
-		p.i++
-		p.skipNoops()
-		if p.match(RROUND) {
-			n := p.mk("call", leftStartTok, p.i-1, left)
-			return n, true, nil
-		}
-		args, _, closeTok, err := p.bracketed(RROUND, func() (S, int, error) {
-			p.skipNoops()
-			start := p.i
-			a, err := p.expr(0)
-			if err != nil {
-				return nil, 0, err
-			}
-			return a, start, nil
-		})
-		if err != nil {
-			return nil, false, err
-		}
-		n := p.mk("call", leftStartTok, closeTok, append([]any{left}, args...)...)
-		return n, true, nil
-
-	case CLSQUARE:
-		p.i++
-		p.skipNoops()
-		idx, err := p.expr(0)
-		if err != nil {
-			return nil, false, err
-		}
-		p.skipNoops()
-		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-			return nil, false, err
-		}
-		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
-		return n, true, nil
-
-	case PERIOD:
-		p.i++ // consume '.'
-		// (expr) -> idx
-		if p.match(LROUND) || p.match(CLROUND) {
-			p.skipNoops()
-			ex, err := p.expr(0)
-			if err != nil {
-				return nil, false, err
-			}
-			p.skipNoops()
-			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
-				return nil, false, perr
-			}
-			n := p.mk("idx", leftStartTok, p.i-1, left, ex)
-			return n, true, nil
-		}
-		// .<int> -> idx
-		if p.match(INTEGER) {
-			intTok := p.i - 1
-			intNode := p.mkLeaf("int", intTok, p.prev().Literal)
-			n := p.mk("idx", leftStartTok, intTok, left, intNode)
-			return n, true, nil
-		}
-		// .id / ."str" -> get
-		if p.match(ID) || p.match(STRING) {
-			propTok := p.i - 1
-			prop := p.mkLeaf("str", propTok, tokText(p.prev()))
-			n := p.mk("get", leftStartTok, propTok, left, prop)
-			return n, true, nil
-		}
-		g := p.peek()
-		line, col := p.posAtByte(g.StartByte)
-		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
-	}
-	return nil, false, nil
-}
-
-// ───────────────────────── collections / lists / maps ─────────────────────
-
-// bracketed parses a generic comma-list whose opener has just been consumed.
-func (p *parser) bracketed(
-	close TokenType,
-	parseElem func() (S, int, error),
-) ([]any, int, int, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	// Empty
-	if p.match(close) {
-		return nil, openTok, p.i - 1, nil
-	}
-	elems, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == close },
-		parseElem,
-	)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	p.skipNoops()
-	if _, err := p.need(close, "expected ')'"); err != nil {
-		return nil, 0, 0, err
-	}
-	return elems, openTok, p.i - 1, nil
-}
-
-// parseCommaList parses items until isClose(peek.Type) is true.
-// It also performs standardized "trailing POST binding" (after element and after comma).
-func (p *parser) parseCommaList(
-	isClose func(TokenType) bool,
-	parseElem func() (S, int, error),
-) ([]any, error) {
-	var out []any
-	for {
-		p.skipNoops()
-		if isClose(p.peek().Type) {
-			break
-		}
-		elem, startTok, err := parseElem()
-		if err != nil {
-			return nil, err
-		}
-		// direct trailing POST
-		elem, err = p.afterExprMaybePost(elem, startTok)
-		if err != nil {
-			return nil, err
-		}
-
-		p.skipNoops()
-		if p.match(COMMA) {
-			// POST after comma binds to the left element
-			p.skipNoops()
-			elem, err = p.afterExprMaybePost(elem, startTok)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, elem)
-			// allow trailing comma
-			p.skipNoops()
-			if isClose(p.peek().Type) {
-				break
-			}
+	end
+	null
+end
+
+let _setErr = fun(ctx: {}, r: {}) -> Null do
+	if ctx == null then
+		return
+	end
+	if mapHas(r, "error") and r.error != null then
+		ctx._errorDump = r.error
+	else
+		ctx._errorDump = "panic"
+	end
+	null
+end
+
+# contract — Wrap a route contract (marker).
+#
+# Summary:
+# 	Return the given contract marker. This is a no-op wrapper that
+# 	just signals intent at call sites.
+#
+# Args:
+# 	c: Contract — Route contract object.
+# Return:
+# 	Contract — The same contract marker.
+let contract = fun(c: Contract) -> Contract do
+	c
+end
+
+# =========================
+# Error helpers (public)
+# =========================
+
+# raise — Build a structured HTTP error result.
+#
+# Summary:
+# 	Create a typed error object to be returned by value handlers.
+# 	The router will convert it into an HTTP response with the given
+# 	status and body, plus optional headers (empty here).
+#
+# Args:
+# 	status: Int — HTTP status code (e.g., 401).
+# 	message: Str — Response body as plain text.
+# Return:
+# 	{} — Structured error object (HttpError-like).
+let raise = fun(status: Int, message: Str) -> {} do
+	{__http_error__: true, status: status, body: message, headers: {}}
+end
+
+# raiseWithHeaders — Build a structured HTTP error with headers.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	message: Str — Response body as plain text.
+# 	headers: {} — Headers to set on the response.
+# Return:
+# 	{} — Structured error object.
+let raiseWithHeaders = fun(status: Int, message: Str, headers: {}) -> {} do
+	{__http_error__: true, status: status, body: message, headers: headers}
+end
+
+# =========================
+# Binding helpers (private)
+# =========================
+
+let _rawBody = fun(req: Request) -> Str? do
+	if isType(req.body, type Str) then
+		return req.body
+	end
+	let s = readAll(req.body)
+	if s == null then
+		return null
+	end
+	s
+end
+
+let _coerceScalar = fun(s: Str, T: Type) -> Any? do
+	if isSubtype(T, type Str) then
+		let pj = jsonParse(s)
+		return if pj != null and isType(pj, type Str) then pj else s end
+	end
+	if isSubtype(T, type Int) then
+		let i = int(s)
+		if i != null then
+			return i
+		end
+		let pj = jsonParse(s)
+		if pj != null and isType(pj, type Int) then
+			return pj
+		end
+		return null
+	end
+	if isSubtype(T, type Num) then
+		let n = num(s)
+		if n != null then
+			return n
+		end
+		let pj = jsonParse(s)
+		if pj != null and (isType(pj, type Num) or isType(pj, type Int)) then
+			return pj
+		end
+		return null
+	end
+	if isSubtype(T, type Bool) then
+		let sl = toLower(s)
+		if sl == "true" then
+			return true
+		end
+		if sl == "false" then
+			return false
+		end
+		let pj = jsonParse(s)
+		if pj != null and isType(pj, type Bool) then
+			return pj
+		end
+		return null
+	end
+	null
+end
+
+let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
+	let rt = reflect(T)
+	if rt == null then
+		return null
+	end
+	let node = rt[1]
+	if node[0] != "map" then
+		return null
+	end
+
+	let out = {}
+	let entries = slice(node, 1, len(node))
+	let i = 0
+	while i < len(entries) do
+		let e = entries[i]
+		let tag = e[0]
+		let k = e[1][1]
+		let TkNode = e[2]
+		let Tk = reify(["type", TkNode])
+		let vs = if mapHas(m, k) then m[k] else null end
+
+		if vs == null or len(vs) == 0 then
+			if tag == "pair!" then
+				return null
+			end
+			i = i + 1
 			continue
-		}
+		end
 
-		out = append(out, elem)
-		break
-	}
-	return out, nil
-}
-
-func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	p.skipNoops()
-	if p.match(RSQUARE) {
-		return p.mk("array", p.i-2, p.i-1 /*'[]'*/), nil
-	}
-	elems, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == RSQUARE },
-		func() (S, int, error) {
-			p.skipNoops()
-			start := p.i
-			e, err := p.expr(0)
-			if err != nil {
-				return nil, 0, err
-			}
-			return e, start, nil
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	p.skipNoops()
-	if _, perr := p.need(RSQUARE, "expected ']'"); perr != nil {
-		return nil, perr
-	}
-	// span: from '[' (or CLSQUARE) to ']'
-	return p.mk("array", p.findMatchingOpenSquare(), p.i-1, elems...), nil
-}
-
-func (p *parser) findMatchingOpenSquare() int {
-	// Best-effort: previous token (we call right after consuming ']')
-	if p.i-2 >= 0 {
-		// walk back to LSQUARE/CLSQUARE
-		for j := p.i - 2; j >= 0; j-- {
-			if p.toks[j].Type == LSQUARE || p.toks[j].Type == CLSQUARE {
-				return j
-			}
-		}
-	}
-	return p.i - 1
-}
-
-// params parses (CLROUND ... RROUND) parameter pairs; POST can follow each param
-// directly or after the comma. Default type is Any.
-func (p *parser) params() (S, error) {
-	var openTok int
-	if _, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
-		return nil, perr
-	}
-	openTok = p.i - 1
-
-	p.skipNoops()
-	if p.match(RROUND) {
-		return p.mk("array", openTok, p.i-1), nil
-	}
-
-	elems, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == RROUND },
-		func() (S, int, error) {
-			p.skipNoops()
-			idTok, err := p.need(ID, "expected parameter name")
-			if err != nil {
-				return nil, 0, err
-			}
-			idIdx := p.i - 1
-			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
-
-			// Decide type presence first; emit exactly one node.
-			endTokForPair := idIdx
-			var typ S
-
-			p.skipNoops()
-			if p.match(COLON) {
-				if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
-					return nil, 0, err
-				}
-				p.skipNoops()
-				e, err := p.expr(0)
-				if err != nil {
-					return nil, 0, err
-				}
-				typ = e
-				endTokForPair = p.lastSpanEndTok
-			} else {
-				typ = p.mkLeaf("id", -1, "Any") // emit only in the untyped case
-			}
-
-			pair := p.mk("pair", idIdx, endTokForPair, nameLeaf, typ)
-			return pair, idIdx, nil
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	p.skipNoops()
-	if _, perr := p.need(RROUND, "expected ')' after parameters"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("array", openTok, p.i-1, elems...), nil
-}
-
-func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
-	p.skipNoops()
-	if p.match(RCURLY) {
-		return p.mk("map", openTok, p.i-1), nil
-	}
-
-	isClose := func(tt TokenType) bool { return tt == RCURLY }
-	readKey := func() (S, int, bool, error) {
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, 0, false, err
-		}
-		keyStartTok := p.lastSpanStartTok
-		req := p.match(BANG)
-		return k, keyStartTok, req, nil
-	}
-	parseVal := func() (S, int, error) {
-		p.skipNoops()
-		start := p.i
-		v, err := p.expr(0)
-		if err != nil {
-			return nil, 0, err
-		}
-		return v, start, nil
-	}
-
-	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
-	if err != nil {
-		return nil, err
-	}
-	p.skipNoops()
-	if _, perr := p.need(RCURLY, "expected '}'"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("map", openTok, p.i-1, pairs...), nil
-}
-
-// parseKVPairs reuses standardized trailing-POST logic on key (after ':')
-// and value (after value and after comma).
-func (p *parser) parseKVPairs(
-	isClose func(TokenType) bool,
-	readKey func() (key S, keyStartTok int, required bool, err error),
-	parseValue func() (val S, valStartTok int, err error),
-) ([]any, error) {
-	var pairs []any
-	for {
-		p.skipNoops()
-		if isClose(p.peek().Type) {
-			break
-		}
-		pairStartTok := p.i
-
-		k, keyStartTok, required, err := readKey()
-		if err != nil {
-			return nil, err
-		}
-		p.skipNoops()
-		if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-			return nil, err
-		}
-
-		// POST belonging to key (right after ':')
-		p.skipNoops()
-		if nk, _, err := p.absorbOneTrailingPostAnnot(k, keyStartTok); err != nil {
-			return nil, err
-		} else {
-			k = nk
-		}
-
-		// value
-		p.skipNoops()
-		v, vStartTok, err := parseValue()
-		if err != nil {
-			return nil, err
-		}
-		// direct value POST
-		p.skipNoops()
-		if nv, _, err := p.absorbOneTrailingPostAnnot(v, vStartTok); err != nil {
-			return nil, err
-		} else {
-			v = nv
-		}
-
-		// optional trailing comma (+ POST-after-comma binds to value)
-		p.skipNoops()
-		hadComma := p.match(COMMA)
-		if hadComma {
-			valStartTok := p.lastSpanStartTok
-			p.skipNoops()
-			if nv, _, err := p.absorbOneTrailingPostAnnot(v, valStartTok); err != nil {
-				return nil, err
-			} else {
-				v = nv
-			}
-		}
-
-		tag := "pair"
-		if required {
-			tag = "pair!"
-		}
-		endTok := p.lastSpanEndTok
-		pr := p.mk(tag, pairStartTok, endTok, k, v)
-		pairs = append(pairs, pr)
-
-		p.skipNoops()
-		if hadComma {
-			if isClose(p.peek().Type) {
-				break
-			}
+		if TkNode[0] == "array" then
+			let U = reify(["type", TkNode[1]])
+			if len(vs) == 1 then
+				let pj = jsonParse(vs[0])
+				if pj != null and isType(pj, type [Any]) then
+					let arr = []
+					let j = 0
+					while j < len(pj) do
+						let s = str(pj[j])
+						let u = _coerceScalar(s, U)
+						if u == null then
+							return null
+						end
+						arr = arr + [u]
+						j = j + 1
+					end
+					out[k] = arr
+					i = i + 1
+					continue
+				end
+			end
+			let arr2 = []
+			let j2 = 0
+			while j2 < len(vs) do
+				let u2 = _coerceScalar(vs[j2], U)
+				if u2 == null then
+					return null
+				end
+				arr2 = arr2 + [u2]
+				j2 = j2 + 1
+			end
+			out[k] = arr2
+			i = i + 1
 			continue
-		}
-		break
-	}
-	return pairs, nil
-}
+		end
 
-// ───────────────────────── control / loops / if ───────────────────────────
+		let s = vs[len(vs) - 1]
+		let v = _coerceScalar(s, Tk)
+		if v == null then
+			return null
+		end
+		out[k] = v
+		i = i + 1
+	end
 
-func (p *parser) parseControl(t Token, startTok int) (S, error) {
-	// tag: "return" | "break" | "continue"
-	tag := "return"
-	switch t.Type {
-	case BREAK:
-		tag = "break"
-	case CONTINUE:
-		tag = "continue"
-	}
+	if isType(out, T) then
+		return out
+	end
+	null
+end
 
-	// Newline after the control word → no value (Null).
-	if !p.nextTokenIsOnSameLine(t) {
-		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
-	}
+let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
+	let qm = urlQueryParse(if req.url.query == null then "" else req.url.query end)
+	if qm == null then
+		return null
+	end
+	_bindQueryMap(qm, TQ)
+end
 
-	p.skipNoops()
-	// Same line but next token can't start a value → also Null.
-	switch p.peek().Type {
-	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
-		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
-	}
+let _paramsFromPath = fun(parts: [Str], segs: [Str]) -> {} do
+	let ps = {}
+	let i = 0
+	while i < len(parts) do
+		let p = parts[i]
+		if _isParamSeg(p) then
+			ps[_paramName(p)] = segs[i]
+		end
+		i = i + 1
+	end
+	ps
+end
 
-	// Parse value and absorb a single trailing POST annotation.
-	valStartTok := p.i
-	x, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if nx, _, err := p.absorbOneTrailingPostAnnot(x, valStartTok); err != nil {
-		return nil, err
-	} else {
-		x = nx
-	}
-	return p.mk(tag, startTok, p.lastSpanEndTok, x), nil
-}
+let _bindPath = fun(ps: {}, TP: Type) -> Any? do
+	let rt = reflect(TP)
+	if rt == null then
+		return null
+	end
+	let node = rt[1]
+	if node[0] != "map" then
+		return null
+	end
+	let out = {}
+	let entries = slice(node, 1, len(node))
+	let i = 0
+	while i < len(entries) do
+		let e = entries[i]
+		let tag = e[0]
+		let k = e[1][1]
+		let Tk = reify(["type", e[2]])
+		let raw = if mapHas(ps, k) then ps[k] else null end
+		if raw == null then
+			if tag == "pair!" then
+				return null
+			end
+			i = i + 1
+			continue
+		end
+		let v = _coerceScalar(raw, Tk)
+		if v == null then
+			return null
+		end
+		out[k] = v
+		i = i + 1
+	end
+	if isType(out, TP) then
+		return out
+	end
+	null
+end
 
-func (p *parser) ifExpr() (S, error) {
-	condStartTok := p.i
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(THEN, "expected 'then'"); err != nil {
-		return nil, err
-	}
-	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
-	if err != nil {
-		return nil, err
-	}
-	arm := p.mk("pair", condStartTok, p.lastSpanEndTok, cond, thenBlk)
-	arms := []any{arm}
+let _bindBody = fun(req: Request, TB: Type) -> Any? do
+	let raw = _rawBody(req)
+	if raw == null then
+		return null
+	end
+	let v = jsonParse(raw)
+	if v == null then
+		return null
+	end
+	if not isType(v, TB) then
+		return null
+	end
+	v
+end
 
-	for p.match(ELIF) {
-		condStartTok = p.i
-		c, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := p.need(THEN, "expected 'then'"); err != nil {
-			return nil, err
-		}
-		b, err := p.blockUntil(END, ELIF, ELSE)
-		if err != nil {
-			return nil, err
-		}
-		arm := p.mk("pair", condStartTok, p.lastSpanEndTok, c, b)
-		arms = append(arms, arm)
-	}
+# Build a compact JSON validation payload.
+# reason may be absent (null) when a binder failed without a note.
+let _validationJSON = fun(where: Str, reason: Str?) -> Str do
+	let msg =
+		if reason == null then
+			"validation failed"
+		else
+			reason
+		end
+	let obj = {error: "validation", detail: [{in: where, reason: msg}]}
+	let s = _json(obj)
+	if s == null then
+		"{\"error\":\"validation\"}"
+	else
+		s
+	end
+end
 
-	var elseTail []any
-	if p.match(ELSE) {
-		b, err := p.blockUntil(END)
-		if err != nil {
-			return nil, err
-		}
-		elseTail = []any{b}
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return L("if", append(arms, elseTail...)...), nil
-}
+# =========================
+# Response helpers (value handlers)
+# =========================
 
-func (p *parser) forExpr(openTok int) (S, error) {
-	tgt, err := p.forTarget()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(IN, "expected 'in'"); err != nil {
-		return nil, err
-	}
-	iter, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("for", openTok, p.i-1, tgt, iter, body), nil
-}
+# json — Build an application/json response with status code.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	value: Any — JSON-serializable value.
+# Return:
+# 	{} — Buffered response (status/headers/body).
+let json = fun(status: Int, value: Any) -> {} do
+	let s = _json(value)
+	if s == null then
+		return {status: 500, headers: {"Content-Type": "text/plain"}, body: "json encode error"}
+	end
+	{status: status, headers: {"Content-Type": "application/json; charset=utf-8"}, body: s}
+end
 
-func (p *parser) whileExpr(openTok int) (S, error) {
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("while", openTok, p.i-1, cond, body), nil
-}
+# text — Build a text/plain response with status code.
+#
+# Args:
+# 	status: Int — HTTP status code.
+# 	s: Str — Response body.
+# Return:
+# 	{} — Buffered response.
+let text = fun(status: Int, s: Str) -> {} do
+	{status: status, headers: {"Content-Type": "text/plain"}, body: s}
+end
 
-// ───────────────────────── functions / oracle ─────────────────────────────
+# noContent — Build a 204 No Content response.
+#
+# Args:
+# 	_: Null — Unused.
+# Return:
+# 	{} — Buffered response with empty body.
+let noContent = fun(_: Null) -> {} do
+	{status: 204, headers: {}, body: ""}
+end
 
-func (p *parser) optionalArrowType(incMsg string) (S, error) {
-	if p.match(ARROW) {
-		arrowTok := p.prev()
-		if err := p.needExprAfter(arrowTok, incMsg); err != nil {
-			return nil, err
-		}
-		r, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		return r, nil // parsed type (one node)
-	}
-	return p.mkLeaf("id", -1, "Any"), nil // single synthetic node
-}
+# redirect — Build a redirect response with Location header.
+#
+# Args:
+# 	status: Int — Redirect status (e.g., 302).
+# 	location: Str — Absolute path starting with "/".
+# Return:
+# 	{} — Buffered response; 400 if invalid location.
+let redirect = fun(status: Int, location: Str) -> {} do
+	if len(location) == 0 or substr(location, 0, 1) != "/" then
+		return {status: 400, headers: {"Content-Type": "text/plain"}, body: "bad redirect"}
+	end
+	{status: status, headers: {Location: location}, body: ""}
+end
 
-func (p *parser) funExpr(openTok int) (S, int, error) {
-	params, err := p.params()
-	if err != nil {
-		return nil, 0, err
-	}
-	ret, err := p.optionalArrowType("expected return type after '->'")
-	if err != nil {
-		return nil, 0, err
-	}
-	body, perr := p.parseBlock(true)
-	if perr != nil {
-		return nil, 0, perr
-	}
-	node := p.mk("fun", openTok, p.i-1, params, ret, body)
-	return node, p.i - 1, nil
-}
+# =========================
+# Buffered responder (for value routes, tests)
+# =========================
 
-func (p *parser) oracleExpr(openTok int) (S, int, error) {
-	params, err := p.params()
-	if err != nil {
-		return nil, 0, err
-	}
-	out, err := p.optionalArrowType("expected output type after '->'")
-	if err != nil {
-		return nil, 0, err
-	}
-	var src any
-	if p.match(FROM) {
-		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
-			return nil, 0, err
-		}
-		ex, err := p.expr(0)
-		if err != nil {
-			return nil, 0, err
-		}
-		src = ex
-	} else {
-		src = p.mk("array", -1, -1) // build only when needed
-	}
-	body := p.mk("oracle", openTok, p.i-1, params, out, src)
-	return body, p.i - 1, nil
-}
+let _newResponder = fun(_: Null) -> {res!: _Response, api!: Responder} do
+	let state = {status: 200, headers: {}, body: ""}
+	let api = {}
+	api.status = fun(code: Int) -> Responder do
+		state.status = code
+		api
+	end
+	api.setHeader = fun(k: Str, v: Str) -> Responder do
+		state.headers[k] = v
+		api
+	end
+	api.write = fun(chunk: Str) -> Int? do
+		state.body = state.body + chunk
+		len(chunk)
+	end
+	api.flush = fun(_: Null) -> Bool? do
+		true
+	end
+	api.end = fun(_: Null) -> Bool? do
+		true
+	end
+	{res: state, api: api}
+end
 
-// ─────────────────────── declaration patterns (let/for) ───────────────────
+# =========================
+# Socket-backed responder (true streaming)
+# =========================
 
-type preAnn struct {
-	txt    string
-	tokIdx int
-}
+let _reason = fun(code: Int) -> Str do
+	if code == 200 then return "OK" end
+	if code == 204 then return "No Content" end
+	if code == 302 then return "Found" end
+	if code == 400 then return "Bad Request" end
+	if code == 401 then return "Unauthorized" end
+	if code == 404 then return "Not Found" end
+	if code == 405 then return "Method Not Allowed" end
+	if code == 413 then return "Payload Too Large" end
+	if code == 414 then return "URI Too Long" end
+	if code == 422 then return "Unprocessable Entity" end
+	if code == 431 then return "Request Header Fields Too Large" end
+	if code == 500 then return "Internal Server Error" end
+	if code == 504 then return "Gateway Timeout" end
+	"OK"
+end
 
-func (p *parser) takeOnePreAnnotation() (preAnn, bool, error) {
-	if p.atEnd() || p.peek().Type != ANNOTATION || !p.isPreAnnotationAt(p.i) {
-		return preAnn{}, false, nil
-	}
-	tok := p.peek()
-	p.i++
-	txt := ""
-	if s, ok := tok.Literal.(string); ok {
-		txt = s
-	}
-	return preAnn{txt: txt, tokIdx: p.i - 1}, true, nil
-}
+let _newSockResponder = fun(conn: Any, opts: {}) -> {api!: Responder, state!: {}} do
+	let st = {status: 200, headers: {}, wroteHead: false, chunked: false, ended: false}
+	let _emitHead = fun(_: Null) -> Bool do
+		if st.wroteHead then
+			return true
+		end
+		if not mapHas(st.headers, "Content-Type") then
+			st.headers["Content-Type"] = "text/plain"
+		end
+		let useCL = mapHas(st.headers, "Content-Length")
+		if not useCL then
+			st.headers["Transfer-Encoding"] = "chunked"
+			st.chunked = true
+		end
+		let head = sprintf("HTTP/1.1 %d %s\r\n", [int(st.status), _reason(int(st.status))])
+		for [k, v] in st.headers do
+			head = head + sprintf("%s: %s\r\n", [k, v])
+		end
+		head = head + "\r\n"
+		let n = write(conn, head)
+		if n == null then
+			return false
+		end
+		let _ = flush(conn)
+		st.wroteHead = true
+		true
+	end
 
-func (p *parser) declPattern() (S, error) {
-	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
-		return nil, err
-	} else if ok {
-		// Allow at most one POST to merge immediately after the pattern.
-		child := p.mkLeaf("str", ann.tokIdx, ann.txt) // PRE child ("str", pre)
-		sub, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		// Direct trailing POST for the same pattern
-		if nsub, _, err := p.absorbOneTrailingPostAnnot(sub, p.lastSpanStartTok); err != nil {
-			return nil, err
-		} else {
-			sub = nsub
-		}
-		node := p.mk("annot", ann.tokIdx, p.lastSpanEndTok, child, sub)
-		return node, nil
-	}
+	let api = {}
+	api.status = fun(code: Int) -> Responder do
+		if st.wroteHead then
+			return api
+		end
+		st.status = code
+		api
+	end
+	api.setHeader = fun(k: Str, v: Str) -> Responder do
+		if st.wroteHead then
+			return api
+		end
+		st.headers[k] = v
+		api
+	end
+	api.write = fun(chunk: Str) -> Int? do
+		if st.ended then
+			return 0
+		end
+		if not _emitHead(null) then
+			return null
+		end
+		if st.chunked then
+			let pre = sprintf("%x\r\n", [len(chunk)])
+			if write(conn, pre) == null then
+				return null
+			end
+			if write(conn, chunk) == null then
+				return null
+			end
+			if write(conn, "\r\n") == null then
+				return null
+			end
+			let _ = flush(conn)
+			len(chunk)
+		else
+			let n = write(conn, chunk)
+			if n == null then
+				return null
+			end
+			let _ = flush(conn)
+			n
+		end
+	end
+	api.flush = fun(_: Null) -> Bool? do
+		flush(conn)
+	end
+	api.end = fun(_: Null) -> Bool? do
+		if st.ended then
+			return true
+		end
+		if not st.wroteHead then
+			if not _emitHead(null) then
+				return true
+			end
+		end
+		if st.chunked then
+			if write(conn, "0\r\n\r\n") == null then
+				return null
+			end
+		end
+		let _ = flush(conn)
+		st.ended = true
+		true
+	end
 
-	if p.match(ID) {
-		idIdx := p.i - 1
-		return p.mk("decl", idIdx, idIdx, tokText(p.prev())), nil
-	}
-	if p.match(LSQUARE, CLSQUARE) {
-		return p.arrayDeclPattern()
-	}
-	if p.match(LCURLY) {
-		return p.objectDeclPattern()
-	}
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		line, col := p.posAfterLastSpan()
-		return nil, &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return nil, &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-}
+	{api: api, state: st}
+end
 
-func (p *parser) arrayDeclPattern() (S, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RSQUARE) {
-		return p.mk("darr", openTok, p.i-1), nil
-	}
+# =========================
+# Router (closure-backed)
+# =========================
 
-	parts, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == RSQUARE },
-		func() (S, int, error) {
-			p.skipNoops()
-			start := p.i
-			pt, err := p.declPattern()
-			if err != nil {
-				return nil, 0, err
-			}
-			return pt, start, nil
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	p.skipNoops()
-	if _, perr := p.need(RSQUARE, "expected ']' in array pattern"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("darr", openTok, p.i-1, parts...), nil
-}
+let _makeRoute = fun(method: Str, pattern: Str, call: _StreamFn, style: Str, c: Contract) -> {} do
+	let m = _normMethod(method)
+	let isPrefix = len(pattern) > 1 and substr(pattern, len(pattern) - 1, len(pattern)) == "/"
+	{method: m, pattern: pattern, parts: _splitPath(pattern), call: call, style: style, contract: c, prefix: isPrefix}
+end
 
-func (p *parser) objectDeclPattern() (S, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RCURLY) {
-		return p.mk("dobj", openTok, p.i-1), nil
-	}
-
-	isClose := func(tt TokenType) bool { return tt == RCURLY }
-	readKey := func() (S, int, bool, error) {
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, 0, false, err
-		}
-		return k, p.lastSpanStartTok, false, nil
-	}
-	parseVal := func() (S, int, error) {
-		p.skipNoops()
-		ptStart := p.i
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, 0, err
-		}
-		return pt, ptStart, nil
-	}
-
-	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
-	if err != nil {
-		return nil, err
-	}
-
-	p.skipNoops()
-	if _, perr := p.need(RCURLY, "expected '}' in object pattern"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("dobj", openTok, p.i-1, pairs...), nil
-}
-
-// readKeyString allows stacked PRE-annotations (handled recursively).
-// Span order: (1) PRE "str" child; (2) "annot" wrapper; (3) final key "str" leaf.
-func (p *parser) readKeyString() (S, error) {
-	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
-		return nil, err
-	} else if ok {
-		child := p.mkLeaf("str", ann.tokIdx, ann.txt)
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, err
-		}
-		return p.mk("annot", ann.tokIdx, p.lastSpanEndTok, child, k), nil
-	}
-
-	if p.match(STRING) {
-		return p.mkLeaf("str", p.i-1, p.prev().Literal), nil
-	}
-
-	t := p.peek()
-	if isWordLike(t.Type) {
-		p.i++
-		name := t.Lexeme
-		if s, ok := t.Literal.(string); ok {
-			name = s
-		}
-		return p.mkLeaf("str", p.i-1, name), nil
+let _toRouteSpec = fun(method: Str, pattern: Str, style: Str, c: Contract) -> {} do
+	let out = {
+		method: _normMethod(method),
+		pattern: pattern,
+		style: style
 	}
 
-	g := p.peek()
-	if p.interactive && g.Type == EOF {
-		line, col := p.posAfterLastSpan()
-		return nil, &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return nil, &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
-}
+	if mapHas(c, "summary") and c.summary != null and isType(c.summary, type Str) then
+		out.summary = c.summary
+	end
+	if mapHas(c, "description") and c.description != null and isType(c.description, type Str) then
+		out.description = c.description
+	end
+	if mapHas(c, "tags") and c.tags != null and isType(c.tags, type [Str]) then
+		out.tags = c.tags
+	end
+	if mapHas(c, "deprecated") and c.deprecated != null then
+		out.deprecated = bool(c.deprecated)
+	end
+	if mapHas(c, "operationId") and c.operationId != null and isType(c.operationId, type Str) then
+		out.operationId = c.operationId
+	end
 
-func isWordLike(tt TokenType) bool {
-	switch tt {
-	case ID, TYPE, ENUM, BOOLEAN, NULL,
-		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
-		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, MODULE, FOR, IN, FROM,
-		TYPECONS:
-		return true
-	}
-	return false
-}
+	if mapHas(c, "security") and c.security != null then
+		if isType(c.security, type [ {} ]) then
+			out.security = c.security
+		elif isType(c.security, type {}) then
+			out.security = [c.security]
+		end
+	end
 
-// ───────────────────────────── for-target helpers ─────────────────────────
+	if mapHas(c, "x") and c.x != null and isType(c.x, type {}) then
+		out.x = c.x
+	end
 
-func (p *parser) forTarget() (S, error) {
-	if p.match(LET) {
-		return p.declPattern()
-	}
-	switch p.peek().Type {
-	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
-		save := p.i
-		pt, err := p.declPattern()
-		if err == nil {
-			return pt, nil
-		}
-		if p.interactive && IsIncomplete(err) {
-			return nil, err
-		}
-		p.i = save
-	}
-	save := p.i
-	e, err := p.expr(90)
-	if err != nil {
-		return nil, err
-	}
-	if !assignable(e) {
-		p.i = save
-		g := p.peek()
-		line, col := p.posAtByte(g.StartByte)
-		return nil, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
-	}
-	if e[0].(string) == "id" {
-		// Reuse the existing id span for the decl node range.
-		return p.mk("decl", p.lastSpanStartTok, p.lastSpanEndTok, e[1].(string)), nil
-	}
-	return e, nil
-}
+	if mapHas(c, "path") or mapHas(c, "query") or mapHas(c, "headers") or mapHas(c, "cookies") or mapHas(c, "body") or mapHas(c, "responses") then
+		out.contract = c
+	end
 
-func assignable(n S) bool {
-	cur := n
-	for len(cur) > 0 {
-		tag, _ := cur[0].(string)
-		if tag == "annot" {
-			if inner, ok := cur[2].(S); ok {
-				cur = inner
+	out
+end
+
+let _pathMatch = fun(parts: [Str], reqSegs: [Str]) -> {}? do
+	let nParts = len(parts)
+	let nReq = len(reqSegs)
+	if nParts == 0 then
+		return if nReq == 0 then {params: {}, matched: 0} else null end
+	end
+	let last = nParts - 1
+	let hasCatch = _isCatchSeg(parts[last])
+	if not hasCatch and nReq != nParts then
+		return
+	end
+	if hasCatch and nReq < last then
+		return
+	end
+	let params = {}
+	let limit = if hasCatch then last else nParts end
+	let i = 0
+	while i < limit do
+		let pat = parts[i]
+		let seg = reqSegs[i]
+		if _isParamSeg(pat) then
+			params[_paramName(pat)] = seg
+		else
+			if pat != seg then
+				return
+			end
+		end
+		i = i + 1
+	end
+	if hasCatch then
+		let name = _paramName(parts[last])
+		let rest = join(slice(reqSegs, last, nReq), "/")
+		params[name] = rest
+	end
+	{params: params, matched: if hasCatch then last else nParts end}
+end
+
+let _getHeader = fun(h: {}, name: Str) -> Str? do
+	let want = toLower(name)
+	for [k, v] in h do
+		if toLower(k) == want then
+			return v
+		end
+	end
+	null
+end
+
+# router — Create a new router.
+#
+# Summary:
+# 	Construct a router instance supporting value and streaming routes,
+# 	middleware composition, nested mounting, and OpenAPI export.
+#
+# Args:
+# 	opts: {}? — Optional:
+# 		docs?: {
+# 			enabled?: Bool (default true),
+# 			path?: Str (default "/openapi.json"),
+# 			info?: openapi.Info (default {title:"API", version:"0.1.0"}),
+# 			servers?: [Str] (default []),
+# 			opts?: openapi.SpecOpts (default {})
+# 		}
+# Return:
+# 	{} — Router instance with route/routeStream/mount/use/test helpers.
+let router = fun(opts: {}?) -> {} do
+	let o = if opts == null then {} else opts end
+	let dIn = if mapHas(o, "docs") and o.docs != null then o.docs else {} end
+	let docs = {
+		enabled: if mapHas(dIn, "enabled") and dIn.enabled != null then bool(dIn.enabled) else true end,
+		path: if mapHas(dIn, "path") and dIn.path != null then dIn.path else "/openapi.json" end,
+		info: if mapHas(dIn, "info") and dIn.info != null then dIn.info else {title: "API", version: "0.1.0"} end,
+		servers: if mapHas(dIn, "servers") and dIn.servers != null then dIn.servers else [] end,
+		opts: if mapHas(dIn, "opts") and dIn.opts != null then dIn.opts else {} end
+	}
+
+	let _routes = []
+	let _mws = []
+	let _mounts = []
+	let _specRoutes = []
+
+	let _buildSpec = fun(_: Null) -> {} do
+		openapi.spec(_specRoutes, docs.info, docs.servers, docs.opts)
+	end
+
+	let _startsWith = fun(a: [Str], b: [Str]) -> Bool do
+		if len(a) < len(b) then
+			return false
+		end
+		let i = 0
+		while i < len(b) do
+			if a[i] != b[i] then
+				return false
+			end
+			i = i + 1
+		end
+		true
+	end
+
+	let _allowedMethodsLocal = fun(path: Str) -> [Str] do
+		let segs = _splitPath(path)
+		let out = []
+		for r in _routes do
+			let hit = _pathMatch(r.parts, segs) != null or (mapHas(r, "prefix") and r.prefix == true and _startsWith(segs, r.parts))
+			if hit then
+				let seen = false
+				let i = 0
+				while i < len(out) do
+					if out[i] == r.method then
+						seen = true
+						break
+					end
+					i = i + 1
+				end
+				if not seen then
+					out = out + [r.method]
+				end
+			end
+		end
+		out
+	end
+
+	let _matchLocal = fun(method: Str, path: Str) -> {}? do
+		let want = _normMethod(method)
+		let segs = _splitPath(path)
+		let best = null
+		let score = -1
+		for r in _routes do
+			if r.method != want then
+				if not (want == "HEAD" and r.method == "GET" and r.style == "value") then
+					continue
+				end
+			end
+			let p = _pathMatch(r.parts, segs)
+			if p != null then
+				let s = int(p.matched)
+				if s > score then
+					best = {route: r, segs: segs, params: p.params}
+					score = s
+				end
+			end
+		end
+		if best != null then
+			return best
+		end
+		null
+	end
+
+	let _pathExistsLocal = fun(path: Str) -> Bool do
+		let segs = _splitPath(path)
+		for r in _routes do
+			if _pathMatch(r.parts, segs) != null then
+				return true
+			end
+		end
+		false
+	end
+
+	let _compose = fun(fn: _StreamFn) -> _StreamFn do
+		let h = fn
+		let i = len(_mws) - 1
+		while i >= 0 do
+			h = _mws[i](h)
+			i = i - 1
+		end
+		h
+	end
+
+	let _emitViaMw = fun(req: Request, ctx: {}, status: Int, headers: {}, body: Str) -> _Response do
+		let pack = _newResponder(null)
+		let h = fun(_: Request, res: Responder, _: {}) -> Null do
+			for [k, v] in headers do
+				res.setHeader(k, v)
+			end
+			res.status(status)
+			let _ = res.write(body)
+			let _ = res.end(null)
+			null
+		end
+		let call = _compose(h)
+		let _ = call(req, pack.api, ctx)
+		{status: pack.res.status, headers: pack.res.headers, body: pack.res.body}
+	end
+
+	let _emitStreamViaMw = fun(req: Request, ctx: {}, conn: Any, opts: {}, status: Int, headers: {}, body: Str) -> Null do
+		let sock = _newSockResponder(conn, opts)
+		let h = fun(_: Request, res: Responder, _: {}) -> Null do
+			for [k, v] in headers do
+				res.setHeader(k, v)
+			end
+			res.status(status)
+			let _ = res.write(body)
+			let _ = res.end(null)
+			null
+		end
+		let call = _compose(h)
+		let _ = call(req, sock.api, ctx)
+		null
+	end
+
+	let _delegateToMount = fun(req: Request) -> _Response? do
+		let segs = _splitPath(req.url.path)
+		for m in _mounts do
+			let pfx = m.prefixParts
+			if len(segs) < len(pfx) then
 				continue
+			end
+			let ok = true
+			let i = 0
+			while i < len(pfx) do
+				if pfx[i] != segs[i] then
+					ok = false
+					break
+				end
+				i = i + 1
+			end
+			if not ok then
+				continue
+			end
+			let rest = slice(segs, len(pfx), len(segs))
+			let subPath = "/" + join(rest, "/")
+			let subReq = {
+				method: req.method,
+				url: {scheme: req.url.scheme, host: req.url.host, path: subPath, query: req.url.query},
+				headers: req.headers,
+				body: req.body,
+				pathParams: {}
 			}
-		}
-		break
-	}
-	if len(cur) == 0 {
-		return false
-	}
-	switch cur[0] {
-	case "id", "get", "idx", "decl", "darr", "dobj":
-		return true
-	default:
-		return false
-	}
-}
+			return m.child._entryCall(subReq)
+		end
+		null
+	end
 
-func unwrapAnnots(n S) S {
-	cur := n
-	for len(cur) > 0 {
-		tag, _ := cur[0].(string)
-		if tag != "annot" {
-			break
-		}
-		inner, ok := cur[2].(S)
-		if !ok {
-			break
-		}
-		cur = inner
+	let _entryCore = fun(req: Request) -> _Response do
+		let m = _matchLocal(req.method, req.url.path)
+		if m == null then
+			let delegated = _delegateToMount(req)
+			if delegated != null then
+				return delegated
+			end
+
+			let ctx = {req: req}
+			if _normMethod(req.method) == "OPTIONS" then
+				let allowed = _allowedMethodsLocal(req.url.path)
+				if len(allowed) > 0 then
+					return _emitViaMw(req, ctx, 204, {"Allow": join(allowed, ", ")}, "")
+				end
+				if len(_mws) > 0 then
+					return _emitViaMw(req, ctx, 204, {}, "")
+				end
+				ctx._errorDump = "not found"
+				return _emitViaMw(req, ctx, 404, {"Content-Type": "text/plain"}, "not found")
+			end
+			if _pathExistsLocal(req.url.path) then
+				ctx._errorDump = "method not allowed"
+				return _emitViaMw(req, ctx, 405, {"Content-Type": "text/plain", "Allow": join(_allowedMethodsLocal(req.url.path), ", ")}, "method not allowed")
+			end
+			ctx._errorDump = "not found"
+			return _emitViaMw(req, ctx, 404, {"Content-Type": "text/plain"}, "not found")
+		end
+
+		let r = m.route
+		let params = if mapHas(m, "params") and m.params != null then m.params else {} end
+		let C = if mapHas(r, "contract") then r.contract else {} end
+
+		let rq = {method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: params}
+		let ctx = {req: rq}
+
+		if mapHas(C, "path") and C.path != null then
+			let P = _bindPath(rq.pathParams, C.path)
+			if P == null then
+				ctx._errorDump = "validation error in path: " + str(noteGet(P))
+				return _emitViaMw(rq, ctx, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("path", noteGet(P)))
+			end
+			ctx.path = P
+		end
+		if mapHas(C, "query") and C.query != null then
+			let Q = _bindQueryFromReq(rq, C.query)
+			if Q == null then
+				ctx._errorDump = "validation error in query: " + str(noteGet(Q))
+				return _emitViaMw(rq, ctx, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("query", noteGet(Q)))
+			end
+			ctx.query = Q
+		end
+		if mapHas(C, "body") and C.body != null then
+			let B = _bindBody(rq, C.body)
+			if B == null then
+				ctx._errorDump = "validation error in body: " + str(noteGet(B))
+				return _emitViaMw(rq, ctx, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("body", noteGet(B)))
+			end
+			ctx.body = B
+		end
+
+		let pack = _newResponder(null)
+		let call = _compose(r.call)
+
+		let t = try(fun(_: Null) do call(rq, pack.api, ctx) end)
+		if not t.ok then
+			ctx._errorDump = "panic"
+			return {status: 500, headers: {"Content-Type": "text/plain"}, body: "internal server error"}
+		end
+
+		{status: pack.res.status, headers: pack.res.headers, body: pack.res.body}
+	end
+
+	let _preflight = fun(req: Request) -> {ok!: Bool} do
+		let m = _matchLocal(req.method, req.url.path)
+		if m == null then
+			return {ok: false}
+		end
+		let r = m.route
+		let params = if mapHas(m, "params") and m.params != null then m.params else {} end
+		let C = if mapHas(r, "contract") then r.contract else {} end
+		let rq = {method: req.method, url: req.url, headers: req.headers, body: "", pathParams: params}
+		if mapHas(C, "path") and C.path != null then
+			let P = _bindPath(rq.pathParams, C.path)
+			if P == null then
+				return {ok: false}
+			end
+		end
+		if mapHas(C, "query") and C.query != null then
+			let Q = _bindQueryFromReq(rq, C.query)
+			if Q == null then
+				return {ok: false}
+			end
+		end
+		{ok: true}
+	end
+
+	let api = {
+		__kind: "nethttp.router",
+
+		# route — Register a value route that returns a buffered result.
+		#
+		# Args:
+		# 	method: Str — HTTP method (GET/POST/...).
+		# 	pattern: Str — Path pattern (supports {param} and {*catch}).
+		# 	c: Contract — Optional contract (binding/validation).
+		# 	handler: Request -> {} -> Any — Returns Any or _Response/_HttpError.
+		# Return:
+		# 	Bool — true on success.
+		route: fun(method: Str, pattern: Str, c: Contract, handler: Request -> {} -> Any) -> Bool do
+			let parts = _splitPath(pattern)
+			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
+				let r = try(fun(_: Null) do handler(req, ctx) end)
+				if not r.ok then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("internal server error")
+					let _ = res.end(null)
+					return
+				end
+				let out = r.value
+				if out == null then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("handler returned null")
+					let _ = res.end(null)
+					return
+				end
+				if isType(out, _HttpError) then
+					let hdrs = if mapHas(out, "headers") and out.headers != null then out.headers else {} end
+					let rt = if mapHas(out, "body") and out.body != null then out.body else "" end
+					for [k, v] in hdrs do
+						res.setHeader(k, v)
+					end
+					res.status(out.status)
+					let _ = res.write(rt)
+					let _ = res.end(null)
+					return
+				end
+				if isType(out, _Response) then
+					if mapHas(c, "responses") and c.responses != null then
+						let payload = if mapHas(out, "body") then jsonParse(out.body) else out end
+						if not _checkResponse(out.status, payload, c.responses) then
+							res.status(500).setHeader("Content-Type", "application/json")
+							let _ = res.write(_validationJSON("response", "response-validation failed"))
+							let _ = res.end(null)
+							return
+						end
+					end
+					for [k, v] in out.headers do
+						res.setHeader(k, v)
+					end
+					res.status(out.status)
+					let _ = res.write(out.body)
+					let _ = res.end(null)
+					return
+				end
+				let js = _json(out)
+				if js == null then
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("json encode error")
+					let _ = res.end(null)
+					return
+				end
+				if mapHas(c, "responses") and c.responses != null then
+					if not _checkResponse(200, out, c.responses) then
+						res.status(500).setHeader("Content-Type", "application/json")
+						let _ = res.write(_validationJSON("response", "response-validation failed"))
+						let _ = res.end(null)
+						return
+					end
+				end
+				res.setHeader("Content-Type", "application/json; charset=utf-8").status(200)
+				let _ = res.write(js)
+				let _ = res.end(null)
+				null
+			end
+			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "value", c)]
+			_routes = _routes + [_makeRoute(method, pattern, stream, "value", c)]
+			true
+		end,
+
+		# routeStream — Register a streaming route.
+		#
+		# Args:
+		# 	method: Str — HTTP method.
+		# 	pattern: Str — Path pattern.
+		# 	c: Contract — Optional contract.
+		# 	handler: Request -> Responder -> {} -> Null — Performs streaming writes.
+		# Return:
+		# 	Bool — true on success.
+		routeStream: fun(method: Str, pattern: Str, c: Contract, handler: Request -> Responder -> {} -> Null) -> Bool do
+			let stream = fun(req: Request, res: Responder, ctx: {}) -> Null do
+				let r = try(fun(_: Null) do handler(req, res, ctx) end)
+				if not r.ok then
+					_setErr(ctx, r)
+					res.status(500).setHeader("Content-Type", "text/plain")
+					let _ = res.write("internal server error")
+					let _ = res.end(null)
+				end
+				null
+			end
+			_specRoutes = _specRoutes + [_toRouteSpec(method, pattern, "stream", c)]
+			_routes = _routes + [_makeRoute(method, pattern, stream, "stream", c)]
+			true
+		end,
+
+		# mount — Mount a child router at a fixed prefix.
+		#
+		# Args:
+		# 	prefix: Str — Path prefix (e.g., "/v1").
+		# 	child: {} — Router returned by router().
+		# Return:
+		# 	Bool — true on success.
+		mount: fun(prefix: Str, child: {}) -> Bool do
+			_mounts = _mounts + [{prefixParts: _splitPath(prefix), child: child}]
+			true
+		end,
+
+		# use — Register a streaming-friendly middleware.
+		#
+		# Args:
+		# 	mw: _Mw — Middleware function.
+		# Return:
+		# 	Bool — true on success.
+		use: fun(mw: _Mw) -> Bool do
+			_mws = _mws + [mw]
+			true
+		end,
+
+		# _entryCall — Buffered entrypoint used by the server and tests.
+		_entryCall: fun(req: Request) -> _Response do
+			_entryCore(req)
+		end,
+
+		# _entryCallStream — Streaming entrypoint for server-side use.
+		_entryCallStream: fun(req: Request, conn: Any, opts: {}) -> {}? do
+			let m = _matchLocal(req.method, req.url.path)
+			if m == null then
+				return null
+			end
+			let r = m.route
+			if r.style != "stream" then
+				return null
+			end
+
+			let params = if mapHas(m, "params") and m.params != null then m.params else {} end
+			let C = if mapHas(r, "contract") then r.contract else {} end
+			let rq = {method: req.method, url: req.url, headers: req.headers, body: req.body, pathParams: params}
+			let ctx = {req: rq}
+
+			if mapHas(C, "path") and C.path != null then
+				let P = _bindPath(rq.pathParams, C.path)
+				if P == null then
+					ctx._errorDump = "validation error in path: " + str(noteGet(P))
+					_emitStreamViaMw(rq, ctx, conn, opts, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("path", noteGet(P)))
+					return {streamed: true}
+				end
+				ctx.path = P
+			end
+			if mapHas(C, "query") and C.query != null then
+				let Q = _bindQueryFromReq(rq, C.query)
+				if Q == null then
+					ctx._errorDump = "validation error in query: " + str(noteGet(Q))
+					_emitStreamViaMw(rq, ctx, conn, opts, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("query", noteGet(Q)))
+					return {streamed: true}
+				end
+				ctx.query = Q
+			end
+			if mapHas(C, "body") and C.body != null then
+				let B = _bindBody(rq, C.body)
+				if B == null then
+					ctx._errorDump = "validation error in body: " + str(noteGet(B))
+					_emitStreamViaMw(rq, ctx, conn, opts, 422, {"Content-Type": "application/json; charset=utf-8"}, _validationJSON("body", noteGet(B)))
+					return {streamed: true}
+				end
+				ctx.body = B
+			end
+
+			let sock = _newSockResponder(conn, opts)
+			let call = _compose(r.call)
+			let t = try(fun(_: Null) do call(rq, sock.api, ctx) end)
+			if not t.ok then
+				_setErr(ctx, t)
+				let _ = sock.api.status(500).setHeader("Content-Type", "text/plain").write("internal server error")
+				let _ = sock.api.end(null)
+				return {streamed: true}
+			end
+			let _ = sock.api.end(null)
+			{streamed: true}
+		end,
+
+		# _dump — Internal debugging: returns routes and middleware stacks.
+		_dump: fun(_: Null) -> {} do
+			{routes: _routes, mws: _mws}
+		end,
+
+		# _preflight — Lightweight contract-only check used for 100-continue.
+		_preflight: fun(req: Request) -> {ok!: Bool} do
+			_preflight(req)
+		end
 	}
-	return cur
-}
-=== END FILE: parser.go ===
+	if docs.enabled then
+		api.route("GET", docs.path, contract({responses: {"200": type Any}}), fun(req: Request, ctx: {}) do
+			json(200, _buildSpec(null))
+		end)
+	end
+
+	api
+end
+
+# =========================
+# Response validation (contract responses)
+# =========================
+
+let _checkResponse = fun(status: Int, out: Any, respMap: {}) -> Bool do
+	if respMap == null then
+		return true
+	end
+	if not mapHas(respMap, str(status)) and not mapHas(respMap, status) then
+		return true
+	end
+	let T = if mapHas(respMap, str(status)) then respMap[str(status)] else respMap[status] end
+	if not isType(T, type Type) then
+		return true
+	end
+	isType(out, T)
+end
+
+# =========================
+# Test client (buffered)
+# =========================
+
+# testClient — Build a buffered test client for a router.
+#
+# Summary:
+# 	Allows issuing synthetic requests against a router without sockets.
+#
+# Args:
+# 	r: {} — Router returned by router().
+# Return:
+# 	{} — {call!: (req:{method?:Str, path?:Str, headers?:{}, body?:Str}) -> {status:Int, headers:{}, body:Str}}
+let testClient = fun(r: {}) -> {} do
+	let call = fun(req: {}) -> {} do
+		let method = if mapHas(req, "method") and req.method != null then req.method else "GET" end
+		let pathStr = if mapHas(req, "path") and req.path != null then req.path else "/" end
+		let headers = if mapHas(req, "headers") and req.headers != null then req.headers else {} end
+		let body = if mapHas(req, "body") and req.body != null then req.body else "" end
+
+		let q = ""
+		let p = pathStr
+		let parts = split(pathStr, "?")
+		if len(parts) >= 2 then
+			p = parts[0]
+			q = join(slice(parts, 1, len(parts)), "?")
+		end
+
+		let RQ = {method: _normMethod(method), url: _makeURL(p, q), headers: headers, body: body, pathParams: {}}
+		let res = r._entryCall(RQ)
+		{status: res.status, headers: res.headers, body: res.body}
+	end
+	{call: call}
+end
+=== END FILE: lib/nethttp/router.ms ===
+
+=== BEGIN FILE: lib/nethttp/server.ms ===
+# nethttp/server — HTTP/1.1 server lifecycle (minimal viable implementation)
+#
+# This module wires a router to a plain TCP listener and serves HTTP/1.1.
+# Behavior mirrors the original implementation; only naming, docs, and comments
+# were polished to follow conventions.
+
+let router = import("nethttp/router")
+let _getHeader = router._getHeader
+
+# Private server handle state.
+let _ServerHandle = type {listener!: Any, stop!: {closed!: Bool}, conns!: [Any], opts!: {}}
+
+# Map status code to reason phrase (polished list; logic unchanged).
+let _reason = fun(code: Int) -> Str do
+	if code == 200 then
+		"OK"
+	elif code == 204 then
+		"No Content"
+	elif code == 302 then
+		"Found"
+	elif code == 400 then
+		"Bad Request"
+	elif code == 401 then
+		"Unauthorized"
+	elif code == 404 then
+		"Not Found"
+	elif code == 405 then
+		"Method Not Allowed"
+	elif code == 413 then
+		"Payload Too Large"
+	elif code == 414 then
+		"URI Too Long"
+	elif code == 422 then
+		"Unprocessable Entity"
+	elif code == 431 then
+		"Request Header Fields Too Large"
+	elif code == 500 then
+		"Internal Server Error"
+	elif code == 504 then
+		"Gateway Timeout"
+	else
+		"OK"
+	end
+end
+
+# Trim a trailing CR from a line (HTTP/1.x CRLF handling).
+let _trimCR = fun(s: Str) -> Str do
+	let n = len(s)
+	if n > 0 and substr(s, n - 1, n) == "\r" then
+		substr(s, 0, n - 1)
+	else
+		s
+	end
+end
+
+# Header value must not contain CR/LF.
+let _validHeaderValue = fun(v: Str) -> Bool do
+	match("\r|\n", v) == []
+end
+
+# Read a single line and enforce a remaining-byte budget (if provided).
+let _readLineLimited = fun(c: Any, remaining: Int?) -> Str? do
+	let line = readLine(c)
+	if line == null then
+		return null
+	end
+	let s = _trimCR(line)
+	if remaining != null then
+		let left = int(remaining) - len(s) - 2
+		if left < 0 then
+			return null
+		end
+	end
+	s
+end
+
+# Read request headers up to byte and count limits.
+# Returns map of headers, or special keys "__too_many__" / "__cl_conflict__".
+let _readHeaders = fun(c: Any, maxBytes: Int, maxCount: Int?) -> {}? do
+	let headers = {}
+	let budget = maxBytes
+	let count = 0
+	while true do
+		let line = _readLineLimited(c, budget)
+		if line == null then
+			return null
+		end
+		if len(line) == 0 then
+			break
+		end
+		count = count + 1
+		if maxCount != null and count > int(maxCount) then
+			return {"__too_many__": true}
+		end
+		let parts = split(line, ":")
+		if len(parts) < 2 then
+			return null
+		end
+		let key = parts[0]
+		let value = strip(join(slice(parts, 1, len(parts)), ":"))
+		if mapHas(headers, key) and toLower(key) == "content-length" and headers[key] != value then
+			headers["__cl_conflict__"] = true
+		end
+		headers[key] = value
+		budget = budget - len(line) - 2
+	end
+	headers
+end
+
+# Parse the request-target into path/query. Absolute-form is rejected higher up.
+let _parseTarget = fun(t: Str) -> {path!: Str, query: Str?, absolute: Bool?} do
+	if match("^[a-zA-Z][a-zA-Z0-9+.-]*://", t) != [] then
+		return {absolute: true, path: "/", query: null}
+	end
+	let path = t
+	let query = null
+	let parts = split(t, "?")
+	if len(parts) >= 2 then
+		path = parts[0]
+		query = join(slice(parts, 1, len(parts)), "?")
+	end
+	{path: path, query: query}
+end
+
+# Read request body using Content-Length with a hard cap.
+let _readBodyContentLength = fun(c: Any, n: Int, cap: Int) -> Str? do
+	let want = if n > cap then cap else n end
+	let buf = ""
+	let remaining = want
+	while remaining > 0 do
+		let chunk = readN(c, remaining)
+		if chunk == null then
+			return null
+		end
+		buf = buf + chunk
+		remaining = remaining - len(chunk)
+		if len(chunk) == 0 then
+			return null
+		end
+	end
+	buf
+end
+
+# Headers-only request parse; body is handled later (after 100-continue if any).
+# On success returns {req, wantCL, keepAlive}; on structured errors returns a map
+# with flags handled by the caller.
+let _readRequest = fun(conn: Any, opts: {}) -> {}? do
+	let line = readLine(conn)
+	if line == null then
+		return null
+	end
+	let reqLine = _trimCR(line)
+	if len(reqLine) > 0 and mapHas(opts, "maxStartLineBytes") and opts.maxStartLineBytes != null and len(reqLine) > int(opts.maxStartLineBytes) then
+		return {tooLong: true}
+	end
+	let parts = split(reqLine, " ")
+	if len(parts) != 3 then
+		return null
+	end
+	let method = toUpper(parts[0])
+	let target = parts[1]
+	let proto = parts[2]
+	if proto != "HTTP/1.1" then
+		return null
+	end
+
+	let maxHdr = int(opts.maxHeaderBytes)
+	let maxCnt = if mapHas(opts, "maxHeaders") then opts.maxHeaders else null end
+	let hdrs = _readHeaders(conn, maxHdr, maxCnt)
+	if hdrs == null then
+		return null
+	end
+	if mapHas(hdrs, "__too_many__") then
+		return {tooManyHeaders: true}
+	end
+
+	if mapHas(hdrs, "Transfer-Encoding") then
+		return {badRequest: true}
+	end
+	if mapHas(hdrs, "__cl_conflict__") and bool(hdrs["__cl_conflict__"]) then
+		return {badRequest: true}
+	end
+
+	let keepAlive = true
+	let connV = _getHeader(hdrs, "Connection")
+	if connV != null and toLower(connV) == "close" then
+		keepAlive = false
+	end
+
+	let t = _parseTarget(target)
+	if mapHas(t, "absolute") and t.absolute == true then
+		return {badRequest: true}
+	end
+
+	let wantCL = -1
+	if mapHas(hdrs, "Content-Length") then
+		let n = int(hdrs["Content-Length"])
+		if n == null or n < 0 then
+			return null
+		end
+		wantCL = n
+	end
+
+	{
+		req: {method: method, url: {scheme: null, host: null, path: t.path, query: t.query}, headers: hdrs, body: "", pathParams: {}},
+		wantCL: wantCL,
+		keepAlive: keepAlive
+	}
+end
+
+# Write a complete response (status line, headers, body). Validates header values.
+let _writeResponse = fun(conn: Any, res: {status!: Int, headers!: {}, body!: Str}, opts: {}) -> Bool do
+	let status = int(res.status)
+	let headers = clone(res.headers)
+	let body = if res.body == null then "" else res.body end
+	if mapHas(opts, "addDateHeader") and opts.addDateHeader != null and opts.addDateHeader and not mapHas(headers, "Date") then
+		headers["Date"] = timeFormatRFC3339(nowMillis())
+	end
+	for [k, v] in headers do
+		if not _validHeaderValue(v) then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			flush(conn)
+			return false
+		end
+	end
+	if not mapHas(headers, "Content-Length") then
+		headers["Content-Length"] = str(len(body))
+	end
+	if not mapHas(headers, "Content-Type") then
+		headers["Content-Type"] = "text/plain"
+	end
+	let head = sprintf("HTTP/1.1 %d %s\r\n", [status, _reason(status)])
+	for [k, v] in headers do
+		head = head + sprintf("%s: %s\r\n", [k, v])
+	end
+	head = head + "\r\n"
+	let n1 = write(conn, head)
+	if n1 == null then
+		return false
+	end
+	let n2 = write(conn, body)
+	if n2 == null then
+		return false
+	end
+	flush(conn)
+	true
+end
+
+# Remove a connection from the active list (by identity).
+let _removeConn = fun(arr: [Any], c: Any) -> [Any] do
+	let out = []
+	let i = 0
+	while i < len(arr) do
+		let it = arr[i]
+		if uid(it) != uid(c) then
+			out = out + [it]
+		end
+		i = i + 1
+	end
+	out
+end
+
+# Handle a single TCP connection: parse->route->respond loop.
+let _connLoop = fun(conn: Any, rtr: {}, server: _ServerHandle) -> Null do
+	while true do
+		let rr = _readRequest(conn, server.opts)
+		if rr == null then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			break
+		end
+		if mapHas(rr, "tooLong") and bool(rr.tooLong) then
+			let _ = write(conn, sprintf("HTTP/1.1 414 %s\r\nContent-Length: 8\r\nContent-Type: text/plain\r\n\r\ntoo long", [_reason(414)]))
+			break
+		end
+		if mapHas(rr, "badRequest") and bool(rr.badRequest) then
+			let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+			break
+		end
+		if mapHas(rr, "tooManyHeaders") and bool(rr.tooManyHeaders) then
+			let _ = write(conn, sprintf("HTTP/1.1 431 %s\r\nContent-Length: 27\r\nContent-Type: text/plain\r\n\r\nrequest header fields too large", [_reason(431)]))
+			break
+		end
+
+		let req = rr.req
+
+		# Expect: 100-continue preflight (path+query only)
+		let expect = _getHeader(req.headers, "Expect")
+		if expect != null and toLower(expect) == "100-continue" then
+			let pf = rtr._preflight(req)
+			if pf == null or not pf.ok then
+				let _ = write(conn, sprintf("HTTP/1.1 404 %s\r\nContent-Length: 9\r\nContent-Type: text/plain\r\n\r\nnot found", [_reason(404)]))
+				let _ = flush(conn)
+				break
+			end
+			if rr.wantCL > 0 then
+				let _ = write(conn, "HTTP/1.1 100 Continue\r\n\r\n")
+				let _ = flush(conn)
+			end
+		end
+
+		# Read body (Content-Length only)
+		if rr.wantCL >= 0 then
+			let cap = int(server.opts.maxBodyBytes)
+			if rr.wantCL > cap then
+				let _ = write(conn, sprintf("HTTP/1.1 413 %s\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\npayload too large", [_reason(413)]))
+				break
+			end
+			let s = _readBodyContentLength(conn, rr.wantCL, cap)
+			if s == null then
+				let _ = write(conn, sprintf("HTTP/1.1 400 %s\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nbad request", [_reason(400)]))
+				break
+			end
+			req.body = s
+		end
+
+		# Try streaming path first (for stream routes)
+		let sres = rtr._entryCallStream(req, conn, server.opts)
+		if sres != null and mapHas(sres, "streamed") and sres.streamed == true then
+			if not rr.keepAlive then
+				break
+			end
+			continue
+		end
+
+		# Buffered value route
+		let out = rtr._entryCall(req)
+		# Auto-HEAD for value routes: same headers (accurate Content-Length), no body
+		if req.method == "HEAD" then
+			let hdr = clone(out.headers)
+			if not mapHas(hdr, "Content-Length") then
+				hdr["Content-Length"] = str(len(out.body))
+			end
+			let ok = _writeResponse(conn, {status: out.status, headers: hdr, body: ""}, server.opts)
+			if not ok or not rr.keepAlive then
+				break
+			end
+			continue
+		end
+		let ok = _writeResponse(conn, out, server.opts)
+		if not ok or not rr.keepAlive then
+			break
+		end
+	end
+
+	close(conn)
+	server.conns = _removeConn(server.conns, conn)
+	null
+end
+
+# serve — Start an HTTP/1.1 server with a router on a TCP listener.
+#
+# Summary:
+# 	Spawns an accept loop and per-connection handler loops. Supports basic
+# 	limits (headers/body/start-line), 100-continue preflight, value and
+# 	stream routes, keep-alive, and optional Date header injection.
+#
+# Args:
+# 	listener: Any — TCP listener handle returned by netListen.
+# 	r: {} — A router value created by nethttp/router.
+# 	opts: {} — {
+# 		readHeaderTimeoutMs?: Int,
+# 		writeTimeoutMs?: Int,
+# 		idleTimeoutMs?: Int,
+# 		maxHeaderBytes?: Int (default 8192),
+# 		maxBodyBytes?: Int (default 1048576),
+# 		maxStartLineBytes?: Int?,
+# 		maxHeaders?: Int?,
+# 		addDateHeader?: Bool?  # when true, adds Date header to responses
+# 	}
+# Return:
+# 	_ServerHandle? — Handle used for shutdown; null on invalid inputs.
+let serve = fun(listener: Any, r: {}, opts: {}) -> _ServerHandle? do
+	if listener == null then
+		return null
+	end
+	if not mapHas(r, "_entryCall") then
+		return null
+	end
+
+	if not mapHas(opts, "readHeaderTimeoutMs") or opts.readHeaderTimeoutMs == null then opts.readHeaderTimeoutMs = 0 end
+	if not mapHas(opts, "writeTimeoutMs") or opts.writeTimeoutMs == null then opts.writeTimeoutMs = 0 end
+	if not mapHas(opts, "idleTimeoutMs") or opts.idleTimeoutMs == null then opts.idleTimeoutMs = 0 end
+	if not mapHas(opts, "maxHeaderBytes") or opts.maxHeaderBytes == null then opts.maxHeaderBytes = 8192 end
+	if not mapHas(opts, "maxBodyBytes") or opts.maxBodyBytes == null then opts.maxBodyBytes = 1048576 end
+
+	let server = {listener: listener, stop: {closed: false}, conns: [], opts: opts}
+
+	let _ = procSpawn(fun(_: Null) -> Null do
+		while not server.stop.closed do
+			let c = netAccept(listener)
+			if c == null then
+				continue
+			end
+			server.conns = server.conns + [c]
+			procSpawn(fun(_: Null) -> Null do
+				_connLoop(c, r, server)
+			end)
+		end
+		null
+	end)
+
+	server
+end
+
+# shutdown — Gracefully stop the server and close active connections.
+#
+# Summary:
+# 	Stops new accepts, closes the listener, and best-effort closes all
+# 	active connections. No wait on in-flight work is enforced here.
+#
+# Args:
+# 	server: _ServerHandle? — Handle returned by serve.
+# 	timeoutMs: Int? — Unused placeholder for future coordination.
+# Return:
+# 	Bool — true when the shutdown sequence ran (idempotent).
+let shutdown = fun(server: _ServerHandle?, timeoutMs: Int?) -> Bool do
+	if server == null then
+		return true
+	end
+	server.stop.closed = true
+	close(server.listener)
+	let i = 0
+	while i < len(server.conns) do
+		let c = server.conns[i]
+		close(c)
+		i = i + 1
+	end
+	server.conns = []
+	true
+end
+=== END FILE: lib/nethttp/server.ms ===
 

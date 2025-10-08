@@ -188,7 +188,13 @@ let _addParams = fun(ps: [ {} ], where: Str, T: Type, reg: {}, comps: {}) -> [ {
 					if n == "Str" or n == "Int" or n == "Num" or n == "Bool" then
 						p.style = "form"
 						p.explode = true
+					else
+						# Non-scalar array → do not explode (make key present to avoid panic)
+						p.explode = false
 					end
+				else
+					# Unknown/compound element type → do not explode
+					p.explode = false
 				end
 			elif rt != null and rt[1][0] == "map" then
 				p.style = "deepObject"
@@ -378,7 +384,13 @@ let spec = fun(routes: [RouteSpec], info: Info, servers: [Str]?, opts: SpecOpts?
 		end
 
 		let op = {parameters: ps, responses: rs, operationId: _opId(r.method, pat)}
-		if mapHas(r, "security") and r.security != null then op.security = r.security end
+		if mapHas(r, "security") and r.security != null then
+			# Route explicitly specifies security (including [] to clear).
+			op.security = r.security
+		elif mapHas(o, "security") and o.security != null then
+			# Route inherits root security; expose explicit null so clients/tests can read it safely.
+			op.security = null
+		end
 		if mapHas(r, "summary") and r.summary != null then op.summary = r.summary end
 		if mapHas(r, "description") and r.description != null then op.description = r.description end
 		if mapHas(r, "tags") and r.tags != null then op.tags = r.tags end

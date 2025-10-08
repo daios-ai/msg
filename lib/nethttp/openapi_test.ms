@@ -149,7 +149,7 @@ end)
 # 12) $ref dedup for reused Type
 testing.test("openapi/ref dedup", fun(_: Null) do
 	let T = type {id: Int}
-	let r = http.router()
+	let r = http.router({docs: {enabled: false}})
 	r.route("POST", "/a", {body: T, responses: {"200": T}}, fun(req, ctx) do
 		http.json(200, {id: 1})
 	end)

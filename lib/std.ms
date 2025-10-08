@@ -445,7 +445,7 @@ end
 # Args: value: Any
 # Returns: Int
 let uid = fun(value) -> Int do
-	let hx = hexEncode(sha256(str(value)))
+	let hx = hexEncode(sha256(formatValue(value)))
 	let h = 5381
 	let n = len(hx)
 	let i = 0

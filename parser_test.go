@@ -1612,3 +1612,197 @@ func Test_Parser_Continue_Null_When_ImmediateEnd(t *testing.T) {
 	val := kid(stmt, 0)
 	wantTag(t, val, "null")
 }
+
+func Test_Parser_Params_Name_PRE_AnnotationOnName(t *testing.T) {
+	src := `
+fun(
+  # number of items
+  n: Int
+) -> Any do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	// First parameter
+	p0 := kid(params, 0)
+	// Pair should be the element (possibly wrapped by annot at the pair level;
+	// but here we annotated the NAME, so the pair itself is not wrapped).
+	wantTag(t, p0, "pair")
+
+	// Name position should be an annot wrapping the id "n"
+	name := kid(p0, 0)
+	txt, wrapped, isPost := asAnnot(t, name)
+	if isPost {
+		t.Fatalf("name PRE should not be POST")
+	}
+	if txt != "number of items" {
+		t.Fatalf("want PRE text %q, got %q", "number of items", txt)
+	}
+	wantTag(t, wrapped, "id")
+	if wrapped[1].(string) != "n" {
+		t.Fatalf("want id n, got %v", wrapped[1])
+	}
+
+	// Type unchanged
+	typ := kid(p0, 1)
+	wantTag(t, typ, "id")
+	if typ[1].(string) != "Int" {
+		t.Fatalf("want type Int, got %v", typ[1])
+	}
+}
+
+func Test_Parser_Params_Name_POST_AfterColon_BindsToName(t *testing.T) {
+	src := `
+fun(
+  n:  # count of items
+    Int
+) -> Any do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	p0 := kid(params, 0)
+	wantTag(t, p0, "pair")
+
+	// Name position should be an annot **POST** wrapping id "n"
+	name := kid(p0, 0)
+	txt, wrapped, isPost := asAnnot(t, name)
+	if !isPost {
+		t.Fatalf("name annot should be POST")
+	}
+	if txt != "count of items" {
+		t.Fatalf("want POST text %q, got %q", "count of items", txt)
+	}
+	wantTag(t, wrapped, "id")
+	if wrapped[1].(string) != "n" {
+		t.Fatalf("want id n, got %v", wrapped[1])
+	}
+}
+
+func Test_Parser_Params_Type_PRE_AnnotationOnType(t *testing.T) {
+	src := `
+fun(
+  n:
+    # must be positive
+    Int
+) -> Any do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	p0 := kid(params, 0)
+	wantTag(t, p0, "pair")
+
+	// Type position should be a PRE annot wrapping id "Int"
+	typ := kid(p0, 1)
+	txt, wrapped, isPost := asAnnot(t, typ)
+	if isPost {
+		t.Fatalf("type PRE should not be POST")
+	}
+	if txt != "must be positive" {
+		t.Fatalf("want PRE text %q, got %q", "must be positive", txt)
+	}
+	wantTag(t, wrapped, "id")
+	if wrapped[1].(string) != "Int" {
+		t.Fatalf("want type Int, got %v", wrapped[1])
+	}
+}
+
+func Test_Parser_Params_Element_POST_DirectlyAfterElement_BindsToPair(t *testing.T) {
+	// POST directly after first element (before comma) binds to the whole pair,
+	// reusing parseCommaList’s element-level POST handling.
+	src := `
+fun(
+  n: Int # element-level
+, m: Num
+) -> Any do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	// First element should be wrapped by POST annot
+	e0 := kid(params, 0)
+	txt, wrapped, isPost := asAnnot(t, e0)
+	if !isPost {
+		t.Fatalf("element annot should be POST")
+	}
+	if txt != "element-level" {
+		t.Fatalf("want POST text %q, got %q", "element-level", txt)
+	}
+	wantTag(t, wrapped, "pair")
+}
+
+func Test_Parser_Params_Annotation_OnOwnLine_IsPREForNextParam(t *testing.T) {
+	src := `
+fun(
+  n: Int,
+  # next is PRE
+ m: Num
+) -> Any do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	params := kid(fn, 0)
+
+	// First element should NOT be annotated
+	e0 := kid(params, 0)
+	wantTag(t, e0, "pair")
+
+	// Second element's name should have a PRE (because the # line is PRE for "m")
+	p1 := kid(params, 1)
+	name := kid(p1, 0)
+	_, wrapped, isPost := asAnnot(t, name)
+	if isPost {
+		t.Fatalf("expected PRE on second param name")
+	}
+	wantTag(t, wrapped, "id")
+	if wrapped[1].(string) != "m" {
+		t.Fatalf("want id m, got %v", wrapped[1])
+	}
+}
+
+func Test_Parser_Params_Name_PRE_And_Name_POST_MergeIntoSinglePRE(t *testing.T) {
+	// PRE before the name plus POST after the colon should MERGE into one PRE
+	// (existing rule: PRE+POST → PRE with "pre\npost").
+	src := `
+fun(
+  # pre note
+  n:  # post note
+    Int
+) -> Any do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	p0 := kid(params, 0)
+	wantTag(t, p0, "pair")
+
+	name := kid(p0, 0)
+	txt, wrapped, isPost := asAnnot(t, name)
+	if isPost {
+		t.Fatalf("merged annotation should not be POST")
+	}
+	want := "pre note\npost note"
+	if txt != want {
+		t.Fatalf("want merged text %q, got %q", want, txt)
+	}
+	wantTag(t, wrapped, "id")
+	if wrapped[1].(string) != "n" {
+		t.Fatalf("want id n, got %v", wrapped[1])
+	}
+}

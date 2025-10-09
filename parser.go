@@ -1113,6 +1113,15 @@ func (p *parser) params() (S, error) {
 		func(tt TokenType) bool { return tt == RROUND },
 		func() (S, int, error) {
 			p.skipNoops()
+			var hadPre bool
+			var pre preAnn
+			if ann, ok, aerr := p.takeOnePreAnnotation(); aerr != nil {
+				return nil, 0, aerr
+			} else if ok {
+				hadPre, pre = true, ann
+			}
+
+			// Expect the parameter name as before
 			idTok, err := p.need(ID, "expected parameter name")
 			if err != nil {
 				return nil, 0, err
@@ -1120,12 +1129,31 @@ func (p *parser) params() (S, error) {
 			idIdx := p.i - 1
 			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
 
+			// If there was a PRE, wrap the name with it (merges with any POST later)
+			if hadPre {
+				child := p.mkLeaf("str", pre.tokIdx, pre.txt)
+				nameLeaf = p.mk("annot", pre.tokIdx, idIdx, child, nameLeaf)
+			}
+
 			// Decide type presence first; emit exactly one node.
 			endTokForPair := idIdx
 			var typ S
 
 			p.skipNoops()
 			if p.match(COLON) {
+				p.skipNoops()
+				{
+					nameStartTok := idIdx
+					if hadPre {
+						nameStartTok = pre.tokIdx
+					}
+					if nname, _, aerr := p.absorbOneTrailingPostAnnot(nameLeaf, nameStartTok); aerr != nil {
+						return nil, 0, aerr
+					} else {
+						nameLeaf = nname
+					}
+				}
+
 				if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
 					return nil, 0, err
 				}

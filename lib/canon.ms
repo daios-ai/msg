@@ -229,7 +229,7 @@ end
 # root: Str — directory to scan (relative or absolute).
 # Return:
 # { total!: Int, changed!: Int, errors!: Int }? — totals; null if discovery fails.
-let formatTree = fun(root: Str) -> {total: Int, changed: Int, errors: Int}? do
+let formatTree = fun(root: Str) -> {changed: Int, errors: Int, total: Int}? do
 	let fs = files(root)
 	if fs == null then
 		return null # <discovery failed>

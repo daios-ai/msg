@@ -23,7 +23,7 @@ end)
 testing.test("nethttp/route query success", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/q", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) do
+	r.route("GET", "/q", http.contract({query: type {age: Int, name: Str}}), fun(req, ctx) do
 		http.json(200, {ok: true, who: ctx.query.name, age: ctx.query.age})
 	end)
 
@@ -42,7 +42,7 @@ end)
 testing.test("nethttp/route query failure -> 422", fun(_: Null) do
 	let r = http.router()
 
-	r.route("GET", "/qbad", http.contract({query: type {name: Str, age: Int}}), fun(req, ctx) do
+	r.route("GET", "/qbad", http.contract({query: type {age: Int, name: Str}}), fun(req, ctx) do
 		http.text(200, "ok")
 	end)
 
@@ -312,10 +312,7 @@ testing.test("nethttp/openapi basic", fun(_: Null) do
 	let res = c.call({method: "GET", path: "/openapi.json"})
 	testing.assert(res.status == 200, "openapi status != 200")
 	testing.assert(len(res.body) > 0, "openapi body empty")
-	testing.assert(
-		len(split(res.body, "/a/{id}")) > 1 or len(split(res.body, "\"/a/{id}\"")) > 1,
-		"missing /a/{id} in openapi.json"
-	)
+	testing.assert(len(split(res.body, "/a/{id}")) > 1 or len(split(res.body, "\"/a/{id}\"")) > 1, "missing /a/{id} in openapi.json")
 end)
 
 # =========================================================

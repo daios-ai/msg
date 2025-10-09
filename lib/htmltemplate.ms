@@ -32,13 +32,13 @@ let SafeHTML = type {__safe_html__: Bool, html: Str}
 let SafeURL = type {__safe_url__: Bool, url: Str}
 
 let RenderOpts = type {
-	baseDir: Str,
 	autoescape: Bool,
-	strictUndefined: Bool,
-	bytecodeCache: {}
+	baseDir: Str,
+	bytecodeCache: {},
+	strictUndefined: Bool
 }
 
-let Span = type {line: Int, col: Int}
+let Span = type {col: Int, line: Int}
 
 let TemplateError = type {
 	kind: Enum["parse", "load", "render", "type"],
@@ -46,17 +46,17 @@ let TemplateError = type {
 	where: Span?
 }
 
-let Template = type {__mtml__: Bool, name: Str, ast: [Any]}
+let Template = type {__mtml__: Bool, ast: [Any], name: Str}
 
-let Writer = type {write: Str -> Int?, flush: Null -> Bool?}
+let Writer = type {flush: Null -> Bool?, write: Str -> Int?}
 
 let Env = type {
 	__mtml_env__: Bool,
-	opts: RenderOpts,
 	_filters: {},
-	_helpers: {},
 	_globals: {},
-	_loader: Str -> {src: Str, name: Str}?
+	_helpers: {},
+	_loader: Str -> {name: Str, src: Str}?,
+	opts: RenderOpts
 }
 
 # =========================
@@ -142,7 +142,7 @@ let env = fun(opts: RenderOpts) -> Env do
 		_filters: {},
 		_helpers: {},
 		_globals: {},
-		_loader: fun(path: Str) -> {src: Str, name: Str}? do
+		_loader: fun(path: Str) -> {name: Str, src: Str}? do
 			let full = if len(o.baseDir) == 0 then
 				path
 			else
@@ -1130,7 +1130,7 @@ let load = fun(e: Env, path: Str) -> Template? do
 	fromString(e, info.src, info.name)
 end
 
-let _stringWriter = fun() -> {w: Writer, buf: {s: Str}} do
+let _stringWriter = fun() -> {buf: {s: Str}, w: Writer} do
 	let state = {s: ""}
 	let w = {
 		write: fun(s: Str) -> Int? do

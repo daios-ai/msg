@@ -3,8 +3,12 @@
 # Format: <name>: <Type|fun line from formatValue> — <first line of note>
 
 # Helpers
-let _trim = fun(s: Str) -> Str do strip(s) end
-let _rstrip = fun(s: Str) -> Str do rstrip(s) end
+let _trim = fun(s: Str) -> Str do
+	strip(s)
+end
+let _rstrip = fun(s: Str) -> Str do
+	rstrip(s)
+end
 let _startsWith = fun(s: Str, p: Str) -> Bool do
 	len(s) >= len(p) and substr(s, 0, len(p)) == p
 end

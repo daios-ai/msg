@@ -279,7 +279,7 @@ T.test("std/oracleHealth/installed-or-soft-null", fun(_: Null) do
 		T.assert(ann != null, "<missing annotation>")
 		T.assert(str(ann) == "oracle not installed" or len(str(ann)) > 0, null)
 	else
-		T.assertType(r, type {ok: Bool, ms: Int})
+		T.assertType(r, type {ms: Int, ok: Bool})
 		T.assertEq(r.ok, true)
 		T.assert(r.ms >= 0, null)
 	end

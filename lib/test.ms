@@ -1,4 +1,4 @@
-let Test = type {name: Str, age: Int}
+let Test = type {age: Int, name: Str}
 
 let print = fun(t) do
 	printf("[print] " + formatValue(t) + "\n", [])

@@ -299,7 +299,7 @@ end
 
 # Sort an array in-place using a comparison function.
 # Args: arr:[Any] - array to sort (modified in-place)
-#       cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
+# cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
 # Return: [Any] - the sorted array (same reference)
 let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
 	let swap = fun(i: Int, j: Int) -> Null do
@@ -308,7 +308,7 @@ let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
 		arr[j] = t
 		null
 	end
-	
+
 	let partition = fun(lo: Int, hi: Int) -> [Int] do
 		let pivot = arr[lo]
 		let lt = lo
@@ -329,17 +329,17 @@ let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
 		end
 		[lt, gt]
 	end
-	
+
 	let qsort = fun(lo: Int, hi: Int) -> Null do
 		if lo >= hi then
-			return null
+			return
 		end
 		let [lt, gt] = partition(lo, hi)
 		qsort(lo, lt - 1)
 		qsort(gt + 1, hi)
 		null
 	end
-	
+
 	qsort(0, len(arr) - 1)
 	arr
 end
@@ -625,4 +625,4 @@ end
 let llm = import("llm")
 oracleInstall(llm.exec)
 llm.useBackend("openai-responses")
-llm.useModel("gpt-5")
+llm.useModel("gpt-4.1-mini")

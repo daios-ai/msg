@@ -322,18 +322,14 @@ end)
 testing.test("mtml/srcset preserves descriptors", fun(_: Null) do
 	let e = mtml.env({})
 	let t = mtml.fromString(e, "<img srcset=\"{{ s }}\">", "srcset-ok.html")
-	let out = mtml.render(e, t, {
-		s: "/a.jpg 1x, https://ex.com/b.jpg 2x"
-	})
+	let out = mtml.render(e, t, {s: "/a.jpg 1x, https://ex.com/b.jpg 2x"})
 	testing.assertEq("<img srcset=\"/a.jpg 1x, https://ex.com/b.jpg 2x\">", out)
 end)
 
 testing.test("mtml/srcset rejects bad candidate", fun(_: Null) do
 	let e = mtml.env({})
 	let t = mtml.fromString(e, "<img srcset=\"{{ s }}\">", "srcset-bad.html")
-	let out = mtml.render(e, t, {
-		s: "/ok.jpg 1x, javascript:alert(1) 2x"
-	})
+	let out = mtml.render(e, t, {s: "/ok.jpg 1x, javascript:alert(1) 2x"})
 	testing.assertEq(null, out)
 end)
 
@@ -389,7 +385,9 @@ let mtml = import("mtml")
 testing.test("mtml/safehtml forgery escapes", fun(_: Null) do
 	let e = mtml.env({})
 	let t = mtml.fromString(e, "<div>{{ x }}</div>", "f.html")
-	let out = mtml.render(e, t, {x: {__safe_html__: true, html: "<img src=x onerror=1>"}})
+	let out = mtml.render(e, t, {
+		x: {__safe_html__: true, html: "<img src=x onerror=1>"}
+	})
 	testing.assertEq(null, out)
 	testing.assert(match("forged safehtml", toLower(noteGet(out))) != null, "expected forged SafeHTML annotation")
 end)
@@ -398,7 +396,9 @@ end)
 testing.test("mtml/safeurl forgery rejected", fun(_: Null) do
 	let e = mtml.env({})
 	let t = mtml.fromString(e, "<a href=\"{{ u }}\">go</a>", "fu.html")
-	let out = mtml.render(e, t, {u: {__safe_url__: true, url: "javascript:alert(1)"}})
+	let out = mtml.render(e, t, {
+		u: {__safe_url__: true, url: "javascript:alert(1)"}
+	})
 	testing.assertEq(null, out)
 end)
 
@@ -431,7 +431,8 @@ testing.test("mtml/helper arity mismatch annotated", fun(_: Null) do
 	let e = mtml.env({})
 	let rep = fun(s: Str) do
 		fun(n: Int) -> Str do
-			"s"  # stub content, arity is what we care about
+			"s" # stub content, arity is what we care about
+
 		end
 	end
 	let _ = mtml.registerHelper(e, "repeat", rep)

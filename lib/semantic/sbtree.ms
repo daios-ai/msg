@@ -3,7 +3,7 @@
 # --------------------------------------------
 # Types
 # --------------------------------------------
-let Node = type { content!: Str, children!: [Node] }
+let Node = type {children!: [Node], content!: Str}
 
 # --------------------------------------------
 # Oracles (nullable returns by design)
@@ -12,7 +12,6 @@ let Node = type { content!: Str, children!: [Node] }
 # Given a query and a set of options, pick the index in {0, 1, ...} of the most
 # relevant option in the set.
 let chooseChild = oracle(query: Str, options: [Str]) -> Int?
-
 
 let summarizeExamples = [
 	[
@@ -58,11 +57,10 @@ let summarizeExamples = [
 # of no more than 3 lines.
 let summarize = oracle(texts: [Str]) -> Str? from summarizeExamples
 
-
 # Given a collection of `N` texts, partition them into two coherent groups
 # called `left` and `right`. For each group, indicate the members through
 # their indicies in `0...(N-1)`.
-let split = oracle(children: [Str]) -> { left!: [Int], right!: [Int] }?
+let split = oracle(children: [Str]) -> {left!: [Int], right!: [Int]}?
 
 # --------------------------------------------
 # Tiny safe wrappers (prevent nulls from breaking Node)
@@ -71,14 +69,22 @@ let _safeChoose = fun(query: Str, opts: [Str]) -> Int do
 	println("before chooseChild: " + query)
 	let i = chooseChild(query, opts)
 	println("after chooseChild: " + query)
-	if i == null or i < 0 or i >= len(opts) then 0 else i end
+	if i == null or i < 0 or i >= len(opts) then
+		0
+	else
+		i
+	end
 end
 
 let _safeSumm = fun(texts: [Str]) -> Str do
 	println("before summarize")
 	let s = summarize(texts)
 	println("after summarize")
-	if s == null then texts[0] else s end
+	if s == null then
+		texts[0]
+	else
+		s
+	end
 end
 
 let _safeSplit = fun(cs: [Str]) -> {left!: [Int], right!: [Int]} do
@@ -90,7 +96,11 @@ let _safeSplit = fun(cs: [Str]) -> {left!: [Int], right!: [Int]} do
 	end
 	# Fallback: balanced halving by index
 	let n = len(cs)
-	let mid = if n % 2 == 0 then n / 2 else (n / 2) + 1 end
+	let mid = if n % 2 == 0 then
+		n / 2
+	else
+		n / 2 + 1
+	end
 	let L = []
 	let i = 0
 	while i < mid do
@@ -102,14 +112,14 @@ let _safeSplit = fun(cs: [Str]) -> {left!: [Int], right!: [Int]} do
 		R = R + [i]
 		i = i + 1
 	end
-	{ left: L, right: R }
+	{left: L, right: R}
 end
 
 # --------------------------------------------
 # Helpers
 # --------------------------------------------
 let leaf = fun(text: Str) -> Node do
-	{ content: text, children: [] }
+	{content: text, children: []}
 end
 
 let _centroids = fun(kids: [Node]) -> [Str] do
@@ -123,7 +133,10 @@ let _centroids = fun(kids: [Node]) -> [Str] do
 end
 
 let internal = fun(kids: [Node]) -> Node do
-	{ content: _safeSumm(_centroids(kids)), children: kids }
+	{
+		content: _safeSumm(_centroids(kids)),
+		children: kids
+	}
 end
 
 let isLeaf = fun(n: Node) -> Bool do
@@ -155,7 +168,7 @@ let _splitIfNeeded = fun(n: Node, b: Int) -> Node do
 			ri = ri + 1
 		end
 
-		internal([ internal(leftKids), internal(rightKids) ])
+		internal([internal(leftKids), internal(rightKids)])
 	end
 end
 
@@ -194,7 +207,10 @@ end
 let insert = fun(root: Node, text: Str, b: Int) -> Node do
 	let rec = fun(n: Node) -> {node!: Node, promoted!: Bool} do
 		if len(n.children) == 0 then
-			return { node: internal([ leaf(n.content), leaf(text) ]), promoted: true }
+			return {
+				node: internal([leaf(n.content), leaf(text)]),
+				promoted: true
+			}
 		end
 
 		let i = _safeChoose(text, kidCents(n))
@@ -203,17 +219,15 @@ let insert = fun(root: Node, text: Str, b: Int) -> Node do
 
 		if r.promoted then
 			let ks2 = _splicePromoted(ks, i, r.node)
-			return { node: _splitIfNeeded(internal(ks2), b), promoted: false }
+			return {node: _splitIfNeeded(internal(ks2), b), promoted: false}
 		end
 
 		ks[i] = r.node
-		{ node: _splitIfNeeded(internal(ks), b), promoted: false }
+		{node: _splitIfNeeded(internal(ks), b), promoted: false}
 	end
 
 	rec(root).node
 end
-
-
 
 # --------------------------------------------
 # Delete (nullable recursion) → Node
@@ -222,7 +236,8 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 	let rec = fun(n: Node) -> Node? do
 		if isLeaf(n) then
 			if n.content == text then
-				return null  # deleted
+				return null # deleted
+
 			end
 			return n
 		end
@@ -236,13 +251,17 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 			let out = []
 			let j = 0
 			while j < len(ks) do
-				if j != i then out = out + [ks[j]] end
+				if j != i then
+					out = out + [ks[j]]
+				end
 				j = j + 1
 			end
 			if len(out) == 0 then
-				return null         # prune empty internal
+				return null # prune empty internal
+
 			elif len(out) == 1 then
-				return out[0]       # collapse single-child internal
+				return out[0] # collapse single-child internal
+
 			end
 			return internal(out)
 		end
@@ -253,8 +272,13 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 
 	let r = rec(root)
 	if r == null then
-		leaf("")  # empty-tree sentinel: single empty leaf (still a valid tree)
+		leaf("") # empty-tree sentinel: single empty leaf (still a valid tree)
+
 	else
-		if not isLeaf(r) and len(r.children) == 1 then r.children[0] else r end
+		if not isLeaf(r) and len(r.children) == 1 then
+			r.children[0]
+		else
+			r
+		end
 	end
 end

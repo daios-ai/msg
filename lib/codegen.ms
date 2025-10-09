@@ -276,7 +276,7 @@ let _genExamples = [
 	]
 ]
 
-let _genOracle = oracle(spec: Str) -> []? from _genExamples
+let _genOracle = oracle(spec: Str) -> [Any]? from _genExamples
 let _genComment = "Write a JSON-MindScript anonymous function or oracle for the requested behavior." + "\n\n" + _genManual
 _genOracle = noteSet(_genComment, _genOracle)
 

@@ -19,11 +19,14 @@
 //     at EOF instead of hard parse errors, suitable for REPLs.
 //
 // Annotation model (lowest precedence):
-//   - PRE annotation decorates the expression to its right.
-//   - POST annotation decorates the expression to its left and can also appear
-//     after a comma or a colon (binding to the element/key/value on the left).
-//   - PRE and POST cannot stack. If both apply to the same expression, they are
-//     merged into a single PRE with text "pre\npost".
+//   - Annotations attach to **values** (not sites/names). The parser collects
+//     all nearby annotation texts around a binding site and merges them onto
+//     the value node as a single wrapper:
+//     ("annot", ("str", mergedText), value)
+//   - The AST does not preserve whether a note was written “pre” or “post”.
+//     The pretty-printer is responsible for rendering (e.g., multiline → pre,
+//     single line → post) and must be deterministic for idempotency:
+//     pretty(src) == pretty(pretty(src))
 //
 // Nodes & Spans
 // -------------
@@ -82,10 +85,7 @@
 //
 // Annotations:
 //
-//	("annot", ("str", textOr<text>), wrappedNode)
-//	   • PRE  text stored as-is
-//	   • POST text stored with leading "<"
-//	   • PRE+POST becomes PRE with "pre\npost" (no POST stacking)
+//	("annot", ("str", text), wrappedNode)   // merged text; no POST marker
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // SPAN EMISSION INVARIANT (CRITICAL)
@@ -222,14 +222,20 @@ func (p *parser) need(t TokenType, msg string) (Token, error) {
 	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
 }
 
-func (p *parser) expect(t TokenType, msg string) (Token, error) {
-	p.skipNoops()
-	return p.need(t, msg)
-}
-func (p *parser) expectClose(t TokenType, msg string) error {
-	p.skipNoops()
-	_, err := p.need(t, msg)
-	return err
+// joinNonEmpty concatenates non-empty parts with '\n' in order.
+func joinNonEmpty(parts ...string) string {
+	out := ""
+	for _, s := range parts {
+		if s == "" {
+			continue
+		}
+		if out == "" {
+			out = s
+		} else {
+			out += "\n" + s
+		}
+	}
+	return out
 }
 
 func (p *parser) posAtByte(b int) (int, int) {
@@ -338,19 +344,6 @@ func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
 
 // ───────────────────────────── NOOP / annotation utils ─────────────────────
 
-func tokenCanEndExpr(tt TokenType) bool {
-	switch tt {
-	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
-		TYPE, ENUM,
-		RROUND, RSQUARE, RCURLY,
-		QUESTION,
-		END:
-		return true
-	default:
-		return false
-	}
-}
-
 func (p *parser) nextTokenIsOnSameLine(as Token) bool {
 	if p.atEnd() {
 		return false
@@ -358,99 +351,62 @@ func (p *parser) nextTokenIsOnSameLine(as Token) bool {
 	return p.peek().Line == as.Line
 }
 
-func (p *parser) isPreAnnotationAt(idx int) bool {
-	if idx <= 0 || idx >= len(p.toks) {
-		return true
-	}
-	ann := p.toks[idx]
-	for j := idx - 1; j >= 0; j-- {
-		t := p.toks[j]
-		if t.Line < ann.Line {
-			break
+// Collect any number of adjacent ANNOTATION tokens, merging with '\n'.
+func (p *parser) collectAnnots() string {
+	// Collect only *immediately adjacent* ANNOTATION tokens.
+	// Do NOT skip NOOPs here; a blank-line run must break annotation groups
+	// and remain as its own statement.
+	var parts []string
+	for !p.atEnd() && p.peek().Type == ANNOTATION {
+		if s, ok := p.peek().Literal.(string); ok && s != "" {
+			parts = append(parts, s)
 		}
-		if t.Line == ann.Line {
-			if t.Type == COMMA || t.Type == COLON {
-				continue
-			}
-			return !tokenCanEndExpr(t.Type)
-		}
+		p.i++ // consume ANNOTATION
+		// Intentionally NOT calling p.skipNoops() here.
 	}
-	return true
+	return joinNonEmpty(parts...)
 }
 
-func isAnnot(n S) (isAnnot, isPost bool) {
-	if len(n) < 2 {
-		return false, false
+// attachInlineTrailingAnnots attaches only the trailing ANNOTATION tokens that
+// start on the *same line* as the end of the node most recently parsed.
+// Own-line annotations (on later lines) are left for the next parse step
+// (so they bind forward or wrap a NOOP).
+func (p *parser) attachInlineTrailingAnnots(e S) S {
+	if p.atEnd() || p.peek().Type != ANNOTATION || p.lastSpanEndTok < 0 {
+		return e
 	}
-	tag, _ := n[0].(string)
-	if tag != "annot" {
-		return false, false
+	endTok := p.lastSpanEndTok
+	if endTok >= len(p.toks) {
+		return e
 	}
-	if child, ok := n[1].(S); ok && len(child) >= 2 && child[0] == "str" {
-		if s, ok := child[1].(string); ok && len(s) > 0 && s[0] == '<' {
-			return true, true
+	endLine, _ := p.posAtByte(p.toks[endTok].EndByte)
+
+	var parts []string
+	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == endLine {
+		if s, ok := p.peek().Literal.(string); ok && s != "" {
+			parts = append(parts, s)
 		}
-		return true, false
+		p.i++ // consume ANNOTATION
 	}
-	return true, false
+	if len(parts) == 0 {
+		return e
+	}
+	return p.attachAnnot(e, joinNonEmpty(parts...))
 }
 
-func mergePreWithPostText(preAnnot S, postTxt string) S {
-	if len(preAnnot) >= 2 {
-		if c, ok := preAnnot[1].(S); ok && len(c) >= 2 && c[0] == "str" {
-			if s, ok := c[1].(string); ok {
-				if postTxt != "" {
-					if s == "" {
-						c[1] = postTxt
-					} else {
-						c[1] = s + "\n" + postTxt
-					}
-				}
-			}
-		}
+// Merge text onto a value as a PRE-style annot (single representation in AST).
+func (p *parser) attachAnnot(val S, text string) S {
+	if text == "" {
+		return val
 	}
-	return preAnnot
-}
-
-// Attach at most one trailing POST to `base`. (Used at top-level and list items)
-func (p *parser) afterExprMaybePost(base S, baseStartTok int) (S, error) {
-	n, _, err := p.absorbOneTrailingPostAnnot(base, baseStartTok)
-	return n, err
-}
-
-// absorbOneTrailingPostAnnot applies one POST annotation to `base`.
-// **Span order**: (1) POST child "str" leaf; (2) wrapping "annot" node.
-func (p *parser) absorbOneTrailingPostAnnot(base S, baseStartTok int) (S, bool, error) {
-	if p.atEnd() || p.peek().Type != ANNOTATION || p.isPreAnnotationAt(p.i) {
-		return base, false, nil
+	// If already annotated, unwrap & merge texts, then rewrap.
+	if base, have, ok := unwrapAnnot(val); ok {
+		merged := joinNonEmpty(have, text)
+		child := p.mkLeaf("str", -1, merged)
+		return p.mk("annot", -1, -1, child, base)
 	}
-	aTok := p.i
-	a := p.peek()
-	p.i++
-
-	postTxt := ""
-	if s, ok := a.Literal.(string); ok {
-		postTxt = s
-	}
-
-	// Disallow stacked POSTs.
-	if !p.atEnd() && p.peek().Type == ANNOTATION && !p.isPreAnnotationAt(p.i) {
-		line, col := p.posAtByte(p.peek().StartByte)
-		return nil, false, &Error{Kind: DiagParse, Line: line, Col: col, Msg: "multiple consecutive post-annotations are not allowed; combine them"}
-	}
-
-	// If base is already PRE, merge and return the same node.
-	if ok, isPost := isAnnot(base); ok && !isPost {
-		base = mergePreWithPostText(base, postTxt)
-		p.skipNoops()
-		return base, true, nil
-	}
-
-	// Normal POST: (1) child "str" span, (2) parent "annot" span.
-	child := p.mkLeaf("str", aTok, "<"+postTxt)
-	base = p.mk("annot", baseStartTok, aTok, child, base)
-	p.skipNoops()
-	return base, true, nil
+	child := p.mkLeaf("str", -1, text)
+	return p.mk("annot", -1, -1, child, val)
 }
 
 // ───────────────────────── program / blocks ────────────────────────────
@@ -461,12 +417,6 @@ func (p *parser) program() (S, error) {
 		e, err := p.expr(0)
 		if err != nil {
 			return nil, err
-		}
-		startTok := p.lastSpanStartTok
-		if ne, err := p.afterExprMaybePost(e, startTok); err != nil {
-			return nil, err
-		} else {
-			e = ne
 		}
 		items = append(items, e)
 	}
@@ -493,12 +443,6 @@ func (p *parser) blockUntil(stops ...TokenType) (S, error) {
 		e, err := p.expr(0)
 		if err != nil {
 			return nil, err
-		}
-		baseStartTok := p.lastSpanStartTok
-		if ne, err := p.afterExprMaybePost(e, baseStartTok); err != nil {
-			return nil, err
-		} else {
-			e = ne
 		}
 		items = append(items, e)
 		consumedAny = true
@@ -699,7 +643,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			base := unwrapAnnots(pat)
 			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
 				j := p.i
-				for j < len(p.toks) && p.toks[j].Type == ANNOTATION && !p.isPreAnnotationAt(j) {
+				for j < len(p.toks) && p.toks[j].Type == ANNOTATION {
 					j++
 				}
 				if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
@@ -726,93 +670,83 @@ func (p *parser) expr(minBP int) (S, error) {
 			leftStartTok = tokIndexOfThis
 
 		case ANNOTATION:
-			pre := p.isPreAnnotationAt(p.i - 1)
 			txt := ""
 			if s, ok := t.Literal.(string); ok {
 				txt = s
 			}
 
-			if pre {
-				// forbid stacked PREs
-				if !p.atEnd() && p.peek().Type == ANNOTATION && p.isPreAnnotationAt(p.i) {
-					next := p.peek()
-					line, col := p.posAtByte(next.StartByte)
-					return nil, &Error{
-						Kind: DiagParse, Line: line, Col: col,
-						Msg: "multiple consecutive pre-annotations are not allowed; combine them",
-					}
-				}
-
-				// If EOF in normal mode: PRE wraps NOOP (degenerate case)
-				if p.atEnd() && !p.interactive {
-					child := p.mkLeaf("str", tokIndexOfThis, txt)
-					node := p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, p.mkLeaf("noop", -1))
-					left = node
-					leftStartTok = tokIndexOfThis
-					break
-				}
-				if p.atEnd() && p.interactive {
-					line, col := p.posAtByte(t.StartByte)
-					return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
-				}
-
-				// SPECIAL: PRE preceding a control form binds to the control's value.
-				nt := p.peek()
-				if nt.Type == RETURN || nt.Type == BREAK || nt.Type == CONTINUE {
-					p.i++ // consume control token
-					valueTokStart := p.i
-					var val S
-					if p.nextTokenIsOnSameLine(nt) {
-						if err := p.needExprAfter(nt, "expected value after control"); err != nil {
-							return nil, err
-						}
-						x, err := p.expr(0)
-						if err != nil {
-							return nil, err
-						}
-						if nx, _, err := p.absorbOneTrailingPostAnnot(x, valueTokStart); err != nil {
-							return nil, err
-						} else {
-							val = nx
-						}
-					} else {
-						val = p.mkLeaf("null", -1)
-					}
-					annChild := p.mkLeaf("str", tokIndexOfThis, txt)
-					ann := p.mk("annot", tokIndexOfThis, p.lastSpanEndTok, annChild, val)
-
-					tag := "return"
-					if nt.Type == BREAK {
-						tag = "break"
-					} else if nt.Type == CONTINUE {
-						tag = "continue"
-					}
-					left = p.mk(tag, tokIndexOfThis, p.lastSpanEndTok, ann)
-					leftStartTok = tokIndexOfThis
-					break
-				}
-
-				// General PRE wrap (non-control)
-				operand, err := p.expr(0)
-				if err != nil {
-					return nil, err
-				}
-				child := p.mkLeaf("str", tokIndexOfThis, txt) // PRE child
-				left = p.mk("annot", tokIndexOfThis, p.lastSpanEndTok, child, operand)
+			if p.atEnd() && p.interactive {
+				line, col := p.posAtByte(t.StartByte)
+				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
+			}
+			if p.atEnd() && !p.interactive {
+				child := p.mkLeaf("str", tokIndexOfThis, txt)
+				node := p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, p.mkLeaf("noop", -1))
+				left = node
 				leftStartTok = tokIndexOfThis
-
-				// Optionally absorb one immediate POST into this PRE (merge txt)
-				if nleft, _, err := p.absorbOneTrailingPostAnnot(left, tokIndexOfThis); err != nil {
-					return nil, err
-				} else {
-					left = nleft
-				}
-				return left, nil
+				break
 			}
 
-			// POST in prefix position is an error.
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "post-annotation has no preceding expression to attach", Line: line, Col: col}
+			operand, err := p.expr(0)
+			if err != nil {
+				return nil, err
+			}
+			endTok := p.lastSpanEndTok
+			if endTok < 0 {
+				endTok = tokIndexOfThis
+			}
+
+			// If operand is an assignment, fold onto the RHS value (unchanged)
+			if len(operand) >= 3 {
+				if tag, _ := operand[0].(string); tag == "assign" {
+					lhs, _ := operand[1].(S)
+					rhs, _ := operand[2].(S)
+
+					// PRE goes before any existing text on the RHS
+					if base, have, ok := unwrapAnnot(rhs); ok {
+						merged := joinNonEmpty(txt, have) // <--- PRE first
+						child := p.mkLeaf("str", -1, merged)
+						rhs = p.mk("annot", -1, -1, child, base)
+					} else {
+						child := p.mkLeaf("str", -1, txt)
+						rhs = p.mk("annot", -1, -1, child, rhs)
+					}
+
+					left = p.mk("assign", -1, -1, lhs, rhs)
+					leftStartTok = tokIndexOfThis
+					return left, nil
+				}
+			}
+
+			// If operand is a control form, PRE attaches to the control's VALUE
+			if len(operand) >= 2 {
+				if tag, _ := operand[0].(string); tag == "return" || tag == "break" || tag == "continue" {
+					val := operand[1].(S)
+					if base, have, ok := unwrapAnnot(val); ok {
+						merged := joinNonEmpty(txt, have)
+						child := p.mkLeaf("str", -1, merged)
+						val = p.mk("annot", -1, -1, child, base)
+					} else {
+						child := p.mkLeaf("str", -1, txt)
+						val = p.mk("annot", -1, -1, child, val)
+					}
+					left = p.mk(tag, tokIndexOfThis, endTok, val)
+					leftStartTok = tokIndexOfThis
+					return left, nil
+				}
+			}
+
+			// Normal (non-assignment) case: wrap operand; PRE first, then any existing text
+			if base, have, ok := unwrapAnnot(operand); ok {
+				merged := joinNonEmpty(txt, have) // <--- PRE first
+				child := p.mkLeaf("str", -1, merged)
+				left = p.mk("annot", -1, -1, child, base)
+			} else {
+				child := p.mkLeaf("str", -1, txt)
+				left = p.mk("annot", -1, -1, child, operand)
+			}
+			leftStartTok = tokIndexOfThis
+			return left, nil
 
 		default:
 			if t.Type == EOF && p.interactive {
@@ -858,18 +792,41 @@ func (p *parser) expr(minBP int) (S, error) {
 		if err := p.needExprAfter(op, "expected expression after operator"); err != nil {
 			return nil, err
 		}
-		right, err := p.expr(nextBP)
+		// === ASSIGN normalization with A+B+C+D merge ===
+		// A: PRE on LHS site → collected from 'left' by unwrapping.
+		// B: annotations immediately after '=' (any count) → collectAnnots.
+		// C: PRE on RHS value (unwrap from parsed node).
+		// D: trailing annotations after the RHS (and after a trailing comma in lists) → collectAnnots.
+		rightParsed, err := p.expr(nextBP)
 		if err != nil {
 			return nil, err
 		}
+
 		endTok := p.lastSpanEndTok
 		if op.Type == ASSIGN {
-			left = p.mk("assign", leftStartTok, endTok, left, right)
+			// A
+			cleanLeft, aTxt, _ := unwrapAnnot(left)
+			// B (after '=')
+			p.skipNoops()
+			bTxt := p.collectAnnots()
+			// C (unwrap from RHS)
+			baseRight, cTxt, _ := unwrapAnnot(rightParsed)
+			// D (after RHS and optional trailing comma in lists)
+			p.skipNoops()
+			dTxt := p.collectAnnots()
+			merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt)
+			normRight := p.attachAnnot(baseRight, merged)
+			left = p.mk("assign", leftStartTok, endTok, cleanLeft, normRight)
 		} else {
-			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, right)
+			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, rightParsed)
 		}
 	}
-
+	// Attach trailing *same-line* annotations (POST) only at the outermost level.
+	// This ensures `… * (8 # note)` doesn't consume `# note` inside the RHS,
+	// allowing the outer expression to wrap the whole `(4+5)*8`.
+	if minBP == 0 {
+		left = p.attachInlineTrailingAnnots(left)
+	}
 	return left, nil
 }
 
@@ -1010,7 +967,7 @@ func (p *parser) bracketed(
 }
 
 // parseCommaList parses items until isClose(peek.Type) is true.
-// It also performs standardized "trailing POST binding" (after element and after comma).
+// It attaches any adjacent annotations before/after each element (incl. after comma) to the element value.
 func (p *parser) parseCommaList(
 	isClose func(TokenType) bool,
 	parseElem func() (S, int, error),
@@ -1021,23 +978,21 @@ func (p *parser) parseCommaList(
 		if isClose(p.peek().Type) {
 			break
 		}
-		elem, startTok, err := parseElem()
+		elem, _, err := parseElem()
 		if err != nil {
 			return nil, err
 		}
-		// direct trailing POST
-		elem, err = p.afterExprMaybePost(elem, startTok)
-		if err != nil {
-			return nil, err
+		// attach trailing annotations to the element
+		if tail := p.collectAnnots(); tail != "" {
+			elem = p.attachAnnot(elem, tail)
 		}
 
 		p.skipNoops()
 		if p.match(COMMA) {
-			// POST after comma binds to the left element
+			// annotations after the comma also bind to the previous element
 			p.skipNoops()
-			elem, err = p.afterExprMaybePost(elem, startTok)
-			if err != nil {
-				return nil, err
+			if extra := p.collectAnnots(); extra != "" {
+				elem = p.attachAnnot(elem, extra)
 			}
 			out = append(out, elem)
 			// allow trailing comma
@@ -1063,12 +1018,11 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 		func(tt TokenType) bool { return tt == RSQUARE },
 		func() (S, int, error) {
 			p.skipNoops()
-			start := p.i
 			e, err := p.expr(0)
 			if err != nil {
 				return nil, 0, err
 			}
-			return e, start, nil
+			return e, 0, nil
 		},
 	)
 	if err != nil {
@@ -1098,82 +1052,85 @@ func (p *parser) findMatchingOpenSquare() int {
 // params parses (CLROUND ... RROUND) parameter pairs; POST can follow each param
 // directly or after the comma. Default type is Any.
 func (p *parser) params() (S, error) {
-	var openTok int
 	if _, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
 		return nil, perr
 	}
-	openTok = p.i - 1
+	openTok := p.i - 1
 
+	var elems []any
 	p.skipNoops()
 	if p.match(RROUND) {
 		return p.mk("array", openTok, p.i-1), nil
 	}
 
-	elems, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == RROUND },
-		func() (S, int, error) {
-			p.skipNoops()
-			var hadPre bool
-			var pre preAnn
-			if ann, ok, aerr := p.takeOnePreAnnotation(); aerr != nil {
-				return nil, 0, aerr
-			} else if ok {
-				hadPre, pre = true, ann
-			}
+	for {
+		p.skipNoops()
 
-			// Expect the parameter name as before
-			idTok, err := p.need(ID, "expected parameter name")
+		// Collect annotations before the parameter name (A)
+		aTxt := p.collectAnnots()
+
+		// Name
+		idTok, err := p.need(ID, "expected parameter name")
+		if err != nil {
+			return nil, err
+		}
+		idIdx := p.i - 1
+		nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
+
+		// Optional type after ':'
+		p.skipNoops()
+		var val S
+		if p.match(COLON) {
+			// B: annotations immediately after ':'
+			p.skipNoops()
+			bTxt := p.collectAnnots()
+			// Type expression
+			if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
+				return nil, err
+			}
+			p.skipNoops()
+			tExpr, err := p.expr(0)
 			if err != nil {
-				return nil, 0, err
+				return nil, err
 			}
-			idIdx := p.i - 1
-			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
-
-			// If there was a PRE, wrap the name with it (merges with any POST later)
-			if hadPre {
-				child := p.mkLeaf("str", pre.tokIdx, pre.txt)
-				nameLeaf = p.mk("annot", pre.tokIdx, idIdx, child, nameLeaf)
-			}
-
-			// Decide type presence first; emit exactly one node.
-			endTokForPair := idIdx
-			var typ S
-
+			// C: unwrap pre on type; D: after type (+ after comma)
+			baseT, cTxt, _ := unwrapAnnot(tExpr)
 			p.skipNoops()
-			if p.match(COLON) {
-				p.skipNoops()
-				{
-					nameStartTok := idIdx
-					if hadPre {
-						nameStartTok = pre.tokIdx
-					}
-					if nname, _, aerr := p.absorbOneTrailingPostAnnot(nameLeaf, nameStartTok); aerr != nil {
-						return nil, 0, aerr
-					} else {
-						nameLeaf = nname
-					}
-				}
+			dTxt := p.collectAnnots()
+			merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt)
+			val = p.attachAnnot(baseT, merged)
+		} else {
+			// No explicit type → implicit Any; merge A + D onto it
+			base := p.mkLeaf("id", -1, "Any")
+			p.skipNoops()
+			dTxt := p.collectAnnots()
+			val = p.attachAnnot(base, joinNonEmpty(aTxt, dTxt))
+		}
 
-				if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
-					return nil, 0, err
+		pair := p.mk("pair", idIdx, p.i-1, nameLeaf, val)
+		elems = append(elems, pair)
+
+		// optional trailing comma; any annotations just after it still bind to this param
+		p.skipNoops()
+		if p.match(COMMA) {
+			p.skipNoops()
+			if extra := p.collectAnnots(); extra != "" {
+				// Attach to the VALUE inside the last ("pair", name, value).
+				last := elems[len(elems)-1].(S) // ("pair", nameLeaf, val)
+				if len(last) >= 3 {
+					val := last[2].(S)
+					last[2] = p.attachAnnot(val, extra)
+					elems[len(elems)-1] = last
 				}
-				p.skipNoops()
-				e, err := p.expr(0)
-				if err != nil {
-					return nil, 0, err
-				}
-				typ = e
-				endTokForPair = p.lastSpanEndTok
-			} else {
-				typ = p.mkLeaf("id", -1, "Any") // emit only in the untyped case
 			}
-
-			pair := p.mk("pair", idIdx, endTokForPair, nameLeaf, typ)
-			return pair, idIdx, nil
-		},
-	)
-	if err != nil {
-		return nil, err
+			// allow trailing comma
+			p.skipNoops()
+			if p.peek().Type == RROUND {
+				break
+			}
+			continue
+		}
+		break
 	}
 
 	p.skipNoops()
@@ -1201,12 +1158,11 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 	}
 	parseVal := func() (S, int, error) {
 		p.skipNoops()
-		start := p.i
 		v, err := p.expr(0)
 		if err != nil {
 			return nil, 0, err
 		}
-		return v, start, nil
+		return v, 0, nil
 	}
 
 	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
@@ -1220,8 +1176,7 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 	return p.mk("map", openTok, p.i-1, pairs...), nil
 }
 
-// parseKVPairs reuses standardized trailing-POST logic on key (after ':')
-// and value (after value and after comma).
+// parseKVPairs collects annotations at A (key), B (after ':'), C (value's own), D (after value/comma) and merges onto the value.
 func (p *parser) parseKVPairs(
 	isClose func(TokenType) bool,
 	readKey func() (key S, keyStartTok int, required bool, err error),
@@ -1235,56 +1190,53 @@ func (p *parser) parseKVPairs(
 		}
 		pairStartTok := p.i
 
-		k, keyStartTok, required, err := readKey()
+		k, _, required, err := readKey()
 		if err != nil {
 			return nil, err
 		}
+		// A: unwrap & collect key PRE
+		baseKey, aTxt, _ := unwrapAnnot(k)
+		k = baseKey
 		p.skipNoops()
 		if _, err := p.need(COLON, "expected ':' after key"); err != nil {
 			return nil, err
 		}
 
-		// POST belonging to key (right after ':')
+		// B: annotations after ':' belong to value
 		p.skipNoops()
-		if nk, _, err := p.absorbOneTrailingPostAnnot(k, keyStartTok); err != nil {
-			return nil, err
-		} else {
-			k = nk
-		}
+		keyPostTxt := p.collectAnnots()
 
-		// value
+		// value expresion
 		p.skipNoops()
-		v, vStartTok, err := parseValue()
+		v, _, err := parseValue()
 		if err != nil {
 			return nil, err
 		}
-		// direct value POST
+		// C: unwrap value PRE
+		baseVal, cTxt, _ := unwrapAnnot(v)
+
+		// D: after value (+ after comma)
 		p.skipNoops()
-		if nv, _, err := p.absorbOneTrailingPostAnnot(v, vStartTok); err != nil {
-			return nil, err
-		} else {
-			v = nv
-		}
+		dTxt := p.collectAnnots()
 
 		// optional trailing comma (+ POST-after-comma binds to value)
 		p.skipNoops()
 		hadComma := p.match(COMMA)
 		if hadComma {
-			valStartTok := p.lastSpanStartTok
 			p.skipNoops()
-			if nv, _, err := p.absorbOneTrailingPostAnnot(v, valStartTok); err != nil {
-				return nil, err
-			} else {
-				v = nv
-			}
+			dTxt = joinNonEmpty(dTxt, p.collectAnnots())
 		}
+
+		// Merge A→B→C→D onto value
+		merged := joinNonEmpty(aTxt, keyPostTxt, cTxt, dTxt)
+		valNode := p.attachAnnot(baseVal, merged)
 
 		tag := "pair"
 		if required {
 			tag = "pair!"
 		}
-		endTok := p.lastSpanEndTok
-		pr := p.mk(tag, pairStartTok, endTok, k, v)
+		endTok := p.i - 1
+		pr := p.mk(tag, pairStartTok, endTok, k, valNode)
 		pairs = append(pairs, pr)
 
 		p.skipNoops()
@@ -1313,6 +1265,9 @@ func (p *parser) parseControl(t Token, startTok int) (S, error) {
 
 	// Newline after the control word → no value (Null).
 	if !p.nextTokenIsOnSameLine(t) {
+		// Do NOT consume annotations here; leave them for the next statement.
+		// Returning a bare null ensures `# pre` on the following line can wrap
+		// the next expression instead of being swallowed by this control.
 		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
 	}
 
@@ -1323,18 +1278,76 @@ func (p *parser) parseControl(t Token, startTok int) (S, error) {
 		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
 	}
 
-	// Parse value and absorb a single trailing POST annotation.
+	// Parse value and attach any adjacent annotations.
 	valStartTok := p.i
+	_ = valStartTok
 	x, err := p.expr(0)
 	if err != nil {
 		return nil, err
 	}
-	if nx, _, err := p.absorbOneTrailingPostAnnot(x, valStartTok); err != nil {
-		return nil, err
-	} else {
-		x = nx
+	// Attach any adjacent annotations to the control's value.
+	if tail := p.collectAnnots(); tail != "" {
+		x = p.attachAnnot(x, tail)
 	}
 	return p.mk(tag, startTok, p.lastSpanEndTok, x), nil
+}
+
+// ────────────────────── Minimal annotation normalization helpers ─────────────
+//
+// Goal: annotations always attach to the VALUE. We normalize at construction
+// sites (ASSIGN, pairs in maps/types/params). Presentation (pre vs post) is a
+// pretty-printer concern.
+
+// unwrapAnnot collects stacked ("annot", ("str", s), base) wrappers:
+// - merges stacked texts with '\n' (no POST marker semantics);
+// - returns (base, mergedText, hadAnnot).
+func unwrapAnnot(n S) (S, string, bool) {
+	var parts []string
+	cur := n
+	for len(cur) >= 3 {
+		tag, _ := cur[0].(string)
+		if tag != "annot" {
+			break
+		}
+		if child, ok := cur[1].(S); ok && len(child) >= 2 && child[0] == "str" {
+			if s, _ := child[1].(string); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		base, _ := cur[2].(S)
+		cur = base
+	}
+	if len(parts) == 0 {
+		return n, "", false
+	}
+	merged := parts[0]
+	for i := 1; i < len(parts); i++ {
+		if parts[i] != "" {
+			if merged == "" {
+				merged = parts[i]
+			}
+			if merged != "" && parts[i] != "" {
+				merged += "\n" + parts[i]
+			}
+		}
+	}
+	return cur, merged, true
+}
+
+func unwrapAnnots(n S) S {
+	cur := n
+	for len(cur) > 0 {
+		tag, _ := cur[0].(string)
+		if tag != "annot" {
+			break
+		}
+		inner, ok := cur[2].(S)
+		if !ok {
+			break
+		}
+		cur = inner
+	}
+	return cur
 }
 
 func (p *parser) ifExpr() (S, error) {
@@ -1482,8 +1495,10 @@ type preAnn struct {
 	tokIdx int
 }
 
+// takeOnePreAnnotation: in the simplified model, any ANNOTATION immediately
+// before a pattern is considered PRE and consumed. Allows stacking.
 func (p *parser) takeOnePreAnnotation() (preAnn, bool, error) {
-	if p.atEnd() || p.peek().Type != ANNOTATION || !p.isPreAnnotationAt(p.i) {
+	if p.atEnd() || p.peek().Type != ANNOTATION {
 		return preAnn{}, false, nil
 	}
 	tok := p.peek()
@@ -1499,17 +1514,14 @@ func (p *parser) declPattern() (S, error) {
 	if ann, ok, err := p.takeOnePreAnnotation(); err != nil {
 		return nil, err
 	} else if ok {
-		// Allow at most one POST to merge immediately after the pattern.
+		// Collect and merge any annotations adjacent to the completed pattern.
 		child := p.mkLeaf("str", ann.tokIdx, ann.txt) // PRE child ("str", pre)
 		sub, err := p.declPattern()
 		if err != nil {
 			return nil, err
 		}
-		// Direct trailing POST for the same pattern
-		if nsub, _, err := p.absorbOneTrailingPostAnnot(sub, p.lastSpanStartTok); err != nil {
-			return nil, err
-		} else {
-			sub = nsub
+		if tail := p.collectAnnots(); tail != "" {
+			sub = p.attachAnnot(sub, tail)
 		}
 		node := p.mk("annot", ann.tokIdx, p.lastSpanEndTok, child, sub)
 		return node, nil
@@ -1545,12 +1557,11 @@ func (p *parser) arrayDeclPattern() (S, error) {
 		func(tt TokenType) bool { return tt == RSQUARE },
 		func() (S, int, error) {
 			p.skipNoops()
-			start := p.i
 			pt, err := p.declPattern()
 			if err != nil {
 				return nil, 0, err
 			}
-			return pt, start, nil
+			return pt, 0, nil
 		},
 	)
 	if err != nil {
@@ -1580,12 +1591,11 @@ func (p *parser) objectDeclPattern() (S, error) {
 	}
 	parseVal := func() (S, int, error) {
 		p.skipNoops()
-		ptStart := p.i
 		pt, err := p.declPattern()
 		if err != nil {
 			return nil, 0, err
 		}
-		return pt, ptStart, nil
+		return pt, 0, nil
 	}
 
 	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
@@ -1705,20 +1715,4 @@ func assignable(n S) bool {
 	default:
 		return false
 	}
-}
-
-func unwrapAnnots(n S) S {
-	cur := n
-	for len(cur) > 0 {
-		tag, _ := cur[0].(string)
-		if tag != "annot" {
-			break
-		}
-		inner, ok := cur[2].(S)
-		if !ok {
-			break
-		}
-		cur = inner
-	}
-	return cur
 }

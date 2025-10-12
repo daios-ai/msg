@@ -379,13 +379,22 @@ func (p *parser) attachInlineTrailingAnnots(e S) S {
 	if endTok >= len(p.toks) {
 		return e
 	}
-	endLine, _ := p.posAtByte(p.toks[endTok].EndByte)
-
+	// Never POST onto a NOOP (blank-line statement).
+	if p.toks[endTok].Type == NOOP {
+		return e
+	}
 	var parts []string
-	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == endLine {
-		if s, ok := p.peek().Literal.(string); ok && s != "" {
-			parts = append(parts, s)
+	for !p.atEnd() && p.peek().Type == ANNOTATION {
+		// Only single-line annotations may be POST.
+		s, ok := p.peek().Literal.(string)
+		if !ok || s == "" || strings.Contains(s, "\n") {
+			break
 		}
+		// Must be truly same line: no newline between previous node end and annot start.
+		if strings.Contains(p.src[p.toks[endTok].EndByte:p.peek().StartByte], "\n") {
+			break
+		}
+		parts = append(parts, s)
 		p.i++ // consume ANNOTATION
 	}
 	if len(parts) == 0 {
@@ -673,6 +682,18 @@ func (p *parser) expr(minBP int) (S, error) {
 			txt := ""
 			if s, ok := t.Literal.(string); ok {
 				txt = s
+			}
+
+			// Trailing EOF comment: ANNOT NOOP EOF → synthesize annot(noop)
+			// without consuming the real NOOP statement.
+			if p.i < len(p.toks) && p.toks[p.i].Type == NOOP {
+				if p.i+1 < len(p.toks) && p.toks[p.i+1].Type == EOF {
+					child := p.mkLeaf("str", tokIndexOfThis, txt)
+					synNoop := p.mkLeaf("noop", -1) // synthetic placeholder
+					left := p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, synNoop)
+					leftStartTok = tokIndexOfThis
+					return left, nil
+				}
 			}
 
 			if p.atEnd() && p.interactive {

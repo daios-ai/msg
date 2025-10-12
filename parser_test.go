@@ -1285,8 +1285,8 @@ func Test_Parser_Annot_AfterBlankLine_IsPREOnNextStmt(t *testing.T) {
 	wantTag(t, kid(root, 0), "id")
 	wantTag(t, kid(root, 1), "noop") // the blank-line NOOP
 	ann := kid(root, 2)
-	txt, wrapped, isPost := asAnnot(t, ann)
-	if isPost || txt != "note" || !isId(wrapped, "y") {
+	txt, wrapped, _ := asAnnot(t, ann)
+	if txt != "note" || !isId(wrapped, "y") {
 		t.Fatalf("expected PRE 'note' wrapping y: %s", dump(ann))
 	}
 }

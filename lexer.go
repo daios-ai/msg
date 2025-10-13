@@ -750,6 +750,14 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 // scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
 // Terminates on blank line or a line that does not begin (after spaces) with '#'.
 func (l *Lexer) scanAnnotation() (string, error) {
+	// current '#' is line-start iff only hspace since previous '\n'
+	lineStart := true
+	for i := l.start - 1; i >= 0 && l.src[i] != '\n'; i-- {
+		if l.src[i] != ' ' && l.src[i] != '\t' && l.src[i] != '\r' {
+			lineStart = false
+			break
+		}
+	}
 	var bldr strings.Builder
 
 	// helper: check if the *next* line (after current '\n') starts with '#'
@@ -784,8 +792,9 @@ func (l *Lexer) scanAnnotation() (string, error) {
 		l.advance()
 	}
 
-	// If there is another annotation line, consume the '\n' now and continue.
-	if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
+	// Only coalesce with following '#'-lines when *this* '#' was line-start.
+	// (Inline '# ...' must not merge with the next line's '# ...')
+	if b, ok := l.peek(); ok && b == '\n' && lineStart && nextLineStartsWithHash() {
 		l.advance() // consume newline to move to start of the next line
 	} else {
 		// single-line block; leave the '\n' unconsumed

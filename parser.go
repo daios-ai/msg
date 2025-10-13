@@ -498,6 +498,47 @@ func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
 	return nil, false
 }
 
+// ---- tiny shared helpers for delimited lists ----
+
+// Consume gap tokens between elements/pairs.
+// - Merges ANNOTATIONs into pending PRE text.
+// - Emits NOOPs (and annot(NOOP) if PRE was pending) into out.
+// Returns true if it consumed something (caller should continue the loop).
+func (p *parser) takeGap(pending *string, out *[]any) bool {
+	switch p.peek().Type {
+	case ANNOTATION:
+		*pending = joinNonEmpty(*pending, p.collectAnnots())
+		return true
+	case NOOP:
+		if *pending != "" {
+			child := p.mkLeaf("str", -1, *pending)
+			*out = append(*out, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+			*pending = ""
+			p.i++ // consume the NOOP we wrapped
+			return true
+		}
+		*out = append(*out, p.mkLeaf("noop", p.i))
+		p.i++
+		return true
+	default:
+		return false
+	}
+}
+
+// Collect same-line annotations as a merged string (without attaching).
+// Useful for strict A→B→C→D ordering in maps; pass the reference line.
+func (p *parser) takeSameLineAnnots(line int) string {
+	txt := ""
+	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == line {
+		if t := p.collectAnnots(); t != "" {
+			txt = joinNonEmpty(txt, t)
+		} else {
+			break
+		}
+	}
+	return txt
+}
+
 // ───────────────────────────── prefix / postfix / infix ────────────────────
 
 func (p *parser) expr(minBP int) (S, error) {
@@ -992,44 +1033,63 @@ func (p *parser) bracketed(
 }
 
 // parseCommaList parses items until isClose(peek.Type) is true.
-// It attaches any adjacent annotations before/after each element (incl. after comma) to the element value.
+// Rules: NOOPs are elements; PRE attaches to next element unless a NOOP appears
+// (then PRE→annot(NOOP)); POST is same-line only (element end or comma);
+// dangling PRE before close → annot(NOOP).
 func (p *parser) parseCommaList(
 	isClose func(TokenType) bool,
 	parseElem func() (S, int, error),
 ) ([]any, error) {
 	var out []any
+	pending := ""
+
 	for {
-		p.skipNoops()
+		// Close (emit dangling PRE as annot(NOOP))
 		if isClose(p.peek().Type) {
+			if pending != "" {
+				child := p.mkLeaf("str", -1, pending)
+				out = append(out, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+				pending = ""
+			}
 			break
 		}
+
+		// Interstitial gap
+		if p.takeGap(&pending, &out) {
+			continue
+		}
+
+		// Element
 		elem, _, err := parseElem()
 		if err != nil {
 			return nil, err
 		}
-		// attach trailing annotations to the element
-		if tail := p.collectAnnots(); tail != "" {
-			elem = p.attachAnnot(elem, tail)
+
+		// POST right after element (same line only)
+		endTok := p.lastSpanEndTok
+		if endTok >= 0 {
+			if t := p.takeSameLineAnnots(p.toks[endTok].Line); t != "" {
+				elem = p.attachAnnot(elem, t)
+			}
 		}
 
-		p.skipNoops()
-		if p.match(COMMA) {
-			// annotations after the comma also bind to the previous element
-			p.skipNoops()
-			if extra := p.collectAnnots(); extra != "" {
-				elem = p.attachAnnot(elem, extra)
-			}
-			out = append(out, elem)
-			// allow trailing comma
-			p.skipNoops()
-			if isClose(p.peek().Type) {
-				break
-			}
-			continue
+		// Pending PRE (only if no NOOP before this element)
+		if pending != "" {
+			elem = p.attachAnnot(elem, pending)
+			pending = ""
 		}
-
 		out = append(out, elem)
-		break
+
+		// Optional comma; POST-after-comma binds back only if same line as comma
+		if !p.match(COMMA) {
+			break
+		}
+		comma := p.prev()
+		if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
+			last := out[len(out)-1].(S)
+			out[len(out)-1] = p.attachAnnot(last, txt)
+		}
+		// Next-line annotations (if any) will be handled as PRE via takeGap.
 	}
 	return out, nil
 }
@@ -1201,74 +1261,86 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 	return p.mk("map", openTok, p.i-1, pairs...), nil
 }
 
-// parseKVPairs collects annotations at A (key), B (after ':'), C (value's own), D (after value/comma) and merges onto the value.
+// parseKVPairs honors the same adjacency rules as parseCommaList.
+// Interstitial ANNOTATION/NOOP between pairs are emitted (PRE→next value unless broken by NOOP).
+// POST-after-value and POST-after-comma are same-line only.
+// Dangling PRE before '}' → annot(NOOP).
 func (p *parser) parseKVPairs(
 	isClose func(TokenType) bool,
 	readKey func() (key S, keyStartTok int, required bool, err error),
 	parseValue func() (val S, valStartTok int, err error),
 ) ([]any, error) {
 	var pairs []any
+	pending := ""
+
 	for {
-		p.skipNoops()
+		// Close (emit dangling PRE)
 		if isClose(p.peek().Type) {
+			if pending != "" {
+				child := p.mkLeaf("str", -1, pending)
+				pairs = append(pairs, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+				pending = ""
+			}
 			break
 		}
-		pairStartTok := p.i
 
-		k, _, required, err := readKey()
+		// Interstitial gap
+		if p.takeGap(&pending, &pairs) {
+			continue
+		}
+
+		// Key
+		startTok := p.i
+		k, _, req, err := readKey()
 		if err != nil {
 			return nil, err
 		}
-		// A: unwrap & collect key PRE
-		baseKey, aTxt, _ := unwrapAnnot(k)
+		baseKey, aTxt, _ := unwrapAnnot(k) // A
 		k = baseKey
-		p.skipNoops()
+
 		if _, err := p.need(COLON, "expected ':' after key"); err != nil {
 			return nil, err
 		}
 
-		// B: annotations after ':' belong to value
-		p.skipNoops()
-		keyPostTxt := p.collectAnnots()
+		// B (after ':', no NOOP skipping)
+		bTxt := p.collectAnnots()
 
-		// value expresion
-		p.skipNoops()
+		// Value
 		v, _, err := parseValue()
 		if err != nil {
 			return nil, err
 		}
-		// C: unwrap value PRE
-		baseVal, cTxt, _ := unwrapAnnot(v)
+		baseVal, cTxt, _ := unwrapAnnot(v) // C
 
-		// D: after value (+ after comma)
-		p.skipNoops()
-		dTxt := p.collectAnnots()
-
-		// optional trailing comma (+ POST-after-comma binds to value)
-		p.skipNoops()
-		hadComma := p.match(COMMA)
-		if hadComma {
-			p.skipNoops()
-			dTxt = joinNonEmpty(dTxt, p.collectAnnots())
+		// D = same-line POST after value (before optional comma)
+		dTxt := ""
+		if p.lastSpanEndTok >= 0 {
+			dTxt = p.takeSameLineAnnots(p.toks[p.lastSpanEndTok].Line)
 		}
 
-		// Merge A→B→C→D onto value
-		merged := joinNonEmpty(aTxt, keyPostTxt, cTxt, dTxt)
-		valNode := p.attachAnnot(baseVal, merged)
+		// Merge pending PRE + A + B + C + D
+		val := p.attachAnnot(baseVal, joinNonEmpty(pending, aTxt, bTxt, cTxt, dTxt))
+		pending = ""
 
 		tag := "pair"
-		if required {
+		if req {
 			tag = "pair!"
 		}
-		endTok := p.i - 1
-		pr := p.mk(tag, pairStartTok, endTok, k, valNode)
+		pr := p.mk(tag, startTok, p.i-1, k, val)
 		pairs = append(pairs, pr)
 
-		p.skipNoops()
-		if hadComma {
-			if isClose(p.peek().Type) {
-				break
+		// Optional comma; POST-after-comma same-line only, attaches back to this pair's value
+		if p.match(COMMA) {
+			comma := p.prev()
+			if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
+				last := pairs[len(pairs)-1].(S)
+				if len(last) >= 3 {
+					v := last[2].(S)
+					last[2] = p.attachAnnot(v, txt)
+					pairs[len(pairs)-1] = last
+				}
 			}
+			// Next-line annotations become PRE via the next loop (takeGap).
 			continue
 		}
 		break

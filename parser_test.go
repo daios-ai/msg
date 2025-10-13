@@ -519,15 +519,6 @@ end
 	wantTag(t, kid(blk, 1), "noop")
 }
 
-func Test_Parser_NOOP_Inside_CallArgs_Ignored(t *testing.T) {
-	root := mustParse(t, "f(\n\n  1,\n  \n  2\n)")
-	call := first(root)
-	wantTag(t, call, "call")
-	if len(call) != 1+1+2 {
-		t.Fatalf("want 2 args, got %d", len(call)-2)
-	}
-}
-
 func Test_Parser_NOOP_Inside_Params_Ignored(t *testing.T) {
 	root := mustParse(t, "fun(\n\n  x: Int,\n  \n  y: Str\n) do end")
 	fn := first(root)
@@ -1774,72 +1765,6 @@ func Test_Parser_Array_Annot_Pre_NextElem_NextLine(t *testing.T) {
 	}
 }
 
-func Test_Parser_Array_Annot_Pre_AllowsBlankLines_BeforeComment(t *testing.T) {
-	root := mustParse(t, "[\n  1,\n\n  # note\n  2\n]")
-	arr := first(root)
-	e1 := kid(arr, 1)
-	txt, wrapped := asAnnot(t, e1)
-	if txt != "note" || head(wrapped) != "int" || wrapped[1].(int64) != 2 {
-		t.Fatalf("want PRE 'note' on second elem across blank line before: %s", dump(e1))
-	}
-}
-
-// ─────────────────────── Updated (stale) array tests ───────────────────────
-
-func Test_Parser_Array_Annot_Pre_AllowsBlankLines(t *testing.T) {
-	// Blank line (NOOP) BETWEEN the annotation and the next element breaks adjacency.
-	// The note must NOT attach to 2.
-	root := mustParse(t, "[\n  1,\n  # note\n\n  2\n]")
-	arr := first(root)
-	wantTag(t, arr, "array")
-
-	if len(arr) != 1+2 {
-		t.Fatalf("want 2 elems, got %d\n%s", len(arr)-1, dump(arr))
-	}
-
-	// First element remains an int
-	e0 := kid(arr, 0)
-	wantTag(t, e0, "int")
-	if e0[1].(int64) != 1 {
-		t.Fatalf("elem 0 mismatch: %s", dump(e0))
-	}
-
-	// Second element should be a plain int (annotation not attached due to intervening NOOP)
-	e1 := kid(arr, 1)
-	wantTag(t, e1, "int")
-	if e1[1].(int64) != 2 {
-		t.Fatalf("elem 1 mismatch: %s", dump(e1))
-	}
-}
-
-func Test_Parser_Array_Annot_Dangling_Pre_BeforeClose_SynthNoop(t *testing.T) {
-	// Annotation at the end (right before ']') must synthesize a NOOP to attach to,
-	// rather than erroring.
-	root := mustParse(t, "[\n  1\n\n  # note\n]")
-	arr := first(root)
-	wantTag(t, arr, "array")
-
-	// We expect two items: 1 and annot("note", noop).
-	if len(arr) != 1+2 {
-		t.Fatalf("want 2 elems, got %d\n%s", len(arr)-1, dump(arr))
-	}
-
-	// First item
-	e0 := kid(arr, 0)
-	wantTag(t, e0, "int")
-	if e0[1].(int64) != 1 {
-		t.Fatalf("elem 0 mismatch: %s", dump(e0))
-	}
-
-	// Second item: annotation wrapping NOOP
-	e1 := kid(arr, 1)
-	txt, wrapped := asAnnot(t, e1)
-	if txt != "note" {
-		t.Fatalf("dangling PRE text mismatch: %q", txt)
-	}
-	wantTag(t, wrapped, "noop")
-}
-
 // ───────────────────────── Tiny, orthogonal map tests ──────────────────────
 
 func Test_Parser_Map_Annot_Pre_NextPair_NextLine(t *testing.T) {
@@ -1876,31 +1801,232 @@ func Test_Parser_Map_Annot_Pre_NextPair_NextLine(t *testing.T) {
 	}
 }
 
+func Test_Parser_NOOP_Inside_CallArgs_Ignored(t *testing.T) {
+	root := mustParse(t, "f(\n\n  1,\n  \n  2\n)")
+	call := first(root)
+	wantTag(t, call, "call")
+	// ("call", id "f", NOOP, 1, NOOP, 2)
+	if len(call) != 6 {
+		t.Fatalf("want callee + 4 arg nodes (incl NOOPs), got %d", len(call)-1)
+	}
+	if !isId(kid(call, 0), "f") {
+		t.Fatalf("callee not f")
+	}
+	wantTag(t, kid(call, 1), "noop")
+	if head(kid(call, 2)) != "int" || kid(call, 2)[1].(int64) != 1 {
+		t.Fatalf("arg1 mismatch")
+	}
+	wantTag(t, kid(call, 3), "noop")
+	if head(kid(call, 4)) != "int" || kid(call, 4)[1].(int64) != 2 {
+		t.Fatalf("arg2 mismatch")
+	}
+}
+
+func Test_Parser_Array_Annot_Pre_AllowsBlankLines_BeforeComment(t *testing.T) {
+	root := mustParse(t, "[\n  1,\n\n  # note\n  2\n]")
+	arr := first(root)
+	wantTag(t, arr, "array")
+	// Expect: 1, NOOP, annot("note", 2)
+	if len(arr) != 1+3 {
+		t.Fatalf("want 3 elems, got %d\n%s", len(arr)-1, dump(arr))
+	}
+	wantTag(t, kid(arr, 0), "int")
+	wantTag(t, kid(arr, 1), "noop") // <— updated
+	txt, wrapped := asAnnot(t, kid(arr, 2))
+	if txt != "note" || head(wrapped) != "int" || wrapped[1].(int64) != 2 {
+		t.Fatalf("want PRE 'note' on 2, got %s", dump(kid(arr, 2)))
+	}
+}
+
+func Test_Parser_Array_Annot_Pre_AllowsBlankLines(t *testing.T) {
+	root := mustParse(t, "[\n  1,\n  # note\n\n  2\n]")
+	arr := first(root)
+	wantTag(t, arr, "array")
+	// Expect: 1, annot("note", NOOP), 2
+	if len(arr) != 1+3 {
+		t.Fatalf("want 3 elems, got %d\n%s", len(arr)-1, dump(arr))
+	}
+	wantTag(t, kid(arr, 0), "int")
+	txt, wrapped := asAnnot(t, kid(arr, 1))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(arr, 1)))
+	}
+	wantTag(t, kid(arr, 2), "int")
+}
+
+func Test_Parser_Array_Annot_Dangling_Pre_BeforeClose_SynthNoop(t *testing.T) {
+	root := mustParse(t, "[\n  1\n\n  # note\n]")
+	arr := first(root)
+	wantTag(t, arr, "array")
+	// Expect: 1, NOOP, annot("note", NOOP)
+	if len(arr) != 1+3 {
+		t.Fatalf("want 3 elems, got %d\n%s", len(arr)-1, dump(arr))
+	}
+	wantTag(t, kid(arr, 0), "int")
+	wantTag(t, kid(arr, 1), "noop")
+	txt, wrapped := asAnnot(t, kid(arr, 2))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(arr, 2)))
+	}
+}
+
 func Test_Parser_Map_Annot_Pre_BrokenByBlankLine(t *testing.T) {
-	// Blank line (NOOP) between the annotation and the next pair breaks adjacency.
 	src := "{\n  a: 1,\n  # note\n\n  b: 2\n}"
 	root := mustParse(t, src)
 	obj := first(root)
 	wantTag(t, obj, "map")
-	if len(obj) != 1+2 {
-		t.Fatalf("want 2 pairs, got %d\n%s", len(obj)-1, dump(obj))
+	// Expect: pair(a:1), annot(note, noop), pair(b:2)
+	if len(obj) != 1+3 {
+		t.Fatalf("want 3 entries, got %d\n%s", len(obj)-1, dump(obj))
 	}
-
-	// First pair remains value 1
 	p0 := kid(obj, 0)
 	wantTag(t, p0, "pair")
-	v0 := p0[2].(S)
-	wantTag(t, v0, "int")
-	if v0[1].(int64) != 1 {
-		t.Fatalf("pair 0 value mismatch: %s", dump(v0))
+	if kid(p0, 0)[1].(string) != "a" || head(p0[2].(S)) != "int" {
+		t.Fatalf("pair a mismatch")
 	}
 
-	// Second pair's value should be a plain int (annotation did NOT attach)
-	p1 := kid(obj, 1)
-	wantTag(t, p1, "pair")
-	v1 := p1[2].(S)
-	wantTag(t, v1, "int")
-	if v1[1].(int64) != 2 {
-		t.Fatalf("pair 1 value mismatch: %s", dump(v1))
+	ann := kid(obj, 1)
+	txt, wrapped := asAnnot(t, ann)
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(ann))
 	}
+
+	p1 := kid(obj, 2)
+	wantTag(t, p1, "pair")
+	if kid(p1, 0)[1].(string) != "b" || head(p1[2].(S)) != "int" {
+		t.Fatalf("pair b mismatch")
+	}
+}
+
+func Test_Parser_Function_Params_NOOPs_And_Annotations(t *testing.T) {
+	src := `fun(
+
+  x: Int, # fast
+
+  # important
+  y: Str
+) do end`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	// params: NOOP, pair(x, annot("fast", Int)), NOOP, pair(y, annot("important", Str))
+	wantTag(t, kid(params, 0), "noop")
+
+	p0 := kid(params, 1)
+	wantTag(t, p0, "pair")
+	typ0 := p0[2].(S)
+	txt0, w0 := asAnnot(t, typ0)
+	if txt0 != "fast" || head(w0) != "id" || w0[1].(string) != "Int" {
+		t.Fatalf("param x type annot mismatch: %s", dump(typ0))
+	}
+
+	wantTag(t, kid(params, 2), "noop")
+
+	p1 := kid(params, 3)
+	wantTag(t, p1, "pair")
+	typ1 := p1[2].(S)
+	txt1, w1 := asAnnot(t, typ1)
+	if txt1 != "important" || head(w1) != "id" || w1[1].(string) != "Str" {
+		t.Fatalf("param y type annot mismatch: %s", dump(typ1))
+	}
+}
+
+func Test_Parser_Function_Params_Trailing_Dangling_PRE_SynthNoop(t *testing.T) {
+	src := `fun(
+  x: Int,
+  # about to end
+) do end`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	// Last element is annot("about to end", noop)
+	last := kid(params, len(params)-2) // params is ("array", ...); last elem at len-2
+	txt, wrapped := asAnnot(t, last)
+	if txt != "about to end" || head(wrapped) != "noop" {
+		t.Fatalf("dangling PRE did not synthesize NOOP: %s", dump(last))
+	}
+}
+
+func Test_Parser_Oracle_Sources_Annotations(t *testing.T) {
+	src := `oracle(a: Int, b: Str) -> Bool from[
+  "web", # primary
+  # fallback
+  "docs"
+]`
+	root := mustParse(t, src)
+	orc := first(root)
+	wantTag(t, orc, "oracle")
+
+	srcs := kid(orc, 2)
+	wantTag(t, srcs, "array")
+	if len(srcs) != 1+2 {
+		t.Fatalf("want 2 sources, got %d", len(srcs)-1)
+	}
+
+	// "web" has POST annot on same line
+	s0 := kid(srcs, 0)
+	txt0, w0 := asAnnot(t, s0)
+	if txt0 != "primary" || head(w0) != "str" || w0[1].(string) != "web" {
+		t.Fatalf("source 0 mismatch: %s", dump(s0))
+	}
+
+	// "docs" has PRE annot on the previous line
+	s1 := kid(srcs, 1)
+	txt1, w1 := asAnnot(t, s1)
+	if txt1 != "fallback" || head(w1) != "str" || w1[1].(string) != "docs" {
+		t.Fatalf("source 1 mismatch: %s", dump(s1))
+	}
+}
+
+func Test_Parser_Function_ReturnType_PRE_Annot(t *testing.T) {
+	src := `fun() ->
+  # note about return
+  Str
+do end`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	ret := kid(fn, 1)
+	txt, wrapped := asAnnot(t, ret)
+	if txt != "note about return" || head(wrapped) != "id" || wrapped[1].(string) != "Str" {
+		t.Fatalf("return type PRE annot mismatch: %s", dump(ret))
+	}
+}
+
+func Test_Parser_Params_Annot_AfterBlankLine_WrapsNOOP(t *testing.T) {
+	src := `fun(
+  x: Int,
+
+  # note
+
+  y: Str
+) do end`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+
+	// Expect: pair(x, Int), annot("note", noop), pair(y, Str)
+	if len(params) != 1+3 {
+		t.Fatalf("want 3 param entries, got %d\n%s", len(params)-1, dump(params))
+	}
+
+	p0 := kid(params, 0)
+	wantTag(t, p0, "pair")
+
+	mid := kid(params, 1)
+	txt, w := asAnnot(t, mid)
+	if txt != "note" || head(w) != "noop" {
+		t.Fatalf("mid param entry should be annot(note, noop): %s", dump(mid))
+	}
+
+	p1 := kid(params, 2)
+	wantTag(t, p1, "pair")
 }

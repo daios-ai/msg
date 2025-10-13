@@ -1505,13 +1505,22 @@ func (p *parser) attachInlineTrailingAnnots(e S) S {
 	if endTok >= len(p.toks) {
 		return e
 	}
-	endLine, _ := p.posAtByte(p.toks[endTok].EndByte)
-
+	// Never POST onto a NOOP (blank-line statement).
+	if p.toks[endTok].Type == NOOP {
+		return e
+	}
 	var parts []string
-	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == endLine {
-		if s, ok := p.peek().Literal.(string); ok && s != "" {
-			parts = append(parts, s)
+	for !p.atEnd() && p.peek().Type == ANNOTATION {
+		// Only single-line annotations may be POST.
+		s, ok := p.peek().Literal.(string)
+		if !ok || s == "" || strings.Contains(s, "\n") {
+			break
 		}
+		// Must be truly same line: no newline between previous node end and annot start.
+		if strings.Contains(p.src[p.toks[endTok].EndByte:p.peek().StartByte], "\n") {
+			break
+		}
+		parts = append(parts, s)
 		p.i++ // consume ANNOTATION
 	}
 	if len(parts) == 0 {
@@ -1801,6 +1810,24 @@ func (p *parser) expr(minBP int) (S, error) {
 				txt = s
 			}
 
+			// Standalone comment: after skipping NOOPs, if the next token cannot start a value,
+			// synthesize annot(noop) without consuming any real NOOPs.
+			{
+				j := p.i
+				for j < len(p.toks) && p.toks[j].Type == NOOP {
+					j++
+				}
+				next := EOF
+				if j < len(p.toks) {
+					next = p.toks[j].Type
+				}
+				switch next {
+				case EOF, END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
+					child := p.mkLeaf("str", tokIndexOfThis, txt)
+					return p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, p.mkLeaf("noop", -1)), nil
+				}
+			}
+
 			if p.atEnd() && p.interactive {
 				line, col := p.posAtByte(t.StartByte)
 				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
@@ -1932,13 +1959,11 @@ func (p *parser) expr(minBP int) (S, error) {
 		if op.Type == ASSIGN {
 			// A
 			cleanLeft, aTxt, _ := unwrapAnnot(left)
-			// B (after '=')
-			p.skipNoops()
+			// B (after '=') — do NOT skip NOOPs; blank line breaks adjacency
 			bTxt := p.collectAnnots()
 			// C (unwrap from RHS)
 			baseRight, cTxt, _ := unwrapAnnot(rightParsed)
-			// D (after RHS and optional trailing comma in lists)
-			p.skipNoops()
+			// D (after RHS and optional trailing comma in lists) — do NOT skip NOOPs
 			dTxt := p.collectAnnots()
 			merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt)
 			normRight := p.attachAnnot(baseRight, merged)

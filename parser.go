@@ -684,15 +684,21 @@ func (p *parser) expr(minBP int) (S, error) {
 				txt = s
 			}
 
-			// Trailing EOF comment: ANNOT NOOP EOF → synthesize annot(noop)
-			// without consuming the real NOOP statement.
-			if p.i < len(p.toks) && p.toks[p.i].Type == NOOP {
-				if p.i+1 < len(p.toks) && p.toks[p.i+1].Type == EOF {
+			// Standalone comment: after skipping NOOPs, if the next token cannot start a value,
+			// synthesize annot(noop) without consuming any real NOOPs.
+			{
+				j := p.i
+				for j < len(p.toks) && p.toks[j].Type == NOOP {
+					j++
+				}
+				next := EOF
+				if j < len(p.toks) {
+					next = p.toks[j].Type
+				}
+				switch next {
+				case EOF, END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
 					child := p.mkLeaf("str", tokIndexOfThis, txt)
-					synNoop := p.mkLeaf("noop", -1) // synthetic placeholder
-					left := p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, synNoop)
-					leftStartTok = tokIndexOfThis
-					return left, nil
+					return p.mk("annot", tokIndexOfThis, tokIndexOfThis, child, p.mkLeaf("noop", -1)), nil
 				}
 			}
 
@@ -827,13 +833,11 @@ func (p *parser) expr(minBP int) (S, error) {
 		if op.Type == ASSIGN {
 			// A
 			cleanLeft, aTxt, _ := unwrapAnnot(left)
-			// B (after '=')
-			p.skipNoops()
+			// B (after '=') — do NOT skip NOOPs; blank line breaks adjacency
 			bTxt := p.collectAnnots()
 			// C (unwrap from RHS)
 			baseRight, cTxt, _ := unwrapAnnot(rightParsed)
-			// D (after RHS and optional trailing comma in lists)
-			p.skipNoops()
+			// D (after RHS and optional trailing comma in lists) — do NOT skip NOOPs
 			dTxt := p.collectAnnots()
 			merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt)
 			normRight := p.attachAnnot(baseRight, merged)

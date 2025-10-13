@@ -111,18 +111,13 @@ func isStr(n S, s string) bool {
 	return head(n) == "str" && n[1].(string) == s
 }
 
-func asAnnot(t *testing.T, n S) (txt string, wrapped S, isPost bool) {
+func asAnnot(t *testing.T, n S) (txt string, wrapped S) {
 	t.Helper()
 	wantTag(t, n, "annot")
 	txtNode := kid(n, 0)
 	wantTag(t, txtNode, "str")
 	raw := txtNode[1].(string)
-	isPost = strings.HasPrefix(raw, "<")
-	if isPost {
-		txt = strings.TrimPrefix(raw, "<")
-	} else {
-		txt = raw
-	}
+	txt = raw
 	wrapped = kid(n, 1)
 	return
 }
@@ -510,11 +505,11 @@ end
 		t.Fatalf("want 2 top-level children, got %d\n%s", len(root)-1, dump(root))
 	}
 	annNoop := kid(root, 0)
-	_, wrapped, _ := asAnnot(t, annNoop)
+	_, wrapped := asAnnot(t, annNoop)
 	wantTag(t, wrapped, "noop")
 
 	annBlock := kid(root, 1)
-	_, wrapped2, _ := asAnnot(t, annBlock)
+	_, wrapped2 := asAnnot(t, annBlock)
 	wantTag(t, wrapped2, "block")
 
 	blk := wrapped2
@@ -854,8 +849,8 @@ func Test_Parser_Module_Interactive_Incomplete_NoNameOrDoOrEnd(t *testing.T) {
 func Test_Parser_Annot_PRE_WrapsNextExpr(t *testing.T) {
 	root := mustParse(t, "# hello\nx")
 	ann := first(root)
-	txt, wrapped, isPost := asAnnot(t, ann)
-	if txt != "hello" || isPost {
+	txt, wrapped := asAnnot(t, ann)
+	if txt != "hello" {
 		t.Fatalf("want PRE 'hello'")
 	}
 	wantTag(t, wrapped, "id")
@@ -864,7 +859,7 @@ func Test_Parser_Annot_PRE_WrapsNextExpr(t *testing.T) {
 func Test_Parser_Annot_POST_WrapsPreviousExpr_TopLevel(t *testing.T) {
 	root := mustParse(t, `(4+5)*8 # This`)
 	ann := first(root)
-	txt, wrapped, _ := asAnnot(t, ann)
+	txt, wrapped := asAnnot(t, ann)
 	if txt != "This" {
 		t.Fatalf("want POST 'This'")
 	}
@@ -877,7 +872,7 @@ func Test_Parser_Annot_POST_WrapsPreviousExpr_TopLevel(t *testing.T) {
 func Test_Parser_Annot_POST_AttachesToWholeCallChain(t *testing.T) {
 	root := mustParse(t, `obj.name(1)[i] # post `)
 	ann := first(root)
-	txt, wrapped, _ := asAnnot(t, ann)
+	txt, wrapped := asAnnot(t, ann)
 	if !strings.HasPrefix(txt, "post") {
 		t.Fatalf("want POST 'post'")
 	}
@@ -888,8 +883,8 @@ func Test_Parser_Annot_PRE_On_RHS_Map(t *testing.T) {
 	root := mustParse(t, "let obj = \n# 4. pre map\n{ a: 1 }")
 	asn := first(root)
 	val := kid(asn, 1)
-	txt, wrapped, isPost := asAnnot(t, val)
-	if isPost || txt != "4. pre map" {
+	txt, wrapped := asAnnot(t, val)
+	if txt != "4. pre map" {
 		t.Fatalf("want PRE '4. pre map'")
 	}
 	wantTag(t, wrapped, "map")
@@ -900,8 +895,8 @@ func Test_Parser_Annot_Control_PRE_BeforeReturn_BindsToValue(t *testing.T) {
 	ret := first(root)
 	wantTag(t, ret, "return")
 	valAnn := ret[1].(S)
-	txt, wrapped, isPost := asAnnot(t, valAnn)
-	if isPost || txt != "this" || head(wrapped) != "int" {
+	txt, wrapped := asAnnot(t, valAnn)
+	if txt != "this" || head(wrapped) != "int" {
 		t.Fatalf("bad PRE on return value")
 	}
 }
@@ -910,8 +905,8 @@ func Test_Parser_Annot_Control_PRE_InlineValue_BindsToValue(t *testing.T) {
 	root := mustParse(t, "return # this\n0")
 	ret := first(root)
 	valAnn := ret[1].(S)
-	txt, wrapped, isPost := asAnnot(t, valAnn)
-	if isPost || txt != "this" || head(wrapped) != "int" {
+	txt, wrapped := asAnnot(t, valAnn)
+	if txt != "this" || head(wrapped) != "int" {
 		t.Fatalf("bad PRE on return inline value")
 	}
 }
@@ -1217,7 +1212,7 @@ func Test_Parser_Oracle_From_NoSpace_OK(t *testing.T) {
 func Test_Parser_Annot_PRE_POST_Merge_ToSinglePRE(t *testing.T) {
 	root := mustParse(t, "# pre\nx # post")
 	ann := first(root)
-	txt, wrapped, _ := asAnnot(t, ann)
+	txt, wrapped := asAnnot(t, ann)
 	if txt != "pre\npost" {
 		t.Fatalf("merge text mismatch: %q", txt)
 	}
@@ -1232,7 +1227,7 @@ func Test_Parser_Annot_AfterBlankLine_WrapsNOOP(t *testing.T) {
 	wantTag(t, kid(root, 0), "id")   // x
 	wantTag(t, kid(root, 1), "noop") // the blank line run
 	ann := kid(root, 2)
-	txt, wrapped, _ := asAnnot(t, ann)
+	txt, wrapped := asAnnot(t, ann)
 	if txt != "post" {
 		t.Fatalf("expected PRE 'post', got: %s", dump(ann))
 	}
@@ -1285,7 +1280,7 @@ func Test_Parser_Annot_AfterBlankLine_IsPREOnNextStmt(t *testing.T) {
 	wantTag(t, kid(root, 0), "id")
 	wantTag(t, kid(root, 1), "noop") // the blank-line NOOP
 	ann := kid(root, 2)
-	txt, wrapped, _ := asAnnot(t, ann)
+	txt, wrapped := asAnnot(t, ann)
 	if txt != "note" || !isId(wrapped, "y") {
 		t.Fatalf("expected PRE 'note' wrapping y: %s", dump(ann))
 	}
@@ -1304,8 +1299,8 @@ func Test_Parser_Enum_Literal(t *testing.T) {
 func Test_Parser_Annot_TrailingPRE_WrapsNOOP(t *testing.T) {
 	root := mustParse(t, "# note") // lone PRE at EOF
 	ann := first(root)
-	txt, wrapped, isPost := asAnnot(t, ann)
-	if isPost || txt != "note" {
+	txt, wrapped := asAnnot(t, ann)
+	if txt != "note" {
 		t.Fatalf("expected PRE 'note'")
 	}
 	wantTag(t, wrapped, "noop")
@@ -1360,10 +1355,7 @@ fun(
 
 	// Type position should be a PRE annot wrapping id "Int"
 	typ := kid(p0, 1)
-	txt, wrapped, isPost := asAnnot(t, typ)
-	if isPost {
-		t.Fatalf("type PRE should not be POST")
-	}
+	txt, wrapped := asAnnot(t, typ)
 	if txt != "must be positive" {
 		t.Fatalf("want PRE text %q, got %q", "must be positive", txt)
 	}
@@ -1392,9 +1384,9 @@ x = # B
 
 	// RHS is annot("A\nB\nC\nD", true)
 	rhs := kid(asn, 1)
-	txt, wrapped, isPost := asAnnot(t, rhs)
-	if isPost || txt != "A\nB\nC\nD" {
-		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got isPost=%v txt=%q", isPost, txt)
+	txt, wrapped := asAnnot(t, rhs)
+	if txt != "A\nB\nC\nD" {
+		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got txt=%q", txt)
 	}
 	wantTag(t, wrapped, "bool")
 	if wrapped[1].(bool) != true {
@@ -1421,9 +1413,9 @@ let x = # B
 
 	// RHS is annot("A\nB\nC\nD", true)
 	rhs := kid(asn, 1)
-	txt, wrapped, isPost := asAnnot(t, rhs)
-	if isPost || txt != "A\nB\nC\nD" {
-		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got isPost=%v txt=%q", isPost, txt)
+	txt, wrapped := asAnnot(t, rhs)
+	if txt != "A\nB\nC\nD" {
+		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got txt=%q", txt)
 	}
 	wantTag(t, wrapped, "bool")
 	if wrapped[1].(bool) != true {
@@ -1455,9 +1447,9 @@ func Test_Parser_Normalize_MapPair_Annotations_MergeToValue(t *testing.T) {
 
 	// value is annot("A\nB\nC\nD", true)
 	val := p[2].(S)
-	txt, wrapped, isPost := asAnnot(t, val)
-	if isPost || txt != "A\nB\nC\nD" {
-		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got isPost=%v txt=%q", isPost, txt)
+	txt, wrapped := asAnnot(t, val)
+	if txt != "A\nB\nC\nD" {
+		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got txt=%q", txt)
 	}
 	wantTag(t, wrapped, "bool")
 }
@@ -1488,9 +1480,9 @@ type {
 
 	// value is annot("A\nB\nC\nD", id "Str")
 	val := p[2].(S)
-	txt, wrapped, isPost := asAnnot(t, val)
-	if isPost || txt != "A\nB\nC\nD" {
-		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got isPost=%v txt=%q", isPost, txt)
+	txt, wrapped := asAnnot(t, val)
+	if txt != "A\nB\nC\nD" {
+		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got  txt=%q", txt)
 	}
 	wantTag(t, wrapped, "id")
 	if wrapped[1].(string) != "Str" {
@@ -1524,9 +1516,9 @@ fun(
 
 	// param type value is annot("A\nB\nC\nD", id "Str")
 	val := p[2].(S)
-	txt, wrapped, isPost := asAnnot(t, val)
-	if isPost || txt != "A\nB\nC\nD" {
-		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got isPost=%v txt=%q", isPost, txt)
+	txt, wrapped := asAnnot(t, val)
+	if txt != "A\nB\nC\nD" {
+		t.Fatalf("want PRE merged 'A\\nB\\nC\\nD', got txt=%q", txt)
 	}
 	wantTag(t, wrapped, "id")
 	if wrapped[1].(string) != "Str" {
@@ -1548,9 +1540,9 @@ func Test_Parser_Array_Items_Annotations_AttachAroundComma(t *testing.T) {
 
 	// First element should have annotation coming AFTER the comma.
 	e0 := kid(arr, 0)
-	txt0, wrapped0, isPost0 := asAnnot(t, e0)
-	if isPost0 || txt0 != "note for 1" {
-		t.Fatalf("element 0 annotation mismatch: isPost=%v txt=%q", isPost0, txt0)
+	txt0, wrapped0 := asAnnot(t, e0)
+	if txt0 != "note for 1" {
+		t.Fatalf("element 0 annotation mismatch: txt=%q", txt0)
 	}
 	wantTag(t, wrapped0, "int")
 	if wrapped0[1].(int64) != 1 {
@@ -1559,9 +1551,9 @@ func Test_Parser_Array_Items_Annotations_AttachAroundComma(t *testing.T) {
 
 	// Second element should have annotation directly trailing the value.
 	e1 := kid(arr, 1)
-	txt1, wrapped1, isPost1 := asAnnot(t, e1)
-	if isPost1 || txt1 != "note for 2" {
-		t.Fatalf("element 1 annotation mismatch: isPost=%v txt=%q", isPost1, txt1)
+	txt1, wrapped1 := asAnnot(t, e1)
+	if txt1 != "note for 2" {
+		t.Fatalf("element 1 annotation mismatch: txt=%q", txt1)
 	}
 	wantTag(t, wrapped1, "int")
 	if wrapped1[1].(int64) != 2 {
@@ -1590,9 +1582,9 @@ func Test_Parser_Map_Items_Annotations_AttachAroundComma(t *testing.T) {
 		t.Fatalf("key0 mismatch: %s", dump(key0))
 	}
 	val0 := p0[2].(S)
-	txt0, wrapped0, isPost0 := asAnnot(t, val0)
-	if isPost0 || txt0 != "note for 1" {
-		t.Fatalf("pair 0 value annotation mismatch: isPost=%v txt=%q", isPost0, txt0)
+	txt0, wrapped0 := asAnnot(t, val0)
+	if txt0 != "note for 1" {
+		t.Fatalf("pair 0 value annotation mismatch: txt=%q", txt0)
 	}
 	wantTag(t, wrapped0, "int")
 	if wrapped0[1].(int64) != 1 {
@@ -1608,12 +1600,307 @@ func Test_Parser_Map_Items_Annotations_AttachAroundComma(t *testing.T) {
 		t.Fatalf("key1 mismatch: %s", dump(key1))
 	}
 	val1 := p1[2].(S)
-	txt1, wrapped1, isPost1 := asAnnot(t, val1)
-	if isPost1 || txt1 != "note for 2" {
-		t.Fatalf("pair 1 value annotation mismatch: isPost=%v txt=%q", isPost1, txt1)
+	txt1, wrapped1 := asAnnot(t, val1)
+	if txt1 != "note for 2" {
+		t.Fatalf("pair 1 value annotation mismatch:  txt=%q", txt1)
 	}
 	wantTag(t, wrapped1, "int")
 	if wrapped1[1].(int64) != 2 {
 		t.Fatalf("pair 1 value mismatch: %s", dump(wrapped1))
+	}
+}
+
+// 1) No leakage of PRE annotations across blank lines between statements.
+func Test_Parser_Assign_Annot_NoLeak_AcrossBlankLine_BetweenStatements(t *testing.T) {
+	src := `
+# A
+let X = 1
+
+# B
+let Y = 2
+`
+	root := mustParse(t, src)
+	if len(root) != 1+3 {
+		t.Fatalf("want assign, NOOP, assign; got %d\n%s", len(root)-1, dump(root))
+	}
+	asn1 := kid(root, 0)
+	wantTag(t, kid(root, 1), "noop")
+	asn2 := kid(root, 2)
+	wantTag(t, asn1, "assign")
+	wantTag(t, asn2, "assign")
+
+	// RHS of first is annot("A", 1)
+	rhs1 := kid(asn1, 1)
+	txt1, w1 := asAnnot(t, rhs1)
+	if txt1 != "A" {
+		t.Fatalf("first RHS annot mismatch: txt=%q", txt1)
+	}
+	wantTag(t, w1, "int")
+	if w1[1].(int64) != 1 {
+		t.Fatalf("first RHS value mismatch: %s", dump(w1))
+	}
+
+	// RHS of second is annot("B", 2)
+	rhs2 := kid(asn2, 1)
+	txt2, w2 := asAnnot(t, rhs2)
+	if txt2 != "B" {
+		t.Fatalf("second RHS annot mismatch: txt=%q", txt2)
+	}
+	wantTag(t, w2, "int")
+	if w2[1].(int64) != 2 {
+		t.Fatalf("second RHS value mismatch: %s", dump(w2))
+	}
+}
+
+// 2) Trailing annotation (D) must NOT cross a blank line; it becomes a PRE on a NOOP.
+func Test_Parser_Assign_TrailingAnnot_DoesNotCrossBlankLine(t *testing.T) {
+	src := `x = 1
+
+# D`
+	root := mustParse(t, src)
+	// Expect: assign, NOOP, annot(PRE, NOOP)
+	if len(root) != 1+3 {
+		t.Fatalf("want 3 top-level statements, got %d\n%s", len(root)-1, dump(root))
+	}
+	asn := kid(root, 0)
+	wantTag(t, asn, "assign")
+	// RHS should be plain int (no annot merged, because blank line breaks D)
+	rhs := kid(asn, 1)
+	wantTag(t, rhs, "int")
+	if rhs[1].(int64) != 1 {
+		t.Fatalf("rhs value mismatch: %s", dump(rhs))
+	}
+	// Middle is NOOP
+	wantTag(t, kid(root, 1), "noop")
+	// Trailing annot wraps NOOP
+	ann := kid(root, 2)
+	txt, wrapped := asAnnot(t, ann)
+	if txt != "D" {
+		t.Fatalf("trailing PRE mismatch: txt=%q", txt)
+	}
+	wantTag(t, wrapped, "noop")
+}
+
+// 3) Floating comment inside an empty block should synthesize a NOOP and be valid.
+func Test_Parser_Block_FloatingAnnot_WrapsNOOP_BeforeEnd(t *testing.T) {
+	src := "do\n# a\nend"
+	root := mustParse(t, src)
+	blk := first(root)
+	wantTag(t, blk, "block")
+	if len(blk) != 1+1 {
+		t.Fatalf("want 1 statement in block, got %d\n%s", len(blk)-1, dump(blk))
+	}
+	ann := kid(blk, 0)
+	txt, wrapped := asAnnot(t, ann)
+	if txt != "a" {
+		t.Fatalf("block PRE mismatch: txt=%q", txt)
+	}
+	wantTag(t, wrapped, "noop")
+}
+
+// 4) Two PRE annotations split by a blank line: first wraps NOOP, second wraps the next block.
+func Test_Parser_Annot_TwoPRE_SplitByBlankLine_DoWrapsBlock(t *testing.T) {
+	src := `
+# a1
+
+# a2
+do end
+`
+	root := mustParse(t, src)
+	if len(root) != 1+2 {
+		t.Fatalf("want 2 top-level nodes, got %d\n%s", len(root)-1, dump(root))
+	}
+	annNoop := kid(root, 0)
+	txt1, w1 := asAnnot(t, annNoop)
+	if txt1 != "a1" {
+		t.Fatalf("first PRE mismatch: txt=%q", txt1)
+	}
+	wantTag(t, w1, "noop")
+
+	annBlk := kid(root, 1)
+	txt2, w2 := asAnnot(t, annBlk)
+	if txt2 != "a2" {
+		t.Fatalf("second PRE mismatch: txt=%q", txt2)
+	}
+	wantTag(t, w2, "block")
+}
+
+// 6) Inside params: blank lines between ":" and PRE do not break adjacency; PRE attaches to type.
+func Test_Parser_Params_Annot_IgnoresNoopsAroundType(t *testing.T) {
+	src := `
+fun(
+  x:
+
+  # C
+  Str
+) do end
+`
+	root := mustParse(t, src)
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+	p := kid(params, 0)
+	wantTag(t, p, "pair")
+
+	val := p[2].(S)
+	txt, wrapped := asAnnot(t, val)
+	if txt != "C" {
+		t.Fatalf("param type PRE mismatch: txt=%q", txt)
+	}
+	wantTag(t, wrapped, "id")
+	if wrapped[1].(string) != "Str" {
+		t.Fatalf("param type value mismatch: %s", dump(wrapped))
+	}
+}
+
+func Test_Parser_Array_Annot_Post_AfterComma_SameLine(t *testing.T) {
+	root := mustParse(t, "[\n  1, # note\n  2\n]")
+	arr := first(root)
+	e0 := kid(arr, 0)
+	txt, wrapped := asAnnot(t, e0)
+	if txt != "note" || head(wrapped) != "int" || wrapped[1].(int64) != 1 {
+		t.Fatalf("want POST 'note' on first elem: %s", dump(e0))
+	}
+}
+
+func Test_Parser_Array_Annot_Pre_NextElem_NextLine(t *testing.T) {
+	root := mustParse(t, "[\n  1,\n  # note\n  2\n]")
+	arr := first(root)
+	e1 := kid(arr, 1)
+	txt, wrapped := asAnnot(t, e1)
+	if txt != "note" || head(wrapped) != "int" || wrapped[1].(int64) != 2 {
+		t.Fatalf("want PRE 'note' on second elem: %s", dump(e1))
+	}
+}
+
+func Test_Parser_Array_Annot_Pre_AllowsBlankLines_BeforeComment(t *testing.T) {
+	root := mustParse(t, "[\n  1,\n\n  # note\n  2\n]")
+	arr := first(root)
+	e1 := kid(arr, 1)
+	txt, wrapped := asAnnot(t, e1)
+	if txt != "note" || head(wrapped) != "int" || wrapped[1].(int64) != 2 {
+		t.Fatalf("want PRE 'note' on second elem across blank line before: %s", dump(e1))
+	}
+}
+
+// ─────────────────────── Updated (stale) array tests ───────────────────────
+
+func Test_Parser_Array_Annot_Pre_AllowsBlankLines(t *testing.T) {
+	// Blank line (NOOP) BETWEEN the annotation and the next element breaks adjacency.
+	// The note must NOT attach to 2.
+	root := mustParse(t, "[\n  1,\n  # note\n\n  2\n]")
+	arr := first(root)
+	wantTag(t, arr, "array")
+
+	if len(arr) != 1+2 {
+		t.Fatalf("want 2 elems, got %d\n%s", len(arr)-1, dump(arr))
+	}
+
+	// First element remains an int
+	e0 := kid(arr, 0)
+	wantTag(t, e0, "int")
+	if e0[1].(int64) != 1 {
+		t.Fatalf("elem 0 mismatch: %s", dump(e0))
+	}
+
+	// Second element should be a plain int (annotation not attached due to intervening NOOP)
+	e1 := kid(arr, 1)
+	wantTag(t, e1, "int")
+	if e1[1].(int64) != 2 {
+		t.Fatalf("elem 1 mismatch: %s", dump(e1))
+	}
+}
+
+func Test_Parser_Array_Annot_Dangling_Pre_BeforeClose_SynthNoop(t *testing.T) {
+	// Annotation at the end (right before ']') must synthesize a NOOP to attach to,
+	// rather than erroring.
+	root := mustParse(t, "[\n  1\n\n  # note\n]")
+	arr := first(root)
+	wantTag(t, arr, "array")
+
+	// We expect two items: 1 and annot("note", noop).
+	if len(arr) != 1+2 {
+		t.Fatalf("want 2 elems, got %d\n%s", len(arr)-1, dump(arr))
+	}
+
+	// First item
+	e0 := kid(arr, 0)
+	wantTag(t, e0, "int")
+	if e0[1].(int64) != 1 {
+		t.Fatalf("elem 0 mismatch: %s", dump(e0))
+	}
+
+	// Second item: annotation wrapping NOOP
+	e1 := kid(arr, 1)
+	txt, wrapped := asAnnot(t, e1)
+	if txt != "note" {
+		t.Fatalf("dangling PRE text mismatch: %q", txt)
+	}
+	wantTag(t, wrapped, "noop")
+}
+
+// ───────────────────────── Tiny, orthogonal map tests ──────────────────────
+
+func Test_Parser_Map_Annot_Pre_NextPair_NextLine(t *testing.T) {
+	// After-comma annotation on the NEXT line attaches to the NEXT pair's value (PRE),
+	// not the previous pair (POST only allowed on same line).
+	src := "{\n  a: 1,\n  # note\n  b: 2\n}"
+	root := mustParse(t, src)
+	obj := first(root)
+	wantTag(t, obj, "map")
+	if len(obj) != 1+2 {
+		t.Fatalf("want 2 pairs, got %d\n%s", len(obj)-1, dump(obj))
+	}
+
+	// First pair remains unannotated value 1
+	p0 := kid(obj, 0)
+	wantTag(t, p0, "pair")
+	v0 := p0[2].(S)
+	wantTag(t, v0, "int")
+	if v0[1].(int64) != 1 {
+		t.Fatalf("pair 0 value mismatch: %s", dump(v0))
+	}
+
+	// Second pair's value carries PRE "note"
+	p1 := kid(obj, 1)
+	wantTag(t, p1, "pair")
+	v1 := p1[2].(S)
+	txt, wrapped := asAnnot(t, v1)
+	if txt != "note" {
+		t.Fatalf("pair 1 PRE text mismatch: %q", txt)
+	}
+	wantTag(t, wrapped, "int")
+	if wrapped[1].(int64) != 2 {
+		t.Fatalf("pair 1 wrapped value mismatch: %s", dump(wrapped))
+	}
+}
+
+func Test_Parser_Map_Annot_Pre_BrokenByBlankLine(t *testing.T) {
+	// Blank line (NOOP) between the annotation and the next pair breaks adjacency.
+	src := "{\n  a: 1,\n  # note\n\n  b: 2\n}"
+	root := mustParse(t, src)
+	obj := first(root)
+	wantTag(t, obj, "map")
+	if len(obj) != 1+2 {
+		t.Fatalf("want 2 pairs, got %d\n%s", len(obj)-1, dump(obj))
+	}
+
+	// First pair remains value 1
+	p0 := kid(obj, 0)
+	wantTag(t, p0, "pair")
+	v0 := p0[2].(S)
+	wantTag(t, v0, "int")
+	if v0[1].(int64) != 1 {
+		t.Fatalf("pair 0 value mismatch: %s", dump(v0))
+	}
+
+	// Second pair's value should be a plain int (annotation did NOT attach)
+	p1 := kid(obj, 1)
+	wantTag(t, p1, "pair")
+	v1 := p1[2].(S)
+	wantTag(t, v1, "int")
+	if v1[1].(int64) != 2 {
+		t.Fatalf("pair 1 value mismatch: %s", dump(v1))
 	}
 }

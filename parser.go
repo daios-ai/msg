@@ -543,6 +543,41 @@ func (p *parser) takeSameLineAnnots(line int) string {
 	return ""
 }
 
+// drainTrailingGapsUntil consumes any sequence of NOOPs and/or ANNOTATIONs
+// until the given closing token is seen. Each NOOP becomes ("noop") and each
+// annotation becomes ("annot", ("str", mergedText), ("noop")).
+//
+// It never crosses non-gap tokens. If a non-gap appears before the closer,
+// it delegates to need(close, expectMsg) to produce the right diagnostic.
+func (p *parser) drainTrailingGapsUntil(close TokenType, expectMsg string, out *[]any) error {
+	for {
+		if p.atEnd() {
+			// Let need(...) decide whether this is parse vs incomplete, with correct anchoring.
+			if _, err := p.need(close, expectMsg); err != nil {
+				return err
+			}
+			return nil
+		}
+		switch p.peek().Type {
+		case close:
+			return nil
+		case NOOP:
+			*out = append(*out, p.mkLeaf("noop", p.i))
+			p.i++
+		case ANNOTATION:
+			txt := p.collectAnnots() // merges adjacent annotation tokens
+			child := p.mkLeaf("str", -1, txt)
+			*out = append(*out, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+		default:
+			// Unexpected token before closer → canonical error.
+			if _, err := p.need(close, expectMsg); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+}
+
 // ───────────────────────────── prefix / postfix / infix ────────────────────
 
 func (p *parser) expr(minBP int) (S, error) {
@@ -944,8 +979,7 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			return n, true, nil
 		}
 		// Let the bracketed list own gaps/NOOPs/annotations.
-		args, _, closeTok, err := p.bracketed(RROUND, func() (S, int, error) {
-			// Do NOT skip NOOPs here — the comma-list will handle interstitials.
+		args, _, closeTok, err := p.bracketed(RROUND, "expected ')'", func() (S, int, error) {
 			start := p.i
 			a, err := p.expr(0)
 			if err != nil {
@@ -953,6 +987,7 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			}
 			return a, start, nil
 		})
+
 		if err != nil {
 			return nil, false, err
 		}
@@ -1016,6 +1051,7 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 // bracketed parses a generic comma-list whose opener has just been consumed.
 func (p *parser) bracketed(
 	close TokenType,
+	expectMsg string,
 	parseElem func() (S, int, error),
 ) ([]any, int, int, error) {
 	openTok := p.i - 1
@@ -1025,20 +1061,21 @@ func (p *parser) bracketed(
 		return nil, openTok, p.i - 1, nil
 	}
 
-	// Parse with the uniform comma-list rules (gaps → NOOP/annot, POST same-line only).
-	elems, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == close },
-		parseElem,
-	)
+	elems, err := p.parseCommaList(func(tt TokenType) bool { return tt == close }, parseElem)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 
-	// Do not skip NOOPs before the closer; dangling PRE must synthesize NOOP.
-	if _, err := p.need(close, "expected ')'"); err != nil {
+	// drain dangling gaps before the closer
+	if err := p.drainTrailingGapsUntil(close, expectMsg, &elems); err != nil {
+		return nil, 0, 0, err
+	}
+
+	if _, err := p.need(close, expectMsg); err != nil {
 		return nil, 0, 0, err
 	}
 	return elems, openTok, p.i - 1, nil
+
 }
 
 // parseCommaList parses items until isClose(peek.Type) is true.
@@ -1124,13 +1161,14 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 		return nil, err
 	}
 
-	// Do not skip NOOPs; allow dangling PRE before ']' to synthesize NOOP.
-	p.skipNoops()
+	if err := p.drainTrailingGapsUntil(RSQUARE, "expected ']'", &elems); err != nil {
+		return nil, err
+	}
 	if _, perr := p.need(RSQUARE, "expected ']'"); perr != nil {
 		return nil, perr
 	}
-	// span: from '[' (or CLSQUARE) to ']'
 	return p.mk("array", p.findMatchingOpenSquare(), p.i-1, elems...), nil
+
 }
 
 func (p *parser) findMatchingOpenSquare() int {
@@ -1324,11 +1362,14 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.skipNoops()
+	if err := p.drainTrailingGapsUntil(RCURLY, "expected '}'", &pairs); err != nil {
+		return nil, err
+	}
 	if _, perr := p.need(RCURLY, "expected '}'"); perr != nil {
 		return nil, perr
 	}
 	return p.mk("map", openTok, p.i-1, pairs...), nil
+
 }
 
 // parseKVPairs honors the same adjacency rules as parseCommaList.
@@ -1734,11 +1775,14 @@ func (p *parser) arrayDeclPattern() (S, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.skipNoops()
+	if err := p.drainTrailingGapsUntil(RSQUARE, "expected ']' in array pattern", &parts); err != nil {
+		return nil, err
+	}
 	if _, perr := p.need(RSQUARE, "expected ']' in array pattern"); perr != nil {
 		return nil, perr
 	}
 	return p.mk("darr", openTok, p.i-1, parts...), nil
+
 }
 
 func (p *parser) objectDeclPattern() (S, error) {
@@ -1770,11 +1814,14 @@ func (p *parser) objectDeclPattern() (S, error) {
 		return nil, err
 	}
 
-	p.skipNoops()
+	if err := p.drainTrailingGapsUntil(RCURLY, "expected '}' in object pattern", &pairs); err != nil {
+		return nil, err
+	}
 	if _, perr := p.need(RCURLY, "expected '}' in object pattern"); perr != nil {
 		return nil, perr
 	}
 	return p.mk("dobj", openTok, p.i-1, pairs...), nil
+
 }
 
 // readKeyString allows stacked PRE-annotations (handled recursively).

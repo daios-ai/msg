@@ -2045,3 +2045,114 @@ func Test_Parser_Params_Annot_AfterBlankLine_WrapsNOOP(t *testing.T) {
 	p1 := kid(params, 3)
 	wantTag(t, p1, "pair")
 }
+
+// --- Dangling PRE before closers (uniform across contexts) -----------------
+
+func Test_Parser_Array_DanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "[\n  1\n  # note\n]")
+	arr := first(root)
+	wantTag(t, arr, "array")
+	if len(arr) != 1+2 {
+		t.Fatalf("want [1, annot(note, noop)], got %s", dump(arr))
+	}
+	wantTag(t, kid(arr, 0), "int")
+	txt, wrapped := asAnnot(t, kid(arr, 1))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(arr, 1)))
+	}
+}
+
+func Test_Parser_Map_DanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "{\n  a: 1,\n  # note\n}")
+	m := first(root)
+	wantTag(t, m, "map")
+	if len(m) != 1+2 {
+		t.Fatalf("want pair(a:1), annot(note, noop), got %s", dump(m))
+	}
+	wantTag(t, kid(m, 0), "pair")
+	txt, wrapped := asAnnot(t, kid(m, 1))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(m, 1)))
+	}
+}
+
+func Test_Parser_CallArgs_DanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "f(\n  1\n  # note\n)")
+	call := first(root)
+	wantTag(t, call, "call")
+	// call = ("call", callee, 1, annot(note, noop))
+	if len(call) != 1+1+2 {
+		t.Fatalf("want callee + 2 args, got %d\n%s", len(call)-1, dump(call))
+	}
+	if !isId(kid(call, 0), "f") {
+		t.Fatalf("callee not f")
+	}
+	wantTag(t, kid(call, 1), "int")
+	txt, wrapped := asAnnot(t, kid(call, 2))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("dangling PRE should synthesize NOOP, got %s", dump(kid(call, 2)))
+	}
+}
+
+func Test_Parser_CallArgs_EmptyWithDanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "f(\n  # note\n)")
+	call := first(root)
+	wantTag(t, call, "call")
+	// ("call", callee, annot(note, noop))
+	if len(call) != 1+1+1 {
+		t.Fatalf("want callee + 1 arg (annot), got %d\n%s", len(call)-1, dump(call))
+	}
+	txt, wrapped := asAnnot(t, kid(call, 1))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(call, 1)))
+	}
+}
+
+func Test_Parser_Params_EmptyWithDanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "fun(\n  # note\n) do end")
+	fn := first(root)
+	wantTag(t, fn, "fun")
+	params := kid(fn, 0)
+	wantTag(t, params, "array")
+	if len(params) != 1+1 {
+		t.Fatalf("want one entry (annot(note, noop)), got %s", dump(params))
+	}
+	txt, wrapped := asAnnot(t, kid(params, 0))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(params, 0)))
+	}
+}
+
+// --- Destructuring patterns: dangling PRE before ']' / '}' -----------------
+
+func Test_Parser_ArrayPattern_DanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "let [a,\n  # note\n] = xs")
+	asn := first(root)
+	wantTag(t, asn, "assign")
+	lhs := kid(asn, 0)
+	wantTag(t, lhs, "darr")
+	if len(lhs) != 1+2 {
+		t.Fatalf("want decl(a), annot(note, noop), got %s", dump(lhs))
+	}
+	wantTag(t, kid(lhs, 0), "decl")
+	txt, wrapped := asAnnot(t, kid(lhs, 1))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(lhs, 1)))
+	}
+}
+
+func Test_Parser_ObjectPattern_DanglingPre_SynthNoop(t *testing.T) {
+	root := mustParse(t, "let {\n  a: x,\n  # note\n} = m")
+	asn := first(root)
+	wantTag(t, asn, "assign")
+	lhs := kid(asn, 0)
+	wantTag(t, lhs, "dobj")
+	if len(lhs) != 1+2 {
+		t.Fatalf("want pair(a:x), annot(note, noop), got %s", dump(lhs))
+	}
+	wantTag(t, kid(lhs, 0), "pair")
+	txt, wrapped := asAnnot(t, kid(lhs, 1))
+	if txt != "note" || head(wrapped) != "noop" {
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(lhs, 1)))
+	}
+}

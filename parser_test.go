@@ -520,12 +520,21 @@ end
 }
 
 func Test_Parser_NOOP_Inside_Params_Ignored(t *testing.T) {
+	// NOOPs inside param lists are preserved. Count only ("pair", ...) entries.
 	root := mustParse(t, "fun(\n\n  x: Int,\n  \n  y: Str\n) do end")
 	fn := first(root)
 	wantTag(t, fn, "fun")
-	params := kid(fn, 0)
-	if len(params) != 1+2 {
-		t.Fatalf("want 2 params, got %d", len(params)-1)
+	params := kid(fn, 0) // ("array", entries...)
+	wantTag(t, params, "array")
+
+	pairs := 0
+	for i := 0; i < len(params)-1; i++ {
+		if head(kid(params, i)) == "pair" {
+			pairs++
+		}
+	}
+	if pairs != 2 {
+		t.Fatalf("want 2 param pairs, got %d\n%s", pairs, dump(params))
 	}
 }
 
@@ -2010,23 +2019,29 @@ func Test_Parser_Params_Annot_AfterBlankLine_WrapsNOOP(t *testing.T) {
 	root := mustParse(t, src)
 	fn := first(root)
 	wantTag(t, fn, "fun")
-	params := kid(fn, 0)
+	params := kid(fn, 0) // ("array", ...)
 	wantTag(t, params, "array")
 
-	// Expect: pair(x, Int), annot("note", noop), pair(y, Str)
-	if len(params) != 1+3 {
-		t.Fatalf("want 3 param entries, got %d\n%s", len(params)-1, dump(params))
+	// Expect: pair(x,Int), NOOP, annot("note", NOOP), pair(y,Str)
+	if len(params) != 1+4 {
+		t.Fatalf("want 4 param entries, got %d\n%s", len(params)-1, dump(params))
 	}
 
+	// 0: first parameter pair
 	p0 := kid(params, 0)
 	wantTag(t, p0, "pair")
 
-	mid := kid(params, 1)
+	// 1: blank-line NOOP between params
+	wantTag(t, kid(params, 1), "noop")
+
+	// 2: annotation wrapping a synthesized NOOP
+	mid := kid(params, 2)
 	txt, w := asAnnot(t, mid)
 	if txt != "note" || head(w) != "noop" {
 		t.Fatalf("mid param entry should be annot(note, noop): %s", dump(mid))
 	}
 
-	p1 := kid(params, 2)
+	// 3: second parameter pair
+	p1 := kid(params, 3)
 	wantTag(t, p1, "pair")
 }

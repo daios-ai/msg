@@ -528,15 +528,19 @@ func (p *parser) takeGap(pending *string, out *[]any) bool {
 // Collect same-line annotations as a merged string (without attaching).
 // Useful for strict A→B→C→D ordering in maps; pass the reference line.
 func (p *parser) takeSameLineAnnots(line int) string {
-	txt := ""
-	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == line {
-		if t := p.collectAnnots(); t != "" {
-			txt = joinNonEmpty(txt, t)
-		} else {
-			break
-		}
+	if p.atEnd() {
+		return ""
 	}
-	return txt
+	if p.peek().Type != ANNOTATION || p.peek().Line != line {
+		return ""
+	}
+	// Consume exactly one same-line annotation token.
+	tok := p.peek()
+	p.i++
+	if s, ok := tok.Literal.(string); ok && s != "" {
+		return s
+	}
+	return ""
 }
 
 // ───────────────────────────── prefix / postfix / infix ────────────────────
@@ -933,14 +937,15 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		return n, true, nil
 
 	case CLROUND:
+		// IMPORTANT: do not skip NOOPs here; gaps inside argument lists are first-class.
 		p.i++
-		p.skipNoops()
 		if p.match(RROUND) {
 			n := p.mk("call", leftStartTok, p.i-1, left)
 			return n, true, nil
 		}
+		// Let the bracketed list own gaps/NOOPs/annotations.
 		args, _, closeTok, err := p.bracketed(RROUND, func() (S, int, error) {
-			p.skipNoops()
+			// Do NOT skip NOOPs here — the comma-list will handle interstitials.
 			start := p.i
 			a, err := p.expr(0)
 			if err != nil {
@@ -955,6 +960,7 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		return n, true, nil
 
 	case CLSQUARE:
+		// For index expressions, NOOPs inside brackets are ignored by design.
 		p.i++
 		p.skipNoops()
 		idx, err := p.expr(0)
@@ -1013,11 +1019,13 @@ func (p *parser) bracketed(
 	parseElem func() (S, int, error),
 ) ([]any, int, int, error) {
 	openTok := p.i - 1
-	p.skipNoops()
-	// Empty
+
+	// Empty *only* if the very next token is the closer — no gap skipping.
 	if p.match(close) {
 		return nil, openTok, p.i - 1, nil
 	}
+
+	// Parse with the uniform comma-list rules (gaps → NOOP/annot, POST same-line only).
 	elems, err := p.parseCommaList(
 		func(tt TokenType) bool { return tt == close },
 		parseElem,
@@ -1025,7 +1033,8 @@ func (p *parser) bracketed(
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	p.skipNoops()
+
+	// Do not skip NOOPs before the closer; dangling PRE must synthesize NOOP.
 	if _, err := p.need(close, "expected ')'"); err != nil {
 		return nil, 0, 0, err
 	}
@@ -1095,14 +1104,15 @@ func (p *parser) parseCommaList(
 }
 
 func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	p.skipNoops()
+	// Empty array only when immediate ']' follows.
 	if p.match(RSQUARE) {
 		return p.mk("array", p.i-2, p.i-1 /*'[]'*/), nil
 	}
+
 	elems, err := p.parseCommaList(
 		func(tt TokenType) bool { return tt == RSQUARE },
 		func() (S, int, error) {
-			p.skipNoops()
+			// IMPORTANT: no skipNoops here; list gaps are handled by parseCommaList.
 			e, err := p.expr(0)
 			if err != nil {
 				return nil, 0, err
@@ -1113,6 +1123,8 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Do not skip NOOPs; allow dangling PRE before ']' to synthesize NOOP.
 	p.skipNoops()
 	if _, perr := p.need(RSQUARE, "expected ']'"); perr != nil {
 		return nil, perr
@@ -1134,25 +1146,79 @@ func (p *parser) findMatchingOpenSquare() int {
 	return p.i - 1
 }
 
-// params parses (CLROUND ... RROUND) parameter pairs; POST can follow each param
-// directly or after the comma. Default type is Any.
+// params parses (CLROUND ... RROUND) parameter pairs; preserves NOOPs and
+// PRE/POST rules uniformly across entries, while *ignoring* NOOPs that appear
+// between ':' and the type expression (so annotations there still bind to the type).
+// Critically, it NORMALIZES annotations at the binding site by merging pending/A/B/C/D
+// onto the VALUE inside each ("pair", name, value), never onto the pair node itself.
 func (p *parser) params() (S, error) {
 	if _, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
 		return nil, perr
 	}
 	openTok := p.i - 1
 
-	var elems []any
-	p.skipNoops()
+	// Immediate close → empty params array
 	if p.match(RROUND) {
 		return p.mk("array", openTok, p.i-1), nil
 	}
 
-	for {
-		p.skipNoops()
+	var entries []any
+	pending := "" // PRE text accumulated from interstitial gaps to apply to next param's VALUE
 
-		// Collect annotations before the parameter name (A)
-		aTxt := p.collectAnnots()
+	for {
+		// If we see ')', close list — but first synthesize dangling PRE → annot(noop)
+		if p.peek().Type == RROUND {
+			if pending != "" {
+				child := p.mkLeaf("str", -1, pending)
+				entries = append(entries, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+				pending = ""
+			}
+			break
+		}
+
+		// Guard: if the next token cannot start a parameter element,
+		// the parameter list wasn't properly closed. Emit the canonical
+		// "expected ')' after parameters" at the unexpected token.
+		switch p.peek().Type {
+		case ANNOTATION, NOOP, RROUND:
+			// handled by branches above
+		case ID:
+			// valid start of a parameter; continue to parse it
+		case EOF:
+			// Delegate to need(...) so interactive mode yields DiagIncomplete.
+			if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
+				return nil, err
+			}
+			// Unreachable: need() always returns an error here.
+		default:
+			g := p.peek()
+			line, col := p.posAtByte(g.StartByte)
+			return nil, &Error{Kind: DiagParse, Msg: "expected ')' after parameters", Line: line, Col: col}
+		}
+
+		// Inter-entry gap handling:
+		switch p.peek().Type {
+		case ANNOTATION:
+			// PRE stacks in pending; do NOT skip NOOPs here — a NOOP would break PRE and be emitted.
+			pending = joinNonEmpty(pending, p.collectAnnots())
+			continue
+		case NOOP:
+			// If we had pending PRE, it attaches to a NOOP first (annot(noop)); then emit the NOOP itself.
+			if pending != "" {
+				child := p.mkLeaf("str", -1, pending)
+				entries = append(entries, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+				pending = ""
+				// consume the NOOP we just wrapped
+				p.i++
+				continue
+			}
+			entries = append(entries, p.mkLeaf("noop", p.i))
+			p.i++
+			continue
+		}
+
+		// --- Parse one parameter element ---
+		elemStartTok := p.i
 
 		// Name
 		idTok, err := p.need(ID, "expected parameter name")
@@ -1162,67 +1228,71 @@ func (p *parser) params() (S, error) {
 		idIdx := p.i - 1
 		nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
 
-		// Optional type after ':'
-		p.skipNoops()
+		// Optional ':' type
 		var val S
 		if p.match(COLON) {
-			// B: annotations immediately after ':'
-			p.skipNoops()
+			// B: annotations immediately after ':' (do not cross a NOOP boundary).
+			// We ignore NOOPs *between* ':' and the type — see tests expecting that.
+			for !p.atEnd() && p.peek().Type == NOOP {
+				p.i++ // ignore NOOPs local to the type site
+			}
 			bTxt := p.collectAnnots()
+
 			// Type expression
-			if err := p.needExprAfter(idTok, "expected type after ':'"); err != nil {
+			if err := p.needExprAfter(p.prev(), "expected type after ':'"); err != nil {
 				return nil, err
 			}
-			p.skipNoops()
 			tExpr, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
-			// C: unwrap pre on type; D: after type (+ after comma)
+
+			// C: unwrap PRE already on the parsed type
 			baseT, cTxt, _ := unwrapAnnot(tExpr)
-			p.skipNoops()
-			dTxt := p.collectAnnots()
-			merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt)
-			val = p.attachAnnot(baseT, merged)
+
+			// D: same-line POST after the type (before optional comma) attaches back
+			dTxt := ""
+			if p.lastSpanEndTok >= 0 {
+				dTxt = p.takeSameLineAnnots(p.toks[p.lastSpanEndTok].Line)
+			}
+
+			// Merge pending (PRE from gap) + B + C + D onto VALUE
+			val = p.attachAnnot(baseT, joinNonEmpty(pending, bTxt, cTxt, dTxt))
+			pending = ""
 		} else {
-			// No explicit type → implicit Any; merge A + D onto it
+			// No explicit type → implicit Any; merge pending onto it.
 			base := p.mkLeaf("id", -1, "Any")
-			p.skipNoops()
-			dTxt := p.collectAnnots()
-			val = p.attachAnnot(base, joinNonEmpty(aTxt, dTxt))
+			val = p.attachAnnot(base, pending)
+			pending = ""
 		}
 
-		pair := p.mk("pair", idIdx, p.i-1, nameLeaf, val)
-		elems = append(elems, pair)
+		pair := p.mk("pair", elemStartTok, p.i-1, nameLeaf, val)
+		entries = append(entries, pair)
 
-		// optional trailing comma; any annotations just after it still bind to this param
-		p.skipNoops()
+		// Optional comma; POST-after-comma attaches back ONLY if same line as the comma.
 		if p.match(COMMA) {
-			p.skipNoops()
-			if extra := p.collectAnnots(); extra != "" {
-				// Attach to the VALUE inside the last ("pair", name, value).
-				last := elems[len(elems)-1].(S) // ("pair", nameLeaf, val)
+			comma := p.prev()
+			if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
+				// Attach to this pair's VALUE (normalization at binding site!)
+				last := entries[len(entries)-1].(S)
 				if len(last) >= 3 {
-					val := last[2].(S)
-					last[2] = p.attachAnnot(val, extra)
-					elems[len(elems)-1] = last
+					v := last[2].(S)
+					last[2] = p.attachAnnot(v, txt)
+					entries[len(entries)-1] = last
 				}
 			}
-			// allow trailing comma
-			p.skipNoops()
-			if p.peek().Type == RROUND {
-				break
-			}
+			// allow trailing comma — loop continues until we hit ')'
 			continue
 		}
-		break
+
+		// No comma; next token should be ')' or gap (handled at top of loop).
 	}
 
-	p.skipNoops()
+	// Final closer
 	if _, perr := p.need(RROUND, "expected ')' after parameters"); perr != nil {
 		return nil, perr
 	}
-	return p.mk("array", openTok, p.i-1, elems...), nil
+	return p.mk("array", openTok, p.i-1, entries...), nil
 }
 
 func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {

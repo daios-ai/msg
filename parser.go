@@ -624,10 +624,12 @@ func (p *parser) expr(minBP int) (S, error) {
 		case ENUM:
 			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
 				p.i++ // consume '[' or CLSQUARE
+				// Reuse full array machinery (gaps, PRE/POST, dangling PRE).
 				arr, err := p.arrayLiteralAfterOpen()
 				if err != nil {
 					return nil, err
 				}
+				// Retag: ("array", e1, e2, ...) -> ("enum", e1, e2, ...)
 				items := make([]any, 0, len(arr)-1)
 				for i := 1; i < len(arr); i++ {
 					items = append(items, arr[i])
@@ -974,6 +976,7 @@ func (p *parser) parseGrouping() (S, error) {
 
 // ───────────────────────── unified postfix dispatcher ──────────────────────
 //
+
 // Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
 // **Span order** is enforced: children were already appended during their parse.
 // We append exactly one span for the new wrapper node (unop '?', call, idx, get).
@@ -987,22 +990,25 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		return n, true, nil
 
 	case CLROUND:
-		// IMPORTANT: do not skip NOOPs here; gaps inside argument lists are first-class.
 		p.i++
 		if p.match(RROUND) {
 			n := p.mk("call", leftStartTok, p.i-1, left)
 			return n, true, nil
 		}
-		// Let the bracketed list own gaps/NOOPs/annotations.
-		args, _, closeTok, err := p.bracketed(RROUND, "expected ')'", func() (S, int, error) {
-			start := p.i
-			a, err := p.expr(0)
-			if err != nil {
-				return nil, 0, err
-			}
-			return a, start, nil
-		})
-
+		args, _, closeTok, err := p.bracketed(
+			RROUND, "expected ')'",
+			func(pending string) (S, int, error) {
+				a, err := p.expr(0)
+				if err != nil {
+					return nil, 0, err
+				}
+				if pending != "" {
+					a = p.attachAnnot(a, pending)
+				}
+				return a, 0, nil
+			},
+			nil,
+		)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1063,50 +1069,38 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 
 // ───────────────────────── collections / lists / maps ─────────────────────
 
-// bracketed parses a generic comma-list whose opener has just been consumed.
+// bracketed parses a comma-separated list between an already-consumed opener
+// and its 'close'. It owns:
+//   - interstitial PRE via ANNOTATION (pending text) and NOOP emission,
+//   - POST right after an element (same line),
+//   - POST after a COMMA (same line) via onCommaPost callback,
+//   - dangling PRE before closer -> annot(noop),
+//   - trailing gaps before closer (NOOPs/ANNOTATION).
+//
+// parseElem receives the currently pending PRE text (already collected from
+// interstitial gaps) so callers decide how to apply it (e.g., to a pair's VALUE).
+// After parseElem returns, bracketed clears the pending PRE (never attaches it
+// itself). onCommaPost may be nil; if provided, it receives the last element
+// node and POST text and must return the updated node.
 func (p *parser) bracketed(
 	close TokenType,
 	expectMsg string,
-	parseElem func() (S, int, error),
+	parseElem func(pendingPRE string) (S, int, error),
+	onCommaPost func(last S, commaTok Token, txt string) S,
 ) ([]any, int, int, error) {
 	openTok := p.i - 1
 
-	// Empty *only* if the very next token is the closer — no gap skipping.
+	// Empty only when the very next token is the closer (no gap skipping).
 	if p.match(close) {
 		return nil, openTok, p.i - 1, nil
 	}
 
-	elems, err := p.parseCommaList(func(tt TokenType) bool { return tt == close }, parseElem)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-
-	// drain dangling gaps before the closer
-	if err := p.drainTrailingGapsUntil(close, expectMsg, &elems); err != nil {
-		return nil, 0, 0, err
-	}
-
-	if _, err := p.need(close, expectMsg); err != nil {
-		return nil, 0, 0, err
-	}
-	return elems, openTok, p.i - 1, nil
-
-}
-
-// parseCommaList parses items until isClose(peek.Type) is true.
-// Rules: NOOPs are elements; PRE attaches to next element unless a NOOP appears
-// (then PRE→annot(NOOP)); POST is same-line only (element end or comma);
-// dangling PRE before close → annot(NOOP).
-func (p *parser) parseCommaList(
-	isClose func(TokenType) bool,
-	parseElem func() (S, int, error),
-) ([]any, error) {
 	var out []any
 	pending := ""
 
 	for {
-		// Close (emit dangling PRE as annot(NOOP))
-		if isClose(p.peek().Type) {
+		// Close: emit dangling PRE as annot(noop)
+		if p.peek().Type == close {
 			if pending != "" {
 				child := p.mkLeaf("str", -1, pending)
 				out = append(out, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
@@ -1115,75 +1109,89 @@ func (p *parser) parseCommaList(
 			break
 		}
 
-		// Interstitial gap
-		if p.takeGap(&pending, &out) {
+		// Interstitial gaps
+		switch p.peek().Type {
+		case ANNOTATION:
+			pending = joinNonEmpty(pending, p.collectAnnots())
+			continue
+		case NOOP:
+			if pending != "" {
+				child := p.mkLeaf("str", -1, pending)
+				out = append(out, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
+				pending = ""
+				p.i++ // consume the NOOP we wrapped
+				continue
+			}
+			out = append(out, p.mkLeaf("noop", p.i))
+			p.i++
 			continue
 		}
 
-		// Element
-		elem, _, err := parseElem()
+		// Element with current pending PRE (caller applies it appropriately)
+		elem, _, err := parseElem(pending)
 		if err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
-
 		// POST right after element (same line only)
-		endTok := p.lastSpanEndTok
-		if endTok >= 0 {
-			if t := p.takeSameLineAnnots(p.toks[endTok].Line); t != "" {
+		if end := p.lastSpanEndTok; end >= 0 {
+			if t := p.takeSameLineAnnots(p.toks[end].Line); t != "" {
 				elem = p.attachAnnot(elem, t)
 			}
 		}
+		// Clear pending PRE — responsibility is with parseElem.
+		pending = ""
 
-		// Pending PRE (only if no NOOP before this element)
-		if pending != "" {
-			elem = p.attachAnnot(elem, pending)
-			pending = ""
-		}
 		out = append(out, elem)
 
-		// Optional comma; POST-after-comma binds back only if same line as comma
+		// Optional comma; allow trailing comma
 		if !p.match(COMMA) {
 			break
 		}
 		comma := p.prev()
+		// POST-after-comma (same line) — caller decides where to attach it
 		if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
 			last := out[len(out)-1].(S)
-			out[len(out)-1] = p.attachAnnot(last, txt)
+			if onCommaPost != nil {
+				last = onCommaPost(last, comma, txt)
+			} else {
+				last = p.attachAnnot(last, txt)
+			}
+			out[len(out)-1] = last
 		}
-		// Next-line annotations (if any) will be handled as PRE via takeGap.
 	}
-	return out, nil
+
+	// Drain trailing gaps before closer (NOOP/ANNOTATION), then require closer.
+	if err := p.drainTrailingGapsUntil(close, expectMsg, &out); err != nil {
+		return nil, 0, 0, err
+	}
+	if _, err := p.need(close, expectMsg); err != nil {
+		return nil, 0, 0, err
+	}
+	return out, openTok, p.i - 1, nil
 }
 
 func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	// Empty array only when immediate ']' follows.
 	if p.match(RSQUARE) {
-		return p.mk("array", p.i-2, p.i-1 /*'[]'*/), nil
+		return p.mk("array", p.i-2, p.i-1 /* '[]' */), nil
 	}
-
-	elems, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == RSQUARE },
-		func() (S, int, error) {
-			// IMPORTANT: no skipNoops here; list gaps are handled by parseCommaList.
+	items, openTok, closeTok, err := p.bracketed(
+		RSQUARE, "expected ']'",
+		func(pending string) (S, int, error) {
 			e, err := p.expr(0)
 			if err != nil {
 				return nil, 0, err
 			}
+			if pending != "" {
+				e = p.attachAnnot(e, pending)
+			}
 			return e, 0, nil
 		},
+		nil, // POST-after-comma attaches to element itself
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := p.drainTrailingGapsUntil(RSQUARE, "expected ']'", &elems); err != nil {
-		return nil, err
-	}
-	if _, perr := p.need(RSQUARE, "expected ']'"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("array", p.findMatchingOpenSquare(), p.i-1, elems...), nil
-
+	return p.mk("array", openTok, closeTok, items...), nil
 }
 
 func (p *parser) findMatchingOpenSquare() int {
@@ -1215,124 +1223,68 @@ func (p *parser) params() (S, error) {
 		return p.mk("array", openTok, p.i-1), nil
 	}
 
-	var entries []any
-	pending := "" // PRE text accumulated from interstitial gaps to apply to next param's VALUE
+	// Guard: preserve the same diagnostic if a non-element appears before ')'.
+	switch p.peek().Type {
+	case ANNOTATION, NOOP, RROUND, ID, EOF:
+	default:
+		g := p.peek()
+		line, col := p.posAtByte(g.StartByte)
+		return nil, &Error{Kind: DiagParse, Msg: "expected ')' after parameters", Line: line, Col: col}
+	}
 
-	for {
-		// If we see ')', close list — but first synthesize dangling PRE → annot(noop)
-		if p.peek().Type == RROUND {
-			if pending != "" {
-				child := p.mkLeaf("str", -1, pending)
-				entries = append(entries, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
-				pending = ""
-			}
-			break
-		}
-
-		// Guard: if the next token cannot start a parameter element,
-		// the parameter list wasn't properly closed. Emit the canonical
-		// "expected ')' after parameters" at the unexpected token.
-		switch p.peek().Type {
-		case ANNOTATION, NOOP, RROUND:
-			// handled by branches above
-		case ID:
-			// valid start of a parameter; continue to parse it
-		case EOF:
-			// Delegate to need(...) so interactive mode yields DiagIncomplete.
-			if _, err := p.need(RROUND, "expected ')' after parameters"); err != nil {
-				return nil, err
-			}
-			// Unreachable: need() always returns an error here.
-		default:
-			g := p.peek()
-			line, col := p.posAtByte(g.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "expected ')' after parameters", Line: line, Col: col}
-		}
-
-		// Inter-entry gap handling:
-		switch p.peek().Type {
-		case ANNOTATION:
-			// PRE stacks in pending; do NOT skip NOOPs here — a NOOP would break PRE and be emitted.
-			pending = joinNonEmpty(pending, p.collectAnnots())
-			continue
-		case NOOP:
-			// If we had pending PRE, it attaches to a NOOP first (annot(noop)); then emit the NOOP itself.
-			if pending != "" {
-				child := p.mkLeaf("str", -1, pending)
-				entries = append(entries, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
-				pending = ""
-				// consume the NOOP we just wrapped
-				p.i++
-				continue
-			}
-			entries = append(entries, p.mkLeaf("noop", p.i))
-			p.i++
-			continue
-		}
-
-		// --- Parse one parameter element ---
-		elemStartTok := p.i
-
-		// Name
-		idTok, err := p.need(ID, "expected parameter name")
-		if err != nil {
-			return nil, err
-		}
-		idIdx := p.i - 1
-		nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
-
-		// Optional ':' type
-		var val S
-		if p.match(COLON) {
-			// Ignore NOOPs local to the type site
-			for !p.atEnd() && p.peek().Type == NOOP {
-				p.i++
-			}
-			bTxt := p.collectAnnots() // B
-			if err := p.needExprAfter(p.prev(), "expected type after ':'"); err != nil {
-				return nil, err
-			}
-			tExpr, err := p.expr(0)
+	entries, _, closeTok, err := p.bracketed(
+		RROUND, "expected ')' after parameters",
+		func(pendingPRE string) (S, int, error) {
+			elemStartTok := p.i
+			// Name
+			idTok, err := p.need(ID, "expected parameter name")
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
-			// Merge A(pending) + B + C + D onto VALUE
-			val = p.normalizeABCDText(pending, bTxt, tExpr)
-			pending = ""
-		} else {
-			// No explicit type → implicit Any; merge pending onto it.
-			base := p.mkLeaf("id", -1, "Any")
-			val = p.attachAnnot(base, pending)
-			pending = ""
-		}
+			idIdx := p.i - 1
+			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
 
-		pair := p.mk("pair", elemStartTok, p.i-1, nameLeaf, val)
-		entries = append(entries, pair)
-
-		// Optional comma; POST-after-comma attaches back ONLY if same line as the comma.
-		if p.match(COMMA) {
-			comma := p.prev()
-			if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
-				// Attach to this pair's VALUE (normalization at binding site!)
-				last := entries[len(entries)-1].(S)
-				if len(last) >= 3 {
-					v := last[2].(S)
-					last[2] = p.attachAnnot(v, txt)
-					entries[len(entries)-1] = last
+			// Optional ':' type
+			var val S
+			if p.match(COLON) {
+				// Ignore NOOPs local to the type site; collect B right after ':'
+				for !p.atEnd() && p.peek().Type == NOOP {
+					p.i++
 				}
+				bTxt := p.collectAnnots() // B
+				if err := p.needExprAfter(p.prev(), "expected type after ':'"); err != nil {
+					return nil, 0, err
+				}
+				tExpr, err := p.expr(0)
+				if err != nil {
+					return nil, 0, err
+				}
+				// Merge A(pending) + B + C + D onto VALUE
+				val = p.normalizeABCDText(pendingPRE, bTxt, tExpr)
+			} else {
+				// No explicit type → implicit Any; merge pending onto it.
+				base := p.mkLeaf("id", -1, "Any")
+				val = p.attachAnnot(base, pendingPRE)
 			}
-			// allow trailing comma — loop continues until we hit ')'
-			continue
-		}
 
-		// No comma; next token should be ')' or gap (handled at top of loop).
+			return p.mk("pair", elemStartTok, p.i-1, nameLeaf, val), 0, nil
+		},
+		func(last S, _ Token, txt string) S {
+			// POST-after-comma must attach to the pair's VALUE (not the pair node).
+			// last is the ("pair", name, value) we just appended.
+			if len(last) >= 3 {
+				v := last[2].(S)
+				last[2] = p.attachAnnot(v, txt)
+				return last
+			}
+			// Fallback (shouldn't happen for well-formed pairs)
+			return p.attachAnnot(last, txt)
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
-
-	// Final closer
-	if _, perr := p.need(RROUND, "expected ')' after parameters"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("array", openTok, p.i-1, entries...), nil
+	return p.mk("array", openTok, closeTok, entries...), nil
 }
 
 func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
@@ -1341,115 +1293,54 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 		return p.mk("map", openTok, p.i-1), nil
 	}
 
-	isClose := func(tt TokenType) bool { return tt == RCURLY }
-	readKey := func() (S, int, bool, error) {
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, 0, false, err
-		}
-		keyStartTok := p.lastSpanStartTok
-		req := p.match(BANG)
-		return k, keyStartTok, req, nil
-	}
-	parseVal := func() (S, int, error) {
-		p.skipNoops()
-		v, err := p.expr(0)
-		if err != nil {
-			return nil, 0, err
-		}
-		return v, 0, nil
-	}
+	pairs, _, closeTok, err := p.bracketed(
+		RCURLY, "expected '}'",
+		func(pendingPRE string) (S, int, error) {
+			startTok := p.i
+			// Key (may have its own PRE; do not attach PRE to the key)
+			k, err := p.readKeyString()
+			if err != nil {
+				return nil, 0, err
+			}
+			baseKey, aTxt, _ := unwrapAnnot(k)
+			k = baseKey
 
-	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
+			req := p.match(BANG)
+			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+				return nil, 0, err
+			}
+
+			// B immediately after ':'
+			bTxt := p.collectAnnots()
+			p.skipNoops()
+			v, err := p.expr(0)
+			if err != nil {
+				return nil, 0, err
+			}
+
+			// Merge pending PRE + A(from key) + B + C + D onto VALUE
+			val := p.normalizeABCDText(joinNonEmpty(pendingPRE, aTxt), bTxt, v)
+
+			tag := "pair"
+			if req {
+				tag = "pair!"
+			}
+			return p.mk(tag, startTok, p.i-1, k, val), 0, nil
+		},
+		func(last S, _ Token, txt string) S {
+			// POST-after-comma attaches to VALUE
+			if len(last) >= 3 {
+				v := last[2].(S)
+				last[2] = p.attachAnnot(v, txt)
+				return last
+			}
+			return p.attachAnnot(last, txt)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.drainTrailingGapsUntil(RCURLY, "expected '}'", &pairs); err != nil {
-		return nil, err
-	}
-	if _, perr := p.need(RCURLY, "expected '}'"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("map", openTok, p.i-1, pairs...), nil
-
-}
-
-// parseKVPairs honors the same adjacency rules as parseCommaList.
-// Interstitial ANNOTATION/NOOP between pairs are emitted (PRE→next value unless broken by NOOP).
-// POST-after-value and POST-after-comma are same-line only.
-// Dangling PRE before '}' → annot(NOOP).
-func (p *parser) parseKVPairs(
-	isClose func(TokenType) bool,
-	readKey func() (key S, keyStartTok int, required bool, err error),
-	parseValue func() (val S, valStartTok int, err error),
-) ([]any, error) {
-	var pairs []any
-	pending := ""
-
-	for {
-		// Close (emit dangling PRE)
-		if isClose(p.peek().Type) {
-			if pending != "" {
-				child := p.mkLeaf("str", -1, pending)
-				pairs = append(pairs, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
-				pending = ""
-			}
-			break
-		}
-
-		// Interstitial gap
-		if p.takeGap(&pending, &pairs) {
-			continue
-		}
-
-		// Key
-		startTok := p.i
-		k, _, req, err := readKey()
-		if err != nil {
-			return nil, err
-		}
-		baseKey, aTxt, _ := unwrapAnnot(k) // A
-		k = baseKey
-
-		if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-			return nil, err
-		}
-
-		// B (after ':', no NOOP skipping here)
-		bTxt := p.collectAnnots()
-		// Value
-		v, _, err := parseValue()
-		if err != nil {
-			return nil, err
-		}
-		// Merge pending PRE + A(from key) + B + C + D
-		val := p.normalizeABCDText(joinNonEmpty(pending, aTxt), bTxt, v)
-		pending = ""
-
-		tag := "pair"
-		if req {
-			tag = "pair!"
-		}
-		pr := p.mk(tag, startTok, p.i-1, k, val)
-		pairs = append(pairs, pr)
-
-		// Optional comma; POST-after-comma same-line only, attaches back to this pair's value
-		if p.match(COMMA) {
-			comma := p.prev()
-			if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
-				last := pairs[len(pairs)-1].(S)
-				if len(last) >= 3 {
-					v := last[2].(S)
-					last[2] = p.attachAnnot(v, txt)
-					pairs[len(pairs)-1] = last
-				}
-			}
-			// Next-line annotations become PRE via the next loop (takeGap).
-			continue
-		}
-		break
-	}
-	return pairs, nil
+	return p.mk("map", openTok, closeTok, pairs...), nil
 }
 
 // ───────────────────────── control / loops / if ───────────────────────────
@@ -1754,28 +1645,25 @@ func (p *parser) arrayDeclPattern() (S, error) {
 		return p.mk("darr", openTok, p.i-1), nil
 	}
 
-	parts, err := p.parseCommaList(
-		func(tt TokenType) bool { return tt == RSQUARE },
-		func() (S, int, error) {
+	parts, _, closeTok, err := p.bracketed(
+		RSQUARE, "expected ']' in array pattern",
+		func(pending string) (S, int, error) {
 			p.skipNoops()
 			pt, err := p.declPattern()
 			if err != nil {
 				return nil, 0, err
 			}
+			if pending != "" {
+				pt = p.attachAnnot(pt, pending)
+			}
 			return pt, 0, nil
 		},
+		nil, // POST-after-comma attaches to the element itself
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.drainTrailingGapsUntil(RSQUARE, "expected ']' in array pattern", &parts); err != nil {
-		return nil, err
-	}
-	if _, perr := p.need(RSQUARE, "expected ']' in array pattern"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("darr", openTok, p.i-1, parts...), nil
-
+	return p.mk("darr", openTok, closeTok, parts...), nil
 }
 
 func (p *parser) objectDeclPattern() (S, error) {
@@ -1785,36 +1673,46 @@ func (p *parser) objectDeclPattern() (S, error) {
 		return p.mk("dobj", openTok, p.i-1), nil
 	}
 
-	isClose := func(tt TokenType) bool { return tt == RCURLY }
-	readKey := func() (S, int, bool, error) {
-		k, err := p.readKeyString()
-		if err != nil {
-			return nil, 0, false, err
-		}
-		return k, p.lastSpanStartTok, false, nil
-	}
-	parseVal := func() (S, int, error) {
-		p.skipNoops()
-		pt, err := p.declPattern()
-		if err != nil {
-			return nil, 0, err
-		}
-		return pt, 0, nil
-	}
+	pairs, _, closeTok, err := p.bracketed(
+		RCURLY, "expected '}' in object pattern",
+		func(pendingPRE string) (S, int, error) {
+			startTok := p.i
+			k, err := p.readKeyString()
+			if err != nil {
+				return nil, 0, err
+			}
+			baseKey, aTxt, _ := unwrapAnnot(k)
+			k = baseKey
 
-	pairs, err := p.parseKVPairs(isClose, readKey, parseVal)
+			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+				return nil, 0, err
+			}
+			// B after ':'
+			bTxt := p.collectAnnots()
+			p.skipNoops()
+			pt, err := p.declPattern()
+			if err != nil {
+				return nil, 0, err
+			}
+
+			// Merge pending PRE + A(from key) + B + C + D onto VALUE
+			val := p.normalizeABCDText(joinNonEmpty(pendingPRE, aTxt), bTxt, pt)
+			return p.mk("pair", startTok, p.i-1, k, val), 0, nil
+		},
+		func(last S, _ Token, txt string) S {
+			// POST-after-comma attaches to VALUE
+			if len(last) >= 3 {
+				v := last[2].(S)
+				last[2] = p.attachAnnot(v, txt)
+				return last
+			}
+			return p.attachAnnot(last, txt)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := p.drainTrailingGapsUntil(RCURLY, "expected '}' in object pattern", &pairs); err != nil {
-		return nil, err
-	}
-	if _, perr := p.need(RCURLY, "expected '}' in object pattern"); perr != nil {
-		return nil, perr
-	}
-	return p.mk("dobj", openTok, p.i-1, pairs...), nil
-
+	return p.mk("dobj", openTok, closeTok, pairs...), nil
 }
 
 // readKeyString allows stacked PRE-annotations (handled recursively).

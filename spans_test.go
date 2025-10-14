@@ -64,52 +64,51 @@ func Test_Spans_DeclPatterns(t *testing.T) {
 // let
 // #p
 // [x, y] = v
-// Covers: PRE-annotation wrapper in pattern contexts.
-// NOTE: PRE-annotation must be on its own line, otherwise it captures the rest of that line.
+// After normalization: LHS is bare pattern; RHS value carries #p.
 func Test_Spans_PatternPreAnnotation(t *testing.T) {
 	src := "let\n#p\n[x, y] = v"
 	_, idx := mustParseWithSpansMS(t, src)
 
-	// LHS of the assign is the annotated pattern
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "#p\n[x, y]")
+	// LHS of the assign is just the pattern (no annot wrapper).
+	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "[x, y]")
 
-	//   child ("str","p") — the annotation token slice
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "#p")
+	// Inner decls "x" and "y".
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "x")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "y")
 
-	//   wrapped pattern "[x, y]"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "[x, y]")
-
-	//     inner decls "x" and "y"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "x")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "y")
+	// RHS value node spans the value itself; its child 0 is the annot text.
+	assertSpanTextMS(t, idx, NodePath{0, 1}, src, "v")
+	assertSpanTextMS(t, idx, NodePath{0, 1, 0}, src, "#p")
+	// Wrapped value leaf (under annot) is still "v".
+	assertSpanTextMS(t, idx, NodePath{0, 1, 1}, src, "v")
 }
 
 // {
 // #A
 // k: 1
 // }
-// Covers: PRE-annotation in key position (readKeyString recursion): ("annot", ("str","#A"), ("str","k"))
-// NOTE: annotation on its own line so it doesn't swallow the key.
+// After normalization: key is bare "k"; value carries #A.
+// The pair's span starts at the pre-annotation.
 func Test_Spans_KeyPreAnnotation(t *testing.T) {
 	src := "{\n#A\nk: 1\n}"
 	_, idx := mustParseWithSpansMS(t, src)
 
-	// Whole map
+	// Whole map unchanged.
 	assertSpanTextMS(t, idx, NodePath{0}, src, "{\n#A\nk: 1\n}")
 
-	// The only pair spans from annotation through value
+	// Pair spans from the annotation through the value.
 	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "#A\nk: 1")
 
-	//   key is an ("annot", ("str","#A"), ("str","k")) → spans "#A\nk"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "#A\nk")
-	//     child annotation text ("str","#A")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0}, src, "#A")
-	//     base key ("str","k")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1}, src, "k")
+	// Key is just "k" (no annot wrapper on the key).
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "k")
 
-	//   value "1"
+	// Value node span is the literal; its child 0 is the annot text.
 	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "1")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "#A")
+	// Wrapped value leaf (under annot) is still "1".
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "1")
 }
+
 func Test_Spans_Module_Whole_And_Parts(t *testing.T) {
 	src := `module "M" do let x = 1 end`
 	_, idx := mustParseWithSpansMS(t, src)

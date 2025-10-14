@@ -847,7 +847,6 @@ func (p *parser) expr(minBP int) (S, error) {
 					}
 
 					left = p.mk("assign", -1, -1, lhs, rhs)
-					leftStartTok = tokIndexOfThis
 					return left, nil
 				}
 			}
@@ -879,7 +878,6 @@ func (p *parser) expr(minBP int) (S, error) {
 				child := p.mkLeaf("str", -1, txt)
 				left = p.mk("annot", -1, -1, child, operand)
 			}
-			leftStartTok = tokIndexOfThis
 			return left, nil
 
 		default:
@@ -1537,29 +1535,37 @@ func (p *parser) optionalArrowType(incMsg string) (S, error) {
 	return p.mkLeaf("id", -1, "Any"), nil // single synthetic node
 }
 
+// Small shared header for fun/oracle: params + optional arrow type
+type fnHeader struct{ params, arrow S }
+
+func (p *parser) parseFnHeader(kind string) (fnHeader, error) {
+	ps, err := p.params()
+	if err != nil {
+		return fnHeader{}, err
+	}
+	msg := "expected return type after '->'"
+	if kind == "oracle" {
+		msg = "expected output type after '->'"
+	}
+	ar, err := p.optionalArrowType(msg)
+	return fnHeader{ps, ar}, err
+}
+
 func (p *parser) funExpr(openTok int) (S, int, error) {
-	params, err := p.params()
+	h, err := p.parseFnHeader("fun")
 	if err != nil {
 		return nil, 0, err
 	}
-	ret, err := p.optionalArrowType("expected return type after '->'")
+	body, err := p.parseBlock(true)
 	if err != nil {
 		return nil, 0, err
 	}
-	body, perr := p.parseBlock(true)
-	if perr != nil {
-		return nil, 0, perr
-	}
-	node := p.mk("fun", openTok, p.i-1, params, ret, body)
+	node := p.mk("fun", openTok, p.i-1, h.params, h.arrow, body)
 	return node, p.i - 1, nil
 }
 
 func (p *parser) oracleExpr(openTok int) (S, int, error) {
-	params, err := p.params()
-	if err != nil {
-		return nil, 0, err
-	}
-	out, err := p.optionalArrowType("expected output type after '->'")
+	h, err := p.parseFnHeader("oracle")
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1576,7 +1582,7 @@ func (p *parser) oracleExpr(openTok int) (S, int, error) {
 	} else {
 		src = p.mk("array", -1, -1) // build only when needed
 	}
-	body := p.mk("oracle", openTok, p.i-1, params, out, src)
+	body := p.mk("oracle", openTok, p.i-1, h.params, h.arrow, src)
 	return body, p.i - 1, nil
 }
 

@@ -418,6 +418,31 @@ func (p *parser) attachAnnot(val S, text string) S {
 	return p.mk("annot", -1, -1, child, val)
 }
 
+// ───────────────────── centralized A+B+C+D normalization ─────────────────────
+// A: PRE from the "left" side (e.g., LHS annot, key annot, pending PRE)
+// B: annotations immediately after the binding site token (e.g., '=' or ':')
+// C: PRE already on the parsed right/value node
+// D: annotations immediately following the right/value node (same adjacency rule as parser)
+//
+// Note: these helpers do not emit spans themselves, except via attachAnnot(),
+// which appends exactly one wrapper span (tok=-1) — preserving the post-order invariant.
+func (p *parser) normalizeABCDForAssign(left S, bTxt string, right S) (cleanLeft S, normRight S) {
+	cleanLeft, aTxt, _ := unwrapAnnot(left)        // A
+	baseRight, cTxt, _ := unwrapAnnot(right)       // C
+	dTxt := p.collectAnnots()                      // D
+	merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt) // A+B+C+D
+	return cleanLeft, p.attachAnnot(baseRight, merged)
+}
+
+// Same as above, but A is provided as free text (used for params and map/object pairs,
+// where A comes from "pending PRE" and/or key annotations rather than a left node).
+func (p *parser) normalizeABCDText(aTxt, bTxt string, right S) S {
+	baseRight, cTxt, _ := unwrapAnnot(right)       // C
+	dTxt := p.collectAnnots()                      // D
+	merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt) // A+B+C+D
+	return p.attachAnnot(baseRight, merged)
+}
+
 // ───────────────────────── program / blocks ────────────────────────────
 
 func (p *parser) program() (S, error) {
@@ -899,28 +924,18 @@ func (p *parser) expr(minBP int) (S, error) {
 		if err := p.needExprAfter(op, "expected expression after operator"); err != nil {
 			return nil, err
 		}
-		// === ASSIGN normalization with A+B+C+D merge ===
-		// A: PRE on LHS site → collected from 'left' by unwrapping.
-		// B: annotations immediately after '=' (any count) → collectAnnots.
-		// C: PRE on RHS value (unwrap from parsed node).
-		// D: trailing annotations after the RHS (and after a trailing comma in lists) → collectAnnots.
+		// For ASSIGN, capture B *before* parsing RHS; other ops parse normally.
+		bTxt := ""
+		if op.Type == ASSIGN {
+			bTxt = p.collectAnnots() // B (do NOT skip NOOPs)
+		}
 		rightParsed, err := p.expr(nextBP)
 		if err != nil {
 			return nil, err
 		}
-
 		endTok := p.lastSpanEndTok
 		if op.Type == ASSIGN {
-			// A
-			cleanLeft, aTxt, _ := unwrapAnnot(left)
-			// B (after '=') — do NOT skip NOOPs; blank line breaks adjacency
-			bTxt := p.collectAnnots()
-			// C (unwrap from RHS)
-			baseRight, cTxt, _ := unwrapAnnot(rightParsed)
-			// D (after RHS and optional trailing comma in lists) — do NOT skip NOOPs
-			dTxt := p.collectAnnots()
-			merged := joinNonEmpty(aTxt, bTxt, cTxt, dTxt)
-			normRight := p.attachAnnot(baseRight, merged)
+			cleanLeft, normRight := p.normalizeABCDForAssign(left, bTxt, rightParsed)
 			left = p.mk("assign", leftStartTok, endTok, cleanLeft, normRight)
 		} else {
 			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, rightParsed)
@@ -1269,14 +1284,11 @@ func (p *parser) params() (S, error) {
 		// Optional ':' type
 		var val S
 		if p.match(COLON) {
-			// B: annotations immediately after ':' (do not cross a NOOP boundary).
-			// We ignore NOOPs *between* ':' and the type — see tests expecting that.
+			// Ignore NOOPs local to the type site
 			for !p.atEnd() && p.peek().Type == NOOP {
-				p.i++ // ignore NOOPs local to the type site
+				p.i++
 			}
-			bTxt := p.collectAnnots()
-
-			// Type expression
+			bTxt := p.collectAnnots() // B
 			if err := p.needExprAfter(p.prev(), "expected type after ':'"); err != nil {
 				return nil, err
 			}
@@ -1284,18 +1296,8 @@ func (p *parser) params() (S, error) {
 			if err != nil {
 				return nil, err
 			}
-
-			// C: unwrap PRE already on the parsed type
-			baseT, cTxt, _ := unwrapAnnot(tExpr)
-
-			// D: same-line POST after the type (before optional comma) attaches back
-			dTxt := ""
-			if p.lastSpanEndTok >= 0 {
-				dTxt = p.takeSameLineAnnots(p.toks[p.lastSpanEndTok].Line)
-			}
-
-			// Merge pending (PRE from gap) + B + C + D onto VALUE
-			val = p.attachAnnot(baseT, joinNonEmpty(pending, bTxt, cTxt, dTxt))
+			// Merge A(pending) + B + C + D onto VALUE
+			val = p.normalizeABCDText(pending, bTxt, tExpr)
 			pending = ""
 		} else {
 			// No explicit type → implicit Any; merge pending onto it.
@@ -1413,24 +1415,15 @@ func (p *parser) parseKVPairs(
 			return nil, err
 		}
 
-		// B (after ':', no NOOP skipping)
+		// B (after ':', no NOOP skipping here)
 		bTxt := p.collectAnnots()
-
 		// Value
 		v, _, err := parseValue()
 		if err != nil {
 			return nil, err
 		}
-		baseVal, cTxt, _ := unwrapAnnot(v) // C
-
-		// D = same-line POST after value (before optional comma)
-		dTxt := ""
-		if p.lastSpanEndTok >= 0 {
-			dTxt = p.takeSameLineAnnots(p.toks[p.lastSpanEndTok].Line)
-		}
-
-		// Merge pending PRE + A + B + C + D
-		val := p.attachAnnot(baseVal, joinNonEmpty(pending, aTxt, bTxt, cTxt, dTxt))
+		// Merge pending PRE + A(from key) + B + C + D
+		val := p.normalizeABCDText(joinNonEmpty(pending, aTxt), bTxt, v)
 		pending = ""
 
 		tag := "pair"

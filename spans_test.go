@@ -151,3 +151,27 @@ func Test_Spans_PropertyAfterDot_ModuleKeyword(t *testing.T) {
 	//   property name ("str") — taken from the ID token after '.'
 	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `module`)
 }
+
+func Test_Spans_Assign_AB_AnchorsToB(t *testing.T) {
+	// A before target, B after '=', then value
+	src := "#A\nlet x =\n#B\n42"
+	_, idx := mustParseWithSpansMS(t, src)
+
+	// RHS is ("annot", ("str", "#A\n#B"), ("int", 42))
+	// Child 0 span should anchor to the nearest source-backed contributor (here B).
+	// That’s the "#B" line.
+	// Find the assign root: ("assign" ("decl" "x") <rhs>)
+	// Path {0,1,0} → RHS annot child "str"
+	assertSpanTextMS(t, idx, NodePath{0, 1, 0}, src, "#B")
+}
+
+func Test_Spans_MapValue_BD_AnchorsToD(t *testing.T) {
+	// Map with B after colon, D after value (same-line ok)
+	src := "{ k: \n#B\n1 #D\n }"
+	_, idx := mustParseWithSpansMS(t, src)
+
+	// Pair is ("pair", "k", ("annot", ("str", "#B\n#D"), ("int", 1)))
+	// Child 0 under value should anchor to D (nearest).
+	// Path: root map {0}, first pair {0,0}, value {0,0,1}, child {0,0,1,0}
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "#D")
+}

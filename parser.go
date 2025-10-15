@@ -462,7 +462,16 @@ func (p *parser) attachAnnotFrom(src annSrc, val S) S {
 	if endTok < 0 {
 		endTok = baseEndTok
 	}
+	// 1) Append child span.
 	child := p.mk("str", startTok, endTok, childText)
+
+	// 2) Reorder spans to match post-order of the *final* AST subtree:
+	// We just appended: [..., base, child]. The post-order under ("annot", child, base)
+	// must be: child, base, wrapper. Swap the last two so it becomes [..., child, base].
+	if n := len(p.post); n >= 2 {
+		p.post[n-2], p.post[n-1] = p.post[n-1], p.post[n-2]
+		// Do not touch lastSpanStartTok/EndTok; wrapper uses the base snapshot we captured.
+	}
 	// Wrapper inherits the *base's* span snapshot.
 	return p.mk("annot", baseStartTok, baseEndTok, child, base)
 }

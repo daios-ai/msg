@@ -367,40 +367,25 @@ func (p *parser) collectAnnots() string {
 	return joinNonEmpty(parts...)
 }
 
-// attachInlineTrailingAnnots attaches only the trailing ANNOTATION tokens that
-// start on the *same line* as the end of the node most recently parsed.
-// Own-line annotations (on later lines) are left for the next parse step
-// (so they bind forward or wrap a NOOP).
-func (p *parser) attachInlineTrailingAnnots(e S) S {
-	if p.atEnd() || p.peek().Type != ANNOTATION || p.lastSpanEndTok < 0 {
-		return e
-	}
-	endTok := p.lastSpanEndTok
-	if endTok >= len(p.toks) {
-		return e
-	}
-	// Never POST onto a NOOP (blank-line statement).
-	if p.toks[endTok].Type == NOOP {
-		return e
+// attachSameLineAnnots consumes one or more *single-line* ANNOTATION tokens
+// that start on the specified reference line and attaches the merged text to n.
+func (p *parser) attachSameLineAnnots(n S, refLine int) S {
+	if p.atEnd() || p.peek().Type != ANNOTATION {
+		return n
 	}
 	var parts []string
-	for !p.atEnd() && p.peek().Type == ANNOTATION {
-		// Only single-line annotations may be POST.
-		s, ok := p.peek().Literal.(string)
-		if !ok || s == "" || strings.Contains(s, "\n") {
-			break
+	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == refLine {
+		if s, ok := p.peek().Literal.(string); ok && s != "" && !strings.Contains(s, "\n") {
+			parts = append(parts, s)
+			p.i++ // consume this same-line annotation
+			continue
 		}
-		// Must be truly same line: no newline between previous node end and annot start.
-		if strings.Contains(p.src[p.toks[endTok].EndByte:p.peek().StartByte], "\n") {
-			break
-		}
-		parts = append(parts, s)
-		p.i++ // consume ANNOTATION
+		break
 	}
 	if len(parts) == 0 {
-		return e
+		return n
 	}
-	return p.attachAnnot(e, joinNonEmpty(parts...))
+	return p.attachAnnot(n, joinNonEmpty(parts...))
 }
 
 // Merge text onto a value as a PRE-style annot (single representation in AST).
@@ -525,49 +510,6 @@ func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
 
 // ---- tiny shared helpers for delimited lists ----
 
-// Consume gap tokens between elements/pairs.
-// - Merges ANNOTATIONs into pending PRE text.
-// - Emits NOOPs (and annot(NOOP) if PRE was pending) into out.
-// Returns true if it consumed something (caller should continue the loop).
-func (p *parser) takeGap(pending *string, out *[]any) bool {
-	switch p.peek().Type {
-	case ANNOTATION:
-		*pending = joinNonEmpty(*pending, p.collectAnnots())
-		return true
-	case NOOP:
-		if *pending != "" {
-			child := p.mkLeaf("str", -1, *pending)
-			*out = append(*out, p.mk("annot", -1, -1, child, p.mkLeaf("noop", -1)))
-			*pending = ""
-			p.i++ // consume the NOOP we wrapped
-			return true
-		}
-		*out = append(*out, p.mkLeaf("noop", p.i))
-		p.i++
-		return true
-	default:
-		return false
-	}
-}
-
-// Collect same-line annotations as a merged string (without attaching).
-// Useful for strict A→B→C→D ordering in maps; pass the reference line.
-func (p *parser) takeSameLineAnnots(line int) string {
-	if p.atEnd() {
-		return ""
-	}
-	if p.peek().Type != ANNOTATION || p.peek().Line != line {
-		return ""
-	}
-	// Consume exactly one same-line annotation token.
-	tok := p.peek()
-	p.i++
-	if s, ok := tok.Literal.(string); ok && s != "" {
-		return s
-	}
-	return ""
-}
-
 // drainTrailingGapsUntil consumes any sequence of NOOPs and/or ANNOTATIONs
 // until the given closing token is seen. Each NOOP becomes ("noop") and each
 // annotation becomes ("annot", ("str", mergedText), ("noop")).
@@ -678,20 +620,18 @@ func (p *parser) expr(minBP int) (S, error) {
 			leftStartTok = tokIndexOfThis
 
 		case FUNCTION:
-			fn, endTok, err := p.funExpr(tokIndexOfThis)
+			fn, err := p.funExpr(tokIndexOfThis)
 			if err != nil {
 				return nil, err
 			}
-			_ = endTok
 			left = fn
 			leftStartTok = tokIndexOfThis
 
 		case ORACLE:
-			orc, endTok, err := p.oracleExpr(tokIndexOfThis)
+			orc, err := p.oracleExpr(tokIndexOfThis)
 			if err != nil {
 				return nil, err
 			}
-			_ = endTok
 			left = orc
 			leftStartTok = tokIndexOfThis
 
@@ -756,7 +696,7 @@ func (p *parser) expr(minBP int) (S, error) {
 				return nil, err
 			}
 			left = pat
-			base := unwrapAnnots(pat)
+			base, _, _ := unwrapAnnot(pat)
 			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
 				j := p.i
 				for j < len(p.toks) && p.toks[j].Type == ANNOTATION {
@@ -945,7 +885,12 @@ func (p *parser) expr(minBP int) (S, error) {
 	// This ensures `… * (8 # note)` doesn't consume `# note` inside the RHS,
 	// allowing the outer expression to wrap the whole `(4+5)*8`.
 	if minBP == 0 {
-		left = p.attachInlineTrailingAnnots(left)
+		if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
+			// Never POST onto a NOOP (blank-line statement).
+			if p.toks[p.lastSpanEndTok].Type != NOOP {
+				left = p.attachSameLineAnnots(left, p.toks[p.lastSpanEndTok].Line)
+			}
+		}
 	}
 	return left, nil
 }
@@ -1051,8 +996,8 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			n := p.mk("idx", leftStartTok, intTok, left, intNode)
 			return n, true, nil
 		}
-		// .id / ."str" -> get
-		if p.match(ID) || p.match(STRING) {
+		// .id or coerced quoted-name -> get
+		if p.match(ID) {
 			propTok := p.i - 1
 			prop := p.mkLeaf("str", propTok, tokText(p.prev()))
 			n := p.mk("get", leftStartTok, propTok, left, prop)
@@ -1132,12 +1077,11 @@ func (p *parser) bracketed(
 		}
 		// POST right after element (same line only)
 		if end := p.lastSpanEndTok; end >= 0 {
-			if t := p.takeSameLineAnnots(p.toks[end].Line); t != "" {
-				elem = p.attachAnnot(elem, t)
+			if end < len(p.toks) {
+				elem = p.attachSameLineAnnots(elem, p.toks[end].Line)
 			}
 		}
-		// Clear pending PRE — responsibility is with parseElem.
-		pending = ""
+		pending = "" // Clear pending PRE — responsibility is with parseElem.
 
 		out = append(out, elem)
 
@@ -1146,16 +1090,15 @@ func (p *parser) bracketed(
 			break
 		}
 		comma := p.prev()
-		// POST-after-comma (same line) — caller decides where to attach it
-		if txt := p.takeSameLineAnnots(comma.Line); txt != "" {
-			last := out[len(out)-1].(S)
-			if onCommaPost != nil {
-				last = onCommaPost(last, comma, txt)
-			} else {
-				last = p.attachAnnot(last, txt)
-			}
-			out[len(out)-1] = last
+		// POST-after-comma (same line) — caller decides where to attach it.
+		// The hook should call attachSameLineAnnots on the proper sub-node.
+		last := out[len(out)-1].(S)
+		if onCommaPost != nil {
+			last = onCommaPost(last, comma, "")
+		} else {
+			last = p.attachSameLineAnnots(last, comma.Line)
 		}
+		out[len(out)-1] = last
 	}
 
 	// Drain trailing gaps before closer (NOOP/ANNOTATION), then require closer.
@@ -1190,19 +1133,6 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 		return nil, err
 	}
 	return p.mk("array", openTok, closeTok, items...), nil
-}
-
-func (p *parser) findMatchingOpenSquare() int {
-	// Best-effort: previous token (we call right after consuming ']')
-	if p.i-2 >= 0 {
-		// walk back to LSQUARE/CLSQUARE
-		for j := p.i - 2; j >= 0; j-- {
-			if p.toks[j].Type == LSQUARE || p.toks[j].Type == CLSQUARE {
-				return j
-			}
-		}
-	}
-	return p.i - 1
 }
 
 // params parses (CLROUND ... RROUND) parameter pairs; preserves NOOPs and
@@ -1267,16 +1197,17 @@ func (p *parser) params() (S, error) {
 
 			return p.mk("pair", elemStartTok, p.i-1, nameLeaf, val), 0, nil
 		},
-		func(last S, _ Token, txt string) S {
-			// POST-after-comma must attach to the pair's VALUE (not the pair node).
-			// last is the ("pair", name, value) we just appended.
+		func(last S, comma Token, _ string) S {
+			// POST-after-comma must attach to the pair's VALUE (not the pair).
+			// Consume same-line annotations at the comma's line.
 			if len(last) >= 3 {
 				v := last[2].(S)
-				last[2] = p.attachAnnot(v, txt)
+				v = p.attachSameLineAnnots(v, comma.Line)
+				last[2] = v
 				return last
 			}
 			// Fallback (shouldn't happen for well-formed pairs)
-			return p.attachAnnot(last, txt)
+			return p.attachSameLineAnnots(last, comma.Line)
 		},
 	)
 	if err != nil {
@@ -1325,14 +1256,16 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 			}
 			return p.mk(tag, startTok, p.i-1, k, val), 0, nil
 		},
-		func(last S, _ Token, txt string) S {
-			// POST-after-comma attaches to VALUE
+		func(last S, comma Token, _ string) S {
+			// POST-after-comma attaches to VALUE; consume same-line annots.
+
 			if len(last) >= 3 {
 				v := last[2].(S)
-				last[2] = p.attachAnnot(v, txt)
+				v = p.attachSameLineAnnots(v, comma.Line)
+				last[2] = v
 				return last
 			}
-			return p.attachAnnot(last, txt)
+			return p.attachSameLineAnnots(last, comma.Line)
 		},
 	)
 	if err != nil {
@@ -1369,8 +1302,6 @@ func (p *parser) parseControl(t Token, startTok int) (S, error) {
 	}
 
 	// Parse value and attach any adjacent annotations.
-	valStartTok := p.i
-	_ = valStartTok
 	x, err := p.expr(0)
 	if err != nil {
 		return nil, err
@@ -1410,34 +1341,7 @@ func unwrapAnnot(n S) (S, string, bool) {
 	if len(parts) == 0 {
 		return n, "", false
 	}
-	merged := parts[0]
-	for i := 1; i < len(parts); i++ {
-		if parts[i] != "" {
-			if merged == "" {
-				merged = parts[i]
-			}
-			if merged != "" && parts[i] != "" {
-				merged += "\n" + parts[i]
-			}
-		}
-	}
-	return cur, merged, true
-}
-
-func unwrapAnnots(n S) S {
-	cur := n
-	for len(cur) > 0 {
-		tag, _ := cur[0].(string)
-		if tag != "annot" {
-			break
-		}
-		inner, ok := cur[2].(S)
-		if !ok {
-			break
-		}
-		cur = inner
-	}
-	return cur
+	return cur, joinNonEmpty(parts...), true
 }
 
 func (p *parser) ifExpr() (S, error) {
@@ -1551,39 +1455,39 @@ func (p *parser) parseFnHeader(kind string) (fnHeader, error) {
 	return fnHeader{ps, ar}, err
 }
 
-func (p *parser) funExpr(openTok int) (S, int, error) {
+func (p *parser) funExpr(openTok int) (S, error) {
 	h, err := p.parseFnHeader("fun")
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	body, err := p.parseBlock(true)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	node := p.mk("fun", openTok, p.i-1, h.params, h.arrow, body)
-	return node, p.i - 1, nil
+	return node, nil
 }
 
-func (p *parser) oracleExpr(openTok int) (S, int, error) {
+func (p *parser) oracleExpr(openTok int) (S, error) {
 	h, err := p.parseFnHeader("oracle")
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	var src any
 	if p.match(FROM) {
 		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		ex, err := p.expr(0)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		src = ex
 	} else {
 		src = p.mk("array", -1, -1) // build only when needed
 	}
 	body := p.mk("oracle", openTok, p.i-1, h.params, h.arrow, src)
-	return body, p.i - 1, nil
+	return body, nil
 }
 
 // ─────────────────────── declaration patterns (let/for) ───────────────────
@@ -1654,7 +1558,6 @@ func (p *parser) arrayDeclPattern() (S, error) {
 	parts, _, closeTok, err := p.bracketed(
 		RSQUARE, "expected ']' in array pattern",
 		func(pending string) (S, int, error) {
-			p.skipNoops()
 			pt, err := p.declPattern()
 			if err != nil {
 				return nil, 0, err
@@ -1705,14 +1608,15 @@ func (p *parser) objectDeclPattern() (S, error) {
 			val := p.normalizeABCDText(joinNonEmpty(pendingPRE, aTxt), bTxt, pt)
 			return p.mk("pair", startTok, p.i-1, k, val), 0, nil
 		},
-		func(last S, _ Token, txt string) S {
-			// POST-after-comma attaches to VALUE
+		func(last S, comma Token, _ string) S {
+			// POST-after-comma attaches to VALUE; consume same-line annots.
 			if len(last) >= 3 {
 				v := last[2].(S)
-				last[2] = p.attachAnnot(v, txt)
+				v = p.attachSameLineAnnots(v, comma.Line)
+				last[2] = v
 				return last
 			}
-			return p.attachAnnot(last, txt)
+			return p.attachSameLineAnnots(last, comma.Line)
 		},
 	)
 	if err != nil {

@@ -369,7 +369,7 @@ func (e *Env) Define(name string, v Value) {
 func (e *Env) Set(name string, v Value) error {
 	// Disallow assignment to language-level builtins (even if not present in envs).
 	if isBuiltinTypeAtom(name) {
-		return fmt.Errorf("cannot assign to type atom/contructor: %s", name)
+		return fmt.Errorf("cannot assign to type atom/constructor: %s", name)
 	}
 	if _, ok := e.table[name]; ok {
 		e.table[name] = v

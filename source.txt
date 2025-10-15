@@ -1,345 +1,2661 @@
-=== BEGIN FILE: spans.go ===
-// spans.go — Sidecar spans for MindScript ASTs (S-expressions)
+=== BEGIN FILE: printer.go ===
+// printer.go: pretty-printers for MindScript ASTs, types, and runtime values.
 //
-// WHAT THIS MODULE DOES
-// =====================
-// This module provides a tiny, non-invasive mechanism to associate **source-code
-// byte spans** with nodes of a MindScript AST (encoded as the S-expression type
-// `S` from parser.go) **without modifying the AST itself**.
+// What this file does
+// -------------------
+// This module provides the formatting layer for MindScript. It renders three
+// kinds of data to human-readable, stable strings:
 //
-// The spans are modeled as half-open byte intervals `[StartByte, EndByte)`
-// relative to the original UTF-8 source. Line/column coordinates are intentionally
-// omitted here to keep the structure minimal; callers can derive them on demand
-// from the original source text.
+//  1. Parsed source ASTs (S-expressions) → MindScript source code.
+//     - Entry points: Pretty, Standardize, FormatSExpr.
+//     - Produces whitespace- and newline-stable output with minimal
+//     parentheses, based on operator precedence. It understands all
+//     statement and expression tags emitted by the parser (e.g. "fun",
+//     "oracle", "for", "if/elif/else", "type", "block", "assign",
+//     "return/break/continue", arrays, maps, calls, indexing, properties,
+//     unary and binary operators).
+//     - Annotation nodes use the simplified 3-ary form:
+//     ("annot", ("str", textOr<text>), wrappedNode)
+//     PRE annotations are stored as-is (text); POST annotations are encoded
+//     by a leading "<" in the stored text. PRE annotations print as `# ...`
+//     lines immediately above the construct; POST annotations print as a
+//     trailing `# ...` inline comment on the same line as the construct.
+//     **Important (POST semantics):**
+//     • POST captures the rest of the current line and therefore *forces a newline*.
+//     • In comma/colon separated contexts, POST attaches **after the separator**:
+//     - For comma-separated lists (arrays, enums, destructuring arrays, value arrays):
+//     the POST prints *after the comma that follows the element* (or after the
+//     element itself if it is the last one).
+//     Example:
+//     [ 1, # post
+//     2 ]
+//     - For maps/object patterns/type maps: POST on a **key** prints after the colon
+//     on the key line (`key: # post`), while POST on a **value** of a non-last
+//     entry prints after the following comma (`key: value, # post`).
+//     Printers account for this and avoid emitting an extra blank line before a
+//     closing brace/bracket.
+//     - Property names are emitted bare if they are identifier-like, otherwise
+//     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
+//     are rendered in a compact, readable form.
+//     - Formatting emits no space before '(' for calls and for 'fun(...)'
+//     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
+//     - Control keywords render without parens:
+//     return expr
+//     break expr
+//     continue [expr]
+//     A `null` payload prints as the bare keyword (e.g. `continue`).
 //
-// HOW SPANS ARE ASSOCIATED TO NODES
-// =================================
-// We use a *sidecar* structure (`SpanIndex`) keyed by a stable, structural
-// address called a **NodePath**. A `NodePath` is a slice of child indexes
-// into the AST tree: e.g. `[]int{0,2,1}` means “root’s 0th child → its 2nd
-// child → its 1st child”. Paths are defined against the S-expression shape
-// where a node is `[]any{tagString, child0, child1, ...}` — i.e. the first
-// element is the string tag, and child index 0 refers to the element at
-// S[1], child index 1 refers to S[2], etc.
+//  2. Type ASTs (S-expressions) → compact type strings.
+//     - Entry point: FormatType.
+//     - Supported forms:
+//     ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
+//     ("unop","?", T)         → prints as `T?`
+//     ("array", T)            → prints as `[T]`
+//     ("map", ("pair"| "pair!", ("str",k), T) ...)
+//     Required fields print with a trailing `!` on the key.
+//     Key/value annotations (if wrapped in "annot") are respected:
+//     PRE as header lines; POST as trailing inline comments that force a
+//     newline (see POST semantics above). For **value POST** in non-last
+//     entries, the POST prints *after the following comma*.
+//     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
+//     may be scalars, arrays, or maps.
+//     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
+//     right-associated chains.
+//     - Output is stable. Multi-line maps are rendered with sorted keys to
+//     avoid visual churn.
+//     - When the last field ends with a POST, the closing `}` appears on the
+//     next line without an extra blank line.
 //
-// This file does **not** compute spans itself. Instead, the parser (or any
-// external producer) records one `Span` per AST node in **post-order**
-// (children before parent) while constructing or inspecting the tree, and
-// then calls `BuildSpanIndexPostOrder(ast, spans)` to bind those spans to
-// concrete paths via a deterministic walk of the AST in the same order.
+//  3. Runtime values (Value) → width-aware strings.
+//     - Entry point: FormatValue.
+//     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
+//     - Arrays and maps prefer a single-line rendering if it fits the
+//     MaxInlineWidth budget and no PRE annotations force multi-line; else
+//     they fall back to pretty, multi-line output with indentation.
+//     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
+//     - Annotations distinguish PRE vs POST using the same `<` convention:
+//     • PRE (no '<' prefix): printed as `# ...` lines before the value.
+//     • POST (with '<' prefix): printed as an inline trailing comment
+//     on the same line as the value **and forces a newline**.
+//     • In comma/colon separated contexts, POST respects the same **after
+//     separator** rule as the AST printers (value POST after comma).
+//     When a POST ends the last element/entry line, the closing bracket/brace
+//     is placed on the next line without an extra blank line.
+//     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
+//     - Types (VTType) are printed by extracting the embedded type AST and
+//     delegating to FormatType.
+//     - Modules print as `<module: <pretty name>>` when available.
 //
-// The result is a `SpanIndex` you can query with a `NodePath` to retrieve
-// the associated byte interval in the original source.
-//
-// DEPENDENCIES ON OTHER FILES
-// ===========================
+// Dependencies (other files)
+// --------------------------
 // • parser.go
-//   - Defines the S-expression node type alias `type S = []any`.
-//   - Produces the AST that this module indexes.
-//   - (Optional instrumentation) While parsing, record a `Span` per finished
-//     node in **post-order** (children first, then the node) using the token
-//     byte spans collected by the lexer.
+//   - S = []any (AST payload shape)
+//   - ParseSExpr(string) / ParseSExprInteractive (used by Pretty/Standardize)
+//   - AST tags: "block", "fun", "oracle", "for", "while", "if",
+//     "type", "return", "break", "continue", "assign", "array", "map",
+//     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
+//     "null", "unop", "binop", "decl", "darr", "dobj", "annot", "noop".
 //
-// • lexer.go
-//   - Tokens should carry precise byte offsets (`StartByte`/`EndByte`) so that
-//     the parser can compute node spans as:
-//     node.StartByte = firstToken.StartByte
-//     node.EndByte   = lastToken.EndByte
+// • interpreter.go (runtime model)
+//   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
+//     VTFun, VTType, VTModule, VTHandle)
+//   - Fun, TypeValue, MapObject (Entries/KeyAnn/Keys).
 //
-// PERFORMANCE & CONCURRENCY
-// =========================
-// Building an index is O(n) in the number of AST nodes. `SpanIndex` is
-// read-only after construction and safe to share for concurrent reads.
-// Memory usage is one map entry per node (string key per `NodePath`).
+// • modules.go (module loader)
+//   - Module struct and prettySpec(string) (used for VTModule display).
 //
-// PUBLIC VS PRIVATE LAYOUT
-// ========================
-// The file is split into a PUBLIC API (types and functions you call) and a
-// PRIVATE section (helpers and internal details). The PUBLIC API is fully
-// documented so its behavior is understandable without reading the PRIVATE
-// code.
+// • errors.go (shared errors)
+//   - WrapErrorWithSource(err, src) (used by Pretty/Standardize).
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC vs PRIVATE layout
+// ------------------------
+// This file is organized in two blocks:
+//  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
+//  2. PRIVATE: helper types and functions that implement the printers.
+//
+// Formatting policy highlights
+// ----------------------------
+//   - Indentation uses **tabs** only (gofmt-style).
+//   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
+//
+// Requiredness in value maps
+// --------------------------
+// The printer never emits required fields ("pair!") in **expression/value maps**:
+// requiredness is a **type-level** concept only. If the AST carried "pair!" in a
+// value map (e.g., via parser sugar), it is dropped in the printed code.
+//
+// Canonicalizations & Omissions (parser ↔ printer contract)
+// ---------------------------------------------------------
+// These are deliberate simplifications made by the parser and normalized by
+// the printer; users may not see certain syntactic sugar re-emitted:
+//   - Param types default to `Any` and are not printed (e.g., `fun(x)` not `x: Any`).
+//   - Function return type defaults to `Any` and is not printed (`fun(...) do ... end`
+//     without `-> Any`).
+//   - `oracle(...)` without `from` carries an empty default source; `from ...` is omitted.
+//   - Bare `return` / `break` / `continue` carry an implicit `null` value and print
+//     as the bare keyword (no `null`).
+//   - Redundant parentheses are removed; only minimal parentheses are emitted.
+//   - Calls print with no space before '(' (canonical `f(x)` form).
+//   - Property indices written as `obj.(expr)` or `obj.12` are printed canonically
+//     as `obj[expr]` / `obj[12]`.
+//   - Trailing commas in arrays/maps/parameter lists are dropped in output.
+//   - Map keys that are identifier-like print without quotes; others are quoted.
+//   - **Expression maps** ignore the required marker `!` at runtime; the printer
+//     therefore **drops `!` in value maps** (e.g., `{ id!: 1 }` → `{ id: 1 }`).
+//     (Type maps still print required keys as `key!`.)
 package mindscript
 
 import (
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-////////////////////////////////////////////////////////////////////////////////
-//                                  PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
+// ==============================
+// ========== PUBLIC ============
+// ==============================
 
-// Span represents a half-open byte interval [StartByte, EndByte) in the original
-// source text. Offsets are counted in bytes from the start of the UTF-8 source.
-// EndByte is exclusive.
-//
-// Line/column coordinates are not stored here to keep Span minimal; if you need
-// them, compute (line, col) from the original source using your preferred mapping.
-type Span struct {
-	StartByte int // inclusive
-	EndByte   int // exclusive
-}
+// MaxInlineWidth controls when arrays/maps are rendered on a single line by
+// FormatValue / FormatType / FormatSExpr. The single-line decision accounts for
+// the current indentation; i.e., it uses the remaining space on the line after
+// tabs (tab width = 4) and any preceding text.
+var MaxInlineWidth = 80
 
-// NodePath is a stable structural address into an S-expression AST.
-// Each integer selects a child in the node's children array:
+// Pretty parses a MindScript source string and returns a formatted version.
 //
-//	path element k  → child at S[k+1] (since S[0] is the string tag).
+// Behavior:
+//   - Parses src via ParseSExpr. If parsing fails, the error is wrapped with
+//     source context via WrapErrorWithSource.
+//   - On success, pretty-prints the AST using FormatSExpr, producing stable,
+//     whitespace-normalized code with minimal parentheses.
+//   - Supports annotations using the 3-ary form:
+//     ("annot", ("str", textOr<text>), X)
+//     PRE prints as `# ...` above; POST prints as trailing `# ...` on the line
+//     and forces a newline.
 //
-// Example:
-//
-//	// ("call", callee, arg0, arg1)
-//	//  tag   ^      ^ child0 ^ child1
-//	//  S[0]        S[1]      S[2]     S[3]
-//	path []int{0}   → callee
-//	path []int{2}   → arg1
-type NodePath []int
-
-// SpanIndex stores a sidecar mapping from NodePath → Span for an AST.
-// It is read-only after construction. Use Get to retrieve spans by path.
-//
-// Typical construction flow (performed by the parser or a post-pass):
-//  1. Walk/construct the AST while recording one Span per node in post-order.
-//  2. Call BuildSpanIndexPostOrder(ast, postorderSpans) to bind spans to paths.
-//  3. Query with si.Get(path) wherever you need source intervals.
-type SpanIndex struct {
-	byPath map[string]Span
-}
-
-// Get returns the span associated with the given path, if present.
-// The boolean is false if the path is unknown or the index is nil.
-//
-// A SpanIndex may be partial (e.g., producer skipped some nodes). In that case
-// only the recorded nodes will resolve to spans.
-func (si *SpanIndex) Get(p NodePath) (Span, bool) {
-	if si == nil {
-		return Span{}, false
+// Errors:
+//   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
+func Pretty(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: "<main>", Src: src}
+			}
+			return "", fmt.Errorf("%s", FormatError(e))
+		}
+		return "", err
 	}
-	sp, ok := si.byPath[pathKey(p)]
-	return sp, ok
+	return FormatSExpr(ast), nil
 }
 
-// BuildSpanIndexPostOrder constructs a SpanIndex by walking the AST in
-// **post-order** (children before parent) and binding each visited node to
-// the next span from the provided `postorder` slice.
+// Standardize returns the canonical source form:
+//   - deterministic layout
+//   - indentation using tabs
+//   - exactly one trailing newline
 //
-// Contract:
-//   - The `postorder` slice must list exactly one Span for each node in `root`
-//     in post-order. If it is longer, extras are ignored; if shorter, remaining
-//     nodes are left unindexed (Get will return (Span{}, false) for them).
-//   - The resulting index is read-only and safe for concurrent reads.
+// It is equivalent to Pretty(src), but ensures precisely one '\n' at the end.
+func Standardize(src string) (string, error) {
+	ast, err := ParseSExpr(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: "<standardize>", Src: src}
+			}
+			return "", fmt.Errorf("%s", FormatError(e))
+		}
+		return "", err
+	}
+	out := FormatSExpr(ast)
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	} else {
+		out = strings.TrimRight(out, "\n") + "\n"
+	}
+	return out, nil
+}
+
+// FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
 //
-// Complexity: O(n) time and O(n) space where n is the number of AST nodes.
+// Inputs:
+//   - n: an AST produced by parser.go (e.g., the result of ParseSExpr).
 //
-// Example usage (parser instrumentation idea):
+// Output policy:
+//   - Statements (fun/oracle/for/if/type/block/return/break/continue/assign)
+//     are rendered with keywords and indentation.
+//   - Expressions use minimal parentheses according to a fixed precedence table;
+//     property access vs calls/indexing binds tightly.
+//   - Arrays and maps are printed inline (AST form); map key annotations print
+//     as preceding `# ...` lines (PRE) or trailing inline comments (POST).
+//     POST consumes the rest of the line and forces a newline, and containers
+//     avoid emitting an extra blank line before closing delimiters.
+//   - Annotation nodes wrap the printed construct; POST becomes trailing inline.
+//   - **POST-after-separator rule** is enforced (see file header).
 //
-//	// During parse, for each finished node (after parsing children):
-//	//   spans = append(spans, Span{StartByte:firstTok.StartByte, EndByte:lastTok.EndByte})
-//	idx := BuildSpanIndexPostOrder(ast, spans)
-//	sp, ok := idx.Get(NodePath{0,2}) // lookup "child 0's child 2"
-func BuildSpanIndexPostOrder(root S, postorder []Span) *SpanIndex {
-	si := &SpanIndex{byPath: make(map[string]Span, len(postorder))}
-	bindPostOrder(si, root, postorder)
-	return si
+// This function does not parse; it strictly formats the provided AST.
+func FormatSExpr(n S) string {
+	doc := docProgram(n)
+	var b strings.Builder
+	r := renderer{
+		out:      &b,
+		maxWidth: MaxInlineWidth,
+		tabWidth: 4,
+	}
+	r.render(doc)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// FormatType renders a type S-expression into a compact, human-readable string.
+// It respects PRE (header lines) vs POST (trailing inline that forces newline)
+// in the same way as the AST/code printer, including the **POST-after-separator**
+// behavior for value POSTs in maps.
+func FormatType(t S) string {
+	doc := docType(t)
+	var b strings.Builder
+	r := renderer{
+		out:      &b,
+		maxWidth: MaxInlineWidth,
+		tabWidth: 4,
+	}
+	r.render(doc)
+	return b.String()
+}
+
+// FormatValue renders a runtime Value into a stable, readable string.
+//
+// Layout policy:
+//   - Scalars: null, booleans, ints, floats (with a decimal point for
+//     non-scientific output), and quoted strings.
+//   - Arrays: single-line `[ a, b, c ]` when the group fits and there are no
+//     PRE annotations forcing multi-line; otherwise multi-line with indentation.
+//     Value POST follows the **after-comma** rule.
+//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short,
+//     with no PRE key/value annotations; else multi-line with indentation,
+//     where PRE annotations print as header lines, value POST prints **after
+//     the following comma**, and key POST prints after the colon. When the last
+//     entry ends with a POST, the closing brace is on the next line without an
+//     extra blank line.
+//   - Functions: `<fun: name:T -> name2:U -> R>` (zero-arg uses `_:Null`).
+//   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
+//   - Modules: `<module: pretty-name>` when available.
+func FormatValue(v Value) string {
+	ctx := newValPrintCtx()
+	doc := ctx.docValue(v)
+	var b strings.Builder
+	r := renderer{out: &b, maxWidth: MaxInlineWidth, tabWidth: 4}
+	r.render(doc)
+	return b.String()
 }
 
 //// END_OF_PUBLIC
 
-////////////////////////////////////////////////////////////////////////////////
-//                                 PRIVATE
-////////////////////////////////////////////////////////////////////////////////
+// ===============================
+// ========= PRIVATE =============
+// ===============================
 
-// pathKey serializes a NodePath to a compact "a.b.c" string used as the map key.
-func pathKey(p NodePath) string {
-	if len(p) == 0 {
-		return ""
+/* ---------- small globals & utilities ---------- */
+
+func isIdent(s string) bool {
+	if s == "" {
+		return false
 	}
-	var sb strings.Builder
-	for i, x := range p {
+	b := []byte(s)
+	c := b[0]
+	if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+		return false
+	}
+	for i := 1; i < len(b); i++ {
+		c = b[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func quoteString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.TrimSpace(s)
+}
+
+// unwrap VTType payload to its AST (supports legacy S too).
+func typeAst(data any) S {
+	switch tv := data.(type) {
+	case *TypeValue:
+		return tv.Ast
+	case S:
+		return tv
+	default:
+		return S{}
+	}
+}
+
+// Split annotation text into PRE vs POST according to leading "<".
+func splitAnnotText(s string) (pre, post string) {
+	if s == "" {
+		return "", ""
+	}
+	if strings.HasPrefix(s, "<") {
+		return "", strings.TrimPrefix(s, "<")
+	}
+	return s, ""
+}
+
+/* ---------- Doc engine (tiny) ---------- */
+
+type docKind int
+
+const (
+	dText     docKind = iota
+	dLine             // space if flat, newline if broken
+	dSoftLine         // empty if flat, newline if broken
+	dHardLine         // always newline
+	dGroup
+	dNest
+	dConcat
+)
+
+type Doc struct {
+	k      docKind
+	s      string
+	a      *Doc
+	kids   []*Doc
+	indent int // for Nest
+}
+
+func Text(s string) *Doc      { return &Doc{k: dText, s: s} }
+func LineDoc() *Doc           { return &Doc{k: dLine} }
+func SoftLineDoc() *Doc       { return &Doc{k: dSoftLine} }
+func HardLineDoc() *Doc       { return &Doc{k: dHardLine} }
+func Group(d *Doc) *Doc       { return &Doc{k: dGroup, a: d} }
+func Nest(n int, d *Doc) *Doc { return &Doc{k: dNest, a: d, indent: n} }
+func Concat(ds ...*Doc) *Doc  { return &Doc{k: dConcat, kids: ds} }
+
+func Join(sep *Doc, items []*Doc) *Doc {
+	if len(items) == 0 {
+		return Concat()
+	}
+	out := make([]*Doc, 0, len(items)*2-1)
+	for i, it := range items {
 		if i > 0 {
-			sb.WriteByte('.')
+			out = append(out, sep)
 		}
-		sb.WriteString(strconv.Itoa(x))
+		out = append(out, it)
 	}
-	return sb.String()
+	return Concat(out...)
 }
 
-// bindPostOrder walks `root` in post-order, assigning spans from `postorder`
-// to each visited node, in order.
-func bindPostOrder(si *SpanIndex, root S, postorder []Span) {
-	i := 0
-	var walk func(n S, path NodePath)
-	walk = func(n S, path NodePath) {
-		// Visit children
-		for ci := 1; ci < len(n); ci++ {
-			if child, ok := n[ci].(S); ok {
-				walk(child, append(path, ci-1))
+type renderer struct {
+	out      *strings.Builder
+	maxWidth int
+	tabWidth int
+
+	col         int  // current column in characters (tabs count as tabWidth)
+	depth       int  // indentation depth (tabs)
+	atLineStart bool // just after newline
+}
+
+func (r *renderer) writeIndentIfNeeded() {
+	if r.atLineStart {
+		for i := 0; i < r.depth; i++ {
+			r.out.WriteByte('\t')
+		}
+		r.col = r.depth * r.tabWidth
+		r.atLineStart = false
+	}
+}
+func (r *renderer) writeString(s string) {
+	if s == "" {
+		return
+	}
+	r.writeIndentIfNeeded()
+	r.out.WriteString(s)
+	r.col += len(s)
+}
+func (r *renderer) newline() {
+	r.out.WriteByte('\n')
+	r.atLineStart = true
+	// col will be set when indent is written
+}
+
+func (r *renderer) render(d *Doc) {
+	r.atLineStart = false // caller controls leading indentation
+	r.renderGroup(d)
+}
+
+func (r *renderer) renderGroup(d *Doc) {
+	// Render a group with "flat if fits" policy.
+	if r.fitsFlat(d, r.maxWidth-r.col) {
+		r.renderFlat(d)
+	} else {
+		r.renderBroken(d)
+	}
+}
+
+func (r *renderer) renderFlat(d *Doc) {
+	switch d.k {
+	case dText:
+		r.writeString(d.s)
+	case dLine:
+		r.writeString(" ")
+	case dSoftLine:
+		// nothing
+	case dHardLine:
+		// hard line cannot appear in flat mode if fitsFlat was true,
+		// but guard just in case: break the line.
+		r.newline()
+	case dGroup:
+		r.renderFlat(d.a)
+	case dNest:
+		old := r.depth
+		r.depth += d.indent
+		r.renderFlat(d.a)
+		r.depth = old
+	case dConcat:
+		for _, k := range d.kids {
+			r.renderFlat(k)
+		}
+	}
+}
+
+func (r *renderer) renderBroken(d *Doc) {
+	switch d.k {
+	case dText:
+		r.writeString(d.s)
+	case dLine:
+		r.newline()
+	case dSoftLine:
+		r.newline()
+	case dHardLine:
+		r.newline()
+	case dGroup:
+		// In broken mode, nested groups still try flat if they fit at this point.
+		r.renderGroup(d.a)
+	case dNest:
+		old := r.depth
+		r.depth += d.indent
+		r.renderBroken(d.a)
+		r.depth = old
+	case dConcat:
+		for _, k := range d.kids {
+			r.renderBroken(k)
+		}
+	}
+}
+
+// fitsFlat reports whether the doc can be rendered flat within the given budget.
+// Any HardLine inside makes it not flat-fit.
+func (r *renderer) fitsFlat(d *Doc, budget int) bool {
+	if budget < 0 {
+		return false
+	}
+	switch d.k {
+	case dText:
+		return len(d.s) <= budget
+	case dLine:
+		return 1 <= budget
+	case dSoftLine:
+		return 0 <= budget
+	case dHardLine:
+		return false
+	case dGroup:
+		return r.fitsFlat(d.a, budget)
+	case dNest:
+		return r.fitsFlat(d.a, budget)
+	case dConcat:
+		for _, k := range d.kids {
+			if !r.fitsFlat(k, budget) {
+				return false
 			}
+			// reduce budget by flat width of k
+			budget -= flatWidth(k)
 		}
-		// Bind this node
-		if i < len(postorder) {
-			si.byPath[pathKey(path)] = postorder[i]
-			i++
+		return true
+	default:
+		return false
+	}
+}
+
+func flatWidth(d *Doc) int {
+	switch d.k {
+	case dText:
+		return len(d.s)
+	case dLine:
+		return 1
+	case dSoftLine:
+		return 0
+	case dHardLine:
+		return 1 // arbitrary; but any hardline makes fitsFlat false before using this
+	case dGroup:
+		return flatWidth(d.a)
+	case dNest:
+		return flatWidth(d.a)
+	case dConcat:
+		sum := 0
+		for _, k := range d.kids {
+			sum += flatWidth(k)
+		}
+		return sum
+	default:
+		return 0
+	}
+}
+
+/* ---------- shared Doc helpers ---------- */
+
+func idOrQuoted(name string) *Doc {
+	if isIdent(name) {
+		return Text(name)
+	}
+	return Text(quoteString(name))
+}
+
+// PRE annotations (block/head) — prints as lines above current position.
+func annotPre(text string) *Doc {
+	if strings.TrimSpace(text) == "" {
+		return Concat()
+	}
+	lines := strings.Split(text, "\n")
+	ds := make([]*Doc, 0, len(lines)*2)
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		ds = append(ds, Text("# "+ln), HardLineDoc())
+	}
+	return Concat(ds...)
+}
+
+// POST annotations (inline/trailing) — prints on the same line.
+// IMPORTANT: POST captures the rest of the line, so we force a newline here.
+func annotInline(text string) *Doc {
+	trim := oneLine(text)
+	if trim == "" {
+		return Concat()
+	}
+	return Concat(Text(" # "+trim), HardLineDoc())
+}
+
+func braced(open string, inside *Doc, close string) *Doc {
+	return Concat(Text(open), inside, Text(close))
+}
+
+// inlineOrMultiAdvanced builds a `[ a, b ]` or multi-line with indentation.
+// If endsLastLine is true, the trailing SoftLine is omitted to avoid an extra
+// blank line before the closing bracket/brace.
+func inlineOrMultiAdvanced(open string, elems []*Doc, close string, endsLastLine bool) *Doc {
+	if len(elems) == 0 {
+		// exact-empty without spaces: [] or {}
+		return Text(open + close)
+	}
+	sep := Concat(Text(","), LineDoc())
+	inside := Join(sep, elems)
+	body := Concat(SoftLineDoc(), inside)
+	if !endsLastLine {
+		body = Concat(body, SoftLineDoc())
+	}
+	return Group(braced(open, Nest(1, body), close))
+}
+
+// inlineOrMulti is the default variant when the last element does not force
+// a newline (or when callers don't track it).
+func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
+	return inlineOrMultiAdvanced(open, elems, close, false)
+}
+
+// kvEntry builds a single map entry, respecting PRE/POST placement and
+// POST-newline semantics.
+//   - keyPre prints above the key.
+//   - If valPre is non-empty, the value is placed on its own indented line
+//     under `key:` and valPre prints above the value.
+//   - POSTs: key POST lives on the key line (after ':'), value POST lives on
+//     the value line. Both force a newline.
+//   - NOTE: Callers may choose to *not* pass a value POST here in order to
+//     attach it **after the following comma** using the comma-aware joiner.
+func kvEntry(keyDoc *Doc, valDoc *Doc, keyPre, valPre, keyPost, valPost string) *Doc {
+	var parts []*Doc
+	// key PRE above entry
+	if keyPre != "" {
+		parts = append(parts, annotPre(keyPre))
+	}
+	// key:
+	parts = append(parts, keyDoc)
+
+	// Cases:
+	switch {
+	case valPre != "":
+		// Own line for value; key POST attaches to key line.
+		if keyPost != "" {
+			parts = append(parts, Text(":"), annotInline(keyPost))
+		} else {
+			parts = append(parts, Text(":"))
+		}
+		parts = append(parts, HardLineDoc(),
+			Nest(1, Concat(annotPre(valPre), valDoc)))
+		// Value POST on the value line.
+		if valPost != "" {
+			parts = append(parts, annotInline(valPost))
+		}
+
+	case keyPost != "":
+		// No valPre; key has POST → put key POST on key line, then value below.
+		parts = append(parts, Text(":"), annotInline(keyPost),
+			Nest(1, Concat(valDoc)))
+		if valPost != "" {
+			parts = append(parts, annotInline(valPost))
+		}
+
+	default:
+		// Same line `key: value`; only value POST trails and forces newline.
+		parts = append(parts, Text(": "), valDoc)
+		if valPost != "" {
+			parts = append(parts, annotInline(valPost))
 		}
 	}
-	walk(root, nil)
-}
-=== END FILE: spans.go ===
 
-=== BEGIN FILE: spans_test.go ===
-// more_spans_test.go
+	return Concat(parts...)
+}
+
+/* ---------- Comma-aware joining (centralized POST-after-comma logic) ---------- */
+
+type sepItem struct {
+	main *Doc // rendered item (element or entry) without its trailing POST
+	post string
+}
+
+// joinCommaWithPost joins items with commas, printing any item's POST
+// *after the comma that follows that item*. The last item's POST (if any)
+// prints after the item (no comma). POST forces newline via annotInline.
+func joinCommaWithPost(items []sepItem) *Doc {
+	if len(items) == 0 {
+		return Concat()
+	}
+	out := make([]*Doc, 0, len(items)*3)
+	for i, it := range items {
+		out = append(out, it.main)
+		if i < len(items)-1 {
+			out = append(out, Text(","))
+			if it.post != "" {
+				out = append(out, annotInline(it.post))
+			} else {
+				out = append(out, LineDoc())
+			}
+		} else if it.post != "" {
+			out = append(out, annotInline(it.post))
+		}
+	}
+	return Concat(out...)
+}
+
+/* ---------- AST helpers: tags, shapes, precedence ---------- */
+
+func tag(n S) string   { return n[0].(string) }
+func getId(n S) string { return n[1].(string) }
+func getStr(n S) string {
+	// Used for ("str", s), but safe for ("id", name) too.
+	return n[1].(string)
+}
+func listS(n S, from int) []S {
+	if len(n) <= from {
+		return nil
+	}
+	out := make([]S, 0, len(n)-from)
+	for i := from; i < len(n); i++ {
+		out = append(out, n[i].(S))
+	}
+	return out
+}
+
+func unwrapKeyAST(n S) (name string, annot string) {
+	if tag(n) == "annot" {
+		return n[2].(S)[1].(string), n[1].(S)[1].(string)
+	}
+	return n[1].(string), ""
+}
+
+var binPrec = map[string]struct {
+	p     int
+	right bool
+}{
+	"->": {15, true},
+	"*":  {70, false}, "/": {70, false}, "%": {70, false},
+	"+": {60, false}, "-": {60, false},
+	"<": {50, false}, "<=": {50, false}, ">": {50, false}, ">=": {50, false},
+	"==": {40, false}, "!=": {40, false},
+	"and": {30, false},
+	"or":  {20, false},
+}
+
+func exprPrec(n S) int {
+	switch tag(n) {
+	case "assign":
+		return 10
+	case "binop":
+		if pr, ok := binPrec[n[1].(string)]; ok {
+			return pr.p
+		}
+		return 60
+	case "unop":
+		if n[1].(string) == "?" {
+			return 90
+		}
+		return 80
+	case "call", "idx", "get":
+		return 90
+	default:
+		return 100
+	}
+}
+
+func parenIf(need int, d *Doc, n S) *Doc {
+	if exprPrec(n) < need {
+		return Concat(Text("("), d, Text(")"))
+	}
+	return d
+}
+
+func parenIfLE(need int, d *Doc, n S) *Doc {
+	if exprPrec(n) <= need {
+		return Concat(Text("("), d, Text(")"))
+	}
+	return d
+}
+
+/* ---------- AST → Doc ---------- */
+
+func docProgram(n S) *Doc {
+	if tag(n) != "block" {
+		return docStmt(n)
+	}
+	kids := listS(n, 1)
+	var ds []*Doc
+	for i, k := range kids {
+		ds = append(ds, docStmt(k))
+		if i < len(kids)-1 {
+			ds = append(ds, HardLineDoc())
+		}
+	}
+	return Concat(ds...)
+}
+
+func docStmt(n S) *Doc {
+	switch tag(n) {
+	case "noop":
+		return Concat()
+
+	case "annot":
+		text, wrapped, pre := asAnnotAST(n)
+		if pre {
+			return Concat(annotPre(text), docStmt(wrapped))
+		}
+		// POST: trailing inline — capture the remainder of the line and break.
+		return Concat(docStmt(wrapped), annotInline(text))
+
+	case "fun":
+		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
+		header := Concat(Text("fun("), docParams(params), Text(")"))
+		if !(tag(ret) == "id" && getId(ret) == "Any") {
+			header = Concat(header, Text(" -> "), docType(ret))
+		}
+		return Concat(
+			header, Text(" do"), HardLineDoc(),
+			Nest(1, docBlock(body)), HardLineDoc(),
+			Text("end"),
+		)
+
+	case "oracle":
+		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
+		header := Concat(Text("oracle("), docParams(params), Text(")"))
+		if !(tag(outT) == "id" && getId(outT) == "Any") {
+			header = Concat(header, Text(" -> "), docType(outT))
+		}
+		if !(tag(src) == "array" && len(src) == 1) {
+			header = Concat(header, Text(" from "), docExpr(src))
+		}
+		return header
+
+	case "for":
+		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
+		// Target never prints "let" — it's implied in the surface syntax.
+		head := Concat(Text("for "), docPattern(tgt), Text(" in "), docExpr(iter), Text(" do"))
+		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
+
+	case "while":
+		cond, body := n[1].(S), n[2].(S)
+		head := Concat(Text("while "), docExpr(cond), Text(" do"))
+		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
+
+	case "if":
+		arms := listS(n, 1)
+		first := arms[0]
+		d := Concat(
+			Text("if "), docExpr(first[1].(S)), Text(" then"), HardLineDoc(),
+			Nest(1, docBlock(first[2].(S))),
+		)
+		for i := 1; i < len(arms) && tag(arms[i]) == "pair"; i++ {
+			arm := arms[i]
+			d = Concat(d, HardLineDoc(),
+				Text("elif "), docExpr(arm[1].(S)), Text(" then"), HardLineDoc(),
+				Nest(1, docBlock(arm[2].(S))),
+			)
+		}
+		// possible else block
+		if last := arms[len(arms)-1]; tag(last) != "pair" {
+			d = Concat(d, HardLineDoc(), Text("else"), HardLineDoc(), Nest(1, docBlock(last)))
+		}
+		return Concat(d, HardLineDoc(), Text("end"))
+
+	case "module":
+		nameExpr, body := n[1].(S), n[2].(S)
+		return Concat(Text("module "), docExpr(nameExpr), Text(" do"), HardLineDoc(),
+			Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
+
+	case "type":
+		return Concat(Text("type "), docType(n[1].(S)))
+
+	case "return":
+		arg := n[1].(S)
+		if tag(arg) == "null" {
+			return Text("return")
+		}
+		return Concat(Text("return "), docExpr(arg))
+	case "break":
+		arg := n[1].(S)
+		if tag(arg) == "null" {
+			return Text("break")
+		}
+		return Concat(Text("break "), docExpr(arg))
+	case "continue":
+		arg := n[1].(S)
+		if tag(arg) == "null" {
+			return Text("continue")
+		}
+		return Concat(Text("continue "), docExpr(arg))
+
+	case "decl", "darr", "dobj":
+		return Concat(Text("let "), docPattern(n))
+	case "assign":
+		lhs, rhs := n[1].(S), n[2].(S)
+		if isDeclPattern(lhs) {
+			return Concat(Text("let "), docPattern(lhs), Text(" = "), docExpr(rhs))
+		}
+		return Concat(docExpr(lhs), Text(" = "), docExpr(rhs))
+
+	case "block":
+		return Concat(Text("do"), HardLineDoc(), Nest(1, docBlock(n)), HardLineDoc(), Text("end"))
+
+	default:
+		return docExpr(n)
+	}
+}
+
+func docBlock(n S) *Doc {
+	if tag(n) != "block" {
+		return docStmt(n)
+	}
+	kids := listS(n, 1)
+	var ds []*Doc
+	for i, k := range kids {
+		ds = append(ds, docStmt(k))
+		if i < len(kids)-1 {
+			ds = append(ds, HardLineDoc())
+		}
+	}
+	return Concat(ds...)
+}
+
+func docParams(arr S) *Doc {
+	if tag(arr) != "array" || len(arr) == 1 {
+		return Concat()
+	}
+	items := listS(arr, 1)
+	var parts []*Doc
+	for i, pi := range items {
+		name := getId(pi[1].(S))
+		ty := pi[2].(S)
+		if !(tag(ty) == "id" && getId(ty) == "Any") {
+			parts = append(parts, Concat(Text(name), Text(": "), docType(ty)))
+		} else {
+			parts = append(parts, Text(name))
+		}
+		if i < len(items)-1 {
+			parts = append(parts, Text(", "))
+		}
+	}
+	return Concat(parts...)
+}
+
+func docExprMin(n S, need int) *Doc {
+	return parenIf(need, docExpr(n), n)
+}
+
+// docExprAndTrailingPost renders n as an expression and returns any single
+// outer POST annotation's text (without '<') so the caller can attach it
+// after a following comma when needed.
+func docExprAndTrailingPost(n S) (*Doc, string) {
+	if tag(n) == "annot" {
+		txt, wrapped, pre := asAnnotAST(n)
+		if !pre {
+			return docExpr(wrapped), txt
+		}
+	}
+	return docExpr(n), ""
+}
+
+func docPatternAndTrailingPost(n S) (*Doc, string) {
+	if tag(n) == "annot" {
+		txt, wrapped, pre := asAnnotAST(n)
+		if !pre {
+			return docPattern(wrapped), txt
+		}
+	}
+	return docPattern(n), ""
+}
+
+func docExpr(n S) *Doc {
+	switch tag(n) {
+	case "id":
+		return Text(getId(n))
+	case "int":
+		return Text(fmt.Sprint(n[1]))
+	case "num":
+		s := strconv.FormatFloat(n[1].(float64), 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		return Text(s)
+	case "str":
+		return Text(quoteString(getStr(n)))
+	case "bool":
+		if n[1].(bool) {
+			return Text("true")
+		}
+		return Text("false")
+	case "null":
+		return Text("null")
+
+	case "unop":
+		op, rhs := n[1].(string), n[2].(S)
+		if op == "?" {
+			return Concat(docExprMin(rhs, 90), Text("?"))
+		}
+		if op == "not" {
+			return Concat(Text("not "), docExprMin(rhs, 80))
+		}
+		return Concat(Text(op), docExprMin(rhs, 80))
+
+	case "binop":
+		op, l, r := n[1].(string), n[2].(S), n[3].(S)
+		my, right := 60, false
+		if pr, ok := binPrec[op]; ok {
+			my, right = pr.p, pr.right
+		}
+		// Associativity-aware parentheses:
+		//  - right-assoc:  paren LEFT if prec(left) <= my; RIGHT if prec(right) < my
+		//  - left-assoc:   paren LEFT if prec(left) <  my; RIGHT if prec(right) <= my
+		lDoc := docExpr(l)
+		rDoc := docExpr(r)
+		if right {
+			lDoc = parenIfLE(my, lDoc, l) // inclusive on left
+			rDoc = parenIf(my, rDoc, r)   // exclusive on right
+		} else {
+			lDoc = parenIf(my, lDoc, l)   // exclusive on left
+			rDoc = parenIfLE(my, rDoc, r) // inclusive on right
+		}
+		return Concat(lDoc, Text(" "+op+" "), rDoc)
+
+	case "assign":
+		l, r := n[1].(S), n[2].(S)
+		return Concat(docExprMin(l, 10), Text(" = "), docExprMin(r, 10))
+
+	case "call":
+		recv := n[1].(S)
+		args := listS(n, 2)
+		var argDocs []*Doc
+		for _, a := range args {
+			argDocs = append(argDocs, docExpr(a))
+		}
+		return Concat(docExprMin(recv, 90), Text("("), Join(Text(", "), argDocs), Text(")"))
+
+	case "idx":
+		recv, ix := n[1].(S), n[2].(S)
+		// Be careful with array indices: this is indexing, not array literal.
+		return Concat(docExprMin(recv, 90), Text("["), docExpr(ix), Text("]"))
+
+	case "get":
+		recv, name := n[1].(S), n[2].(S)[1].(string)
+		if isIdent(name) {
+			return Concat(docExprMin(recv, 90), Text("."+name))
+		}
+		return Concat(docExprMin(recv, 90), Text("."+quoteString(name)))
+
+	case "array":
+		elems := listS(n, 1)
+		if len(elems) == 0 {
+			return Text("[]")
+		}
+		items := make([]sepItem, 0, len(elems))
+		for _, e := range elems {
+			d, post := docExprAndTrailingPost(e)
+			items = append(items, sepItem{main: d, post: post})
+		}
+		inside := joinCommaWithPost(items)
+		lastEnds := items[len(items)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
+
+	case "map":
+		items := listS(n, 1)
+		if len(items) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(items))
+		for _, pr := range items {
+			keyNode := pr[1].(S)
+			valNode := pr[2].(S)
+
+			key, kAnn := unwrapKeyAST(keyNode)
+			kPre, kPost := splitAnnotText(kAnn)
+
+			vPre, vPost := "", ""
+			if tag(valNode) == "annot" {
+				txt, wrapped, pre := asAnnotAST(valNode)
+				if pre {
+					vPre = txt
+				} else {
+					vPost = txt // defer to after-comma placement
+				}
+				valNode = wrapped
+			}
+			entryDoc := kvEntry(idOrQuoted(key), docExpr(valNode), kPre, vPre, kPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entryDoc, post: vPost})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "}"))
+
+	case "enum":
+		elems := listS(n, 1)
+		if len(elems) == 0 {
+			return Text("Enum[]")
+		}
+		items := make([]sepItem, 0, len(elems))
+		for _, e := range elems {
+			d, post := docExprAndTrailingPost(e)
+			items = append(items, sepItem{main: d, post: post})
+		}
+		inside := joinCommaWithPost(items)
+		lastEnds := items[len(items)-1].post != ""
+		return Group(braced("Enum[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
+
+	case "decl", "darr", "dobj":
+		return docPattern(n)
+
+	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot", "module":
+		return docStmt(n)
+
+	default:
+		return Text("<" + tag(n) + ">")
+	}
+}
+
+/* ---------- patterns ---------- */
+
+func isDeclPattern(n S) bool {
+	switch tag(n) {
+	case "decl", "darr", "dobj":
+		return true
+	case "annot":
+		return isDeclPattern(n[2].(S))
+	default:
+		return false
+	}
+}
+
+func docPattern(n S) *Doc {
+	switch tag(n) {
+	case "decl":
+		return Text(getId(n))
+	case "darr":
+		items := listS(n, 1)
+		if len(items) == 0 {
+			return Text("[]")
+		}
+		joined := make([]sepItem, 0, len(items))
+		for _, it := range items {
+			d, post := docPatternAndTrailingPost(it)
+			joined = append(joined, sepItem{main: d, post: post})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
+	case "dobj":
+		items := listS(n, 1)
+		if len(items) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(items))
+		for _, it := range items {
+			key, ann := unwrapKeyAST(it[1].(S))
+			kPre, kPost := splitAnnotText(ann)
+			val := it[2].(S)
+			vPre, vPost := "", ""
+			if tag(val) == "annot" {
+				txt, wrapped, pre := asAnnotAST(val)
+				if pre {
+					vPre = txt
+				} else {
+					vPost = txt // defer to comma
+				}
+				val = wrapped
+			}
+			entry := kvEntry(idOrQuoted(key), docPattern(val), kPre, vPre, kPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entry, post: vPost})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "}"))
+	case "annot":
+		text, wrapped, pre := asAnnotAST(n)
+		if pre {
+			return Concat(annotPre(text), docPattern(wrapped))
+		}
+		return Concat(docPattern(wrapped), annotInline(text))
+	default:
+		return docExpr(n)
+	}
+}
+
+/* ---------- AST "annot" helpers ---------- */
+
+// New: decode 3-ary ("annot", ("str", textOr<text>), wrapped) to (text, wrapped, pre?)
+func asAnnotAST(n S) (text string, wrapped S, pre bool) {
+	raw := n[1].(S)[1].(string)
+	preText, postText := splitAnnotText(raw)
+	if preText != "" {
+		return preText, n[2].(S), true
+	}
+	return postText, n[2].(S), false
+}
+
+/* ---------- Type pretty-printer (as Doc) ---------- */
+
+func docType(t S) *Doc {
+	if len(t) == 0 {
+		return Text("<type>")
+	}
+	switch tag(t) {
+	case "id":
+		return Text(getStr(t))
+	case "get":
+		recv := t[1].(S)
+		prop := t[2].(S)[1].(string)
+		// Reuse docType for the receiver so nested gets print as a.b.c
+		// If the receiver were ever non-type-ish, docType will fall back gracefully.
+		return Concat(docType(recv), Text("."), idOrQuoted(prop))
+	case "unop":
+		if t[1].(string) == "?" {
+			return Concat(docType(t[2].(S)), Text("?"))
+		}
+		return Text("<unop>")
+	case "array":
+		elem := S{"id", "Any"}
+		if len(t) == 2 {
+			elem = t[1].(S)
+		}
+		return Concat(Text("["), docType(elem), Text("]"))
+	case "enum":
+		elems := listS(t, 1)
+		if len(elems) == 0 {
+			return Text("Enum[]")
+		}
+		var ds []*Doc
+		for _, e := range elems {
+			ds = append(ds, docTypeLiteral(e))
+		}
+		return inlineOrMulti("Enum[", ds, "]")
+	case "map":
+		type fld struct {
+			name     string
+			req      bool
+			typ      S
+			kAnnPre  string
+			kAnnPost string
+			vAnnPre  string
+			vAnnPost string
+		}
+		var fs []fld
+		for _, raw := range listS(t, 1) {
+			req := raw[0].(string) == "pair!"
+			k, kAnn := unwrapKeyAST(raw[1].(S))
+			kPre, kPost := splitAnnotText(kAnn)
+			ft := raw[2].(S)
+			vPre, vPost := "", ""
+			if len(ft) > 0 && tag(ft) == "annot" {
+				txt, inner, pre := asAnnotAST(ft)
+				if pre {
+					vPre = txt
+				} else {
+					vPost = txt
+				}
+				ft = inner
+			}
+			fs = append(fs, fld{
+				name: k, req: req, typ: ft,
+				kAnnPre: kPre, kAnnPost: kPost,
+				vAnnPre: vPre, vAnnPost: vPost,
+			})
+		}
+		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
+		if len(fs) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(fs))
+		for _, f := range fs {
+			key := idOrQuoted(f.name)
+			if f.req {
+				key = Concat(key, Text("!"))
+			}
+			entry := kvEntry(key, docType(f.typ), f.kAnnPre, f.vAnnPre, f.kAnnPost /*valPost*/, "")
+			joined = append(joined, sepItem{main: entry, post: f.vAnnPost})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "}"))
+	case "binop":
+		if t[1].(string) == "->" && len(t) >= 4 {
+			left := t[2].(S)
+			right := t[3].(S)
+			// Right-associative printing:
+			// - If LEFT is itself an arrow, parenthesize it.
+			// - Always render RIGHT via docType (which will continue the chain).
+			leftDoc := docType(left)
+			if tag(left) == "binop" && left[1].(string) == "->" {
+				leftDoc = Concat(Text("("), leftDoc, Text(")"))
+			}
+			return Concat(leftDoc, Text(" -> "), docType(right))
+		}
+		return Text("<binop>")
+	case "annot":
+		txt, wrapped, pre := asAnnotAST(t)
+		if pre {
+			return Concat(annotPre(txt), docType(wrapped))
+		}
+		return Concat(docType(wrapped), annotInline(txt))
+	default:
+		return Text("<type>")
+	}
+}
+
+func docTypeLiteral(lit S) *Doc {
+	switch tag(lit) {
+	case "null":
+		return Text("null")
+	case "bool":
+		if lit[1].(bool) {
+			return Text("true")
+		}
+		return Text("false")
+	case "int":
+		return Text(fmt.Sprint(lit[1]))
+	case "num":
+		return Text(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
+	case "str":
+		return Text(quoteString(getStr(lit)))
+	case "array":
+		items := listS(lit, 1)
+		if len(items) == 0 {
+			return Text("[]")
+		}
+		var ds []*Doc
+		for _, s := range items {
+			ds = append(ds, docTypeLiteral(s))
+		}
+		return inlineOrMulti("[", ds, "]")
+	case "map":
+		items := listS(lit, 1)
+		if len(items) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(items))
+		for _, pr := range items {
+			k := pr[1].(S)[1].(string)
+			val := docTypeLiteral(pr[2].(S))
+			entry := kvEntry(idOrQuoted(k), val, "", "", "", "")
+			joined = append(joined, sepItem{main: entry, post: ""})
+		}
+		inside := joinCommaWithPost(joined)
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, SoftLineDoc())), "}"))
+	default:
+		return Text("<lit>")
+	}
+}
+
+func flattenArrow(t S) (params []S, ret S) {
+	for tag(t) == "binop" && t[1].(string) == "->" && len(t) >= 4 {
+		params = append(params, t[2].(S))
+		t = t[3].(S)
+	}
+	ret = t
+	return
+}
+
+/* ---------- Runtime value pretty-printer (as Doc) ---------- */
+
+func numString(f float64) string {
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
+	return s
+}
+
+// Detect cycles by pointer identity during a single render pass.
+type valPrintCtx struct {
+	seenA map[*ArrayObject]bool
+	seenM map[*MapObject]bool
+}
+
+func newValPrintCtx() *valPrintCtx {
+	return &valPrintCtx{
+		seenA: make(map[*ArrayObject]bool),
+		seenM: make(map[*MapObject]bool),
+	}
+}
+
+// docValue: threads a cycle-detection context.
+// (Keeps existing PRE/POST handling and doc engine contract.)
+func (ctx *valPrintCtx) docValue(v Value) *Doc {
+	pre, post := splitAnnotText(v.Annot)
+	var head []*Doc
+	if pre != "" {
+		head = append(head, annotPre(pre))
+	}
+	body := ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data}) // print payload w/o own anns
+	if post != "" {
+		body = Concat(body, annotInline(post))
+	}
+	return Concat(append(head, body)...)
+}
+
+// docValueNoAnnWith: actual value rendering with cycle guards.
+// Uses Python-style cycle markers: `[...]` for arrays, `{...}` for maps.
+func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
+	switch v.Tag {
+	case VTNull:
+		return Text("null")
+	case VTBool:
+		if v.Data.(bool) {
+			return Text("true")
+		}
+		return Text("false")
+	case VTInt:
+		return Text(strconv.FormatInt(v.Data.(int64), 10))
+	case VTNum:
+		return Text(numString(v.Data.(float64)))
+	case VTStr:
+		return Text(quoteString(v.Data.(string)))
+
+	case VTArray:
+		ao := v.Data.(*ArrayObject)
+		// ---- cycle guard (identity) ----
+		if ctx.seenA[ao] {
+			return Text("[...]") // minimal, stable placeholder
+		}
+		ctx.seenA[ao] = true
+
+		xs := ao.Elems
+		if len(xs) == 0 {
+			return Text("[]")
+		}
+		joined := make([]sepItem, 0, len(xs))
+		for _, it := range xs {
+			pre, post := splitAnnotText(it.Annot)
+			elemDoc := ctx.docValueNoAnn(Value{Tag: it.Tag, Data: it.Data})
+			if pre != "" {
+				elemDoc = Concat(annotPre(pre), elemDoc)
+			}
+			joined = append(joined, sepItem{main: elemDoc, post: post})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
+
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		// ---- cycle guard (identity) ----
+		if ctx.seenM[mo] {
+			return Text("{...}") // minimal, stable placeholder
+		}
+		ctx.seenM[mo] = true
+
+		keys := append([]string(nil), mo.Keys...)
+		sort.Strings(keys)
+		if len(keys) == 0 {
+			return Text("{}")
+		}
+		joined := make([]sepItem, 0, len(keys))
+		for _, k := range keys {
+			kPre, kPost := splitAnnotText(mo.KeyAnn[k])
+			vv := mo.Entries[k]
+			vPre, vPost := splitAnnotText(vv.Annot)
+			entry := kvEntry(
+				idOrQuoted(k),
+				ctx.docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}),
+				kPre, vPre, kPost /* valPost handled after comma */, "",
+			)
+			joined = append(joined, sepItem{main: entry, post: vPost})
+		}
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "}"))
+
+	case VTFun:
+		// unchanged, no recursive descent into values
+		if f, ok := v.Data.(*Fun); ok && f != nil {
+			label := "fun"
+			if f.IsOracle {
+				label = "oracle"
+			}
+			var chain []*Doc
+			if len(f.ParamTypes) == 0 {
+				chain = append(chain, Text("_:Null"))
+			} else {
+				for i := range f.ParamTypes {
+					if i > 0 {
+						chain = append(chain, Text(" -> "))
+					}
+					name := "_"
+					if i < len(f.Params) && f.Params[i] != "" {
+						name = f.Params[i]
+					}
+					pt := f.ParamTypes[i]
+					td := docType(pt)
+					if len(pt) >= 4 && pt[0] == "binop" && pt[1] == "->" {
+						td = Concat(Text("("), td, Text(")"))
+					}
+					chain = append(chain, Text(name), Text(":"), td)
+				}
+			}
+			chain = append(chain, Text(" -> "), docType(f.ReturnType))
+			return Group(Concat(Text("<"+label+": "), Concat(chain...), Text(">")))
+		}
+		return Text("<fun>")
+
+	case VTType:
+		return Group(Concat(Text("<type: "), docType(typeAst(v.Data)), Text(">")))
+
+	case VTModule:
+		name := "<module>"
+		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
+			disp := prettySpec(m.Name)
+			if disp == "" {
+				disp = m.Name
+			}
+			name = "<module: " + disp + ">"
+		}
+		return Text(name)
+
+	default:
+		if v.Tag == VTHandle {
+			if h, ok := v.Data.(*Handle); ok {
+				return Text("<handle: " + h.Kind + ">")
+			}
+			return Text("<handle>")
+		}
+		return Text("<unknown>")
+	}
+}
+=== END FILE: printer.go ===
+
+=== BEGIN FILE: printer_test.go ===
+// printer_test.go
 package mindscript
 
-import "testing"
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
 
-// local helpers with unique names to avoid collisions
-func mustParseWithSpansMS(t *testing.T, src string) (S, *SpanIndex) {
+func pretty(t *testing.T, src string) string {
 	t.Helper()
-	ast, idx, err := ParseSExprWithSpans(src)
+	out, err := Pretty(src)
 	if err != nil {
-		t.Fatalf("parse error: %v", err)
+		t.Fatalf("Pretty error: %v\nsource:\n%s", err, src)
 	}
-	if idx == nil {
-		t.Fatalf("nil SpanIndex")
-	}
-	_ = ast
-	return ast, idx
+	return out
 }
-func sliceMS(src string, sp Span) string {
-	if sp.StartByte < 0 || sp.EndByte < 0 || sp.EndByte > len(src) || sp.StartByte > sp.EndByte {
-		return ""
-	}
-	return src[sp.StartByte:sp.EndByte]
-}
-func assertSpanTextMS(t *testing.T, idx *SpanIndex, path NodePath, src, want string) {
+
+func parse(t *testing.T, src string) S {
 	t.Helper()
-	got, ok := idx.Get(path)
-	if !ok {
-		t.Fatalf("missing span for path %v", path)
+	sexpr, err := ParseSExpr(src)
+	if err != nil {
+		t.Fatalf("Parse error: %v\nsource:\n%s", err, src)
 	}
-	text := sliceMS(src, got)
-	if text != want {
-		t.Fatalf("span text mismatch at path %v:\n  got : %q\n  want: %q\n  span: %+v", path, text, want, got)
+	return sexpr
+}
+
+func norm(s string) string { return strings.TrimSpace(s) }
+
+func eq(t *testing.T, got, want string) {
+	t.Helper()
+	if strings.TrimSpace(got) != strings.TrimSpace(want) {
+		t.Fatalf("pretty mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 
-// let {a: x, b: [y]} = rhs
-// Covers: object pattern ("dobj"), inner ("pair")s, nested array pattern ("darr"), and decl spans.
-// NOTE: destructuring let requires an assignment; the pattern is the LHS of ("assign", ...).
-func Test_Spans_DeclPatterns(t *testing.T) {
-	src := "let {a: x, b: [y]} = rhs"
-	_, idx := mustParseWithSpansMS(t, src)
+// ---------- Core expression/precedence & chaining ----------
 
-	// Root is ("assign" ...); the pattern is the LHS at path {0,0}
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "{a: x, b: [y]}")
-
-	// First pair "a: x"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "a: x")
-	//   key "a"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0}, src, "a")
-	//   decl "x"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1}, src, "x")
-
-	// Second pair "b: [y]"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "b: [y]")
-	//   key "b"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "b")
-	//   darr "[y]"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "[y]")
-	//     inner decl "y"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1, 0}, src, "y")
+func Test_Printer_Operators_And_Grouping(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`1 + 2 * 3`, `1 + 2 * 3`},
+		{`(1 + 2) * 3`, `(1 + 2) * 3`},
+		{`- (a + b)`, `-(a + b)`},
+		{`not a and b`, `not a and b`}, // (not a) and b
+		{`a < b == c`, `a < b == c`},   // (< a b) == c
+	}
+	for _, tc := range cases {
+		got := pretty(t, tc.in)
+		if norm(got) != tc.want {
+			t.Fatalf("pretty mismatch\nin:   %q\nwant: %q\ngot:  %q", tc.in, tc.want, got)
+		}
+	}
 }
 
-// let
-// #p
-// [x, y] = v
-// After normalization: LHS is bare pattern; RHS value carries #p.
-func Test_Spans_PatternPreAnnotation(t *testing.T) {
-	src := "let\n#p\n[x, y] = v"
-	_, idx := mustParseWithSpansMS(t, src)
-
-	// LHS of the assign is just the pattern (no annot wrapper).
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "[x, y]")
-
-	// Inner decls "x" and "y".
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "x")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "y")
-
-	// RHS value node spans the value itself; its child 0 is the annot text.
-	assertSpanTextMS(t, idx, NodePath{0, 1}, src, "v")
-	assertSpanTextMS(t, idx, NodePath{0, 1, 0}, src, "#p")
-	// Wrapped value leaf (under annot) is still "v".
-	assertSpanTextMS(t, idx, NodePath{0, 1, 1}, src, "v")
+func Test_Printer_Chaining_Call_Idx_Get(t *testing.T) {
+	in := `obj.name(1, 2)[i]."weird"`
+	want := `obj.name(1, 2)[i].weird`
+	got := pretty(t, in)
+	if norm(got) != want {
+		t.Fatalf("pretty chain mismatch\nwant: %q\ngot:  %q", want, got)
+	}
 }
 
-// {
-// #A
-// k: 1
-// }
-// After normalization: key is bare "k"; value carries #A.
-// The pair's span starts at the pre-annotation.
-func Test_Spans_KeyPreAnnotation(t *testing.T) {
-	src := "{\n#A\nk: 1\n}"
-	_, idx := mustParseWithSpansMS(t, src)
-
-	// Whole map unchanged.
-	assertSpanTextMS(t, idx, NodePath{0}, src, "{\n#A\nk: 1\n}")
-
-	// Pair spans from the annotation through the value.
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "#A\nk: 1")
-
-	// Key is just "k" (no annot wrapper on the key).
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "k")
-
-	// Value node span is the literal; its child 0 is the annot text.
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "1")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "#A")
-	// Wrapped value leaf (under annot) is still "1".
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "1")
+// Dot-number shorthand: obj.12 → obj[12]
+func Test_Printer_Dot_Number_Indexing_Shorthand(t *testing.T) {
+	eq(t, pretty(t, "obj.12"), "obj[12]")
 }
 
-func Test_Spans_Module_Whole_And_Parts(t *testing.T) {
-	src := `module "M" do let x = 1 end`
-	_, idx := mustParseWithSpansMS(t, src)
-
-	// The module node (root child) covers the whole construct
-	assertSpanTextMS(t, idx, NodePath{0}, src, `module "M" do let x = 1 end`)
-
-	// Name expression is the string literal (including quotes)
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `"M"`)
-
-	// Body block span covers only the contents between 'do' and 'end'
-	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `let x = 1`)
+// Computed dot -> indexing: a.(1+2) → a[1 + 2]
+func Test_Printer_ComputedDot_NormalizesToIndexing(t *testing.T) {
+	in := `a.(1 + 2)`
+	want := `a[1 + 2]`
+	got := pretty(t, in)
+	eq(t, got, want)
 }
 
-func Test_Spans_Module_NameExpression_And_EmptyBody(t *testing.T) {
-	// Note: grouping parens belong to the *parent* construct span, not the child.
-	// So the name expression span excludes '(' and ')', mirroring computed props.
-	src := `module ("M" + "1") do end`
-	_, idx := mustParseWithSpansMS(t, src)
-
-	// Name expression (without parentheses)
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `"M" + "1"`)
-
-	// Empty body block has an empty span
-	assertSpanTextMS(t, idx, NodePath{0, 1}, src, ``)
-
-	// Whole module span is the full construct (including parens around the name)
-	assertSpanTextMS(t, idx, NodePath{0}, src, `module ("M" + "1") do end`)
+// Enum rendered as an expression
+func Test_Printer_Enum_Expression_Format(t *testing.T) {
+	eq(t, pretty(t, `Enum["a", 1, {k: 2}]`), `Enum["a", 1, {k: 2}]`)
 }
 
-func Test_Spans_PropertyAfterDot_ModuleKeyword(t *testing.T) {
-	src := `obj.module`
-	_, idx := mustParseWithSpansMS(t, src)
+// ---------- Functions, oracles, control flow, modules ----------
 
-	// ("get" obj "module") spans the entire chain
-	assertSpanTextMS(t, idx, NodePath{0}, src, `obj.module`)
-
-	//   object id
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `obj`)
-	//   property name ("str") — taken from the ID token after '.'
-	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `module`)
+func Test_Printer_Function_And_Oracle(t *testing.T) {
+	in := `fun(a: Str) -> Str do return("hi " + a) end
+oracle() -> Str from["web","docs"]`
+	want := "fun(a: Str) -> Str do\n" +
+		"\treturn \"hi \" + a\n" +
+		"end\n" +
+		"oracle() -> Str from [\"web\", \"docs\"]"
+	got := pretty(t, in)
+	if norm(got) != norm(want) {
+		t.Fatalf("pretty fun/oracle mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
 }
-=== END FILE: spans_test.go ===
+
+// Ensure fun omits -> Any and oracle omits default 'from'
+func Test_Printer_Fun_And_Oracle_Default_Headers(t *testing.T) {
+	in := `fun(a: Int) do end
+oracle()`
+	want := "fun(a: Int) do\n\nend\noracle()"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_If_Elif_Else_And_For(t *testing.T) {
+	in := `if a then x elif b then y else z end
+for let x in xs do break 0 end`
+	want := "if a then\n" +
+		"\tx\n" +
+		"elif b then\n" +
+		"\ty\n" +
+		"else\n" +
+		"\tz\n" +
+		"end\n" +
+		"for x in xs do\n" +
+		"\tbreak 0\n" +
+		"end"
+	got := pretty(t, in)
+	if norm(got) != norm(want) {
+		t.Fatalf("pretty if/for mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
+}
+
+func Test_Printer_While(t *testing.T) {
+	in := `while a < b do a = a + 1 end`
+	want := "while a < b do\n" +
+		"\ta = a + 1\n" +
+		"end"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_Variants(t *testing.T) {
+	// Basic
+	in := `module MyLib do x = 1 end`
+	want := "module MyLib do\n" +
+		"\tx = 1\n" +
+		"end"
+	eq(t, pretty(t, in), want)
+
+	// String name + empty body
+	eq(t, pretty(t, `module "my mod" do end`), "module \"my mod\" do\n\nend")
+
+	// Name as expression (keeps minimal parens)
+	eq(t, pretty(t, `module "a" + "b" do end`), "module \"a\" + \"b\" do\n\nend")
+
+	// With pre-annotation
+	in4 := `# about this module
+module M do
+end`
+	want4 := "# about this module\nmodule M do\n\nend"
+	eq(t, pretty(t, in4), want4)
+
+	// Module amid other statements
+	in5 := `let x = 1
+module M do
+  x = 2
+end
+return x`
+	want5 := "let x = 1\nmodule M do\n\tx = 2\nend\nreturn x"
+	eq(t, pretty(t, in5), want5)
+}
+
+// ---------- Maps, arrays, strings, destructuring ----------
+
+func Test_Printer_Maps_Arrays_Strings(t *testing.T) {
+	// Note: Go string literal contains an actual newline in "Jo\nhn".
+	in := "{\n  \"name\":\"Jo\nhn\", age:25\n} [1,2,3] []"
+	want := "{name: \"Jo\\nhn\", age: 25}\n[1, 2, 3]\n[]"
+	got := pretty(t, in)
+	if norm(got) != norm(want) {
+		t.Fatalf("pretty map/array mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
+}
+
+func Test_Printer_Maps_And_Arrays_And_Quoting(t *testing.T) {
+	in := `{ok: 1, "weird key": 2, also_ok: [1,2,3]}`
+	want := `{ok: 1, "weird key": 2, also_ok: [1, 2, 3]}`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+// Keywords permitted as map keys & pattern fields (bare, not quoted)
+func Test_Printer_Keywords_As_Keys_In_Maps_And_Patterns(t *testing.T) {
+	src := `
+let {if: x, else: y, type: z} = {if: 1, else: 2, type: 3}
+`
+	out := pretty(t, src)
+	want := `
+let {if: x, else: y, type: z} = {if: 1, else: 2, type: 3}
+`
+	eq(t, out, want)
+}
+
+func Test_Printer_Destructuring_Assign(t *testing.T) {
+	in := `let {"x": a, y: b} = m`
+	// Identifier-like keys are unquoted by the printer.
+	want := `let {x: a, y: b} = m`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Let_Array_And_Object_Patterns(t *testing.T) {
+	src := `
+let [x, y] = [1,2]
+let {name: n, age: a} = {name: "Bob", age: 40}
+`
+	out := pretty(t, src)
+	want := `
+let [x, y] = [1, 2]
+let {name: n, age: a} = {name: "Bob", age: 40}
+`
+	eq(t, out, want)
+}
+
+func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
+	// Uses PRE hash-line annotations for value positions in an object pattern.
+	in := "let {\n" +
+		"\tname: \n" +
+		"\t# username\n" +
+		"\tn,\n" +
+		"\tage: \n" +
+		"\t# yearsOld\n" +
+		"\ta\n" +
+		"} = {name: \"Bob\", age: 40}"
+	want := "let {\n" +
+		"\tname:\n" +
+		"\t\t# username\n" +
+		"\t\tn,\n" +
+		"\tage:\n" +
+		"\t\t# yearsOld\n" +
+		"\t\ta\n" +
+		"} = {name: \"Bob\", age: 40}"
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+// Assignment stays assignment (no desugaring into let)
+func Test_Printer_Assign_NonDecl_Remains_Assignment(t *testing.T) {
+	src := `
+a = 1
+(a).b = 2
+`
+	out := pretty(t, src)
+	want := `
+a = 1
+a.b = 2
+`
+	eq(t, out, want)
+}
+
+// ---------- Control forms adjacency & grouping ----------
+
+func Test_Printer_Control_Forms_Are_Adjacent(t *testing.T) {
+	in := `return(1) break(0) continue(null)`
+	want := `return 1
+break 0
+continue`
+	got := pretty(t, in)
+	if norm(got) != norm(want) {
+		t.Fatalf("pretty control mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
+}
+
+func Test_Printer_ReturnBreakContinue_SameLineVsNewline(t *testing.T) {
+	// Same-line expression → carry the expression.
+	casesSame := []struct{ in, want string }{
+		{`return 1`, `return 1`},
+		{`break  x`, `break x`},
+		{`continue "z"`, `continue "z"`},
+	}
+	for _, tc := range casesSame {
+		got := pretty(t, tc.in)
+		eq(t, got, tc.want)
+	}
+
+	// Next token on the next line → implicit null.
+	in := `return
+x`
+	want := `return
+x`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Grouping_With_Postfix_Question(t *testing.T) {
+	in := `(a + b)?`
+	want := `(a + b)?`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+// ---------- Property name normalization ----------
+
+func Test_Printer_Property_Name_Normalization_And_Quoting(t *testing.T) {
+	// Keywords after '.' normalize to bare identifiers.
+	eq(t, pretty(t, `obj."then"`), `obj.then`)
+	// Non-identifier names remain quoted.
+	eq(t, pretty(t, `obj."not ident"`), `obj."not ident"`)
+}
+
+// ---------- Annotations (PRE/POST) ----------
+
+func Test_Printer_Annotations_PRE(t *testing.T) {
+	in := `# hello
+x`
+	got := pretty(t, in)
+	if norm(got) != norm(in) {
+		t.Fatalf("pretty annotation mismatch:\n%q", got)
+	}
+}
+
+func Test_Printer_Annotations_LineBlocks(t *testing.T) {
+	in := `# first
+# second
+x`
+	want := `# first
+# second
+x`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Annotations_TwoSeparateBlocks(t *testing.T) {
+	in := `# a
+
+# b
+x`
+	// Two separate annotations should stay as two header lines.
+	want := `# a
+
+# b
+x`
+	got := pretty(t, in)
+	eq(t, got, want)
+}
+
+func Test_Printer_Annotations_Post_Trailing_Inline(t *testing.T) {
+	// Same-line hash after an expr becomes a POST annotation
+	eq(t, pretty(t, `x # after`), `x # after`)
+}
+
+func Test_Printer_Map_Value_Post_Inline(t *testing.T) {
+	// POST after a map value consumes the rest of the line,
+	// so the closing brace must move to the next line.
+	got := pretty(t, "{a: 1 # note\n}")
+	want := "{\n\ta: 1 # note\n}"
+	eq(t, got, want)
+}
+
+// ---------- Pretty/Standardize roundtrip & idempotence ----------
+
+func Test_Printer_Idempotent_And_Roundtrip(t *testing.T) {
+	src := `
+# demo
+let Person = type {name!: Str?, hobbies: [Str]?, age: Int}
+fun(g: Str) -> Str do
+  return("hi " + g)
+end
+oracle() from["web"]`
+
+	once := pretty(t, src)
+	twice := pretty(t, once)
+	if once != twice {
+		t.Fatalf("pretty not idempotent\nonce:\n%s\n---\ntwice:\n%s", once, twice)
+	}
+
+	// AST roundtrip: parse original and pretty'ed, ensure same AST
+	ast1 := parse(t, once)
+	ast2 := parse(t, twice)
+	if !reflect.DeepEqual(ast1, ast2) {
+		t.Fatalf("AST roundtrip mismatch after pretty")
+	}
+}
+
+func Test_Printer_RoundTrip_Samples(t *testing.T) {
+	samples := []string{
+		`f ( x )`,      // grouping vs call (space before '(')
+		`f(x , 1,  2)`, // sloppy arg spacing
+		`arr [ i ]`,    // spacing before '[' breaks indexing
+		`# note
+f(x)`,
+		`if a then x elif b then y else z end`,
+		`{ok:1,"bad key":2}`,
+	}
+	for _, src := range samples {
+		p1 := pretty(t, src)
+		p2 := pretty(t, p1)
+		if p2 != p1 {
+			t.Fatalf("pretty not idempotent for:\n%s\n---1---\n%s\n---2---\n%s", src, p1, p2)
+		}
+		// Parse equality (AST)
+		a1 := parse(t, src)
+		a2 := parse(t, p1)
+		if !reflect.DeepEqual(a1, a2) {
+			t.Fatalf("AST mismatch after pretty for:\n%s\n---a1---\n%v\n---a2---\n%v", src, a1, a2)
+		}
+	}
+}
+
+func Test_Printer_RoundTrip_Standardize(t *testing.T) {
+	cases := []string{
+		// Simple expressions and ops
+		`x=1+2*3`,
+
+		// Calls / idx / get
+		`f( a, b )[i].name(3)`,
+
+		// Array with pre-annotation on the next element (comma-before-comment form)
+		`arr = [1, # note about 2
+2]`,
+
+		// Map with a key annotation and multiple fields
+		`m = { a: 1, # key doc
+b: 2 }`,
+
+		// Function + control flow in a block
+		`do
+	x = 1 + 2 * 3
+	if x < 10 then
+		return(x)
+	elif x == 10 then
+		break(null)
+	else
+		continue(false)
+	end
+end`,
+
+		// Oracle with non-empty from expression (any expr that evaluates to an array)
+		`res = oracle(a: Int) -> Str from sources()`,
+
+		// Destructuring with annotated key in an object pattern
+		`let { # id of the user
+userId: id, profile: { name: n } } = obj`,
+	}
+
+	for i, in := range cases {
+		std1, err := Standardize(in)
+		if err != nil {
+			t.Fatalf("case %d: Standardize(in) error: %v\nin:\n%s", i, err, in)
+		}
+
+		ast1 := parse(t, std1)
+
+		std2, err := Standardize(std1)
+		if err != nil {
+			t.Fatalf("case %d: Standardize(std1) error: %v\nstd1:\n%s", i, err, std1)
+		}
+
+		// The standardized source should be idempotent.
+		eq(t, std2, std1)
+
+		// And the ASTs should be structurally equal.
+		ast2 := parse(t, std2)
+		if !reflect.DeepEqual(ast1, ast2) {
+			t.Fatalf("case %d: AST mismatch after second pass\n--- ast1 (from std1) ---\n%#v\n--- ast2 (from std2) ---\n%#v\nstd1:\n%s\nstd2:\n%s", i, ast1, ast2, std1, std2)
+		}
+	}
+}
+
+func Test_Standardize_Trailing_Newline_And_Idempotence(t *testing.T) {
+	src := `fun(a: Str) -> Str do return("hi " + a) end`
+	std1, err := Standardize(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(std1, "\n") {
+		t.Fatalf("missing trailing newline:\n%q", std1)
+	}
+
+	std2, err := Standardize(std1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if std2 != std1 {
+		t.Fatalf("not idempotent:\n---1---\n%q\n---2---\n%q", std1, std2)
+	}
+}
+
+// ---------- Indentation policy ----------
+
+func Test_Printer_TabsOnly_Indentation(t *testing.T) {
+	got := pretty(t, `if a then x else y end`)
+	// Ensure no leading spaces are used for indentation on any line.
+	lines := strings.Split(got, "\n")
+	for i, ln := range lines {
+		// Trim trailing empty last line if any
+		if ln == "" && i == len(lines)-1 {
+			continue
+		}
+		for j := 0; j < len(ln) && (ln[j] == ' ' || ln[j] == '\t'); j++ {
+			if ln[j] == ' ' {
+				t.Fatalf("found space in indentation at line %d: %q", i+1, ln)
+			}
+		}
+	}
+}
+
+// ---------- FormatValue (runtime values) ----------
+
+func Test_Printer_FormatValue_Scalars_And_AnnotatedNull(t *testing.T) {
+	// construct values directly
+	vNull := withAnnot(Null, "division by zero")
+	vInt := Int(42)
+	vStr := Str("hi")
+
+	outNull := FormatValue(vNull)
+	outInt := FormatValue(vInt)
+	outStr := FormatValue(vStr)
+
+	// Annotation should be a header line (single '#') before the value.
+	if !strings.Contains(outNull, "# division by zero") || !strings.Contains(outNull, "\nnull") {
+		t.Fatalf("annotated null not rendered properly:\n%s", outNull)
+	}
+	if strings.TrimSpace(outInt) != "42" {
+		t.Fatalf("int not rendered: %q", outInt)
+	}
+	if strings.TrimSpace(outStr) != `"hi"` {
+		t.Fatalf("str not rendered/quoted: %q", outStr)
+	}
+}
+
+func Test_Printer_FormatValue_Array_And_Map(t *testing.T) {
+	// Array with mixed values, including annotated null
+	arr := Arr([]Value{Int(1), withAnnot(Null, "missing"), Str("x")})
+	outArr := FormatValue(arr)
+
+	// Should render as multi-line because an element has a header annotation
+	if !strings.Contains(outArr, "[") || !strings.Contains(outArr, "]") || !strings.Contains(outArr, "\n") {
+		t.Fatalf("array not formatted multi-line: %q", outArr)
+	}
+	if !strings.Contains(outArr, "# missing") {
+		t.Fatalf("annotation in array element missing:\n%s", outArr)
+	}
+
+	// Map should render keys in stable (sorted) order
+	m := Map(map[string]Value{
+		"b": Int(2),
+		"a": Int(1),
+	})
+	outMap := FormatValue(m)
+	// Expect "a" before "b"
+	if strings.Index(outMap, "a:") > strings.Index(outMap, "b:") {
+		t.Fatalf("map keys not sorted:\n%s", outMap)
+	}
+	// Basic structure
+	if !strings.Contains(outMap, "{") || !strings.Contains(outMap, "}") {
+		t.Fatalf("map not braced: %q", outMap)
+	}
+}
+
+// Inline array + numeric decimal rendering
+func Test_Printer_FormatValue_Array_Inline_And_NumDecimal(t *testing.T) {
+	outArr := FormatValue(Arr([]Value{Int(1), Int(2)}))
+	eq(t, outArr, "[1, 2]")
+
+	outNum := FormatValue(Num(3))
+	eq(t, outNum, "3.0")
+}
+
+// PRE placement (key + value) inside map values
+func Test_Printer_Value_Map_KeyAndValuePREPlacement(t *testing.T) {
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"name"},
+	}
+	v := Str("John McCarthy")
+	v.Annot = "John's name" // value PRE
+	mo.Entries["name"] = v
+	mo.KeyAnn["name"] = "The name" // key PRE
+
+	got := FormatValue(Value{Tag: VTMap, Data: mo})
+	want := "{\n\t# The name\n\tname:\n\t\t# John's name\n\t\t\"John McCarthy\"\n}"
+	if norm(got) != norm(want) {
+		t.Fatalf("value map PRE placement mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
+	}
+}
+
+// POST ordering: value POST then key POST when both present (inline form)
+func Test_Printer_Value_Map_Post_Order(t *testing.T) {
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"a"},
+	}
+	v := Int(1)
+	v.Annot = "<v" // value POST
+	mo.Entries["a"] = v
+	mo.KeyAnn["a"] = "<k" // key POST
+	got := FormatValue(Value{Tag: VTMap, Data: mo})
+	want := "{\n\ta: # k\n\t\t1 # v\n}"
+	eq(t, got, want)
+}
+
+// ---------- Value rendering: Fun/Oracle/Type/Module/Handle ----------
+
+func Test_Printer_Fun_Rendering_ZeroArg(t *testing.T) {
+	f := &Fun{
+		Params:     nil,
+		ParamTypes: nil,
+		ReturnType: S{"id", "Any"},
+	}
+	got := FormatValue(FunVal(f))
+	want := "<fun: _:Null -> Any>"
+	if got != want {
+		t.Fatalf("fun rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Fun_Rendering_With_Params(t *testing.T) {
+	f := &Fun{
+		Params:     []string{"a", "b"},
+		ParamTypes: []S{S{"id", "Int"}, S{"id", "Str"}},
+		ReturnType: S{"id", "Bool"},
+	}
+	got := FormatValue(FunVal(f))
+	want := "<fun: a:Int -> b:Str -> Bool>"
+	if got != want {
+		t.Fatalf("fun rendering (with params) mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Oracle_Rendering(t *testing.T) {
+	f := &Fun{
+		Params:     nil,
+		ParamTypes: nil,
+		ReturnType: S{"id", "Str"},
+		IsOracle:   true,
+	}
+	got := FormatValue(FunVal(f))
+	want := "<oracle: _:Null -> Str>"
+	if got != want {
+		t.Fatalf("oracle rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Type_Rendering(t *testing.T) {
+	// { age: Int, name: Str } — order is sorted by printer
+	env := NewEnv(nil)
+	typ := S{
+		"map",
+		S{"pair", S{"str", "name"}, S{"id", "Str"}},
+		S{"pair", S{"str", "age"}, S{"id", "Int"}},
+	}
+	got := FormatValue(TypeValIn(typ, env))
+	want := "<type: {age: Int, name: Str}>"
+	if got != want {
+		t.Fatalf("type rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+// Type printer: basic arrow/optional + enum literal
+func Test_FormatType_Basics(t *testing.T) {
+	// T? where T = [Int] -> Str
+	T := S{"binop", "->", S{"array", S{"id", "Int"}}, S{"id", "Str"}}
+	opt := S{"unop", "?", T}
+	got := FormatType(opt)
+	want := `[Int] -> Str?`
+	if norm(got) != norm(want) {
+		t.Fatalf("FormatType mismatch\nwant: %q\ngot:  %q", want, got)
+	}
+
+	// Enum type with scalars and a map literal
+	enum := S{"enum",
+		S{"str", "a"},
+		S{"int", int64(1)},
+		S{"map", S{"pair", S{"str", "k"}, S{"num", 1.5}}},
+	}
+	got2 := FormatType(enum)
+	want2 := `Enum["a", 1, {k: 1.5}]`
+	if norm(got2) != norm(want2) {
+		t.Fatalf("FormatType enum mismatch\nwant: %q\ngot:  %q", want2, got2)
+	}
+}
+
+// Type printer: required field + PRE/POST annotations
+func Test_FormatType_Required_And_Annotations(t *testing.T) {
+	typ := S{"map",
+		S{"pair!", // required field
+			S{"annot", S{"str", "Key pre"}, S{"str", "id"}},     // key PRE
+			S{"annot", S{"str", "<Value post"}, S{"id", "Int"}}, // value POST
+		},
+	}
+	got := FormatType(typ)
+	want := "{\n\t# Key pre\n\tid!: Int # Value post\n}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Module_Rendering(t *testing.T) {
+	// Minimal module with a display name that should pass through prettySpec unchanged.
+	m := &Module{Name: "MyMod"}
+	got := FormatValue(Value{Tag: VTModule, Data: m})
+	want := "<module: MyMod>"
+	if got != want {
+		t.Fatalf("module rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Handle_Rendering(t *testing.T) {
+	h := HandleVal("token", 123)
+	got := FormatValue(h)
+	want := "<handle: token>"
+	if got != want {
+		t.Fatalf("handle rendering mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func Test_Printer_Value_Type_EmptyObject_NoSpace(t *testing.T) {
+	env := NewEnv(nil)
+	got := FormatValue(TypeValIn(S{"map"}, env))
+	want := "<type: {}>"
+	if norm(got) != norm(want) {
+		t.Fatalf("empty object type spacing mismatch\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+// ---------- POST annotations after comma/colon ----------
+
+// Arrays (expressions): POST should render *after the comma*.
+func Test_Printer_Array_Post_After_Comma(t *testing.T) {
+	in := `let a = [1, # here
+2]`
+	want := "let a = [\n" +
+		"\t1, # here\n" +
+		"\t2\n" +
+		"]"
+	eq(t, pretty(t, in), want)
+}
+
+// Enums (expressions): same comma behavior inside Enum[...].
+func Test_Printer_Enum_Post_After_Comma(t *testing.T) {
+	in := `Enum[1, # post
+2]`
+	want := "Enum[\n" +
+		"\t1, # post\n" +
+		"\t2\n" +
+		"]"
+	eq(t, pretty(t, in), want)
+}
+
+// Maps (expressions): value POST should render *after the comma* that follows the entry.
+// Key POST should render *after the colon* on the key line.
+func Test_Printer_Map_Posts_After_Comma_And_After_Colon(t *testing.T) {
+	// Value POST after comma
+	in1 := `let a = {x: 1, # vpost
+y: 2}`
+	want1 := "let a = {\n" +
+		"\tx: 1, # vpost\n" +
+		"\ty: 2\n" +
+		"}"
+	eq(t, pretty(t, in1), want1)
+
+	// Key POST after colon; value on next line, comma after the value line
+	in2 := `let a = {x: # kpost
+1, y: 2}`
+	want2 := "let a = {\n" +
+		"\tx: # kpost\n" +
+		"\t\t1,\n" +
+		"\ty: 2\n" +
+		"}"
+	eq(t, pretty(t, in2), want2)
+}
+
+// Type maps: same rules as maps — value POST after comma; key POST after colon.
+func Test_Printer_TypeMap_Posts_After_Comma_And_After_Colon(t *testing.T) {
+	// Value POST after comma
+	in1 := `type {x: Int, # vpost
+y: Str}`
+	want1 := "type {\n" +
+		"\tx: Int, # vpost\n" +
+		"\ty: Str\n" +
+		"}"
+	eq(t, pretty(t, in1), want1)
+
+	// Key POST after colon; type value on next line, comma after that line
+	in2 := `type {x: # kpost
+Int, y: Str}`
+	want2 := "type {\n" +
+		"\tx: # kpost\n" +
+		"\t\tInt,\n" +
+		"\ty: Str\n" +
+		"}"
+	eq(t, pretty(t, in2), want2)
+}
+
+// Array destructuring patterns: POST should render *after the comma*.
+func Test_Printer_ArrayPattern_Post_After_Comma(t *testing.T) {
+	in := `let [a, # post
+b] = xs`
+	want := "let [\n" +
+		"\ta, # post\n" +
+		"\tb\n" +
+		"] = xs"
+	eq(t, pretty(t, in), want)
+}
+
+// Object destructuring patterns: value POST after comma; key POST after colon.
+func Test_Printer_ObjectPattern_Posts_After_Comma_And_After_Colon(t *testing.T) {
+	// Value POST after comma between entries
+	in1 := `let {x: p, # vpost
+y: q} = xs`
+	want1 := "let {\n" +
+		"\tx: p, # vpost\n" +
+		"\ty: q\n" +
+		"} = xs"
+	eq(t, pretty(t, in1), want1)
+
+	// Key POST after colon; pattern value on next line, comma after that line
+	in2 := `let {x: # kpost
+p, y: q} = xs`
+	want2 := "let {\n" +
+		"\tx: # kpost\n" +
+		"\t\tp,\n" +
+		"\ty: q\n" +
+		"} = xs"
+	eq(t, pretty(t, in2), want2)
+}
+
+func Test_Printer_FunctionType_Parentheses(t *testing.T) {
+	in := `fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do end`
+	want := `
+fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do
+
+end`
+	eq(t, pretty(t, in), want)
+}
+
+func Test_Printer_FunValue_FunctionTypeParam_Parens(t *testing.T) {
+	// <fun: f:(Any -> Any) -> it:(Null -> Any) -> Null -> Any>
+	f := &Fun{
+		Params: []string{"f", "it"},
+		ParamTypes: []S{
+			{"binop", "->", S{"id", "Any"}, S{"id", "Any"}},
+			{"binop", "->", S{"id", "Null"}, S{"id", "Any"}},
+		},
+		ReturnType: S{"binop", "->", S{"id", "Null"}, S{"id", "Any"}},
+	}
+	got := FormatValue(Value{Tag: VTFun, Data: f})
+	want := "<fun: f:(Any -> Any) -> it:(Null -> Any) -> Null -> Any>"
+	if strings.TrimSpace(got) != want {
+		t.Fatalf("fun render mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func Test_FormatType_RightAssociative_Arrows(t *testing.T) {
+	tests := []struct {
+		name string
+		in   S
+		want string
+	}{
+		{
+			name: "single arg",
+			in:   S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}},
+			want: "Int -> Int",
+		},
+		{
+			name: "left is arrow: (Int -> Int) -> Int",
+			in:   S{"binop", "->", S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}, S{"id", "Int"}},
+			want: "(Int -> Int) -> Int",
+		},
+		{
+			name: "right is arrow: Int -> (Int -> Int) prints as chain",
+			in:   S{"binop", "->", S{"id", "Int"}, S{"binop", "->", S{"id", "Int"}, S{"id", "Int"}}},
+			want: "Int -> Int -> Int",
+		},
+		{
+			name: "long chain right-assoc",
+			in: S{"binop", "->",
+				S{"id", "A"},
+				S{"binop", "->",
+					S{"id", "B"},
+					S{"binop", "->", S{"id", "C"}, S{"id", "R"}},
+				},
+			},
+			want: "A -> B -> C -> R",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.TrimSpace(FormatType(tc.in))
+			if got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func Test_Printer_FunctionParam_Parentheses(t *testing.T) {
+	// helper keeps consistency with existing pretty() + eq() style
+	check := func(in, want string) {
+		eq(t, pretty(t, in), want)
+	}
+
+	// fun(m: Int -> Int, n: Int) ==> fun(m: (Int -> Int), n: Int)
+	check(
+		`fun(m: Int -> Int, n: Int) do end`,
+		`
+fun(m: Int -> Int, n: Int) do
+
+end`,
+	)
+
+	// fun(m: (Int -> Int) -> Int) ==> fun(m: ((Int -> Int) -> Int))
+	check(
+		`fun(m: (Int -> Int) -> Int) do end`,
+		`
+fun(m: (Int -> Int) -> Int) do
+
+end`,
+	)
+
+	// Mixed case from earlier test: keeps right-assoc and wraps params
+	check(
+		`fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do end`,
+		`
+fun(f: (Int -> Int) -> Int, g: Int -> Int -> Int) do
+
+end`,
+	)
+}
+
+func Test_Printer_Value_Cycle_ArraySelf(t *testing.T) {
+	// a = []; a[0] = a
+	ao := &ArrayObject{}
+	a := Value{Tag: VTArray, Data: ao}
+	ao.Elems = []Value{a}
+
+	got := FormatValue(a)
+	want := "[[...]]" // Python-style cycle marker inside array, rendered inline
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_MapSelf(t *testing.T) {
+	// m = {}; m.self = m
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	mo.Entries["self"] = m
+	mo.Keys = append(mo.Keys, "self")
+
+	got := FormatValue(m)
+	// Keys are sorted; single key "self" prints inline.
+	want := "{self: {...}}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_Cross_ArrayToMap(t *testing.T) {
+	// a = [m]; m = { k: a }  (cross-reference; printing 'a' should show k: [...] )
+	ao := &ArrayObject{}
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"k"},
+	}
+
+	a := Value{Tag: VTArray, Data: ao}
+	m := Value{Tag: VTMap, Data: mo}
+
+	ao.Elems = []Value{m}
+	mo.Entries["k"] = a
+
+	got := FormatValue(a)
+	want := "[{k: [...]}]"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_ArrayElement_PostAfterComma(t *testing.T) {
+	// a = [a # post, 1]  — POST should print after the comma of the first element and force newline.
+	ao := &ArrayObject{}
+	a := Value{Tag: VTArray, Data: ao}
+	// First element is the array itself, *with* a POST annotation.
+	first := a
+	first.Annot = "< post here"
+	ao.Elems = []Value{first, Int(1)}
+
+	got := FormatValue(a)
+
+	// Expect multi-line due to POST (HardLine).
+	// Tabs for indentation (as the printer uses).
+	want := "[\n\t[...], # post here\n\t1\n]"
+	if strings.TrimSpace(got) != strings.TrimSpace(want) {
+		t.Fatalf("cycle array with POST mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func Test_Printer_Value_Cycle_MapValue_PostAfterComma(t *testing.T) {
+	// m = { k: m # post } — value POST prints after following comma;
+	// with a single entry there's no following comma, so it trails the value.
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"k"},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	val := m
+	val.Annot = "<v-post"
+	mo.Entries["k"] = val
+
+	got := FormatValue(m)
+	// Single entry: inline with value POST trailing.
+	want := "{\n\tk: {...} # v-post\n}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_NestedAnnots_PreservePreAndPost(t *testing.T) {
+	// Array with PRE on container element and POST on value:
+	// [  # pre
+	//   {...} # post
+	// ]
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"x"},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	mo.Entries["x"] = Int(1)
+
+	ao := &ArrayObject{}
+	elem := m
+	a := Value{Tag: VTArray, Data: ao}
+	ao.Elems = []Value{withAnnot(elem, "head")} // PRE on element via Annot without '<'
+
+	got := FormatValue(a)
+
+	// Expect multi-line due to PRE; POST remains trailing on the value line.
+	want := "[\n\t# head\n\t{x: 1}\n]"
+	if strings.TrimSpace(got) != strings.TrimSpace(want) {
+		t.Fatalf("nested PRE/POST mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func Test_Printer_Value_Cycle_ArrayToArray(t *testing.T) {
+	// a = [b]; b = [a]  (2-cycle through arrays)
+	aoA := &ArrayObject{}
+	aoB := &ArrayObject{}
+	a := Value{Tag: VTArray, Data: aoA}
+	b := Value{Tag: VTArray, Data: aoB}
+
+	aoA.Elems = []Value{b}
+	aoB.Elems = []Value{a}
+
+	got := FormatValue(a)
+	// Outer a contains b, which contains a (elided) → [[[...]]]
+	want := "[[[...]]]"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_Cycle_MapValue_PostAfterCommaBetweenEntries(t *testing.T) {
+	// m = { a: m # post, b: 1 } — value POST for 'a' prints after the comma
+	mo := &MapObject{
+		Entries: map[string]Value{},
+		KeyAnn:  map[string]string{},
+		Keys:    []string{"a", "b"},
+	}
+	m := Value{Tag: VTMap, Data: mo}
+	val := m
+	val.Annot = "<first" // value POST
+	mo.Entries["a"] = val
+	mo.Entries["b"] = Int(1)
+
+	got := FormatValue(m)
+	want := "{\n\ta: {...}, # first\n\tb: 1\n}"
+	eq(t, got, want)
+}
+
+func Test_Printer_Value_SharedSubstructure_ElidesSecondOccurrence(t *testing.T) {
+	// b = [1]; a = [b, b] — same identity appears twice; second occurrence elides.
+	aoB := &ArrayObject{Elems: []Value{Int(1)}}
+	b := Value{Tag: VTArray, Data: aoB}
+
+	aoA := &ArrayObject{Elems: []Value{b, b}}
+	a := Value{Tag: VTArray, Data: aoA}
+
+	got := FormatValue(a)
+	want := "[[1], [...]]"
+	eq(t, got, want)
+}
+=== END FILE: printer_test.go ===
 

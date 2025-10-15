@@ -685,6 +685,9 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 	namesArr := make([]Value, 0, max(0, len(params)-1))
 	for i := 1; i < len(params); i++ {
 		p := params[i].(S)
+		if len(p) == 0 || p[0].(string) != "pair" {
+			continue
+		}
 		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
 	}
 	if len(retT) == 0 {
@@ -699,7 +702,11 @@ func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, ex
 	// Build the param types at runtime via ("type", …) so they capture env.
 	typeCount := 0
 	for i := 1; i < len(params); i++ {
-		t := params[i].(S)[2].(S) // may be empty
+		p := params[i].(S)
+		if len(p) == 0 || p[0].(string) != "pair" {
+			continue
+		}
+		t := p[2].(S) // may be empty
 		if len(t) == 0 {
 			t = S{"id", "Any"}
 		}
@@ -745,7 +752,7 @@ func (e *emitter) emitExpr(n S) {
 	case "bool":
 		e.emit(opConst, e.k(Bool(n[1].(bool))))
 	case "noop":
-		e.emit(opConst, e.k(Null))
+		// ignore
 	case "null":
 		e.emit(opConst, e.k(Null))
 
@@ -909,28 +916,43 @@ func (e *emitter) emitExpr(n S) {
 
 	// ----- arrays / maps -----
 	case "array":
+		emitted := 0
 		for i := 1; i < len(n); i++ {
-			e.withChild(i-1, func() { e.emitExpr(n[i].(S)) })
+			child := n[i].(S)
+			if isNoopish(child) {
+				continue
+			}
+			e.withChild(i-1, func() { e.emitExpr(child) })
+			emitted++
 		}
-		e.emit(opMakeArr, uint32(len(n)-1))
+		e.emit(opMakeArr, uint32(emitted))
 
 	case "map":
-		keys := S{"array"}
-		vals := S{"array"}
+		keys := []S{}
+		vals := []S{}
 		for i := 1; i < len(n); i++ {
 			p := n[i].(S)
+			if len(p) == 0 {
+				continue
+			}
+			tag := p[0].(string)
+			if tag != "pair" && tag != "pair!" {
+				continue
+			}
 			keys = append(keys, p[1].(S))
 			vals = append(vals, p[2].(S))
 		}
 		e.emit(opLoadGlobal, e.ks("__map_from"))
-		for i := 1; i < len(keys); i++ {
-			e.withChild(i-1, func() { e.withChild(0, func() { e.emitExpr(keys[i].(S)) }) })
+		for i := 0; i < len(keys); i++ {
+			idx := i
+			e.withChild(idx, func() { e.withChild(0, func() { e.emitExpr(keys[idx]) }) })
 		}
-		e.emit(opMakeArr, uint32(len(keys)-1))
-		for i := 1; i < len(vals); i++ {
-			e.withChild(i-1, func() { e.withChild(1, func() { e.emitExpr(vals[i].(S)) }) })
+		e.emit(opMakeArr, uint32(len(keys)))
+		for i := 0; i < len(vals); i++ {
+			idx := i
+			e.withChild(idx, func() { e.withChild(1, func() { e.emitExpr(vals[idx]) }) })
 		}
-		e.emit(opMakeArr, uint32(len(vals)-1))
+		e.emit(opMakeArr, uint32(len(vals)))
 		e.emit(opCall, 2)
 
 	// ----- property / index -----
@@ -950,17 +972,26 @@ func (e *emitter) emitExpr(n S) {
 		// Evaluate callee once.
 		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
 
-		argc := len(n) - 2
-		if argc == 0 {
+		argc := 0
+		if len(n) == 2 {
 			// Zero-arg call: blame callee right before CALL 0.
 			e.callWithMarkChild(0, 0)
 			return
 		}
-		// Apply args one by one; blame each arg before its CALL 1.
+		// Apply args one by one; skip noopish args; blame each emitted arg.
 		for i := 2; i < len(n); i++ {
+			arg := n[i].(S)
+			if isNoopish(arg) {
+				continue
+			}
 			argIdx := i - 1
-			e.withChild(argIdx, func() { e.emitExpr(n[i].(S)) })
+			e.withChild(argIdx, func() { e.emitExpr(arg) })
 			e.callWithMarkChild(1, argIdx)
+			argc++
+		}
+		if argc == 0 {
+			// No real arguments after skipping noops → call with 0 args.
+			e.callWithMarkChild(0, 0)
 		}
 		return
 
@@ -1184,7 +1215,6 @@ func (e *emitter) emitExpr(n S) {
 		subj := n[2].(S)
 
 		if isNoopish(subj) {
-			e.emit(opConst, e.k(Null))
 			return
 		}
 

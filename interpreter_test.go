@@ -1045,8 +1045,9 @@ let {
 	if !isAnnotatedNull(vy) {
 		t.Fatalf("want annotated null for missing 'age', got %#v", vy)
 	}
-	// The message should mention it's missing (we don't assert exact string, just meaning).
-	wantAnnotatedNullContains(t, vy, "missing key")
+	if vy.Annot != "years" {
+		t.Fatalf("want annotation %q on missing 'age', got %q", "years", vy.Annot)
+	}
 }
 
 // Map construction with several annotated keys mixed with values.
@@ -1111,12 +1112,21 @@ let c = it(null)
 `
 	v := evalSrc(t, src)
 	xs := v.Data.(*ArrayObject).Elems
-	wantStrAnn(t, xs[0], "name", "the name")
-	wantStr(t, xs[1], "Mo")
-	wantStrAnn(t, xs[2], "age", "the age")
+	// First pair
+	wantStrAnn(t, xs[0], "name", "")             // key has no annotation
+	wantStrWithAnnot(t, xs[1], "Mo", "the name") // value carries the note
+	// Second pair
+	wantStrAnn(t, xs[2], "age", "")
 	wantInt(t, xs[3], 47)
+	if xs[3].Annot != "the age" {
+		t.Fatalf("want value annotation %q, got %q", "the age", xs[3].Annot)
+	}
+	// Third pair
 	wantStrAnn(t, xs[4], "plain", "")
 	wantStr(t, xs[5], "ok")
+	if xs[5].Annot != "" {
+		t.Fatalf("unexpected value annotation %q for 'plain'", xs[5].Annot)
+	}
 }
 
 // Lookup ignores key annotation (storage by raw string).
@@ -1183,8 +1193,11 @@ arr
 `
 	v := evalSrc(t, src)
 	pair := v.Data.(*ArrayObject).Elems
-	wantStrAnn(t, pair[0], "k", "B")
+	wantStrAnn(t, pair[0], "k", "") // key has no annotation under new policy
 	wantInt(t, pair[1], 9)
+	if pair[1].Annot != "B" {
+		t.Fatalf("want value annotation %q on merged RHS, got %q", "B", pair[1].Annot)
+	}
 }
 
 func Test_Interpreter_Annot_On_Assign_Persists_In_Env(t *testing.T) {
@@ -1281,8 +1294,9 @@ func Test_Interpreter_Pretty_Does_Not_Show_Desugaring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pretty error: %v", err)
 	}
-	if got1 != src1 {
-		t.Fatalf("Pretty changed surface form.\nwant:\n%s\n\ngot:\n%s", src1, got1)
+	want1 := "let y = # hello\n1"
+	if got1 != want1 {
+		t.Fatalf("Pretty normalization mismatch.\nwant:\n%s\n\ngot:\n%s", want1, got1)
 	}
 
 	src2 := "# note\nlet u"

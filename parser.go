@@ -789,7 +789,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			if err := p.needExprAfter(t, "expected type expression after 'type'"); err != nil {
 				return nil, err
 			}
-			x, err := p.expr(0)
+			x, err := p.expr(1) // was 0; using 1 suppresses inner attachSameLineAnnots
 			if err != nil {
 				return nil, err
 			}

@@ -1294,7 +1294,7 @@ func Test_Interpreter_Pretty_Does_Not_Show_Desugaring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pretty error: %v", err)
 	}
-	want1 := "let y = # hello\n1"
+	want1 := "let y = 1 # hello"
 	if got1 != want1 {
 		t.Fatalf("Pretty normalization mismatch.\nwant:\n%s\n\ngot:\n%s", want1, got1)
 	}

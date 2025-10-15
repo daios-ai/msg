@@ -14,28 +14,10 @@
 //     "return/break/continue", arrays, maps, calls, indexing, properties,
 //     unary and binary operators).
 //     - Annotation nodes use the simplified 3-ary form:
-//     ("annot", ("str", textOr<text>), wrappedNode)
-//     PRE annotations are stored as-is (text); POST annotations are encoded
-//     by a leading "<" in the stored text. PRE annotations print as `# ...`
-//     lines immediately above the construct; POST annotations print as a
-//     trailing `# ...` inline comment on the same line as the construct.
-//     **Important (POST semantics):**
-//     • POST captures the rest of the current line and therefore *forces a newline*.
-//     • In comma/colon separated contexts, POST attaches **after the separator**:
-//     - For comma-separated lists (arrays, enums, destructuring arrays, value arrays):
-//     the POST prints *after the comma that follows the element* (or after the
-//     element itself if it is the last one).
-//     Example:
-//     [ 1, # post
-//     2 ]
-//     - For maps/object patterns/type maps: POST on a **key** prints after the colon
-//     on the key line (`key: # post`), while POST on a **value** of a non-last
-//     entry prints after the following comma (`key: value, # post`).
-//     Printers account for this and avoid emitting an extra blank line before a
-//     closing brace/bracket.
-//     - Property names are emitted bare if they are identifier-like, otherwise
-//     quoted. Destructuring declaration patterns ("decl" | "darr" | "dobj")
-//     are rendered in a compact, readable form.
+//     ("annot", ("str", text), wrappedNode)
+//     PRE/POST is *not* encoded by the parser anymore. All annotations are
+//     attached to values (or noops), and the pretty-printer decides PRE vs POST
+//     based on layout at binding sites.
 //     - Formatting emits no space before '(' for calls and for 'fun(...)'
 //     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
 //     - Control keywords render without parens:
@@ -52,10 +34,8 @@
 //     ("array", T)            → prints as `[T]`
 //     ("map", ("pair"| "pair!", ("str",k), T) ...)
 //     Required fields print with a trailing `!` on the key.
-//     Key/value annotations (if wrapped in "annot") are respected:
-//     PRE as header lines; POST as trailing inline comments that force a
-//     newline (see POST semantics above). For **value POST** in non-last
-//     entries, the POST prints *after the following comma*.
+//     Value annotations (if wrapped in "annot") are respected and decided
+//     PRE vs POST by the same centralized policy as expressions.
 //     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
 //     may be scalars, arrays, or maps.
 //     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
@@ -72,12 +52,10 @@
 //     MaxInlineWidth budget and no PRE annotations force multi-line; else
 //     they fall back to pretty, multi-line output with indentation.
 //     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
-//     - Annotations distinguish PRE vs POST using the same `<` convention:
-//     • PRE (no '<' prefix): printed as `# ...` lines before the value.
-//     • POST (with '<' prefix): printed as an inline trailing comment
-//     on the same line as the value **and forces a newline**.
-//     • In comma/colon separated contexts, POST respects the same **after
-//     separator** rule as the AST printers (value POST after comma).
+//     - Annotations: the printer chooses PRE vs POST. At binding/entry/element
+//     sites, short single-line notes become inline trailing comments; otherwise
+//     they become header lines. POST forces a newline and respects the
+//     **after-separator** rule (value POST after comma).
 //     When a POST ends the last element/entry line, the closing bracket/brace
 //     is placed on the next line without an extra blank line.
 //     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
@@ -98,7 +76,7 @@
 // • interpreter.go (runtime model)
 //   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
 //     VTFun, VTType, VTModule, VTHandle)
-//   - Fun, TypeValue, MapObject (Entries/KeyAnn/Keys).
+//   - Fun, TypeValue, MapObject (Entries/Keys).
 //
 // • modules.go (module loader)
 //   - Module struct and prettySpec(string) (used for VTModule display).
@@ -169,9 +147,8 @@ var MaxInlineWidth = 80
 //   - On success, pretty-prints the AST using FormatSExpr, producing stable,
 //     whitespace-normalized code with minimal parentheses.
 //   - Supports annotations using the 3-ary form:
-//     ("annot", ("str", textOr<text>), X)
-//     PRE prints as `# ...` above; POST prints as trailing `# ...` on the line
-//     and forces a newline.
+//     ("annot", ("str", text), X)
+//     PRE/POST is chosen by the pretty-printer at binding sites.
 //
 // Errors:
 //   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
@@ -225,12 +202,9 @@ func Standardize(src string) (string, error) {
 //     are rendered with keywords and indentation.
 //   - Expressions use minimal parentheses according to a fixed precedence table;
 //     property access vs calls/indexing binds tightly.
-//   - Arrays and maps are printed inline (AST form); map key annotations print
-//     as preceding `# ...` lines (PRE) or trailing inline comments (POST).
-//     POST consumes the rest of the line and forces a newline, and containers
-//     avoid emitting an extra blank line before closing delimiters.
-//   - Annotation nodes wrap the printed construct; POST becomes trailing inline.
-//   - **POST-after-separator rule** is enforced (see file header).
+//   - Arrays and maps are printed inline (AST form).
+//   - Annotation nodes wrap the printed construct; PRE vs POST is chosen centrally.
+//   - **POST-after-separator rule** is enforced for inline cases.
 //
 // This function does not parse; it strictly formats the provided AST.
 func FormatSExpr(n S) string {
@@ -246,9 +220,8 @@ func FormatSExpr(n S) string {
 }
 
 // FormatType renders a type S-expression into a compact, human-readable string.
-// It respects PRE (header lines) vs POST (trailing inline that forces newline)
-// in the same way as the AST/code printer, including the **POST-after-separator**
-// behavior for value POSTs in maps.
+// It uses the same centralized PRE/POST policy for value annotations inside
+// type maps and enum literals.
 func FormatType(t S) string {
 	doc := docType(t)
 	var b strings.Builder
@@ -266,15 +239,11 @@ func FormatType(t S) string {
 // Layout policy:
 //   - Scalars: null, booleans, ints, floats (with a decimal point for
 //     non-scientific output), and quoted strings.
-//   - Arrays: single-line `[ a, b, c ]` when the group fits and there are no
-//     PRE annotations forcing multi-line; otherwise multi-line with indentation.
-//     Value POST follows the **after-comma** rule.
-//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short,
-//     with no PRE key/value annotations; else multi-line with indentation,
-//     where PRE annotations print as header lines, value POST prints **after
-//     the following comma**, and key POST prints after the colon. When the last
-//     entry ends with a POST, the closing brace is on the next line without an
-//     extra blank line.
+//   - Arrays: single-line `[ a, b, c ]` when the group fits; otherwise
+//     multi-line with indentation. Element annotations use the centralized
+//     policy (inline if short; else header).
+//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short;
+//     else multi-line with indentation. Value annotations use centralized policy.
 //   - Functions: `<fun: name:T -> name2:U -> R>` (zero-arg uses `_:Null`).
 //   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
 //   - Modules: `<module: pretty-name>` when available.
@@ -357,16 +326,8 @@ func typeAst(data any) S {
 	}
 }
 
-// Split annotation text into PRE vs POST according to leading "<".
-func splitAnnotText(s string) (pre, post string) {
-	if s == "" {
-		return "", ""
-	}
-	if strings.HasPrefix(s, "<") {
-		return "", strings.TrimPrefix(s, "<")
-	}
-	return s, ""
-}
+// NOTE: The parser no longer encodes PRE vs POST; all annotations live on values.
+// The pretty-printer chooses PRE vs POST purely by layout at binding sites.
 
 /* ---------- Doc engine (tiny) ---------- */
 
@@ -628,57 +589,9 @@ func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
 	return inlineOrMultiAdvanced(open, elems, close, false)
 }
 
-// kvEntry builds a single map entry, respecting PRE/POST placement and
-// POST-newline semantics.
-//   - keyPre prints above the key.
-//   - If valPre is non-empty, the value is placed on its own indented line
-//     under `key:` and valPre prints above the value.
-//   - POSTs: key POST lives on the key line (after ':'), value POST lives on
-//     the value line. Both force a newline.
-//   - NOTE: Callers may choose to *not* pass a value POST here in order to
-//     attach it **after the following comma** using the comma-aware joiner.
-func kvEntry(keyDoc *Doc, valDoc *Doc, keyPre, valPre, keyPost, valPost string) *Doc {
-	var parts []*Doc
-	// key PRE above entry
-	if keyPre != "" {
-		parts = append(parts, annotPre(keyPre))
-	}
-	// key:
-	parts = append(parts, keyDoc)
-
-	// Cases:
-	switch {
-	case valPre != "":
-		// Own line for value; key POST attaches to key line.
-		if keyPost != "" {
-			parts = append(parts, Text(":"), annotInline(keyPost))
-		} else {
-			parts = append(parts, Text(":"))
-		}
-		parts = append(parts, HardLineDoc(),
-			Nest(1, Concat(annotPre(valPre), valDoc)))
-		// Value POST on the value line.
-		if valPost != "" {
-			parts = append(parts, annotInline(valPost))
-		}
-
-	case keyPost != "":
-		// No valPre; key has POST → put key POST on key line, then value below.
-		parts = append(parts, Text(":"), annotInline(keyPost),
-			Nest(1, Concat(valDoc)))
-		if valPost != "" {
-			parts = append(parts, annotInline(valPost))
-		}
-
-	default:
-		// Same line `key: value`; only value POST trails and forces newline.
-		parts = append(parts, Text(": "), valDoc)
-		if valPost != "" {
-			parts = append(parts, annotInline(valPost))
-		}
-	}
-
-	return Concat(parts...)
+// Minimal entry builder; annotation handling is centralized elsewhere.
+func kvEntry(keyDoc *Doc, valDoc *Doc) *Doc {
+	return Concat(keyDoc, Text(": "), valDoc)
 }
 
 /* ---------- Comma-aware joining (centralized POST-after-comma logic) ---------- */
@@ -731,12 +644,8 @@ func listS(n S, from int) []S {
 	return out
 }
 
-func unwrapKeyAST(n S) (name string, annot string) {
-	if tag(n) == "annot" {
-		return n[2].(S)[1].(string), n[1].(S)[1].(string)
-	}
-	return n[1].(string), ""
-}
+// Keys/names are not annotated; unwrap name only.
+func unwrapKeyName(n S) string { return n[1].(string) }
 
 var binPrec = map[string]struct {
 	p     int
@@ -794,11 +703,16 @@ func docProgram(n S) *Doc {
 	}
 	kids := listS(n, 1)
 	var ds []*Doc
-	for i, k := range kids {
-		ds = append(ds, docStmt(k))
-		if i < len(kids)-1 {
+	firstReal := true
+	for _, k := range kids {
+		if tag(k) == "noop" {
+			continue
+		}
+		if !firstReal {
 			ds = append(ds, HardLineDoc())
 		}
+		ds = append(ds, docStmt(k))
+		firstReal = false
 	}
 	return Concat(ds...)
 }
@@ -809,12 +723,10 @@ func docStmt(n S) *Doc {
 		return Concat()
 
 	case "annot":
-		text, wrapped, pre := asAnnotAST(n)
-		if pre {
-			return Concat(annotPre(text), docStmt(wrapped))
-		}
-		// POST: trailing inline — capture the remainder of the line and break.
-		return Concat(docStmt(wrapped), annotInline(text))
+		// With value-only annotations, statement wrappers should be rare.
+		// Render as PRE for stability.
+		text, wrapped, _ := asAnnotASTRaw(n)
+		return Concat(annotPre(text), docStmt(wrapped))
 
 	case "fun":
 		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
@@ -900,11 +812,24 @@ func docStmt(n S) *Doc {
 	case "decl", "darr", "dobj":
 		return Concat(Text("let "), docPattern(n))
 	case "assign":
+		// Decide PRE vs POST for the whole binding (let-or-assign).
 		lhs, rhs := n[1].(S), n[2].(S)
+		var head *Doc
 		if isDeclPattern(lhs) {
-			return Concat(Text("let "), docPattern(lhs), Text(" = "), docExpr(rhs))
+			head = Concat(Text("let "), docPattern(lhs), Text(" = "))
+		} else {
+			head = Concat(docExprMin(lhs, 10), Text(" = "))
 		}
-		return Concat(docExpr(lhs), Text(" = "), docExpr(rhs))
+		if txt, inner, ok := asAnnotASTRaw(rhs); ok && strings.TrimSpace(txt) != "" {
+			val := docExprMin(inner, 10)
+			probe := Concat(head, val)
+			main, post := attachInlineOrPre(probe, txt)
+			if post != "" {
+				return Concat(head, val, annotInline(post))
+			}
+			return main
+		}
+		return Concat(head, docExprMin(rhs, 10))
 
 	case "block":
 		return Concat(Text("do"), HardLineDoc(), Nest(1, docBlock(n)), HardLineDoc(), Text("end"))
@@ -920,11 +845,16 @@ func docBlock(n S) *Doc {
 	}
 	kids := listS(n, 1)
 	var ds []*Doc
-	for i, k := range kids {
-		ds = append(ds, docStmt(k))
-		if i < len(kids)-1 {
+	firstReal := true
+	for _, k := range kids {
+		if tag(k) == "noop" {
+			continue
+		}
+		if !firstReal {
 			ds = append(ds, HardLineDoc())
 		}
+		ds = append(ds, docStmt(k))
+		firstReal = false
 	}
 	return Concat(ds...)
 }
@@ -954,28 +884,7 @@ func docExprMin(n S, need int) *Doc {
 	return parenIf(need, docExpr(n), n)
 }
 
-// docExprAndTrailingPost renders n as an expression and returns any single
-// outer POST annotation's text (without '<') so the caller can attach it
-// after a following comma when needed.
-func docExprAndTrailingPost(n S) (*Doc, string) {
-	if tag(n) == "annot" {
-		txt, wrapped, pre := asAnnotAST(n)
-		if !pre {
-			return docExpr(wrapped), txt
-		}
-	}
-	return docExpr(n), ""
-}
-
-func docPatternAndTrailingPost(n S) (*Doc, string) {
-	if tag(n) == "annot" {
-		txt, wrapped, pre := asAnnotAST(n)
-		if !pre {
-			return docPattern(wrapped), txt
-		}
-	}
-	return docPattern(n), ""
-}
+// (old trailing-post helpers removed; annotation policy is centralized)
 
 func docExpr(n S) *Doc {
 	switch tag(n) {
@@ -1061,8 +970,12 @@ func docExpr(n S) *Doc {
 		}
 		items := make([]sepItem, 0, len(elems))
 		for _, e := range elems {
-			d, post := docExprAndTrailingPost(e)
-			items = append(items, sepItem{main: d, post: post})
+			if txt, inner, ok := asAnnotASTRaw(e); ok {
+				main, post := attachInlineOrPre(docExpr(inner), txt)
+				items = append(items, sepItem{main: main, post: post})
+			} else {
+				items = append(items, sepItem{main: docExpr(e), post: ""})
+			}
 		}
 		inside := joinCommaWithPost(items)
 		lastEnds := items[len(items)-1].post != ""
@@ -1080,24 +993,13 @@ func docExpr(n S) *Doc {
 		}
 		joined := make([]sepItem, 0, len(items))
 		for _, pr := range items {
-			keyNode := pr[1].(S)
-			valNode := pr[2].(S)
-
-			key, kAnn := unwrapKeyAST(keyNode)
-			kPre, kPost := splitAnnotText(kAnn)
-
-			vPre, vPost := "", ""
-			if tag(valNode) == "annot" {
-				txt, wrapped, pre := asAnnotAST(valNode)
-				if pre {
-					vPre = txt
-				} else {
-					vPost = txt // defer to after-comma placement
-				}
-				valNode = wrapped
+			key := unwrapKeyName(pr[1].(S))
+			val := pr[2].(S)
+			if txt, inner, ok := asAnnotASTRaw(val); ok {
+				joined = append(joined, entryWithAnn(idOrQuoted(key), docExpr(inner), txt))
+			} else {
+				joined = append(joined, sepItem{main: kvEntry(idOrQuoted(key), docExpr(val)), post: ""})
 			}
-			entryDoc := kvEntry(idOrQuoted(key), docExpr(valNode), kPre, vPre, kPost /*valPost*/, "")
-			joined = append(joined, sepItem{main: entryDoc, post: vPost})
 		}
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
@@ -1115,8 +1017,12 @@ func docExpr(n S) *Doc {
 		}
 		items := make([]sepItem, 0, len(elems))
 		for _, e := range elems {
-			d, post := docExprAndTrailingPost(e)
-			items = append(items, sepItem{main: d, post: post})
+			if txt, inner, ok := asAnnotASTRaw(e); ok {
+				main, post := attachInlineOrPre(docExpr(inner), txt)
+				items = append(items, sepItem{main: main, post: post})
+			} else {
+				items = append(items, sepItem{main: docExpr(e), post: ""})
+			}
 		}
 		inside := joinCommaWithPost(items)
 		lastEnds := items[len(items)-1].post != ""
@@ -1162,8 +1068,12 @@ func docPattern(n S) *Doc {
 		}
 		joined := make([]sepItem, 0, len(items))
 		for _, it := range items {
-			d, post := docPatternAndTrailingPost(it)
-			joined = append(joined, sepItem{main: d, post: post})
+			if txt, inner, ok := asAnnotASTRaw(it); ok {
+				main, post := attachInlineOrPre(docPattern(inner), txt)
+				joined = append(joined, sepItem{main: main, post: post})
+			} else {
+				joined = append(joined, sepItem{main: docPattern(it), post: ""})
+			}
 		}
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
@@ -1180,21 +1090,13 @@ func docPattern(n S) *Doc {
 		}
 		joined := make([]sepItem, 0, len(items))
 		for _, it := range items {
-			key, ann := unwrapKeyAST(it[1].(S))
-			kPre, kPost := splitAnnotText(ann)
+			key := unwrapKeyName(it[1].(S))
 			val := it[2].(S)
-			vPre, vPost := "", ""
-			if tag(val) == "annot" {
-				txt, wrapped, pre := asAnnotAST(val)
-				if pre {
-					vPre = txt
-				} else {
-					vPost = txt // defer to comma
-				}
-				val = wrapped
+			if txt, inner, ok := asAnnotASTRaw(val); ok {
+				joined = append(joined, entryWithAnn(idOrQuoted(key), docPattern(inner), txt))
+			} else {
+				joined = append(joined, sepItem{main: kvEntry(idOrQuoted(key), docPattern(val)), post: ""})
 			}
-			entry := kvEntry(idOrQuoted(key), docPattern(val), kPre, vPre, kPost /*valPost*/, "")
-			joined = append(joined, sepItem{main: entry, post: vPost})
 		}
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
@@ -1205,11 +1107,9 @@ func docPattern(n S) *Doc {
 			return SoftLineDoc()
 		}())), "}"))
 	case "annot":
-		text, wrapped, pre := asAnnotAST(n)
-		if pre {
-			return Concat(annotPre(text), docPattern(wrapped))
-		}
-		return Concat(docPattern(wrapped), annotInline(text))
+		text, wrapped, _ := asAnnotASTRaw(n)
+		// Pattern wrapper: render as PRE. Entry/element sites decide inline.
+		return Concat(annotPre(text), docPattern(wrapped))
 	default:
 		return docExpr(n)
 	}
@@ -1217,14 +1117,12 @@ func docPattern(n S) *Doc {
 
 /* ---------- AST "annot" helpers ---------- */
 
-// New: decode 3-ary ("annot", ("str", textOr<text>), wrapped) to (text, wrapped, pre?)
-func asAnnotAST(n S) (text string, wrapped S, pre bool) {
-	raw := n[1].(S)[1].(string)
-	preText, postText := splitAnnotText(raw)
-	if preText != "" {
-		return preText, n[2].(S), true
+// Neutral unwrap: ("annot", ("str", txt), wrapped) → (txt, wrapped, true)
+func asAnnotASTRaw(n S) (text string, wrapped S, ok bool) {
+	if tag(n) == "annot" {
+		return n[1].(S)[1].(string), n[2].(S), true
 	}
-	return postText, n[2].(S), false
+	return "", n, false
 }
 
 /* ---------- Type pretty-printer (as Doc) ---------- */
@@ -1265,35 +1163,21 @@ func docType(t S) *Doc {
 		return inlineOrMulti("Enum[", ds, "]")
 	case "map":
 		type fld struct {
-			name     string
-			req      bool
-			typ      S
-			kAnnPre  string
-			kAnnPost string
-			vAnnPre  string
-			vAnnPost string
+			name string
+			req  bool
+			typ  S
+			vAnn string
 		}
 		var fs []fld
 		for _, raw := range listS(t, 1) {
 			req := raw[0].(string) == "pair!"
-			k, kAnn := unwrapKeyAST(raw[1].(S))
-			kPre, kPost := splitAnnotText(kAnn)
+			k := unwrapKeyName(raw[1].(S))
 			ft := raw[2].(S)
-			vPre, vPost := "", ""
-			if len(ft) > 0 && tag(ft) == "annot" {
-				txt, inner, pre := asAnnotAST(ft)
-				if pre {
-					vPre = txt
-				} else {
-					vPost = txt
-				}
+			txt, inner, ok := asAnnotASTRaw(ft)
+			if ok {
 				ft = inner
 			}
-			fs = append(fs, fld{
-				name: k, req: req, typ: ft,
-				kAnnPre: kPre, kAnnPost: kPost,
-				vAnnPre: vPre, vAnnPost: vPost,
-			})
+			fs = append(fs, fld{name: k, req: req, typ: ft, vAnn: strings.TrimSpace(txt)})
 		}
 		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
 		if len(fs) == 0 {
@@ -1305,8 +1189,11 @@ func docType(t S) *Doc {
 			if f.req {
 				key = Concat(key, Text("!"))
 			}
-			entry := kvEntry(key, docType(f.typ), f.kAnnPre, f.vAnnPre, f.kAnnPost /*valPost*/, "")
-			joined = append(joined, sepItem{main: entry, post: f.vAnnPost})
+			if f.vAnn != "" {
+				joined = append(joined, entryWithAnn(key, docType(f.typ), f.vAnn))
+			} else {
+				joined = append(joined, sepItem{main: kvEntry(key, docType(f.typ)), post: ""})
+			}
 		}
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
@@ -1331,11 +1218,9 @@ func docType(t S) *Doc {
 		}
 		return Text("<binop>")
 	case "annot":
-		txt, wrapped, pre := asAnnotAST(t)
-		if pre {
-			return Concat(annotPre(txt), docType(wrapped))
-		}
-		return Concat(docType(wrapped), annotInline(txt))
+		txt, wrapped, _ := asAnnotASTRaw(t)
+		// Outside binding sites, render as PRE.
+		return Concat(annotPre(txt), docType(wrapped))
 	default:
 		return Text("<type>")
 	}
@@ -1375,7 +1260,7 @@ func docTypeLiteral(lit S) *Doc {
 		for _, pr := range items {
 			k := pr[1].(S)[1].(string)
 			val := docTypeLiteral(pr[2].(S))
-			entry := kvEntry(idOrQuoted(k), val, "", "", "", "")
+			entry := kvEntry(idOrQuoted(k), val)
 			joined = append(joined, sepItem{main: entry, post: ""})
 		}
 		inside := joinCommaWithPost(joined)
@@ -1383,15 +1268,6 @@ func docTypeLiteral(lit S) *Doc {
 	default:
 		return Text("<lit>")
 	}
-}
-
-func flattenArrow(t S) (params []S, ret S) {
-	for tag(t) == "binop" && t[1].(string) == "->" && len(t) >= 4 {
-		params = append(params, t[2].(S))
-		t = t[3].(S)
-	}
-	ret = t
-	return
 }
 
 /* ---------- Runtime value pretty-printer (as Doc) ---------- */
@@ -1418,21 +1294,16 @@ func newValPrintCtx() *valPrintCtx {
 }
 
 // docValue: threads a cycle-detection context.
-// (Keeps existing PRE/POST handling and doc engine contract.)
 func (ctx *valPrintCtx) docValue(v Value) *Doc {
-	pre, post := splitAnnotText(v.Annot)
-	var head []*Doc
-	if pre != "" {
-		head = append(head, annotPre(pre))
+	txt := strings.TrimSpace(v.Annot)
+	if txt == "" {
+		return ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data})
 	}
-	body := ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data}) // print payload w/o own anns
-	if post != "" {
-		body = Concat(body, annotInline(post))
-	}
-	return Concat(append(head, body)...)
+	// Top-level values: conservative PRE (stable and unsurprising).
+	return Concat(annotPre(txt), ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data}))
 }
 
-// docValueNoAnnWith: actual value rendering with cycle guards.
+// docValueNoAnn: actual value rendering with cycle guards.
 // Uses Python-style cycle markers: `[...]` for arrays, `{...}` for maps.
 func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
 	switch v.Tag {
@@ -1464,12 +1335,9 @@ func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
 		}
 		joined := make([]sepItem, 0, len(xs))
 		for _, it := range xs {
-			pre, post := splitAnnotText(it.Annot)
-			elemDoc := ctx.docValueNoAnn(Value{Tag: it.Tag, Data: it.Data})
-			if pre != "" {
-				elemDoc = Concat(annotPre(pre), elemDoc)
-			}
-			joined = append(joined, sepItem{main: elemDoc, post: post})
+			elem := ctx.docValueNoAnn(Value{Tag: it.Tag, Data: it.Data})
+			main, post := attachInlineOrPre(elem, it.Annot)
+			joined = append(joined, sepItem{main: main, post: post})
 		}
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
@@ -1495,15 +1363,12 @@ func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
 		}
 		joined := make([]sepItem, 0, len(keys))
 		for _, k := range keys {
-			kPre, kPost := splitAnnotText(mo.KeyAnn[k])
 			vv := mo.Entries[k]
-			vPre, vPost := splitAnnotText(vv.Annot)
-			entry := kvEntry(
+			joined = append(joined, entryWithAnn(
 				idOrQuoted(k),
 				ctx.docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}),
-				kPre, vPre, kPost /* valPost handled after comma */, "",
-			)
-			joined = append(joined, sepItem{main: entry, post: vPost})
+				vv.Annot,
+			))
 		}
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
@@ -1569,4 +1434,38 @@ func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
 		}
 		return Text("<unknown>")
 	}
+}
+
+/* ---------- Central annotation policy (single place) ---------- */
+
+// Decide inline vs PRE for a candidate: if `candidate + " # ann"` fits flat
+// under a conservative width budget, return (candidate, ann) so callers can
+// trail as inline (or after-comma). Otherwise return (PRE+candidate, "").
+func attachInlineOrPre(candidate *Doc, ann string) (*Doc, string) {
+	ann = strings.TrimSpace(ann)
+	if ann == "" {
+		return candidate, ""
+	}
+	// Multi-line annotations always become PRE headers.
+	if strings.Contains(ann, "\n") {
+		return Concat(annotPre(ann), candidate), ""
+	}
+	// Conservative budget: avoid over-inlining.
+	r := renderer{maxWidth: MaxInlineWidth - 8, tabWidth: 4}
+	if r.fitsFlat(Concat(candidate, Text(" # "+oneLine(ann))), r.maxWidth) {
+		return candidate, ann
+	}
+	return Concat(annotPre(ann), candidate), ""
+}
+
+// Entry helper applying the policy to `key: value`.
+// If inline, the POST returns via .post (rendered after the following comma).
+// If PRE, the header is part of .main (no trailing POST).
+func entryWithAnn(keyDoc, valDoc *Doc, ann string) sepItem {
+	probe := kvEntry(keyDoc, valDoc)
+	main, post := attachInlineOrPre(probe, ann)
+	if post != "" {
+		return sepItem{main: probe, post: post}
+	}
+	return sepItem{main: main, post: ""}
 }

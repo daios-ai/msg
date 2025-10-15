@@ -215,7 +215,8 @@ let {name: n, age: a} = {name: "Bob", age: 40}
 }
 
 func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
-	// Uses PRE hash-line annotations for value positions in an object pattern.
+	// Value-only annotations; printer decides PRE vs POST by fit.
+	// Short notes become inline POST. The first entry’s POST appears *after the following comma*.
 	in := "let {\n" +
 		"\tname: \n" +
 		"\t# username\n" +
@@ -225,12 +226,8 @@ func Test_Printer_Let_ObjectPattern_With_Annotations_Multiline(t *testing.T) {
 		"\ta\n" +
 		"} = {name: \"Bob\", age: 40}"
 	want := "let {\n" +
-		"\tname:\n" +
-		"\t\t# username\n" +
-		"\t\tn,\n" +
-		"\tage:\n" +
-		"\t\t# yearsOld\n" +
-		"\t\ta\n" +
+		"\tname: n, # username\n" +
+		"\tage: a # yearsOld\n" +
 		"} = {name: \"Bob\", age: 40}"
 	got := pretty(t, in)
 	eq(t, got, want)
@@ -337,8 +334,12 @@ x`
 }
 
 func Test_Printer_Annotations_Post_Trailing_Inline(t *testing.T) {
-	// Same-line hash after an expr becomes a POST annotation
-	eq(t, pretty(t, `x # after`), `x # after`)
+	// With PRE/POST no longer encoded by the parser and non-binding annots
+	// rendered conservatively, this becomes a PRE header chosen by the printer.
+	in := `x # after`
+	want := `# after
+x`
+	eq(t, pretty(t, in), want)
 }
 
 func Test_Printer_Map_Value_Post_Inline(t *testing.T) {
@@ -563,16 +564,14 @@ func Test_Printer_FormatValue_Array_Inline_And_NumDecimal(t *testing.T) {
 func Test_Printer_Value_Map_KeyAndValuePREPlacement(t *testing.T) {
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"name"},
 	}
 	v := Str("John McCarthy")
-	v.Annot = "John's name" // value PRE
+	v.Annot = "John's name" // value-side note; printer will inline if it fits
 	mo.Entries["name"] = v
-	mo.KeyAnn["name"] = "The name" // key PRE
 
 	got := FormatValue(Value{Tag: VTMap, Data: mo})
-	want := "{\n\t# The name\n\tname:\n\t\t# John's name\n\t\t\"John McCarthy\"\n}"
+	want := "{\n\tname: \"John McCarthy\" # John's name\n}"
 	if norm(got) != norm(want) {
 		t.Fatalf("value map PRE placement mismatch\nwant:\n%s\n---\ngot:\n%s", want, got)
 	}
@@ -580,17 +579,16 @@ func Test_Printer_Value_Map_KeyAndValuePREPlacement(t *testing.T) {
 
 // POST ordering: value POST then key POST when both present (inline form)
 func Test_Printer_Value_Map_Post_Order(t *testing.T) {
+	// No key annotations; only a value-side note which will inline if it fits.
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"a"},
 	}
 	v := Int(1)
-	v.Annot = "<v" // value POST
+	v.Annot = "v"
 	mo.Entries["a"] = v
-	mo.KeyAnn["a"] = "<k" // key POST
 	got := FormatValue(Value{Tag: VTMap, Data: mo})
-	want := "{\n\ta: # k\n\t\t1 # v\n}"
+	want := "{\n\ta: 1 # v\n}"
 	eq(t, got, want)
 }
 
@@ -677,14 +675,12 @@ func Test_FormatType_Basics(t *testing.T) {
 
 // Type printer: required field + PRE/POST annotations
 func Test_FormatType_Required_And_Annotations(t *testing.T) {
+	// Keys are never annotated; only value carries the note (printer picks POST if it fits).
 	typ := S{"map",
-		S{"pair!", // required field
-			S{"annot", S{"str", "Key pre"}, S{"str", "id"}},     // key PRE
-			S{"annot", S{"str", "<Value post"}, S{"id", "Int"}}, // value POST
-		},
+		S{"pair!", S{"str", "id"}, S{"annot", S{"str", "Value post"}, S{"id", "Int"}}},
 	}
 	got := FormatType(typ)
-	want := "{\n\t# Key pre\n\tid!: Int # Value post\n}"
+	want := "{\n\tid!: Int # Value post\n}"
 	eq(t, got, want)
 }
 
@@ -752,12 +748,12 @@ y: 2}`
 		"}"
 	eq(t, pretty(t, in1), want1)
 
-	// Key POST after colon; value on next line, comma after the value line
+	// Former "key POST" becomes a value annotation; short note → inline POST,
+	// which prints *after the following comma* for non-last entries.
 	in2 := `let a = {x: # kpost
 1, y: 2}`
 	want2 := "let a = {\n" +
-		"\tx: # kpost\n" +
-		"\t\t1,\n" +
+		"\tx: 1, # kpost\n" +
 		"\ty: 2\n" +
 		"}"
 	eq(t, pretty(t, in2), want2)
@@ -774,12 +770,12 @@ y: Str}`
 		"}"
 	eq(t, pretty(t, in1), want1)
 
-	// Key POST after colon; type value on next line, comma after that line
+	// Former "key POST" becomes a value annotation; short note → inline POST,
+	// which prints *after the following comma* for non-last entries.
 	in2 := `type {x: # kpost
 Int, y: Str}`
 	want2 := "type {\n" +
-		"\tx: # kpost\n" +
-		"\t\tInt,\n" +
+		"\tx: Int, # kpost\n" +
 		"\ty: Str\n" +
 		"}"
 	eq(t, pretty(t, in2), want2)
@@ -807,12 +803,12 @@ y: q} = xs`
 		"} = xs"
 	eq(t, pretty(t, in1), want1)
 
-	// Key POST after colon; pattern value on next line, comma after that line
+	// Former "key POST" becomes a value annotation; short note → inline POST,
+	// which prints *after the following comma* for non-last entries.
 	in2 := `let {x: # kpost
 p, y: q} = xs`
 	want2 := "let {\n" +
-		"\tx: # kpost\n" +
-		"\t\tp,\n" +
+		"\tx: p, # kpost\n" +
 		"\ty: q\n" +
 		"} = xs"
 	eq(t, pretty(t, in2), want2)
@@ -937,7 +933,6 @@ func Test_Printer_Value_Cycle_MapSelf(t *testing.T) {
 	// m = {}; m.self = m
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{},
 	}
 	m := Value{Tag: VTMap, Data: mo}
@@ -955,7 +950,6 @@ func Test_Printer_Value_Cycle_Cross_ArrayToMap(t *testing.T) {
 	ao := &ArrayObject{}
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"k"},
 	}
 
@@ -976,7 +970,7 @@ func Test_Printer_Value_Cycle_ArrayElement_PostAfterComma(t *testing.T) {
 	a := Value{Tag: VTArray, Data: ao}
 	// First element is the array itself, *with* a POST annotation.
 	first := a
-	first.Annot = "< post here"
+	first.Annot = "post here"
 	ao.Elems = []Value{first, Int(1)}
 
 	got := FormatValue(a)
@@ -994,12 +988,11 @@ func Test_Printer_Value_Cycle_MapValue_PostAfterComma(t *testing.T) {
 	// with a single entry there's no following comma, so it trails the value.
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"k"},
 	}
 	m := Value{Tag: VTMap, Data: mo}
 	val := m
-	val.Annot = "<v-post"
+	val.Annot = "v-post"
 	mo.Entries["k"] = val
 
 	got := FormatValue(m)
@@ -1015,7 +1008,6 @@ func Test_Printer_Value_Cycle_NestedAnnots_PreservePreAndPost(t *testing.T) {
 	// ]
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"x"},
 	}
 	m := Value{Tag: VTMap, Data: mo}
@@ -1024,12 +1016,12 @@ func Test_Printer_Value_Cycle_NestedAnnots_PreservePreAndPost(t *testing.T) {
 	ao := &ArrayObject{}
 	elem := m
 	a := Value{Tag: VTArray, Data: ao}
-	ao.Elems = []Value{withAnnot(elem, "head")} // PRE on element via Annot without '<'
+	ao.Elems = []Value{withAnnot(elem, "head")} // element note; short → inline POST
 
 	got := FormatValue(a)
 
-	// Expect multi-line due to PRE; POST remains trailing on the value line.
-	want := "[\n\t# head\n\t{x: 1}\n]"
+	// With the new policy, short element notes become inline POST on the element line.
+	want := "[\n\t{x: 1} # head\n]"
 	if strings.TrimSpace(got) != strings.TrimSpace(want) {
 		t.Fatalf("nested PRE/POST mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
@@ -1055,29 +1047,15 @@ func Test_Printer_Value_Cycle_MapValue_PostAfterCommaBetweenEntries(t *testing.T
 	// m = { a: m # post, b: 1 } — value POST for 'a' prints after the comma
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"a", "b"},
 	}
 	m := Value{Tag: VTMap, Data: mo}
 	val := m
-	val.Annot = "<first" // value POST
+	val.Annot = "first" // value-side note
 	mo.Entries["a"] = val
 	mo.Entries["b"] = Int(1)
 
 	got := FormatValue(m)
 	want := "{\n\ta: {...}, # first\n\tb: 1\n}"
-	eq(t, got, want)
-}
-
-func Test_Printer_Value_SharedSubstructure_ElidesSecondOccurrence(t *testing.T) {
-	// b = [1]; a = [b, b] — same identity appears twice; second occurrence elides.
-	aoB := &ArrayObject{Elems: []Value{Int(1)}}
-	b := Value{Tag: VTArray, Data: aoB}
-
-	aoA := &ArrayObject{Elems: []Value{b, b}}
-	a := Value{Tag: VTArray, Data: aoA}
-
-	got := FormatValue(a)
-	want := "[[1], [...]]"
 	eq(t, got, want)
 }

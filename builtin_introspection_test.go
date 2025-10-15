@@ -406,7 +406,7 @@ func Test_Builtin_Introspection_Printer_ElisionsAndPost(t *testing.T) {
 
 	// array with last element POST should place closing ']' next line (no extra blank)
 	arr := S{"array",
-		S{"annot", S{"str", "<last"}, S{"int", int64(1)}},
+		S{"annot", S{"str", "last"}, S{"int", int64(1)}},
 	}
 	src := FormatSExpr(arr)
 	if !strings.Contains(src, "# last") || !strings.Contains(src, "]") {

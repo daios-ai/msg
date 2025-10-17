@@ -306,6 +306,61 @@ func (p *parser) posAfterLastSpan() (int, int) {
 	return g.Line, g.Col + 1
 }
 
+// takeReqGap consumes immediately-adjacent GAP (ANNOTATION/NOOP) that appear
+// before something *required* after `anchor`. It emits these gaps (returned as
+// annSrc) but NEVER lets them satisfy the requirement.
+// If only gaps remain to EOF, it returns an error anchored to `anchor`:
+//   - interactive: DiagIncomplete(msg)
+//   - noninteractive: DiagParse(msg)
+func (p *parser) takeReqGap(anchor Token, incMsg string) (annSrc, error) {
+	// Coalesce sequential annotations first, then eat blank-line runs.
+	pre := p.collectAnnotsSrc()
+	p.skipNoops()
+	// If after consuming those we only have gaps to EOF, this is an incomplete requirement.
+	if p.onlyGapsToEOF() {
+		line, col := p.posAtByte(anchor.StartByte)
+		kind := DiagParse
+		if p.interactive {
+			kind = DiagIncomplete
+		}
+		return annNone(), &Error{
+			Kind: kind,
+			Msg:  incMsg,
+			Line: line, Col: col,
+		}
+	}
+	return pre, nil
+}
+
+// needNoGap enforces the "GAPLESS after dot" rule: immediately after `anchor`
+// (which should be a PERIOD token) there must not be ANNOTATION/NOOP.
+// If a GAP is present:
+//   - interactive + only gaps to EOF → DiagIncomplete anchored to `anchor`;
+//   - otherwise → hard parse error anchored at the first GAP token.
+//
+// It does NOT consume any token.
+func (p *parser) needNoGap(anchor Token, msg string) error {
+	if p.atEnd() {
+		// Unify message across modes: same text, different kind.
+		line, col := p.posAtByte(anchor.StartByte)
+		kind := DiagParse
+		if p.interactive {
+			kind = DiagIncomplete
+		}
+		return &Error{Kind: kind, Msg: msg, Line: line, Col: col}
+	}
+	switch p.peek().Type {
+	case ANNOTATION, NOOP:
+		if p.interactive && p.onlyGapsToEOF() {
+			line, col := p.posAtByte(anchor.StartByte)
+			return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
+		}
+		line, col := p.posAtByte(p.peek().StartByte)
+		return &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
+	}
+	return nil
+}
+
 func tokText(t Token) string {
 	if s, ok := t.Literal.(string); ok {
 		return s
@@ -689,12 +744,16 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 
 		case MINUS, NOT:
-			if err := p.needExprAfter(t, "expected expression after unary operator"); err != nil {
+			pre, err := p.takeReqGap(t, "expected expression after unary operator")
+			if err != nil {
 				return nil, err
 			}
 			r, err := p.expr(80)
 			if err != nil {
 				return nil, err
+			}
+			if pre.ok {
+				r = p.attachAnnotFrom(pre, r)
 			}
 			endTok := p.lastSpanEndTok
 			if endTok < 0 {
@@ -743,12 +802,16 @@ func (p *parser) expr(minBP int) (S, error) {
 			leftStartTok = tokIndexOfThis
 
 		case MODULE:
-			if err := p.needExprAfter(t, "expected module name expression"); err != nil {
+			pre, err := p.takeReqGap(t, "expected module name expression")
+			if err != nil {
 				return nil, err
 			}
 			name, err := p.expr(0)
 			if err != nil {
 				return nil, err
+			}
+			if pre.ok {
+				name = p.attachAnnotFrom(pre, name)
 			}
 			// Accept annotations/newlines before 'do' and attach them to body.
 			preDo := p.collectGap()
@@ -814,28 +877,38 @@ func (p *parser) expr(minBP int) (S, error) {
 			// If destructuring, require an '=' (after any annotations).
 			base, _, _ := unwrapAnnot(pat)
 			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
+				// Skip GAPs (ANNOTATION/NOOP) without letting them satisfy the requirement.
 				j := p.i
-				for j < len(p.toks) && p.toks[j].Type == ANNOTATION {
+				for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
 					j++
 				}
-				if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
-					g := p.peek()
-					if p.interactive && g.Type == EOF {
-						line, col := p.posAfterLastSpan()
-						return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+				// If only gaps/EOF remain, report same message across modes.
+				if j >= len(p.toks) || p.toks[j].Type == EOF {
+					line, col := p.posAfterLastSpan()
+					kind := DiagParse
+					if p.interactive {
+						kind = DiagIncomplete
 					}
-					line, col := p.posAtByte(g.StartByte)
+					return nil, &Error{Kind: kind, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+				}
+				// Not EOF: require ASSIGN next; if not, hard parse error at that token.
+				if p.toks[j].Type != ASSIGN {
+					line, col := p.posAtByte(p.toks[j].StartByte)
 					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 				}
 			}
 
 		case TYPECONS:
-			if err := p.needExprAfter(t, "expected type expression after 'type'"); err != nil {
-				return nil, err
-			}
-			x, err := p.expr(1) // was 0; using 1 suppresses inner attachSameLineAnnots
+			pre, err := p.takeReqGap(t, "expected type expression after 'type'")
 			if err != nil {
 				return nil, err
+			}
+			x, err := p.expr(1) // keep bp=1 behavior
+			if err != nil {
+				return nil, err
+			}
+			if pre.ok {
+				x = p.attachAnnotFrom(pre, x)
 			}
 			left = p.mk("type", tokIndexOfThis, p.lastSpanEndTok, x)
 			leftStartTok = tokIndexOfThis
@@ -845,6 +918,12 @@ func (p *parser) expr(minBP int) (S, error) {
 			src := annSrc{ok: true, txt: "", startTok: tokIndexOfThis, endTok: tokIndexOfThis}
 			if s, ok := t.Literal.(string); ok {
 				src.txt = s
+			}
+
+			// Floating annotation: if the very next token is a NOOP, consume exactly one
+			// NOOP and return annot(noop) immediately.
+			if p.match(NOOP) {
+				return p.attachAnnotFrom(src, p.mkLeaf("noop", p.i-1)), nil
 			}
 
 			// Standalone comment: after skipping NOOPs, if the next token cannot start a value,
@@ -960,15 +1039,16 @@ func (p *parser) expr(minBP int) (S, error) {
 			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
 		}
 
-		if err := p.needExprAfter(op, "expected expression after operator"); err != nil {
+		// Allow GAP between operator and RHS, but don't let it satisfy the need.
+		preOp, err := p.takeReqGap(op, "expected expression after operator")
+		if err != nil {
 			return nil, err
 		}
 
 		var b annSrc
 		if op.Type == ASSIGN {
-			// B (do NOT skip NOOPs)
-			b = p.collectAnnotsSrc()
-			p.skipNoops()
+			// Use the immediate post-'=' gap as B.
+			b = preOp
 		}
 
 		rightParsed, err := p.expr(nextBP)
@@ -1001,25 +1081,19 @@ func (p *parser) expr(minBP int) (S, error) {
 	return left, nil
 }
 
-func (p *parser) needExprAfter(tok Token, msg string) error {
-	// In interactive mode, treat "only gaps to EOF" as incomplete, not valid input.
-	if p.interactive && p.onlyGapsToEOF() {
-		line, col := p.posAtByte(tok.StartByte)
-		return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
-	}
-	return nil
-}
-
 // parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
 func (p *parser) parseGrouping() (S, error) {
 	openTok := p.toks[p.i-1]
-	p.skipNoops()
-	if err := p.needExprAfter(openTok, "expected expression after '('"); err != nil {
+	pre, err := p.takeReqGap(openTok, "expected expression after '('")
+	if err != nil {
 		return nil, err
 	}
 	inner, err := p.expr(0)
 	if err != nil {
 		return nil, err
+	}
+	if pre.ok {
+		inner = p.attachAnnotFrom(pre, inner)
 	}
 	// Allow trailing annotations/newlines before ')', attach as POST to inner.
 	trail := p.collectGap() // consumes ANNOTATIONs and NOOPs
@@ -1040,6 +1114,23 @@ func (p *parser) parseGrouping() (S, error) {
 // We append exactly one span for the new wrapper node (unop '?', call, idx, get).
 
 func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
+	// Enforce GAPLESS *before* '.' : if we are sitting on GAPs and the next
+	// non-gap token is PERIOD, that is an error (or incomplete at EOF).
+	if !p.atEnd() && (p.peek().Type == ANNOTATION || p.peek().Type == NOOP) {
+		j := p.i
+		firstGap := p.peek()
+		for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
+			j++
+		}
+		if j < len(p.toks) && p.toks[j].Type == PERIOD {
+			// There *is* a dot after a gap → forbidden.
+			line, col := p.posAtByte(firstGap.StartByte)
+			return nil, false, &Error{Kind: DiagParse, Msg: "no gap allowed before '.'", Line: line, Col: col}
+		}
+		// Not a dot next; postfix chain stops here.
+		return nil, false, nil
+	}
+
 	switch p.peek().Type {
 	case QUESTION:
 		qtok := p.i
@@ -1076,49 +1167,52 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 	case CLSQUARE:
 		p.i++
 		sqTok := p.toks[p.i-1]
-		pre := p.collectGap() // PRE before index expr
-		if err := p.needExprAfter(sqTok, "expected index expression after '['"); err != nil {
+		// Allow gaps after '[' but they cannot satisfy the required expr.
+		preIdx, err := p.takeReqGap(sqTok, "expected index expression after '['")
+		if err != nil {
 			return nil, false, err
 		}
 		idx, err := p.expr(0)
 		if err != nil {
 			return nil, false, err
 		}
-		trail := p.collectGap() // POST before ']'
-		if pre.ok {
-			idx = p.attachAnnotFrom(pre, idx)
-		}
-		if trail.ok {
+		// Allow trailing gaps before ']'
+		if trail := p.collectGap(); trail.ok {
 			idx = p.attachAnnotFrom(trail, idx)
 		}
 		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
 			return nil, false, err
 		}
+		_ = preIdx // gap already attached via normalize/attach above if needed
 		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
 		return n, true, nil
 
 	case PERIOD:
 		p.i++ // consume '.'
+		dotTok := p.toks[p.i-1]
+		// GAPLESS after '.': forbid ANNOTATION/NOOP immediately after dot.
+		if err := p.needNoGap(dotTok, "expected property name, integer, or '(expr)' immediately after '.' (no gap allowed)"); err != nil {
+			return nil, false, err
+		}
 		if p.match(LROUND) || p.match(CLROUND) {
 			parTok := p.toks[p.i-1] // '(' token just consumed
-			pre := p.collectGap()   // PRE before expr
-			if err := p.needExprAfter(parTok, "expected expression after '('"); err != nil {
+			// Allow gaps after '(' but they cannot satisfy the required expr.
+			pre, err := p.takeReqGap(parTok, "expected expression after '('")
+			if err != nil {
 				return nil, false, err
 			}
 			ex, err := p.expr(0)
 			if err != nil {
 				return nil, false, err
 			}
-			trail := p.collectGap() // POST before ')'
-			if pre.ok {
-				ex = p.attachAnnotFrom(pre, ex)
-			}
-			if trail.ok {
+			// Allow trailing gaps before ')'
+			if trail := p.collectGap(); trail.ok {
 				ex = p.attachAnnotFrom(trail, ex)
 			}
 			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
 				return nil, false, perr
 			}
+			_ = pre // attached above
 			n := p.mk("idx", leftStartTok, p.i-1, left, ex)
 			return n, true, nil
 		}
@@ -1129,19 +1223,15 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			n := p.mk("idx", leftStartTok, intTok, left, intNode)
 			return n, true, nil
 		}
-		// .id or coerced quoted-name -> get
+		// .id or coerced quoted-name (lexer coerces after PERIOD) -> get
 		if p.match(ID) {
 			propTok := p.i - 1
 			prop := p.mkLeaf("str", propTok, tokText(p.prev()))
 			n := p.mk("get", leftStartTok, propTok, left, prop)
 			return n, true, nil
 		}
+		// Fallback diagnostic (not a valid follower)
 		g := p.peek()
-		// Interactive: if only gaps remain, this is an incomplete property access.
-		if p.interactive && p.onlyGapsToEOF() {
-			line, col := p.posAtByte(g.StartByte)
-			return nil, false, &Error{Kind: DiagIncomplete, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
-		}
 		line, col := p.posAtByte(g.StartByte)
 		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
 	}
@@ -1156,7 +1246,7 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 //   - POST right after an element (same line),
 //   - POST after a COMMA (same line) via onCommaPost callback,
 //   - dangling PRE before closer -> annot(noop),
-//   - trailing gaps before closer (NOOPs/ANNOTATION).
+//   - trailing gaps before closer (NOOP/ANNOTATION).
 //
 // bracketed parses a comma-separated list between an already-consumed opener.
 // It carries interstitial PRE as annSrc and emits annot(noop) with correct spans.
@@ -1302,11 +1392,8 @@ func (p *parser) params() (S, error) {
 
 			var val S
 			if p.match(COLON) {
-				for !p.atEnd() && p.peek().Type == NOOP {
-					p.i++
-				}
-				b := p.collectAnnotsSrc()
-				if err := p.needExprAfter(p.prev(), "expected type after ':'"); err != nil {
+				b, err := p.takeReqGap(p.prev(), "expected type after ':'")
+				if err != nil {
 					return nil, 0, err
 				}
 				tExpr, err := p.expr(0)
@@ -1363,10 +1450,9 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 				return nil, 0, err
 			}
 
-			// B immediately after ':'
-			b := p.collectAnnotsSrc()
-			p.skipNoops()
-			if err := p.needExprAfter(colonTok, "expected value after ':'"); err != nil {
+			// B = GAP after ':'; it cannot satisfy the value requirement.
+			b, err := p.takeReqGap(colonTok, "expected value after ':'")
+			if err != nil {
 				return nil, 0, err
 			}
 			v, err := p.expr(0)
@@ -1482,12 +1568,16 @@ func unwrapAnnot(n S) (S, string, bool) {
 func (p *parser) ifExpr() (S, error) {
 	ifTok := p.toks[p.i-1]
 	condStartTok := p.i
-	if err := p.needExprAfter(ifTok, "expected condition after 'if'"); err != nil {
+	preIf, err := p.takeReqGap(ifTok, "expected condition after 'if'")
+	if err != nil {
 		return nil, err
 	}
 	cond, err := p.expr(0)
 	if err != nil {
 		return nil, err
+	}
+	if preIf.ok {
+		cond = p.attachAnnotFrom(preIf, cond)
 	}
 	between := p.collectGap()
 	if _, err := p.need(THEN, "expected 'then'"); err != nil {
@@ -1514,12 +1604,16 @@ func (p *parser) ifExpr() (S, error) {
 		}
 		elifTok := p.toks[p.i-1]
 		condStartTok = p.i
-		if err := p.needExprAfter(elifTok, "expected condition after 'elif'"); err != nil {
+		preElif, err := p.takeReqGap(elifTok, "expected condition after 'elif'")
+		if err != nil {
 			return nil, err
 		}
 		c, err := p.expr(0)
 		if err != nil {
 			return nil, err
+		}
+		if preElif.ok {
+			c = p.attachAnnotFrom(preElif, c)
 		}
 		between := p.collectGap()
 		if _, err := p.need(THEN, "expected 'then'"); err != nil {
@@ -1563,25 +1657,33 @@ func (p *parser) ifExpr() (S, error) {
 }
 
 func (p *parser) forExpr(openTok int) (S, error) {
+	// Ensure gaps right after 'for' are treated uniformly (including NOOPs)
+	preFor, err := p.takeReqGap(p.toks[openTok], "expected for-target after 'for'")
+	if err != nil {
+		return nil, err
+	}
 	tgt, err := p.forTarget()
 	if err != nil {
 		return nil, err
+	}
+	if preFor.ok {
+		tgt = p.attachAnnotFrom(preFor, tgt)
 	}
 	between := p.collectGap()
 	inTok, err := p.need(IN, "expected 'in'")
 	if err != nil {
 		return nil, err
 	}
-	if err := p.needExprAfter(inTok, "expected expression after 'in'"); err != nil {
+	postIn, err := p.takeReqGap(inTok, "expected expression after 'in'")
+	if err != nil {
 		return nil, err
 	}
 	iter, err := p.expr(0)
 	if err != nil {
 		return nil, err
 	}
-	if between.ok {
-		iter = p.attachAnnotFrom(between, iter)
-	}
+	// Attach both the pre-'in' gap (between target and 'in') and the post-'in' gap.
+	iter = p.attachAnnotFrom(mergeAnn(between, postIn), iter)
 	// Annotations/newlines before 'do' attach to the loop body.
 	preDo := p.collectGap()
 	body, err := p.parseBlock(true)
@@ -1595,12 +1697,16 @@ func (p *parser) forExpr(openTok int) (S, error) {
 }
 
 func (p *parser) whileExpr(openTok int) (S, error) {
-	if err := p.needExprAfter(p.toks[openTok], "expected condition after 'while'"); err != nil {
+	pre, err := p.takeReqGap(p.toks[openTok], "expected condition after 'while'")
+	if err != nil {
 		return nil, err
 	}
 	cond, err := p.expr(0)
 	if err != nil {
 		return nil, err
+	}
+	if pre.ok {
+		cond = p.attachAnnotFrom(pre, cond)
 	}
 	// Annotations/newlines before 'do' attach to the body.
 	preDo := p.collectGap()
@@ -1621,19 +1727,18 @@ func (p *parser) optionalArrowType(incMsg string) (S, error) {
 	// parse the type and attach the gap's annotations to that type. Otherwise,
 	// restore so the gap can belong to the subsequent join (e.g., 'do').
 	saveI := p.i
-	gap := p.collectGap()
+	lead := p.collectGap() // GAP between ')' and '->' (if any)
 	if p.match(ARROW) {
 		arrowTok := p.prev()
-		if err := p.needExprAfter(arrowTok, incMsg); err != nil {
+		post, err := p.takeReqGap(arrowTok, incMsg) // GAP immediately after '->'
+		if err != nil {
 			return nil, err
 		}
 		r, err := p.expr(0)
 		if err != nil {
 			return nil, err
 		}
-		if gap.ok {
-			r = p.attachAnnotFrom(gap, r)
-		}
+		r = p.attachAnnotFrom(mergeAnn(lead, post), r)
 		return r, nil // parsed type (one node)
 	}
 	// No arrow: put the parser back so the gap isn't consumed.
@@ -1688,16 +1793,16 @@ func (p *parser) oracleExpr(openTok int) (S, error) {
 	preFrom := p.collectGap()
 	matchedFrom := p.match(FROM)
 	if matchedFrom {
-		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
+		fromTok := p.prev()
+		postFrom, err := p.takeReqGap(fromTok, "expected expression after 'from'")
+		if err != nil {
 			return nil, err
 		}
 		ex, err := p.expr(0)
 		if err != nil {
 			return nil, err
 		}
-		if preFrom.ok {
-			ex = p.attachAnnotFrom(preFrom, ex)
-		}
+		ex = p.attachAnnotFrom(mergeAnn(preFrom, postFrom), ex)
 		src = ex
 	} else {
 		// No 'from': restore so the gap belongs to whatever follows the oracle.
@@ -1711,7 +1816,7 @@ func (p *parser) oracleExpr(openTok int) (S, error) {
 // ─────────────────────── declaration patterns (let/for) ───────────────────
 
 func (p *parser) declPattern() (S, annSrc, error) {
-	// Gather stacked PRE immediately before the pattern (do not wrap yet).
+	// Gather stacked PRE immediately before pattern (do not wrap yet).
 	pre := annNone()
 	for !p.atEnd() && p.peek().Type == ANNOTATION {
 		pre = mergeAnn(pre, p.collectAnnotsSrc())
@@ -1787,9 +1892,11 @@ func (p *parser) objectDeclPattern() (S, error) {
 			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
 				return nil, 0, err
 			}
-			// B after ':'
-			b := p.collectAnnotsSrc()
-			p.skipNoops()
+			// B = GAP after ':' (cannot satisfy requirement)
+			b, err := p.takeReqGap(p.toks[p.i-1], "expected pattern after ':'")
+			if err != nil {
+				return nil, 0, err
+			}
 			pt, aSub, err := p.declPattern()
 			if err != nil {
 				return nil, 0, err

@@ -2269,124 +2269,232 @@ func Test_Parser_Interactive_Annotation_FollowedByExpr_IsOK(t *testing.T) {
 	}
 }
 
-// ───────────────────── Missing-but-desired centralized gap checks ─────────────────────
+func Test_Parser_Incomplete_Table(t *testing.T) {
+	cases := []struct {
+		name     string
+		src      string
+		wantLine int
+		wantCol  int
+		wantSub  string
+	}{
+		// ── Missing-but-desired centralized gap checks (folded from your list) ──
 
-// 1) Grouping: after '(' needs an expression (anchor at '(')
-func Test_Parser_Incomplete_Grouping_NeedsExpr_AfterOpenParen(t *testing.T) {
-	src := "(\n"
-	checkParseInc(t, src, 1, 1, "expected expression after '('")
-}
+		// 1) Grouping: after '(' needs an expression (anchor at '(')
+		{
+			name:     "Grouping_NeedsExpr_AfterOpenParen",
+			src:      "(\n",
+			wantLine: 1, wantCol: 1,
+			wantSub: "expected expression after '('",
+		},
 
-// 2) Computed property: after '.(' needs an expression (anchor at '(')
-func Test_Parser_Incomplete_ComputedProperty_NeedsExpr_AfterOpenParen(t *testing.T) {
-	src := "obj.(\n"
-	// o=1 b=2 j=3 .=4 ( =5 → Col=5
-	checkParseInc(t, src, 1, 5, "expected expression after '('")
-}
+		// 2) Computed property: after '.(' needs an expression (anchor at '(')
+		{
+			name:     "ComputedProperty_NeedsExpr_AfterOpenParen",
+			src:      "obj.(\n", // o=1 b=2 j=3 .=4 ( =5 → Col=5
+			wantLine: 1, wantCol: 5,
+			wantSub: "expected expression after '('",
+		},
 
-// 3) Index: after '[' needs an expression (anchor at '[')
-func Test_Parser_Incomplete_Index_NeedsExpr_AfterOpenBracket(t *testing.T) {
-	src := "arr[\n"
-	// a=1 r=2 r=3 [=4 → Col=4
-	checkParseInc(t, src, 1, 4, "expected index expression after '['")
-}
+		// 3) Index: after '[' needs an expression (anchor at '[')
+		{
+			name:     "Index_NeedsExpr_AfterOpenBracket",
+			src:      "arr[\n", // a=1 r=2 r=3 [=4 → Col=4
+			wantLine: 1, wantCol: 4,
+			wantSub: "expected index expression after '['",
+		},
 
-// 4) Map literal: after ':' needs a value (anchor at ':')
-func Test_Parser_Incomplete_MapValue_NeedsExpr_AfterColon(t *testing.T) {
-	src := "{a:\n"
-	// {=1 a=2 :=3 → Col=3
-	checkParseInc(t, src, 1, 3, "expected value after ':'")
-}
+		// 4) Map literal: after ':' needs a value (anchor at ':')
+		{
+			name:     "MapValue_NeedsExpr_AfterColon",
+			src:      "{a:\n", // {=1 a=2 :=3 → Col=3
+			wantLine: 1, wantCol: 3,
+			wantSub: "expected value after ':'",
+		},
 
-// 5) If: needs a condition after 'if' (anchor at 'if')
-func Test_Parser_Incomplete_If_NeedsCondition(t *testing.T) {
-	src := "if \n"
-	checkParseInc(t, src, 1, 1, "expected condition after 'if'")
-}
+		// 5) If: needs a condition after 'if' (anchor at 'if')
+		{
+			name:     "If_NeedsCondition",
+			src:      "if \n",
+			wantLine: 1, wantCol: 1,
+			wantSub: "expected condition after 'if'",
+		},
 
-// 6) Elif: needs a condition after 'elif' (anchor at 'elif')
-func Test_Parser_Incomplete_Elif_NeedsCondition(t *testing.T) {
-	src := "if a then x\nelif \n"
-	// 'elif' starts at line 2, column 1
-	checkParseInc(t, src, 2, 1, "expected condition after 'elif'")
-}
+		// 6) Elif: needs a condition after 'elif' (anchor at 'elif')
+		{
+			name:     "Elif_NeedsCondition",
+			src:      "if a then x\nelif \n", // 'elif' starts at line 2, column 1
+			wantLine: 2, wantCol: 1,
+			wantSub: "expected condition after 'elif'",
+		},
 
-// 7) While: needs a condition after 'while' (anchor at 'while')
-func Test_Parser_Incomplete_While_NeedsCondition(t *testing.T) {
-	src := "while \n"
-	checkParseInc(t, src, 1, 1, "expected condition after 'while'")
-}
+		// 7) While: needs a condition after 'while' (anchor at 'while')
+		{
+			name:     "While_NeedsCondition",
+			src:      "while \n",
+			wantLine: 1, wantCol: 1,
+			wantSub: "expected condition after 'while'",
+		},
 
-// 8) For: needs an iterator expression after 'in' (anchor at 'in')
-func Test_Parser_Incomplete_ForIn_NeedsExpr(t *testing.T) {
-	src := "for x in \n"
-	// f=1 o=2 r=3 space=4 x=5 space=6 i=7 n=8 → Col=7
-	checkParseInc(t, src, 1, 7, "expected expression after 'in'")
-}
+		// 8) For: needs an iterator expression after 'in' (anchor at 'in')
+		{
+			name:     "ForIn_NeedsExpr",
+			src:      "for x in \n", // f=1 o=2 r=3 sp=4 x=5 sp=6 i=7 n=8 → Col=7
+			wantLine: 1, wantCol: 7,
+			wantSub: "expected expression after 'in'",
+		},
 
-// ───────────────────── After-condition gaps before required token ─────────────────────
+		// ── After-condition gaps before required token (folded from your list) ──
 
-// IF: condition present, only gaps before required 'then'
-func Test_Parser_Incomplete_If_AfterCondition_NeedsThen(t *testing.T) {
-	src := "if x\n"
-	// Anchor should be right after 'x' (line 1, col 5 for "if␠x").
-	checkParseInc(t, src, 1, 5, "expected 'then'")
-}
+		// IF: condition present, only gaps before required 'then'
+		{
+			name:     "If_AfterCondition_NeedsThen",
+			src:      "if x\n", // "if␠x" → anchor after x (col 5)
+			wantLine: 1, wantCol: 5,
+			wantSub: "expected 'then'",
+		},
 
-// ELIF: condition present, only gaps before required 'then'
-func Test_Parser_Incomplete_Elif_AfterCondition_NeedsThen(t *testing.T) {
-	src := "if a then b\nelif c\n"
-	// 'elif c' is on line 2; anchor after 'c' (line 2, col 7).
-	checkParseInc(t, src, 2, 7, "expected 'then'")
-}
+		// ELIF: condition present, only gaps before required 'then'
+		{
+			name:     "Elif_AfterCondition_NeedsThen",
+			src:      "if a then b\nelif c\n", // line 2, after 'c' (col 7)
+			wantLine: 2, wantCol: 7,
+			wantSub: "expected 'then'",
+		},
 
-// WHILE: condition present, only gaps before required 'do'
-func Test_Parser_Incomplete_While_AfterCondition_NeedsDo(t *testing.T) {
-	src := "while x\n"
-	// "while␠x" → anchor after x (line 1, col 8).
-	checkParseInc(t, src, 1, 8, "expected 'do'")
-}
+		// WHILE: condition present, only gaps before required 'do'
+		{
+			name:     "While_AfterCondition_NeedsDo",
+			src:      "while x\n", // "while␠x" → anchor after x (col 8)
+			wantLine: 1, wantCol: 8,
+			wantSub: "expected 'do'",
+		},
 
-// FOR: target present, only gaps before required 'in'
-func Test_Parser_Incomplete_For_AfterTarget_NeedsIn(t *testing.T) {
-	src := "for x \n"
-	// "for␠x␠" → anchor after x (line 1, col 6).
-	checkParseInc(t, src, 1, 6, "expected 'in'")
-}
+		// FOR: target present, only gaps before required 'in'
+		{
+			name:     "For_AfterTarget_NeedsIn",
+			src:      "for x \n", // "for␠x␠" → after x (col 6)
+			wantLine: 1, wantCol: 6,
+			wantSub: "expected 'in'",
+		},
 
-// FOR: iterator present, only gaps before required 'do'
-func Test_Parser_Incomplete_For_AfterIter_NeedsDo(t *testing.T) {
-	src := "for x in y\n"
-	// "for␠x␠in␠y" → anchor after y (line 1, col 11).
-	checkParseInc(t, src, 1, 11, "expected 'do'")
-}
+		// FOR: iterator present, only gaps before required 'do'
+		{
+			name:     "For_AfterIter_NeedsDo",
+			src:      "for x in y\n", // "for␠x␠in␠y" → after y (col 11)
+			wantLine: 1, wantCol: 11,
+			wantSub: "expected 'do'",
+		},
 
-// MODULE: name expr present, only gaps before required 'do'
-func Test_Parser_Incomplete_Module_AfterName_NeedsDo(t *testing.T) {
-	src := "module M\n"
-	// "module␠M" → anchor after 'M' (line 1, col 9).
-	checkParseInc(t, src, 1, 9, "expected 'do'")
-}
+		// MODULE: name expr present, only gaps before required 'do'
+		{
+			name:     "Module_AfterName_NeedsDo",
+			src:      "module M\n", // "module␠M" → after 'M' (col 9)
+			wantLine: 1, wantCol: 9,
+			wantSub: "expected 'do'",
+		},
 
-// ───────────────────── After-expr gaps before closing delimiter (post-condition shape) ─────────────────────
+		// ── After-expr gaps before closing delimiter (folded from your list) ──
 
-// Grouping: expr present, only gaps before ')'
-func Test_Parser_Incomplete_Grouping_AfterExpr_MissingRParen(t *testing.T) {
-	src := "(1\n"
-	// Anchor after '1' (line 1, col 3). Message from need(RROUND,...).
-	checkParseInc(t, src, 1, 3, "expected ')'")
-}
+		// Grouping: expr present, only gaps before ')'
+		{
+			name:     "Grouping_AfterExpr_MissingRParen",
+			src:      "(1\n", // after '1' (col 3)
+			wantLine: 1, wantCol: 3,
+			wantSub: "expected ')'",
+		},
 
-// Computed property: expr present, only gaps before ')'
-func Test_Parser_Incomplete_ComputedProperty_AfterExpr_MissingRParen(t *testing.T) {
-	src := "obj.(1\n"
-	// "obj.(1" → anchor after '1' (line 1, col 7).
-	checkParseInc(t, src, 1, 7, "expected ')'")
-}
+		// Computed property: expr present, only gaps before ')'
+		{
+			name:     "ComputedProperty_AfterExpr_MissingRParen",
+			src:      "obj.(1\n", // after '1' (col 7)
+			wantLine: 1, wantCol: 7,
+			wantSub: "expected ')'",
+		},
 
-// Index: expr present, only gaps before ']'
-func Test_Parser_Incomplete_Index_AfterExpr_MissingRSquare(t *testing.T) {
-	src := "arr[1\n"
-	// "arr[1" → anchor after '1' (line 1, col 6).
-	checkParseInc(t, src, 1, 6, "expected ']'")
+		// Index: expr present, only gaps before ']'
+		{
+			name:     "Index_AfterExpr_MissingRSquare",
+			src:      "arr[1\n", // after '1' (col 6)
+			wantLine: 1, wantCol: 6,
+			wantSub: "expected ']'",
+		},
+
+		// ── Extra core operators (nice-to-have coverage) ──
+
+		// Infix: needs RHS after '+'
+		{
+			name:     "InfixPlus_MissingRHS",
+			src:      "a +\n", // '+' at col 3
+			wantLine: 1, wantCol: 3,
+			wantSub: "expected expression after operator",
+		},
+
+		// Infix: needs RHS after '->'
+		{
+			name:     "InfixArrow_MissingRHS",
+			src:      "a ->\n", // '-' at col 3
+			wantLine: 1, wantCol: 3,
+			wantSub: "expected expression after operator",
+		},
+
+		// Infix: needs RHS after '='
+		{
+			name:     "InfixAssign_MissingRHS",
+			src:      "a =\n", // '=' at col 3
+			wantLine: 1, wantCol: 3,
+			wantSub: "expected expression after operator",
+		},
+
+		// Prefix: needs operand after 'type'
+		{
+			name:     "Type_MissingOperand",
+			src:      "type \n",
+			wantLine: 1, wantCol: 1,
+			wantSub: "expected type expression after 'type'",
+		},
+
+		// Fun header: missing params closer ')'
+		{
+			name: "Fun_Params_MissingRParen",
+			src:  "fun(\n",
+			// need(...) for ')' anchors after last span (the '(') → line 1 col 5
+			wantLine: 1, wantCol: 5,
+			wantSub: "expected ')' after parameters",
+		},
+
+		// Oracle header: arrow present but missing type
+		{
+			name:     "Oracle_Arrow_MissingType",
+			src:      "oracle() ->\n",
+			wantLine: 1, wantCol: 10, // '-' in '->' is 10
+			wantSub: "expected output type after '->'",
+		},
+
+		// Enum literal: missing closing ']'
+		{
+			name: "Enum_MissingClose",
+			src:  "Enum[\n",
+			// need(']') anchors after last span (the '[') → line 1 col 6
+			wantLine: 1, wantCol: 6,
+			wantSub: "expected ']'",
+		},
+
+		// ── Regression: destructuring let must be incomplete if '=' is missing ──
+
+		// Destructuring let with only gaps (NOOPs) before EOF: MUST be Incomplete.
+		{
+			name: "Let_Destructuring_MissingAssign_WithBlankLines",
+			src:  "let [a,b]\n\n",
+			// posAfterLastSpan() → after ']' on line 1; "let␠[a,b]" → col 10
+			wantLine: 1, wantCol: 10,
+			wantSub: "expected '=' after destructuring let pattern",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run("Incomplete_"+tc.name, func(t *testing.T) {
+			checkParseInc(t, tc.src, tc.wantLine, tc.wantCol, tc.wantSub)
+		})
+	}
 }

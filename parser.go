@@ -386,7 +386,7 @@ func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
 	return n
 }
 
-// ───────────────────────────── NOOP / annotation utils ─────────────────────
+// ───────────────────────── NOOP / annotation utils ─────────────────────
 
 // onlyGapsToEOF reports whether from the current lookahead to EOF there are
 // no real tokens (only NOOP and/or ANNOTATION). This is the canonical
@@ -426,6 +426,17 @@ func (p *parser) collectAnnotsSrc() annSrc {
 		}
 	}
 	return out
+}
+
+// collectGap coalesces a "gap" at a join: it first consumes immediately-adjacent
+// ANNOTATION tokens into a single annSrc and then skips any NOOPs (blank-line runs).
+// Use this *before* requiring a keyword/delimiter (then/do/in/from/else/elif, closers, etc.).
+// If callers then call need(...), EOF after this consumption will naturally become
+// DiagIncomplete in interactive mode via need(...).
+func (p *parser) collectGap() annSrc {
+	a := p.collectAnnotsSrc()
+	p.skipNoops()
+	return a
 }
 
 // Attach one or more *single-line* ANNOTATION tokens that start on refLine.
@@ -651,6 +662,9 @@ func (p *parser) expr(minBP int) (S, error) {
 			left = p.mkLeaf("noop", tokIndexOfThis)
 
 		case ENUM:
+			// Accept gap (annotations/newlines) between 'Enum' and '[' safely.
+			saveI := p.i
+			enumPre := p.collectGap()
 			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
 				p.i++ // consume '[' or CLSQUARE
 				// Reuse full array machinery (gaps, PRE/POST, dangling PRE).
@@ -663,8 +677,14 @@ func (p *parser) expr(minBP int) (S, error) {
 				for i := 1; i < len(arr); i++ {
 					items = append(items, arr[i])
 				}
-				left = p.mk("enum", tokIndexOfThis, p.i-1, items...)
+				n := p.mk("enum", tokIndexOfThis, p.i-1, items...)
+				if enumPre.ok {
+					n = p.attachAnnotFrom(enumPre, n)
+				}
+				left = n
 			} else {
+				// Not an Enum-literal; restore so gap remains for the next construct.
+				p.i = saveI
 				left = p.mkLeaf("id", tokIndexOfThis, tokText(t))
 			}
 
@@ -730,9 +750,14 @@ func (p *parser) expr(minBP int) (S, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Accept annotations/newlines before 'do' and attach them to body.
+			preDo := p.collectGap()
 			body, err := p.parseBlock(true)
 			if err != nil {
 				return nil, err
+			}
+			if preDo.ok {
+				body = p.attachAnnotFrom(preDo, body)
 			}
 			left = p.mk("module", tokIndexOfThis, p.i-1, name, body)
 			leftStartTok = tokIndexOfThis
@@ -987,12 +1012,20 @@ func (p *parser) needExprAfter(tok Token, msg string) error {
 
 // parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
 func (p *parser) parseGrouping() (S, error) {
+	openTok := p.toks[p.i-1]
 	p.skipNoops()
+	if err := p.needExprAfter(openTok, "expected expression after '('"); err != nil {
+		return nil, err
+	}
 	inner, err := p.expr(0)
 	if err != nil {
 		return nil, err
 	}
-	p.skipNoops()
+	// Allow trailing annotations/newlines before ')', attach as POST to inner.
+	trail := p.collectGap() // consumes ANNOTATIONs and NOOPs
+	if trail.ok {
+		inner = p.attachAnnotFrom(trail, inner)
+	}
 	if _, err := p.need(RROUND, "expected ')'"); err != nil {
 		return nil, err
 	}
@@ -1041,14 +1074,23 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		return n, true, nil
 
 	case CLSQUARE:
-		// For index expressions, NOOPs inside brackets are ignored by design.
 		p.i++
-		p.skipNoops()
+		sqTok := p.toks[p.i-1]
+		pre := p.collectGap() // PRE before index expr
+		if err := p.needExprAfter(sqTok, "expected index expression after '['"); err != nil {
+			return nil, false, err
+		}
 		idx, err := p.expr(0)
 		if err != nil {
 			return nil, false, err
 		}
-		p.skipNoops()
+		trail := p.collectGap() // POST before ']'
+		if pre.ok {
+			idx = p.attachAnnotFrom(pre, idx)
+		}
+		if trail.ok {
+			idx = p.attachAnnotFrom(trail, idx)
+		}
 		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
 			return nil, false, err
 		}
@@ -1057,14 +1099,23 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 
 	case PERIOD:
 		p.i++ // consume '.'
-		// (expr) -> idx
 		if p.match(LROUND) || p.match(CLROUND) {
-			p.skipNoops()
+			parTok := p.toks[p.i-1] // '(' token just consumed
+			pre := p.collectGap()   // PRE before expr
+			if err := p.needExprAfter(parTok, "expected expression after '('"); err != nil {
+				return nil, false, err
+			}
 			ex, err := p.expr(0)
 			if err != nil {
 				return nil, false, err
 			}
-			p.skipNoops()
+			trail := p.collectGap() // POST before ')'
+			if pre.ok {
+				ex = p.attachAnnotFrom(pre, ex)
+			}
+			if trail.ok {
+				ex = p.attachAnnotFrom(trail, ex)
+			}
 			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
 				return nil, false, perr
 			}
@@ -1307,13 +1358,17 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 			}
 
 			req := p.match(BANG)
-			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
+			colonTok, err := p.need(COLON, "expected ':' after key")
+			if err != nil {
 				return nil, 0, err
 			}
 
 			// B immediately after ':'
 			b := p.collectAnnotsSrc()
 			p.skipNoops()
+			if err := p.needExprAfter(colonTok, "expected value after ':'"); err != nil {
+				return nil, 0, err
+			}
 			v, err := p.expr(0)
 			if err != nil {
 				return nil, 0, err
@@ -1425,11 +1480,16 @@ func unwrapAnnot(n S) (S, string, bool) {
 }
 
 func (p *parser) ifExpr() (S, error) {
+	ifTok := p.toks[p.i-1]
 	condStartTok := p.i
+	if err := p.needExprAfter(ifTok, "expected condition after 'if'"); err != nil {
+		return nil, err
+	}
 	cond, err := p.expr(0)
 	if err != nil {
 		return nil, err
 	}
+	between := p.collectGap()
 	if _, err := p.need(THEN, "expected 'then'"); err != nil {
 		return nil, err
 	}
@@ -1437,15 +1497,31 @@ func (p *parser) ifExpr() (S, error) {
 	if err != nil {
 		return nil, err
 	}
+	if between.ok {
+		thenBlk = p.attachAnnotFrom(between, thenBlk)
+	}
 	arm := p.mk("pair", condStartTok, p.lastSpanEndTok, cond, thenBlk)
 	arms := []any{arm}
 
-	for p.match(ELIF) {
+	// Repeated elif arms with gap-aware detection and attachment.
+	for {
+		saveI := p.i
+		lead := p.collectGap() // annotations just before 'elif' attach to that arm's block
+		if !p.match(ELIF) {
+			// Not an elif: restore so annotations remain for 'else' or next construct.
+			p.i = saveI
+			break
+		}
+		elifTok := p.toks[p.i-1]
 		condStartTok = p.i
+		if err := p.needExprAfter(elifTok, "expected condition after 'elif'"); err != nil {
+			return nil, err
+		}
 		c, err := p.expr(0)
 		if err != nil {
 			return nil, err
 		}
+		between := p.collectGap()
 		if _, err := p.need(THEN, "expected 'then'"); err != nil {
 			return nil, err
 		}
@@ -1453,15 +1529,30 @@ func (p *parser) ifExpr() (S, error) {
 		if err != nil {
 			return nil, err
 		}
+		if lead.ok {
+			b = p.attachAnnotFrom(lead, b)
+		}
+		if between.ok {
+			b = p.attachAnnotFrom(between, b)
+		}
 		arm := p.mk("pair", condStartTok, p.lastSpanEndTok, c, b)
 		arms = append(arms, arm)
 	}
 
 	var elseTail []any
-	if p.match(ELSE) {
+	// Optional else with gap-aware attachment.
+	saveI := p.i
+	preElse := p.collectGap()
+	if !p.match(ELSE) {
+		// No else: restore so annotations are not lost.
+		p.i = saveI
+	} else {
 		b, err := p.blockUntil(END)
 		if err != nil {
 			return nil, err
+		}
+		if preElse.ok {
+			b = p.attachAnnotFrom(preElse, b)
 		}
 		elseTail = []any{b}
 	}
@@ -1476,28 +1567,49 @@ func (p *parser) forExpr(openTok int) (S, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.need(IN, "expected 'in'"); err != nil {
+	between := p.collectGap()
+	inTok, err := p.need(IN, "expected 'in'")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.needExprAfter(inTok, "expected expression after 'in'"); err != nil {
 		return nil, err
 	}
 	iter, err := p.expr(0)
 	if err != nil {
 		return nil, err
 	}
+	if between.ok {
+		iter = p.attachAnnotFrom(between, iter)
+	}
+	// Annotations/newlines before 'do' attach to the loop body.
+	preDo := p.collectGap()
 	body, err := p.parseBlock(true)
 	if err != nil {
 		return nil, err
+	}
+	if preDo.ok {
+		body = p.attachAnnotFrom(preDo, body)
 	}
 	return p.mk("for", openTok, p.i-1, tgt, iter, body), nil
 }
 
 func (p *parser) whileExpr(openTok int) (S, error) {
+	if err := p.needExprAfter(p.toks[openTok], "expected condition after 'while'"); err != nil {
+		return nil, err
+	}
 	cond, err := p.expr(0)
 	if err != nil {
 		return nil, err
 	}
+	// Annotations/newlines before 'do' attach to the body.
+	preDo := p.collectGap()
 	body, err := p.parseBlock(true)
 	if err != nil {
 		return nil, err
+	}
+	if preDo.ok {
+		body = p.attachAnnotFrom(preDo, body)
 	}
 	return p.mk("while", openTok, p.i-1, cond, body), nil
 }
@@ -1505,6 +1617,11 @@ func (p *parser) whileExpr(openTok int) (S, error) {
 // ───────────────────────── functions / oracle ─────────────────────────────
 
 func (p *parser) optionalArrowType(incMsg string) (S, error) {
+	// Allow a GAP between params ')' and '->'. If '->' is found AFTER the gap,
+	// parse the type and attach the gap's annotations to that type. Otherwise,
+	// restore so the gap can belong to the subsequent join (e.g., 'do').
+	saveI := p.i
+	gap := p.collectGap()
 	if p.match(ARROW) {
 		arrowTok := p.prev()
 		if err := p.needExprAfter(arrowTok, incMsg); err != nil {
@@ -1514,8 +1631,13 @@ func (p *parser) optionalArrowType(incMsg string) (S, error) {
 		if err != nil {
 			return nil, err
 		}
+		if gap.ok {
+			r = p.attachAnnotFrom(gap, r)
+		}
 		return r, nil // parsed type (one node)
 	}
+	// No arrow: put the parser back so the gap isn't consumed.
+	p.i = saveI
 	return p.mkLeaf("id", -1, "Any"), nil // single synthetic node
 }
 
@@ -1531,6 +1653,8 @@ func (p *parser) parseFnHeader(kind string) (fnHeader, error) {
 	if kind == "oracle" {
 		msg = "expected output type after '->'"
 	}
+	// NOTE: optionalArrowType now internally accepts a gap before '->' and
+	// safely restores position if '->' is not present, so no extra work here.
 	ar, err := p.optionalArrowType(msg)
 	return fnHeader{ps, ar}, err
 }
@@ -1540,9 +1664,14 @@ func (p *parser) funExpr(openTok int) (S, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Annotations/newlines before 'do' attach to the function body.
+	preDo := p.collectGap()
 	body, err := p.parseBlock(true)
 	if err != nil {
 		return nil, err
+	}
+	if preDo.ok {
+		body = p.attachAnnotFrom(preDo, body)
 	}
 	node := p.mk("fun", openTok, p.i-1, h.params, h.arrow, body)
 	return node, nil
@@ -1554,7 +1683,11 @@ func (p *parser) oracleExpr(openTok int) (S, error) {
 		return nil, err
 	}
 	var src any
-	if p.match(FROM) {
+	// Collect annotations/newlines before optional 'from'.
+	saveI := p.i
+	preFrom := p.collectGap()
+	matchedFrom := p.match(FROM)
+	if matchedFrom {
 		if err := p.needExprAfter(p.prev(), "expected expression after 'from'"); err != nil {
 			return nil, err
 		}
@@ -1562,8 +1695,13 @@ func (p *parser) oracleExpr(openTok int) (S, error) {
 		if err != nil {
 			return nil, err
 		}
+		if preFrom.ok {
+			ex = p.attachAnnotFrom(preFrom, ex)
+		}
 		src = ex
 	} else {
+		// No 'from': restore so the gap belongs to whatever follows the oracle.
+		p.i = saveI
 		src = p.mk("array", -1, -1) // build only when needed
 	}
 	body := p.mk("oracle", openTok, p.i-1, h.params, h.arrow, src)

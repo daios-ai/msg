@@ -388,6 +388,25 @@ func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
 
 // ───────────────────────────── NOOP / annotation utils ─────────────────────
 
+// onlyGapsToEOF reports whether from the current lookahead to EOF there are
+// no real tokens (only NOOP and/or ANNOTATION). This is the canonical
+// "need more input" detector for interactive mode.
+func (p *parser) onlyGapsToEOF() bool {
+	j := p.i
+	for j < len(p.toks) {
+		switch p.toks[j].Type {
+		case NOOP, ANNOTATION:
+			j++
+			continue
+		case EOF:
+			return true
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (p *parser) nextTokenIsOnSameLine(as Token) bool {
 	if p.atEnd() {
 		return false
@@ -815,13 +834,20 @@ func (p *parser) expr(minBP int) (S, error) {
 					next = p.toks[j].Type
 				}
 				switch next {
-				case EOF, END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
+				case EOF:
+					// Interactive + only gaps to EOF ⇒ ask for more input instead of annot(noop).
+					if p.interactive && p.onlyGapsToEOF() {
+						line, col := p.posAtByte(t.StartByte)
+						return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
+					}
+					return p.attachAnnotFrom(src, p.mkLeaf("noop", -1)), nil
+				case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
 					return p.attachAnnotFrom(src, p.mkLeaf("noop", -1)), nil
 				}
 			}
 
-			// Interactive EOF right after the annotation → incomplete
-			if p.atEnd() && p.interactive {
+			// Interactive: only gaps after the annotation → incomplete
+			if p.interactive && p.onlyGapsToEOF() {
 				line, col := p.posAtByte(t.StartByte)
 				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
 			}
@@ -917,6 +943,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		if op.Type == ASSIGN {
 			// B (do NOT skip NOOPs)
 			b = p.collectAnnotsSrc()
+			p.skipNoops()
 		}
 
 		rightParsed, err := p.expr(nextBP)
@@ -950,7 +977,8 @@ func (p *parser) expr(minBP int) (S, error) {
 }
 
 func (p *parser) needExprAfter(tok Token, msg string) error {
-	if p.atEnd() && p.interactive {
+	// In interactive mode, treat "only gaps to EOF" as incomplete, not valid input.
+	if p.interactive && p.onlyGapsToEOF() {
 		line, col := p.posAtByte(tok.StartByte)
 		return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
 	}
@@ -1058,6 +1086,11 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			return n, true, nil
 		}
 		g := p.peek()
+		// Interactive: if only gaps remain, this is an incomplete property access.
+		if p.interactive && p.onlyGapsToEOF() {
+			line, col := p.posAtByte(g.StartByte)
+			return nil, false, &Error{Kind: DiagIncomplete, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
+		}
 		line, col := p.posAtByte(g.StartByte)
 		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
 	}
@@ -1558,7 +1591,7 @@ func (p *parser) declPattern() (S, annSrc, error) {
 		return n, pre, err
 	}
 	g := p.peek()
-	if p.interactive && g.Type == EOF {
+	if p.interactive && p.onlyGapsToEOF() {
 		line, col := p.posAfterLastSpan()
 		return nil, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
 	}
@@ -1669,9 +1702,8 @@ func (p *parser) readKeyString() (S, annSrc, error) {
 		}
 		return p.mkLeaf("str", p.i-1, name), pre, nil
 	}
-
 	g := p.peek()
-	if p.interactive && g.Type == EOF {
+	if p.interactive && p.onlyGapsToEOF() {
 		line, col := p.posAfterLastSpan()
 		return nil, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
 	}

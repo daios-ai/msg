@@ -2156,3 +2156,237 @@ func Test_Parser_ObjectPattern_DanglingPre_SynthNoop(t *testing.T) {
 		t.Fatalf("want annot(note, noop), got %s", dump(kid(lhs, 1)))
 	}
 }
+
+//
+// ───────────────────────── Incomplete (interactive) ─────────────────────────
+//
+
+func Test_Parser_Incomplete_Assign_RHS_OnlyGaps(t *testing.T) {
+	// After '=', only blank lines → should be Incomplete (not a parsed noop).
+	mustIncomplete(t, "let x =\n\n")
+}
+
+func Test_Parser_Incomplete_AfterAnnotation_OnlyGaps(t *testing.T) {
+	// Standalone hash line in interactive mode should request more input,
+	// not parse as annot(noop).
+	mustIncomplete(t, "# hi\n")
+}
+
+func Test_Parser_Incomplete_AfterDot_OnlyGaps(t *testing.T) {
+	// Property access started but no property given, only gaps → Incomplete.
+	mustIncomplete(t, "obj.\n\n")
+}
+
+func Test_Parser_Incomplete_ParamTypeAfterColon(t *testing.T) {
+	// Inside params, after ':', only gaps → Incomplete (needs a type expr).
+	mustIncomplete(t, "fun(x: \n")
+}
+
+func Test_Parser_Incomplete_MapValueAfterColon(t *testing.T) {
+	// In map literal, after ':', only gaps → Incomplete (needs a value).
+	mustIncomplete(t, "{ \"k\": \n")
+}
+
+func Test_Parser_Incomplete_AfterTypeKeyword(t *testing.T) {
+	// 'type' must be followed by an expression; gaps-to-EOF → Incomplete.
+	mustIncomplete(t, "type \n")
+}
+
+func Test_Parser_Incomplete_FunctionArrowType(t *testing.T) {
+	// After '->' in fun header, only gaps → Incomplete.
+	mustIncomplete(t, "fun(x) -> \n")
+}
+
+func Test_Parser_Incomplete_OracleFromExpr(t *testing.T) {
+	// After 'from' in oracle, only gaps → Incomplete.
+	mustIncomplete(t, "oracle(x) from \n")
+}
+
+func Test_Parser_Incomplete_ForPattern_OpenArray(t *testing.T) {
+	// Pattern started but incomplete (only gaps before EOF) → Incomplete.
+	mustIncomplete(t, "for let [a, \n")
+}
+
+func Test_Parser_Incomplete_Idx_OpenBracket(t *testing.T) {
+	// Index opened but value missing (gaps) → Incomplete expects ']'.
+	mustIncomplete(t, "arr[\n")
+}
+
+func Test_Parser_Incomplete_Call_OpenParen(t *testing.T) {
+	// Call opened but no close and only gaps → Incomplete expects ')'.
+	mustIncomplete(t, "f(\n")
+}
+
+func Test_Parser_Incomplete_ComputedProperty_OpenParen(t *testing.T) {
+	// Computed property 'obj.( ...' started, gaps to EOF → Incomplete ')'.
+	mustIncomplete(t, "obj.(\n")
+}
+
+func Test_Parser_Incomplete_ObjectKey_Missing(t *testing.T) {
+	// Object literal with only '{' and gaps → Incomplete (needs key or '}').
+	mustIncomplete(t, "{\n")
+}
+
+func Test_Parser_Incomplete_EnumOpenBracket(t *testing.T) {
+	// Enum literal started but only gaps → Incomplete expects ']'.
+	mustIncomplete(t, "Enum[\n")
+}
+
+//
+// ─────────────── Behavior that should NOT be incomplete (interactive) ───────
+//
+
+func Test_Parser_Interactive_Return_Newline_YieldsNull(t *testing.T) {
+	// Same-line rule: 'return' followed by newline means return null (valid).
+	root := mustParseInteractive(t, "return\n")
+	stmt := first(root)
+	wantTag(t, stmt, "return")
+	wantTag(t, kid(stmt, 0), "null")
+}
+
+func Test_Parser_Interactive_Assign_RHS_WithFollowingExpr_IsOK(t *testing.T) {
+	// If there is a real token after gaps, it's NOT incomplete.
+	root := mustParseInteractive(t, "let x =\n\n42\n")
+	stmt := first(root)
+	wantTag(t, stmt, "assign")
+	if head(kid(stmt, 1)) != "int" || kid(stmt, 1)[1].(int64) != 42 {
+		t.Fatalf("rhs not 42: %s", dump(stmt))
+	}
+}
+
+func Test_Parser_Interactive_Annotation_FollowedByExpr_IsOK(t *testing.T) {
+	// Annotation line followed by a value on a later line parses as annot(value).
+	root := mustParseInteractive(t, "# hi\n42\n")
+	stmt := first(root)
+	// Parser normalizes annotations to wrap values.
+	txt, wrapped := asAnnot(t, stmt)
+	if txt != "hi" {
+		t.Fatalf("want annotation text 'hi', got %q", txt)
+	}
+	wantTag(t, wrapped, "int")
+	if wrapped[1].(int64) != 42 {
+		t.Fatalf("want 42, got %v", wrapped[1])
+	}
+}
+
+// ───────────────────── Missing-but-desired centralized gap checks ─────────────────────
+
+// 1) Grouping: after '(' needs an expression (anchor at '(')
+func Test_Parser_Incomplete_Grouping_NeedsExpr_AfterOpenParen(t *testing.T) {
+	src := "(\n"
+	checkParseInc(t, src, 1, 1, "expected expression after '('")
+}
+
+// 2) Computed property: after '.(' needs an expression (anchor at '(')
+func Test_Parser_Incomplete_ComputedProperty_NeedsExpr_AfterOpenParen(t *testing.T) {
+	src := "obj.(\n"
+	// o=1 b=2 j=3 .=4 ( =5 → Col=5
+	checkParseInc(t, src, 1, 5, "expected expression after '('")
+}
+
+// 3) Index: after '[' needs an expression (anchor at '[')
+func Test_Parser_Incomplete_Index_NeedsExpr_AfterOpenBracket(t *testing.T) {
+	src := "arr[\n"
+	// a=1 r=2 r=3 [=4 → Col=4
+	checkParseInc(t, src, 1, 4, "expected index expression after '['")
+}
+
+// 4) Map literal: after ':' needs a value (anchor at ':')
+func Test_Parser_Incomplete_MapValue_NeedsExpr_AfterColon(t *testing.T) {
+	src := "{a:\n"
+	// {=1 a=2 :=3 → Col=3
+	checkParseInc(t, src, 1, 3, "expected value after ':'")
+}
+
+// 5) If: needs a condition after 'if' (anchor at 'if')
+func Test_Parser_Incomplete_If_NeedsCondition(t *testing.T) {
+	src := "if \n"
+	checkParseInc(t, src, 1, 1, "expected condition after 'if'")
+}
+
+// 6) Elif: needs a condition after 'elif' (anchor at 'elif')
+func Test_Parser_Incomplete_Elif_NeedsCondition(t *testing.T) {
+	src := "if a then x\nelif \n"
+	// 'elif' starts at line 2, column 1
+	checkParseInc(t, src, 2, 1, "expected condition after 'elif'")
+}
+
+// 7) While: needs a condition after 'while' (anchor at 'while')
+func Test_Parser_Incomplete_While_NeedsCondition(t *testing.T) {
+	src := "while \n"
+	checkParseInc(t, src, 1, 1, "expected condition after 'while'")
+}
+
+// 8) For: needs an iterator expression after 'in' (anchor at 'in')
+func Test_Parser_Incomplete_ForIn_NeedsExpr(t *testing.T) {
+	src := "for x in \n"
+	// f=1 o=2 r=3 space=4 x=5 space=6 i=7 n=8 → Col=7
+	checkParseInc(t, src, 1, 7, "expected expression after 'in'")
+}
+
+// ───────────────────── After-condition gaps before required token ─────────────────────
+
+// IF: condition present, only gaps before required 'then'
+func Test_Parser_Incomplete_If_AfterCondition_NeedsThen(t *testing.T) {
+	src := "if x\n"
+	// Anchor should be right after 'x' (line 1, col 5 for "if␠x").
+	checkParseInc(t, src, 1, 5, "expected 'then'")
+}
+
+// ELIF: condition present, only gaps before required 'then'
+func Test_Parser_Incomplete_Elif_AfterCondition_NeedsThen(t *testing.T) {
+	src := "if a then b\nelif c\n"
+	// 'elif c' is on line 2; anchor after 'c' (line 2, col 7).
+	checkParseInc(t, src, 2, 7, "expected 'then'")
+}
+
+// WHILE: condition present, only gaps before required 'do'
+func Test_Parser_Incomplete_While_AfterCondition_NeedsDo(t *testing.T) {
+	src := "while x\n"
+	// "while␠x" → anchor after x (line 1, col 8).
+	checkParseInc(t, src, 1, 8, "expected 'do'")
+}
+
+// FOR: target present, only gaps before required 'in'
+func Test_Parser_Incomplete_For_AfterTarget_NeedsIn(t *testing.T) {
+	src := "for x \n"
+	// "for␠x␠" → anchor after x (line 1, col 6).
+	checkParseInc(t, src, 1, 6, "expected 'in'")
+}
+
+// FOR: iterator present, only gaps before required 'do'
+func Test_Parser_Incomplete_For_AfterIter_NeedsDo(t *testing.T) {
+	src := "for x in y\n"
+	// "for␠x␠in␠y" → anchor after y (line 1, col 11).
+	checkParseInc(t, src, 1, 11, "expected 'do'")
+}
+
+// MODULE: name expr present, only gaps before required 'do'
+func Test_Parser_Incomplete_Module_AfterName_NeedsDo(t *testing.T) {
+	src := "module M\n"
+	// "module␠M" → anchor after 'M' (line 1, col 9).
+	checkParseInc(t, src, 1, 9, "expected 'do'")
+}
+
+// ───────────────────── After-expr gaps before closing delimiter (post-condition shape) ─────────────────────
+
+// Grouping: expr present, only gaps before ')'
+func Test_Parser_Incomplete_Grouping_AfterExpr_MissingRParen(t *testing.T) {
+	src := "(1\n"
+	// Anchor after '1' (line 1, col 3). Message from need(RROUND,...).
+	checkParseInc(t, src, 1, 3, "expected ')'")
+}
+
+// Computed property: expr present, only gaps before ')'
+func Test_Parser_Incomplete_ComputedProperty_AfterExpr_MissingRParen(t *testing.T) {
+	src := "obj.(1\n"
+	// "obj.(1" → anchor after '1' (line 1, col 7).
+	checkParseInc(t, src, 1, 7, "expected ')'")
+}
+
+// Index: expr present, only gaps before ']'
+func Test_Parser_Incomplete_Index_AfterExpr_MissingRSquare(t *testing.T) {
+	src := "arr[1\n"
+	// "arr[1" → anchor after '1' (line 1, col 6).
+	checkParseInc(t, src, 1, 6, "expected ']'")
+}

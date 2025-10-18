@@ -1443,17 +1443,23 @@ func (p *parser) posAfterLastSpan() (int, int) {
 
 // takeReqGap consumes immediately-adjacent GAP (ANNOTATION/NOOP) that appear
 // before something *required* after `anchor`. It emits these gaps (returned as
-// annSrc) but NEVER lets them satisfy the requirement. If interactive and only
-// gaps remain to EOF, returns DiagIncomplete anchored to `anchor`.
+// annSrc) but NEVER lets them satisfy the requirement.
+// If only gaps remain to EOF, it returns an error anchored to `anchor`:
+//   - interactive: DiagIncomplete(msg)
+//   - noninteractive: DiagParse(msg)
 func (p *parser) takeReqGap(anchor Token, incMsg string) (annSrc, error) {
 	// Coalesce sequential annotations first, then eat blank-line runs.
 	pre := p.collectAnnotsSrc()
 	p.skipNoops()
-	// If after consuming those we only have gaps to EOF, this is incomplete.
-	if p.interactive && p.onlyGapsToEOF() {
+	// If after consuming those we only have gaps to EOF, this is an incomplete requirement.
+	if p.onlyGapsToEOF() {
 		line, col := p.posAtByte(anchor.StartByte)
+		kind := DiagParse
+		if p.interactive {
+			kind = DiagIncomplete
+		}
 		return annNone(), &Error{
-			Kind: DiagIncomplete,
+			Kind: kind,
 			Msg:  incMsg,
 			Line: line, Col: col,
 		}
@@ -1470,11 +1476,13 @@ func (p *parser) takeReqGap(anchor Token, incMsg string) (annSrc, error) {
 // It does NOT consume any token.
 func (p *parser) needNoGap(anchor Token, msg string) error {
 	if p.atEnd() {
+		// Unify message across modes: same text, different kind.
+		line, col := p.posAtByte(anchor.StartByte)
+		kind := DiagParse
 		if p.interactive {
-			line, col := p.posAtByte(anchor.StartByte)
-			return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
+			kind = DiagIncomplete
 		}
-		return nil
+		return &Error{Kind: kind, Msg: msg, Line: line, Col: col}
 	}
 	switch p.peek().Type {
 	case ANNOTATION, NOOP:
@@ -2004,17 +2012,23 @@ func (p *parser) expr(minBP int) (S, error) {
 			// If destructuring, require an '=' (after any annotations).
 			base, _, _ := unwrapAnnot(pat)
 			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
+				// Skip GAPs (ANNOTATION/NOOP) without letting them satisfy the requirement.
 				j := p.i
-				for j < len(p.toks) && p.toks[j].Type == ANNOTATION {
+				for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
 					j++
 				}
-				if j >= len(p.toks) || p.toks[j].Type != ASSIGN {
-					g := p.peek()
-					if p.interactive && g.Type == EOF {
-						line, col := p.posAfterLastSpan()
-						return nil, &Error{Kind: DiagIncomplete, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+				// If only gaps/EOF remain, report same message across modes.
+				if j >= len(p.toks) || p.toks[j].Type == EOF {
+					line, col := p.posAfterLastSpan()
+					kind := DiagParse
+					if p.interactive {
+						kind = DiagIncomplete
 					}
-					line, col := p.posAtByte(g.StartByte)
+					return nil, &Error{Kind: kind, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+				}
+				// Not EOF: require ASSIGN next; if not, hard parse error at that token.
+				if p.toks[j].Type != ASSIGN {
+					line, col := p.posAtByte(p.toks[j].StartByte)
 					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 				}
 			}
@@ -2039,6 +2053,12 @@ func (p *parser) expr(minBP int) (S, error) {
 			src := annSrc{ok: true, txt: "", startTok: tokIndexOfThis, endTok: tokIndexOfThis}
 			if s, ok := t.Literal.(string); ok {
 				src.txt = s
+			}
+
+			// Floating annotation: if the very next token is a NOOP, consume exactly one
+			// NOOP and return annot(noop) immediately.
+			if p.match(NOOP) {
+				return p.attachAnnotFrom(src, p.mkLeaf("noop", p.i-1)), nil
 			}
 
 			// Standalone comment: after skipping NOOPs, if the next token cannot start a value,
@@ -2291,6 +2311,9 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		if preIdx.ok {
+			idx = p.attachAnnotFrom(preIdx, idx)
+		}
 		// Allow trailing gaps before ']'
 		if trail := p.collectGap(); trail.ok {
 			idx = p.attachAnnotFrom(trail, idx)
@@ -2298,7 +2321,6 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
 			return nil, false, err
 		}
-		_ = preIdx // gap already attached via normalize/attach above if needed
 		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
 		return n, true, nil
 
@@ -2319,6 +2341,9 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			ex, err := p.expr(0)
 			if err != nil {
 				return nil, false, err
+			}
+			if pre.ok {
+				ex = p.attachAnnotFrom(pre, ex)
 			}
 			// Allow trailing gaps before ')'
 			if trail := p.collectGap(); trail.ok {
@@ -2772,9 +2797,17 @@ func (p *parser) ifExpr() (S, error) {
 }
 
 func (p *parser) forExpr(openTok int) (S, error) {
+	// Ensure gaps right after 'for' are treated uniformly (including NOOPs)
+	preFor, err := p.takeReqGap(p.toks[openTok], "expected for-target after 'for'")
+	if err != nil {
+		return nil, err
+	}
 	tgt, err := p.forTarget()
 	if err != nil {
 		return nil, err
+	}
+	if preFor.ok {
+		tgt = p.attachAnnotFrom(preFor, tgt)
 	}
 	between := p.collectGap()
 	inTok, err := p.need(IN, "expected 'in'")

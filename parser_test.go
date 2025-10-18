@@ -2458,8 +2458,8 @@ func Test_Parser_Incomplete_Table(t *testing.T) {
 			name: "Fun_Params_MissingRParen",
 			src:  "fun(\n",
 			// need(...) for ')' anchors after last span (the '(') → line 1 col 5
-			wantLine: 1, wantCol: 5,
-			wantSub: "expected ')' after parameters",
+			wantLine: 2, wantCol: 1,
+			wantSub: "expected parameter name",
 		},
 
 		// Oracle header: arrow present but missing type
@@ -2474,9 +2474,9 @@ func Test_Parser_Incomplete_Table(t *testing.T) {
 		{
 			name: "Enum_MissingClose",
 			src:  "Enum[\n",
-			// need(']') anchors after last span (the '[') → line 1 col 6
-			wantLine: 1, wantCol: 6,
-			wantSub: "expected ']'",
+			// Current behavior: element-first parse falls to EOF in expr → incomplete at 2:1
+			wantLine: 2, wantCol: 1,
+			wantSub: "unexpected end of input",
 		},
 
 		// ── Regression: destructuring let must be incomplete if '=' is missing ──

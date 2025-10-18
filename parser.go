@@ -1176,6 +1176,9 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		if preIdx.ok {
+			idx = p.attachAnnotFrom(preIdx, idx)
+		}
 		// Allow trailing gaps before ']'
 		if trail := p.collectGap(); trail.ok {
 			idx = p.attachAnnotFrom(trail, idx)
@@ -1183,7 +1186,6 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
 			return nil, false, err
 		}
-		_ = preIdx // gap already attached via normalize/attach above if needed
 		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
 		return n, true, nil
 
@@ -1204,6 +1206,9 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			ex, err := p.expr(0)
 			if err != nil {
 				return nil, false, err
+			}
+			if pre.ok {
+				ex = p.attachAnnotFrom(pre, ex)
 			}
 			// Allow trailing gaps before ')'
 			if trail := p.collectGap(); trail.ok {

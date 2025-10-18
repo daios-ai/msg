@@ -180,8 +180,7 @@ func execResult(status int, stdout, stderr string) Value {
 			"stdout": Str(stdout),
 			"stderr": Str(stderr),
 		},
-		KeyAnn: map[string]string{},
-		Keys:   []string{"status", "stdout", "stderr"},
+		Keys: []string{"status", "stdout", "stderr"},
 	}
 	return Value{Tag: VTMap, Data: m}
 }

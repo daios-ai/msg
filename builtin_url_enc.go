@@ -155,7 +155,7 @@ Returns:
 
 			// Build query map Str -> [Str]
 			q := u.Query() // url.Values (map[string][]string)
-			qOut := &MapObject{Entries: map[string]Value{}, KeyAnn: map[string]string{}, Keys: []string{}}
+			qOut := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
 			// stable key order
 			keys := make([]string, 0, len(q))
 			for k := range q {
@@ -175,7 +175,6 @@ Returns:
 
 			out := &MapObject{
 				Entries: map[string]Value{},
-				KeyAnn:  map[string]string{},
 				Keys:    []string{},
 			}
 			put := func(k string, v Value) { out.Entries[k] = v; out.Keys = append(out.Keys, k) }
@@ -359,7 +358,7 @@ Notes:
 			if err != nil {
 				return annNull("invalid query: " + err.Error())
 			}
-			out := &MapObject{Entries: map[string]Value{}, KeyAnn: map[string]string{}, Keys: []string{}}
+			out := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
 			keys := make([]string, 0, len(vals))
 			for k := range vals {
 				keys = append(keys, k)

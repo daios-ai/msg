@@ -10,7 +10,7 @@
 //
 //	type Module struct {
 //	  Name string     // canonical identity (path/URL/memory-name)
-//	  Map  *MapObject // ordered export surface with per-key annotations
+//	  Map  *MapObject // ordered export surface
 //	  Env  *Env       // lexical environment where the module executed
 //	}
 //
@@ -286,7 +286,6 @@ func buildModuleMap(modEnv *Env) *MapObject {
 
 	mo := &MapObject{
 		Entries: make(map[string]Value, len(keys)),
-		KeyAnn:  make(map[string]string, len(keys)),
 		Keys:    make([]string, 0, len(keys)),
 	}
 	for _, k := range keys {
@@ -304,9 +303,6 @@ func buildModuleMap(modEnv *Env) *MapObject {
 
 		mo.Entries[k] = v
 		mo.Keys = append(mo.Keys, k)
-		if ann := v.Annot; ann != "" {
-			mo.KeyAnn[k] = ann
-		}
 	}
 	return mo
 }

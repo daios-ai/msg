@@ -90,14 +90,10 @@ func deepCloneValue(ctx *cloneCtx, v Value, targetCore *Env) Value {
 		src := v.Data.(*MapObject)
 		dst := &MapObject{
 			Entries: make(map[string]Value, len(src.Entries)),
-			KeyAnn:  make(map[string]string, len(src.KeyAnn)),
 			Keys:    make([]string, 0, len(src.Keys)),
 		}
 		for _, k := range src.Keys {
 			dst.Keys = append(dst.Keys, k)
-			if ann, ok := src.KeyAnn[k]; ok {
-				dst.KeyAnn[k] = ann
-			}
 			dst.Entries[k] = deepCloneValue(ctx, src.Entries[k], targetCore)
 		}
 		return Value{Tag: VTMap, Data: dst}
@@ -358,7 +354,6 @@ Returns:
 			r := <-ch
 			mo := &MapObject{
 				Entries: map[string]Value{"index": Int(int64(r.i)), "value": r.v},
-				KeyAnn:  map[string]string{},
 				Keys:    []string{"index", "value"},
 			}
 			return Value{Tag: VTMap, Data: mo}
@@ -507,7 +502,6 @@ Returns:
 			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
 			out := &MapObject{
 				Entries: map[string]Value{},
-				KeyAnn:  map[string]string{},
 				Keys:    []string{"ok", "value"},
 			}
 			select {

@@ -62,9 +62,9 @@
 // -------------
 // `Value` is a tagged sum covering: null, bool, int64, float64, string, arrays,
 // ordered maps, functions, type values, modules, and opaque handles. `MapObject`
-// preserves **insertion order** (`Keys`) and supports **per-key annotations**
-// (`KeyAnn`). Its `Entries` is a string→Value map; order-sensitive operations
-// must consult `Keys`. The helper `AsMapValue` exposes a module’s map view.
+// preserves **insertion order** (`Keys`). Its `Entries` is a string→Value map;
+// order-sensitive operations must consult `Keys`. The helper `AsMapValue`
+// exposes a module’s map view.
 //
 // FUNCTIONS & NATIVES
 // -------------------
@@ -240,11 +240,10 @@ func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
 func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
 func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: &ArrayObject{Elems: xs}} }
 
-// MapObject is an ordered map preserving insertion order and per-key annotations.
+// MapObject is an ordered map preserving insertion order.
 //
 // Fields:
 //   - Entries — the key/value storage (by string key).
-//   - KeyAnn  — optional per-key annotation text (preserved on round-trips).
 //   - Keys    — insertion order (unique keys); use this to iterate predictably.
 //
 // Semantics:
@@ -255,7 +254,6 @@ func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: &ArrayObject{Elems
 // Values of map type are represented as Value{Tag: VTMap, Data: *MapObject}.
 type MapObject struct {
 	Entries map[string]Value
-	KeyAnn  map[string]string
 	Keys    []string
 }
 
@@ -267,7 +265,6 @@ type MapObject struct {
 func Map(m map[string]Value) Value {
 	mo := &MapObject{
 		Entries: m,
-		KeyAnn:  map[string]string{},
 	}
 	mo.Keys = make([]string, 0, len(m))
 	for k := range m {
@@ -937,14 +934,10 @@ func rebindValue(v Value, from, to *Env) Value {
 		sm := v.Data.(*MapObject)
 		nm := &MapObject{
 			Entries: make(map[string]Value, len(sm.Entries)),
-			KeyAnn:  make(map[string]string, len(sm.KeyAnn)),
 			Keys:    append([]string(nil), sm.Keys...),
 		}
 		for k, vv := range sm.Entries {
 			nm.Entries[k] = rebindValue(vv, from, to)
-		}
-		for k, a := range sm.KeyAnn {
-			nm.KeyAnn[k] = a
 		}
 		nv := Value{Tag: VTMap, Data: nm, Annot: v.Annot}
 		return nv

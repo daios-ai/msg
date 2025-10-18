@@ -495,8 +495,7 @@ func stripAnnDeep(v Value) Value {
 			Tag: VTMap,
 			Data: &MapObject{
 				Entries: cpE,
-				KeyAnn:  map[string]string{}, // drop per-key annotations
-				Keys:    cpK,                 // preserve insertion order
+				Keys:    cpK,
 			},
 		}
 	default:

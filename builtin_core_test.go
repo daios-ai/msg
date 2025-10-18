@@ -148,12 +148,9 @@ func Test_Builtin_Core_snapshot_returns_env(t *testing.T) {
 		t.Fatalf("'typeOf' should be a function value, got %#v", typeOfVal)
 	}
 
-	// Value annotations stay on the values; key annotations are independent.
+	// Value annotations stay on the values.
 	if failVal.Annot == "" {
 		t.Fatalf("'fail' should carry docs in its value annotation (Annot); got empty")
-	}
-	if ann, ok := mo.KeyAnn["fail"]; ok && ann != "" {
-		t.Fatalf("per-key annotation for 'fail' should be empty; got %q", ann)
 	}
 }
 

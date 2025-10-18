@@ -111,9 +111,8 @@ Notes:
 	)
 	setBuiltinDoc(target, "clone", `Clone a value (deep-copy).
 
-For maps, preserves key order and per-key annotations. Primitive values are
-returned as-is. Functions, modules, and handles are not duplicated (identity
-is preserved).
+For maps, preserves key order. Primitive values are returned as-is. 
+Functions, modules, and handles are not duplicated (identity is preserved).
 
 Params:
   x: Any
@@ -137,8 +136,8 @@ Returns:
 Behavior:
   • Captures a flattened view of the current frame and its parents (Core included).
   • Inner bindings shadow outer ones.
-  • Values are deep-copied where applicable (arrays/maps preserve order & per-key annotations).
-  • Variable annotations are preserved on the **values themselves** (KeyAnn is not used).
+  • Values are deep-copied where applicable (arrays/maps preserve order).
+  • Variable annotations are preserved on the **values themselves**.
 
 Params:
   _: Null
@@ -358,8 +357,6 @@ Returns:
 			}
 			// delete from Entries
 			delete(mo.Entries, k)
-			// delete annotation if present
-			delete(mo.KeyAnn, k)
 			// remove from Keys while preserving order
 			keys := mo.Keys[:0]
 			for _, kk := range mo.Keys {
@@ -373,7 +370,7 @@ Returns:
 	)
 	setBuiltinDoc(target, "mapDelete", `Delete a property from a map (in place).
 
-Preserves the key order and per-key annotations for the remaining entries.
+Preserves the key order for the remaining entries.
 
 Params:
   obj: {}  — a map value (mutated)
@@ -519,22 +516,16 @@ func cloneValue(v Value) Value {
 
 	case VTMap:
 		mo := v.Data.(*MapObject)
-		// Deep-copy entries
 		entries := make(map[string]Value, len(mo.Entries))
 		for k, vv := range mo.Entries {
 			entries[k] = cloneValue(vv)
 		}
-		// Preserve insertion order and per-key annotations
 		keys := make([]string, len(mo.Keys))
 		copy(keys, mo.Keys)
-		keyAnn := make(map[string]string, len(mo.KeyAnn))
-		for k, ann := range mo.KeyAnn {
-			keyAnn[k] = ann
-		}
 		return Value{
 			Tag:   VTMap,
-			Data:  &MapObject{Entries: entries, KeyAnn: keyAnn, Keys: keys},
-			Annot: v.Annot, // preserve map-level annotation
+			Data:  &MapObject{Entries: entries, Keys: keys},
+			Annot: v.Annot,
 		}
 
 	default:
@@ -548,11 +539,9 @@ func cloneValue(v Value) Value {
 //
 // Annotations: we do NOT mix key-annotations with value annotations.
 //   - Entries[name] = cloned value (with Value.Annot preserved ON THE VALUE)
-//   - KeyAnn[name] remains empty
 //   - Keys ordered inner→outer; names sorted within each frame for stability.
 func snapshotVisibleEnvAsMap(e *Env) Value {
 	entries := map[string]Value{}
-	keyAnn := map[string]string{} // intentionally left empty
 	var order []string
 
 	for cur := e; cur != nil; cur = cur.parent {
@@ -574,6 +563,6 @@ func snapshotVisibleEnvAsMap(e *Env) Value {
 
 	return Value{
 		Tag:  VTMap,
-		Data: &MapObject{Entries: entries, KeyAnn: keyAnn, Keys: order},
+		Data: &MapObject{Entries: entries, Keys: order},
 	}
 }

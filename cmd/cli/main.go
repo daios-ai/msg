@@ -202,8 +202,7 @@ func cmdRun(args []string) int {
 			"path":    mindscript.Str(fileAbsOrOrig(file)),
 			"argv":    mindscript.Arr(strSliceToVals(argv)),
 		},
-		KeyAnn: map[string]string{},
-		Keys:   []string{"isEntry", "path", "argv"},
+		Keys: []string{"isEntry", "path", "argv"},
 	}
 	child.Define("runtime", mindscript.Value{Tag: mindscript.VTMap, Data: rt})
 

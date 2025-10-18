@@ -145,7 +145,7 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	if v.Tag != VTMap {
 		v = Value{Tag: VTMap, Data: &MapObject{
 			Entries: map[string]Value{"output": v},
-			KeyAnn:  map[string]string{}, Keys: []string{"output"},
+			Keys:    []string{"output"},
 		}}
 	}
 	mo := v.Data.(*MapObject)
@@ -293,7 +293,7 @@ func valueMapFromArgs(ctx CallCtx, names []string) Value {
 		entries[name] = v
 		keys = append(keys, name)
 	}
-	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, KeyAnn: map[string]string{}, Keys: keys}}
+	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, Keys: keys}}
 }
 
 // Box examples: each example is [inVal, outVal]; normalize to maps for prompt rendering:
@@ -330,11 +330,10 @@ func boxExamplesAsMaps(exs Value, names []string) []Value {
 				keys = append(keys, names[0])
 			}
 		}
-		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, KeyAnn: map[string]string{}, Keys: keys}}
+		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, Keys: keys}}
 
 		outVal := Value{Tag: VTMap, Data: &MapObject{
 			Entries: map[string]Value{"output": outV},
-			KeyAnn:  map[string]string{},
 			Keys:    []string{"output"},
 		}}
 

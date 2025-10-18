@@ -79,7 +79,6 @@ Returns:
 					"second":      Int(int64(now.Second())),
 					"millisecond": Int(int64(now.Nanosecond() / int(time.Millisecond))),
 				},
-				KeyAnn: map[string]string{},
 				Keys: []string{
 					"year", "month", "day",
 					"hour", "minute", "second", "millisecond",

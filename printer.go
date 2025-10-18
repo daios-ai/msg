@@ -1344,11 +1344,9 @@ func valueToASTRec(v Value, seenA map[*ArrayObject]bool, seenM map[*MapObject]bo
 		for _, k := range mo.Keys {
 			val := mo.Entries[k]
 			node := valueToASTRec(val, seenA, seenM)
-			// Per-key annotation goes on the VALUE. Merge with value.Annot if both exist.
-			keyNote := strings.TrimSpace(mo.KeyAnn[k])
-			valNote := strings.TrimSpace(val.Annot)
-			if keyNote != "" || valNote != "" {
-				node = S{"annot", S{"str", joinNonEmptyLocal(keyNote, valNote)}, node}
+			// Annotations live on the VALUE.
+			if ann := strings.TrimSpace(val.Annot); ann != "" {
+				node = S{"annot", S{"str", ann}, node}
 			}
 			out = append(out, S{"pair", S{"str", k}, node})
 		}

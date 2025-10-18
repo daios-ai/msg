@@ -243,12 +243,8 @@ func ixConstructorS_core(v Value) (S, bool) {
 			if !ok {
 				return nil, false
 			}
-			// Requiredness policy: value maps never carry "pair!" (type-only).
-			// We pass through any key docs (minus a lone "!") as PRE/POST annot.
+			// Value maps never carry "pair!" (type-only). Keys are plain strings.
 			keyNode := S{"str", k}
-			if extra := keyDocWithoutBang(mo.KeyAnn[k]); extra != "" {
-				keyNode = annWrapS(extra, keyNode)
-			}
 			out = append(out, S{"pair", keyNode, ctor})
 		}
 		return out, true
@@ -304,36 +300,6 @@ func ixConstructorS_core(v Value) (S, bool) {
 	default:
 		return nil, false
 	}
-}
-
-func containsBang(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '!' {
-			return true
-		}
-	}
-	return false
-}
-
-func keyDocWithoutBang(s string) string {
-	// Strip a lone "!" (requiredness marker). Preserve any other docs.
-	if s == "!" {
-		return ""
-	}
-	if containsBang(s) {
-		out := make([]byte, 0, len(s))
-		for i := 0; i < len(s); i++ {
-			if s[i] != '!' {
-				out = append(out, s[i])
-			}
-		}
-		// trim trailing space
-		if n := len(out); n > 0 && out[n-1] == ' ' {
-			out = out[:n-1]
-		}
-		return string(out)
-	}
-	return s
 }
 
 // ==============================

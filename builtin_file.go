@@ -128,8 +128,7 @@ Returns:
 					"modTimeMillis": Int(info.ModTime().UnixNano() / 1e6),
 					"mode":          Int(int64(info.Mode())),
 				},
-				KeyAnn: map[string]string{},
-				Keys:   []string{"isDir", "size", "modTimeMillis", "mode"},
+				Keys: []string{"isDir", "size", "modTimeMillis", "mode"},
 			}
 			return Value{Tag: VTMap, Data: mo}
 		},

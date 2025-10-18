@@ -573,7 +573,6 @@ func Test_Types_IsType_Module_As_Map(t *testing.T) {
 	// Build a module with export: foo = 1
 	mo := &MapObject{
 		Entries: map[string]Value{"foo": Int(1)},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"foo"},
 	}
 	mod := &Module{Map: mo, Env: NewEnv(ip.Global)}
@@ -604,7 +603,6 @@ func Test_Types_ValueToType_Module_Inference(t *testing.T) {
 	// Build a module with exports: x:"hi", n:2
 	mo := &MapObject{
 		Entries: map[string]Value{"x": Str("hi"), "n": Int(2)},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"x", "n"},
 	}
 	mod := &Module{Map: mo, Env: NewEnv(ip.Global)}

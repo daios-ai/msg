@@ -364,7 +364,6 @@ func goJSONToValue(x any) Value {
 		}
 		mo := &MapObject{
 			Entries: entries,
-			KeyAnn:  map[string]string{},
 			Keys:    keys, // insertion order from range is unspecified; fine for open-world maps
 		}
 		return Value{Tag: VTMap, Data: mo}

@@ -113,7 +113,6 @@ func initCore(ip *Interpreter) {
 				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
 				out := &MapObject{
 					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
-					KeyAnn:  make(map[string]string, len(am.KeyAnn)+len(bm.KeyAnn)),
 					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
 				}
 				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
@@ -125,9 +124,6 @@ func initCore(ip *Interpreter) {
 				for k, v := range am.Entries {
 					out.Entries[k] = v
 				}
-				for k, ann := range am.KeyAnn {
-					out.KeyAnn[k] = ann
-				}
 				// overlay RHS; append new keys in RHS order
 				for _, k := range bm.Keys {
 					if _, ok := seen[k]; !ok {
@@ -137,9 +133,6 @@ func initCore(ip *Interpreter) {
 				}
 				for k, v := range bm.Entries {
 					out.Entries[k] = v
-				}
-				for k, ann := range bm.KeyAnn {
-					out.KeyAnn[k] = ann
 				}
 				return Value{Tag: VTMap, Data: out}
 			}
@@ -213,7 +206,6 @@ func initCore(ip *Interpreter) {
 			}
 			mo := &MapObject{
 				Entries: make(map[string]Value, len(ka)),
-				KeyAnn:  make(map[string]string, len(ka)),
 				Keys:    make([]string, 0, len(ka)),
 			}
 			for i := range ka {
@@ -223,9 +215,6 @@ func initCore(ip *Interpreter) {
 				k := ka[i].Data.(string)
 				mo.Entries[k] = va[i]
 				mo.Keys = append(mo.Keys, k)
-				if ann := ka[i].Annot; ann != "" {
-					mo.KeyAnn[k] = ann
-				}
 			}
 			return Value{Tag: VTMap, Data: mo}
 		})
@@ -432,18 +421,14 @@ func initCore(ip *Interpreter) {
 				return newIter(envInit, S{"id", "$arr"}, then)
 			}
 
-			// Map → iterator (yields [key, value]) preserving insertion order + key annotations
+			// Map → iterator (yields [key, value]) preserving insertion order
 			if x.Tag == VTMap {
 				mo := x.Data.(*MapObject)
 				envInit := NewEnv(ctx.Env())
 				envInit.Define("$map", x)
 				keyVals := make([]Value, 0, len(mo.Keys))
 				for _, k := range mo.Keys {
-					s := Str(k)
-					if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
-						s = withAnnot(s, ann)
-					}
-					keyVals = append(keyVals, s)
+					keyVals = append(keyVals, Str(k))
 				}
 				envInit.Define("$keys", Arr(keyVals))
 

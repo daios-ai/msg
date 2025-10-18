@@ -127,19 +127,16 @@ func Test_Introspection_ScalarsAndNegatives(t *testing.T) {
 }
 
 func Test_Introspection_ArrayMap_WithKeyAnn_NoRequirednessInValues(t *testing.T) {
-	// Value maps never carry requiredness; '!' in KeyAnn is dropped by IxReflect.
+	// Value maps never carry requiredness in reflection.
 	mo := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{},
 	}
 	mo.Keys = append(mo.Keys, "a")
 	mo.Entries["a"] = vInt(1)
-	mo.KeyAnn["a"] = "!" // should NOT produce pair!
 
 	mo.Keys = append(mo.Keys, "b")
 	mo.Entries["b"] = vStr("x")
-	mo.KeyAnn["b"] = "doc for b" // preserved as PRE key annot
 
 	got := IxReflect(Value{Tag: VTMap, Data: mo})
 	want := vArray(
@@ -149,12 +146,9 @@ func Test_Introspection_ArrayMap_WithKeyAnn_NoRequirednessInValues(t *testing.T)
 			vArray(vStr("str"), vStr("a")),
 			vArray(vStr("int"), vInt(1)),
 		),
-		// "b" has PRE key doc
+		// "b" plain key
 		vArray(vStr("pair"),
-			vArray(vStr("annot"),
-				vArray(vStr("str"), vStr("doc for b")),
-				vArray(vStr("str"), vStr("b")),
-			),
+			vArray(vStr("str"), vStr("b")),
 			vArray(vStr("str"), vStr("x")),
 		),
 	)
@@ -450,7 +444,7 @@ func Test_Introspection_ArrayElementAnnotation_PreservedInReflect(t *testing.T) 
 func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) {
 	// Same setup as above.
 	e0 := vInt(1)
-	e0.Annot = "<hi"
+	e0.Annot = "hi"
 	e1 := vInt(2)
 	val := Arr([]Value{e0, e1})
 
@@ -468,8 +462,8 @@ func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) 
 	if len(elems) != 2 {
 		t.Fatalf("expected 2 elements, got %d", len(elems))
 	}
-	if elems[0].Annot != "<hi" {
-		t.Fatalf("expected first element Annot '<hi', got %q", elems[0].Annot)
+	if elems[0].Annot != "hi" {
+		t.Fatalf("expected first element Annot 'hi', got %q", elems[0].Annot)
 	}
 	if elems[1].Annot != "" {
 		t.Fatalf("expected second element Annot empty, got %q", elems[1].Annot)
@@ -478,16 +472,12 @@ func Test_Introspection_Array_ReifyRoundtrip_PreservesAnnotations(t *testing.T) 
 
 // Map key/requiredness + key/value annotations should be preserved by reflect().
 func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing.T) {
-	// Value map with key PRE doc and key/value POST; no requiredness.
+	// Value map with value doc.
 	mo := &MapObject{
 		Keys: []string{"a", "b"},
 		Entries: map[string]Value{
 			"a": vInt(1),
-			"b": func() Value { v := vInt(2); v.Annot = "<vpost"; return v }(),
-		},
-		KeyAnn: map[string]string{
-			"a": "kdoc",   // PRE key doc only (no '!')
-			"b": "<kpost", // POST key annot
+			"b": func() Value { v := vInt(2); v.Annot = "vpost"; return v }(),
 		},
 	}
 	got := IxReflect(Value{Tag: VTMap, Data: mo})
@@ -496,13 +486,13 @@ func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing
 		vStr("map"),
 		vArray(
 			vStr("pair"),
-			wrapAnnot(vArray(vStr("str"), vStr("a")), "kdoc"),
+			vArray(vStr("str"), vStr("a")),
 			vArray(vStr("int"), vInt(1)),
 		),
 		vArray(
 			vStr("pair"),
-			wrapAnnot(vArray(vStr("str"), vStr("b")), "<kpost"),
-			wrapAnnot(vArray(vStr("int"), vInt(2)), "<vpost"),
+			vArray(vStr("str"), vStr("b")),
+			wrapAnnot(vArray(vStr("int"), vInt(2)), "vpost"),
 		),
 	)
 	mustEqValue(t, got, want)
@@ -511,30 +501,26 @@ func Test_Introspection_Map_KeyAndValueAnnotations_PreservedInReflect(t *testing
 // Nested arrays/maps should propagate annotations recursively in reflect().
 func Test_Introspection_NestedContainers_AnnotationsPropagate(t *testing.T) {
 	// Value: [ { x: 1 }, 2 ] with:
-	//  - POST on key 'x' (key ann "<k")
-	//  - POST on value 1 (val ann "<v1")
-	//  - POST on outer array element 1 ("<outer")
+	//  - POST on value 1 (val ann "v1")
+	//  - POST on outer array element 1 ("outer")
 	innerMO := &MapObject{
 		Keys: []string{"x"},
 		Entries: map[string]Value{
-			"x": func() Value { v := vInt(1); v.Annot = "<v1"; return v }(),
-		},
-		KeyAnn: map[string]string{
-			"x": "<k", // POST on key
+			"x": func() Value { v := vInt(1); v.Annot = "v1"; return v }(),
 		},
 	}
 	innerMap := Value{Tag: VTMap, Data: innerMO}
 	elem1 := vInt(2)
-	elem1.Annot = "<outer"
+	elem1.Annot = "outer"
 
 	val := Arr([]Value{innerMap, elem1})
 
 	got := IxReflect(val)
 
-	// Expected:
+	// Expected (no key annotation reflected):
 	// ["array",
-	//   ["map", ["pair", ["annot", ["str","<k"], ["str","x"]], ["annot", ["str","<v1"], ["int",1]]]],
-	//   ["annot", ["str","<outer"], ["int",2]]
+	//   ["map", ["pair", ["str","x"], ["annot", ["str","v1"], ["int",1]]]],
+	//   ["annot", ["str","outer"], ["int",2]]
 	// ]
 	want := vArray(
 		vStr("array"),
@@ -542,11 +528,11 @@ func Test_Introspection_NestedContainers_AnnotationsPropagate(t *testing.T) {
 			vStr("map"),
 			vArray(
 				vStr("pair"),
-				wrapAnnot(vArray(vStr("str"), vStr("x")), "<k"),
-				wrapAnnot(vArray(vStr("int"), vInt(1)), "<v1"),
+				vArray(vStr("str"), vStr("x")),
+				wrapAnnot(vArray(vStr("int"), vInt(1)), "v1"),
 			),
 		),
-		wrapAnnot(vArray(vStr("int"), vInt(2)), "<outer"),
+		wrapAnnot(vArray(vStr("int"), vInt(2)), "outer"),
 	)
 
 	mustEqValue(t, got, want)
@@ -850,7 +836,6 @@ func Test_Interpreter_DeepEqual_MapSelfCycle(t *testing.T) {
 	// Build a self-cyclic map: m = {}; m['self'] = m
 	m1 := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"self"},
 	}
 	mv1 := Value{Tag: VTMap, Data: m1}
@@ -859,7 +844,6 @@ func Test_Interpreter_DeepEqual_MapSelfCycle(t *testing.T) {
 	// Another, structurally identical self-cyclic map
 	m2 := &MapObject{
 		Entries: map[string]Value{},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"self"},
 	}
 	mv2 := Value{Tag: VTMap, Data: m2}
@@ -868,7 +852,6 @@ func Test_Interpreter_DeepEqual_MapSelfCycle(t *testing.T) {
 	// Different map: same key but different value
 	m3 := &MapObject{
 		Entries: map[string]Value{"self": Null},
-		KeyAnn:  map[string]string{},
 		Keys:    []string{"self"},
 	}
 	mv3 := Value{Tag: VTMap, Data: m3}

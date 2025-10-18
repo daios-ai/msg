@@ -181,6 +181,14 @@ type parser struct {
 	src              string
 }
 
+// New small shared helpers (each used ≥3 times):
+// - parseSingleBetween: "( expr )" / "[ expr ]" single element with PRE + trailing gaps + need(close).
+// - parseDoBlockWithLeadingGap: common "gap before `do` attaches to body".
+// - parseExprAfterBP: require expression after an anchor token with PRE attachment, caller chooses BP.
+// - onCommaPostAttachToValue: POST-after-comma attaches to VALUE inside a ("pair", key, value).
+//
+// All helpers reuse existing machinery: takeReqGap, collectGap, need, attachAnnotFrom, bracketed, etc.
+
 // ─────────────────────── centralized annotation carrier ──────────────────────
 type annSrc struct {
 	txt      string
@@ -462,6 +470,78 @@ func (p *parser) onlyGapsToEOF() bool {
 	return true
 }
 
+// ───────────────────────────── shared mini-helpers ───────────────────────────
+
+// opener already consumed. Parse exactly one expr between opener/closer,
+// attach PRE (after opener) and trailing gaps (before closer), then need(closer).
+// Returns the inner expression and the closer's token index.
+func (p *parser) parseSingleBetween(closer TokenType, expect string) (S, int, error) {
+	openTok := p.toks[p.i-1]
+	needMsg := "expected expression after '('"
+	if closer == RSQUARE {
+		needMsg = "expected index expression after '['"
+	}
+	pre, err := p.takeReqGap(openTok, needMsg)
+	if err != nil {
+		return nil, 0, err
+	}
+	inner, err := p.expr(0)
+	if err != nil {
+		return nil, 0, err
+	}
+	if pre.ok {
+		inner = p.attachAnnotFrom(pre, inner)
+	}
+	if tail := p.collectGap(); tail.ok {
+		inner = p.attachAnnotFrom(tail, inner)
+	}
+	if _, err := p.need(closer, expect); err != nil {
+		return nil, 0, err
+	}
+	return inner, p.i - 1, nil
+}
+
+// Common "gap before do" handling for fun/oracle/module/loops.
+func (p *parser) parseDoBlockWithLeadingGap() (S, error) {
+	pre := p.collectGap()
+	b, err := p.parseBlock(true)
+	if err != nil {
+		return nil, err
+	}
+	if pre.ok {
+		b = p.attachAnnotFrom(pre, b)
+	}
+	return b, nil
+}
+
+// Require an expression after a just-consumed anchor token, with configurable BP,
+// attaching PRE to that expression.
+func (p *parser) parseExprAfterBP(anchor Token, msg string, bp int) (S, error) {
+	pre, err := p.takeReqGap(anchor, msg)
+	if err != nil {
+		return nil, err
+	}
+	e, err := p.expr(bp)
+	if err != nil {
+		return nil, err
+	}
+	if pre.ok {
+		e = p.attachAnnotFrom(pre, e)
+	}
+	return e, nil
+}
+
+// POST-after-comma attaches to VALUE inside ("pair", key, value)
+func (p *parser) onCommaPostAttachToValue(last S, comma Token) S {
+	if len(last) >= 3 {
+		v := last[2].(S)
+		v = p.attachSameLineAnnots(v, comma.Line)
+		last[2] = v
+		return last
+	}
+	return p.attachSameLineAnnots(last, comma.Line)
+}
+
 func (p *parser) nextTokenIsOnSameLine(as Token) bool {
 	if p.atEnd() {
 		return false
@@ -588,12 +668,10 @@ func (p *parser) program() (S, error) {
 		}
 		items = append(items, e)
 	}
-	rootStart := 0
-	rootEnd := len(p.toks) - 2 // last non-EOF
-	if rootEnd < rootStart || len(p.toks) == 0 {
+	if len(p.toks) <= 1 {
 		return p.mk("block", -1, -1 /*empty*/), nil
 	}
-	return p.mk("block", rootStart, rootEnd, items...), nil
+	return p.mk("block", 0, len(p.toks)-2, items...), nil
 }
 
 // blockUntil parses statements until a stop token is seen.
@@ -744,16 +822,9 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 
 		case MINUS, NOT:
-			pre, err := p.takeReqGap(t, "expected expression after unary operator")
+			r, err := p.parseExprAfterBP(t, "expected expression after unary operator", 80)
 			if err != nil {
 				return nil, err
-			}
-			r, err := p.expr(80)
-			if err != nil {
-				return nil, err
-			}
-			if pre.ok {
-				r = p.attachAnnotFrom(pre, r)
 			}
 			endTok := p.lastSpanEndTok
 			if endTok < 0 {
@@ -762,7 +833,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
 
 		case LROUND, CLROUND:
-			inner, err := p.parseGrouping()
+			inner, _, err := p.parseSingleBetween(RROUND, "expected ')'")
 			if err != nil {
 				return nil, err
 			}
@@ -802,25 +873,13 @@ func (p *parser) expr(minBP int) (S, error) {
 			leftStartTok = tokIndexOfThis
 
 		case MODULE:
-			pre, err := p.takeReqGap(t, "expected module name expression")
+			name, err := p.parseExprAfterBP(t, "expected module name expression", 0)
 			if err != nil {
 				return nil, err
 			}
-			name, err := p.expr(0)
+			body, err := p.parseDoBlockWithLeadingGap()
 			if err != nil {
 				return nil, err
-			}
-			if pre.ok {
-				name = p.attachAnnotFrom(pre, name)
-			}
-			// Accept annotations/newlines before 'do' and attach them to body.
-			preDo := p.collectGap()
-			body, err := p.parseBlock(true)
-			if err != nil {
-				return nil, err
-			}
-			if preDo.ok {
-				body = p.attachAnnotFrom(preDo, body)
 			}
 			left = p.mk("module", tokIndexOfThis, p.i-1, name, body)
 			leftStartTok = tokIndexOfThis
@@ -899,16 +958,9 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 
 		case TYPECONS:
-			pre, err := p.takeReqGap(t, "expected type expression after 'type'")
+			x, err := p.parseExprAfterBP(t, "expected type expression after 'type'", 1)
 			if err != nil {
 				return nil, err
-			}
-			x, err := p.expr(1) // keep bp=1 behavior
-			if err != nil {
-				return nil, err
-			}
-			if pre.ok {
-				x = p.attachAnnotFrom(pre, x)
 			}
 			left = p.mk("type", tokIndexOfThis, p.lastSpanEndTok, x)
 			leftStartTok = tokIndexOfThis
@@ -1081,34 +1133,8 @@ func (p *parser) expr(minBP int) (S, error) {
 	return left, nil
 }
 
-// parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
-func (p *parser) parseGrouping() (S, error) {
-	openTok := p.toks[p.i-1]
-	pre, err := p.takeReqGap(openTok, "expected expression after '('")
-	if err != nil {
-		return nil, err
-	}
-	inner, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if pre.ok {
-		inner = p.attachAnnotFrom(pre, inner)
-	}
-	// Allow trailing annotations/newlines before ')', attach as POST to inner.
-	trail := p.collectGap() // consumes ANNOTATIONs and NOOPs
-	if trail.ok {
-		inner = p.attachAnnotFrom(trail, inner)
-	}
-	if _, err := p.need(RROUND, "expected ')'"); err != nil {
-		return nil, err
-	}
-	return inner, nil
-}
-
 // ───────────────────────── unified postfix dispatcher ──────────────────────
 //
-
 // Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
 // **Span order** is enforced: children were already appended during their parse.
 // We append exactly one span for the new wrapper node (unop '?', call, idx, get).
@@ -1144,20 +1170,16 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			n := p.mk("call", leftStartTok, p.i-1, left)
 			return n, true, nil
 		}
-		args, _, closeTok, err := p.bracketed(
-			RROUND, "expected ')'",
-			func(pending annSrc) (S, int, error) {
-				a, err := p.expr(0)
-				if err != nil {
-					return nil, 0, err
-				}
-				if pending.ok {
-					a = p.attachAnnotFrom(pending, a)
-				}
-				return a, 0, nil
-			},
-			nil,
-		)
+		args, _, closeTok, err := p.bracketed(RROUND, "expected ')'", func(pending annSrc) (S, int, error) {
+			a, err := p.expr(0)
+			if err != nil {
+				return nil, 0, err
+			}
+			if pending.ok {
+				a = p.attachAnnotFrom(pending, a)
+			}
+			return a, 0, nil
+		}, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1166,27 +1188,11 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 
 	case CLSQUARE:
 		p.i++
-		sqTok := p.toks[p.i-1]
-		// Allow gaps after '[' but they cannot satisfy the required expr.
-		preIdx, err := p.takeReqGap(sqTok, "expected index expression after '['")
-		if err != nil {
-			return nil, false, err
+		idx, closeTok, perr := p.parseSingleBetween(RSQUARE, "expected ']'")
+		if perr != nil {
+			return nil, false, perr
 		}
-		idx, err := p.expr(0)
-		if err != nil {
-			return nil, false, err
-		}
-		if preIdx.ok {
-			idx = p.attachAnnotFrom(preIdx, idx)
-		}
-		// Allow trailing gaps before ']'
-		if trail := p.collectGap(); trail.ok {
-			idx = p.attachAnnotFrom(trail, idx)
-		}
-		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-			return nil, false, err
-		}
-		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
+		n := p.mk("idx", leftStartTok, closeTok, left, idx)
 		return n, true, nil
 
 	case PERIOD:
@@ -1197,28 +1203,11 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 			return nil, false, err
 		}
 		if p.match(LROUND) || p.match(CLROUND) {
-			parTok := p.toks[p.i-1] // '(' token just consumed
-			// Allow gaps after '(' but they cannot satisfy the required expr.
-			pre, err := p.takeReqGap(parTok, "expected expression after '('")
-			if err != nil {
-				return nil, false, err
-			}
-			ex, err := p.expr(0)
-			if err != nil {
-				return nil, false, err
-			}
-			if pre.ok {
-				ex = p.attachAnnotFrom(pre, ex)
-			}
-			// Allow trailing gaps before ')'
-			if trail := p.collectGap(); trail.ok {
-				ex = p.attachAnnotFrom(trail, ex)
-			}
-			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
+			ex, closeTok, perr := p.parseSingleBetween(RROUND, "expected ')' after computed property")
+			if perr != nil {
 				return nil, false, perr
 			}
-			_ = pre // attached above
-			n := p.mk("idx", leftStartTok, p.i-1, left, ex)
+			n := p.mk("idx", leftStartTok, closeTok, left, ex)
 			return n, true, nil
 		}
 		// .<int> -> idx
@@ -1259,7 +1248,7 @@ func (p *parser) bracketed(
 	close TokenType,
 	expectMsg string,
 	parseElem func(pendingPRE annSrc) (S, int, error),
-	onCommaPost func(last S, commaTok Token, txt string) S,
+	onCommaPost func(last S, comma Token, txt string) S,
 ) ([]any, int, int, error) {
 	openTok := p.i - 1
 
@@ -1418,15 +1407,7 @@ func (p *parser) params() (S, error) {
 			}
 			return p.mk("pair", pairStartTok, p.i-1, nameLeaf, val), 0, nil
 		},
-		func(last S, comma Token, _ string) S {
-			if len(last) >= 3 {
-				v := last[2].(S)
-				v = p.attachSameLineAnnots(v, comma.Line)
-				last[2] = v
-				return last
-			}
-			return p.attachSameLineAnnots(last, comma.Line)
-		},
+		func(last S, comma Token, _ string) S { return p.onCommaPostAttachToValue(last, comma) },
 	)
 	if err != nil {
 		return nil, err
@@ -1483,16 +1464,7 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 			}
 			return p.mk(tag, pairStartTok, p.i-1, k, val), 0, nil
 		},
-		func(last S, comma Token, _ string) S {
-			// POST-after-comma attaches to VALUE; consume same-line annots.
-			if len(last) >= 3 {
-				v := last[2].(S)
-				v = p.attachSameLineAnnots(v, comma.Line)
-				last[2] = v
-				return last
-			}
-			return p.attachSameLineAnnots(last, comma.Line)
-		},
+		func(last S, comma Token, _ string) S { return p.onCommaPostAttachToValue(last, comma) },
 	)
 	if err != nil {
 		return nil, err
@@ -1573,16 +1545,9 @@ func unwrapAnnot(n S) (S, string, bool) {
 func (p *parser) ifExpr() (S, error) {
 	ifTok := p.toks[p.i-1]
 	condStartTok := p.i
-	preIf, err := p.takeReqGap(ifTok, "expected condition after 'if'")
+	cond, err := p.parseExprAfterBP(ifTok, "expected condition after 'if'", 0)
 	if err != nil {
 		return nil, err
-	}
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if preIf.ok {
-		cond = p.attachAnnotFrom(preIf, cond)
 	}
 	between := p.collectGap()
 	if _, err := p.need(THEN, "expected 'then'"); err != nil {
@@ -1609,16 +1574,9 @@ func (p *parser) ifExpr() (S, error) {
 		}
 		elifTok := p.toks[p.i-1]
 		condStartTok = p.i
-		preElif, err := p.takeReqGap(elifTok, "expected condition after 'elif'")
+		c, err := p.parseExprAfterBP(elifTok, "expected condition after 'elif'", 0)
 		if err != nil {
 			return nil, err
-		}
-		c, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		if preElif.ok {
-			c = p.attachAnnotFrom(preElif, c)
 		}
 		between := p.collectGap()
 		if _, err := p.need(THEN, "expected 'then'"); err != nil {
@@ -1689,38 +1647,21 @@ func (p *parser) forExpr(openTok int) (S, error) {
 	}
 	// Attach both the pre-'in' gap (between target and 'in') and the post-'in' gap.
 	iter = p.attachAnnotFrom(mergeAnn(between, postIn), iter)
-	// Annotations/newlines before 'do' attach to the loop body.
-	preDo := p.collectGap()
-	body, err := p.parseBlock(true)
+	body, err := p.parseDoBlockWithLeadingGap()
 	if err != nil {
 		return nil, err
-	}
-	if preDo.ok {
-		body = p.attachAnnotFrom(preDo, body)
 	}
 	return p.mk("for", openTok, p.i-1, tgt, iter, body), nil
 }
 
 func (p *parser) whileExpr(openTok int) (S, error) {
-	pre, err := p.takeReqGap(p.toks[openTok], "expected condition after 'while'")
+	cond, err := p.parseExprAfterBP(p.toks[openTok], "expected condition after 'while'", 0)
 	if err != nil {
 		return nil, err
 	}
-	cond, err := p.expr(0)
+	body, err := p.parseDoBlockWithLeadingGap()
 	if err != nil {
 		return nil, err
-	}
-	if pre.ok {
-		cond = p.attachAnnotFrom(pre, cond)
-	}
-	// Annotations/newlines before 'do' attach to the body.
-	preDo := p.collectGap()
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	if preDo.ok {
-		body = p.attachAnnotFrom(preDo, body)
 	}
 	return p.mk("while", openTok, p.i-1, cond, body), nil
 }
@@ -1774,14 +1715,9 @@ func (p *parser) funExpr(openTok int) (S, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Annotations/newlines before 'do' attach to the function body.
-	preDo := p.collectGap()
-	body, err := p.parseBlock(true)
+	body, err := p.parseDoBlockWithLeadingGap()
 	if err != nil {
 		return nil, err
-	}
-	if preDo.ok {
-		body = p.attachAnnotFrom(preDo, body)
 	}
 	node := p.mk("fun", openTok, p.i-1, h.params, h.arrow, body)
 	return node, nil
@@ -1915,16 +1851,7 @@ func (p *parser) objectDeclPattern() (S, error) {
 			val := p.normalizeABCD(mergeAnn(pendingPRE, aKey), b, pt)
 			return p.mk("pair", startTok, p.i-1, k, val), 0, nil
 		},
-		func(last S, comma Token, _ string) S {
-			// POST-after-comma attaches to VALUE; consume same-line annots.
-			if len(last) >= 3 {
-				v := last[2].(S)
-				v = p.attachSameLineAnnots(v, comma.Line)
-				last[2] = v
-				return last
-			}
-			return p.attachSameLineAnnots(last, comma.Line)
-		},
+		func(last S, comma Token, _ string) S { return p.onCommaPostAttachToValue(last, comma) },
 	)
 	if err != nil {
 		return nil, err

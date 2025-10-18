@@ -1304,7 +1304,8 @@ func Test_Interpreter_Pretty_Does_Not_Show_Desugaring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pretty error: %v", err)
 	}
-	if got2 != src2 {
+	want2 := "let u # note"
+	if got2 != want2 {
 		t.Fatalf("Pretty changed surface form for bare decl.\nwant:\n%s\n\ngot:\n%s", src2, got2)
 	}
 }

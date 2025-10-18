@@ -1,3185 +1,3288 @@
-=== BEGIN FILE: lexer.go ===
-// lexer.go: provides a whitespace-sensitive, UTF-8–aware lexer for the
-// MindScript language. It converts a source string into a linear stream of
-// tokens with accurate source positions and rich literal decoding.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// HIGH-LEVEL OVERVIEW
-//
-// The lexer scans left→right and emits Token values, always ending with EOF.
-// Each token carries:
-//   - Type     — a TokenType enum
-//   - Lexeme   — the exact source slice (verbatim characters from the input)
-//   - Literal  — the decoded value for literal tokens (e.g., bool/int/float/string)
-//   - Line/Col — 1-based line and 0-based column of the token’s *start*
-//   - StartByte/EndByte — byte offsets [start, end) for the token’s source span
-//
-// Whitespace-sensitive delimiters:
-//
-//	The lexer decides between LROUND/CLROUND (and LSQUARE/CLSQUARE) solely by
-//	whether there is immediate whitespace before the delimiter:
-//
-//	  '('  → LROUND  if there IS preceding whitespace
-//	         CLROUND if there is NO preceding whitespace
-//	  '['  → LSQUARE if there IS preceding whitespace
-//	         CLSQUARE if there is NO preceding whitespace
-//
-// Consequences (user-facing syntax):
-//   - Calls and parameter lists require NO space before '(':
-//     f(x)           // call: uses CLROUND
-//     fun(x: T)      // function params: uses CLROUND
-//     oracle(x: T)   // oracle params: uses CLROUND
-//     With a space ("fun (x: T)"), '(' becomes LROUND and is NOT treated as a
-//     parameter list; the parser will error.
-//   - Indexing requires NO space before '[':
-//     arr[i]         // indexing: uses CLSQUARE
-//     With a space ("arr [i]"), '[' is LSQUARE and is NOT treated as indexing.
-//   - Grouping "(expr)" is produced regardless of LROUND/CLROUND, but only
-//     CLROUND participates in call/juxtaposition chains.
-//
-// The '.' character is context-sensitive:
-//   - If it begins a number (e.g., “.5” or “1.” or “1.2e3”), a NUMBER/INTEGER is
-//     produced.
-//   - Otherwise it is PERIOD (typically for property access).
-//
-// IDENTIFIERS & KEYWORDS
-//
-//	Identifiers match [A-Za-z_][A-Za-z0-9_]* and normally produce ID.
-//	Reserved words produce dedicated TokenTypes (e.g., IF, LET, FUNCTION, etc.).
-//	After a PERIOD, both identifiers *and* quoted strings are treated as
-//	property names and forced to ID (even if the text is a keyword). This allows:
-//	    obj."then"   // ID with Literal="then"
-//	    obj.then     // ID with Literal="then"
-//
-// LITERALS
-//   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
-//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
-//     bytes in the lexeme are validated and decoded.
-//   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
-//   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
-//   - BOOLEAN — “true” or “false” (Literal: bool).
-//   - NULL    — “null” (Literal: nil).
-//
-// ANNOTATIONS
-//   - Hash-line annotations: one or more consecutive lines where, after optional
-//     indentation, the first non-space is '#'. The leading '#' (and at most one
-//     optional following space) are stripped; lines are joined with '\n', and a
-//     single ANNOTATION token is emitted. A blank/non-# line ends the block.
-//
-// ERRORS (start-of-token anchoring)
-//   - Lexical errors (e.g., bad escape, invalid UTF-8, unexpected character) are
-//     reported as *Error* with precise location anchored to the **start** of the
-//     offending token (the token that is being scanned).
-//   - Interactive/REPL mode: if enabled via NewLexerInteractive, unterminated
-//     strings produce *IncompleteError* (still anchored to the token start).
-//
-// OUTPUT
-//   - Scan returns the full token slice *including* the terminal EOF token.
-//   - Each token’s Lexeme is the exact source text (e.g., a STRING’s lexeme
-//     includes the quotes and escapes), while Literal carries the decoded value.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-//
-// FILE ORGANIZATION
-//  1. PUBLIC API  — exported enums/types/constructors/methods & their docs.
-//  2. PRIVATE     — all non-exported helpers, internal tables, and scanning.
-//
-// The PUBLIC API docs below are intentionally exhaustive so the behavior is
-// understandable without reading the implementation.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-package mindscript
-
-import (
-	"errors"
-	"fmt"
-	"strconv"
-	"strings"
-	"unicode/utf16"
-	"unicode/utf8"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                               PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
-
-// TokenType is the enumeration of all token kinds the lexer can emit.
-// Most names are self-explanatory; groups are listed for clarity.
-//
-// Special:
-//
-//	EOF     — end-of-file sentinel (always the final token)
-//	ILLEGAL — produced only for unrecoverable internal conditions (not used by Scan)
-//
-// Punctuation (some are whitespace-sensitive, see '(' and '[' notes below):
-//
-//	LROUND, CLROUND   — '(' with/without preceding whitespace respectively
-//	RROUND            — ')'
-//	LSQUARE, CLSQUARE — '[' with/without preceding whitespace respectively
-//	RSQUARE           — ']'
-//	LCURLY, RCURLY    — '{', '}'
-//	COLON, COMMA, PERIOD, QUESTION — ':', ',', '.', '?'
-//
-// Operators:
-//
-//	PLUS, MINUS, MULT, DIV, MOD — '+', '-', '*', '/', '%'
-//	ASSIGN                      — '='
-//	EQ, NEQ                     — '==', '!='
-//	LESS, LESS_EQ               — '<',  '<='
-//	GREATER, GREATER_EQ         — '>',  '>='
-//	BANG                        — '!' (used by the language in object/type literals)
-//	ARROW                       — '->'
-//
-// Literals & identifiers:
-//
-//	ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL
-//
-// Keywords (produced when the identifier text equals these words, except when
-// forced to an ID after PERIOD/property access):
-//
-//	AND, OR, NOT,
-//	LET, DO, END, RETURN, BREAK, CONTINUE,
-//	IF, THEN, ELIF, ELSE,
-//	FUNCTION, ORACLE, MODULE,
-//	FOR, IN, FROM, WHILE,
-//	TYPECONS, TYPE, ENUM
-//
-// Annotation:
-//
-//	ANNOTATION — emitted for multi-line blocks starting with '#'.
-type TokenType int
-
-const (
-	// Special
-	EOF TokenType = iota
-	ILLEGAL
-
-	// Punctuation
-	LROUND   // "(" when preceded by whitespace
-	CLROUND  // "(" when not preceded by whitespace (juxtaposition/call form)
-	RROUND   // ")"
-	LSQUARE  // "["
-	CLSQUARE // "[" when not preceded by whitespace (index-close)
-	RSQUARE  // "]"
-	LCURLY   // "{"
-	RCURLY   // "}"
-	COLON    // ":"
-	COMMA    // ","
-	PERIOD   // "."
-	QUESTION // "?"
-
-	// Operators
-	PLUS
-	MINUS
-	MULT
-	DIV
-	MOD
-	ASSIGN // "="
-	EQ     // "=="
-	NEQ    // "!="
-	LESS
-	LESS_EQ
-	GREATER
-	GREATER_EQ
-	BANG  // "!" (required-field marker in object/type literals)
-	ARROW // "->"
-
-	// Literals & identifiers
-	ID
-	STRING
-	INTEGER
-	NUMBER
-	BOOLEAN
-	NULL
-
-	// Keywords
-	AND
-	OR
-	NOT
-	LET
-	DO
-	END
-	RETURN
-	BREAK
-	CONTINUE
-	IF
-	THEN
-	ELIF
-	ELSE
-	FUNCTION
-	ORACLE
-	MODULE
-	FOR
-	IN
-	FROM
-	WHILE
-	TYPECONS
-	TYPE
-	ENUM
-
-	// Annotation token (from lines starting with '#')
-	ANNOTATION
-	NOOP
-)
-
-// Token is a single lexical unit produced by the lexer.
-//
-// Fields:
-//
-//	Type    — the TokenType kind.
-//	Lexeme  — the exact source slice comprising the token (verbatim, including
-//	          quotes for strings, escape sequences, etc.).
-//	Literal — a decoded value for literal tokens:
-//	          • STRING  → Go string with escapes and surrogate pairs resolved
-//	          • INTEGER → int64
-//	          • NUMBER  → float64
-//	          • BOOLEAN → bool
-//	          • NULL    → nil
-//	          Non-literal tokens usually carry nil or an unmodified string
-//	          (keywords may store their text; property IDs store the property name).
-//	Line    — 1-based line number at which this token starts.
-//	Col     — 0-based column index at which this token starts.
-//	StartByte / EndByte — byte offsets [start, end) for the token’s slice.
-type Token struct {
-	Type      TokenType
-	Lexeme    string
-	Literal   interface{}
-	Line      int
-	Col       int
-	StartByte int
-	EndByte   int
-}
-
-// HARD errors produced by the lexer use the unified *Error type defined in
-// errors.go. See DiagLex and DiagIncomplete.
-//
-// In interactive mode, the lexer returns *Error with Kind=DiagIncomplete
-// when input ends inside an unterminated construct (e.g., string literal).
-//
-// **Error locations:** All lexing errors (both hard and incomplete) are anchored
-// to the **start of the offending token** (the token whose scanning raised
-// the error). This makes diagnostics stable and easy to map to spans.
-
-// Lexer is a streaming tokenizer for MindScript.
-//
-// Construction:
-//   - NewLexer(src)            — normal mode. Unterminated constructs produce LexError.
-//   - NewLexerInteractive(src) — REPL-friendly mode. Unterminated constructs
-//     produce IncompleteError.
-//
-// Semantics:
-//   - Scan() returns the full token slice including EOF. It never panics for
-//     malformed input; instead it returns (nil, error).
-//   - Whitespace is skipped, but influences '(' and '[' classification (see TokenType docs).
-//   - PERIOD vs number: a '.' followed by digits begins a number IFF there is
-//     either preceding whitespace *or* the previous token cannot be a left operand.
-//     Otherwise '.' is PERIOD used for property access.
-//   - After PERIOD, the *next* identifier or quoted string is forced to ID,
-//     even if it matches a keyword.
-//
-// Positioning:
-//   - Line numbers are 1-based; column indices are 0-based.
-//   - A token’s position is captured at the start of scanning that token.
-type Lexer struct {
-	// public type with no exported fields; use constructors + Scan()
-	src    string
-	start  int // start index of current token
-	cur    int // current index
-	line   int // 1-based
-	col    int // 0-based column within line
-	tokens []Token
-
-	// precise token start position
-	tokStartLine int
-	tokStartCol  int
-
-	// interactive mode: produce IncompleteError for unterminated constructs at EOF
-	interactive bool
-}
-
-// NewLexer creates a new lexer for the given source in normal mode.
-func NewLexer(src string) *Lexer {
-	return &Lexer{
-		src: src,
-		// very rough guess to reduce reslices on big files
-		tokens: make([]Token, 0, len(src)/4),
-		line:   1,
-		col:    0,
-	}
-}
-
-// NewLexerInteractive creates a lexer in interactive mode.
-// Unterminated strings return IncompleteError at EOF, allowing REPLs to request more input.
-func NewLexerInteractive(src string) *Lexer {
-	return &Lexer{
-		src:         src,
-		tokens:      make([]Token, 0, len(src)/4),
-		line:        1,
-		col:         0,
-		interactive: true,
-	}
-}
-
-// Scan tokenizes the entire source string and returns the resulting slice of
-// tokens. The returned slice always ends with EOF. On error, it returns (nil, err).
-//
-// Error behavior summary:
-//   - Normal mode: returns *LexError on malformed input or unterminated constructs.
-//   - Interactive mode: returns *IncompleteError at EOF if a construct is
-//     unterminated; other issues still return *LexError.
-//
-// Note: Token.Lexeme is the exact source span; Token.Literal contains decoded
-// values for STRING/INTEGER/NUMBER/BOOLEAN/NULL as described in Token docs.
-func (l *Lexer) Scan() ([]Token, error) {
-	for {
-		tok, err := l.scanToken()
-		if err != nil {
-			return nil, err
-		}
-		if tok.Type == EOF {
-			return l.tokens, nil
-		}
-	}
-}
-
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                            PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-// ---------------- keywords map (private) ----------------
-
-var keywords = map[string]TokenType{
-	"null":     NULL,
-	"false":    BOOLEAN,
-	"true":     BOOLEAN,
-	"and":      AND,
-	"or":       OR,
-	"not":      NOT,
-	"let":      LET,
-	"do":       DO,
-	"end":      END,
-	"return":   RETURN,
-	"break":    BREAK,
-	"continue": CONTINUE,
-	"if":       IF,
-	"then":     THEN,
-	"elif":     ELIF,
-	"else":     ELSE,
-	"fun":      FUNCTION,
-	"oracle":   ORACLE,
-	"module":   MODULE,
-	"for":      FOR,
-	"in":       IN,
-	"from":     FROM,
-	"while":    WHILE,
-	"type":     TYPECONS,
-	"Type":     TYPE,
-	"Null":     TYPE,
-	"Str":      TYPE,
-	"Int":      TYPE,
-	"Num":      TYPE,
-	"Bool":     TYPE,
-	"Any":      TYPE,
-	"Enum":     ENUM,
-}
-
-// ---------------- core scanning helpers ----------------
-
-func (l *Lexer) isAtEnd() bool { return l.cur >= len(l.src) }
-
-func (l *Lexer) peek() (byte, bool) {
-	if l.isAtEnd() {
-		return 0, false
-	}
-	return l.src[l.cur], true
-}
-
-func (l *Lexer) peekN(n int) (byte, bool) {
-	idx := l.cur + n
-	if idx >= len(l.src) {
-		return 0, false
-	}
-	return l.src[idx], true
-}
-
-func (l *Lexer) advance() (byte, bool) {
-	if l.isAtEnd() {
-		return 0, false
-	}
-	ch := l.src[l.cur]
-	l.cur++
-	if ch == '\n' {
-		l.line++
-		l.col = 0
-	} else {
-		l.col++
-	}
-	return ch, true
-}
-
-func (l *Lexer) rewindToStart() {
-	// We rewind only within the bounds of the current token start; line/col are kept
-	// for error arrows (OK since we set tokStartLine/Col before scanning).
-	l.cur = l.start
-}
-
-func (l *Lexer) addToken(tt TokenType, lit interface{}) Token {
-	lex := l.src[l.start:l.cur]
-	tok := Token{
-		Type:      tt,
-		Lexeme:    lex,
-		Literal:   lit,
-		Line:      l.tokStartLine,
-		Col:       l.tokStartCol,
-		StartByte: l.start,
-		EndByte:   l.cur,
-	}
-	l.tokens = append(l.tokens, tok)
-	l.start = l.cur
-	return tok
-}
-
-func (l *Lexer) previousToken() *Token {
-	if len(l.tokens) == 0 {
-		return nil
-	}
-	return &l.tokens[len(l.tokens)-1]
-}
-
-func (l *Lexer) skipHorizontalWhitespace() {
-	for !l.isAtEnd() {
-		ch, _ := l.peek()
-		switch ch {
-		case ' ', '\t', '\r':
-			l.advance()
-			l.start = l.cur
-		default:
-			return
-		}
-	}
-}
-
-// immediateWhitespaceBefore reports whether the byte immediately preceding the
-// current token start is ASCII whitespace. Called *after* skipWhitespace.
-func (l *Lexer) immediateWhitespaceBefore() bool {
-	if l.start == 0 {
-		return false
-	}
-	switch l.src[l.start-1] {
-	case ' ', '\t', '\n', '\r', ';':
-		return true
-	default:
-		return false
-	}
-}
-
-// ---------------- small predicates ----------------
-
-func canBeLeftOperand(t TokenType) bool {
-	switch t {
-	case ID, STRING, INTEGER, NUMBER, BOOLEAN, NULL,
-		TYPE, ENUM,
-		RROUND, RSQUARE, RCURLY,
-		QUESTION:
-		return true
-	default:
-		return false
-	}
-}
-
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-func isHex(b byte) bool {
-	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
-}
-func isAlpha(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' }
-func isAlphaNum(b byte) bool {
-	return (b >= 'a' && b <= 'z') ||
-		(b >= 'A' && b <= 'Z') ||
-		(b >= '0' && b <= '9') ||
-		b == '_'
-}
-
-func (l *Lexer) afterDotIsProperty() bool {
-	p := l.previousToken()
-	return p != nil && p.Type == PERIOD
-}
-
-// ---------------- error builders (start-of-token anchored) ----------------
-
-func (l *Lexer) err(msg string) error {
-	// All lexer diagnostics are anchored to the start of the *current* token,
-	// which is the most stable and helpful position for tools and users.
-	return &Error{Kind: DiagLex, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
-}
-
-func (l *Lexer) errIncomplete(msg string) error {
-	// Report need-more-input conditions in interactive mode, anchored to token start.
-	return &Error{Kind: DiagIncomplete, Msg: msg, Src: nil, Line: l.tokStartLine, Col: l.tokStartCol + 1}
-}
-
-// ---------------- scanners ----------------
-
-// scanString parses a JSON-style string literal (single or double quotes).
-func (l *Lexer) scanString() (string, error) {
-	del := l.src[l.start]
-	if del != '"' && del != '\'' {
-		return "", l.err("internal: scanString without quote")
-	}
-	// consume the delimiter
-	l.advance()
-
-	var out []rune
-	for !l.isAtEnd() {
-		ch, _ := l.advance()
-		if ch == byte(del) {
-			return string(out), nil
-		}
-		if ch == '\\' {
-			if l.isAtEnd() {
-				if l.interactive {
-					return "", l.errIncomplete("unfinished escape sequence")
-				}
-				return "", l.err("unfinished escape sequence")
-			}
-			esc, _ := l.advance()
-			switch esc {
-			case '"':
-				out = append(out, '"')
-			case '\'':
-				out = append(out, '\'')
-			case '\\':
-				out = append(out, '\\')
-			case '/':
-				out = append(out, '/')
-			case 'b':
-				out = append(out, '\b')
-			case 'f':
-				out = append(out, '\f')
-			case 'n':
-				out = append(out, '\n')
-			case 'r':
-				out = append(out, '\r')
-			case 't':
-				out = append(out, '\t')
-			case 'u':
-				// expect 4 hex digits
-				toHex := func(b byte) int {
-					switch {
-					case b >= '0' && b <= '9':
-						return int(b - '0')
-					case b >= 'a' && b <= 'f':
-						return 10 + int(b-'a')
-					case b >= 'A' && b <= 'F':
-						return 10 + int(b-'A')
-					default:
-						return -1
-					}
-				}
-				val := 0
-				for i := 0; i < 4; i++ {
-					b, ok := l.peek()
-					if !ok {
-						if l.interactive {
-							return "", l.errIncomplete("unicode escape was not terminated (expect 4 hex digits)")
-						}
-						return "", l.err("unicode escape was not terminated (expect 4 hex digits)")
-					}
-					d := toHex(b)
-					if d < 0 {
-						return "", l.err("invalid unicode escape")
-					}
-					val = (val << 4) | d
-					l.advance()
-				}
-				r := rune(val)
-
-				// handle surrogate pair \uD800-\uDBFF followed by \uDC00-\uDFFF
-				if 0xD800 <= r && r <= 0xDBFF {
-					saveCur := l.cur
-					saveLine, saveCol := l.line, l.col
-					if b1, ok := l.peek(); ok && b1 == '\\' {
-						l.advance()
-						if b2, ok := l.peek(); ok && b2 == 'u' {
-							l.advance()
-							val2 := 0
-							for i := 0; i < 4; i++ {
-								b, ok := l.peek()
-								if !ok {
-									if l.interactive {
-										return "", l.errIncomplete("unicode surrogate pair low was not terminated")
-									}
-									return "", l.err("unicode surrogate pair low was not terminated")
-								}
-								d := toHex(b)
-								if d < 0 {
-									return "", l.err("invalid unicode surrogate pair low")
-								}
-								val2 = (val2 << 4) | d
-								l.advance()
-							}
-							r2 := rune(val2)
-							if 0xDC00 <= r2 && r2 <= 0xDFFF {
-								cp := utf16.DecodeRune(r, r2)
-								out = append(out, cp)
-								continue
-							}
-						}
-					}
-					// not a valid pair; rewind and just emit r
-					l.cur = saveCur
-					l.line, l.col = saveLine, saveCol
-				}
-				out = append(out, r)
-			default:
-				return "", l.err(fmt.Sprintf("invalid escape sequence: \\%c", esc))
-			}
-			continue
-		}
-		// normal char; ensure it’s valid UTF-8 boundary (source may be UTF-8)
-		if ch < utf8.RuneSelf {
-			out = append(out, rune(ch))
-			continue
-		}
-		// If we see a non-ASCII byte here, the source itself is UTF-8; back up one byte and decode rune.
-		l.cur-- // step back 1 byte to let utf8.DecodeRuneInString read from correct start
-		r, size := utf8.DecodeRuneInString(l.src[l.cur:])
-		if r == utf8.RuneError && size == 1 {
-			return "", l.err("invalid UTF-8 in source")
-		}
-		out = append(out, r)
-		l.cur += size
-		l.col += size - 1
-	}
-	if l.interactive {
-		return "", l.errIncomplete("string was not terminated")
-	}
-	return "", l.err("string was not terminated")
-}
-
-// scanIdentifier parses [A-Za-z_][A-Za-z0-9_]*
-func (l *Lexer) scanIdentifier() string {
-	for {
-		b, ok := l.peek()
-		if !ok || !isAlphaNum(b) {
-			break
-		}
-		l.advance()
-	}
-	return l.src[l.start:l.cur]
-}
-
-// scanNumber parses integer or float; supports .5, 1., 1.23e-4, etc.
-// Precondition: current position is at l.start and the first rune is either a digit
-// or a '.' that has already been verified to start a number.
-func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
-	sawDigits := false
-	sawDot := false
-	sawExp := false
-
-	// integral part (optional for leading '.')
-	for {
-		b, ok := l.peek()
-		if !ok || !isDigit(b) {
-			break
-		}
-		l.advance()
-		sawDigits = true
-	}
-
-	// fractional part
-	if b, ok := l.peek(); ok && b == '.' {
-		// Do NOT consume '.' if we're after a property PERIOD (obj.<digits>)
-		// OR if the next char is also '.' (e.g. "1..2").
-		if !(l.afterDotIsProperty()) {
-			if b2, ok2 := l.peekN(1); !(ok2 && b2 == '.') {
-				l.advance() // consume '.'
-				sawDot = true
-				for {
-					b2, ok2 := l.peek()
-					if !ok2 || !isDigit(b2) {
-						break
-					}
-					l.advance()
-					sawDigits = true
-				}
-			}
-		}
-	}
-
-	// exponent part: ([eE][+-]?digits)?
-	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
-		save := l.cur
-		l.advance() // consume e/E
-		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
-			l.advance()
-		}
-		if b3, ok := l.peek(); ok && isDigit(b3) {
-			sawExp = true
-			for {
-				b4, ok := l.peek()
-				if !ok || !isDigit(b4) {
-					break
-				}
-				l.advance()
-			}
-		} else {
-			l.cur = save // no exponent
-		}
-	}
-
-	if !sawDigits {
-		return ILLEGAL, nil, l.err("malformed number")
-	}
-
-	lex := l.src[l.start:l.cur]
-	if !sawDot && !sawExp {
-		v, convErr := strconv.ParseInt(lex, 10, 64)
-		if convErr != nil {
-			return ILLEGAL, nil, l.err("invalid integer literal")
-		}
-		return INTEGER, v, nil
-	}
-	vf, convErr := strconv.ParseFloat(lex, 64)
-	if convErr != nil {
-		return ILLEGAL, nil, l.err("invalid float literal")
-	}
-	return NUMBER, vf, nil
-}
-
-// scanAnnotation captures consecutive lines that start with '#' (ignoring leading spaces).
-// Terminates on blank line or a line that does not begin (after spaces) with '#'.
-func (l *Lexer) scanAnnotation() (string, error) {
-	// current '#' is line-start iff only hspace since previous '\n'
-	lineStart := true
-	for i := l.start - 1; i >= 0 && l.src[i] != '\n'; i-- {
-		if l.src[i] != ' ' && l.src[i] != '\t' && l.src[i] != '\r' {
-			lineStart = false
-			break
-		}
-	}
-	var bldr strings.Builder
-
-	// helper: check if the *next* line (after current '\n') starts with '#'
-	nextLineStartsWithHash := func() bool {
-		// we are currently positioned at the '\n' (unconsumed)
-		probe := l.cur + 1
-		for probe < len(l.src) {
-			c := l.src[probe]
-			if c == ' ' || c == '\t' || c == '\r' {
-				probe++
-				continue
-			}
-			break
-		}
-		return probe < len(l.src) && l.src[probe] == '#'
-	}
-
-	// Trim at most one ASCII space (NOT tab) after the first '#'.
-	if b, ok := l.peek(); ok && b == ' ' {
-		l.advance()
-	}
-
-	// ----- capture first line, but DO NOT consume its trailing '\n' -----
-	for {
-		b, ok := l.peek()
-		if !ok || b == '\n' {
-			// do not l.advance() here; leave '\n' in the stream
-			bldr.WriteByte('\n')
-			break
-		}
-		bldr.WriteByte(b)
-		l.advance()
-	}
-
-	// Only coalesce with following '#'-lines when *this* '#' was line-start.
-	// (Inline '# ...' must not merge with the next line's '# ...')
-	if b, ok := l.peek(); ok && b == '\n' && lineStart && nextLineStartsWithHash() {
-		l.advance() // consume newline to move to start of the next line
-	} else {
-		// single-line block; leave the '\n' unconsumed
-		s := bldr.String()
-		if len(s) == 0 {
-			return "", errors.New("incomplete annotation")
-		}
-		for len(s) > 0 && s[len(s)-1] == '\n' {
-			s = s[:len(s)-1]
-		}
-		return s, nil
-	}
-
-	// ----- capture subsequent '#'-prefixed lines -----
-	consumeHashOnLine := func() (bool, error) {
-		for {
-			b, ok := l.peek()
-			if !ok || b == '\n' {
-				break
-			}
-			if b == ' ' || b == '\t' || b == '\r' {
-				l.advance()
-				continue
-			}
-			break
-		}
-		b, ok := l.peek()
-		if !ok || b != '#' {
-			return false, nil
-		}
-		l.advance() // '#'
-		// Trim at most one ASCII space (NOT tab) after '#'
-		if b2, ok2 := l.peek(); ok2 && b2 == ' ' {
-			l.advance()
-		}
-		return true, nil
-	}
-
-	for {
-		save := l.cur
-		cont, err := consumeHashOnLine()
-		if err != nil {
-			return "", err
-		}
-		if !cont {
-			l.cur = save
-			break
-		}
-
-		// read rest of line, but DO NOT consume trailing '\n'
-		for {
-			b, ok := l.peek()
-			if !ok || b == '\n' {
-				bldr.WriteByte('\n')
-				break
-			}
-			bldr.WriteByte(b)
-			l.advance()
-		}
-
-		// If another '#'-line follows, eat this '\n' and continue; else stop (leave '\n').
-		if b, ok := l.peek(); ok && b == '\n' && nextLineStartsWithHash() {
-			l.advance() // consume newline to move to next line
-		} else {
-			break // leave final '\n' unconsumed
-		}
-	}
-
-	s := bldr.String()
-	if len(s) == 0 {
-		return "", errors.New("incomplete annotation")
-	}
-	for len(s) > 0 && s[len(s)-1] == '\n' {
-		s = s[:len(s)-1]
-	}
-	return s, nil
-}
-
-// --- hash/comment helpers ---
-
-// handleSingleHash processes '#' annotations (inline or multiline).
-// Returns (producedAnnotation, text, err).
-func (l *Lexer) handleSingleHash() (bool, string, error) {
-	annot, err := l.scanAnnotation()
-	if err != nil {
-		return false, "", l.err("incomplete annotation")
-	}
-	return true, annot, nil
-}
-
-// scanNoopIfPresent emits a NOOP token if the source at the current position
-// matches: '\n' ( hws* '\n' )+  where hws ∈ {' ', '\r', '\t'}.
-func (l *Lexer) scanNoopIfPresent() (Token, bool) {
-	b, ok := l.peek()
-	if !ok || b != '\n' {
-		return Token{}, false
-	}
-
-	// Snapshot so we can roll back on non-match (i.e., if we don't see at least one repetition).
-	saveCur, saveLine, saveCol, saveStart := l.cur, l.line, l.col, l.start
-
-	// Token starts here.
-	l.tokStartLine = l.line
-	l.tokStartCol = l.col
-	l.start = l.cur
-
-	// Consume the initial newline.
-	l.advance()
-
-	matchedReps := 0
-	for {
-		// Consume zero or more horizontal whitespace chars.
-		for {
-			nb, ok := l.peek()
-			if !ok || (nb != ' ' && nb != '\t' && nb != '\r') {
-				break
-			}
-			l.advance()
-		}
-		// Require a newline to complete one (hws* '\n') repetition.
-		nb, ok := l.peek()
-		if ok && nb == '\n' {
-			l.advance()
-			matchedReps++
-			continue
-		}
-		break
-	}
-
-	if matchedReps >= 1 {
-		return l.addToken(NOOP, nil), true
-	}
-
-	// Not a full match: restore and report no-op not present.
-	l.cur, l.line, l.col, l.start = saveCur, saveLine, saveCol, saveStart
-	return Token{}, false
-}
-
-// --- misc helpers ---
-
-func (l *Lexer) dotStartsNumber() bool {
-	b, ok := l.peek()
-	if !ok || !isDigit(b) {
-		return false
-	}
-	prev := l.previousToken()
-	if l.immediateWhitespaceBefore() || prev == nil || !canBeLeftOperand(prev.Type) {
-		return true
-	}
-	return false
-}
-
-// ---------------- main tokenization ----------------
-
-func (l *Lexer) scanToken() (Token, error) {
-	for {
-		l.skipHorizontalWhitespace()
-		l.tokStartLine = l.line
-		l.tokStartCol = l.col
-		l.start = l.cur
-
-		if l.isAtEnd() {
-			return l.addToken(EOF, nil), nil
-		}
-
-		// No-op (blank lines)
-		if b, _ := l.peek(); b == '\n' {
-			if tok, ok := l.scanNoopIfPresent(); ok {
-				return tok, nil
-			}
-			// Lone newline (or newline followed by non-hws) → skip it as whitespace and loop.
-			l.advance()
-			l.start = l.cur
-			continue
-		}
-
-		// Treat semicolons exactly like newlines for layout/same-line logic.
-		// They are NOT tokens; we "lower" them to line breaks.
-		if b, _ := l.peek(); b == ';' {
-			// Consume ';' and advance line/col as if it were '\n'.
-			l.advance()     // move past ';'
-			l.line++        // start a new line
-			l.col = 0       // reset column
-			l.start = l.cur // next token starts after the semicolon
-			continue
-		}
-
-		ch, _ := l.advance()
-
-		// Single-char tokens & punctuation with whitespace-sensitive "(" and "["
-		switch ch {
-		case '(':
-			if l.immediateWhitespaceBefore() {
-				return l.addToken(LROUND, "("), nil
-			}
-			return l.addToken(CLROUND, "("), nil
-		case ')':
-			return l.addToken(RROUND, ")"), nil
-		case '[':
-			if l.immediateWhitespaceBefore() {
-				return l.addToken(LSQUARE, "["), nil
-			}
-			return l.addToken(CLSQUARE, "["), nil
-		case ']':
-			return l.addToken(RSQUARE, "]"), nil
-		case '{':
-			return l.addToken(LCURLY, "{"), nil
-		case '}':
-			return l.addToken(RCURLY, "}"), nil
-		case '+':
-			return l.addToken(PLUS, "+"), nil
-		case '*':
-			return l.addToken(MULT, "*"), nil
-		case '/':
-			return l.addToken(DIV, "/"), nil
-		case '%':
-			return l.addToken(MOD, "%"), nil
-		case ':':
-			return l.addToken(COLON, ":"), nil
-		case ',':
-			return l.addToken(COMMA, ","), nil
-		case '?':
-			return l.addToken(QUESTION, "?"), nil
-		}
-
-		// '.' : either decimal-starting float or PERIOD
-		if ch == '.' {
-			if l.dotStartsNumber() {
-				l.rewindToStart()
-				tt, lit, err := l.scanNumber()
-				if err != nil {
-					return Token{}, err
-				}
-				return l.addToken(tt, lit), nil
-			}
-			return l.addToken(PERIOD, "."), nil
-		}
-
-		// Two-char operators and fallbacks
-		switch ch {
-		case '-':
-			if b, ok := l.peek(); ok && b == '>' {
-				l.advance()
-				return l.addToken(ARROW, "->"), nil
-			}
-			return l.addToken(MINUS, "-"), nil
-		case '=':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(EQ, "=="), nil
-			}
-			return l.addToken(ASSIGN, "="), nil
-		case '!':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(NEQ, "!="), nil
-			}
-			return l.addToken(BANG, "!"), nil
-		case '<':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(LESS_EQ, "<="), nil
-			}
-			return l.addToken(LESS, "<"), nil
-		case '>':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(GREATER_EQ, ">="), nil
-			}
-			return l.addToken(GREATER, ">"), nil
-		}
-
-		// Annotations
-		if ch == '#' {
-			ok, text, err := l.handleSingleHash()
-			if err != nil {
-				return Token{}, err
-			}
-			if ok {
-				return l.addToken(ANNOTATION, text), nil
-			}
-		}
-
-		// Strings
-		if ch == '"' || ch == '\'' {
-			l.rewindToStart()
-			text, err := l.scanString()
-			if err != nil {
-				return Token{}, err
-			}
-			// After '.' a quoted key becomes ID (property name)
-			if l.afterDotIsProperty() {
-				return l.addToken(ID, text), nil
-			}
-			return l.addToken(STRING, text), nil
-		}
-
-		// Numbers (starting with digit)
-		if isDigit(ch) {
-			l.rewindToStart()
-			tt, lit, err := l.scanNumber()
-			if err != nil {
-				return Token{}, err
-			}
-			return l.addToken(tt, lit), nil
-		}
-
-		// Identifiers / Keywords
-		if isAlpha(ch) {
-			l.rewindToStart()
-			lex := l.scanIdentifier()
-			// After '.', treat as property name (ID)
-			if l.afterDotIsProperty() {
-				return l.addToken(ID, lex), nil
-			}
-			if tt, ok := keywords[lex]; ok {
-				switch tt {
-				case NULL:
-					return l.addToken(NULL, nil), nil
-				case BOOLEAN:
-					if lex == "true" {
-						return l.addToken(BOOLEAN, true), nil
-					}
-					return l.addToken(BOOLEAN, false), nil
-				default:
-					return l.addToken(tt, nil), nil
-				}
-			}
-			return l.addToken(ID, lex), nil
-		}
-
-		return Token{}, l.err(fmt.Sprintf("unexpected character: %q", ch))
-	}
-}
-=== END FILE: lexer.go ===
-
-=== BEGIN FILE: parser.go ===
-// parser.go — Pratt parser for MindScript that produces compact S-expressions.
+=== BEGIN FILE: interpreter.go ===
+// interpreter.go — SINGLE PUBLIC API SURFACE for the MindScript interpreter.
 //
 // OVERVIEW
-// --------
-// This module implements the newline-aware Pratt parser for the MindScript
-// language. It consumes the token stream produced by the *whitespace-sensitive*
-// lexer (see lexer.go) and builds a compact, Lisp-style S-expression (AST).
+// ========
+// This file exposes the **entire public surface** of the MindScript runtime. It
+// deliberately contains **only exported types and thin methods**. All behavior
+// is specified here in enough detail that a consumer can use the interpreter
+// without reading any private implementation.
 //
-// Design goals:
-//   - Keep the grammar readable via precedence rules (Pratt parser).
-//   - Encode the AST in a tiny, serialisable structure (S-expressions).
-//   - Respect whitespace-sensitive signals emitted by the lexer:
-//   - '(' can be LROUND or CLROUND; only CLROUND participates in calls.
-//   - '[' can be LSQUARE or CLSQUARE; only CLSQUARE participates in indexing.
-//   - '.' is PERIOD unless it started a number in the lexer.
-//   - multi-line '#' annotations become ANNOTATION tokens.
-//   - blank-line runs may be emitted as NOOP tokens.
-//   - Support an "interactive" mode that surfaces *Error{Kind:DiagIncomplete}
-//     at EOF instead of hard parse errors, suitable for REPLs.
+// What you get in this file:
+//   • The **runtime value model** (`Value`, `ValueTag`, constructors like `Int/Str/Arr`).
+//   • **Ordered maps** with per-key annotations (`MapObject`) and helpers.
+//   • **Functions / closures** (`Fun`) as first-class values.
+//   • **Environments** (`Env`) with lexical scoping.
+//   • The **Interpreter** type with the canonical entry points:
+//        - parsing+evaluation of source/AST (ephemeral vs persistent),
+//        - function application (`Apply`, `Call0`),
+//        - function introspection (`FunMeta`),
+//        - native registration (`RegisterNative`),
+//        - type helpers (`ResolveType`, `IsType`, `IsSubtype`, `UnifyTypes`, `ValueToType`).
+//   • Hard errors bubble as a single `*Error` (see errors.go). Entry points
+//     format them with caret snippets; internals do **not** format.
 //
-// Annotation model (lowest precedence):
-//   - Annotations attach to **values** (not sites/names). The parser collects
-//     all nearby annotation texts around a binding site and merges them onto
-//     the value node as a single wrapper:
-//     ("annot", ("str", mergedText), value)
-//   - The AST does not preserve whether a note was written “pre” or “post”.
-//     The pretty-printer is responsible for rendering (e.g., multiline → pre,
-//     single line → post) and must be deterministic for idempotency:
-//     pretty(src) == pretty(pretty(src))
+// What this file does **not** include:
+//   • Any algorithmic implementation, bytecode generation, or the VM. Those live
+//     in private files and are intentionally hidden behind narrow private
+//     interfaces that are wired up during `NewInterpreter()`.
 //
-// Nodes & Spans
+// EXECUTION & SCOPING SEMANTICS
+// -----------------------------
+// MindScript code evaluates in **environments** (`*Env`) that form a lexical
+// chain via `parent`. The Interpreter exposes two well-known frames:
+//   • `Core`: built-ins and registered natives (read-only to user code).
+//   • `Global`: user-visible program state (REPL/module globals).
+//
+// Entry points differ only in *which* environment they target:
+//   • Ephemeral (sandboxed) runs: `EvalSource` and `Eval` create a **fresh child
+//     of Global**; names bound during evaluation land in that throwaway child,
+//     so `Global` remains unchanged unless the program **explicitly** mutates it.
+//   • Persistent (REPL-style) runs: `EvalPersistentSource` and `EvalPersistent`
+//     evaluate **in Global** itself, so `let`/assignment update the persistent
+//     state.
+//   • Advanced embedding: `EvalAST(ast, env)` evaluates exactly in the provided
+//     environment, letting hosts control scoping explicitly.
+//
+// ERROR MODEL
+// -----------
+// MindScript distinguishes:
+//   1) **Soft errors** for operational conditions (file-not-found, no space,
+//      etc.). These surface as annotated-null **Values** (not Go errors).
+//   2) **Hard errors** for contractual failures (lex/parse mistakes, wrong
+//      arity/type contracts, runtime invariants). These bubble as a single
+//      `*Error` with (Kind, Msg, Line, Col, Src). Internals NEVER pretty print.
+//      Public entry points attach the correct SourceRef and format them.
+//
+// All `Eval*` methods return `(Value, error)`. On hard failure they return a Go
+// `error` whose message is a caret-formatted snippet produced **only here** at
+// the API surface via `FormatError` (see errors.go). Internals pass `*Error` up
+// unformatted.
+//
+// VALUES & MAPS
 // -------------
-// The AST is a tree of S-expressions: []any whose first element is a string tag.
-// **This list is the most important reference.**
+// `Value` is a tagged sum covering: null, bool, int64, float64, string, arrays,
+// ordered maps, functions, type values, modules, and opaque handles. `MapObject`
+// preserves **insertion order** (`Keys`) and supports **per-key annotations**
+// (`KeyAnn`). Its `Entries` is a string→Value map; order-sensitive operations
+// must consult `Keys`. The helper `AsMapValue` exposes a module’s map view.
 //
-//	("block", n1, n2, ...)
-//	("noop")
+// FUNCTIONS & NATIVES
+// -------------------
+// `Fun` carries parameter names/types, a body (as an S-expression), its closure
+// environment, and an optional `NativeName` when the function is implemented in
+// the host. Natives are registered via `RegisterNative(name, params, ret, impl)`
+// and are **type-checked both on call and on return** using the MindScript type
+// engine (see Type Helpers below). `Apply` performs call/currying semantics and
+// enforces parameter types. `FunMeta` exposes arity, parameter specs, return
+// type, docs, and closure environment for tooling.
 //
-// Literals & identifiers:
+// TYPES (STRUCTURAL)
+// ------------------
+// Types are S-expressions (`type S = []any`, defined in parser.go). The public
+// helpers delegate to the private type engine:
+//   • `ResolveType(t, env)` — resolve identifiers within a type expression.
+//   • `IsType(v, t, env)`   — runtime value check against a type.
+//   • `IsSubtype(a, b, env)`— structural subtyping.
+//   • `UnifyTypes(t1, t2, env)` — least common supertype (LUB).
+//   • `ValueToType(v, env)` — pragmatic structural type inference.
+// The precise structural rules (nullable, arrays, maps with required/optional,
+// functions contravariant/covariant, enums, `Int <: Num`, etc.) are defined in
+// `types.go` and fully respected by this API.
 //
-//	("id",   string)              // identifier (includes property names coerced to ID by lexer rules)
-//	("int",  int64)               // from INTEGER
-//	("num",  float64)             // from NUMBER
-//	("str",  string)              // decoded literal
-//	("bool", bool)                // from BOOLEAN
-//	("null")                      // from NULL
-//	("type", expr)                // from 'type' ...
+// PROCESSES & CONCURRENCY (MINIMAL, LUA-STYLE)
+// --------------------------------------------
+// The simplest safe model is **isolates**: each `Interpreter` instance is an
+// independent “process” with its own `Global`, module cache, stacks, and
+// ephemeral state. The `Core` environment is shared **read-only** across
+// isolates (user code cannot mutate Core; see sealing notes below).
 //
-// Operators / expressions:
+// You can spawn concurrent work by **cloning** an interpreter and running code
+// in a new goroutine. This file exposes:
+//   • `(*Interpreter) Clone()` — snapshot the current interpreter into a new
+//     isolate (shares a read-only Core; copies native registry; new Global).
+//   • Host-level spawns: `SpawnSource` / `SpawnAST` returning a `ProcessHandle`.
+//   • A helper `HandleVal` to wrap/unwrap process handles as `Value` (VTHandle),
+//     so `spawn`/`join` natives can be implemented in `interpreter_ops.go`.
 //
-//	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
-//	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
-//	("assign", target, value)     // "=" (right-assoc)
+// Concurrency contract:
+//   • Instantiate and register natives **before** spawning concurrent processes.
+//     (Clones copy the native registry; mutating a Go `map` concurrently is not
+//     allowed. Core is treated as immutable after init.)
+//   • Each `Interpreter` instance is not re-entrant; run at most one evaluation
+//     at a time per instance. For parallel work, use `Clone()`.
+//   • `Global`/module caches are **not** shared between clones.
 //
-// Property / call / index:
+// DEPENDENCIES (OTHER FILES)
+// --------------------------
+//   • lexer.go / parser.go: tokenization and Pratt parser that produce S-expr ASTs.
+//     (Public alias `type S = []any` is defined in parser.go.)
+//   • spans.go: sidecar source spans used for caret-style runtime errors.
+//   • vm.go: bytecode `Chunk`, opcodes, and VM execution (internal).
+//   • interpreter_exec.go (private): parsing, JIT, VM dispatch, calls/currying.
+//   • interpreter_ops.go  (private): built-ins, assignment, iteration, emitter.
+//   • types.go: structural type system (used via public wrappers here).
+//   • errors.go: unified diagnostic (`*Error`) and pretty-printing at API surface.
+//   • oracles.go, modules.go: optional features used internally (opaque here).
 //
-//	("call", callee, arg1, arg2, ...)
-//	("get",  obj, ("str", name))             // obj.name or obj."name"
-//	("idx",  obj, indexExpr)                 // obj[expr] or obj.(expr) or obj.12
+// DESIGN INTENT
+// -------------
+// The API is intentionally **narrow and predictable**. You can:
+//   • Choose source or AST inputs.
+//   • Choose ephemeral (child) or persistent (Global) scope.
+//   • Register natives with explicit param/return types.
+//   • Call functions and introspect them.
+//   • Ask type questions and perform type inference.
+//   • Clone interpreters and spawn concurrent processes safely.
 //
-// Collections:
-//
-//	("array", e1, e2, ...)
-//	("map",   ("pair",  keyStrExpr, value)*)
-//	("map",   ("pair!", keyStrExpr, value)*) // required-field (key! : value)
-//	("enum",  item1, item2, ...)             // from Enum[ ... ]
-//
-// Functions, modules, control, loops:
-//
-//	("fun",     paramsArray, retTypeExprOrAny, bodyBlock)
-//	("oracle",  paramsArray, outTypeExprOrAny, sourceExpr)
-//	("module",  nameExpr, bodyBlock)
-//	("if", ("pair", cond1, thenBlk1), ..., elseBlk?)
-//	("while", cond, bodyBlock)
-//	("for",   targetPatternOrLvalue, iterExpr, bodyBlock)
-//	("return", value)  // value may be "null" per newline semantics
-//	("break",  value)  // value may be "null"
-//	("continue", value)// value may be "null"
-//
-// Declaration patterns (used by 'let' and 'for' targets):
-//
-//	("decl", name)
-//	("darr", p1, p2, ...)
-//	("dobj", ("pair", keyStrExpr, subPattern), ...)
-//
-// Annotations:
-//
-//	("annot", ("str", text), wrappedNode)   // merged text; no POST marker
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// SPAN EMISSION INVARIANT (CRITICAL)
-// ----------------------------------
-// **This file now centralizes AST construction and span emission.**
-//
-//   - Every AST node is constructed through `mk*` helpers that *atomically*
-//     append exactly one span for that node.
-//   - Spans are appended in strict **post-order** of the final AST (children
-//     first, then parent), left-to-right among siblings.
-//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule:
-//     child's span first, then the wrapper's span.
-//   - Nodes that are synthesized with no concrete tokens (e.g. default type
-//     `Any`) still receive a placeholder `Span{}` via `mk*` (using tok=-1).
-//   - The root block’s span is appended last.
-//
-// The helpers in this file enforce the invariant mechanically at every construct.
-//
-// Dependencies
-// ------------
-//   - lexer.go
-//   - errors.go (*Error, DiagParse, DiagIncomplete, IsIncomplete)
-//   - spans.go (Span, SpanIndex, BuildSpanIndexPostOrder)
+// Everything else—parsing details, bytecode shapes, opcodes, cache strategies,
+// optimization passes—remains private and may evolve without breaking this API.
+
 package mindscript
 
 import (
 	"fmt"
-	"strings"
+	"strconv"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-//                                  PUBLIC API
+//                              PUBLIC TYPES & CTORS
 ////////////////////////////////////////////////////////////////////////////////
 
-type S = []any
+// ValueTag enumerates all runtime kinds a Value may hold.
+// The tag determines which field of Value.Data is valid (see Value docs).
+type ValueTag int
 
-func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
+const (
+	VTNull   ValueTag = iota // null (no payload)
+	VTBool                   // bool
+	VTInt                    // int64
+	VTNum                    // float64
+	VTStr                    // string
+	VTArray                  // *ArrayObject
+	VTMap                    // *MapObject (ordered map)
+	VTFun                    // *Fun (closure; native or user-defined)
+	VTType                   // *TypeValue (type AST + definition env)
+	VTModule                 // module handle (opaque; maps to a MapObject view)
+	VTHandle                 // opaque host handle (integration-specific)
+)
 
-// ParseSExpr parses a complete MindScript source string and returns its AST.
-func ParseSExpr(src string) (S, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, err
-	}
-	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
+// Value is the universal runtime carrier used by the interpreter.
+//
+// Fields:
+//   - Tag   — discriminant indicating which case is active.
+//   - Data  — Go value appropriate for Tag (see ValueTag; e.g., int64 for VTInt).
+//   - Annot — optional annotation used by the runtime to propagate user-facing
+//     documentation or error context. Annotations never affect equality.
+//
+// Invariants:
+//   - When Tag==VTNull, Data is nil.
+//   - When Tag==VTMap, Data is *MapObject preserving insertion order.
+//   - Modules (VTModule) can be viewed as maps via AsMapValue.
+type Value struct {
+	Tag   ValueTag
+	Data  interface{}
+	Annot string
 }
 
-// ParseSExprWithSpans parses like ParseSExpr and also returns a *SpanIndex,
-// with spans recorded in strict post-order per the invariant.
-func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
-	lex := NewLexer(src)
-	toks, err := lex.Scan()
-	if err != nil {
-		return nil, nil, err
-	}
-	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	ast, perr := p.program()
-	if perr != nil {
-		return nil, nil, perr
-	}
-	idx := BuildSpanIndexPostOrder(ast, p.post)
-	return ast, idx, nil
+// ArrayObject gives arrays reference semantics (like MapObject), so mutations
+// (push/pop/shift/unshift/index-assign) are observed by all aliases.
+type ArrayObject struct {
+	Elems []Value
 }
 
-// ParseSExprInteractive parses in REPL-friendly mode.
-// Unterminated constructs at EOF produce *Error{Kind:DiagIncomplete}.
-func ParseSExprInteractive(src string) (S, error) {
-	lex := NewLexerInteractive(src)
-	toks, err := lex.Scan()
-	if err != nil {
+// Handle is the single opaque/userdata-like carrier (Lua-style).
+// Hosts can box arbitrary data behind a "kind" discriminator.
+type Handle struct {
+	Kind string
+	Data any
+}
+
+// HandleVal boxes host data into an opaque runtime Value.
+func HandleVal(kind string, data any) Value {
+	return Value{Tag: VTHandle, Data: &Handle{Kind: kind, Data: data}}
+}
+
+// String renders a human-friendly debug representation (annotations are omitted).
+func (v Value) String() string {
+	switch v.Tag {
+	case VTNull:
+		return "null"
+	case VTBool:
+		return fmt.Sprintf("%v", v.Data.(bool))
+	case VTInt:
+		return strconv.FormatInt(v.Data.(int64), 10)
+	case VTNum:
+		return strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+	case VTStr:
+		return fmt.Sprintf("%q", v.Data.(string))
+	case VTArray:
+		return fmt.Sprintf("<array len=%d>", len(v.Data.(*ArrayObject).Elems))
+	case VTMap:
+		return "<map>"
+	case VTFun:
+		return "<fun>"
+	case VTType:
+		return "<type>"
+	case VTModule:
+		return "<module>"
+	default:
+		return "<unknown>"
+	}
+}
+
+// Null is the singleton null Value (no annotation, no payload).
+var Null = Value{Tag: VTNull}
+
+// Primitive constructors for convenience. They do not attach annotations.
+func Bool(b bool) Value    { return Value{Tag: VTBool, Data: b} }
+func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
+func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
+func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
+func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: &ArrayObject{Elems: xs}} }
+
+// MapObject is an ordered map preserving insertion order and per-key annotations.
+//
+// Fields:
+//   - Entries — the key/value storage (by string key).
+//   - KeyAnn  — optional per-key annotation text (preserved on round-trips).
+//   - Keys    — insertion order (unique keys); use this to iterate predictably.
+//
+// Semantics:
+//   - Insert order is the iteration order.
+//   - Setting a value for a new key appends that key to Keys.
+//   - Removing keys (if implemented in hosts) must also update Keys.
+//
+// Values of map type are represented as Value{Tag: VTMap, Data: *MapObject}.
+type MapObject struct {
+	Entries map[string]Value
+	KeyAnn  map[string]string
+	Keys    []string
+}
+
+// Map constructs a VTMap from a plain Go map. Note: Literal maps constructed
+// from source preserve exact key order via internal built-ins; hosts building
+// maps programmatically can use Map for convenience (order equals Go map
+// iteration order if Keys is not supplied, so this helper synthesizes Keys
+// from the initial map contents).
+func Map(m map[string]Value) Value {
+	mo := &MapObject{
+		Entries: m,
+		KeyAnn:  map[string]string{},
+	}
+	mo.Keys = make([]string, 0, len(m))
+	for k := range m {
+		mo.Keys = append(mo.Keys, k)
+	}
+	return Value{Tag: VTMap, Data: mo}
+}
+
+// TypeValue carries a type expression AST (S) and the lexical Env where it was
+// defined. Resolution uses the stored Env when available.
+type TypeValue struct {
+	Ast S
+	Env *Env
+}
+
+// TypeValIn builds a VTType and pins its resolution environment explicitly.
+// Use this when exporting user-defined types from specific scopes.
+func TypeValIn(expr S, env *Env) Value {
+	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
+}
+
+// Fun represents a function/closure. Functions are first-class Values (VTFun).
+//
+// Fields (stable API; implementation specifics like bytecode are private):
+//   - Params      — parameter names in order.
+//   - ParamTypes  — declared parameter types (S-expression per param).
+//   - ReturnType  — declared return type (S). Oracles are made nullable internally.
+//   - Body        — function body as an S-expression (opaque to callers).
+//   - Env         — closure environment captured at definition time.
+//   - NativeName  — non-empty iff implemented by a registered native.
+//   - Examples    — optional example values for tooling; ignored by runtime.
+//   - IsOracle    — marks oracle functions (different return-type semantics).
+//   - HiddenNull  — internal arity placeholder for zero-arg construction (not API).
+//   - Src         — optional source metadata for enriched runtime errors.
+//
+// Note: `Chunk` is an internal JIT product stored here for caching; callers
+// should treat it as opaque and never rely on it.
+type Fun struct {
+	Params     []string
+	Body       S
+	Env        *Env
+	ParamTypes []S
+	ReturnType S
+	HiddenNull bool
+
+	Chunk      *Chunk // JIT result (from vm.go) — internal use only
+	NativeName string // non-empty for registered natives
+
+	IsOracle bool  // oracle marker
+	Examples Value // VTArray of [input, output] pairs, or Null when none
+
+	Src *SourceRef // source metadata (optional)
+
+	// Original declaration signature (names/types): tools/oracles can
+	// reference it even after currying changes Params.
+	Sig *SigMeta
+}
+
+// SigMeta is an immutable, engine-internal carrier of the original signature.
+// It replaces the old $__sig_names / $__sig_types closure bindings for oracles.
+type SigMeta struct {
+	Names []string // original parameter names, in order
+	Types []S      // original declared parameter types, in order
+}
+
+// FunVal wraps *Fun into a Value (Tag=VTFun).
+func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
+
+// Env is a lexical environment frame with a parent link. Lookups walk parent-ward.
+// Use Define to bind in the current frame, Set to update an existing visible
+// binding (nearest frame), and Get to retrieve.
+type Env struct {
+	parent           *Env
+	table            map[string]Value
+	sealParentWrites bool
+}
+
+// ---- Builtin type names/constructors (value-namespace guards) ----
+var builtinTypeAtoms = map[string]struct{}{
+	"Any": {}, "Null": {}, "Bool": {}, "Int": {}, "Num": {}, "Str": {}, "Type": {}, "Enum": {},
+}
+
+func isBuiltinTypeAtom(name string) bool { _, ok := builtinTypeAtoms[name]; return ok }
+
+// SealParentWrites prevents Set from climbing into parent frames.
+// Lookups (Get) still traverse parents as usual.
+func (e *Env) SealParentWrites() { e.sealParentWrites = true }
+
+// NewEnv creates a new lexical frame with the given parent (which may be nil).
+func NewEnv(parent *Env) *Env { return &Env{parent: parent, table: make(map[string]Value)} }
+
+// Define binds name to v in the current frame, shadowing any outer binding.
+func (e *Env) Define(name string, v Value) {
+	e.table[name] = v
+}
+
+// Set updates the nearest existing binding of name to v. If no binding exists
+// in any visible frame, Set returns an error (it does not implicitly define).
+func (e *Env) Set(name string, v Value) error {
+	// Disallow assignment to language-level builtins (even if not present in envs).
+	if isBuiltinTypeAtom(name) {
+		return fmt.Errorf("cannot assign to type atom/constructor: %s", name)
+	}
+	if _, ok := e.table[name]; ok {
+		e.table[name] = v
+		return nil
+	}
+	// If this frame is sealed, do not climb; emit a friendlier message
+	// when the name exists in an ancestor (e.g., Core builtins).
+	if e.sealParentWrites {
+		for p := e.parent; p != nil; p = p.parent {
+			if _, ok := p.table[name]; ok {
+				return fmt.Errorf("cannot assign to builtin: %s", name)
+			}
+		}
+		return fmt.Errorf("undefined variable: %s", name)
+	}
+	if e.parent != nil {
+		return e.parent.Set(name, v)
+	}
+	return fmt.Errorf("undefined variable: %s", name)
+}
+
+// Get retrieves the nearest visible binding for name or returns an error.
+func (e *Env) Get(name string) (Value, error) {
+	if v, ok := e.table[name]; ok {
+		return v, nil
+	}
+	if e.parent != nil {
+		return e.parent.Get(name)
+	}
+	// If the miss is a type atom/ctor, explain how to obtain a runtime Type.
+	if isBuiltinTypeAtom(name) {
+		return Value{}, fmt.Errorf("'%s' is a type expression, not a value. Use 'type %s' to obtain a runtime Type, or use it in a type annotation", name, name)
+	}
+	return Value{}, fmt.Errorf("undefined variable: %s", name)
+}
+
+// ParamSpec documents a function parameter (name + declared type). Used by
+// native registration and function introspection.
+type ParamSpec struct {
+	Name string
+	Type S
+}
+
+// Callable exposes metadata about a function Value (for tooling, docs, REPLs).
+// The returned values reflect the function’s declared signature and closure env.
+type Callable interface {
+	Arity() int
+	ParamSpecs() []ParamSpec
+	ReturnType() S
+	Doc() string
+	ClosureEnv() *Env
+}
+
+// CallCtx is passed to native functions, providing access to bound arguments
+// (by parameter name) and the effect scope (where side effects should land).
+type CallCtx interface {
+	Arg(name string) Value
+	Env() *Env
+}
+
+// NativeImpl is the implementation signature for registered host/native functions.
+// Implementations must return a Value conforming to the declared return type;
+// the interpreter enforces parameter and return types on every call.
+type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
+
+////////////////////////////////////////////////////////////////////////////////
+//                          PROCESSES (MINIMAL CONCURRENCY)
+////////////////////////////////////////////////////////////////////////////////
+
+// ProcessHandle is a tiny, host-visible handle for a spawned evaluation.
+// Join blocks until the process completes and returns the same (Value, error)
+// shape as Eval* entry points (errors already pretty-printed).
+type ProcessHandle struct {
+	ch chan processResult
+}
+
+type processResult struct {
+	v   Value
+	err error
+}
+
+// Join waits for the spawned evaluation to finish and returns its result.
+func (h *ProcessHandle) Join() (Value, error) {
+	if h == nil || h.ch == nil {
+		return Null, fmt.Errorf("invalid process handle")
+	}
+	r := <-h.ch
+	return r.v, r.err
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC INTERPRETER
+////////////////////////////////////////////////////////////////////////////////
+
+// Interpreter is the entry point for evaluating MindScript programs.
+//
+// Public fields:
+//   - Core   — built-in environment; parent of Global. Populated by NewInterpreter.
+//   - Global — persistent program environment (REPL/module state).
+//
+// Construction:
+//   - Use NewInterpreter() to obtain a ready-to-use instance. Core natives are
+//     installed automatically; Global is an empty child of Core.
+//
+// Behavior summary:
+//   - EvalSource/Eval run in a **fresh child of Global** (ephemeral).
+//   - EvalPersistentSource/EvalPersistent run **in Global** (persistent).
+//   - EvalAST runs in the environment you pass.
+//   - Apply/Call0 invoke function Values with type-checking & currying.
+//   - FunMeta returns a Callable to inspect signatures/docs.
+//   - (New) Clone returns an isolated interpreter suitable for concurrent runs.
+//   - (New) SpawnSource/SpawnAST run code in a fresh isolate on a goroutine.
+//
+// Hard-error discipline:
+//   - Internals bubble `*Error` up **unformatted**.
+//   - Public entry points attach the correct `SourceRef` and return a Go error
+//     whose message is a pretty, caret-labeled snippet via `FormatError`.
+type Interpreter struct {
+	// Publicly visible environments:
+	Global *Env // user-visible namespace (per-interpreter)
+	Base   *Env // per-namespace runtime/prelude layer (overwritable)
+	Core   *Env // engine-critical intrinsics (read-only)
+
+	// Immutable, pre-seeded Base template used for fast namespace snapshots.
+	baseTemplate *Env
+
+	// Private internals (opaque to callers):
+	modules   map[string]*moduleRec // private module system (defined elsewhere)
+	native    map[string]NativeImpl // registered natives
+	loadStack []string              // import guard
+
+	currentSrc *SourceRef
+
+	// Private facades implemented in private files:
+	_exec execCore
+}
+
+// Private contracts the internals satisfy (wired by NewInterpreter).
+// These are intentionally unexported and may evolve.
+type execCore interface {
+	// Parse + evaluate source into the given env (fresh or persistent).
+	evalSource(src string, env *Env) (Value, error)
+	// Evaluate AST in the given env.
+	evalAST(ast S, env *Env) (Value, error)
+	// Calls & metadata
+	applyArgsScoped(fn Value, args []Value, callSite *Env) Value
+	funMeta(fn Value) (Callable, bool)
+}
+
+// NewInterpreter constructs an engine with core natives and a seeded Base,
+// failing fast if the standard prelude cannot be loaded. After construction:
+//   - Core is populated with built-ins and any subsequently registered natives.
+//   - Global is empty and inherits from Core.
+//   - Global is sealed from mutating Core (user code cannot overwrite builtins).
+//   - The interpreter is ready for Eval*/Apply/FunMeta/etc.
+func NewInterpreter() (*Interpreter, error) {
+	ip := &Interpreter{}
+	ip.Core = NewEnv(nil)
+	ip.modules = map[string]*moduleRec{}
+	ip.native = map[string]NativeImpl{}
+
+	// Wire private implementations (defined in private files).
+	ip._exec = newExec(ip)
+
+	// Install core built-ins.
+	initCore(ip)
+
+	// Build a pre-seeded, immutable Base template once, then snapshot per namespace.
+	if err := ip.buildBaseTemplate(); err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
+	ip.Base = ip.newBaseFromTemplate()
+	// Global is the user frame. It may climb into Base to overwrite runtime/prelude.
+	ip.Global = NewEnv(ip.Base)
+
+	return ip, nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                         PUBLIC METHODS (THIN DELEGATIONS)
+////////////////////////////////////////////////////////////////////////////////
+
+// ensureErrorHasSource attaches sr to e if e is a *Error and Src is nil.
+// Returns the possibly-updated error.
+func ensureErrorHasSource(err error, sr *SourceRef) error {
+	if err == nil || sr == nil {
+		return err
+	}
+	if e, ok := err.(*Error); ok && e.Src == nil {
+		e.Src = sr
+	}
+	return err
+}
+
+// formatAtAPI pretty-prints a hard error to a Go error (string message).
+// If err is not a *Error, it is passed through unchanged.
+func formatAtAPI(err error) error {
+	if err == nil {
+		return nil
+	}
+	if e, ok := err.(*Error); ok {
+		return fmt.Errorf("%s", FormatError(e))
+	}
+	return err
+}
+
+// EvalSource parses and evaluates source **in a fresh child of Global**.
+// Effects (lets/assignments) land in that ephemeral child; Global is unchanged
+// unless the program explicitly mutates it.
+//
+// Returns the resulting Value; on hard failure returns a Go error with a
+// caret-formatted snippet (LEXICAL/PARSE/RUNTIME) produced at the API surface.
+func (ip *Interpreter) EvalSource(src string) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// Eval evaluates a pre-parsed AST **in a fresh child of Global**.
+// See EvalSource for scoping and error semantics.
+//
+// Implementation detail:
+//
+//	We format the AST back to source to construct a SourceRef with spans
+//	(via ParseSExprWithSpans) so hard errors can be shown with carets.
+func (ip *Interpreter) Eval(root S) (Value, error) {
+	src := FormatSExpr(root)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// EvalPersistentSource parses and evaluates source **in Global** (REPL-style).
+// Effects directly mutate Global. Returns Value; on hard failure returns a
+// caret-formatted Go error produced at the API surface.
+func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// EvalPersistent evaluates a pre-parsed AST **in Global** (REPL-style).
+// Effects directly mutate Global. Returns Value; on hard failure returns a
+// caret-formatted Go error produced at the API surface.
+func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
+	src := FormatSExpr(root)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// EvalAST evaluates an AST in the provided environment exactly as given.
+// Hosts use this to control scoping (e.g., per-request envs, sandboxes).
+// Returns Value; on hard failure returns a caret-formatted Go error if the
+// bubbled *Error already carries a SourceRef; otherwise the error is passed
+// through unchanged (callers without source can still inspect *Error fields).
+func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
+	val, err := ip._exec.evalAST(ast, env)
+	if err != nil {
+		// If the error already has a SourceRef, pretty print; else pass through.
+		if _, ok := err.(*Error); ok {
+			return Null, formatAtAPI(err)
+		}
+		return Null, err
+	}
+	return val, nil
+}
+
+// Apply applies a function Value to the provided argument Values.
+//
+// Semantics:
+//   - Performs arity/type checking against the function’s declared ParamTypes.
+//   - Supports currying: if fewer args than parameters are provided, returns a
+//     partially-applied function Value; if more are provided, they are applied
+//     in sequence to the results.
+//   - Side effects from natives occur in the call-site/program scope.
+//
+// Panics inside the engine are caught by Eval* callers; Apply itself follows
+// the runtime’s internal error discipline. Use via evaluated programs or in
+// hosts that handle runtime errors accordingly.
+func (ip *Interpreter) Apply(fn Value, args []Value) Value {
+	return ip._exec.applyArgsScoped(fn, args, nil)
+}
+
+// Call0 invokes a function with zero arguments (equivalent to Apply(fn, nil)).
+func (ip *Interpreter) Call0(fn Value) Value { return ip._exec.applyArgsScoped(fn, nil, nil) }
+
+// FunMeta exposes a function Value as a Callable for introspection (arity,
+// parameter specs with declared types, return type, documentation string taken
+// from Value.Annot, and the closure environment). Returns (nil, false) if the
+// Value is not a function.
+func (ip *Interpreter) FunMeta(fn Value) (Callable, bool) {
+	return ip._exec.funMeta(fn)
+}
+
+// ResolveType expands a type expression by resolving identifiers bound to
+// user-defined types in the provided environment. See types.go for semantics.
+func (ip *Interpreter) ResolveType(t S, env *Env) S { return ip.resolveType(t, env) }
+
+// IsType reports whether runtime value v conforms to type t.
+// Structural rules are defined in types.go (Int<:Num, nullable, arrays/maps,
+// function subtyping, enums, open-world objects, etc.).
+func (ip *Interpreter) IsType(v Value, t S, env *Env) bool { return ip.isType(v, t, env) }
+
+// IsSubtype reports whether type a is a structural subtype of type b.
+func (ip *Interpreter) IsSubtype(a, b S, env *Env) bool { return ip.isSubtype(a, b, env) }
+
+// UnifyTypes computes a least common supertype (LUB) of t1 and t2.
+func (ip *Interpreter) UnifyTypes(t1 S, t2 S, env *Env) S { return ip.unifyTypes(t1, t2, env) }
+
+// ValueToType infers a pragmatic structural type for v (JSON-friendly).
+// Arrays unify element types; maps become open-world with observed fields.
+func (ip *Interpreter) ValueToType(v Value, env *Env) S { return ip.valueToTypeS(v, env) }
+
+// RegisterNative installs a host/native function into Core and exposes it as a
+// first-class function Value available by `name` to programs.
+//
+// Contract:
+//   - `params` declares parameter names and types (enforced on call).
+//   - `ret` declares the return type (enforced on return).
+//   - `impl` is invoked with (ip, CallCtx) at runtime.
+//   - The created function is placed in Core under `name`.
+//
+// Notes:
+//   - Natives participate in currying and type-checking like user functions.
+//   - The doc string for introspection is taken from the Value’s Annot (callers
+//     may annotate after registration if desired).
+//
+// Concurrency:
+//   - Register natives **before** using Clone/Spawn for concurrent work.
+//     Clones copy the native registry; mutating maps concurrently is not supported.
+func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, impl NativeImpl) {
+	if ip.native == nil {
+		ip.native = map[string]NativeImpl{}
+	}
+	ip.native[name] = impl
+
+	if ip.Core == nil {
+		ip.Core = NewEnv(nil)
+	}
+
+	names := make([]string, len(params))
+	types := make([]S, len(params))
+	for i, p := range params {
+		names[i], types[i] = p.Name, p.Type
+	}
+
+	hidden := false
+	if len(names) == 0 {
+		names = []string{"_"}
+		types = []S{S{"id", "Null"}}
+		hidden = true
+	}
+
+	ip.Core.Define(name, FunVal(&Fun{
+		Params:     names,
+		ParamTypes: types,
+		ReturnType: ret,
+		Body:       S{"native", name}, // sentinel for debugging; not executed
+		Env:        ip.Core,
+		NativeName: name,
+		HiddenNull: hidden, // <-- set this
+		Sig: &SigMeta{
+			Names: append([]string{}, names...),
+			Types: append([]S{}, types...),
+		},
+	}))
+}
+
+// AsMapValue returns a VTMap view for VTMap/VTModule (sharing the same MapObject),
+// else returns the input unchanged. This is useful when callers want uniform map
+// handling for modules and plain maps.
+func AsMapValue(v Value) Value {
+	if v.Tag == VTModule {
+		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
+	}
+	return v
+}
+
+// Clone creates an isolated Interpreter that shares no mutable runtime state
+// with the original. It shares the read-only Core, reuses the prebuilt
+// baseTemplate, creates a fresh Base + Global, and copies the native registry
+// (name -> implementation) without mutating Core.
+//
+// Notes:
+//   - Core is shared and treated as immutable after init (no writes here).
+//   - Base is recreated from the immutable template; Global is a fresh child.
+//   - Module cache and loader state are fresh per-clone.
+//   - The exec facade is rebound to the clone.
+func (ip *Interpreter) Clone() *Interpreter {
+	// New interpreter shell
+	cl := &Interpreter{}
+
+	// Share read-only Core; do not mutate it here.
+	cl.Core = ip.Core
+
+	// Fresh per-clone state
+	cl.modules = map[string]*moduleRec{}
+	cl.native = make(map[string]NativeImpl, len(ip.native))
+	cl._exec = newExec(cl)
+
+	// Reuse immutable template to create a fresh Base, then make a fresh Global.
+	cl.baseTemplate = ip.baseTemplate
+	cl.Base = cl.newBaseFromTemplate()
+	cl.Global = NewEnv(cl.Base)
+
+	// Copy native registry implementations for this clone (no Core writes).
+	for name, impl := range ip.native {
+		cl.native[name] = impl
+	}
+
+	// Fresh loader/source tracking
+	cl.modules = map[string]*moduleRec{}
+	cl.loadStack = nil
+	cl.currentSrc = nil
+
+	return cl
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                      ISOLATES: CLONE & HOST-LEVEL SPAWN
+////////////////////////////////////////////////////////////////////////////////
+
+// SpawnSource clones the interpreter and evaluates `src` persistently (in the
+// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
+// yields the same (Value, error) contract as EvalPersistentSource.
+func (ip *Interpreter) SpawnSource(src string) *ProcessHandle {
+	child := ip.Clone()
+	h := &ProcessHandle{ch: make(chan processResult, 1)}
+	go func() {
+		v, err := child.EvalPersistentSource(src)
+		h.ch <- processResult{v: v, err: err}
+	}()
+	return h
+}
+
+// SpawnAST clones the interpreter and evaluates `ast` persistently (in the
+// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
+// yields the same (Value, error) contract as EvalPersistent.
+func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
+	child := ip.Clone()
+	h := &ProcessHandle{ch: make(chan processResult, 1)}
+	go func() {
+		v, err := child.EvalPersistent(ast)
+		h.ch <- processResult{v: v, err: err}
+	}()
+	return h
 }
 
 //// END_OF_PUBLIC
 
 ////////////////////////////////////////////////////////////////////////////////
-///////////////////////////// PRIVATE IMPLEMENTATION ///////////////////////////
+//                    BASE TEMPLATE + SNAPSHOT HELPERS (PRIVATE)
 ////////////////////////////////////////////////////////////////////////////////
 
-type parser struct {
-	toks        []Token
-	i           int
-	interactive bool
+// Build a pre-seeded, sealed Base template parented to Core. Treat as immutable.
+// RETURNS ERROR if the runtime/prelude fails to load.
+func (ip *Interpreter) buildBaseTemplate() error {
+	tmpl := NewEnv(ip.Core)
+	tmpl.SealParentWrites()
 
-	post             []Span // strictly post-order: one span per node, appended after children
-	lastSpanStartTok int
-	lastSpanEndTok   int
-	src              string
-}
+	ip.baseTemplate = tmpl
 
-// ─────────────────────── centralized annotation carrier ──────────────────────
-type annSrc struct {
-	txt      string
-	startTok int // inclusive token index of the first contributing annotation token
-	endTok   int // inclusive token index of the last contributing annotation token
-	ok       bool
-}
-
-func annNone() annSrc { return annSrc{} }
-
-func annFromSingle(tokIdx int, txt string) annSrc {
-	return annSrc{txt: txt, startTok: tokIdx, endTok: tokIdx, ok: txt != ""}
-}
-
-func mergeAnn(a, b annSrc) annSrc {
-	if !a.ok && !b.ok {
-		return annSrc{}
+	ip.SeedRuntimeInto(tmpl)
+	if err := ip.SeedRuntimeInto(tmpl); err != nil {
+		return err
 	}
-	if !a.ok {
-		return b
-	}
-	if !b.ok {
-		return a
-	}
-	txt := a.txt
-	if b.txt != "" {
-		if txt == "" {
-			txt = b.txt
-		} else {
-			txt = txt + "\n" + b.txt
-		}
-	}
-	// Compute first and last contributing token indexes, ignoring unknown (-1).
-	start := a.startTok
-	if start < 0 || (b.startTok >= 0 && b.startTok < start) {
-		start = b.startTok
-	}
-	end := a.endTok
-	if end < 0 || (b.endTok >= 0 && b.endTok > end) {
-		end = b.endTok
-	}
-	return annSrc{txt: txt, startTok: start, endTok: end, ok: txt != ""}
-}
-
-// ─────────────────────────── token basics & helpers ─────────────────────────
-
-func (p *parser) atEnd() bool { return p.peek().Type == EOF }
-func (p *parser) peek() Token {
-	if p.i >= len(p.toks) {
-		return p.toks[len(p.toks)-1]
-	}
-	return p.toks[p.i]
-}
-func (p *parser) prev() Token { return p.toks[p.i-1] }
-
-func (p *parser) match(tt ...TokenType) bool {
-	if p.atEnd() {
-		return false
-	}
-	for _, t := range tt {
-		if p.peek().Type == t {
-			p.i++
-			return true
-		}
-	}
-	return false
-}
-
-func (p *parser) need(t TokenType, msg string) (Token, error) {
-	if p.match(t) {
-		return p.prev(), nil
-	}
-	g := p.peek()
-	if g.Type == EOF {
-		line, col := p.posAfterLastSpan()
-		kind := DiagParse
-		if p.interactive {
-			kind = DiagIncomplete
-		}
-		return Token{}, &Error{Kind: kind, Msg: msg, Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
-}
-
-// joinNonEmpty concatenates non-empty parts with '\n' in order.
-func joinNonEmpty(parts ...string) string {
-	out := ""
-	for _, s := range parts {
-		if s == "" {
-			continue
-		}
-		if out == "" {
-			out = s
-		} else {
-			out += "\n" + s
-		}
-	}
-	return out
-}
-
-func (p *parser) posAtByte(b int) (int, int) {
-	if b < 0 {
-		g := p.peek()
-		return g.Line, g.Col + 1
-	}
-	if b > len(p.src) {
-		b = len(p.src)
-	}
-	line := 1 + strings.Count(p.src[:b], "\n")
-	lastNL := strings.LastIndex(p.src[:b], "\n")
-	if lastNL < 0 {
-		return line, b + 1
-	}
-	return line, b - lastNL
-}
-func (p *parser) posAfterLastSpan() (int, int) {
-	if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
-		endB := p.toks[p.lastSpanEndTok].EndByte
-		return p.posAtByte(endB)
-	}
-	g := p.peek()
-	return g.Line, g.Col + 1
-}
-
-// takeReqGap consumes immediately-adjacent GAP (ANNOTATION/NOOP) that appear
-// before something *required* after `anchor`. It emits these gaps (returned as
-// annSrc) but NEVER lets them satisfy the requirement.
-// If only gaps remain to EOF, it returns an error anchored to `anchor`:
-//   - interactive: DiagIncomplete(msg)
-//   - noninteractive: DiagParse(msg)
-func (p *parser) takeReqGap(anchor Token, incMsg string) (annSrc, error) {
-	// Coalesce sequential annotations first, then eat blank-line runs.
-	pre := p.collectAnnotsSrc()
-	p.skipNoops()
-	// If after consuming those we only have gaps to EOF, this is an incomplete requirement.
-	if p.onlyGapsToEOF() {
-		line, col := p.posAtByte(anchor.StartByte)
-		kind := DiagParse
-		if p.interactive {
-			kind = DiagIncomplete
-		}
-		return annNone(), &Error{
-			Kind: kind,
-			Msg:  incMsg,
-			Line: line, Col: col,
-		}
-	}
-	return pre, nil
-}
-
-// needNoGap enforces the "GAPLESS after dot" rule: immediately after `anchor`
-// (which should be a PERIOD token) there must not be ANNOTATION/NOOP.
-// If a GAP is present:
-//   - interactive + only gaps to EOF → DiagIncomplete anchored to `anchor`;
-//   - otherwise → hard parse error anchored at the first GAP token.
-//
-// It does NOT consume any token.
-func (p *parser) needNoGap(anchor Token, msg string) error {
-	if p.atEnd() {
-		// Unify message across modes: same text, different kind.
-		line, col := p.posAtByte(anchor.StartByte)
-		kind := DiagParse
-		if p.interactive {
-			kind = DiagIncomplete
-		}
-		return &Error{Kind: kind, Msg: msg, Line: line, Col: col}
-	}
-	switch p.peek().Type {
-	case ANNOTATION, NOOP:
-		if p.interactive && p.onlyGapsToEOF() {
-			line, col := p.posAtByte(anchor.StartByte)
-			return &Error{Kind: DiagIncomplete, Msg: msg, Line: line, Col: col}
-		}
-		line, col := p.posAtByte(p.peek().StartByte)
-		return &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
-	}
+	ip.baseTemplate = tmpl
 	return nil
 }
 
-func tokText(t Token) string {
-	if s, ok := t.Literal.(string); ok {
-		return s
+// Create a fresh Base(ns) by cloning the template and rebinding closures/types.
+func (ip *Interpreter) newBaseFromTemplate() *Env {
+	// Base template must be constructed during NewInterpreter(). Do not
+	// silently build it here (that would swallow prelude errors).
+	if ip.baseTemplate == nil {
+		panic("base template not initialized (constructor should have failed)")
 	}
-	return t.Lexeme
+	return cloneEnvRebinding(ip.baseTemplate, ip.Core)
 }
 
-func (p *parser) skipNoops() {
-	for !p.atEnd() && p.peek().Type == NOOP {
-		p.i++
+// cloneEnvRebinding clones src into a new Env with newParent, rebinding
+// closures and type envs that *directly* referenced src -> to the new Env.
+// We do not rebuild entire env chains anymore; functions/types now capture
+// the real parent env (Base/module), so a simple pointer equality rebind
+// is sufficient and avoids deep recursion/stack growth.
+func cloneEnvRebinding(src *Env, newParent *Env) *Env {
+	dst := NewEnv(newParent)
+	dst.sealParentWrites = src.sealParentWrites
+	dst.table = make(map[string]Value, len(src.table))
+	for k, v := range src.table {
+		dst.table[k] = rebindValue(v, src, dst)
 	}
+	return dst
 }
 
-// ───────────────────────── precedence / associativity ──────────────────────
-
-func lbp(t TokenType) (int, bool) {
-	switch t {
-	case ARROW:
-		return 15, true
-	case MULT, DIV, MOD:
-		return 70, true
-	case PLUS, MINUS:
-		return 60, true
-	case LESS, LESS_EQ, GREATER, GREATER_EQ:
-		return 50, true
-	case EQ, NEQ:
-		return 40, true
-	case AND:
-		return 30, true
-	case OR:
-		return 20, true
-	case ASSIGN:
-		return 10, true
+// rebindValue: if a function/type closes over 'from', re-pin to 'to'.
+// For arrays/maps we deep-copy the container shape and rebind contained values
+// (to avoid aliasing across namespaces). Primitives pass through unchanged.
+func rebindValue(v Value, from, to *Env) Value {
+	switch v.Tag {
+	case VTFun:
+		f := *v.Data.(*Fun) // copy
+		if f.Env == from {
+			f.Env = to
+		}
+		nv := FunVal(&f)
+		nv.Annot = v.Annot
+		return nv
+	case VTType:
+		tv := *v.Data.(*TypeValue) // copy
+		// Pin envs that were defined in the template (or env-less) to 'to'.
+		if tv.Env == nil || tv.Env == from {
+			tv.Env = to
+		}
+		return Value{Tag: VTType, Data: &tv, Annot: v.Annot}
+	case VTArray:
+		src := v.Data.(*ArrayObject).Elems
+		out := make([]Value, len(src))
+		for i := range src {
+			out[i] = rebindValue(src[i], from, to)
+		}
+		return Arr(out)
+	case VTMap:
+		sm := v.Data.(*MapObject)
+		nm := &MapObject{
+			Entries: make(map[string]Value, len(sm.Entries)),
+			KeyAnn:  make(map[string]string, len(sm.KeyAnn)),
+			Keys:    append([]string(nil), sm.Keys...),
+		}
+		for k, vv := range sm.Entries {
+			nm.Entries[k] = rebindValue(vv, from, to)
+		}
+		for k, a := range sm.KeyAnn {
+			nm.KeyAnn[k] = a
+		}
+		nv := Value{Tag: VTMap, Data: nm, Annot: v.Annot}
+		return nv
+	default:
+		return v
 	}
-	return 0, false
 }
-func isRightAssoc(tt TokenType) bool { return tt == ASSIGN || tt == ARROW }
+=== END FILE: interpreter.go ===
 
-// ───────────────────────────── span emission (core) ─────────────────────────
+=== BEGIN FILE: interpreter_ops.go ===
+// interpreter_ops.go — PRIVATE: language ops (built-ins, assignment, iteration)
+// and the AST → bytecode emitter used by the exec layer.
 //
-// Centralized helpers. **All** node construction goes through these, which
-// also append exactly one span for the node (post-order).
+// This file:
+//  - Implements `newOps(ip)` with `initCore()` (registers all core natives).
+//  - Provides assignment semantics (`assignTo`) and helpers.
+//  - Normalizes collections to iterators (`__to_iter`) and drives iteration.
+//  - Implements deep value equality for const interning in the emitter.
+//  - Hosts the private emitter (`newEmitter`) used by exec for JIT.
 //
-// Rules:
-//   - For leaves tied to a concrete token, pass tok≥0 (start=end=tok).
-//   - For synthetic leaves (e.g. default "Any"), pass tok=-1 to emit Span{}.
-//   - For parents, pass the token range [startTok, endTok] that covers the node.
-//   - Helpers also update (lastSpanStartTok,lastSpanEndTok) to the node’s range,
-//     so callers can compose larger parent ranges deterministically.
+// Public API is in interpreter.go. Exec/call engine is in interpreter_exec.go.
+//
+// Concurrency model (minimal, Lua-style isolates):
+//  - A single *Interpreter is **not re-entrant**; do not call it from multiple
+//    goroutines. For parallelism, clone via (*Interpreter).Clone() and use the
+//    clone in another goroutine. Each clone has its own Core/Global/env graph,
+//    module cache, and source-tracking, so no locks are required here.
+//  - All state touched in this file is per-interpreter (o.ip / ip.*). There are
+//    no package-level mutable singletons. As long as an Interpreter isn't shared
+//    concurrently, operations here are race-free without additional locking.
+//  - Host native functions you register may themselves use goroutines, but they
+//    must not touch the *same* Interpreter or its Env from multiple goroutines.
+//    Use isolates (clones) for truly concurrent execution.
 
-func (p *parser) appendNodeSpanByTok(startTok, endTok int) {
-	if startTok >= 0 && endTok >= startTok &&
-		startTok < len(p.toks) && endTok < len(p.toks) {
-		p.post = append(p.post, Span{
-			StartByte: p.toks[startTok].StartByte,
-			EndByte:   p.toks[endTok].EndByte,
+package mindscript
+
+import (
+	"fmt"
+	"strings"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                         PRIVATE PANIC / ERROR HELPERS
+////////////////////////////////////////////////////////////////////////////////
+
+type returnSig struct{ v Value }
+type rtErr struct {
+	msg  string
+	src  *SourceRef
+	line int
+	col  int
+}
+
+func fail(msg string)          { panic(rtErr{msg: msg}) }
+func errNull(msg string) Value { return withAnnot(Null, msg) }
+func annotNull(msg string) Value {
+	return Value{Tag: VTNull, Annot: msg}
+}
+func withAnnot(v Value, ann string) Value { v.Annot = ann; return v }
+
+// panicRt rethrows a structured runtime error as a **value** (never a pointer).
+// Always use this (or fail) to signal runtime errors within the interpreter.
+func panicRt(msg string, src *SourceRef, line, col int) {
+	panic(rtErr{msg: msg, src: src, line: line, col: col})
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                          PRIVATE OPS FACADE (to API)
+////////////////////////////////////////////////////////////////////////////////
+
+func initCore(ip *Interpreter) {
+	if ip.Core == nil {
+		ip.Core = NewEnv(nil)
+	}
+	// sugar for native registration with a ctx-only closure
+	reg := func(name string, params []ParamSpec, ret S, body func(ctx CallCtx) Value) {
+		ip.RegisterNative(name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
+	}
+
+	// __assign_set(targetAst: Any, value: Any) -> Any
+	reg("__assign_set",
+		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			ast := expectAST(ctx.Arg("targetAst"), "__assign_set")
+			v := ctx.Arg("value")
+			ip.assignTo(ast, v, ctx.Env())
+			return v
 		})
-	} else {
-		p.post = append(p.post, Span{})
+
+	// __assign_def(targetAst: Any, value: Any) -> Any
+	reg("__assign_def",
+		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			ast := expectAST(ctx.Arg("targetAst"), "__assign_def")
+			v := ctx.Arg("value")
+			ip.assignTo(ast, v, ctx.Env(), true)
+			return v
+		})
+
+	// __plus (numbers/strings/arrays/maps)
+	reg("__plus",
+		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			a := AsMapValue(ctx.Arg("a"))
+			b := AsMapValue(ctx.Arg("b"))
+			if isNumber(a) && isNumber(b) {
+				if a.Tag == VTInt && b.Tag == VTInt {
+					return Int(a.Data.(int64) + b.Data.(int64))
+				}
+				return Num(toFloat(a) + toFloat(b))
+			}
+			if a.Tag == VTStr && b.Tag == VTStr {
+				return Str(a.Data.(string) + b.Data.(string))
+			}
+			if a.Tag == VTArray && b.Tag == VTArray {
+				x := append(append([]Value{}, a.Data.(*ArrayObject).Elems...),
+					b.Data.(*ArrayObject).Elems...)
+				return Arr(x)
+			}
+			if a.Tag == VTMap && b.Tag == VTMap {
+				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
+				out := &MapObject{
+					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
+					KeyAnn:  make(map[string]string, len(am.KeyAnn)+len(bm.KeyAnn)),
+					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
+				}
+				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
+				// LHS order/content
+				for _, k := range am.Keys {
+					out.Keys = append(out.Keys, k)
+					seen[k] = struct{}{}
+				}
+				for k, v := range am.Entries {
+					out.Entries[k] = v
+				}
+				for k, ann := range am.KeyAnn {
+					out.KeyAnn[k] = ann
+				}
+				// overlay RHS; append new keys in RHS order
+				for _, k := range bm.Keys {
+					if _, ok := seen[k]; !ok {
+						out.Keys = append(out.Keys, k)
+						seen[k] = struct{}{}
+					}
+				}
+				for k, v := range bm.Entries {
+					out.Entries[k] = v
+				}
+				for k, ann := range bm.KeyAnn {
+					out.KeyAnn[k] = ann
+				}
+				return Value{Tag: VTMap, Data: out}
+			}
+			return errNull("unsupported operands for '+'")
+		})
+
+	// __resolve_type: Value(Type) -> Value(Type(resolved))
+	reg("__resolve_type",
+		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
+		func(ctx CallCtx) Value {
+			t := ctx.Arg("t")
+			resolved := ip.resolveTypeValue(t, ctx.Env())
+			// Always return a pinned Type; never emit env-less types.
+			return TypeValIn(resolved, ctx.Env())
+		})
+
+	// __type_from_ast(ast: Any-handle) -> Type
+	// Build a Type at *instantiation* time from a serialized S-expression,
+	// pinning it to the current lexical environment (like closures do).
+	reg("__type_from_ast",
+		[]ParamSpec{{"ast", S{"id", "Any"}}}, S{"id", "Type"},
+		func(ctx CallCtx) Value {
+			h := ctx.Arg("ast")
+			if h.Tag != VTHandle {
+				return errNull("__type_from_ast: expected internal type-ast handle")
+			}
+			hd := h.Data.(*Handle)
+			if hd == nil || hd.Kind != "type-ast" {
+				return errNull("__type_from_ast: bad handle kind")
+			}
+			s, ok := hd.Data.(S)
+			if !ok {
+				return errNull("__type_from_ast: payload not a type AST")
+			}
+			if msg := validateTypeShape(s); msg != "" {
+				fail(msg)
+			}
+			return TypeValIn(s, ctx.Env())
+		})
+
+	// __annotate(text: Str, v: Any) -> Any
+	reg("__annotate",
+		[]ParamSpec{{"text", S{"id", "Str"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ctx CallCtx) Value { return withAnnot(ctx.Arg("v"), ctx.Arg("text").Data.(string)) })
+
+	// __collect_for_elems(iter: Any) -> Any   (used by high-level mapping helpers)
+	reg("__collect_for_elems",
+		[]ParamSpec{{"iter", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ctx CallCtx) (out Value) {
+			defer func() {
+				if r := recover(); r != nil {
+					if e, ok := r.(rtErr); ok {
+						out = errNull(e.msg)
+						return
+					}
+					panic(r)
+				}
+			}()
+			out = Arr(ip.collectForElemsScoped(ctx.Arg("iter"), ctx.Env()))
+			return
+		})
+
+	// __map_from(keys:[Str], vals:[Any]) -> Map
+	reg("__map_from",
+		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			ka := ctx.Arg("keys").Data.(*ArrayObject).Elems
+			va := ctx.Arg("vals").Data.(*ArrayObject).Elems
+			if len(ka) != len(va) {
+				return errNull("map_from: mismatched arity")
+			}
+			mo := &MapObject{
+				Entries: make(map[string]Value, len(ka)),
+				KeyAnn:  make(map[string]string, len(ka)),
+				Keys:    make([]string, 0, len(ka)),
+			}
+			for i := range ka {
+				if ka[i].Tag != VTStr {
+					return errNull("map key must be string")
+				}
+				k := ka[i].Data.(string)
+				mo.Entries[k] = va[i]
+				mo.Keys = append(mo.Keys, k)
+				if ann := ka[i].Annot; ann != "" {
+					mo.KeyAnn[k] = ann
+				}
+			}
+			return Value{Tag: VTMap, Data: mo}
+		})
+
+	// __len(array|map) -> Int
+	reg("__len",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
+		func(ctx CallCtx) Value {
+			x := AsMapValue(ctx.Arg("x"))
+			switch x.Tag {
+			case VTArray:
+				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
+			case VTMap:
+				return Int(int64(len(x.Data.(*MapObject).Entries)))
+			default:
+				return errNull("len expects array or map")
+			}
+		})
+
+	// __make_fun(params:[Str], types:[Type], ret:Type, bodyAst:Any, isOracle:Bool, examples:Any, basePath:[Int]) -> Fun
+	ip.RegisterNative("__make_fun",
+		[]ParamSpec{
+			{"params", S{"array", S{"id", "Str"}}},
+			{"types", S{"array", S{"id", "Type"}}},
+			{"ret", S{"id", "Type"}},
+			{"bodyAst", S{"id", "Any"}},
+			{"isOracle", S{"id", "Bool"}},
+			{"examples", S{"id", "Any"}},
+			{"basePath", S{"array", S{"id", "Int"}}},
+		},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			namesV := ctx.Arg("params").Data.(*ArrayObject).Elems
+			typesV := ctx.Arg("types").Data.(*ArrayObject).Elems
+			retTV := ctx.Arg("ret").Data.(*TypeValue)
+			bodyAny := ctx.Arg("bodyAst")
+			isOr := ctx.Arg("isOracle").Data.(bool)
+			exAny := ctx.Arg("examples")
+			baseAny := ctx.Arg("basePath")
+
+			names := make([]string, len(namesV))
+			types := make([]S, len(typesV))
+			for i := range namesV {
+				names[i] = namesV[i].Data.(string)
+			}
+			for i := range typesV {
+				types[i] = typesV[i].Data.(*TypeValue).Ast
+			}
+
+			// ---- Validate and box examples as a VTArray of [input, output] pairs ----
+			var examples Value
+			if exAny.Tag == VTNull {
+				examples = Arr(nil)
+			} else if exAny.Tag == VTArray {
+				pairs := exAny.Data.(*ArrayObject).Elems
+				for i, ex := range pairs {
+					if ex.Tag != VTArray {
+						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
+					}
+					pp := ex.Data.(*ArrayObject).Elems
+					if len(pp) != 2 {
+						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
+					}
+				}
+				// Detach the slice so later mutations to the caller's array don't alias.
+				examples = Arr(append([]Value(nil), pairs...))
+			} else {
+				return errNull("examples must be an array of [input, output] pairs (or null)")
+			}
+
+			hidden := false
+			if len(names) == 0 {
+				names = []string{"_"}
+				types = []S{S{"id", "Null"}}
+				hidden = true
+			}
+
+			// Build absolute base path for the body
+			var base NodePath
+			if baseAny.Tag == VTArray {
+				xs := baseAny.Data.(*ArrayObject).Elems
+				base = make(NodePath, 0, len(xs))
+				for _, v := range xs {
+					if v.Tag == VTInt {
+						base = append(base, int(v.Data.(int64)))
+					}
+				}
+			}
+
+			retAst := retTV.Ast
+			if isOr {
+				retAst = ensureNullableUnlessAny(retAst)
+			}
+
+			// Clone current SourceRef and attach base path
+			var sr *SourceRef
+			if ip.currentSrc != nil {
+				cpy := *ip.currentSrc
+				// IMPORTANT: 'base' is ABSOLUTE - overwrite.
+				cpy.PathBase = append(NodePath(nil), base...)
+				sr = &cpy
+			}
+
+			// Unbox function BODY from AST handle ----
+			bodyAst := expectAST(bodyAny, "__make_fun")
+
+			// Construct the function closing over the **parent env directly** (no extra frame).
+			return FunVal(&Fun{
+				Params:     names,
+				ParamTypes: types,
+				ReturnType: retAst,
+				Body:       bodyAst,
+				Env:        ctx.Env(), // <-- direct parent; makes globals late-bind correctly
+				HiddenNull: hidden,
+				IsOracle:   isOr,
+				Examples:   examples,
+				Src:        sr,
+				Sig: &SigMeta{
+					Names: append([]string{}, names...),
+					Types: append([]S{}, types...),
+				},
+			})
+		})
+
+	// __is_fun(x: Any) -> Bool
+	reg("__is_fun",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
+		func(ctx CallCtx) Value { return Bool(ctx.Arg("x").Tag == VTFun) })
+
+	// __iter_should_stop(x: Any) -> Bool
+	reg("__iter_should_stop",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
+		func(ctx CallCtx) Value {
+			v := ctx.Arg("x")
+			if v.Tag == VTNull {
+				if v.Annot != "" {
+					fail(v.Annot)
+				}
+				return Bool(true)
+			}
+			return Bool(false)
+		})
+
+	// __to_iter(x: Any) -> (Null -> Any?)  |  error
+	ip.RegisterNative("__to_iter",
+		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			x := AsMapValue(ctx.Arg("x"))
+
+			// Already an iterator?
+			if x.Tag == VTFun {
+				f := x.Data.(*Fun)
+				if len(f.Params) == 1 && ip.isType(Null, f.ParamTypes[0], f.Env) {
+					return x
+				}
+				fail("for expects array, map, or iterator function (Null -> Any?)")
+			}
+
+			// Helpers
+			newIter := func(parent *Env, lenTarget S, thenBlock S) Value {
+				env := NewEnv(parent)
+				env.Define("$i", Int(0))
+				body := S{"if",
+					S{"pair",
+						S{"binop", "<",
+							S{"id", "$i"},
+							S{"call", S{"id", "__len"}, lenTarget},
+						},
+						S{"block", thenBlock},
+					},
+					S{"block", S{"null"}},
+				}
+				var sr *SourceRef
+				if ip.currentSrc != nil {
+					cpy := *ip.currentSrc // shallow copy; Spans pointer intentionally shared
+					sr = &cpy
+				}
+				return FunVal(&Fun{
+					Params:     []string{"_"},
+					ParamTypes: []S{S{"id", "Null"}},
+					ReturnType: S{"unop", "?", S{"id", "Any"}},
+					Body:       body,
+					Env:        env,
+					Src:        sr,
+				})
+			}
+			inc := func() S {
+				return S{"assign", S{"id", "$i"},
+					S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
+				}
+			}
+
+			// Array → iterator
+			if x.Tag == VTArray {
+				envInit := NewEnv(ctx.Env())
+				envInit.Define("$arr", x)
+				then := S{"block",
+					inc(),
+					S{"idx",
+						S{"id", "$arr"},
+						S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
+					},
+				}
+				return newIter(envInit, S{"id", "$arr"}, then)
+			}
+
+			// Map → iterator (yields [key, value]) preserving insertion order + key annotations
+			if x.Tag == VTMap {
+				mo := x.Data.(*MapObject)
+				envInit := NewEnv(ctx.Env())
+				envInit.Define("$map", x)
+				keyVals := make([]Value, 0, len(mo.Keys))
+				for _, k := range mo.Keys {
+					s := Str(k)
+					if ann, ok := mo.KeyAnn[k]; ok && ann != "" {
+						s = withAnnot(s, ann)
+					}
+					keyVals = append(keyVals, s)
+				}
+				envInit.Define("$keys", Arr(keyVals))
+
+				then := S{"block",
+					S{"assign", S{"decl", "$k"},
+						S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
+					},
+					inc(),
+					S{"array",
+						S{"id", "$k"},
+						S{"idx", S{"id", "$map"}, S{"id", "$k"}},
+					},
+				}
+				return newIter(envInit, S{"id", "$keys"}, then)
+			}
+
+			fail("for expects array, map, or iterator function (Null -> Any?)")
+			return annotNull("__for_iter: unreachable")
+		})
+
+	ip.RegisterNative(
+		"__make_module",
+		[]ParamSpec{
+			{Name: "name", Type: S{"id", "Str"}}, // keep lax; runtime checks enforce string
+			{Name: "body", Type: S{"id", "Any"}}, // Type-carried AST
+			{Name: "base", Type: S{"id", "Any"}}, // [Int] path
+		},
+		S{"id", "Any"}, // could be a dedicated Module type later; Any is simplest now
+		nativeMakeModule,
+	)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                                ASSIGNMENT
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine ...bool) {
+	allowDefine := len(optAllowDefine) > 0 && optAllowDefine[0]
+	switch target[0].(string) {
+	case "id":
+		name := target[1].(string)
+		if err := env.Set(name, value); err != nil {
+			if allowDefine {
+				env.Define(name, value)
+				return
+			}
+			fail(err.Error())
+		}
+	case "decl":
+		env.Define(target[1].(string), value)
+	case "get":
+		obj := ip.evalFull(target[1].(S), env)
+		// resolve key string (literal or computed)
+		var keyStr string
+		if ks := target[2].(S); len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
+			keyStr = ks[1].(string)
+		} else {
+			k := ip.evalFull(target[2].(S), env)
+			if k.Tag != VTStr {
+				fail("object assignment requires map and string key")
+			}
+			keyStr = k.Data.(string)
+		}
+		mv := AsMapValue(obj)
+		if mv.Tag == VTMap {
+			mo := mv.Data.(*MapObject)
+			if _, exists := mo.Entries[keyStr]; !exists {
+				mo.Keys = append(mo.Keys, keyStr)
+			}
+			mo.Entries[keyStr] = value
+			syncModuleEnv(obj, keyStr, value) // no-op for plain maps
+			return
+		}
+		if obj.Tag == VTModule {
+			fail("object assignment requires map and string key") // unreachable, safety
+		}
+		if obj.Tag == VTArray {
+			fail("object assignment requires map and string key")
+		}
+		fail("object assignment requires map and string key")
+	case "idx":
+		obj, idx := ip.evalFull(target[1].(S), env), ip.evalFull(target[2].(S), env)
+		if obj.Tag == VTArray && idx.Tag == VTInt {
+			xs := obj.Data.(*ArrayObject).Elems
+			if len(xs) == 0 {
+				fail("index on empty array")
+			}
+			i := int(idx.Data.(int64))
+			if i < 0 {
+				i = len(xs) + i // -1 -> last, -len -> 0
+			}
+			if i < 0 || i >= len(xs) {
+				fail("array index out of range")
+			}
+			xs[i] = value
+			return
+		}
+		mv := AsMapValue(obj)
+		if mv.Tag == VTMap && idx.Tag == VTStr {
+			mo := mv.Data.(*MapObject)
+			k := idx.Data.(string)
+			if _, exists := mo.Entries[k]; !exists {
+				mo.Keys = append(mo.Keys, k)
+			}
+			mo.Entries[k] = value
+			syncModuleEnv(obj, k, value)
+			return
+		}
+		fail("index assignment requires array[int] or map[string]")
+	case "darr":
+		if value.Tag != VTArray {
+			for i := 1; i < len(target); i++ {
+				ip.assignTo(target[i].(S), annotNull("array pattern: RHS is not an array"), env, true)
+			}
+			return
+		}
+		xs := value.Data.(*ArrayObject).Elems
+		for i := 1; i < len(target); i++ {
+			if i-1 < len(xs) {
+				ip.assignTo(target[i].(S), xs[i-1], env, true)
+			} else {
+				ip.assignTo(target[i].(S), annotNull(fmt.Sprintf("array pattern: missing element #%d", i-1)), env, true)
+			}
+		}
+	case "dobj":
+		vmap := AsMapValue(value)
+		if vmap.Tag != VTMap {
+			for i := 1; i < len(target); i++ {
+				p := target[i].(S) // ("pair", key, pattern)
+				ip.assignTo(p[2].(S), annotNull("object pattern: RHS is not a map"), env, true)
+			}
+			return
+		}
+		mo := vmap.Data.(*MapObject)
+		m := mo.Entries
+		for i := 1; i < len(target); i++ {
+			p := target[i].(S)
+			k := unwrapKeyStr(p[1].(S))
+			if v, ok := m[k]; ok {
+				ip.assignTo(p[2].(S), v, env, true)
+			} else {
+				ip.assignTo(p[2].(S), annotNull(fmt.Sprintf("object pattern: missing key '%s'", k)), env, true)
+			}
+		}
+	case "annot":
+		text := target[1].(S)[1].(string)
+		sub := target[2].(S)
+		if len(sub) > 0 && sub[0].(string) == "decl" {
+			env.Define(sub[1].(string), withAnnot(value, text))
+			return
+		}
+		ip.assignTo(sub, value, env, true)
+	default:
+		fail("invalid assignment target")
 	}
-	p.lastSpanStartTok = startTok
-	p.lastSpanEndTok = endTok
 }
 
-// mkLeaf builds a leaf node whose span is a single token (tok). If tok<0,
-// a placeholder empty span is appended (keeps post-order cardinality intact).
-func (p *parser) mkLeaf(tag string, tok int, parts ...any) S {
-	n := L(tag, parts...)
-	p.appendNodeSpanByTok(tok, tok)
-	return n
-}
-
-// mk builds a parent node after its children were already constructed.
-// It appends exactly one span for the parent covering [startTok,endTok].
-func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
-	n := L(tag, parts...)
-	p.appendNodeSpanByTok(startTok, endTok)
-	return n
-}
-
-// ───────────────────────── NOOP / annotation utils ─────────────────────
-
-// onlyGapsToEOF reports whether from the current lookahead to EOF there are
-// no real tokens (only NOOP and/or ANNOTATION). This is the canonical
-// "need more input" detector for interactive mode.
-func (p *parser) onlyGapsToEOF() bool {
-	j := p.i
-	for j < len(p.toks) {
-		switch p.toks[j].Type {
-		case NOOP, ANNOTATION:
-			j++
-			continue
-		case EOF:
-			return true
-		default:
-			return false
+// syncModuleEnv keeps a module's Env consistent after a write to its map.
+// NOTE (isolates): modules live within a single Interpreter instance; this
+// function updates the module's *local* Env only. Do not cross-post between
+// interpreters.
+func syncModuleEnv(obj Value, key string, val Value) {
+	if obj.Tag == VTModule {
+		m := obj.Data.(*Module)
+		if _, ok := m.Env.table[key]; ok {
+			m.Env.table[key] = val
+		} else {
+			m.Env.Define(key, val)
 		}
 	}
-	return true
 }
 
-func (p *parser) nextTokenIsOnSameLine(as Token) bool {
-	if p.atEnd() {
-		return false
-	}
-	return p.peek().Line == as.Line
-}
+////////////////////////////////////////////////////////////////////////////////
+//                     TINY EVALUATORS (used by assignment)
+////////////////////////////////////////////////////////////////////////////////
 
-// Collect only *immediately adjacent* ANNOTATION tokens into a single source-carrying value.
-// Do NOT skip NOOPs here; a blank-line run must break annotation groups.
-func (p *parser) collectAnnotsSrc() annSrc {
-	var out annSrc
-	for !p.atEnd() && p.peek().Type == ANNOTATION {
-		tok := p.peek()
-		p.i++
-		if s, ok := tok.Literal.(string); ok && s != "" {
-			out = mergeAnn(out, annFromSingle(p.i-1, s))
+// evalFull compiles and runs a single expression in env.
+// Annotated null is turned into a runtime failure (panic(rtErr)) to align with assignment.
+func (ip *Interpreter) evalFull(n S, env *Env) Value {
+	em := newEmitter(ip, ip.currentSrc)
+	em.emitExpr(n)
+	em.emit(opReturn, 0)
+	ch := em.chunk()
+	res := ip.runChunk(ch, env, 0)
+	switch res.status {
+	case vmOK, vmReturn:
+		if res.value.Tag == VTNull && res.value.Annot != "" {
+			fail(res.value.Annot)
 		}
+		return res.value
+	case vmRuntimeError:
+		if res.value.Tag == VTNull && res.value.Annot != "" {
+			fail(res.value.Annot)
+		}
+		fail("runtime error")
+	default:
+		fail("unknown VM status")
+	}
+	return Null
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                             ITERATOR EXPANSION
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
+	iter = AsMapValue(iter)
+
+	// Normalize to iterator function via Core's __to_iter when needed.
+	if iter.Tag != VTFun {
+		toIter, err := ip.Core.Get("__to_iter")
+		if err != nil {
+			fail("for expects array, map, or iterator function (Null -> Any?)")
+		}
+		iter = ip.applyArgsScoped(toIter, []Value{iter}, scope)
+
+		// Safety: __to_iter now fails itself for bad inputs; if it ever
+		// returns non-fun here, keep the user-facing invariant.
+		if iter.Tag != VTFun {
+			fail("for expects array, map, or iterator function (Null -> Any?)")
+		}
+	}
+
+	// At this point, iter must be a function of shape (Null) -> Any?
+	f, ok := iter.Data.(*Fun)
+	if !ok {
+		fail("for expects array, map, or iterator function (Null -> Any?)")
+	}
+	if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
+		name := "_"
+		if len(f.Params) > 0 {
+			name = f.Params[0]
+		}
+		fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
+	}
+
+	stopFn, err := ip.Core.Get("__iter_should_stop")
+	if err != nil {
+		fail("missing __iter_should_stop")
+	}
+
+	out := []Value{}
+	for {
+		next := ip.applyArgsScoped(iter, []Value{Null}, scope)
+		if ip.applyArgsScoped(stopFn, []Value{next}, scope).Data.(bool) {
+			break
+		}
+		out = append(out, next)
 	}
 	return out
 }
 
-// collectGap coalesces a "gap" at a join: it first consumes immediately-adjacent
-// ANNOTATION tokens into a single annSrc and then skips any NOOPs (blank-line runs).
-// Use this *before* requiring a keyword/delimiter (then/do/in/from/else/elif, closers, etc.).
-// If callers then call need(...), EOF after this consumption will naturally become
-// DiagIncomplete in interactive mode via need(...).
-func (p *parser) collectGap() annSrc {
-	a := p.collectAnnotsSrc()
-	p.skipNoops()
-	return a
-}
+////////////////////////////////////////////////////////////////////////////////
+//                          VALUE EQUALITY (for emitter)
+////////////////////////////////////////////////////////////////////////////////
 
-// Attach one or more *single-line* ANNOTATION tokens that start on refLine.
-func (p *parser) attachSameLineAnnots(n S, refLine int) S {
-	if p.atEnd() || p.peek().Type != ANNOTATION {
-		return n
-	}
-	var acc annSrc
-	for !p.atEnd() && p.peek().Type == ANNOTATION && p.peek().Line == refLine {
-		tok := p.peek()
-		if s, ok := tok.Literal.(string); ok && s != "" && !strings.Contains(s, "\n") {
-			acc = mergeAnn(acc, annFromSingle(p.i, s))
-			p.i++ // consume
-			continue
+func (ip *Interpreter) deepEqual(a, b Value) bool {
+	// Visited set of (leftPtr,rightPtr) pairs to break cycles in arrays/maps.
+	type pair struct{ x, y any }
+	visited := make(map[pair]bool)
+
+	var eq func(x, y Value) bool
+	eq = func(x, y Value) bool {
+		// Treat modules as maps (same as the original function).
+		if x.Tag == VTModule {
+			x = Value{Tag: VTMap, Data: x.Data.(*Module).Map}
 		}
-		break
-	}
-	if !acc.ok {
-		return n
-	}
-	return p.attachAnnotFrom(acc, n)
-}
-
-// Attach annotation so:
-//   - the child ("str", txt) uses the annotation token's span (src.tokIdx), and
-//   - the wrapper ("annot", ...) inherits the *wrapped value's* span — not the child.
-//
-// This preserves strict post-order: base was already appended; we append the child
-// next, and finally the wrapper using the base's span snapshot (not "lastSpan*",
-// which now points at the child).
-func (p *parser) attachAnnotFrom(src annSrc, val S) S {
-	if !src.ok || src.txt == "" {
-		return val
-	}
-
-	base := val
-	have := ""
-	if b, h, ok := unwrapAnnot(val); ok {
-		base, have = b, h
-	}
-
-	// Snapshot the base's span *before* emitting the child, because appending
-	// the child will update lastSpan* to the child's span.
-	baseStartTok, baseEndTok := p.lastSpanStartTok, p.lastSpanEndTok
-	// Build the child "str" using the annotation tokens' combined range.
-	// If only one annotation token is present, startTok==endTok.
-	childText := joinNonEmpty(src.txt, have)
-	startTok := src.startTok
-	endTok := src.endTok
-	if startTok < 0 {
-		startTok = baseStartTok // fallback, though callers should supply annotation tokens
-	}
-	if endTok < 0 {
-		endTok = baseEndTok
-	}
-	// 1) Append child span.
-	child := p.mk("str", startTok, endTok, childText)
-
-	// 2) Reorder spans to match post-order of the *final* AST subtree:
-	// We just appended: [..., base, child]. The post-order under ("annot", child, base)
-	// must be: child, base, wrapper. Swap the last two so it becomes [..., child, base].
-	if n := len(p.post); n >= 2 {
-		p.post[n-2], p.post[n-1] = p.post[n-1], p.post[n-2]
-		// Do not touch lastSpanStartTok/EndTok; wrapper uses the base snapshot we captured.
-	}
-	// Wrapper inherits the *base's* span snapshot.
-	return p.mk("annot", baseStartTok, baseEndTok, child, base)
-}
-
-// ───────────────────── centralized A+B+C+D normalization ─────────────────────
-// A: PRE from the "left" side (e.g., LHS annot, key annot, pending PRE)
-// B: annotations immediately after the binding site token (e.g., '=' or ':')
-// C: PRE already on the parsed right/value node
-// D: annotations immediately following the right/value node (same adjacency rule as parser)
-//
-// Central ABCD normalization for VALUE sites (assign RHS, params value, map value, etc.).
-// A and B are source-carrying; C (existing on right) is folded in; D is adjacent after right.
-func (p *parser) normalizeABCD(a annSrc, b annSrc, right S) S {
-	baseRight, cTxt, _ := unwrapAnnot(right) // C: text only (no reliable tokens)
-	c := annSrc{txt: cTxt, startTok: -1, endTok: -1, ok: cTxt != ""}
-	d := p.collectAnnotsSrc() // D: includes source tokens (startTok/endTok set)
-	merged := mergeAnn(mergeAnn(a, b), mergeAnn(c, d))
-	return p.attachAnnotFrom(merged, baseRight)
-}
-
-// ───────────────────────── program / blocks ────────────────────────────
-
-func (p *parser) program() (S, error) {
-	var items []any
-	for !p.atEnd() {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
+		if y.Tag == VTModule {
+			y = Value{Tag: VTMap, Data: y.Data.(*Module).Map}
 		}
-		items = append(items, e)
-	}
-	rootStart := 0
-	rootEnd := len(p.toks) - 2 // last non-EOF
-	if rootEnd < rootStart || len(p.toks) == 0 {
-		return p.mk("block", -1, -1 /*empty*/), nil
-	}
-	return p.mk("block", rootStart, rootEnd, items...), nil
-}
 
-// blockUntil parses statements until a stop token is seen.
-// Span append happens once for the "block" node, after its children.
-func (p *parser) blockUntil(stops ...TokenType) (S, error) {
-	stop := map[TokenType]bool{}
-	for _, s := range stops {
-		stop[s] = true
-	}
-	var items []any
-	startTok := p.i
-	consumedAny := false
-
-	for !p.atEnd() && !stop[p.peek().Type] {
-		e, err := p.expr(0)
-		if err != nil {
-			return nil, err
+		// Numeric unification (Int/Num compare by value).
+		if isNumber(x) && isNumber(y) {
+			return toFloat(x) == toFloat(y)
 		}
-		items = append(items, e)
-		consumedAny = true
-	}
-	if consumedAny {
-		return p.mk("block", startTok, p.i-1, items...), nil
-	}
-	return p.mk("block", -1, -1 /*empty*/), nil
-}
 
-func (p *parser) parseBlock(requireDo bool) (S, error) {
-	if requireDo {
-		if _, err := p.need(DO, "expected 'do'"); err != nil {
-			return nil, err
+		// Tags must match (after numeric normalization above).
+		if x.Tag != y.Tag {
+			return false
 		}
-	}
-	b, err := p.blockUntil(END)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
 
-// ───────────────────────────── tiny node helpers ───────────────────────────
+		switch x.Tag {
+		case VTNull:
+			return true
+		case VTBool:
+			return x.Data.(bool) == y.Data.(bool)
+		case VTInt:
+			return x.Data.(int64) == y.Data.(int64)
+		case VTNum:
+			return x.Data.(float64) == y.Data.(float64)
+		case VTStr:
+			return x.Data.(string) == y.Data.(string)
 
-func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
-	switch t.Type {
-	case ID, TYPE:
-		return p.mkLeaf("id", start, tokText(t)), true
-	case INTEGER:
-		return p.mkLeaf("int", start, t.Literal), true
-	case NUMBER:
-		return p.mkLeaf("num", start, t.Literal), true
-	case STRING:
-		return p.mkLeaf("str", start, t.Literal), true
-	case BOOLEAN:
-		return p.mkLeaf("bool", start, t.Literal), true
-	case NULL:
-		return p.mkLeaf("null", start), true
-	}
-	return nil, false
-}
-
-// ---- tiny shared helpers for delimited lists ----
-
-// drainTrailingGapsUntil consumes any sequence of NOOPs and/or ANNOTATIONs
-// until the given closing token is seen. Each NOOP becomes ("noop") and each
-// annotation becomes ("annot", ("str", mergedText), ("noop")).
-//
-// It never crosses non-gap tokens. If a non-gap appears before the closer,
-// it delegates to need(close, expectMsg) to produce the right diagnostic.
-func (p *parser) drainTrailingGapsUntil(close TokenType, expectMsg string, out *[]any) error {
-	for {
-		if p.atEnd() {
-			// Let need(...) decide whether this is parse vs incomplete, with correct anchoring.
-			if _, err := p.need(close, expectMsg); err != nil {
-				return err
+		case VTArray:
+			ax := x.Data.(*ArrayObject)
+			ay := y.Data.(*ArrayObject)
+			// Cycle guard: if we've already compared this pair, consider it equal.
+			k := pair{ax, ay}
+			if visited[k] {
+				return true
 			}
-			return nil
-		}
-		switch p.peek().Type {
-		case close:
-			return nil
+			visited[k] = true
 
-		case NOOP:
-			*out = append(*out, p.mkLeaf("noop", p.i))
-			p.i++
+			if len(ax.Elems) != len(ay.Elems) {
+				return false
+			}
+			for i := range ax.Elems {
+				if !eq(ax.Elems[i], ay.Elems[i]) {
+					return false
+				}
+			}
+			return true
 
-		case ANNOTATION:
-			// Merge adjacent annotations and wrap a noop, preserving the annotation's source span.
-			src := p.collectAnnotsSrc()
-			*out = append(*out, p.attachAnnotFrom(src, p.mkLeaf("noop", -1)))
+		case VTMap:
+			mx := x.Data.(*MapObject)
+			my := y.Data.(*MapObject)
+			// Cycle guard for maps.
+			k := pair{mx, my}
+			if visited[k] {
+				return true
+			}
+			visited[k] = true
+
+			if len(mx.Entries) != len(my.Entries) {
+				return false
+			}
+			for k, xv := range mx.Entries {
+				yv, ok := my.Entries[k]
+				if !ok || !eq(xv, yv) {
+					return false
+				}
+			}
+			return true
+
+		case VTFun:
+			// Pointer equality on closures (matches original behavior).
+			return x.Data.(*Fun) == y.Data.(*Fun)
+
+		case VTType:
+			// Resolve and structurally compare type ASTs (matches original behavior).
+			ta := x.Data.(*TypeValue)
+			tb := y.Data.(*TypeValue)
+			ea := ta.Env
+			if ea == nil {
+				ea = ip.Core
+			}
+			eb := tb.Env
+			if eb == nil {
+				eb = ip.Core
+			}
+			ra := ip.resolveType(ta.Ast, ea)
+			rb := ip.resolveType(tb.Ast, eb)
+			return equalLiteralS(ra, rb)
+
+		case VTHandle:
+			ah, okA := a.Data.(*Handle)
+			bh, okB := b.Data.(*Handle)
+			return okA && okB && ah == bh // identity equality
 
 		default:
-			// Unexpected token before closer → canonical error.
-			if _, err := p.need(close, expectMsg); err != nil {
-				return err
-			}
-			return nil
+			// Handles VTHandle and any other tags we don't explicitly equal-compare.
+			return false
 		}
+	}
+
+	return eq(a, b)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                                SMALL HELPERS
+////////////////////////////////////////////////////////////////////////////////
+
+func isNumber(v Value) bool { return v.Tag == VTInt || v.Tag == VTNum }
+func toFloat(v Value) float64 {
+	if v.Tag == VTInt {
+		return float64(v.Data.(int64))
+	}
+	return v.Data.(float64)
+}
+
+func unwrapKeyStr(k S) string {
+	for len(k) > 0 && k[0].(string) == "annot" {
+		k = k[2].(S)
+	}
+	if len(k) >= 2 && k[0].(string) == "str" {
+		return k[1].(string)
+	}
+	fail("map key is not a string")
+	return ""
+}
+
+// Noop detection: ("noop") and ("annot", ..., ("noop"), ...) are “noopish” and
+// generate no code inside blocks.
+func isNoopish(n S) bool {
+	if len(n) == 0 {
+		return false
+	}
+	switch n[0].(string) {
+	case "noop":
+		// Defensive: treat a stray ("noop") in expression position as plain Null.
+		return true
+	case "annot":
+		// n[2] is the subject node; treat annot(noop) as noop
+		if len(n) >= 3 {
+			if sub, ok := n[2].(S); ok {
+				return isNoopish(sub)
+			}
+		}
+		return false
+	default:
+		return false
 	}
 }
 
-// ───────────────────────────── prefix / postfix / infix ────────────────────
+// Given a VTType, resolve its AST using its own env if present; otherwise use fallback.
+func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
+	if v.Tag != VTType {
+		return S{"id", "Any"}
+	}
+	tv := v.Data.(*TypeValue)
+	env := tv.Env
+	if env == nil {
+		env = fallback
+	}
+	return ip.resolveType(tv.Ast, env)
+}
 
-func (p *parser) expr(minBP int) (S, error) {
-	tokIndexOfThis := p.i
-	t := p.peek()
-	p.i++
+// "A -> B -> C -> A" using pretty names instead of full canonical specs.
+func joinCyclePath(stack []string, again string) string {
+	i := 0
+	for idx, s := range stack {
+		if s == again {
+			i = idx
+			break
+		}
+	}
+	chain := append(stack[i:], again)
+	out := make([]string, len(chain))
+	for k, s := range chain {
+		out[k] = prettySpec(s)
+	}
+	return strings.Join(out, " -> ")
+}
 
-	var left S
-	leftAnnA := annNone()
-	leftStartTok := tokIndexOfThis
+// expectAST extracts an S-expression from a VTHandle("ast", ...).
+// Fails with a friendly runtime error instead of panicking on bad inputs.
+func expectAST(v Value, where string) S {
+	if v.Tag != VTHandle {
+		fail(where + ": body must be an AST handle")
+	}
+	hd, _ := v.Data.(*Handle)
+	if hd == nil || hd.Kind != "ast" {
+		fail(where + ": body must be an AST handle")
+	}
+	s, ok := hd.Data.(S)
+	if !ok {
+		fail(where + ": AST payload corrupt")
+	}
+	return s
+}
 
-	// ---- prefix ----
-	if n, ok := p.tryLiteralOrId(t, tokIndexOfThis); ok {
-		left = n
+// nativeMakeModule is the implementation of the __make_module primitive.
+//
+// UNIFORM CACHING & CYCLE DETECTION LIVE HERE.
+// This ensures AST/Code/File/inline constructions all behave the same.
+//
+// It receives:
+//   - name: Str   — the **canonical identity** for the module (NOT overwritten).
+//   - body: Type  — AST for the module body wrapped as a type value.
+//   - base: [Int] — absolute NodePath indicating where the body lives in the
+//     caller’s SourceRef; used to re-root spans to the body.
+//
+// Plumbing:
+//   - We build a child SourceRef with PathBase=base so VM marks and PC→(line,col)
+//     map into the module body text.
+//   - Runtime errors are rethrown with exact location using panicRt, so they
+//     bubble to runTopWithSource and render a single caret at the true site.
+//
+// Concurrency note: module load state (ip.modules, ip.loadStack) belongs to a
+// single Interpreter isolate. Do not share the same Interpreter across goroutines.
+func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
+	nameV := ctx.Arg("name")
+	bodyV := ctx.Arg("body")
+	baseV := ctx.Arg("base")
+
+	if nameV.Tag != VTStr {
+		fail("module name must be a string")
+	}
+	canon := nameV.Data.(string)
+
+	// ---- Uniform cycle detection (stack + in-progress record) ----
+	for _, s := range ip.loadStack {
+		if s == canon {
+			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon)))
+		}
+	}
+	if ip.modules != nil {
+		if rec, ok := ip.modules[canon]; ok && rec.state == modLoading {
+			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(append(ip.loadStack, canon), canon)))
+		}
+	}
+
+	// ---- Uniform caching (success-only) ----
+	if ip.modules != nil {
+		if rec, ok := ip.modules[canon]; ok && rec.state == modLoaded && rec.mod != nil {
+			return Value{Tag: VTModule, Data: rec.mod}
+		}
 	} else {
-		switch t.Type {
-		case NOOP:
-			left = p.mkLeaf("noop", tokIndexOfThis)
+		ip.modules = map[string]*moduleRec{}
+	}
 
-		case ENUM:
-			// Accept gap (annotations/newlines) between 'Enum' and '[' safely.
-			saveI := p.i
-			enumPre := p.collectGap()
-			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
-				p.i++ // consume '[' or CLSQUARE
-				// Reuse full array machinery (gaps, PRE/POST, dangling PRE).
-				arr, err := p.arrayLiteralAfterOpen()
-				if err != nil {
-					return nil, err
-				}
-				// Retag: ("array", e1, e2, ...) -> ("enum", e1, e2, ...)
-				items := make([]any, 0, len(arr)-1)
-				for i := 1; i < len(arr); i++ {
-					items = append(items, arr[i])
-				}
-				n := p.mk("enum", tokIndexOfThis, p.i-1, items...)
-				if enumPre.ok {
-					n = p.attachAnnotFrom(enumPre, n)
-				}
-				left = n
-			} else {
-				// Not an Enum-literal; restore so gap remains for the next construct.
-				p.i = saveI
-				left = p.mkLeaf("id", tokIndexOfThis, tokText(t))
-			}
+	// Mark as loading and push on stack.
+	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
+	ip.loadStack = append(ip.loadStack, canon)
 
-		case MINUS, NOT:
-			pre, err := p.takeReqGap(t, "expected expression after unary operator")
-			if err != nil {
-				return nil, err
-			}
-			r, err := p.expr(80)
-			if err != nil {
-				return nil, err
-			}
-			if pre.ok {
-				r = p.attachAnnotFrom(pre, r)
-			}
-			endTok := p.lastSpanEndTok
-			if endTok < 0 {
-				endTok = tokIndexOfThis
-			}
-			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
+	// Ensure we never leave a stale modLoading record or a stuck stack entry.
+	// On panic/failure, delete the cache record; always pop loadStack.
+	defer func() {
+		// Pop load stack
+		if n := len(ip.loadStack); n > 0 {
+			ip.loadStack = ip.loadStack[:n-1]
+		}
+		// If not successfully flipped to modLoaded, remove the half-built record.
+		if rec, ok := ip.modules[canon]; ok && rec.state != modLoaded {
+			delete(ip.modules, canon)
+		}
+		// Preserve existing error semantics.
+		if r := recover(); r != nil {
+			panic(r)
+		}
+	}()
 
-		case LROUND, CLROUND:
-			inner, err := p.parseGrouping()
-			if err != nil {
-				return nil, err
-			}
-			left = inner
-			leftStartTok = tokIndexOfThis
+	// ---- Decode body AST and base path ----
+	bodyAst := expectAST(bodyV, "__make_module")
 
-		case LSQUARE, CLSQUARE:
-			a, err := p.arrayLiteralAfterOpen()
-			if err != nil {
-				return nil, err
+	// Decode absolute base path from [Int]
+	var base NodePath
+	if baseV.Tag == VTArray {
+		xs := baseV.Data.(*ArrayObject).Elems
+		base = make(NodePath, 0, len(xs))
+		for _, v := range xs {
+			if v.Tag != VTInt {
+				fail("internal error: module base path must be [Int]")
 			}
-			left = a
-			leftStartTok = tokIndexOfThis
-
-		case LCURLY:
-			mp, err := p.mapLiteralAfterOpen(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = mp
-			leftStartTok = tokIndexOfThis
-
-		case FUNCTION:
-			fn, err := p.funExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = fn
-			leftStartTok = tokIndexOfThis
-
-		case ORACLE:
-			orc, err := p.oracleExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = orc
-			leftStartTok = tokIndexOfThis
-
-		case MODULE:
-			pre, err := p.takeReqGap(t, "expected module name expression")
-			if err != nil {
-				return nil, err
-			}
-			name, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			if pre.ok {
-				name = p.attachAnnotFrom(pre, name)
-			}
-			// Accept annotations/newlines before 'do' and attach them to body.
-			preDo := p.collectGap()
-			body, err := p.parseBlock(true)
-			if err != nil {
-				return nil, err
-			}
-			if preDo.ok {
-				body = p.attachAnnotFrom(preDo, body)
-			}
-			left = p.mk("module", tokIndexOfThis, p.i-1, name, body)
-			leftStartTok = tokIndexOfThis
-
-		case RETURN, BREAK, CONTINUE:
-			n, err := p.parseControl(t, tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = n
-			leftStartTok = tokIndexOfThis
-
-		case IF:
-			thenIf, err := p.ifExpr()
-			if err != nil {
-				return nil, err
-			}
-			left = p.mk("if", tokIndexOfThis, p.i-1, thenIf[1:]...)
-			leftStartTok = tokIndexOfThis
-
-		case DO:
-			body, err := p.parseBlock(false)
-			if err != nil {
-				return nil, err
-			}
-			left = body
-			leftStartTok = tokIndexOfThis
-
-		case FOR:
-			f, err := p.forExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = f
-			leftStartTok = tokIndexOfThis
-
-		case WHILE:
-			w, err := p.whileExpr(tokIndexOfThis)
-			if err != nil {
-				return nil, err
-			}
-			left = w
-			leftStartTok = tokIndexOfThis
-
-		case LET:
-			pat, a, err := p.declPattern()
-			if err != nil {
-				return nil, err
-			}
-			left = pat
-			leftAnnA = a
-			leftStartTok = tokIndexOfThis
-
-			// If destructuring, require an '=' (after any annotations).
-			base, _, _ := unwrapAnnot(pat)
-			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
-				// Skip GAPs (ANNOTATION/NOOP) without letting them satisfy the requirement.
-				j := p.i
-				for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
-					j++
-				}
-				// If only gaps/EOF remain, report same message across modes.
-				if j >= len(p.toks) || p.toks[j].Type == EOF {
-					line, col := p.posAfterLastSpan()
-					kind := DiagParse
-					if p.interactive {
-						kind = DiagIncomplete
-					}
-					return nil, &Error{Kind: kind, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-				}
-				// Not EOF: require ASSIGN next; if not, hard parse error at that token.
-				if p.toks[j].Type != ASSIGN {
-					line, col := p.posAtByte(p.toks[j].StartByte)
-					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-				}
-			}
-
-		case TYPECONS:
-			pre, err := p.takeReqGap(t, "expected type expression after 'type'")
-			if err != nil {
-				return nil, err
-			}
-			x, err := p.expr(1) // keep bp=1 behavior
-			if err != nil {
-				return nil, err
-			}
-			if pre.ok {
-				x = p.attachAnnotFrom(pre, x)
-			}
-			left = p.mk("type", tokIndexOfThis, p.lastSpanEndTok, x)
-			leftStartTok = tokIndexOfThis
-
-		case ANNOTATION:
-			// Build a source-carrying annotation payload
-			src := annSrc{ok: true, txt: "", startTok: tokIndexOfThis, endTok: tokIndexOfThis}
-			if s, ok := t.Literal.(string); ok {
-				src.txt = s
-			}
-
-			// Floating annotation: if the very next token is a NOOP, consume exactly one
-			// NOOP and return annot(noop) immediately.
-			if p.match(NOOP) {
-				return p.attachAnnotFrom(src, p.mkLeaf("noop", p.i-1)), nil
-			}
-
-			// Standalone comment: after skipping NOOPs, if the next token cannot start a value,
-			// synthesize annot(noop) without consuming any real NOOPs.
-			{
-				j := p.i
-				for j < len(p.toks) && p.toks[j].Type == NOOP {
-					j++
-				}
-				next := EOF
-				if j < len(p.toks) {
-					next = p.toks[j].Type
-				}
-				switch next {
-				case EOF:
-					// Interactive + only gaps to EOF ⇒ ask for more input instead of annot(noop).
-					if p.interactive && p.onlyGapsToEOF() {
-						line, col := p.posAtByte(t.StartByte)
-						return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
-					}
-					return p.attachAnnotFrom(src, p.mkLeaf("noop", -1)), nil
-				case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
-					return p.attachAnnotFrom(src, p.mkLeaf("noop", -1)), nil
-				}
-			}
-
-			// Interactive: only gaps after the annotation → incomplete
-			if p.interactive && p.onlyGapsToEOF() {
-				line, col := p.posAtByte(t.StartByte)
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
-			}
-			// Non-interactive EOF → treat as annot(noop)
-			if p.atEnd() && !p.interactive {
-				left = p.attachAnnotFrom(src, p.mkLeaf("noop", -1))
-				leftStartTok = tokIndexOfThis
-				break
-			}
-
-			// Normal case: parse the annotated operand
-			operand, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			endTok := p.lastSpanEndTok
-			if endTok < 0 {
-				endTok = tokIndexOfThis
-			}
-
-			// If operand is an assignment, fold PRE onto the RHS value
-			if len(operand) >= 3 {
-				if tag, _ := operand[0].(string); tag == "assign" {
-					lhs, _ := operand[1].(S)
-					rhs, _ := operand[2].(S)
-					rhs = p.attachAnnotFrom(src, rhs)
-					left = p.mk("assign", -1, -1, lhs, rhs)
-					return left, nil
-				}
-			}
-
-			// If operand is a control form, PRE attaches to the control's VALUE
-			if len(operand) >= 2 {
-				if tag, _ := operand[0].(string); tag == "return" || tag == "break" || tag == "continue" {
-					val := operand[1].(S)
-					val = p.attachAnnotFrom(src, val)
-					left = p.mk(tag, tokIndexOfThis, endTok, val)
-					leftStartTok = tokIndexOfThis
-					return left, nil
-				}
-			}
-
-			// Normal (non-assignment, non-control) case: wrap operand with PRE
-			left = p.attachAnnotFrom(src, operand)
-			return left, nil
-
-		default:
-			if t.Type == EOF && p.interactive {
-				line, col := p.posAfterLastSpan()
-				return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
-			}
-			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
+			base = append(base, int(v.Data.(int64)))
 		}
 	}
 
-	// ---- postfix chain ----
-	for {
-		n, ok, err := p.parseOnePostfix(left, leftStartTok)
-		if err != nil {
-			return nil, err
+	// Fresh env for the module using a fast snapshot of the pre-seeded Base.
+	modBase := ip.newBaseFromTemplate()
+	// User frame for the module (exports come from here). Allow overwriting into Base.
+	modEnv := NewEnv(modBase)
+
+	// SourceRef rooted at the module BODY path (absolute)
+	var sr *SourceRef
+	if ip.currentSrc != nil {
+		// Compose any existing PathBase with the module's absolute body path.
+		sr = &SourceRef{
+			Name:     ip.currentSrc.Name,
+			Src:      ip.currentSrc.Src,
+			Spans:    ip.currentSrc.Spans, // keep full index; marks are absolute
+			PathBase: append(NodePath(nil), base...),
 		}
+	}
+
+	// JIT + run (like runTopWithSource, but we handle errors to avoid re-wrap)
+	ch := ip.jitTop(bodyAst, sr)
+
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
+	res := ip.runChunk(ch, modEnv, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		// ok
+	case vmRuntimeError:
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		msg := res.value.Annot
+		if msg == "" {
+			msg = "runtime error"
+		}
+		// Rethrow as structured inner-source error (single caret at true site).
+		panicRt(msg, ch.Src, line, col)
+	default:
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		panicRt("unknown VM status", ch.Src, line, col)
+	}
+
+	// Snapshot exports
+	mo := buildModuleMap(modEnv)
+	m := &Module{Name: canon, Map: mo, Env: modEnv}
+
+	// Commit cache (success-only)
+	rec := ip.modules[canon]
+	rec.mod = m
+	rec.env = modEnv
+	rec.state = modLoaded
+	rec.err = nil
+
+	return Value{Tag: VTModule, Data: m}
+}
+=== END FILE: interpreter_ops.go ===
+
+=== BEGIN FILE: interpreter_exec.go ===
+// interpreter_exec.go — PRIVATE: execution & call engine for MindScript.
+//   - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
+//     runs on the VM, and **bubbles unified hard errors (*Error) without formatting**.
+//   - Implements function application, currying, and native-call scoping.
+//   - No exported identifiers here. The public facade lives in interpreter.go.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// MARKING PLAN (PRECISE CARETS)
+// =============================
+//
+// We make runtime caret locations precise and predictable by aligning VM marks
+// with parser spans.
+//
+// Invariants
+// ----------
+//  1. **1:1 Node ↔ Span (parser)** — the parser records exactly one Span per AST
+//     node (every subexpression has a node and a span).
+//  2. **1:1 Node ↔ Mark (emitter)** — the emitter records **exactly one** PCMark
+//     for every AST node it emits code for. (Nodes that truly produce no code do
+//     not get a mark unless they are direct failure targets.)
+//  3. **Monotonic marks** — marks are appended in bytecode order with PC=here().
+//  4. **No late parent marks** — once we place a child’s mark immediately before
+//     a failure-prone instruction, we must not emit a parent/sibling mark before
+//     that instruction executes.
+//  5. **Correct PathBase** — chunks compiled for function bodies / module bodies
+//     carry a SourceRef whose PathBase points at the body’s absolute AST path,
+//     so marks inside map to the right spans.
+//
+// Placement Rules (authoritative)
+// -------------------------------
+//   - **Identifiers**: mark the identifier node **right before** opLoadGlobal.
+//   - **Unary** (-, not): mark the operand **right before** the opcode.
+//   - **Binary** (-,*,/,%, <,<=,>,>=, ==, !=): emit LHS, then RHS; mark the **RHS**
+//     **right before** the arithmetic/compare opcode (or before the builtin CALL
+//     for '+', which lowers to __plus).
+//   - **Calls**: evaluate callee (no mark). For each argument:
+//     1) emit arg code
+//     2) mark the **arg node** **right before** `opCall 1`
+//     3) emit `opCall 1`
+//     For zero-arg call: mark the **callee** right before `opCall 0`.
+//   - **Property** (`obj.name`): emit obj, mark the **property token** right before
+//     `opGetProp`.
+//   - **Index** (`obj[idx]`): emit obj then idx; mark the **idx node** right before
+//     `opGetIdx`.
+//   - **if / while gates**: mark the **tested condition node** right before
+//     `opJumpIfFalse`.
+//   - **Blocks**: never emit a parent mark between a child’s mark and its failing
+//     instruction. No extra block-level mark is needed. **Important:** child
+//     paths must use the **original AST child index** (do not compact after
+//     skipping noopish children), to keep NodePath ↔ Span alignment.
+//   - **Annotations**: attribute errors to the **subject** node (not the wrapper).
+//     For `#(doc) (lhs = rhs)`, we mark the **LHS** before the assignment call.
+//   - **for**: the iterator expression is marked once at the `__to_iter(iterExpr)`
+//     call site. We do not duplicate a mark at the loop head.
+//
+// NOTE: These rules ensure that the VM’s “last mark with PC ≤ failingPC” picks
+// the blameworthy child.
+//
+// Error policy (unchanged)
+// ------------------------
+//   - Soft errors → annotated-null Values.
+//   - Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; formatting only
+//     at the public API surface.
+package mindscript
+
+import (
+	"fmt"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                          PRIVATE EXEC FACADE (to API)
+////////////////////////////////////////////////////////////////////////////////
+
+type execImpl struct{ ip *Interpreter }
+
+func newExec(ip *Interpreter) execCore { return &execImpl{ip: ip} }
+
+// evalSource parses + evaluates in the provided env (fresh or persistent).
+// Returns Value on success; on hard failure returns a *Error with Src attached.
+// No pretty printing here.
+func (x *execImpl) evalSource(src string, env *Env) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok && e.Src == nil {
+			e.Src = &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		}
+		return Value{}, err
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	return x.ip.runTopWithSource(ast, env, false, sr)
+}
+
+// evalAST evaluates an AST in the provided env.
+// No pretty printing here.
+func (x *execImpl) evalAST(ast S, env *Env) (Value, error) {
+	return x.ip.runTopWithSource(ast, env, false, nil)
+}
+
+func (x *execImpl) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	return x.ip.applyArgsScoped(fn, args, callSite)
+}
+
+func (x *execImpl) funMeta(fn Value) (Callable, bool) {
+	if fn.Tag != VTFun {
+		return nil, false
+	}
+	return &funCallable{f: fn.Data.(*Fun), doc: fn.Annot}, true
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                      CORE EXECUTION PLUMBING (PRIVATE)
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
+
+	// Debug spans.
+	if DebuggingMode {
+		_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			switch sig := r.(type) {
+			case returnSig:
+				out, err = sig.v, nil
+			case *Error:
+				if uncaught {
+					out, err = annotNull(sig.Msg), nil
+					return
+				}
+				if sig.Src == nil {
+					sig.Src = sr
+				}
+				err = sig
+				out = Value{}
+			case rtErr:
+				srcRef := sig.src
+				if srcRef == nil {
+					srcRef = sr
+				}
+				line, col := sig.line, sig.col
+				if line <= 0 || col <= 0 {
+					line, col = ip.sourcePosFromChunk(nil, srcRef, 0)
+				}
+				if uncaught {
+					out, err = errNull(sig.msg), nil
+					return
+				}
+				err = &Error{Kind: DiagRuntime, Msg: sig.msg, Src: srcRef, Line: line, Col: col}
+				out = Value{}
+			case error:
+				if uncaught {
+					out, err = annotNull(sig.Error()), nil
+					return
+				}
+				line, col := ip.sourcePosFromChunk(nil, sr, 0)
+				err = &Error{Kind: DiagRuntime, Msg: sig.Error(), Src: sr, Line: line, Col: col}
+				out = Value{}
+			default:
+				if uncaught {
+					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil
+					return
+				}
+				line, col := ip.sourcePosFromChunk(nil, sr, 0)
+				err = &Error{Kind: DiagRuntime, Msg: fmt.Sprintf("runtime panic: %v", r), Src: sr, Line: line, Col: col}
+				out = Value{}
+			}
+		}
+	}()
+
+	ch := ip.jitTop(ast, sr)
+	prev := ip.currentSrc
+	ip.currentSrc = ch.Src
+	res := ip.runChunk(ch, env, 0)
+	ip.currentSrc = prev
+
+	switch res.status {
+	case vmOK, vmReturn:
+		return res.value, nil
+	case vmRuntimeError:
+		if uncaught {
+			return res.value, nil
+		}
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		msg := res.value.Annot
+		if msg == "" {
+			msg = "runtime error"
+		}
+		return Value{}, &Error{Kind: DiagRuntime, Msg: msg, Src: ch.Src, Line: line, Col: col}
+	default:
+		if uncaught {
+			return errNull("unknown VM status"), nil
+		}
+		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+		return Value{}, &Error{Kind: DiagRuntime, Msg: "unknown VM status", Src: ch.Src, Line: line, Col: col}
+	}
+}
+
+// Build a one-off top-level function body and ensure it is compiled.
+func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
+	f := &Fun{ReturnType: S{"id", "Any"}, Body: ast, Src: sr}
+	ip.ensureChunkWithSource(f, sr)
+	return f.Chunk
+}
+
+func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
+	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
+		return
+	}
+	em := newEmitter(ip, sr)
+	em.emitFunBody(f.Body)
+	ch := em.chunk()
+	ch.Src = sr
+	f.Chunk = ch
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                    CALL ENGINE: APPLY / CURRY / EXECUTE
+////////////////////////////////////////////////////////////////////////////////
+
+func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
+	if fn.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fn.Data.(*Fun)
+
+	if len(args) == 0 {
+		switch len(f.Params) {
+		case 0:
+			return ip.execFunBodyScoped(fn, callSite)
+		case 1:
+			if ip.isType(Null, f.ParamTypes[0], f.Env) {
+				return ip.applyOneScoped(fn, Null, callSite)
+			}
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		default:
+			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
+		}
+	}
+
+	cur := fn
+	for i := 0; i < len(args); i++ {
+		cur = ip.applyOneScoped(cur, args[i], callSite)
+		if i < len(args)-1 && cur.Tag != VTFun {
+			fail("too many arguments")
+		}
+	}
+	return cur
+}
+
+func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Value {
+	if fnVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := fnVal.Data.(*Fun)
+
+	if len(f.Params) == 0 {
+		res := ip.execFunBodyScoped(fnVal, callSite)
+		if res.Tag != VTFun {
+			fail("too many arguments")
+		}
+		return ip.applyOneScoped(res, arg, callSite)
+	}
+
+	paramName := f.Params[0]
+	paramType := f.ParamTypes[0]
+	if !ip.isType(arg, paramType, f.Env) {
+		exp := FormatType(paramType)
+		got := FormatType(ip.ValueToType(arg, f.Env))
+		fail(fmt.Sprintf("type mismatch in parameter '%s': expected %s, got %s",
+			paramName, exp, got))
+	}
+
+	parent := f.Env
+	if f.NativeName != "" && callSite != nil {
+		if f.Env == nil || f.Env == ip.Core {
+			parent = callSite
+		}
+	}
+	callEnv := NewEnv(parent)
+	callEnv.Define(paramName, arg)
+
+	if len(f.Params) > 1 {
+		next := FunVal(&Fun{
+			Params:     append([]string{}, f.Params[1:]...),
+			ParamTypes: append([]S{}, f.ParamTypes[1:]...),
+			ReturnType: f.ReturnType,
+			Body:       f.Body,
+			Env:        callEnv,
+			HiddenNull: f.HiddenNull,
+			Chunk:      f.Chunk,
+			NativeName: f.NativeName,
+			Src:        f.Src,
+			IsOracle:   f.IsOracle,
+			Examples:   f.Examples,
+			Sig:        f.Sig, // preserve original declaration signature across currying
+		})
+		next.Annot = fnVal.Annot
+		return next
+	}
+
+	execFun := &Fun{
+		Params:     nil,
+		ParamTypes: append([]S(nil), f.ParamTypes...),
+		ReturnType: f.ReturnType,
+		Body:       f.Body,
+		Env:        callEnv,
+		HiddenNull: f.HiddenNull,
+		Chunk:      f.Chunk,
+		NativeName: f.NativeName,
+		IsOracle:   f.IsOracle,
+		Examples:   f.Examples,
+		Src:        f.Src,
+		Sig:        f.Sig, // preserve for execution
+	}
+	execVal := FunVal(execFun)
+	execVal.Annot = fnVal.Annot
+	return ip.execFunBodyScoped(execVal, callSite)
+}
+
+func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
+	if funVal.Tag != VTFun {
+		fail("not a function")
+	}
+	f := funVal.Data.(*Fun)
+
+	if f.NativeName != "" {
+		impl, ok := ip.native[f.NativeName]
 		if !ok {
-			break
+			fail(fmt.Sprintf("unknown native %q", f.NativeName))
 		}
-		left = n
+		scope := withScope(f.Env, callSite)
+		prev := ip.currentSrc
+		if f.Src != nil {
+			ip.currentSrc = f.Src
+		}
+		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
+		ip.currentSrc = prev
+		if !ip.isType(res, f.ReturnType, f.Env) {
+			exp := FormatType(f.ReturnType)
+			got := FormatType(ip.ValueToType(res, f.Env))
+			fail(fmt.Sprintf("return type mismatch: expected %s, got %s", exp, got))
+		}
+		return res
 	}
 
-	// ---- infix ops ----
-	for {
-		op := p.peek()
-		bp, ok := lbp(op.Type)
-		if !ok || bp < minBP {
-			break
-		}
-		p.i++
+	if f.IsOracle {
+		scope := withScope(f.Env, callSite)
+		ctx := &callCtx{argEnv: f.Env, scope: scope}
+		return ip.execOracle(funVal, ctx)
+	}
 
-		nextBP := bp + 1
-		if isRightAssoc(op.Type) {
-			nextBP = bp
-		}
+	ip.ensureChunkWithSource(f, f.Src)
+	prev := ip.currentSrc
+	if f.Src != nil {
+		ip.currentSrc = f.Src
+	}
+	res := ip.runChunk(f.Chunk, f.Env, 0)
+	ip.currentSrc = prev
 
-		if op.Type == ASSIGN && !assignable(left) {
-			line, col := p.posAtByte(op.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
+	switch res.status {
+	case vmOK, vmReturn:
+		if !ip.isType(res.value, f.ReturnType, f.Env) {
+			exp := FormatType(f.ReturnType)
+			got := FormatType(ip.ValueToType(res.value, f.Env))
+			line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
+			panicRt(fmt.Sprintf("return type mismatch: expected %s, got %s", exp, got), f.Src, line, col)
 		}
+		return res.value
+	case vmRuntimeError:
+		line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
+		panicRt(res.value.Annot, f.Src, line, col)
+		return errNull("unreachable")
+	default:
+		return errNull("unknown VM status")
+	}
+}
 
-		// Allow GAP between operator and RHS, but don't let it satisfy the need.
-		preOp, err := p.takeReqGap(op, "expected expression after operator")
-		if err != nil {
-			return nil, err
-		}
+////////////////////////////////////////////////////////////////////////////////
+//                      SOURCE MAPPING (PC → (line, col))
+////////////////////////////////////////////////////////////////////////////////
 
-		var b annSrc
-		if op.Type == ASSIGN {
-			// Use the immediate post-'=' gap as B.
-			b = preOp
-		}
+func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
+	// Single debug hook
+	if DebuggingMode {
+		dumpSourcePosDebug(ch, sr, pc)
+	}
 
-		rightParsed, err := p.expr(nextBP)
-		if err != nil {
-			return nil, err
-		}
-		endTok := p.lastSpanEndTok
+	src := ""
+	if sr != nil {
+		src = sr.Src
+	}
 
-		if op.Type == ASSIGN {
-			// A (from prior 'let' pattern if any) + B + (C on right) + D
-			normRight := p.normalizeABCD(leftAnnA, b, rightParsed)
-			left = p.mk("assign", leftStartTok, endTok, left, normRight)
-			leftAnnA = annNone()
+	// Early fallback if we don't have enough info
+	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
+		return 1, 1
+	}
+
+	// Pick the last mark with PC <= failing PC
+	i := -1
+	for j := range ch.Marks {
+		if ch.Marks[j].PC <= pc {
+			i = j
 		} else {
-			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, rightParsed)
+			break
 		}
 	}
+	if i < 0 {
+		return 1, 1
+	}
 
-	// Attach trailing *same-line* annotations (POST) only at the outermost level.
-	// This ensures `… * (8 # note)` doesn't consume `# note` inside the RHS,
-	// allowing the outer expression to wrap the whole `(4+5)*8`.
-	if minBP == 0 {
-		if p.lastSpanEndTok >= 0 && p.lastSpanEndTok < len(p.toks) {
-			// Never POST onto a NOOP (blank-line statement).
-			if p.toks[p.lastSpanEndTok].Type != NOOP {
-				left = p.attachSameLineAnnots(left, p.toks[p.lastSpanEndTok].Line)
+	tryPath := func(p NodePath) (int, int, bool) {
+		for cut := len(p); cut >= 0; cut-- {
+			sub := p[:cut]
+			if sp, ok := sr.Spans.Get(sub); ok {
+				line, col := offsetToLineCol(src, sp.StartByte)
+				return line, col, true
 			}
 		}
+		return 1, 1, false
 	}
-	return left, nil
+
+	// Try the best mark's path
+	if line, col, ok := tryPath(ch.Marks[i].Path); ok {
+		return line, col
+	}
+
+	// Walk earlier marks backwards
+	for k := i - 1; k >= 0; k-- {
+		if line, col, ok := tryPath(ch.Marks[k].Path); ok {
+			return line, col
+		}
+	}
+
+	return 1, 1
 }
 
-// parseGrouping reads '(' expr ')' for either LROUND or CLROUND in prefix position.
-func (p *parser) parseGrouping() (S, error) {
-	openTok := p.toks[p.i-1]
-	pre, err := p.takeReqGap(openTok, "expected expression after '('")
-	if err != nil {
-		return nil, err
+// withScope returns override if non-nil (use the call-site env for effects),
+// otherwise it returns parent (the function's closure env).
+func withScope(parent, override *Env) *Env {
+	if override != nil {
+		return override
 	}
-	inner, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if pre.ok {
-		inner = p.attachAnnotFrom(pre, inner)
-	}
-	// Allow trailing annotations/newlines before ')', attach as POST to inner.
-	trail := p.collectGap() // consumes ANNOTATIONs and NOOPs
-	if trail.ok {
-		inner = p.attachAnnotFrom(trail, inner)
-	}
-	if _, err := p.need(RROUND, "expected ')'"); err != nil {
-		return nil, err
-	}
-	return inner, nil
+	return parent
 }
 
-// ───────────────────────── unified postfix dispatcher ──────────────────────
-//
-
-// Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
-// **Span order** is enforced: children were already appended during their parse.
-// We append exactly one span for the new wrapper node (unop '?', call, idx, get).
-
-func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
-	// Enforce GAPLESS *before* '.' : if we are sitting on GAPs and the next
-	// non-gap token is PERIOD, that is an error (or incomplete at EOF).
-	if !p.atEnd() && (p.peek().Type == ANNOTATION || p.peek().Type == NOOP) {
-		j := p.i
-		firstGap := p.peek()
-		for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
-			j++
+func offsetToLineCol(src string, off int) (int, int) {
+	if off < 0 {
+		return 1, 1
+	}
+	line, col := 1, 1
+	i := 0
+	for i < len(src) && i < off {
+		if src[i] == '\n' {
+			line++
+			col = 1
+			i++
+			continue
 		}
-		if j < len(p.toks) && p.toks[j].Type == PERIOD {
-			// There *is* a dot after a gap → forbidden.
-			line, col := p.posAtByte(firstGap.StartByte)
-			return nil, false, &Error{Kind: DiagParse, Msg: "no gap allowed before '.'", Line: line, Col: col}
+		col++
+		i++
+	}
+	return line, col
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                 PRIVATE ADAPTERS: Callable / CallCtx impls
+////////////////////////////////////////////////////////////////////////////////
+
+type funCallable struct {
+	f   *Fun
+	doc string
+}
+
+func (c *funCallable) Arity() int { return len(c.f.Params) }
+func (c *funCallable) ParamSpecs() []ParamSpec {
+	ps := make([]ParamSpec, len(c.f.Params))
+	for i := range c.f.Params {
+		ps[i] = ParamSpec{Name: c.f.Params[i], Type: c.f.ParamTypes[i]}
+	}
+	return ps
+}
+func (c *funCallable) ReturnType() S    { return c.f.ReturnType }
+func (c *funCallable) Doc() string      { return c.doc }
+func (c *funCallable) ClosureEnv() *Env { return c.f.Env }
+
+type callCtx struct {
+	argEnv *Env
+	scope  *Env
+}
+
+func (c *callCtx) Arg(name string) Value {
+	if v, err := c.argEnv.Get(name); err == nil {
+		return v
+	}
+	fail("missing argument: " + name)
+	return Null
+}
+func (c *callCtx) Env() *Env { return c.scope }
+
+////////////////////////////////////////////////////////////////////////////////
+//                             EMITTER (AST → BYTECODE)
+////////////////////////////////////////////////////////////////////////////////
+
+type emitter struct {
+	ip        *Interpreter
+	code      []uint32
+	consts    []Value
+	ctrlStack []ctrlCtx
+
+	// Source mapping
+	src   *SourceRef
+	marks []PCMark
+	path  NodePath
+}
+
+type ctrlCtx struct {
+	isLoop     bool
+	breakJumps []int
+	contJumps  []int
+}
+
+func newEmitter(ip *Interpreter, src *SourceRef) *emitter {
+	e := &emitter{ip: ip, src: src}
+	if src != nil && len(src.PathBase) > 0 {
+		e.path = append(e.path, src.PathBase...)
+	}
+	return e
+}
+
+// ---------------------- mark helpers (centralized) ---------------------------
+
+// Emit a mark for an absolute AST path immediately before a failure-prone opcode.
+// NOTE: Marks MUST be appended immediately before the instruction that can fail
+// because of that path. Do NOT emit any other mark until that instruction.
+func (e *emitter) markHereFor(abs NodePath) {
+	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), abs...)})
+}
+
+// Mark the current node (rare; for node-level blame).
+func (e *emitter) markSelf() { e.markHereFor(append(NodePath(nil), e.path...)) }
+
+// Mark a direct child index under the current node.
+func (e *emitter) markChild(childIdx int) {
+	e.markHereFor(append(append(NodePath(nil), e.path...), childIdx))
+}
+
+// Wrappers that enforce "mark immediately before opcode" ordering.
+func (e *emitter) emitWithMarkChild(op opcode, childIdx int, imm uint32) {
+	e.markChild(childIdx)
+	e.emit(op, imm)
+}
+func (e *emitter) callWithMarkChild(argc int, childIdx int) {
+	e.markChild(childIdx)
+	e.emit(opCall, uint32(argc))
+}
+
+// ----------------------------------------------------------------------------
+
+func equalConst(a, b Value) bool {
+	if a.Tag != b.Tag {
+		return false
+	}
+	switch a.Tag {
+	case VTNull:
+		return true
+	case VTBool:
+		return a.Data.(bool) == b.Data.(bool)
+	case VTInt:
+		return a.Data.(int64) == b.Data.(int64)
+	case VTNum:
+		return a.Data.(float64) == b.Data.(float64)
+	case VTStr:
+		return a.Data.(string) == b.Data.(string)
+	case VTArray, VTMap, VTFun, VTType, VTModule, VTHandle:
+		// For const-pool purposes you usually don't intern compound values;
+		// fall back to pointer/identity if you really need it:
+		return &a == &b
+	default:
+		return false
+	}
+}
+
+func (e *emitter) k(v Value) uint32 {
+	for i := range e.consts {
+		if equalConst(e.consts[i], v) { // <-- use strict equality here
+			return uint32(i)
 		}
-		// Not a dot next; postfix chain stops here.
-		return nil, false, nil
+	}
+	e.consts = append(e.consts, v)
+	return uint32(len(e.consts) - 1)
+}
+func (e *emitter) ks(s string) uint32         { return e.k(Str(s)) }
+func (e *emitter) emit(op opcode, imm uint32) { e.code = append(e.code, pack(op, imm)) }
+func (e *emitter) patch(at int, to int)       { e.code[at] = pack(uop(e.code[at]), uint32(to)) }
+func (e *emitter) here() int                  { return len(e.code) }
+func (e *emitter) chunk() *Chunk {
+	return &Chunk{Code: e.code, Consts: e.consts, Marks: e.marks, Src: e.src}
+}
+
+func (e *emitter) pushBlockCtx() { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: false}) }
+func (e *emitter) pushLoopCtx()  { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: true}) }
+func (e *emitter) popCtx() ctrlCtx {
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	e.ctrlStack = e.ctrlStack[:i]
+	return c
+}
+func (e *emitter) addBreakJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.breakJumps = append(c.breakJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.breakJumps = append(c.breakJumps, at)
+	e.ctrlStack[i] = c
+}
+func (e *emitter) addContJump(at int) {
+	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
+		if e.ctrlStack[i].isLoop {
+			c := e.ctrlStack[i]
+			c.contJumps = append(c.contJumps, at)
+			e.ctrlStack[i] = c
+			return
+		}
+	}
+	i := len(e.ctrlStack) - 1
+	c := e.ctrlStack[i]
+	c.contJumps = append(c.contJumps, at)
+	e.ctrlStack[i] = c
+}
+
+// helpers for loops/blocks persisting "last" value
+func (e *emitter) preloadAssignToLast(lastName string) {
+	e.emit(opLoadGlobal, e.ks("__assign_set"))
+	// Preload the lvalue (("decl", lastName)) as AST handle. No call yet.
+	e.emit(opConst, e.k(HandleVal("ast", S{"decl", lastName})))
+}
+
+func (e *emitter) saveLastAndJumpHead(head int) {
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+	e.emit(opJump, uint32(head))
+}
+func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
+	for _, at := range jumps {
+		e.patch(at, gate)
+	}
+	e.emit(opCall, 2)
+	e.emit(opPop, 0)
+}
+
+// Child path scaffolding
+func (e *emitter) withChild(childIdx int, f func()) {
+	e.path = append(e.path, childIdx)
+	f()
+	e.path = e.path[:len(e.path)-1]
+}
+
+// Builtin call (no automatic marks; callers place marks per plan).
+func (e *emitter) callBuiltin(name string, args ...S) {
+	e.emit(opLoadGlobal, e.ks(name))
+	for _, a := range args {
+		e.emitExpr(a)
+	}
+	e.emit(opCall, uint32(len(args)))
+}
+
+// callBuiltinV calls a Core builtin with constant Value arguments.
+// Use this only when *all* arguments are constants you can encode now.
+func (e *emitter) callBuiltinV(name string, args ...Value) {
+	e.emit(opLoadGlobal, e.ks(name))
+	for _, v := range args {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opCall, uint32(len(args)))
+}
+
+func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S, basePath NodePath) {
+	namesArr := make([]Value, 0, max(0, len(params)-1))
+	for i := 1; i < len(params); i++ {
+		p := params[i].(S)
+		if len(p) == 0 || p[0].(string) != "pair" {
+			continue
+		}
+		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
+	}
+	if len(retT) == 0 {
+		retT = S{"id", "Any"}
+	}
+	e.emit(opLoadGlobal, e.ks("__make_fun"))
+	for _, v := range namesArr {
+		e.emit(opConst, e.k(v))
+	}
+	e.emit(opMakeArr, uint32(len(namesArr)))
+
+	// Build the param types at runtime via ("type", …) so they capture env.
+	typeCount := 0
+	for i := 1; i < len(params); i++ {
+		p := params[i].(S)
+		if len(p) == 0 || p[0].(string) != "pair" {
+			continue
+		}
+		t := p[2].(S) // may be empty
+		if len(t) == 0 {
+			t = S{"id", "Any"}
+		}
+		e.emitExpr(S{"type", t})
+		typeCount++
+	}
+	e.emit(opMakeArr, uint32(typeCount))
+
+	// Return type (env-pinned) and BODY as AST handle
+	e.emitExpr(S{"type", retT})
+	e.emit(opConst, e.k(HandleVal("ast", bodyCarrier)))
+
+	e.emit(opConst, e.k(Bool(isOracle)))
+	e.emitExpr(examples)
+	for _, idx := range basePath {
+		e.emit(opConst, e.k(Int(int64(idx))))
+	}
+	e.emit(opMakeArr, uint32(len(basePath)))
+	e.emit(opCall, 7)
+}
+
+func (e *emitter) emitFunBody(body S) {
+	e.emitExpr(body)
+	e.emit(opReturn, 0)
+}
+
+// Emit an expression node following the precise mark rules.
+func (e *emitter) emitExpr(n S) {
+	if len(n) == 0 {
+		e.emit(opConst, e.k(Null))
+		return
 	}
 
-	switch p.peek().Type {
-	case QUESTION:
-		qtok := p.i
-		p.i++
-		n := p.mk("unop", leftStartTok, qtok, "?", left)
-		return n, true, nil
+	switch n[0].(string) {
 
-	case CLROUND:
-		p.i++
-		if p.match(RROUND) {
-			n := p.mk("call", leftStartTok, p.i-1, left)
-			return n, true, nil
+	// ----- literals / ids -----
+	case "int":
+		e.emit(opConst, e.k(Int(n[1].(int64))))
+	case "num":
+		e.emit(opConst, e.k(Num(n[1].(float64))))
+	case "str":
+		e.emit(opConst, e.k(Str(n[1].(string))))
+	case "bool":
+		e.emit(opConst, e.k(Bool(n[1].(bool))))
+	case "noop":
+		// ignore
+	case "null":
+		e.emit(opConst, e.k(Null))
+
+	case "id":
+		// Identifier load can fail → mark the id right before opLoadGlobal.
+		e.markSelf()
+		e.emit(opLoadGlobal, e.ks(n[1].(string)))
+
+	// ----- blocks -----
+	case "block":
+		e.pushBlockCtx()
+		emitted := 0
+		for j := 1; j < len(n); j++ {
+			child := n[j].(S)
+			if isNoopish(child) {
+				continue
+			}
+			if emitted > 0 {
+				e.emit(opPop, 0)
+			}
+			origIdx := j - 1 // original AST child index
+			e.withChild(origIdx, func() { e.emitExpr(child) })
+			emitted++
 		}
-		args, _, closeTok, err := p.bracketed(
-			RROUND, "expected ')'",
-			func(pending annSrc) (S, int, error) {
-				a, err := p.expr(0)
-				if err != nil {
-					return nil, 0, err
-				}
-				if pending.ok {
-					a = p.attachAnnotFrom(pending, a)
-				}
-				return a, 0, nil
-			},
-			nil,
+		if emitted == 0 {
+			e.emit(opConst, e.k(Null))
+		}
+		exit := e.here()
+		ctx := e.popCtx()
+		for _, at := range ctx.breakJumps {
+			e.patch(at, exit)
+		}
+		for _, at := range ctx.contJumps {
+			e.patch(at, exit)
+		}
+
+	// ----- flow: break / continue -----
+	case "break":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addBreakJump(at)
+	case "continue":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		at := e.here()
+		e.emit(opJump, 0)
+		e.addContJump(at)
+
+	// ----- unary -----
+	case "unop":
+		op := n[1].(string)
+		if op == "?" {
+			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
+			return
+		}
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Mark operand right before opcode.
+		switch op {
+		case "not":
+			e.emitWithMarkChild(opNot, 1, 0)
+		case "-":
+			e.emitWithMarkChild(opNeg, 1, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unknown unary op")))
+		}
+
+	// ----- binary -----
+	case "binop":
+		op := n[1].(string)
+		if op == "and" || op == "or" {
+			// Short-circuit: mark tested subexpr at the gate.
+			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+			e.markChild(1)
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
+
+			// unified AND/OR short-circuit
+			pre := func() { e.withChild(2, func() { e.emitExpr(n[3].(S)) }) } // RHS
+			post := func() { e.emit(opConst, e.k(Bool(false))) }              // const false
+			if op == "or" {
+				pre, post = func() { e.emit(opConst, e.k(Bool(true))) }, pre // const true, then RHS
+			}
+			pre()
+			jend := e.here()
+			e.emit(opJump, 0)
+			lother := e.here()
+			e.patch(jf, lother)
+			post()
+			lend := e.here()
+			e.patch(jend, lend)
+			return
+		}
+		a, b := n[2].(S), n[3].(S)
+		switch op {
+		case "==":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opEq, 2, 0)
+		case "!=":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opNe, 2, 0)
+		case "+":
+			e.emit(opLoadGlobal, e.ks("__plus"))
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.callWithMarkChild(2, 2)
+		case "-":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opSub, 2, 0)
+		case "*":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opMul, 2, 0)
+		case "/":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opDiv, 2, 0)
+		case "%":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opMod, 2, 0)
+		case "<":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opLt, 2, 0)
+		case "<=":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opLe, 2, 0)
+		case ">":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opGt, 2, 0)
+		case ">=":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opGe, 2, 0)
+		default:
+			e.emit(opConst, e.k(errNull("unsupported operator")))
+		}
+
+	// ----- assignment -----
+	case "assign":
+		lhs := n[1].(S)
+		opName := "__assign_set"
+		switch lhs[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			opName = "__assign_def"
+		}
+		e.emit(opLoadGlobal, e.ks(opName))
+		// LHS as a pure AST handle.
+		e.emit(opConst, e.k(HandleVal("ast", lhs)))
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
+		e.callWithMarkChild(2, 0)
+
+	case "decl":
+		e.callBuiltinV("__assign_def", HandleVal("ast", n), Null)
+
+	// ----- arrays / maps -----
+	case "array":
+		emitted := 0
+		for i := 1; i < len(n); i++ {
+			child := n[i].(S)
+			if isNoopish(child) {
+				continue
+			}
+			e.withChild(i-1, func() { e.emitExpr(child) })
+			emitted++
+		}
+		e.emit(opMakeArr, uint32(emitted))
+
+	case "map":
+		keys := []S{}
+		vals := []S{}
+		for i := 1; i < len(n); i++ {
+			p := n[i].(S)
+			if len(p) == 0 {
+				continue
+			}
+			tag := p[0].(string)
+			if tag != "pair" && tag != "pair!" {
+				continue
+			}
+			keys = append(keys, p[1].(S))
+			vals = append(vals, p[2].(S))
+		}
+		e.emit(opLoadGlobal, e.ks("__map_from"))
+		for i := 0; i < len(keys); i++ {
+			idx := i
+			e.withChild(idx, func() { e.withChild(0, func() { e.emitExpr(keys[idx]) }) })
+		}
+		e.emit(opMakeArr, uint32(len(keys)))
+		for i := 0; i < len(vals); i++ {
+			idx := i
+			e.withChild(idx, func() { e.withChild(1, func() { e.emitExpr(vals[idx]) }) })
+		}
+		e.emit(opMakeArr, uint32(len(vals)))
+		e.emit(opCall, 2)
+
+	// ----- property / index -----
+	case "get":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		// Blame the property token (child #1) right before opGetProp.
+		e.emitWithMarkChild(opGetProp, 1, e.ks(n[2].(S)[1].(string)))
+
+	case "idx":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
+		// Blame the index expression (child #1) right before opGetIdx.
+		e.emitWithMarkChild(opGetIdx, 1, 0)
+
+	// ----- call -----
+	case "call":
+		// Evaluate callee once.
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+
+		argc := 0
+		if len(n) == 2 {
+			// Zero-arg call: blame callee right before CALL 0.
+			e.callWithMarkChild(0, 0)
+			return
+		}
+		// Apply args one by one; skip noopish args; blame each emitted arg.
+		for i := 2; i < len(n); i++ {
+			arg := n[i].(S)
+			if isNoopish(arg) {
+				continue
+			}
+			argIdx := i - 1
+			e.withChild(argIdx, func() { e.emitExpr(arg) })
+			e.callWithMarkChild(1, argIdx)
+			argc++
+		}
+		if argc == 0 {
+			// No real arguments after skipping noops → call with 0 args.
+			e.callWithMarkChild(0, 0)
+		}
+		return
+
+	// ----- fun / oracle -----
+	case "fun":
+		// ("fun", params, ret, body) → body child index is 2
+		absBase := append(append(NodePath(nil), e.path...), 2)
+		e.emitMakeFun(n[1].(S), n[2].(S), n[3].(S), false, S{"null"}, absBase)
+	case "oracle":
+		e.withChild(2, func() {
+			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
+		})
+
+	// ----- return -----
+	case "return":
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		e.markSelf()
+		e.emit(opReturn, 0)
+
+	// ----- if -----
+	case "if":
+		arms := n[1:]
+		jends := []int{}
+		hasElse := false
+		if len(arms) > 0 {
+			if last, ok := arms[len(arms)-1].(S); ok && last[0].(string) == "block" {
+				hasElse = true
+			}
+		}
+		limit := len(arms)
+		if hasElse {
+			limit--
+		}
+		for i := 0; i < limit; i++ {
+			p := arms[i].(S) // ("pair", cond, thenBlock)
+			// Emit condition; mark the condition node (pair child #0) at the gate.
+			e.withChild(i, func() { e.withChild(0, func() { e.emitExpr(p[1].(S)) }) })
+			condAbs := append(append(NodePath(nil), e.path...), i, 0)
+			e.markHereFor(condAbs)
+			jf := e.here()
+			e.emit(opJumpIfFalse, 0)
+
+			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) })
+			jend := e.here()
+			e.emit(opJump, 0)
+			jends = append(jends, jend)
+			e.patch(jf, e.here())
+		}
+		if hasElse {
+			e.withChild(len(arms)-1, func() { e.emitExpr(arms[len(arms)-1].(S)) })
+		} else {
+			e.emit(opConst, e.k(Null))
+		}
+		tail := e.here()
+		for _, at := range jends {
+			e.patch(at, tail)
+		}
+
+	// ----- while -----
+	case "while":
+		cond := n[1].(S)
+		body := n[2].(S)
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		// Declare $last_* using an AST handle (no type building here).
+		e.callBuiltinV("__assign_def",
+			HandleVal("ast", S{"decl", lastName}),
+			Null,
 		)
-		if err != nil {
-			return nil, false, err
-		}
-		n := p.mk("call", leftStartTok, closeTok, append([]any{left}, args...)...)
-		return n, true, nil
+		e.emit(opPop, 0)
 
-	case CLSQUARE:
-		p.i++
-		sqTok := p.toks[p.i-1]
-		// Allow gaps after '[' but they cannot satisfy the required expr.
-		preIdx, err := p.takeReqGap(sqTok, "expected index expression after '['")
-		if err != nil {
-			return nil, false, err
-		}
-		idx, err := p.expr(0)
-		if err != nil {
-			return nil, false, err
-		}
-		if preIdx.ok {
-			idx = p.attachAnnotFrom(preIdx, idx)
-		}
-		// Allow trailing gaps before ']'
-		if trail := p.collectGap(); trail.ok {
-			idx = p.attachAnnotFrom(trail, idx)
-		}
-		if _, err := p.need(RSQUARE, "expected ']'"); err != nil {
-			return nil, false, err
-		}
-		n := p.mk("idx", leftStartTok, p.i-1, left, idx)
-		return n, true, nil
+		head := e.here()
+		e.withChild(0, func() { e.emitExpr(cond) })
+		// Mark the condition node right before the gate.
+		e.markChild(0)
+		jf := e.here()
+		e.emit(opJumpIfFalse, 0)
 
-	case PERIOD:
-		p.i++ // consume '.'
-		dotTok := p.toks[p.i-1]
-		// GAPLESS after '.': forbid ANNOTATION/NOOP immediately after dot.
-		if err := p.needNoGap(dotTok, "expected property name, integer, or '(expr)' immediately after '.' (no gap allowed)"); err != nil {
-			return nil, false, err
+		e.preloadAssignToLast(lastName)
+		e.pushLoopCtx()
+		e.withChild(1, func() { e.emitExpr(body) })
+		loopCtx := e.popCtx()
+		e.saveLastAndJumpHead(head)
+
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
+		e.emit(opJump, uint32(head))
+
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		end := e.here()
+		e.patch(jf, end)
+		e.patch(jEnd, end)
+
+		e.emit(opLoadGlobal, e.ks(lastName))
+
+	// ----- for -----
+	case "for":
+		target := n[1].(S)
+		iterExpr := n[2].(S)
+		body := n[3].(S)
+
+		iterName := fmt.Sprintf("$iter_%d", e.here())
+		// Declare the hidden iterator binding with an AST handle (not a Type).
+		// We'll initialize it immediately with __to_iter(iterExpr) below.
+		e.emit(opLoadGlobal, e.ks("__assign_def"))
+		e.emit(opConst, e.k(HandleVal("ast", S{"decl", iterName})))
+
+		// __to_iter(iterExpr); mark the iterExpr (child #1) at this call site.
+		e.emit(opLoadGlobal, e.ks("__to_iter"))
+		e.withChild(1, func() { e.emitExpr(iterExpr) })
+		e.callWithMarkChild(1, 1) // __to_iter(iterExpr)
+		e.emit(opCall, 2)         // assign_def(<AST decl>, iterator)
+		e.emit(opPop, 0)
+
+		tmpName := fmt.Sprintf("$tmp_%d", e.here())
+		e.callBuiltinV("__assign_def", HandleVal("ast", S{"decl", tmpName}), Null)
+		e.emit(opPop, 0)
+
+		lastName := fmt.Sprintf("$last_%d", e.here())
+		e.callBuiltinV("__assign_def", HandleVal("ast", S{"decl", lastName}), Null)
+		e.emit(opPop, 0)
+
+		head := e.here()
+
+		// tmp = iter(Null)
+		e.emit(opLoadGlobal, e.ks("__assign_set"))
+		// lvalue as AST handle
+		e.emit(opConst, e.k(HandleVal("ast", S{"decl", tmpName})))
+		e.emit(opLoadGlobal, e.ks(iterName))
+		e.emit(opConst, e.k(Null))
+		e.emit(opCall, 1) // iter(Null)
+		e.emit(opCall, 2) // assign_set(Type(tmp), result)
+		e.emit(opPop, 0)
+
+		// gate: __iter_should_stop(tmp)
+		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
+		e.emit(opLoadGlobal, e.ks(tmpName))
+		e.emit(opCall, 1)
+		jBody := e.here()
+		e.emit(opJumpIfFalse, 0)
+		jEnd := e.here()
+		e.emit(opJump, 0)
+
+		bodyStart := e.here()
+		e.patch(jBody, bodyStart)
+
+		e.preloadAssignToLast(lastName)
+
+		assignName := "__assign_set"
+		switch target[0].(string) {
+		case "decl", "darr", "dobj", "annot":
+			assignName = "__assign_def"
 		}
-		if p.match(LROUND) || p.match(CLROUND) {
-			parTok := p.toks[p.i-1] // '(' token just consumed
-			// Allow gaps after '(' but they cannot satisfy the required expr.
-			pre, err := p.takeReqGap(parTok, "expected expression after '('")
-			if err != nil {
-				return nil, false, err
+		e.emit(opLoadGlobal, e.ks(assignName))
+		e.emit(opConst, e.k(HandleVal("ast", target)))
+		e.emit(opLoadGlobal, e.ks(tmpName))
+		e.emit(opCall, 2)
+		e.emit(opPop, 0)
+
+		e.pushLoopCtx()
+		e.withChild(2, func() { e.emitExpr(body) })
+		loopCtx := e.popCtx()
+
+		e.saveLastAndJumpHead(head)
+
+		lcont := e.here()
+		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
+		e.emit(opJump, uint32(head))
+
+		lbreak := e.here()
+		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
+		jToEnd := e.here()
+		e.emit(opJump, 0)
+
+		end := e.here()
+		e.patch(jEnd, end)
+		e.patch(jToEnd, end)
+
+		e.emit(opLoadGlobal, e.ks(lastName))
+
+	// ----- type / module / annot -----
+	case "type":
+		// Lower to: __type_from_ast(<handle carrying AST>), pinning env at runtime.
+		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
+		e.emit(opConst, e.k(HandleVal("type-ast", n[1].(S))))
+		// Blame the subject type node (child #0) at the call site.
+		e.markChild(0)
+		e.emit(opCall, 1)
+
+	// ----- type-only surface form seen in value position -----
+	case "enum":
+		// Users wrote Enum[...] as a *value*. Raise a compile-time hard error with a caret on Enum[...] itself.
+		if e.src != nil && e.src.Spans != nil {
+			if sp, ok := e.src.Spans.Get(e.path); ok {
+				line, col := offsetToLineCol(e.src.Src, sp.StartByte)
+				panicRt("Enum[...] is a type expression; wrap it with 'type' to obtain a runtime Type (e.g., type Enum[...]).", e.src, line, col)
 			}
-			ex, err := p.expr(0)
-			if err != nil {
-				return nil, false, err
-			}
-			if pre.ok {
-				ex = p.attachAnnotFrom(pre, ex)
-			}
-			// Allow trailing gaps before ')'
-			if trail := p.collectGap(); trail.ok {
-				ex = p.attachAnnotFrom(trail, ex)
-			}
-			if _, perr := p.need(RROUND, "expected ')' after computed property"); perr != nil {
-				return nil, false, perr
-			}
-			_ = pre // attached above
-			n := p.mk("idx", leftStartTok, p.i-1, left, ex)
-			return n, true, nil
 		}
-		// .<int> -> idx
-		if p.match(INTEGER) {
-			intTok := p.i - 1
-			intNode := p.mkLeaf("int", intTok, p.prev().Literal)
-			n := p.mk("idx", leftStartTok, intTok, left, intNode)
-			return n, true, nil
+		// Fallback if no spans are available (defensive):
+		panicRt("Enum[...] is a type expression; wrap it with 'type' to obtain a runtime Type (e.g., type Enum[...]).", e.src, 1, 1)
+
+	case "module":
+		// Lower to: __make_module(nameExpr, <AST handle>, basePathArray)
+		e.emit(opLoadGlobal, e.ks("__make_module"))
+		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
+		// Pass the module body as a pure AST handle (no env pinning).
+		e.emit(opConst, e.k(HandleVal("ast", n[2].(S))))
+		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, body) → body at child #1
+		for _, idx := range absBase {
+			e.emit(opConst, e.k(Int(int64(idx))))
 		}
-		// .id or coerced quoted-name (lexer coerces after PERIOD) -> get
-		if p.match(ID) {
-			propTok := p.i - 1
-			prop := p.mkLeaf("str", propTok, tokText(p.prev()))
-			n := p.mk("get", leftStartTok, propTok, left, prop)
-			return n, true, nil
-		}
-		// Fallback diagnostic (not a valid follower)
-		g := p.peek()
-		line, col := p.posAtByte(g.StartByte)
-		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
-	}
-	return nil, false, nil
-}
+		e.emit(opMakeArr, uint32(len(absBase)))
+		e.emit(opCall, 3)
 
-// ───────────────────────── collections / lists / maps ─────────────────────
+	case "annot":
+		text := n[1].(S)[1].(string)
+		subj := n[2].(S)
 
-// bracketed parses a comma-separated list between an already-consumed opener
-// and its 'close'. It owns:
-//   - interstitial PRE via ANNOTATION (pending text) and NOOP emission,
-//   - POST right after an element (same line),
-//   - POST after a COMMA (same line) via onCommaPost callback,
-//   - dangling PRE before closer -> annot(noop),
-//   - trailing gaps before closer (NOOP/ANNOTATION).
-//
-// bracketed parses a comma-separated list between an already-consumed opener.
-// It carries interstitial PRE as annSrc and emits annot(noop) with correct spans.
-func (p *parser) bracketed(
-	close TokenType,
-	expectMsg string,
-	parseElem func(pendingPRE annSrc) (S, int, error),
-	onCommaPost func(last S, commaTok Token, txt string) S,
-) ([]any, int, int, error) {
-	openTok := p.i - 1
-
-	// Empty only when the very next token is the closer (no gap skipping).
-	if p.match(close) {
-		return nil, openTok, p.i - 1, nil
-	}
-
-	var out []any
-	pending := annNone()
-
-	for {
-		// Close: emit dangling PRE as annot(noop)
-		if p.peek().Type == close {
-			if pending.ok {
-				out = append(out, p.attachAnnotFrom(pending, p.mkLeaf("noop", -1)))
-				pending = annNone()
-			}
-			break
+		if isNoopish(subj) {
+			return
 		}
 
-		// Interstitial gaps
-		switch p.peek().Type {
-		case ANNOTATION:
-			pending = mergeAnn(pending, p.collectAnnotsSrc())
-			continue
-		case NOOP:
-			if pending.ok {
-				out = append(out, p.attachAnnotFrom(pending, p.mkLeaf("noop", -1)))
-				pending = annNone()
-				p.i++ // consume the NOOP we wrapped
-				continue
+		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
+		if len(subj) > 0 && subj[0].(string) == "assign" {
+			lhs := subj[1].(S)
+			rhs := subj[2].(S)
+			opName := "__assign_set"
+			switch lhs[0].(string) {
+			case "decl", "darr", "dobj", "annot":
+				opName = "__assign_def"
 			}
-			out = append(out, p.mkLeaf("noop", p.i))
-			p.i++
-			continue
+			e.emit(opLoadGlobal, e.ks(opName))
+			// LHS as AST handle
+			e.emit(opConst, e.k(HandleVal("ast", lhs)))
+			e.emit(opLoadGlobal, e.ks("__annotate"))
+			e.emit(opConst, e.k(Str(text)))
+			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
+			e.emit(opCall, 2) // __annotate
+			// Attribute assignment errors to LHS (annot child #1 = assign, its child #0 = lhs).
+			lhsAbs := append(append(NodePath(nil), e.path...), 1, 0)
+			e.markHereFor(lhsAbs)
+			e.emit(opCall, 2) // __assign_*
+			return
 		}
 
-		// Element with current pending PRE (caller applies it appropriately)
-		elem, _, err := parseElem(pending)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		// POST right after element (same line only)
-		if end := p.lastSpanEndTok; end >= 0 && end < len(p.toks) {
-			elem = p.attachSameLineAnnots(elem, p.toks[end].Line)
-		}
-		pending = annNone() // Clear pending PRE — responsibility is with parseElem.
-
-		out = append(out, elem)
-
-		// Optional comma; allow trailing comma
-		if !p.match(COMMA) {
-			break
-		}
-		comma := p.prev()
-		last := out[len(out)-1].(S)
-		if onCommaPost != nil {
-			last = onCommaPost(last, comma, "")
-		} else {
-			last = p.attachSameLineAnnots(last, comma.Line)
-		}
-		out[len(out)-1] = last
-	}
-
-	// Drain trailing gaps before closer (NOOP/ANNOTATION), then require closer.
-	if err := p.drainTrailingGapsUntil(close, expectMsg, &out); err != nil {
-		return nil, 0, 0, err
-	}
-	if _, err := p.need(close, expectMsg); err != nil {
-		return nil, 0, 0, err
-	}
-	return out, openTok, p.i - 1, nil
-}
-
-func (p *parser) arrayLiteralAfterOpen() (S, error) {
-	if p.match(RSQUARE) {
-		return p.mk("array", p.i-2, p.i-1 /* '[]' */), nil
-	}
-	items, openTok, closeTok, err := p.bracketed(
-		RSQUARE, "expected ']'",
-		func(pending annSrc) (S, int, error) {
-			e, err := p.expr(0)
-			if err != nil {
-				return nil, 0, err
-			}
-			if pending.ok {
-				e = p.attachAnnotFrom(pending, e)
-			}
-			return e, 0, nil
-		},
-		nil, // POST-after-comma attaches to element itself
-	)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("array", openTok, closeTok, items...), nil
-}
-
-// params parses (CLROUND ... RROUND) parameter pairs; preserves NOOPs and
-// PRE/POST rules uniformly across entries, while *ignoring* NOOPs that appear
-// between ':' and the type expression (so annotations there still bind to the type).
-// Critically, it NORMALIZES annotations at the binding site by merging pending/A/B/C/D
-// onto the VALUE inside each ("pair", name, value), never onto the pair node itself.
-func (p *parser) params() (S, error) {
-	if _, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
-		return nil, perr
-	}
-	openTok := p.i - 1
-
-	// Immediate close → empty params array
-	if p.match(RROUND) {
-		return p.mk("array", openTok, p.i-1), nil
-	}
-
-	// Guard: preserve the same diagnostic if a non-element appears before ')'.
-	switch p.peek().Type {
-	case ANNOTATION, NOOP, RROUND, ID, EOF:
-	default:
-		g := p.peek()
-		line, col := p.posAtByte(g.StartByte)
-		return nil, &Error{Kind: DiagParse, Msg: "expected ')' after parameters", Line: line, Col: col}
-	}
-
-	entries, _, closeTok, err := p.bracketed(
-		RROUND, "expected ')' after parameters",
-		func(pendingPRE annSrc) (S, int, error) {
-			elemStartTok := p.i
-			idTok, err := p.need(ID, "expected parameter name")
-			if err != nil {
-				return nil, 0, err
-			}
-			idIdx := p.i - 1
-			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
-
-			var val S
-			if p.match(COLON) {
-				b, err := p.takeReqGap(p.prev(), "expected type after ':'")
-				if err != nil {
-					return nil, 0, err
+		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx,decl}
+		if len(subj) > 0 {
+			switch subj[0].(string) {
+			case "decl", "id", "get", "idx":
+				opName := "__assign_set"
+				if subj[0].(string) == "decl" {
+					opName = "__assign_def"
 				}
-				tExpr, err := p.expr(0)
-				if err != nil {
-					return nil, 0, err
-				}
-				val = p.normalizeABCD(pendingPRE, b, tExpr)
-			} else {
-				base := p.mkLeaf("id", -1, "Any")
-				val = p.attachAnnotFrom(pendingPRE, base)
-			}
-
-			// Pair span starts at pending PRE if present.
-			pairStartTok := elemStartTok
-			if pendingPRE.ok && pendingPRE.startTok < pairStartTok {
-				pairStartTok = pendingPRE.startTok
-			}
-			return p.mk("pair", pairStartTok, p.i-1, nameLeaf, val), 0, nil
-		},
-		func(last S, comma Token, _ string) S {
-			if len(last) >= 3 {
-				v := last[2].(S)
-				v = p.attachSameLineAnnots(v, comma.Line)
-				last[2] = v
-				return last
-			}
-			return p.attachSameLineAnnots(last, comma.Line)
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("array", openTok, closeTok, entries...), nil
-}
-
-func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
-	p.skipNoops()
-	if p.match(RCURLY) {
-		return p.mk("map", openTok, p.i-1), nil
-	}
-
-	pairs, _, closeTok, err := p.bracketed(
-		RCURLY, "expected '}'",
-		func(pendingPRE annSrc) (S, int, error) {
-			elemStartTok := p.i // current token before reading key/annots
-			k, aKey, err := p.readKeyString()
-			if err != nil {
-				return nil, 0, err
-			}
-
-			req := p.match(BANG)
-			colonTok, err := p.need(COLON, "expected ':' after key")
-			if err != nil {
-				return nil, 0, err
-			}
-
-			// B = GAP after ':'; it cannot satisfy the value requirement.
-			b, err := p.takeReqGap(colonTok, "expected value after ':'")
-			if err != nil {
-				return nil, 0, err
-			}
-			v, err := p.expr(0)
-			if err != nil {
-				return nil, 0, err
-			}
-
-			// Value normalization (A + B + C + D)
-			val := p.normalizeABCD(mergeAnn(pendingPRE, aKey), b, v)
-
-			// Pair span must start at the earliest PRE (pending or key PRE) if present.
-			pairStartTok := elemStartTok
-			if pendingPRE.ok && (pairStartTok < 0 || pendingPRE.startTok < pairStartTok) {
-				pairStartTok = pendingPRE.startTok
-			}
-			if aKey.ok && (pairStartTok < 0 || aKey.startTok < pairStartTok) {
-				pairStartTok = aKey.startTok
-			}
-
-			tag := "pair"
-			if req {
-				tag = "pair!"
-			}
-			return p.mk(tag, pairStartTok, p.i-1, k, val), 0, nil
-		},
-		func(last S, comma Token, _ string) S {
-			// POST-after-comma attaches to VALUE; consume same-line annots.
-			if len(last) >= 3 {
-				v := last[2].(S)
-				v = p.attachSameLineAnnots(v, comma.Line)
-				last[2] = v
-				return last
-			}
-			return p.attachSameLineAnnots(last, comma.Line)
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("map", openTok, closeTok, pairs...), nil
-}
-
-// ───────────────────────── control / loops / if ───────────────────────────
-
-func (p *parser) parseControl(t Token, startTok int) (S, error) {
-	// tag: "return" | "break" | "continue"
-	tag := "return"
-	switch t.Type {
-	case BREAK:
-		tag = "break"
-	case CONTINUE:
-		tag = "continue"
-	}
-
-	// Newline after the control word → no value (Null).
-	if !p.nextTokenIsOnSameLine(t) {
-		// Do NOT consume annotations here; leave them for the next statement.
-		// Returning a bare null ensures `# pre` on the following line can wrap
-		// the next expression instead of being swallowed by this control.
-		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
-	}
-
-	p.skipNoops()
-	// Same line but next token can't start a value → also Null.
-	switch p.peek().Type {
-	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
-		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
-	}
-
-	// Parse value and attach any adjacent annotations.
-	x, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	// Attach any adjacent annotations to the control's value (source-aware).
-	if tail := p.collectAnnotsSrc(); tail.ok {
-		x = p.attachAnnotFrom(tail, x)
-	}
-	return p.mk(tag, startTok, p.lastSpanEndTok, x), nil
-}
-
-// ────────────────────── Minimal annotation normalization helpers ─────────────
-//
-// Goal: annotations always attach to the VALUE. We normalize at construction
-// sites (ASSIGN, pairs in maps/types/params). Presentation (pre vs post) is a
-// pretty-printer concern.
-
-// unwrapAnnot collects stacked ("annot", ("str", s), base) wrappers:
-// - merges stacked texts with '\n' (no POST marker semantics);
-// - returns (base, mergedText, hadAnnot).
-func unwrapAnnot(n S) (S, string, bool) {
-	var parts []string
-	cur := n
-	for len(cur) >= 3 {
-		tag, _ := cur[0].(string)
-		if tag != "annot" {
-			break
-		}
-		if child, ok := cur[1].(S); ok && len(child) >= 2 && child[0] == "str" {
-			if s, _ := child[1].(string); s != "" {
-				parts = append(parts, s)
+				e.emit(opLoadGlobal, e.ks(opName))
+				// Subject as AST handle
+				e.emit(opConst, e.k(HandleVal("ast", subj)))
+				e.emit(opLoadGlobal, e.ks("__annotate"))
+				e.emit(opConst, e.k(Str(text)))
+				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS
+				e.emit(opCall, 2)
+				// Attribute to subject itself.
+				e.markChild(1)
+				e.emit(opCall, 2)
+				return
 			}
 		}
-		base, _ := cur[2].(S)
-		cur = base
-	}
-	if len(parts) == 0 {
-		return n, "", false
-	}
-	return cur, joinNonEmpty(parts...), true
-}
 
-func (p *parser) ifExpr() (S, error) {
-	ifTok := p.toks[p.i-1]
-	condStartTok := p.i
-	preIf, err := p.takeReqGap(ifTok, "expected condition after 'if'")
-	if err != nil {
-		return nil, err
-	}
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if preIf.ok {
-		cond = p.attachAnnotFrom(preIf, cond)
-	}
-	between := p.collectGap()
-	if _, err := p.need(THEN, "expected 'then'"); err != nil {
-		return nil, err
-	}
-	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
-	if err != nil {
-		return nil, err
-	}
-	if between.ok {
-		thenBlk = p.attachAnnotFrom(between, thenBlk)
-	}
-	arm := p.mk("pair", condStartTok, p.lastSpanEndTok, cond, thenBlk)
-	arms := []any{arm}
+		// default: #(doc) expr  ==>  __annotate(doc, expr)
+		e.emit(opLoadGlobal, e.ks("__annotate"))
+		e.emit(opConst, e.k(Str(text)))
+		e.withChild(1, func() { e.emitExpr(subj) })
+		e.emit(opCall, 2)
 
-	// Repeated elif arms with gap-aware detection and attachment.
-	for {
-		saveI := p.i
-		lead := p.collectGap() // annotations just before 'elif' attach to that arm's block
-		if !p.match(ELIF) {
-			// Not an elif: restore so annotations remain for 'else' or next construct.
-			p.i = saveI
-			break
-		}
-		elifTok := p.toks[p.i-1]
-		condStartTok = p.i
-		preElif, err := p.takeReqGap(elifTok, "expected condition after 'elif'")
-		if err != nil {
-			return nil, err
-		}
-		c, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		if preElif.ok {
-			c = p.attachAnnotFrom(preElif, c)
-		}
-		between := p.collectGap()
-		if _, err := p.need(THEN, "expected 'then'"); err != nil {
-			return nil, err
-		}
-		b, err := p.blockUntil(END, ELIF, ELSE)
-		if err != nil {
-			return nil, err
-		}
-		if lead.ok {
-			b = p.attachAnnotFrom(lead, b)
-		}
-		if between.ok {
-			b = p.attachAnnotFrom(between, b)
-		}
-		arm := p.mk("pair", condStartTok, p.lastSpanEndTok, c, b)
-		arms = append(arms, arm)
-	}
-
-	var elseTail []any
-	// Optional else with gap-aware attachment.
-	saveI := p.i
-	preElse := p.collectGap()
-	if !p.match(ELSE) {
-		// No else: restore so annotations are not lost.
-		p.i = saveI
-	} else {
-		b, err := p.blockUntil(END)
-		if err != nil {
-			return nil, err
-		}
-		if preElse.ok {
-			b = p.attachAnnotFrom(preElse, b)
-		}
-		elseTail = []any{b}
-	}
-	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
-	}
-	return L("if", append(arms, elseTail...)...), nil
-}
-
-func (p *parser) forExpr(openTok int) (S, error) {
-	// Ensure gaps right after 'for' are treated uniformly (including NOOPs)
-	preFor, err := p.takeReqGap(p.toks[openTok], "expected for-target after 'for'")
-	if err != nil {
-		return nil, err
-	}
-	tgt, err := p.forTarget()
-	if err != nil {
-		return nil, err
-	}
-	if preFor.ok {
-		tgt = p.attachAnnotFrom(preFor, tgt)
-	}
-	between := p.collectGap()
-	inTok, err := p.need(IN, "expected 'in'")
-	if err != nil {
-		return nil, err
-	}
-	postIn, err := p.takeReqGap(inTok, "expected expression after 'in'")
-	if err != nil {
-		return nil, err
-	}
-	iter, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	// Attach both the pre-'in' gap (between target and 'in') and the post-'in' gap.
-	iter = p.attachAnnotFrom(mergeAnn(between, postIn), iter)
-	// Annotations/newlines before 'do' attach to the loop body.
-	preDo := p.collectGap()
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	if preDo.ok {
-		body = p.attachAnnotFrom(preDo, body)
-	}
-	return p.mk("for", openTok, p.i-1, tgt, iter, body), nil
-}
-
-func (p *parser) whileExpr(openTok int) (S, error) {
-	pre, err := p.takeReqGap(p.toks[openTok], "expected condition after 'while'")
-	if err != nil {
-		return nil, err
-	}
-	cond, err := p.expr(0)
-	if err != nil {
-		return nil, err
-	}
-	if pre.ok {
-		cond = p.attachAnnotFrom(pre, cond)
-	}
-	// Annotations/newlines before 'do' attach to the body.
-	preDo := p.collectGap()
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	if preDo.ok {
-		body = p.attachAnnotFrom(preDo, body)
-	}
-	return p.mk("while", openTok, p.i-1, cond, body), nil
-}
-
-// ───────────────────────── functions / oracle ─────────────────────────────
-
-func (p *parser) optionalArrowType(incMsg string) (S, error) {
-	// Allow a GAP between params ')' and '->'. If '->' is found AFTER the gap,
-	// parse the type and attach the gap's annotations to that type. Otherwise,
-	// restore so the gap can belong to the subsequent join (e.g., 'do').
-	saveI := p.i
-	lead := p.collectGap() // GAP between ')' and '->' (if any)
-	if p.match(ARROW) {
-		arrowTok := p.prev()
-		post, err := p.takeReqGap(arrowTok, incMsg) // GAP immediately after '->'
-		if err != nil {
-			return nil, err
-		}
-		r, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		r = p.attachAnnotFrom(mergeAnn(lead, post), r)
-		return r, nil // parsed type (one node)
-	}
-	// No arrow: put the parser back so the gap isn't consumed.
-	p.i = saveI
-	return p.mkLeaf("id", -1, "Any"), nil // single synthetic node
-}
-
-// Small shared header for fun/oracle: params + optional arrow type
-type fnHeader struct{ params, arrow S }
-
-func (p *parser) parseFnHeader(kind string) (fnHeader, error) {
-	ps, err := p.params()
-	if err != nil {
-		return fnHeader{}, err
-	}
-	msg := "expected return type after '->'"
-	if kind == "oracle" {
-		msg = "expected output type after '->'"
-	}
-	// NOTE: optionalArrowType now internally accepts a gap before '->' and
-	// safely restores position if '->' is not present, so no extra work here.
-	ar, err := p.optionalArrowType(msg)
-	return fnHeader{ps, ar}, err
-}
-
-func (p *parser) funExpr(openTok int) (S, error) {
-	h, err := p.parseFnHeader("fun")
-	if err != nil {
-		return nil, err
-	}
-	// Annotations/newlines before 'do' attach to the function body.
-	preDo := p.collectGap()
-	body, err := p.parseBlock(true)
-	if err != nil {
-		return nil, err
-	}
-	if preDo.ok {
-		body = p.attachAnnotFrom(preDo, body)
-	}
-	node := p.mk("fun", openTok, p.i-1, h.params, h.arrow, body)
-	return node, nil
-}
-
-func (p *parser) oracleExpr(openTok int) (S, error) {
-	h, err := p.parseFnHeader("oracle")
-	if err != nil {
-		return nil, err
-	}
-	var src any
-	// Collect annotations/newlines before optional 'from'.
-	saveI := p.i
-	preFrom := p.collectGap()
-	matchedFrom := p.match(FROM)
-	if matchedFrom {
-		fromTok := p.prev()
-		postFrom, err := p.takeReqGap(fromTok, "expected expression after 'from'")
-		if err != nil {
-			return nil, err
-		}
-		ex, err := p.expr(0)
-		if err != nil {
-			return nil, err
-		}
-		ex = p.attachAnnotFrom(mergeAnn(preFrom, postFrom), ex)
-		src = ex
-	} else {
-		// No 'from': restore so the gap belongs to whatever follows the oracle.
-		p.i = saveI
-		src = p.mk("array", -1, -1) // build only when needed
-	}
-	body := p.mk("oracle", openTok, p.i-1, h.params, h.arrow, src)
-	return body, nil
-}
-
-// ─────────────────────── declaration patterns (let/for) ───────────────────
-
-func (p *parser) declPattern() (S, annSrc, error) {
-	// Gather stacked PRE immediately before pattern (do not wrap yet).
-	pre := annNone()
-	for !p.atEnd() && p.peek().Type == ANNOTATION {
-		pre = mergeAnn(pre, p.collectAnnotsSrc())
-	}
-	if p.match(ID) {
-		idIdx := p.i - 1
-		return p.mk("decl", idIdx, idIdx, tokText(p.prev())), pre, nil
-	}
-	if p.match(LSQUARE, CLSQUARE) {
-		n, err := p.arrayDeclPattern()
-		return n, pre, err
-	}
-	if p.match(LCURLY) {
-		n, err := p.objectDeclPattern()
-		return n, pre, err
-	}
-	g := p.peek()
-	if p.interactive && p.onlyGapsToEOF() {
-		line, col := p.posAfterLastSpan()
-		return nil, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return nil, annNone(), &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-}
-
-func (p *parser) arrayDeclPattern() (S, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RSQUARE) {
-		return p.mk("darr", openTok, p.i-1), nil
-	}
-
-	parts, _, closeTok, err := p.bracketed(
-		RSQUARE, "expected ']' in array pattern",
-		func(pending annSrc) (S, int, error) {
-			pt, a, err := p.declPattern()
-			if err != nil {
-				return nil, 0, err
-			}
-			// attach element's own PRE + interstitial PRE to the subpattern itself
-			if a.ok {
-				pt = p.attachAnnotFrom(a, pt)
-			}
-			if pending.ok {
-				pt = p.attachAnnotFrom(pending, pt)
-			}
-			return pt, 0, nil
-		},
-		nil, // POST-after-comma attaches to the element itself
-	)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("darr", openTok, closeTok, parts...), nil
-}
-
-func (p *parser) objectDeclPattern() (S, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RCURLY) {
-		return p.mk("dobj", openTok, p.i-1), nil
-	}
-
-	pairs, _, closeTok, err := p.bracketed(
-		RCURLY, "expected '}' in object pattern",
-		func(pendingPRE annSrc) (S, int, error) {
-			startTok := p.i
-			k, aKey, err := p.readKeyString()
-			if err != nil {
-				return nil, 0, err
-			}
-
-			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-				return nil, 0, err
-			}
-			// B = GAP after ':' (cannot satisfy requirement)
-			b, err := p.takeReqGap(p.toks[p.i-1], "expected pattern after ':'")
-			if err != nil {
-				return nil, 0, err
-			}
-			pt, aSub, err := p.declPattern()
-			if err != nil {
-				return nil, 0, err
-			}
-
-			// subpattern-local PRE attaches to the pattern node itself
-			if aSub.ok {
-				pt = p.attachAnnotFrom(aSub, pt)
-			}
-			// Merge pending PRE + A(from key) + B + C + D onto VALUE (the subpattern)
-			val := p.normalizeABCD(mergeAnn(pendingPRE, aKey), b, pt)
-			return p.mk("pair", startTok, p.i-1, k, val), 0, nil
-		},
-		func(last S, comma Token, _ string) S {
-			// POST-after-comma attaches to VALUE; consume same-line annots.
-			if len(last) >= 3 {
-				v := last[2].(S)
-				v = p.attachSameLineAnnots(v, comma.Line)
-				last[2] = v
-				return last
-			}
-			return p.attachSameLineAnnots(last, comma.Line)
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return p.mk("dobj", openTok, closeTok, pairs...), nil
-}
-
-// readKeyString allows stacked PRE-annotations (handled recursively).
-// Span order: (1) PRE "str" child; (2) "annot" wrapper; (3) final key "str" leaf.
-func (p *parser) readKeyString() (S, annSrc, error) {
-	// Stackable PRE immediately before key
-	var pre annSrc
-	for !p.atEnd() && p.peek().Type == ANNOTATION {
-		pre = mergeAnn(pre, p.collectAnnotsSrc())
-	}
-	if p.match(STRING) {
-		return p.mkLeaf("str", p.i-1, p.prev().Literal), pre, nil
-	}
-	t := p.peek()
-	if isWordLike(t.Type) {
-		p.i++
-		name := t.Lexeme
-		if s, ok := t.Literal.(string); ok {
-			name = s
-		}
-		return p.mkLeaf("str", p.i-1, name), pre, nil
-	}
-	g := p.peek()
-	if p.interactive && p.onlyGapsToEOF() {
-		line, col := p.posAfterLastSpan()
-		return nil, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return nil, annNone(), &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
-}
-
-func isWordLike(tt TokenType) bool {
-	switch tt {
-	case ID, TYPE, ENUM, BOOLEAN, NULL,
-		AND, OR, NOT, LET, DO, END, RETURN, BREAK, CONTINUE,
-		IF, THEN, ELIF, ELSE, FUNCTION, ORACLE, MODULE, FOR, IN, FROM,
-		TYPECONS:
-		return true
-	}
-	return false
-}
-
-// ───────────────────────────── for-target helpers ─────────────────────────
-
-func (p *parser) forTarget() (S, error) {
-	// 'for let <pattern> in ...'
-	if p.match(LET) {
-		pt, a, err := p.declPattern()
-		if err != nil {
-			return nil, err
-		}
-		// In a for-target, attach the pattern's own PRE to the pattern itself.
-		if a.ok {
-			pt = p.attachAnnotFrom(a, pt)
-		}
-		return pt, nil
-	}
-
-	// Heuristic: pattern-looking starts — try a decl pattern first.
-	switch p.peek().Type {
-	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
-		save := p.i
-		pt, a, err := p.declPattern()
-		if err == nil {
-			if a.ok {
-				pt = p.attachAnnotFrom(a, pt)
-			}
-			return pt, nil
-		}
-		if p.interactive && IsIncomplete(err) {
-			return nil, err
-		}
-		p.i = save
-	}
-
-	// Otherwise parse an expression and require it to be assignable.
-	save := p.i
-	e, err := p.expr(90)
-	if err != nil {
-		return nil, err
-	}
-	if !assignable(e) {
-		p.i = save
-		g := p.peek()
-		line, col := p.posAtByte(g.StartByte)
-		return nil, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
-	}
-	if e[0].(string) == "id" {
-		// Reuse the existing id span for the decl node range.
-		return p.mk("decl", p.lastSpanStartTok, p.lastSpanEndTok, e[1].(string)), nil
-	}
-	return e, nil
-}
-
-func assignable(n S) bool {
-	cur := n
-	for len(cur) > 0 {
-		tag, _ := cur[0].(string)
-		if tag == "annot" {
-			if inner, ok := cur[2].(S); ok {
-				cur = inner
-				continue
-			}
-		}
-		break
-	}
-	if len(cur) == 0 {
-		return false
-	}
-	switch cur[0] {
-	case "id", "get", "idx", "decl", "darr", "dobj":
-		return true
 	default:
-		return false
+		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
 	}
 }
-=== END FILE: parser.go ===
+
+// Private panic/null helpers live in interpreter_ops.go.
+=== END FILE: interpreter_exec.go ===
 

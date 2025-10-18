@@ -2,7 +2,7 @@
 //
 // What this file does
 // -------------------
-// This module provides the formatting layer for MindScript. It renders three
+// This module provides the formatting layer for MindScript. It renders two
 // kinds of data to human-readable, stable strings:
 //
 //  1. Parsed source ASTs (S-expressions) → MindScript source code.
@@ -24,7 +24,7 @@
 //     return expr
 //     break expr
 //     continue [expr]
-//     A `null` payload prints as the bare keyword (e.g. `continue`).
+//     A `null` payload prints as the bare keyword (e.g., `continue`).
 //
 //  2. Type ASTs (S-expressions) → compact type strings.
 //     - Entry point: FormatType.
@@ -44,24 +44,6 @@
 //     avoid visual churn.
 //     - When the last field ends with a POST, the closing `}` appears on the
 //     next line without an extra blank line.
-//
-//  3. Runtime values (Value) → width-aware strings.
-//     - Entry point: FormatValue.
-//     - Scalars print plainly (`null`, `true/false`, numbers, quoted strings).
-//     - Arrays and maps prefer a single-line rendering if it fits the
-//     MaxInlineWidth budget and no PRE annotations force multi-line; else
-//     they fall back to pretty, multi-line output with indentation.
-//     - Map keys are emitted bare if they’re identifier-like, otherwise quoted.
-//     - Annotations: the printer chooses PRE vs POST. At binding/entry/element
-//     sites, short single-line notes become inline trailing comments; otherwise
-//     they become header lines. POST forces a newline and respects the
-//     **after-separator** rule (value POST after comma).
-//     When a POST ends the last element/entry line, the closing bracket/brace
-//     is placed on the next line without an extra blank line.
-//     - Functions print as `<fun: a:T -> b:U -> R>` (or `_:Null` for zero-arg).
-//     - Types (VTType) are printed by extracting the embedded type AST and
-//     delegating to FormatType.
-//     - Modules print as `<module: <pretty name>>` when available.
 //
 // Dependencies (other files)
 // --------------------------
@@ -234,26 +216,11 @@ func FormatType(t S) string {
 	return b.String()
 }
 
-// FormatValue renders a runtime Value into a stable, readable string.
-//
-// Layout policy:
-//   - Scalars: null, booleans, ints, floats (with a decimal point for
-//     non-scientific output), and quoted strings.
-//   - Arrays: single-line `[ a, b, c ]` when the group fits; otherwise
-//     multi-line with indentation. Element annotations use the centralized
-//     policy (inline if short; else header).
-//   - Maps: keys sorted for stability; single-line `{ k: v, ... }` when short;
-//     else multi-line with indentation. Value annotations use centralized policy.
-//   - Functions: `<fun: name:T -> name2:U -> R>` (zero-arg uses `_:Null`).
-//   - Types (VTType): pretty-printed via docType, wrapped as `<type: ...>`.
-//   - Modules: `<module: pretty-name>` when available.
+// FormatValue renders a runtime Value by first adapting it to the printer’s AST
+// (with cycle guards and opaque fallbacks) and then delegating to FormatSExpr.
 func FormatValue(v Value) string {
-	ctx := newValPrintCtx()
-	doc := ctx.docValue(v)
-	var b strings.Builder
-	r := renderer{out: &b, maxWidth: MaxInlineWidth, tabWidth: 4}
-	r.render(doc)
-	return b.String()
+	ast := ValueToAST(v)
+	return FormatSExpr(ast)
 }
 
 //// END_OF_PUBLIC
@@ -723,10 +690,17 @@ func docStmt(n S) *Doc {
 		return Concat()
 
 	case "annot":
-		// With value-only annotations, statement wrappers should be rare.
-		// Render as PRE for stability.
+		// Apply the centralized inline-vs-PRE policy even at statement level.
+		// If it fits, place as a trailing inline comment on the same line;
+		// otherwise render as a PRE header.
 		text, wrapped, _ := asAnnotASTRaw(n)
-		return Concat(annotPre(text), docStmt(wrapped))
+		body := docStmt(wrapped)
+		main, post := attachInlineOrPre(body, text)
+		if post != "" {
+			// Inline comments consume the rest of the line; force newline.
+			return Concat(body, annotInline(post))
+		}
+		return main
 
 	case "fun":
 		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
@@ -1039,6 +1013,9 @@ func docExpr(n S) *Doc {
 	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot", "module":
 		return docStmt(n)
 
+	case "opaque":
+		return Text(getStr(n))
+
 	default:
 		return Text("<" + tag(n) + ">")
 	}
@@ -1270,172 +1247,6 @@ func docTypeLiteral(lit S) *Doc {
 	}
 }
 
-/* ---------- Runtime value pretty-printer (as Doc) ---------- */
-
-func numString(f float64) string {
-	s := strconv.FormatFloat(f, 'g', -1, 64)
-	if !strings.ContainsAny(s, ".eE") {
-		s += ".0"
-	}
-	return s
-}
-
-// Detect cycles by pointer identity during a single render pass.
-type valPrintCtx struct {
-	seenA map[*ArrayObject]bool
-	seenM map[*MapObject]bool
-}
-
-func newValPrintCtx() *valPrintCtx {
-	return &valPrintCtx{
-		seenA: make(map[*ArrayObject]bool),
-		seenM: make(map[*MapObject]bool),
-	}
-}
-
-// docValue: threads a cycle-detection context.
-func (ctx *valPrintCtx) docValue(v Value) *Doc {
-	txt := strings.TrimSpace(v.Annot)
-	if txt == "" {
-		return ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data})
-	}
-	// Top-level values: conservative PRE (stable and unsurprising).
-	return Concat(annotPre(txt), ctx.docValueNoAnn(Value{Tag: v.Tag, Data: v.Data}))
-}
-
-// docValueNoAnn: actual value rendering with cycle guards.
-// Uses Python-style cycle markers: `[...]` for arrays, `{...}` for maps.
-func (ctx *valPrintCtx) docValueNoAnn(v Value) *Doc {
-	switch v.Tag {
-	case VTNull:
-		return Text("null")
-	case VTBool:
-		if v.Data.(bool) {
-			return Text("true")
-		}
-		return Text("false")
-	case VTInt:
-		return Text(strconv.FormatInt(v.Data.(int64), 10))
-	case VTNum:
-		return Text(numString(v.Data.(float64)))
-	case VTStr:
-		return Text(quoteString(v.Data.(string)))
-
-	case VTArray:
-		ao := v.Data.(*ArrayObject)
-		// ---- cycle guard (identity) ----
-		if ctx.seenA[ao] {
-			return Text("[...]") // minimal, stable placeholder
-		}
-		ctx.seenA[ao] = true
-
-		xs := ao.Elems
-		if len(xs) == 0 {
-			return Text("[]")
-		}
-		joined := make([]sepItem, 0, len(xs))
-		for _, it := range xs {
-			elem := ctx.docValueNoAnn(Value{Tag: it.Tag, Data: it.Data})
-			main, post := attachInlineOrPre(elem, it.Annot)
-			joined = append(joined, sepItem{main: main, post: post})
-		}
-		inside := joinCommaWithPost(joined)
-		lastEnds := joined[len(joined)-1].post != ""
-		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
-			}
-			return SoftLineDoc()
-		}())), "]"))
-
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		// ---- cycle guard (identity) ----
-		if ctx.seenM[mo] {
-			return Text("{...}") // minimal, stable placeholder
-		}
-		ctx.seenM[mo] = true
-
-		keys := append([]string(nil), mo.Keys...)
-		sort.Strings(keys)
-		if len(keys) == 0 {
-			return Text("{}")
-		}
-		joined := make([]sepItem, 0, len(keys))
-		for _, k := range keys {
-			vv := mo.Entries[k]
-			joined = append(joined, entryWithAnn(
-				idOrQuoted(k),
-				ctx.docValueNoAnn(Value{Tag: vv.Tag, Data: vv.Data}),
-				vv.Annot,
-			))
-		}
-		inside := joinCommaWithPost(joined)
-		lastEnds := joined[len(joined)-1].post != ""
-		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
-			}
-			return SoftLineDoc()
-		}())), "}"))
-
-	case VTFun:
-		// unchanged, no recursive descent into values
-		if f, ok := v.Data.(*Fun); ok && f != nil {
-			label := "fun"
-			if f.IsOracle {
-				label = "oracle"
-			}
-			var chain []*Doc
-			if len(f.ParamTypes) == 0 {
-				chain = append(chain, Text("_:Null"))
-			} else {
-				for i := range f.ParamTypes {
-					if i > 0 {
-						chain = append(chain, Text(" -> "))
-					}
-					name := "_"
-					if i < len(f.Params) && f.Params[i] != "" {
-						name = f.Params[i]
-					}
-					pt := f.ParamTypes[i]
-					td := docType(pt)
-					if len(pt) >= 4 && pt[0] == "binop" && pt[1] == "->" {
-						td = Concat(Text("("), td, Text(")"))
-					}
-					chain = append(chain, Text(name), Text(":"), td)
-				}
-			}
-			chain = append(chain, Text(" -> "), docType(f.ReturnType))
-			return Group(Concat(Text("<"+label+": "), Concat(chain...), Text(">")))
-		}
-		return Text("<fun>")
-
-	case VTType:
-		return Group(Concat(Text("<type: "), docType(typeAst(v.Data)), Text(">")))
-
-	case VTModule:
-		name := "<module>"
-		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
-			disp := prettySpec(m.Name)
-			if disp == "" {
-				disp = m.Name
-			}
-			name = "<module: " + disp + ">"
-		}
-		return Text(name)
-
-	default:
-		if v.Tag == VTHandle {
-			if h, ok := v.Data.(*Handle); ok {
-				return Text("<handle: " + h.Kind + ">")
-			}
-			return Text("<handle>")
-		}
-		return Text("<unknown>")
-	}
-}
-
 /* ---------- Central annotation policy (single place) ---------- */
 
 // Decide inline vs PRE for a candidate: if `candidate + " # ann"` fits flat
@@ -1468,4 +1279,177 @@ func entryWithAnn(keyDoc, valDoc *Doc, ann string) sepItem {
 		return sepItem{main: probe, post: post}
 	}
 	return sepItem{main: main, post: ""}
+}
+
+/* ---------- Value → AST adapter (single source of truth) ---------- */
+
+// ValueToAST converts a runtime Value into the printer/parser AST (S), preserving:
+//   - annotations (as ("annot", ("str", ...), node))
+//   - insertion order of maps (MapObject.Keys)
+//   - cycle guards (arrays, maps) with python-style markers via ("opaque", "[...]") / ("opaque", "{...}")
+//
+// Non-source forms (functions, types, modules, handles, unknown) render as ("opaque", "<...>").
+func ValueToAST(v Value) S {
+	seenA := make(map[*ArrayObject]bool)
+	seenM := make(map[*MapObject]bool)
+	n := valueToASTRec(v, seenA, seenM)
+	if s := strings.TrimSpace(v.Annot); s != "" {
+		return S{"annot", S{"str", s}, n}
+	}
+	return n
+}
+
+func valueToASTRec(v Value, seenA map[*ArrayObject]bool, seenM map[*MapObject]bool) S {
+	switch v.Tag {
+	case VTNull:
+		return S{"null"}
+	case VTBool:
+		return S{"bool", v.Data.(bool)}
+	case VTInt:
+		return S{"int", v.Data.(int64)}
+	case VTNum:
+		return S{"num", v.Data.(float64)}
+	case VTStr:
+		return S{"str", v.Data.(string)}
+
+	case VTArray:
+		ao := v.Data.(*ArrayObject)
+		if ao == nil {
+			return S{"array"} // treat nil as empty
+		}
+		if seenA[ao] {
+			return S{"opaque", "[...]"}
+		}
+		seenA[ao] = true
+		out := S{"array"}
+		for _, ev := range ao.Elems {
+			node := valueToASTRec(ev, seenA, seenM)
+			if ann := strings.TrimSpace(ev.Annot); ann != "" {
+				node = S{"annot", S{"str", ann}, node}
+			}
+			out = append(out, node)
+		}
+		return out
+
+	case VTMap:
+		mo := v.Data.(*MapObject)
+		if mo == nil {
+			return S{"map"}
+		}
+		if seenM[mo] {
+			return S{"opaque", "{...}"}
+		}
+		seenM[mo] = true
+		out := S{"map"}
+		for _, k := range mo.Keys {
+			val := mo.Entries[k]
+			node := valueToASTRec(val, seenA, seenM)
+			// Per-key annotation goes on the VALUE. Merge with value.Annot if both exist.
+			keyNote := strings.TrimSpace(mo.KeyAnn[k])
+			valNote := strings.TrimSpace(val.Annot)
+			if keyNote != "" || valNote != "" {
+				node = S{"annot", S{"str", joinNonEmptyLocal(keyNote, valNote)}, node}
+			}
+			out = append(out, S{"pair", S{"str", k}, node})
+		}
+		return out
+
+	case VTFun, VTType, VTModule, VTHandle:
+		return S{"opaque", valueOpaqueString(v)}
+	default:
+		return S{"opaque", valueOpaqueString(v)}
+	}
+}
+
+func valueOpaqueString(v Value) string {
+	switch v.Tag {
+	case VTFun:
+		if f, ok := v.Data.(*Fun); ok && f != nil {
+			label := "fun"
+			if f.IsOracle {
+				label = "oracle"
+			}
+			var parts []string
+			if len(f.ParamTypes) == 0 {
+				parts = append(parts, "_:Null")
+			} else {
+				for i := range f.ParamTypes {
+					name := "_"
+					if i < len(f.Params) && f.Params[i] != "" {
+						name = f.Params[i]
+					}
+					pt := FormatType(f.ParamTypes[i])
+					// Parenthesize arrow types in param position for readability.
+					if len(f.ParamTypes[i]) >= 4 && f.ParamTypes[i][0] == "binop" && f.ParamTypes[i][1] == "->" {
+						pt = "(" + pt + ")"
+					}
+					if i > 0 {
+						parts = append(parts, "-> "+name+":"+pt)
+					} else {
+						parts = append(parts, name+":"+pt)
+					}
+				}
+			}
+			ret := FormatType(f.ReturnType)
+			if len(parts) > 0 {
+				return "<" + label + ": " + strings.Join(parts, " ") + " -> " + ret + ">"
+			}
+			return "<" + label + ": " + ret + ">"
+		}
+		return "<fun>"
+	case VTType:
+		return "<type: " + FormatType(typeAst(v.Data)) + ">"
+	case VTModule:
+		name := "<module>"
+		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
+			disp := prettySpec(m.Name)
+			if disp == "" {
+				disp = m.Name
+			}
+			name = "<module: " + disp + ">"
+		}
+		return name
+	case VTHandle:
+		if h, ok := v.Data.(*Handle); ok && h != nil && h.Kind != "" {
+			return "<handle: " + h.Kind + ">"
+		}
+		return "<handle>"
+	case VTNull:
+		return "null"
+	case VTBool:
+		if b, _ := v.Data.(bool); b {
+			return "true"
+		}
+		return "false"
+	case VTInt:
+		return strconv.FormatInt(v.Data.(int64), 10)
+	case VTNum:
+		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		return s
+	case VTStr:
+		// Reuse the same quoting policy for visibility; the opaque string is expected raw.
+		return quoteString(v.Data.(string))
+	default:
+		return "<unknown>"
+	}
+}
+
+// Local helper to avoid depending on parser.go's joinNonEmpty.
+// Concatenates non-empty strings with a single space.
+func joinNonEmptyLocal(a, b string) string {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	switch {
+	case a == "" && b == "":
+		return ""
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + " " + b
+	}
 }

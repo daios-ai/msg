@@ -738,42 +738,17 @@ func (ip *Interpreter) ValueToType(v Value, env *Env) S { return ip.valueToTypeS
 // Concurrency:
 //   - Register natives **before** using Clone/Spawn for concurrent work.
 //     Clones copy the native registry; mutating maps concurrently is not supported.
-func (ip *Interpreter) RegisterNative(name string, params []ParamSpec, ret S, impl NativeImpl) {
-	if ip.native == nil {
-		ip.native = map[string]NativeImpl{}
-	}
-	ip.native[name] = impl
-
+//
+// 2) Public API (unchanged): also install into Core under the public name.
+func (ip *Interpreter) RegisterNative(
+	name string, params []ParamSpec, ret S, impl NativeImpl,
+) {
+	// For Core natives, use the same key for lookup and public name.
+	funVal := ip.newNativeFun(name, params, ret, impl)
 	if ip.Core == nil {
 		ip.Core = NewEnv(nil)
 	}
-
-	names := make([]string, len(params))
-	types := make([]S, len(params))
-	for i, p := range params {
-		names[i], types[i] = p.Name, p.Type
-	}
-
-	hidden := false
-	if len(names) == 0 {
-		names = []string{"_"}
-		types = []S{S{"id", "Null"}}
-		hidden = true
-	}
-
-	ip.Core.Define(name, FunVal(&Fun{
-		Params:     names,
-		ParamTypes: types,
-		ReturnType: ret,
-		Body:       S{"native", name}, // sentinel for debugging; not executed
-		Env:        ip.Core,
-		NativeName: name,
-		HiddenNull: hidden, // <-- set this
-		Sig: &SigMeta{
-			Names: append([]string{}, names...),
-			Types: append([]S{}, types...),
-		},
-	}))
+	ip.Core.Define(name, funVal)
 }
 
 // AsMapValue returns a VTMap view for VTMap/VTModule (sharing the same MapObject),
@@ -944,4 +919,39 @@ func rebindValue(v Value, from, to *Env) Value {
 	default:
 		return v
 	}
+}
+
+//  1. Single internal constructor (no Core side effects).
+//     Returns a VTFun wired to ip.native[uniq]. Caller decides where to place it.
+func (ip *Interpreter) newNativeFun(
+	uniq string, params []ParamSpec, ret S, impl NativeImpl,
+) Value {
+	if ip.native == nil {
+		ip.native = map[string]NativeImpl{}
+	}
+	ip.native[uniq] = impl
+
+	names := make([]string, len(params))
+	types := make([]S, len(params))
+	for i, p := range params {
+		names[i], types[i] = p.Name, p.Type
+	}
+	hidden := false
+	if len(names) == 0 {
+		names = []string{"_"}
+		types = []S{S{"id", "Null"}}
+		hidden = true
+	}
+
+	f := &Fun{
+		Params:     names,
+		ParamTypes: types,
+		ReturnType: ret,
+		Body:       S{"native", uniq}, // sentinel for debugging
+		Env:        nil,               // let execFunBodyScoped use call-site scope when provided
+		NativeName: uniq,
+		HiddenNull: hidden,
+		Sig:        &SigMeta{Names: append([]string{}, names...), Types: append([]S{}, types...)},
+	}
+	return FunVal(f)
 }

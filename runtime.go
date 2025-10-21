@@ -86,6 +86,7 @@ func (ip *Interpreter) SeedRuntimeInto(target *Env) error {
 	registerStringBuiltins(ip, target)
 	registerRandomBuiltins(ip, target)
 	registerMathBuiltins(ip, target)
+	registerFFIBuiltins(ip, target)
 
 	// --- Load prelude into the SAME target (overrideable within namespace) ---
 	// If you need to load from a different spec, make this configurable by caller.

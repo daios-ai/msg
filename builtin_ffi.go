@@ -18,6 +18,11 @@ static void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue) {
     ffi_call(cif, (void (*)(void))fn, rvalue, avalue);
 }
 
+// Allocate a cif on the C heap (so it outlives the Go stack frame).
+static ffi_cif* ms_alloc_cif(void) {
+    return (ffi_cif*)malloc(sizeof(ffi_cif));
+}
+
 static void* ms_dlopen(const char* path) {
 	return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
 }
@@ -166,6 +171,8 @@ type ffiFunction struct {
 	Doc       string
 	RetAsStr  bool // char*/uchar* -> Str convenience
 	SymbolPtr unsafe.Pointer
+	cif       *C.ffi_cif
+	typesVec  unsafe.Pointer // malloc'd array of ffi_type* (argv type vector)
 }
 
 type ffiVariable struct {
@@ -240,6 +247,7 @@ func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
 				return &C.ffi_type_sint64, nil
 			}
 			return &C.ffi_type_uint64, nil
+
 		default:
 			return nil, fmt.Errorf("int bits=%d not supported", t.Bits)
 		}
@@ -271,20 +279,31 @@ func prepCIF(reg *ffiRegistry, ret string, params []string) (cif, []*C.ffi_type,
 	if err != nil {
 		return nil, nil, err
 	}
-	argv := make([]*C.ffi_type, len(params))
-	for i, p := range params {
-		pt, err := ffiTypeFor(reg, p)
-		if err != nil {
-			return nil, nil, fmt.Errorf("param[%d]: %w", i, err)
+	n := len(params)
+	var typesPtr **C.ffi_type
+	if n > 0 {
+		bytes := C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
+		if bytes == nil {
+			return nil, nil, fmt.Errorf("ffi_prep_cif: OOM")
 		}
-		argv[i] = pt
+		types := (*[1<<30 - 1]*C.ffi_type)(bytes)[:n:n]
+		for i, p := range params {
+			pt, err := ffiTypeFor(reg, p)
+			if err != nil {
+				return nil, nil, fmt.Errorf("param[%d]: %w", i, err)
+			}
+			types[i] = pt
+		}
+		typesPtr = (**C.ffi_type)(bytes) // keep allocated; libffi reads it on call
+	} else {
+		typesPtr = nil
 	}
 	var c C.ffi_cif
-	st := C.ffi_prep_cif(&c, C.FFI_DEFAULT_ABI, C.uint(len(argv)), rty, &argv[0])
+	st := C.ffi_prep_cif(&c, C.FFI_DEFAULT_ABI, C.uint(n), rty, typesPtr)
 	if st != C.FFI_OK {
 		return nil, nil, fmt.Errorf("ffi_prep_cif failed: %d", int(st))
 	}
-	return &c, argv, nil
+	return &c, nil, nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -773,7 +792,12 @@ func computeLayoutOne(reg *ffiRegistry, t *ffiType) error {
 	case ffiArray:
 		elem := reg.mustGet(t.Elem)
 		if elem.Align == 0 {
-			return fmt.Errorf("array element %s has no layout yet", t.Elem)
+			if err := computeLayoutOne(reg, elem); err != nil {
+				return fmt.Errorf("array element %s: %w", t.Elem, err)
+			}
+		}
+		if elem.Align == 0 {
+			return fmt.Errorf("array element %s unresolved align", t.Elem)
 		}
 		if t.Len < 0 {
 			// VLA/flexible: size unknown until allocated; we expose size=0, align=elem.Align
@@ -791,10 +815,15 @@ func computeLayoutOne(reg *ffiRegistry, t *ffiType) error {
 				return fmt.Errorf("bitfields not supported yet")
 			}
 			ft := reg.mustGet(f.Type)
-			a := ft.Align
-			if a == 0 {
+			if ft.Align == 0 {
+				if err := computeLayoutOne(reg, ft); err != nil {
+					return fmt.Errorf("field %s: %w", f.Name, err)
+				}
+			}
+			if ft.Align == 0 {
 				return fmt.Errorf("field %s unresolved align", f.Name)
 			}
+			a := ft.Align
 			off = alignUp(off, a)
 			offsets[i] = off
 			off += ft.Size
@@ -809,6 +838,12 @@ func computeLayoutOne(reg *ffiRegistry, t *ffiType) error {
 		var maxS, maxA uintptr
 		for _, f := range t.Fields {
 			ft := reg.mustGet(f.Type)
+			if ft.Align == 0 {
+				if err := computeLayoutOne(reg, ft); err != nil {
+					return fmt.Errorf("union field %s: %w", f.Name, err)
+				}
+			}
+
 			if ft.Size > maxS {
 				maxS = ft.Size
 			}
@@ -1251,15 +1286,33 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						}
 						argBufs, cleanup := marshalArgs(mod, fn, ctx)
 						defer cleanup()
-						var retBuf [8]byte // enough for scalars/pointers
-						// Call through our C shim to avoid cgo’s strict fn pointer typing.
-						// Note: cgo maps `void**` to `*unsafe.Pointer`, so pass &argBufs[0].
-						C.ms_ffi_call(
-							cif,
-							fn.SymbolPtr,
-							unsafe.Pointer(&retBuf[0]),
-							(*unsafe.Pointer)(&argBufs[0]))
-						return unmarshalRet(mod, fn, unsafe.Pointer(&retBuf[0]))
+						// Build C argv (void**)
+						var argvPtr *unsafe.Pointer
+						if n := len(argBufs); n > 0 {
+							bytes := C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
+							if bytes == nil {
+								fail("ffi: OOM")
+							}
+							defer C.free(bytes)
+							argv := (*[1<<30 - 1]unsafe.Pointer)(bytes)[:n:n]
+							for i := 0; i < n; i++ {
+								argv[i] = argBufs[i]
+							}
+							argvPtr = (*unsafe.Pointer)(bytes)
+						}
+						// Ret buffer on C heap (min 8 bytes)
+						rt := mod.reg.mustGet(fn.Ret)
+						sz := rt.Size
+						if sz < 8 {
+							sz = 8
+						}
+						rbuf := C.malloc(C.size_t(sz))
+						if rbuf == nil {
+							fail("ffi: OOM")
+						}
+						defer C.free(rbuf)
+						C.ms_ffi_call(cif, fn.SymbolPtr, rbuf, argvPtr)
+						return unmarshalRet(mod, fn, rbuf)
 					},
 				)
 				if v, err := modEnv.Get(name); err == nil {

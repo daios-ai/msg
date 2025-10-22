@@ -2,6 +2,7 @@ package mindscript
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -786,4 +787,193 @@ func Test_Builtin_FFI___mem_typeof_inline_and_name(t *testing.T) {
 	if mustInt64(t, m.Entries["a"]) != 4 || mustInt64(t, m.Entries["b"]) != 4 {
 		t.Fatalf("typeof/sizeof mismatch: got a=%d b=%d", mustInt64(t, m.Entries["a"]), mustInt64(t, m.Entries["b"]))
 	}
+}
+
+// String bridge control: passing Str to char* still works.
+func Test_Builtin_FFI_string_bridge_charp_control(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version: 1,
+		  lib: "libc.so.6",
+		  types: {
+		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
+		    int32: { kind:"int", bits:32, signed:true }
+		  },
+		  functions: [
+		    { name:"strlen", ret:"int32", params:["charp"] }
+		  ]
+		})
+		C.strlen("hello")
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 5 {
+		t.Fatalf("strlen('hello') expected 5, got %#v", v)
+	}
+}
+
+// --- pointer tags must be enforced; cast is the explicit escape hatch.
+func Test_Builtin_FFI_pointer_tag_mismatch_then_cast_ok(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Tag mismatch MUST hard-error.
+	_, err := ip.EvalSource(`
+		let C = ffiOpen({
+		  version: 1,
+		  lib: "libc.so.6",
+		  types: {
+		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
+		    int32: { kind:"int", bits:32, signed:true }
+		  },
+		  functions: [ { name:"strlen", ret:"int32", params:["charp"] } ]
+		})
+		do
+		  let p = C.__mem.malloc(4)   # tag = c.ptr::<void>
+		  C.__mem.fill(p, 0, 4)       # ensure NUL
+		  C.strlen(p)                  # MUST error (tag mismatch)
+		end
+	`)
+	if err == nil {
+		t.Fatalf("expected an error for pointer tag mismatch, got nil")
+	}
+
+	// With explicit cast to charp, it must succeed.
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version: 1, lib: "libc.so.6",
+		  types: {
+		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
+		    int32: { kind:"int", bits:32, signed:true }
+		  },
+		  functions: [ { name:"strlen", ret:"int32", params:["charp"] } ]
+		})
+		do
+		  let p = C.__mem.malloc(1)
+		  C.__mem.fill(p, 0, 1)     # write NUL
+		  let cp = C.__mem.cast("charp", p)
+		  C.strlen(cp)               # -> 0
+		end
+	`)
+	if v.Tag != VTInt || v.Data.(int64) != 0 {
+		t.Fatalf("strlen on NUL via cast should be 0, got %#v", v)
+	}
+}
+
+// CIF must outlive prep; first call happens AFTER heavy churn.
+// This is designed to catch the current bug: prepCIF returns &c where c is a stack C struct.
+func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// Build one big source string: prepare M, thrash with many ffiOpen()s, then call M.hypot.
+	var b strings.Builder
+	b.WriteString(`
+		let M = ffiOpen({
+		  version: 1,
+		  lib: "libm.so.6",
+		  types: { dbl: { kind:"float", bits:64 } },
+		  functions: [ { name:"hypot", ret:"dbl", params:["dbl","dbl"] } ]
+		});
+	`)
+	thrashSnip := `
+		let _ = ffiOpen({
+		  version: 1,
+		  lib: "libc.so.6",
+		  types: {
+		    int32: { kind:"int", bits:32, signed:true },
+		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } }
+		  },
+		  functions: [ { name:"strlen", ret:"int32", params:["charp"] } ]
+		});
+		0;
+	`
+	for i := 0; i < 3000; i++ {
+		b.WriteString(thrashSnip)
+	}
+	b.WriteString(`M.hypot(3.0, 4.0)`)
+
+	v, err := ip.EvalSource(b.String())
+	if err != nil {
+		t.Fatalf("hypot call errored after thrash: %v", err)
+	}
+	if v.Tag != VTNum {
+		t.Fatalf("hypot should return Num, got %#v", v)
+	}
+	if math.Abs(v.Data.(float64)-5.0) > 1e-9 {
+		t.Fatalf("hypot(3,4) expected 5.0 after CIF thrash, got %v", v.Data.(float64))
+	}
+
+	// Sanity: another call using a fresh program (normal path) still ok.
+	v = evalWithIP(t, ip, `
+		let M = ffiOpen({
+		  version: 1,
+		  lib: "libm.so.6",
+		  types: { dbl: { kind:"float", bits:64 } },
+		  functions: [ { name:"hypot", ret:"dbl", params:["dbl","dbl"] } ]
+		});
+		M.hypot(6.0, 8.0)
+	`)
+	if v.Tag != VTNum || math.Abs(v.Data.(float64)-10.0) > 1e-9 {
+		t.Fatalf("hypot(6,8)=10.0 mismatch: %#v", v)
+	}
+}
+
+// Pointer tag mismatch at call boundary: passing a void* to strlen(char*)
+// should hard-error with a tag-related message.
+func Test_Builtin_FFI_pointer_tag_mismatch_on_call(t *testing.T) {
+	err(t, "tag", `
+		let C = ffiOpen({
+		  version: "1",
+		  lib: "libc.so.6",
+		  types: {
+		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
+		    int32: { kind:"int", bits:32, signed:true }
+		  },
+		  functions: [
+		    { name:"strlen", ret:"int32", params:["charp"] }
+		  ]
+		})
+		do
+		  let p = C.__mem.malloc(4)   # p has tag c.ptr::<void>
+		  C.strlen(p)                 # should fail: tag mismatch (expects charp)
+		end
+	`)
+}
+
+// Version contract: numeric 1 must be rejected; spec requires "1" (string).
+func Test_Builtin_FFI_version_must_be_string(t *testing.T) {
+	err(t, "version", `
+		ffiOpen({ version: 1, lib: "libc.so.6" })
+	`)
+}
+
+// Duplicate function names within the same spec must be rejected.
+func Test_Builtin_FFI_duplicate_function_names_rejected(t *testing.T) {
+	err(t, "duplicate", `
+		ffiOpen({
+		  version: "1",
+		  lib: "libc.so.6",
+		  types: {
+		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
+		    int32: { kind:"int", bits:32, signed:true }
+		  },
+		  functions: [
+		    { name:"puts", ret:"int32", params:["charp"] },
+		    { name:"puts", ret:"int32", params:["charp"] }  # duplicate
+		  ]
+		})
+	`)
+}
+
+// Duplicate variable names within the same spec must be rejected.
+func Test_Builtin_FFI_duplicate_variable_names_rejected(t *testing.T) {
+	err(t, "duplicate", `
+		ffiOpen({
+		  version: "1",
+		  lib: "libc.so.6",
+		  types: { int32: { kind:"int", bits:32, signed:true } },
+		  variables: [
+		    { name:"errno", type:"int32" },
+		    { name:"errno", type:"int32" }   # duplicate
+		  ]
+		})
+	`)
 }

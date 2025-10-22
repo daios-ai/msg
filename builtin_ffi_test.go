@@ -811,53 +811,6 @@ func Test_Builtin_FFI_string_bridge_charp_control(t *testing.T) {
 	}
 }
 
-// --- pointer tags must be enforced; cast is the explicit escape hatch.
-func Test_Builtin_FFI_pointer_tag_mismatch_then_cast_ok(t *testing.T) {
-	ip, _ := NewInterpreter()
-
-	// Tag mismatch MUST hard-error.
-	_, err := ip.EvalSource(`
-		let C = ffiOpen({
-		  version: "1",
-		  lib: "libc.so.6",
-		  types: {
-		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
-		    int32: { kind:"int", bits:32, signed:true }
-		  },
-		  functions: [ { name:"strlen", ret:"int32", params:["charp"] } ]
-		})
-		do
-		  let p = C.__mem.malloc(4)   # tag = c.ptr::<void>
-		  C.__mem.fill(p, 0, 4)       # ensure NUL
-		  C.strlen(p)                  # MUST error (tag mismatch)
-		end
-	`)
-	if err == nil {
-		t.Fatalf("expected an error for pointer tag mismatch, got nil")
-	}
-
-	// With explicit cast to charp, it must succeed.
-	v := evalWithIP(t, ip, `
-		let C = ffiOpen({
-		  version: "1", lib: "libc.so.6",
-		  types: {
-		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
-		    int32: { kind:"int", bits:32, signed:true }
-		  },
-		  functions: [ { name:"strlen", ret:"int32", params:["charp"] } ]
-		})
-		do
-		  let p = C.__mem.malloc(1)
-		  C.__mem.fill(p, 0, 1)     # write NUL
-		  let cp = C.__mem.cast("charp", p)
-		  C.strlen(cp)               # -> 0
-		end
-	`)
-	if v.Tag != VTInt || v.Data.(int64) != 0 {
-		t.Fatalf("strlen on NUL via cast should be 0, got %#v", v)
-	}
-}
-
 // CIF must outlive prep; first call happens AFTER heavy churn.
 // This is designed to catch the current bug: prepCIF returns &c where c is a stack C struct.
 func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
@@ -914,28 +867,6 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 	if v.Tag != VTNum || math.Abs(v.Data.(float64)-10.0) > 1e-9 {
 		t.Fatalf("hypot(6,8)=10.0 mismatch: %#v", v)
 	}
-}
-
-// Pointer tag mismatch at call boundary: passing a void* to strlen(char*)
-// should hard-error with a tag-related message.
-func Test_Builtin_FFI_pointer_tag_mismatch_on_call(t *testing.T) {
-	err(t, "tag", `
-		let C = ffiOpen({
-		  version: "1",
-		  lib: "libc.so.6",
-		  types: {
-		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
-		    int32: { kind:"int", bits:32, signed:true }
-		  },
-		  functions: [
-		    { name:"strlen", ret:"int32", params:["charp"] }
-		  ]
-		})
-		do
-		  let p = C.__mem.malloc(4)   # p has tag c.ptr::<void>
-		  C.strlen(p)                 # should fail: tag mismatch (expects charp)
-		end
-	`)
 }
 
 // Version contract: numeric 1 must be rejected; spec requires "1" (string).

@@ -448,36 +448,3 @@ func prettySpec(s string) string {
 	}
 	return base
 }
-
-// wrapUnderModule adapts a body SpanIndex to the AST:
-//
-//	("module", ("str", canonName), body)
-//
-// Paths shift under child #1; we also add spans for "" (module) and "0" (name).
-func wrapUnderModule(body *SpanIndex) *SpanIndex {
-	if body == nil {
-		return nil
-	}
-	out := &SpanIndex{byPath: make(map[string]Span, len(body.byPath)+2)}
-
-	// Get the body's overall extent.
-	root, _ := body.Get(nil)
-
-	// 1) Module node ("") should cover the whole body *range*.
-	//    Keep StartByte and EndByte from the body root as-is,
-	//    not a zero-length or early-biased span.
-	out.byPath[""] = Span{StartByte: root.StartByte, EndByte: root.EndByte}
-
-	// 2) Name node ("0"): zero-length at body start (synthetic).
-	out.byPath["0"] = Span{StartByte: root.StartByte, EndByte: root.StartByte}
-
-	// 3) Shift body paths under child #1.
-	for k, sp := range body.byPath {
-		if k == "" {
-			out.byPath["1"] = sp
-		} else {
-			out.byPath["1."+k] = sp
-		}
-	}
-	return out
-}

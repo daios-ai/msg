@@ -54,42 +54,42 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 		err(t, "unsupported version", `ffiOpen({version:"2", lib:"libc.so.6"})`)
 	})
 	t.Run("2.missing-lib-rejected", func(t *testing.T) {
-		err(t, "missing or invalid 'lib'", `ffiOpen({version:1})`)
+		err(t, "missing or invalid 'lib'", `ffiOpen({version: "1"})`)
 	})
 	t.Run("2.dlopen-error-surfaced", func(t *testing.T) {
-		err(t, "dlopen", `ffiOpen({version:1, lib:"/no/such/lib.so"})`)
+		err(t, "dlopen", `ffiOpen({version: "1", lib:"/no/such/lib.so"})`)
 	})
 
 	t.Run("3.types-empty-ok", func(t *testing.T) {
-		ok(t, `ffiOpen({version:1, lib:"libc.so.6", types:{}})`)
+		ok(t, `ffiOpen({version: "1", lib:"libc.so.6", types:{}})`)
 	})
 	t.Run("3.types-nonmap-rejected", func(t *testing.T) {
-		err(t, "'types' must be a map", `ffiOpen({version:1, lib:"libc.so.6", types: 7})`)
+		err(t, "'types' must be a map", `ffiOpen({version: "1", lib:"libc.so.6", types: 7})`)
 	})
 	t.Run("3.types-duplicate-rejected", func(t *testing.T) {
 		err(t, "duplicate type name", `
-			ffiOpen({version:1, lib:"libc.so.6",
+			ffiOpen({version: "1", lib:"libc.so.6",
 			  types:{U8:{kind:"int",bits:8,signed:false},U8:{kind:"int",bits:8,signed:false}}})`)
 	})
 
 	t.Run("4.alias-transitive-ok", func(t *testing.T) {
 		ok(t, `
-		  ffiOpen({version:1, lib:"libc.so.6",
+		  ffiOpen({version: "1", lib:"libc.so.6",
 		    types:{I32:{kind:"int",bits:32,signed:true},X:{kind:"alias",to:"I32"},Y:{kind:"alias",to:"X"}}})`)
 	})
 	t.Run("4.alias-unknown-target", func(t *testing.T) {
 		err(t, "unknown target", `
-		  ffiOpen({version:1, lib:"libc.so.6",types:{X:{kind:"alias",to:"NOPE"}}})`)
+		  ffiOpen({version: "1", lib:"libc.so.6",types:{X:{kind:"alias",to:"NOPE"}}})`)
 	})
 	t.Run("4.alias-cycle", func(t *testing.T) {
 		err(t, "alias cycle", `
-		  ffiOpen({version:1, lib:"libc.so.6",types:{A:{kind:"alias",to:"B"},B:{kind:"alias",to:"A"}}})`)
+		  ffiOpen({version: "1", lib:"libc.so.6",types:{A:{kind:"alias",to:"B"},B:{kind:"alias",to:"A"}}})`)
 	})
 
 	// 5) int-signedness enforced on call (reject negative → unsigned)
 	t.Run("5.int-signedness-enforced-on-call", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`let C=ffiOpen({version:1,lib:"libc.so.6",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`)
+		_, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`)
 		if err == nil {
 			t.Fatalf("expected failure for negative→unsigned")
 		}
@@ -97,7 +97,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("5.int-signedness-enforced-on-call", func(t *testing.T) {
 		err(t, "negative", `
-			let C=ffiOpen({version:1, lib:"libc.so.6",
+			let C=ffiOpen({version: "1", lib:"libc.so.6",
 			  types:{U:{kind:"int",bits:32,signed:false}},
 			  functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]})
 			C.sleep(-1)`)
@@ -105,29 +105,29 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("6.float-bits-validated", func(t *testing.T) {
 		err(t, "float: bits must be 32/64", `
-			ffiOpen({version:1, lib:"libc.so.6", types:{BadF:{kind:"float",bits:128}}})`)
+			ffiOpen({version: "1", lib:"libc.so.6", types:{BadF:{kind:"float",bits:128}}})`)
 	})
 
 	t.Run("7.pointer-size-align", func(t *testing.T) {
-		eqi(t, 8, `let C=ffiOpen({version:1,lib:"libc.so.6",
+		eqi(t, 8, `let C=ffiOpen({version: "1",lib:"libc.so.6",
 		 types:{P:{kind:"pointer",to:{kind:"void"}}}}); C.__mem.sizeof("P")`)
 	})
 	t.Run("7.pointer-align", func(t *testing.T) {
-		eqi(t, 8, `let C=ffiOpen({version:1,lib:"libc.so.6",
+		eqi(t, 8, `let C=ffiOpen({version: "1",lib:"libc.so.6",
 		 types:{P:{kind:"pointer",to:{kind:"void"}}}}); C.__mem.alignof("P")`)
 	})
 
 	t.Run("8.handle-tag-required", func(t *testing.T) {
 		err(t, `missing "rep"`, `
-		  ffiOpen({version:1,lib:"libc.so.6",types:{H:{kind:"handle",tag:"x"}}})`)
+		  ffiOpen({version: "1",lib:"libc.so.6",types:{H:{kind:"handle",tag:"x"}}})`)
 	})
 
 	t.Run("9.array-fixed-size", func(t *testing.T) {
-		eqi(t, 5, `let C=ffiOpen({version:1,lib:"libc.so.6",
+		eqi(t, 5, `let C=ffiOpen({version: "1",lib:"libc.so.6",
 		  types:{U8:{kind:"int",bits:8,signed:false},A5:{kind:"array",of:"U8",len:5}}}); C.__mem.sizeof("A5")`)
 	})
 	t.Run("9.array-flexible-size0", func(t *testing.T) {
-		eqi(t, 0, `let C=ffiOpen({version:1,lib:"libc.so.6",
+		eqi(t, 0, `let C=ffiOpen({version: "1",lib:"libc.so.6",
 		  types:{U8:{kind:"int",bits:8,signed:false},Flex:{kind:"array",of:"U8"}}}); C.__mem.sizeof("Flex")`)
 	})
 
@@ -135,7 +135,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	t.Run("10.struct-layout-offset", func(t *testing.T) {
 		ip, _ := NewInterpreter()
 		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version:1,lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
+	  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
 	  C.__mem.offsetof("S","p")
 	end`)
 		if err != nil {
@@ -150,7 +150,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	t.Run("10.struct-size-align", func(t *testing.T) {
 		ip, _ := NewInterpreter()
 		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version:1,lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
+	  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
 	  {sz:C.__mem.sizeof("S"), al:C.__mem.alignof("S")}
 	end`)
 		if err != nil {
@@ -166,7 +166,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	t.Run("11.union-size-align", func(t *testing.T) {
 		ip, _ := NewInterpreter()
 		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version:1,lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},U:{kind:"union",fields:[{name:"x",type:"I32"},{name:"y",type:"P"}]}}})
+	  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},U:{kind:"union",fields:[{name:"x",type:"I32"},{name:"y",type:"P"}]}}})
 	  {sz:C.__mem.sizeof("U"), al:C.__mem.alignof("U")}
 	end`)
 		if err != nil {
@@ -180,29 +180,29 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("12.enum-base-required", func(t *testing.T) {
 		err(t, `missing "base"`, `
-		  ffiOpen({version:1,lib:"libc.so.6",types:{E:{kind:"enum"}}})`)
+		  ffiOpen({version: "1",lib:"libc.so.6",types:{E:{kind:"enum"}}})`)
 	})
 
 	t.Run("13.funcptr-accepted-as-type", func(t *testing.T) {
-		ok(t, `ffiOpen({version:1,lib:"libc.so.6",
+		ok(t, `ffiOpen({version: "1",lib:"libc.so.6",
 		  types:{CB:{kind:"funcptr",ret:{kind:"void"},params:[{kind:"pointer",to:{kind:"void"}}]}}})`)
 	})
 
 	t.Run("14.functions-need-name-ret-params", func(t *testing.T) {
 		err(t, "function: missing 'ret'", `
-		  ffiOpen({version:1,lib:"libc.so.6",functions:[{name:"puts",params:[]}]})`)
+		  ffiOpen({version: "1",lib:"libc.so.6",functions:[{name:"puts",params:[]}]})`)
 	})
 
 	t.Run("15.dlsym-missing-symbol-errors", func(t *testing.T) {
 		err(t, "dlsym", `
-		  ffiOpen({version:1,lib:"libc.so.6",
+		  ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"__nope__",ret:"i32",params:[]}]})`)
 	})
 
 	t.Run("16.variadic-final-arg-must-array", func(t *testing.T) {
 		err(t, "final argument to be an array", `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},sz:{kind:"int",bits:64,signed:false},i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"snprintf",ret:"i32",params:["charp","sz","charp"],variadic:true}]});
 		  C.snprintf(C.__mem.malloc(8),7,"%d", 1)`)
@@ -211,7 +211,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	// 17) scalar: negative → unsigned rejected
 	t.Run("17.scalar-negative-to-unsigned-rejected", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`let C=ffiOpen({version:1,lib:"libc.so.6",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`)
+		_, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`)
 		if err == nil {
 			t.Fatalf("expected failure for negative→unsigned")
 		}
@@ -219,14 +219,14 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("17.float-to-int-must-be-integral", func(t *testing.T) {
 		err(t, "non-integral", `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]});
 		  C.sleep(0.5)`)
 	})
 
 	t.Run("18.pointer-null-maps-to-NULL", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{voidp:{kind:"pointer",to:{kind:"void"}},i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"memchr",ret:"voidp",params:["voidp","i32",{kind:"int",bits:64,signed:false}]}]});
 		  C.memchr(null,0,0)`)
@@ -234,7 +234,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("19.string-bridge-only-for-charp", func(t *testing.T) {
 		err(t, "expected pointer handle", `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{voidp:{kind:"pointer",to:{kind:"void"}},i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"memchr",ret:"voidp",params:["voidp","i32",{kind:"int",bits:64,signed:false}]}]});
 		  C.memchr("abc",65,3)`)
@@ -242,7 +242,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("20.return-pointer-becomes-handle", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}}},
 		    functions:[{name:"getenv",ret:"charp",params:["charp"]}]});
 		  C.getenv("PATH")`)
@@ -251,7 +251,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	// 21) ret_as_str valid only for char*/uchar* (must error for non-char*)
 	t.Run("21.ret_as_str-valid-only-for-charp", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`ffiOpen({version:1,lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true}},functions:[{name:"getpid",ret:"I32",params:[],ret_as_str:true}]})`)
+		_, err := ip.EvalSource(`ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true}},functions:[{name:"getpid",ret:"I32",params:[],ret_as_str:true}]})`)
 		if err == nil {
 			t.Fatalf("expected error: ret_as_str on non-char*")
 		} // spec requires rejection
@@ -259,7 +259,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("22.variables-get-set-addr", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{i32:{kind:"int",bits:32,signed:true}},
 		    variables:[{name:"errno",type:"i32"}]});
 		  C.errno.get(); C.errno.addr(); C.errno.set(0)`)
@@ -268,7 +268,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	// 23) sizeof/alignof/offsetof accept inline type objects
 	t.Run("23.sizeof-alignof-offsetof-accept-inline", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		v, err := ip.EvalSource(`let C=ffiOpen({version:1,lib:"libc.so.6"}); C.__mem.sizeof({kind:"pointer",to:{kind:"void"}})`)
+		v, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6"}); C.__mem.sizeof({kind:"pointer",to:{kind:"void"}})`)
 		if err != nil {
 			t.Fatalf("eval error: %v", err)
 		}
@@ -279,20 +279,20 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("24.typeof-normalizes", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6"});
+		  let C=ffiOpen({version: "1",lib:"libc.so.6"});
 		  let T=C.__mem.typeof({kind:"int",bits:32,signed:true}); T`)
 	})
 
 	t.Run("25.new-fixed-alloc-size", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",types:{I:{kind:"int",bits:32,signed:true}}});
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I:{kind:"int",bits:32,signed:true}}});
 		  C.__mem.new("I",1)`)
 	})
 
 	// 26) malloc/calloc/realloc/free: negatives are errors (no message coupling)
 	t.Run("26.malloc-calloc-realloc-free-guards", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`let C=ffiOpen({version:1,lib:"libc.so.6"}); C.__mem.malloc(-1)`)
+		_, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6"}); C.__mem.malloc(-1)`)
 		if err == nil {
 			t.Fatalf("expected error on negative size")
 		}
@@ -300,7 +300,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("27.cast-retags-pointer", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6",
+		  let C=ffiOpen({version: "1",lib:"libc.so.6",
 		    types:{Voidp:{kind:"pointer",to:{kind:"void"}},I8:{kind:"int",bits:8,signed:true},Charp:{kind:"pointer",to:"I8"}}});
 		  let p=C.__mem.malloc(1); C.__mem.cast("Charp", p)`)
 	})
@@ -309,7 +309,7 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	t.Run("28.string-read-nul-or-fixed", func(t *testing.T) {
 		ip, _ := NewInterpreter()
 		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version:1,lib:"libc.so.6"})
+	  let C=ffiOpen({version: "1",lib:"libc.so.6"})
 	  let p=C.__mem.malloc(3); C.__mem.copy(p,"hi\u0000",3); C.__mem.string(p,null)
 	end`)
 		if err != nil {
@@ -322,14 +322,14 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 
 	t.Run("29.copy-fill-basic", func(t *testing.T) {
 		ok(t, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6"}); do
+		  let C=ffiOpen({version: "1",lib:"libc.so.6"}); do
 		    let p=C.__mem.malloc(4); C.__mem.fill(p,65,4); C.__mem.string(p,4)
 		  end`)
 	})
 
 	t.Run("30.errno-get-set", func(t *testing.T) {
 		eqi(t, 0, `
-		  let C=ffiOpen({version:1,lib:"libc.so.6"}); do C.__mem.errno(0) end`)
+		  let C=ffiOpen({version: "1",lib:"libc.so.6"}); do C.__mem.errno(0) end`)
 	})
 }
 
@@ -338,7 +338,7 @@ func Test_Builtin_FFI_libm_hypot(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libm.so.6",
 		  types: { double: { kind:"float", bits:64 } },
 		  functions: [
@@ -360,7 +360,7 @@ func Test_Builtin_FFI_libc_strlen_and_strdup_ret_as_str(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -390,7 +390,7 @@ func Test_Builtin_FFI_libc_strlen_and_strdup_ret_as_str(t *testing.T) {
 func Test_Builtin_FFI___mem_malloc_copy_string_free(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
-		let C = ffiOpen({ version:1, lib:"libc.so.6" })
+		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
 		do
 			let p = C.__mem.malloc(6)
 			C.__mem.copy(p, "hello", 6)   # copies "hello\0"
@@ -409,7 +409,7 @@ func Test_Builtin_FFI___mem_sizeof_alignof_offsetof_struct(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    S: { kind:"struct", fields: [
@@ -440,7 +440,7 @@ func Test_Builtin_FFI_bad_symbol_errors(t *testing.T) {
 	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`
 		ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: { int32: { kind:"int", bits:32, signed:true } },
 		  functions: [
@@ -466,7 +466,7 @@ func Test_Builtin_FFI_libm_sin_cos_zero(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libm.so.6",
 		  types: { dbl: { kind:"float", bits:64 } },
 		  functions: [
@@ -489,7 +489,7 @@ func Test_Builtin_FFI_libc_strlen_embedded_nul(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -509,7 +509,7 @@ func Test_Builtin_FFI_libc_snprintf_variadic(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    size_t: { kind:"int", bits:64, signed:false },
@@ -548,7 +548,7 @@ func Test_Builtin_FFI_libc_getenv_ret_as_str_PATH(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } }
@@ -568,7 +568,7 @@ func Test_Builtin_FFI_struct_union_nested_layout(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    U: { kind:"union", fields:[
@@ -601,7 +601,7 @@ func Test_Builtin_FFI_variadic_requires_array(t *testing.T) {
 	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    size_t: { kind:"int", bits:64, signed:false },
@@ -624,7 +624,7 @@ func Test_Builtin_FFI_variadic_requires_array(t *testing.T) {
 func Test_Builtin_FFI___mem_string_len_negative_error(t *testing.T) {
 	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`
-		let C = ffiOpen({ version:1, lib:"libc.so.6" })
+		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
 		C.__mem.string(C.__mem.malloc(1), -5)
 	`)
 	wantErrContains(t, err, "len < 0")
@@ -634,7 +634,7 @@ func Test_Builtin_FFI_per_symbol_lib_override(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",     # default
 		  types: {
 		    int32: { kind:"int", bits:32, signed:true },
@@ -660,7 +660,7 @@ func Test_Builtin_FFI_per_symbol_lib_override(t *testing.T) {
 func Test_Builtin_FFI_open_close_twice_error(t *testing.T) {
 	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`
-		let C = ffiOpen({ version:1, lib:"libc.so.6" })
+		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
 		C.close()
 		C.close()   # second close should error
 	`)
@@ -671,7 +671,7 @@ func Test_Builtin_FFI___types_handles_into_sizeof(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version:1, lib:"libc.so.6",
+		  version: "1", lib:"libc.so.6",
 		  types:{ X:{ kind:"int", bits:64, signed:true } }
 		})
 		# fetch handle from __types and feed to sizeof
@@ -688,7 +688,7 @@ func Test_Builtin_FFI_clock_gettime_timespec_layout_and_call(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    time_t:   { kind:"int", bits:64, signed:true },
@@ -731,7 +731,7 @@ func Test_Builtin_FFI_range_errors_int_and_unsigned(t *testing.T) {
 	ip, _ := NewInterpreter()
 	_, err := ip.EvalSource(`
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    size_t: { kind:"int", bits:64, signed:false },
@@ -755,7 +755,7 @@ func Test_Builtin_FFI_range_errors_int_and_unsigned(t *testing.T) {
 func Test_Builtin_FFI___mem_fill_and_copy_bytes(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
-		let C = ffiOpen({ version:1, lib:"libc.so.6" })
+		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
 		do
 		  let p = C.__mem.malloc(6)
 		  C.__mem.fill(p, 0, 6)         # ensure NUL-termination
@@ -774,7 +774,7 @@ func Test_Builtin_FFI___mem_fill_and_copy_bytes(t *testing.T) {
 func Test_Builtin_FFI___mem_typeof_inline_and_name(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
-		let C = ffiOpen({ version:1, lib:"libc.so.6",
+		let C = ffiOpen({ version: "1", lib:"libc.so.6",
 		  types:{ I32:{ kind:"int", bits:32, signed:true } }
 		})
 		do
@@ -794,7 +794,7 @@ func Test_Builtin_FFI_string_bridge_charp_control(t *testing.T) {
 	ip, _ := NewInterpreter()
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -818,7 +818,7 @@ func Test_Builtin_FFI_pointer_tag_mismatch_then_cast_ok(t *testing.T) {
 	// Tag mismatch MUST hard-error.
 	_, err := ip.EvalSource(`
 		let C = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -839,7 +839,7 @@ func Test_Builtin_FFI_pointer_tag_mismatch_then_cast_ok(t *testing.T) {
 	// With explicit cast to charp, it must succeed.
 	v := evalWithIP(t, ip, `
 		let C = ffiOpen({
-		  version: 1, lib: "libc.so.6",
+		  version: "1", lib: "libc.so.6",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
 		    int32: { kind:"int", bits:32, signed:true }
@@ -867,7 +867,7 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(`
 		let M = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libm.so.6",
 		  types: { dbl: { kind:"float", bits:64 } },
 		  functions: [ { name:"hypot", ret:"dbl", params:["dbl","dbl"] } ]
@@ -875,7 +875,7 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 	`)
 	thrashSnip := `
 		let _ = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libc.so.6",
 		  types: {
 		    int32: { kind:"int", bits:32, signed:true },
@@ -904,7 +904,7 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 	// Sanity: another call using a fresh program (normal path) still ok.
 	v = evalWithIP(t, ip, `
 		let M = ffiOpen({
-		  version: 1,
+		  version: "1",
 		  lib: "libm.so.6",
 		  types: { dbl: { kind:"float", bits:64 } },
 		  functions: [ { name:"hypot", ret:"dbl", params:["dbl","dbl"] } ]

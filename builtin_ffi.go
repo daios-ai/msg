@@ -84,7 +84,7 @@ func dlerr() string {
 	if errC != nil {
 		return C.GoString(errC)
 	}
-	return "<unknown dlerror>"
+	return "unknown dlerror"
 }
 
 // openLib returns the handle for a library path/soname and records it for later dlclose.
@@ -282,7 +282,9 @@ func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
 	}
 }
 
-func prepCIF(reg *ffiRegistry, ret string, params []string) (cif, []*C.ffi_type, error) {
+// prepCIF allocates a C-heap cif and a C-heap ffi_type** argv vector.
+// The caller is responsible for freeing both.
+func prepCIF(reg *ffiRegistry, ret string, params []string) (cif, unsafe.Pointer, error) {
 	rty, err := ffiTypeFor(reg, ret)
 	if err != nil {
 		return nil, nil, err
@@ -306,12 +308,15 @@ func prepCIF(reg *ffiRegistry, ret string, params []string) (cif, []*C.ffi_type,
 	} else {
 		typesPtr = nil
 	}
-	var c C.ffi_cif
-	st := C.ffi_prep_cif(&c, C.FFI_DEFAULT_ABI, C.uint(n), rty, typesPtr)
-	if st != C.FFI_OK {
-		return nil, nil, fmt.Errorf("ffi_prep_cif failed: %d", int(st))
+	c := C.ms_alloc_cif()
+	if c == nil {
+		return nil, nil, fmt.Errorf("ffi_prep_cif: OOM")
 	}
-	return &c, nil, nil
+	st := C.ffi_prep_cif(c, C.FFI_DEFAULT_ABI, C.uint(n), rty, typesPtr)
+	if st != C.FFI_OK {
+		return nil, unsafe.Pointer(typesPtr), fmt.Errorf("ffi_prep_cif failed: %d", int(st))
+	}
+	return c, unsafe.Pointer(typesPtr), nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -365,11 +370,16 @@ func parseFFISpec(spec *MapObject) (string, *ffiRegistry, []*ffiFunction, []*ffi
 		if fv.Tag != VTArray {
 			return "", nil, nil, nil, errors.New("ffiOpen: 'functions' must be an array")
 		}
+		seen := map[string]bool{}
 		for i, raw := range fv.Data.(*ArrayObject).Elems {
 			fn, err := parseFunctionObject(reg, raw)
 			if err != nil {
 				return "", nil, nil, nil, fmt.Errorf("ffiOpen.functions[%d]: %v", i, err)
 			}
+			if seen[fn.Name] {
+				return "", nil, nil, nil, fmt.Errorf("ffiOpen: duplicate function name: %s", fn.Name)
+			}
+			seen[fn.Name] = true
 			funs = append(funs, fn)
 		}
 	}
@@ -380,11 +390,16 @@ func parseFFISpec(spec *MapObject) (string, *ffiRegistry, []*ffiFunction, []*ffi
 		if vv.Tag != VTArray {
 			return "", nil, nil, nil, errors.New("ffiOpen: 'variables' must be an array")
 		}
+		seen := map[string]bool{}
 		for i, raw := range vv.Data.(*ArrayObject).Elems {
 			vd, err := parseVariableObject(reg, raw)
 			if err != nil {
 				return "", nil, nil, nil, fmt.Errorf("ffiOpen.variables[%d]: %v", i, err)
 			}
+			if seen[vd.Name] {
+				return "", nil, nil, nil, fmt.Errorf("ffiOpen: duplicate variable name: %s", vd.Name)
+			}
+			seen[vd.Name] = true
 			vars = append(vars, vd)
 		}
 	}
@@ -1019,6 +1034,17 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						fail("ffi.close: handle already closed")
 					}
 					var firstErr string
+					// free libffi allocations (cif + typesVec) first
+					for _, f := range mod.funcs {
+						if f.typesVec != nil {
+							C.free(f.typesVec)
+							f.typesVec = nil
+						}
+						if f.cif != nil {
+							C.free(unsafe.Pointer(f.cif))
+							f.cif = nil
+						}
+					}
 					for i := len(mod.openLibs) - 1; i >= 0; i-- {
 						ptr := mod.openLibs[i]
 						if ptr == nil {
@@ -1194,6 +1220,8 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					if cnt <= 0 {
 						cnt = 1
 					}
+					// Tag result as "pointer to T"
+					ptrTag := typeKey(reg, t)
 					if t.Kind == ffiArray && t.Len < 0 {
 						// Flexible array: allocate elem.Size * count (header handling left to caller)
 						elem := reg.mustGet(t.Elem)
@@ -1202,14 +1230,14 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						if p == nil {
 							fail("new: OOM")
 						}
-						return HandleVal(canonicalPtrTagKey(reg, t), unsafe.Pointer(p))
+						return HandleVal(ptrTag, unsafe.Pointer(p))
 					}
 					total := uintptr(cnt) * t.Size
 					p := C.malloc(C.size_t(total))
 					if p == nil {
 						fail("new: OOM")
 					}
-					return HandleVal(canonicalPtrTagKey(reg, t), unsafe.Pointer(p))
+					return HandleVal(ptrTag, unsafe.Pointer(p))
 				}, "Allocate storage for T (optionally count).")
 			registerMem("cast",
 				[]ParamSpec{{"T", S{"id", "Any"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
@@ -1283,11 +1311,13 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 			for name, f := range mod.funcs {
 				fn := f // capture
 				// Precompute CIF (non-variadic)
-				cf, _, err := prepCIF(reg, fn.Ret, fn.Params)
+				cf, tp, err := prepCIF(reg, fn.Ret, fn.Params)
 				if err != nil {
 					fail("ffi: " + fn.Name + ": " + err.Error())
 				}
-				cif := cf
+				fn.cif = cf
+				fn.typesVec = tp
+				cif := fn.cif
 				// Validate ret_as_str early: must be char*/uchar*
 				if fn.RetAsStr {
 					rt := mod.reg.mustGet(fn.Ret)
@@ -1506,7 +1536,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 			// Final module
 			m := &Module{
-				Name: "<ffi:" + lib + ">",
+				Name: lib,
 				Map:  modMap,
 				Env:  modEnv,
 			}
@@ -1589,9 +1619,24 @@ func canonicalPtrTagKey(reg *ffiRegistry, t *ffiType) string {
 	}
 	name := t.Name
 	if name == "" {
-		name = "<anon>"
+		name = "(anon)"
 	}
 	return name
+}
+
+// typeKey returns the registry key for t if known, otherwise t.Name (best-effort).
+func typeKey(reg *ffiRegistry, t *ffiType) string {
+	if reg != nil {
+		for k, v := range reg.types {
+			if v == t {
+				return k
+			}
+		}
+	}
+	if t.Name != "" {
+		return t.Name
+	}
+	return "(anon)"
 }
 
 func buildParamSpecs(_ *ffiModule, f *ffiFunction) []ParamSpec {

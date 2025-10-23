@@ -14,6 +14,7 @@ package mindscript
 #include <string.h>
 #include <errno.h>
 #include <stdint.h> // uintptr_t
+#include <stddef.h>
 
 // Thin wrapper so cgo/gopls reliably sees the symbol.
 static int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
@@ -101,6 +102,36 @@ static void ms_closure_free(void* closure) {
 extern void msCallbackInvoke(ffi_cif*, void*, void**, uintptr_t);
 static void ms_callback_thunk(ffi_cif* cif, void* ret, void** args, void* user) {
   msCallbackInvoke(cif, ret, args, (uintptr_t)user);
+}
+
+// -------- helpers to allocate/customize ffi_type on the C heap --------------
+static ffi_type* ms_alloc_ffi_type_struct(size_t nfields) {
+  ffi_type* t = (ffi_type*)malloc(sizeof(ffi_type));
+  if (!t) return NULL;
+  t->size = 0;
+  t->alignment = 0;
+  t->type = FFI_TYPE_STRUCT;
+  ffi_type** elems = (ffi_type**)calloc(nfields + 1, sizeof(ffi_type*)); // +1 for NULL
+  if (!elems) { free(t); return NULL; }
+  t->elements = elems;
+  return t;
+}
+static void ms_struct_set_elem(ffi_type* t, size_t i, ffi_type* e) {
+  t->elements[i] = e;
+}
+static ffi_type* ms_alloc_ffi_type_opaque(size_t size, unsigned short align) {
+  ffi_type* t = (ffi_type*)malloc(sizeof(ffi_type));
+  if (!t) return NULL;
+  t->size = size;
+  t->alignment = align ? align : 1;
+  t->type = FFI_TYPE_STRUCT;   // opaque aggregate per libffi convention
+  t->elements = NULL;          // no element layout; size/alignment provided
+  return t;
+}
+static void ms_free_ffi_type_and_elems(ffi_type* t) {
+  if (!t) return;
+  if (t->elements) { free(t->elements); t->elements = NULL; }
+  free(t);
 }
 */
 import "C"
@@ -322,6 +353,10 @@ type ffiType struct {
 	Align   uintptr
 	Offsets []uintptr // struct: per-field; union: nil; array: nil
 
+	// Cached libffi representation (C-heap); freed on module close
+	cffi   *C.ffi_type
+	celems unsafe.Pointer // ffi_type** for struct fields (if any)
+
 	// --- callbacks (funcptr): cached callback CIF + argv type vector (C-heap) ---
 	cbCIF      *C.ffi_cif
 	cbTypesVec unsafe.Pointer
@@ -521,12 +556,59 @@ func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
 	case ffiEnum:
 		return ffiTypeFor(reg, t.EnumBase)
 	case ffiArray, ffiStruct, ffiUnion:
-		// Minimal v1: require passing by pointer.
-		return nil, fmt.Errorf("aggregate by-value not supported; pass a pointer")
+		return ensureCFFIType(reg, t)
 	case ffiAlias:
 		return ffiTypeFor(reg, t.To)
 	default:
 		return nil, fmt.Errorf("unhandled kind")
+	}
+}
+
+// ensureCFFIType builds (and caches) a libffi aggregate type for arrays/structs/unions.
+func ensureCFFIType(reg *ffiRegistry, t *ffiType) (*C.ffi_type, error) {
+	if t.cffi != nil {
+		return t.cffi, nil
+	}
+	switch t.Kind {
+	case ffiStruct:
+		// True struct: elements describe layout; libffi computes size/align.
+		n := len(t.Fields)
+		tf := C.ms_alloc_ffi_type_struct(C.size_t(n))
+		if tf == nil {
+			return nil, fmt.Errorf("ffi_type OOM")
+		}
+		// Fill field element types.
+		for i := 0; i < n; i++ {
+			ft := reg.mustGet(t.Fields[i].Type)
+			et, err := ffiTypeFor(reg, ft.Key)
+			if err != nil {
+				C.ms_free_ffi_type_and_elems(tf)
+				return nil, fmt.Errorf("field %s: %w", t.Fields[i].Name, err)
+			}
+			C.ms_struct_set_elem(tf, C.size_t(i), et)
+		}
+		t.cffi = tf
+		// keep pointer to elements for later free
+		t.celems = unsafe.Pointer(tf.elements)
+		return t.cffi, nil
+	case ffiUnion, ffiArray:
+		// Opaque aggregate with known size/alignment.
+		// Arrays with flexible size are rejected via layout (Size=0) in by-value positions.
+		if t.Kind == ffiArray && t.Len < 0 {
+			return nil, fmt.Errorf("flexible array cannot be passed/returned by value")
+		}
+		if t.Size == 0 {
+			return nil, fmt.Errorf("opaque aggregate has zero size")
+		}
+		tf := C.ms_alloc_ffi_type_opaque(C.size_t(t.Size), C.ushort(t.Align))
+		if tf == nil {
+			return nil, fmt.Errorf("ffi_type OOM")
+		}
+		t.cffi = tf
+		t.celems = nil
+		return t.cffi, nil
+	default:
+		return nil, fmt.Errorf("internal: ensureCFFIType non-aggregate")
 	}
 }
 
@@ -1347,185 +1429,6 @@ func isPtrToAggregate(reg *ffiRegistry, t *ffiType) (*ffiType, bool) {
 	return nil, false
 }
 
-// ---------- Auto-boxing (map/array literal → temp aggregate buffer) ----------
-const autoBoxMaxAlloc = uintptr(16 << 20) // 16 MiB per arg
-func mulOvf(a, b uintptr) bool {
-	const M = ^uint64(0)
-	return b != 0 && uint64(a) > M/uint64(b)
-}
-
-// Builds a zeroed C buffer for an aggregate and initializes it from a literal.
-// Returns (ptr, cleanup), freeing nested temporaries before the main buffer.
-func autoBoxAggregateLiteral(reg *ffiRegistry, agg *ffiType, lit Value) (unsafe.Pointer, func(), error) {
-	// size
-	var sz uintptr
-	switch agg.Kind {
-	case ffiStruct, ffiUnion:
-		sz = agg.Size
-	case ffiArray:
-		el := reg.mustGet(agg.Elem)
-		if agg.Len >= 0 {
-			if mulOvf(uintptr(agg.Len), el.Size) {
-				return nil, nil, fmt.Errorf("size overflow")
-			}
-			sz = uintptr(agg.Len) * el.Size
-		} else {
-			if lit.Tag != VTArray {
-				return nil, nil, fmt.Errorf("flexible array requires array literal")
-			}
-			n := len(lit.Data.(*ArrayObject).Elems)
-			if mulOvf(uintptr(n), el.Size) {
-				return nil, nil, fmt.Errorf("size overflow")
-			}
-			sz = uintptr(n) * el.Size
-		}
-	default:
-		return nil, nil, fmt.Errorf("internal: not an aggregate")
-	}
-	if sz == 0 {
-		sz = 1
-	}
-	if sz > autoBoxMaxAlloc {
-		return nil, nil, fmt.Errorf("allocation exceeds cap")
-	}
-	base := cMalloc(sz)
-	if base == nil {
-		return nil, nil, fmt.Errorf("out of memory")
-	}
-	cMemset(base, 0, sz)
-	var nested []func()
-	cleanup := func() {
-		for i := len(nested) - 1; i >= 0; i-- {
-			nested[i]()
-		}
-		cFree(base)
-	}
-
-	// Write one slot (scalar/pointer or nested aggregate-by-value)
-	var writeAgg func(t *ffiType, dst unsafe.Pointer, v Value) error
-	writeSlot := func(t *ffiType, dst unsafe.Pointer, v Value) error {
-		switch t.Kind {
-		case ffiPointer, ffiHandle:
-			if v.Tag == VTNull {
-				*(*unsafe.Pointer)(dst) = nil
-				return nil
-			}
-			if isCharPtr(reg, t) && v.Tag == VTStr {
-				cs := C.CString(v.Data.(string))
-				*(*unsafe.Pointer)(dst) = unsafe.Pointer(cs)
-				nested = append(nested, func() { C.free(unsafe.Pointer(cs)) })
-				return nil
-			}
-			if v.Tag != VTHandle {
-				return fmt.Errorf("expected pointer handle")
-			}
-			*(*unsafe.Pointer)(dst) = expectPtr(v)
-			return nil
-		case ffiInt, ffiFloat, ffiEnum:
-			writeValue(reg, t, dst, v)
-			return nil
-		default:
-			return writeAgg(t, dst, v)
-		}
-	}
-
-	writeAgg = func(t *ffiType, dst unsafe.Pointer, v Value) error {
-		switch t.Kind {
-		case ffiStruct:
-			if v.Tag != VTMap {
-				return fmt.Errorf("struct literal must be a map")
-			}
-			m := v.Data.(*MapObject)
-			seen := make(map[string]struct{}, len(t.Fields))
-			for _, f := range t.Fields {
-				seen[f.Name] = struct{}{}
-			}
-			for _, k := range m.Keys {
-				if _, ok := seen[k]; !ok {
-					return fmt.Errorf("unknown field %q", k)
-				}
-			}
-			for i, f := range t.Fields {
-				if f.Bits != 0 {
-					return fmt.Errorf("bitfields not supported")
-				}
-				val, ok := m.Entries[f.Name]
-				if !ok {
-					continue
-				}
-				ft := reg.mustGet(f.Type)
-				if err := writeSlot(ft, unsafe.Pointer(uintptr(dst)+t.Offsets[i]), val); err != nil {
-					return fmt.Errorf("field %s: %w", f.Name, err)
-				}
-			}
-			return nil
-		case ffiUnion:
-			if v.Tag != VTMap {
-				return fmt.Errorf("union literal must be a map with exactly one member")
-			}
-			m := v.Data.(*MapObject)
-			if len(m.Keys) != 1 {
-				return fmt.Errorf("union literal must set exactly one member")
-			}
-			k := m.Keys[0]
-			var ft *ffiType
-			ok := false
-			for _, f := range t.Fields {
-				if f.Name == k {
-					ft, ok = reg.mustGet(f.Type), true
-					break
-				}
-			}
-			if !ok {
-				return fmt.Errorf("unknown union member %q", k)
-			}
-			return writeSlot(ft, dst, m.Entries[k])
-		case ffiArray:
-			el := reg.mustGet(t.Elem)
-			switch v.Tag {
-			case VTArray:
-				arr := v.Data.(*ArrayObject).Elems
-				if t.Len >= 0 && len(arr) > t.Len {
-					return fmt.Errorf("array literal length %d exceeds %d", len(arr), t.Len)
-				}
-				limit := len(arr)
-				if t.Len >= 0 && t.Len < limit {
-					limit = t.Len
-				}
-				for i := 0; i < limit; i++ {
-					if err := writeSlot(el, unsafe.Pointer(uintptr(dst)+uintptr(i)*el.Size), arr[i]); err != nil {
-						return fmt.Errorf("index %d: %w", i, err)
-					}
-				}
-				return nil
-			case VTMap:
-				m := v.Data.(*MapObject)
-				for _, k := range m.Keys {
-					var idx int
-					if _, err := fmt.Sscanf(k, "%d", &idx); err != nil || idx < 0 {
-						return fmt.Errorf("array index %q must be non-negative integer", k)
-					}
-					if t.Len >= 0 && idx >= t.Len {
-						return fmt.Errorf("index %d out of range (len=%d)", idx, t.Len)
-					}
-					if err := writeSlot(el, unsafe.Pointer(uintptr(dst)+uintptr(idx)*el.Size), m.Entries[k]); err != nil {
-						return fmt.Errorf("index %d: %w", idx, err)
-					}
-				}
-				return nil
-			}
-			return fmt.Errorf("array literal must be an array or index map")
-		}
-		return fmt.Errorf("internal: not an aggregate")
-	}
-
-	if err := writeAgg(agg, base, lit); err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	return base, cleanup, nil
-}
-
 // Range & numeric conversions
 
 func mustIntRange(v Value, t *ffiType) int64 {
@@ -1679,21 +1582,9 @@ func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) 
 	for i, key := range fn.Params {
 		pt := mod.reg.mustGet(key)
 		val := ctx.Arg(fmt.Sprintf("p%d", i))
-		// Auto-box: pass literal as temp buffer for pointer/handle-to-aggregate (in-only).
-		if agg, ok := isPtrToAggregate(mod.reg, pt); ok && (val.Tag == VTMap || val.Tag == VTArray) {
-			tmp, rel, err := autoBoxAggregateLiteral(mod.reg, agg, val)
-			if err != nil {
-				fail(fmt.Sprintf("ffi: %s: p%d: %s", fn.Name, i, err.Error()))
-			}
-			buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
-			if buf == nil {
-				rel()
-				fail("ffi: OOM")
-			}
-			*(*unsafe.Pointer)(buf) = tmp
-			argBufs[i] = buf
-			cleanups = append(cleanups, func() { C.free(buf); rel() })
-			continue
+		// Reject aggregate literals for any aggregate parameter (pointer or by-value).
+		if _, ok := isPtrToAggregate(mod.reg, pt); ok && (val.Tag == VTMap || val.Tag == VTArray) {
+			fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
 		}
 		// char*/uchar* bridge for strings
 		if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
@@ -1764,6 +1655,27 @@ func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) 
 				continue
 			}
 		}
+		// By-value aggregates: require a handle to caller-allocated storage; copy bytes.
+		if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
+			if val.Tag != VTHandle {
+				fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
+			}
+			src := expectPtr(val)
+			// allocate slot (at least 8 bytes like scalars)
+			sz := pt.Size
+			if sz < 8 {
+				sz = 8
+			}
+			buf := C.malloc(C.size_t(sz))
+			if buf == nil {
+				fail("ffi: OOM")
+			}
+			// copy only the aggregate's size
+			cMemcpy(buf, src, pt.Size)
+			argBufs[i] = buf
+			cleanups = append(cleanups, func() { C.free(buf) })
+			continue
+		}
 		// allocate at least 8 bytes for scalar/pointer slot
 		sz := pt.Size
 		if sz < 8 {
@@ -1810,5 +1722,17 @@ func msCallbackInvoke(_cif *C.ffi_cif, ret unsafe.Pointer, args *unsafe.Pointer,
 	rt := ctx.reg.mustGet(ft.Ret)
 	if rt.Kind != ffiVoid {
 		writeValue(ctx.reg, rt, ret, res)
+	}
+}
+
+// Free per-type cached ffi_type allocations (called from module close).
+func freeCachedCFFITypes(reg *ffiRegistry) {
+	for _, t := range reg.types {
+		if t.cffi != nil {
+			// elements (if any) are owned by cffi and freed by helper
+			C.ms_free_ffi_type_and_elems(t.cffi)
+			t.cffi = nil
+			t.celems = nil
+		}
 	}
 }

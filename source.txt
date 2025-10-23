@@ -3644,5 +3644,151 @@ func Test_FFI_callback_captures_and_returns(t *testing.T) {
 		t.Fatalf("callback not invoked, got %#v", v)
 	}
 }
+
+func Test_Builtin_FFI_Aggregate_Autoboxing(t *testing.T) {
+	t.Run("struct_timespec_literal_nanosleep", func(t *testing.T) {
+		ip, _ := NewInterpreter()
+		v := evalWithIP(t, ip, `
+			let C = ffiOpen({
+			  version:"1", lib:"libc.so.6",
+			  types:{
+			    long: {kind:"int", bits:64, signed:true},
+			    Timespec: {kind:"struct", fields:[
+			      {name:"tv_sec",  type:"long"},
+			      {name:"tv_nsec", type:"long"}
+			    ]},
+			    Tsp: {kind:"pointer", to:"Timespec"},
+			    i32: {kind:"int", bits:32, signed:true}
+			  },
+			  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
+			})
+			# Pass struct literal; auto-boxer builds a temp buffer (in-only).
+			C.nanosleep({ tv_sec: 0, tv_nsec: 0 }, null)
+		`)
+		if v.Tag != VTInt || v.Data.(int64) != 0 {
+			t.Fatalf("nanosleep({0,0},null) expected rc=0, got %#v", v)
+		}
+	})
+
+	t.Run("array_of_struct_iovec_writev", func(t *testing.T) {
+		ip, _ := NewInterpreter()
+		v := evalWithIP(t, ip, `
+			let C = ffiOpen({
+			  version:"1", lib:"libc.so.6",
+			  types:{
+			    i32:    {kind:"int", bits:32, signed:true},
+			    u64:    {kind:"int", bits:64, signed:false},
+			    i64:    {kind:"int", bits:64, signed:true},
+			    I8:     {kind:"int", bits:8,  signed:true},
+			    charp:  {kind:"pointer", to:"I8"},
+			    IOV:    {kind:"struct", fields:[
+			      {name:"iov_base", type:"charp"},  # NOTE: char* to enable string bridge
+			      {name:"iov_len",  type:"u64"}
+			    ]},
+			    IOV2:   {kind:"array", of:"IOV", len:2},
+			    IOV2p:  {kind:"pointer", to:"IOV2"}
+			  },
+			  functions:[
+			    {name:"open",   ret:"i32", params:["charp","i32"]},
+			    {name:"writev", ret:"i64", params:["i32","IOV2p","i32"]},
+			    {name:"close",  ret:"i32", params:["i32"]}
+			  ]
+			})
+			do
+			  let fd = C.open("/dev/null", 1)   # O_WRONLY = 1
+			  if fd < 0 then error("open /dev/null failed") end
+
+			  # iov = [{base:"ab", len:2}, {base:"XYZ", len:3}]
+			  let total = C.writev(fd,
+			    [
+			      { iov_base: "ab",  iov_len: 2 },
+			      { iov_base: "XYZ", iov_len: 3 }
+			    ],
+			    2)
+
+			  C.close(fd)
+			  total
+			end
+		`)
+		got := func(v Value) int64 {
+			if v.Tag == VTInt {
+				return v.Data.(int64)
+			}
+			return int64(v.Data.(float64))
+		}(v)
+		if got != 5 {
+			t.Fatalf("writev expected 5, got %d", got)
+		}
+	})
+
+	t.Run("array_literal_sparse_map_iovec_writev", func(t *testing.T) {
+		ip, _ := NewInterpreter()
+		v := evalWithIP(t, ip, `
+			let C = ffiOpen({
+			  version:"1", lib:"libc.so.6",
+			  types:{
+			    i32:{kind:"int",bits:32,signed:true},
+			    u64:{kind:"int",bits:64,signed:false},
+			    i64:{kind:"int",bits:64,signed:true},
+			    I8:{kind:"int",bits:8,signed:true},
+			    charp:{kind:"pointer",to:"I8"},
+			    IOV:{kind:"struct",fields:[
+			      {name:"iov_base",type:"charp"},  # NOTE: char* here too
+			      {name:"iov_len", type:"u64"}
+			    ]},
+			    IOV2:{kind:"array",of:"IOV",len:2},
+			    IOV2p:{kind:"pointer",to:"IOV2"}
+			  },
+			  functions:[
+			    {name:"open",   ret:"i32", params:["charp","i32"]},
+			    {name:"writev", ret:"i64", params:["i32","IOV2p","i32"]},
+			    {name:"close",  ret:"i32", params:["i32"]}
+			  ]
+			})
+			do
+			  let fd = C.open("/dev/null", 1)
+			  if fd < 0 then error("open /dev/null failed") end
+
+			  # Provide only index 1; index 0 stays zero-initialized → contributes 0 bytes.
+			  let total = C.writev(fd,
+			    { "1": { iov_base: "XY", iov_len: 2 } },
+			    2)
+
+			  C.close(fd)
+			  total
+			end
+		`)
+		got := func(v Value) int64 {
+			if v.Tag == VTInt {
+				return v.Data.(int64)
+			}
+			return int64(v.Data.(float64))
+		}(v)
+		if got != 2 {
+			t.Fatalf("sparse IOV map expected 2, got %d", got)
+		}
+	})
+
+	t.Run("struct_literal_unknown_field_rejected", func(t *testing.T) {
+		ip, _ := NewInterpreter()
+		_, err := ip.EvalSource(`
+			let C = ffiOpen({
+			  version:"1", lib:"libc.so.6",
+			  types:{
+			    long: {kind:"int", bits:64, signed:true},
+			    Timespec: {kind:"struct", fields:[
+			      {name:"tv_sec",  type:"long"},
+			      {name:"tv_nsec", type:"long"}
+			    ]},
+			    Tsp: {kind:"pointer", to:"Timespec"},
+			    i32: {kind:"int", bits:32, signed:true}
+			  },
+			  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
+			})
+			C.nanosleep({ tv_sec: 0, tv_nsec: 0, oops: 7 }, null)
+		`)
+		wantErrContains(t, err, "unknown field")
+	})
+}
 === END FILE: builtin_ffi_test.go ===
 

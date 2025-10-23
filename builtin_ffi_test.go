@@ -908,3 +908,105 @@ func Test_Builtin_FFI_duplicate_variable_names_rejected(t *testing.T) {
 		})
 	`)
 }
+
+// Table-driven tests for __mem.gc behavior (attach, detach, errors, realloc carry, idempotence).
+func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
+	cases := []struct {
+		name    string
+		src     string
+		wantErr string // if non-empty, error substring to expect
+	}{
+		{
+			name: "attach free then manual free twice (idempotent)",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(16)
+			    C.__mem.gc(p, "free")
+			    C.__mem.free(p)   # first free triggers registered destructor
+			    C.__mem.free(p)   # second free must be a no-op
+			    0
+			  end
+			`,
+		},
+		{
+			name: "detach then free (no destructor invoked)",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(8)
+			    C.__mem.gc(p, "free")
+			    C.__mem.gc(p, null)   # detach finalizer
+			    C.__mem.free(p)       # plain free succeeds
+			    0
+			  end
+			`,
+		},
+		{
+			name:    "custom symbol resolve error surfaces dlsym",
+			wantErr: "dlsym",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  let p = C.__mem.malloc(4)
+			  C.__mem.gc(p, {sym:"__definitely_not_exists__"})
+			`,
+		},
+		{
+			name: "realloc carries destructor to new pointer; double free is safe",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(8)
+			    C.__mem.gc(p, "free")
+			    let q = C.__mem.realloc(p, 16)   # move destructor to q
+			    C.__mem.free(q)
+			    C.__mem.free(q)                  # idempotent
+			    0
+			  end
+			`,
+		},
+		{
+			name:    "string finalizer must be exactly \"free\"",
+			wantErr: "string finalizer must be \"free\"",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  let p = C.__mem.malloc(1)
+			  C.__mem.gc(p, "close")
+			`,
+		},
+		{
+			name:    "first argument must be a pointer handle",
+			wantErr: "pointer handle",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  C.__mem.gc(123, "free")
+			`,
+		},
+		{
+			name: "re-attach overwrites finalizer, then detach",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(8)
+			    C.__mem.gc(p, "free")
+			    # overwrite with the same (no-op behavior change, but allowed)
+			    C.__mem.gc(p, "free")
+			    # now detach and free
+			    C.__mem.gc(p, null)
+			    C.__mem.free(p)
+			    0
+			  end
+			`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantErr == "" {
+				ok(t, tc.src)
+			} else {
+				err(t, tc.wantErr, tc.src)
+			}
+		})
+	}
+}

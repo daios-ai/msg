@@ -5,6 +5,7 @@
 package mindscript
 
 /*
+#define _GNU_SOURCE
 #cgo LDFLAGS: -ldl
 #cgo pkg-config: libffi
 #include <ffi.h>
@@ -13,6 +14,7 @@ package mindscript
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdint.h> // uintptr_t
 
 // Thin wrapper so cgo/gopls reliably sees the symbol.
 int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
@@ -25,6 +27,10 @@ int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
 // This avoids cgo’s function-pointer type constraints at the call site.
 void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue) {
     ffi_call(cif, (void (*)(void))fn, rvalue, avalue);
+}
+
+int ms_default_abi(void) {
+  return FFI_DEFAULT_ABI;
 }
 
 // Allocate a cif on the C heap (so it outlives the Go stack frame).
@@ -64,13 +70,47 @@ int* ms_errno_loc(void) {
   return &errno;
 #endif
 }
+
+// Call a destructor with signature: void (*)(void*)
+typedef void (*ms_destructor_fn)(void*);
+inline void ms_call_destructor(void* fn, void* p) {
+  ((ms_destructor_fn)fn)(p);
+}
+
+// -------- libffi closure helpers (callbacks) ----------
+void* ms_closure_alloc(void** executable) {
+  return ffi_closure_alloc(sizeof(ffi_closure), executable);
+}
+int ms_prep_closure(void* closure, ffi_cif* cif,
+                    void (*thunk)(ffi_cif*, void*, void**, void*),
+                    void* userdata, void* executable) {
+  return ffi_prep_closure_loc((ffi_closure*)closure, cif, thunk, userdata, executable);
+}
+// Wrapper that binds the thunk on the C side to avoid cgo func-ptr typing pitfalls.
+int ms_prep_closure_with_thunk(void* closure, ffi_cif* cif,
+                               void* userdata, void* executable) {
+  extern void ms_callback_thunk(ffi_cif*, void*, void**, void*);
+  return ffi_prep_closure_loc((ffi_closure*)closure, cif,
+                              ms_callback_thunk, userdata, executable);
+}
+void ms_closure_free(void* closure) {
+  ffi_closure_free((ffi_closure*)closure);
+}
+
+// Forward decl to Go; C thunk forwards into it with integer handle.
+extern void msCallbackInvoke(ffi_cif*, void*, void**, uintptr_t);
+void ms_callback_thunk(ffi_cif* cif, void* ret, void** args, void* user) {
+  msCallbackInvoke(cif, ret, args, (uintptr_t)user);
+}
 */
 import "C"
 
 import (
 	"errors"
 	"fmt"
+	"runtime/cgo"
 	"sort"
+	"sync"
 	"unsafe"
 )
 
@@ -119,6 +159,86 @@ func symChecked(lib unsafe.Pointer, name string) (unsafe.Pointer, error) {
 // Step (2): spec parsing, type system, layout engine, symbol binding (ELF/SysV)
 ////////////////////////////////////////////////////////////////////////////////
 
+// -------------------------
+// C shim helpers (single TU)
+// -------------------------
+
+// memory
+func cMalloc(n uintptr) unsafe.Pointer                    { return C.malloc(C.size_t(n)) }
+func cCalloc(count, size uintptr) unsafe.Pointer          { return C.calloc(C.size_t(count), C.size_t(size)) }
+func cRealloc(p unsafe.Pointer, n uintptr) unsafe.Pointer { return C.realloc(p, C.size_t(n)) }
+func cFree(p unsafe.Pointer)                              { C.free(p) }
+func cMemcpy(dst, src unsafe.Pointer, n uintptr)          { C.memcpy(dst, src, C.size_t(n)) }
+func cMemset(dst unsafe.Pointer, b byte, n uintptr)       { C.memset(dst, C.int(int(b)), C.size_t(n)) }
+
+// strings
+func cGoString(p unsafe.Pointer) string { return C.GoString((*C.char)(p)) }
+func cGoStringN(p unsafe.Pointer, n int) string {
+	return C.GoStringN((*C.char)(p), C.int(n))
+}
+func cCString(s string) unsafe.Pointer { return unsafe.Pointer(C.CString(s)) }
+func cCStringFree(p unsafe.Pointer)    { C.free(p) }
+
+// dlopen/dlsym/dlclose wrappers
+func cDlopen(path string) (unsafe.Pointer, error) {
+	cs := (*C.char)(cCString(path))
+	defer cCStringFree(unsafe.Pointer(cs))
+	h := C.ms_dlopen(cs)
+	if h == nil {
+		return nil, fmt.Errorf("dlopen(%q) failed: %s", path, dlerr())
+	}
+	return unsafe.Pointer(h), nil
+}
+func cDlclose(h unsafe.Pointer) error {
+	if int(C.ms_dlclose(h)) != 0 {
+		return fmt.Errorf("dlclose failed: %s", dlerr())
+	}
+	return nil
+}
+func cDlsymClear(h unsafe.Pointer, name string) (unsafe.Pointer, error) {
+	cs := (*C.char)(cCString(name))
+	defer cCStringFree(unsafe.Pointer(cs))
+	var cerr *C.char
+	p := C.ms_dlsym_clear(h, cs, &cerr)
+	if cerr != nil {
+		return nil, fmt.Errorf("dlsym(%q) failed: %s", name, C.GoString(cerr))
+	}
+	return p, nil
+}
+
+// libffi call helpers
+type cif = *C.ffi_cif
+
+func cAllocCIF() *C.ffi_cif { return C.ms_alloc_cif() }
+func cFFIPrepCIFVar(cif *C.ffi_cif, nfixed, ntotal int, rtype *C.ffi_type, atypes unsafe.Pointer) error {
+	st := C.ms_ffi_prep_cif_var(cif, C.FFI_DEFAULT_ABI, C.uint(nfixed), C.uint(ntotal), rtype, (**C.ffi_type)(atypes))
+	if st != C.FFI_OK {
+		return fmt.Errorf("ffi_prep_cif_var failed: %d", int(st))
+	}
+	return nil
+}
+func cFFICall(cif *C.ffi_cif, fn unsafe.Pointer, rvalue unsafe.Pointer, argv unsafe.Pointer) {
+	C.ms_ffi_call(cif, fn, rvalue, (*unsafe.Pointer)(argv))
+}
+
+// errno get/set
+func cErrnoGet() int  { return int(*C.ms_errno_loc()) }
+func cErrnoSet(v int) { *C.ms_errno_loc() = C.int(v) }
+
+// void**/ffi_type** array helpers
+func cAllocVoidPtrArray(n int) unsafe.Pointer {
+	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
+}
+func cVoidPtrSlice(mem unsafe.Pointer, n int) []unsafe.Pointer {
+	return (*[1<<30 - 1]unsafe.Pointer)(mem)[:n:n]
+}
+func cAllocFFITypeArray(n int) unsafe.Pointer {
+	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
+}
+func cFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
+	return (*[1<<30 - 1]*C.ffi_type)(mem)[:n:n]
+}
+
 // --- Internal FFI model ------------------------------------------------------
 
 type ffiKind int
@@ -163,6 +283,10 @@ type ffiType struct {
 	Size    uintptr
 	Align   uintptr
 	Offsets []uintptr // struct: per-field; union: nil; array: nil
+
+	// --- callbacks (funcptr): cached callback CIF + argv type vector (C-heap) ---
+	cbCIF      *C.ffi_cif
+	cbTypesVec unsafe.Pointer
 }
 
 type ffiField struct {
@@ -225,10 +349,94 @@ type ffiModule struct {
 
 	// track all opened handles (default + per-symbol overrides) to close later
 	openLibs []unsafe.Pointer
+
+	// live libffi closures for callbacks (freed on close)
+	cbs []cbRecord
+}
+
+// One record per created callback closure.
+type cbRecord struct {
+	closure unsafe.Pointer // ffi_closure*
+	handle  cgo.Handle     // cgo handle for callback context
+}
+
+// Callback context carried through cgo.Handle.
+type cbContext struct {
+	ip  *Interpreter
+	fn  Value
+	typ *ffiType
+	reg *ffiRegistry
+}
+
+// ---------------- One-shot GC destructor registry (shared) --------------------
+type gcDtorKind uint8
+
+const (
+	gcNone  gcDtorKind = iota
+	gcFree             // C.free
+	gcCFunc            // void(*)(void*)
+)
+
+type gcEntry struct {
+	once sync.Once
+	kind gcDtorKind
+	fn   unsafe.Pointer // for gcCFunc
+	lib  unsafe.Pointer // retained dlopen until run; may be nil
+}
+
+var gcReg sync.Map // raw pointer -> *gcEntry
+
+func gcInstall(p unsafe.Pointer, e *gcEntry) {
+	if p != nil {
+		gcReg.Store(p, e)
+	}
+}
+func gcDetach(p unsafe.Pointer) {
+	if p != nil {
+		gcReg.Delete(p)
+	}
+}
+func gcRunOnce(p unsafe.Pointer) bool {
+	if p == nil {
+		return false
+	}
+	v, ok := gcReg.Load(p)
+	if !ok {
+		return false
+	}
+	e := v.(*gcEntry)
+	e.once.Do(func() {
+		switch e.kind {
+		case gcFree:
+			C.free(p)
+		case gcCFunc:
+			if e.fn != nil {
+				C.ms_call_destructor(e.fn, p)
+			}
+		}
+		if e.lib != nil {
+			C.ms_dlclose(e.lib)
+			e.lib = nil
+		}
+	})
+	return true
+}
+
+// move (used by realloc): re-attach entry to q (fresh Once).
+func gcMove(p, q unsafe.Pointer) {
+	if p == nil || q == nil || p == q {
+		return
+	}
+	if v, ok := gcReg.Load(p); ok {
+		e := v.(*gcEntry)
+		e.once = sync.Once{}
+		gcReg.Delete(p)
+		gcReg.Store(q, e)
+	}
 }
 
 // -------- libffi thin helpers (minimal; structs-by-value/callbacks deferred) -------
-type cif = *C.ffi_cif
+type _cif = *C.ffi_cif // kept to avoid breaking references in this file
 
 func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
 	t := reg.mustGet(key)
@@ -282,6 +490,23 @@ func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
 	default:
 		return nil, fmt.Errorf("unhandled kind")
 	}
+}
+
+// ensureFuncptrCIF lazily prepares a callback-side CIF for a funcptr type.
+func ensureFuncptrCIF(reg *ffiRegistry, ft *ffiType) error {
+	if ft.Kind != ffiFuncPtr {
+		return fmt.Errorf("internal: ensureFuncptrCIF on non-funcptr")
+	}
+	if ft.cbCIF != nil {
+		return nil
+	}
+	cf, tp, err := prepCIF(reg, ft.Ret, ft.Params)
+	if err != nil {
+		return err
+	}
+	ft.cbCIF = cf
+	ft.cbTypesVec = tp
+	return nil
 }
 
 // prepCIF allocates a C-heap cif and a C-heap ffi_type** argv vector.
@@ -1217,7 +1442,7 @@ func readValue(reg *ffiRegistry, t *ffiType, src unsafe.Pointer) Value {
 	return Null
 }
 
-func marshalArgs(mod *ffiModule, fn *ffiFunction, ctx CallCtx) ([]unsafe.Pointer, cleanupFn) {
+func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) ([]unsafe.Pointer, cleanupFn) {
 	n := len(fn.Params)
 	argBufs := make([]unsafe.Pointer, n)
 	cleanups := []func(){}
@@ -1235,6 +1460,63 @@ func marshalArgs(mod *ffiModule, fn *ffiFunction, ctx CallCtx) ([]unsafe.Pointer
 			argBufs[i] = buf
 			cleanups = append(cleanups, func() { C.free(buf); C.free(unsafe.Pointer(cs)) })
 			continue
+		}
+		// funcptr: accept MindScript callable → build libffi closure; or accept pointer handle/null.
+		if pt.Kind == ffiFuncPtr {
+			switch val.Tag {
+			case VTNull:
+				// write NULL
+				buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+				if buf == nil {
+					fail("ffi: OOM")
+				}
+				*(*unsafe.Pointer)(buf) = nil
+				argBufs[i] = buf
+				cleanups = append(cleanups, func() { C.free(buf) })
+				continue
+			case VTHandle:
+				// user supplied raw function pointer
+				buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+				if buf == nil {
+					fail("ffi: OOM")
+				}
+				*(*unsafe.Pointer)(buf) = expectPtr(val)
+				argBufs[i] = buf
+				cleanups = append(cleanups, func() { C.free(buf) })
+				continue
+			default:
+				// Treat as callable (MindScript function). Build a closure.
+				if err := ensureFuncptrCIF(mod.reg, pt); err != nil {
+					fail("ffi: callback prep: " + err.Error())
+				}
+				// Allocate libffi closure (+ executable entry)
+				var exec unsafe.Pointer
+				cl := C.ms_closure_alloc((*unsafe.Pointer)(unsafe.Pointer(&exec)))
+				if cl == nil {
+					fail("ffi: closure_alloc OOM")
+				}
+				// Package user context via cgo.Handle; pass as uintptr_t through the thunk.
+				ctxObj := &cbContext{ip: ip, fn: val, typ: pt, reg: mod.reg}
+				h := cgo.NewHandle(ctxObj)
+				// ffi_prep_closure_loc takes void* userdata; we pass the handle value as a pointer,
+				// then cast it to uintptr_t inside the C thunk.
+				if st := C.ms_prep_closure_with_thunk(cl, pt.cbCIF, unsafe.Pointer(uintptr(h)), exec); st != C.FFI_OK {
+					C.ms_closure_free(cl)
+					h.Delete()
+					fail(fmt.Sprintf("ffi: callback prep failed: %d", int(st)))
+				}
+				// Keep closure alive in module; free on module.close()
+				mod.cbs = append(mod.cbs, cbRecord{closure: cl, handle: h})
+				// Pass executable entry as the function pointer argument
+				buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+				if buf == nil {
+					fail("ffi: OOM")
+				}
+				*(*unsafe.Pointer)(buf) = exec
+				argBufs[i] = buf
+				cleanups = append(cleanups, func() { C.free(buf) })
+				continue
+			}
 		}
 		// allocate at least 8 bytes for scalar/pointer slot
 		sz := pt.Size
@@ -1256,16 +1538,33 @@ func marshalArgs(mod *ffiModule, fn *ffiFunction, ctx CallCtx) ([]unsafe.Pointer
 	}
 }
 
-func unmarshalRet(mod *ffiModule, fn *ffiFunction, p unsafe.Pointer) Value {
-	rt := mod.reg.mustGet(fn.Ret)
-	if fn.RetAsStr && (rt.Kind == ffiPointer || rt.Kind == ffiHandle) && isCharPtr(mod.reg, rt) {
-		ptr := *(*unsafe.Pointer)(p)
-		if ptr == nil {
-			return Null // MindScript null for NULL char*
-		}
-		return Str(C.GoString((*C.char)(ptr)))
+//export msCallbackInvoke
+func msCallbackInvoke(_cif *C.ffi_cif, ret unsafe.Pointer, args *unsafe.Pointer, user C.uintptr_t) {
+	// Rebuild handle → context
+	h := cgo.Handle(user)
+	v := h.Value()
+	ctx, ok := v.(*cbContext)
+	if !ok || ctx == nil || ctx.typ == nil {
+		return
 	}
-	return readValue(mod.reg, rt, p)
+	ft := ctx.typ
+	n := len(ft.Params)
+
+	// args is void** → slice of unsafe.Pointer (each entry is a pointer to the arg storage)
+	argv := (*[1<<30 - 1]unsafe.Pointer)(unsafe.Pointer(args))[:n:n]
+
+	in := make([]Value, n)
+	for i := 0; i < n; i++ {
+		pt := ctx.reg.mustGet(ft.Params[i])
+		in[i] = readValue(ctx.reg, pt, argv[i]) // note: no extra deref now
+	}
+	res := ctx.ip.Apply(ctx.fn, in)
+
+	// Handle void return
+	rt := ctx.reg.mustGet(ft.Ret)
+	if rt.Kind != ffiVoid {
+		writeValue(ctx.reg, rt, ret, res)
+	}
 }
 === END FILE: ffi.go ===
 
@@ -1275,35 +1574,26 @@ func unmarshalRet(mod *ffiModule, fn *ffiFunction, p unsafe.Pointer) Value {
 
 package mindscript
 
-/*
-#cgo LDFLAGS: -ldl
-#cgo pkg-config: libffi
-#include <ffi.h>
-#include <dlfcn.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-
-// Forward declarations for helpers defined in ffi.go's C block
-extern void* ms_dlopen(const char* path);
-extern const char* ms_dlerror(void);
-extern void* ms_dlsym(void* h, const char* name);
-extern int ms_dlclose(void* h);
-extern void* ms_dlsym_clear(void* h, const char* name, char** err);
-extern void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue);
-extern int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
-    unsigned int nfixedargs, unsigned int ntotalargs,
-    ffi_type* rtype, ffi_type** atypes);
-extern int* ms_errno_loc(void);
-*/
-import "C"
-
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"unsafe"
 )
+
+// Convert the return buffer into a Value, honoring ret_as_str for char*/uchar*.
+func unmarshalRet(mod *ffiModule, fn *ffiFunction, rbuf unsafe.Pointer) Value {
+	rt := mod.reg.mustGet(fn.Ret)
+	if fn.RetAsStr {
+		p := *(*unsafe.Pointer)(rbuf)
+		if p == nil {
+			return Null
+		}
+		return Str(cGoString(p))
+	}
+	return readValue(mod.reg, rt, rbuf)
+}
 
 // registerFFIBuiltins wires the user-facing ffiOpen builtin and builds the
 // returned Module with callables, variables, and the __mem toolbox.
@@ -1327,27 +1617,25 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 			}
 
 			// ------------- dlopen ----------------------------------------------
-			cpath := C.CString(lib)
-			defer C.free(unsafe.Pointer(cpath))
-			h := C.ms_dlopen(cpath)
-			if h == nil {
-				fail(fmt.Sprintf("ffiOpen: dlopen(%q) failed: %s", lib, dlerr()))
+			h, e := cDlopen(lib)
+			if e != nil {
+				fail("ffiOpen: " + e.Error())
 			}
 
 			mod := &ffiModule{
 				libName: lib,
-				libH:    unsafe.Pointer(h),
+				libH:    h,
 				reg:     reg,
 				funcs:   map[string]*ffiFunction{},
 				vars:    map[string]*ffiVariable{},
 				openLibs: []unsafe.Pointer{
-					unsafe.Pointer(h),
+					h,
 				},
 			}
 
 			// ------------- dlsym functions/variables ---------------------------
 			for _, f := range funDecls {
-				libH, err := mod.openLib(f.Lib, lib, unsafe.Pointer(h))
+				libH, err := mod.openLib(f.Lib, lib, h)
 				if err != nil {
 					fail(fmt.Sprintf("ffiOpen: %s", err.Error()))
 				}
@@ -1359,7 +1647,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				mod.funcs[f.Name] = f
 			}
 			for _, v := range varDecls {
-				libH, err := mod.openLib(v.Lib, lib, unsafe.Pointer(h))
+				libH, err := mod.openLib(v.Lib, lib, h)
 				if err != nil {
 					fail(fmt.Sprintf("ffiOpen: %s", err.Error()))
 				}
@@ -1414,11 +1702,11 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					// free libffi allocations (cif + typesVec) first
 					for _, f := range mod.funcs {
 						if f.typesVec != nil {
-							C.free(f.typesVec)
+							cFree(f.typesVec)
 							f.typesVec = nil
 						}
 						if f.cif != nil {
-							C.free(unsafe.Pointer(f.cif))
+							cFree(unsafe.Pointer(f.cif))
 							f.cif = nil
 						}
 					}
@@ -1427,8 +1715,8 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						if ptr == nil {
 							continue
 						}
-						if int(C.ms_dlclose(ptr)) != 0 && firstErr == "" {
-							firstErr = dlerr()
+						if err := cDlclose(ptr); err != nil && firstErr == "" {
+							firstErr = err.Error()
 						}
 					}
 					mod.openLibs = nil
@@ -1549,17 +1837,19 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					if n < 0 {
 						fail("malloc: size < 0")
 					}
-					p := C.malloc(C.size_t(n))
+					p := cMalloc(uintptr(n))
 					if p == nil {
 						fail("malloc: out of memory")
 					}
-					return HandleVal("void*", unsafe.Pointer(p))
+					return HandleVal("void*", p)
 				}, "Allocate n bytes; returns a tagged pointer.")
 			registerMem("free",
 				[]ParamSpec{{"p", S{"id", "Any"}}}, S{"id", "Null"},
 				func(ctx CallCtx) Value {
 					p := expectPtr(ctx.Arg("p"))
-					C.free(p)
+					if !gcRunOnce(p) {
+						cFree(p)
+					}
 					return Null
 				}, "Free a pointer previously allocated.")
 			registerMem("calloc",
@@ -1570,11 +1860,11 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					if c < 0 || s < 0 {
 						fail("calloc: negative")
 					}
-					p := C.calloc(C.size_t(c), C.size_t(s))
+					p := cCalloc(uintptr(c), uintptr(s))
 					if p == nil {
 						fail("calloc: out of memory")
 					}
-					return HandleVal("void*", unsafe.Pointer(p))
+					return HandleVal("void*", p)
 				}, "Allocate zero-initialized memory.")
 			registerMem("realloc",
 				[]ParamSpec{{"p", S{"id", "Any"}}, {"n", S{"id", "Int"}}}, S{"id", "Any"},
@@ -1584,11 +1874,17 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					if n < 0 {
 						fail("realloc: negative")
 					}
-					q := C.realloc(p, C.size_t(n))
+					q := cRealloc(p, uintptr(n))
 					if q == nil && n != 0 {
 						fail("realloc: out of memory")
 					}
-					return HandleVal("void*", unsafe.Pointer(q))
+					// move any registered destructor from old to new
+					if q != nil {
+						gcMove(p, q)
+					} else {
+						gcDetach(p)
+					}
+					return HandleVal("void*", q)
 				}, "Resize memory.")
 
 			// Spec-driven helpers (new/cast/string/copy/fill/errno)
@@ -1606,18 +1902,18 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						// Flexible array: allocate elem.Size * count (header handling left to caller)
 						elem := reg.mustGet(t.Elem)
 						total := uintptr(cnt) * elem.Size
-						p := C.malloc(C.size_t(total))
+						p := cMalloc(total)
 						if p == nil {
 							fail("new: OOM")
 						}
-						return HandleVal(ptrTag, unsafe.Pointer(p))
+						return HandleVal(ptrTag, p)
 					}
 					total := uintptr(cnt) * t.Size
-					p := C.malloc(C.size_t(total))
+					p := cMalloc(total)
 					if p == nil {
 						fail("new: OOM")
 					}
-					return HandleVal(ptrTag, unsafe.Pointer(p))
+					return HandleVal(ptrTag, p)
 				}, "Allocate storage for T (optionally count).")
 			registerMem("cast",
 				[]ParamSpec{{"T", S{"id", "Any"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
@@ -1632,13 +1928,13 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					p := expectPtr(ctx.Arg("p"))
 					lv := ctx.Arg("len")
 					if lv.Tag == VTNull {
-						return Str(C.GoString((*C.char)(p)))
+						return Str(cGoString(p))
 					}
 					n := lv.Data.(int64)
 					if n < 0 {
 						fail("string: len < 0")
 					}
-					return Str(C.GoStringN((*C.char)(p), C.int(n)))
+					return Str(cGoStringN(p, int(n)))
 				}, "Read UTF-8 from char* (NUL-terminated or fixed len).")
 			registerMem("copy",
 				[]ParamSpec{{"dst", S{"id", "Any"}}, {"src", S{"id", "Any"}}, {"n", S{"id", "Int"}}}, S{"id", "Null"},
@@ -1651,12 +1947,12 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					sv := ctx.Arg("src")
 					switch sv.Tag {
 					case VTStr:
-						cs := C.CString(sv.Data.(string))
-						defer C.free(unsafe.Pointer(cs))
-						C.memcpy(dst, unsafe.Pointer(cs), C.size_t(n))
+						cs := cCString(sv.Data.(string))
+						defer cCStringFree(cs)
+						cMemcpy(dst, cs, uintptr(n))
 					default:
 						src := expectPtr(sv)
-						C.memcpy(dst, src, C.size_t(n))
+						cMemcpy(dst, src, uintptr(n))
 					}
 					return Null
 				}, "memcpy with tag checks.")
@@ -1669,19 +1965,80 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					if n < 0 || b < 0 || b > 255 {
 						fail("fill: invalid arguments")
 					}
-					C.memset(dst, C.int(b), C.size_t(n))
+					cMemset(dst, byte(b), uintptr(n))
 					return Null
 				}, "memset with tag checks.")
 			registerMem("errno",
 				[]ParamSpec{{"v", S{"id", "Any"}}}, S{"id", "Int"},
 				func(ctx CallCtx) Value {
-					loc := C.ms_errno_loc()
 					v := ctx.Arg("v")
 					if v.Tag != VTNull {
-						*loc = C.int(v.Data.(int64))
+						cErrnoSet(int(v.Data.(int64)))
 					}
-					return Int(int64(*loc))
+					return Int(int64(cErrnoGet()))
 				}, "Get/set thread-local errno.")
+
+			// gc(ptr, finalizer) -> ptr
+			// finalizer: null | "free" | {sym, lib?}
+			registerMem("gc",
+				[]ParamSpec{{"p", S{"id", "Any"}}, {"finalizer", S{"id", "Any"}}}, S{"id", "Any"},
+				func(ctx CallCtx) Value {
+					vp := ctx.Arg("p")
+					if vp.Tag != VTHandle {
+						fail("gc: first argument must be a pointer handle")
+					}
+					h := vp.Data.(*Handle)
+					p := expectPtr(vp)
+
+					fv := ctx.Arg("finalizer")
+					if fv.Tag == VTNull {
+						gcDetach(p)
+						runtime.SetFinalizer(h, nil)
+						return vp
+					}
+
+					e := &gcEntry{}
+					switch fv.Tag {
+					case VTStr:
+						if fv.Data.(string) != "free" {
+							fail(`gc: string finalizer must be "free"`)
+						}
+						e.kind = gcFree
+					case VTMap:
+						m, ok := ffiAsMap(fv)
+						if !ok {
+							fail("gc: invalid finalizer map")
+						}
+						sym := ffiGetReqStr(m, "sym")
+						lib := ffiGetStr(m, "lib", "")
+						if lib == "" {
+							lib = mod.libName
+						}
+						hlib, err := cDlopen(lib)
+						if err != nil {
+							fail(fmt.Sprintf("gc: %s", err.Error()))
+						}
+						fn, err := cDlsymClear(hlib, sym)
+						if err != nil {
+							_ = cDlclose(hlib)
+							fail(fmt.Sprintf("gc: %s", err.Error()))
+						}
+						e.kind, e.fn, e.lib = gcCFunc, fn, hlib
+					default:
+						fail("gc: finalizer must be null, \"free\", or {sym, lib?}")
+					}
+
+					gcInstall(p, e)
+					// Clear any existing finalizer before setting a new one.
+					runtime.SetFinalizer(h, nil)
+					runtime.SetFinalizer(h, func(_ *Handle) {
+						_ = gcRunOnce(p)
+						gcDetach(p)
+					})
+					return vp
+				},
+				"Attach/detach a destructor for a pointer; one-shot per allocation.",
+			)
 
 			// Export __mem
 			modMap.Entries["__mem"] = Value{Tag: VTMap, Data: memMap}
@@ -1713,26 +2070,25 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					name,
 					buildParamSpecs(mod, fn),
 					S{"id", "Any"},
-					func(_ *Interpreter, ctx CallCtx) Value {
+					func(ip2 *Interpreter, ctx CallCtx) Value {
 						// ----- marshal fixed prefix -----
-						argBufs, cleanup := marshalArgs(mod, fn, ctx)
+						argBufs, cleanup := marshalArgs(ip2, mod, fn, ctx)
 						defer cleanup()
 
 						// ----- non-variadic fast path -----
 						if !fn.Variadic {
 							// Build C argv (void**)
-							var argvPtr *unsafe.Pointer
+							var argvMem unsafe.Pointer
 							if n := len(argBufs); n > 0 {
-								bytes := C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
-								if bytes == nil {
+								argvMem = cAllocVoidPtrArray(n)
+								if argvMem == nil {
 									fail("ffi: OOM")
 								}
-								defer C.free(bytes)
-								argv := (*[1<<30 - 1]unsafe.Pointer)(bytes)[:n:n]
+								defer cFree(argvMem)
+								argv := cVoidPtrSlice(argvMem, n)
 								for i := 0; i < n; i++ {
 									argv[i] = argBufs[i]
 								}
-								argvPtr = (*unsafe.Pointer)(bytes)
 							}
 							// Ret buffer on C heap (min 8 bytes)
 							rt := mod.reg.mustGet(fn.Ret)
@@ -1740,12 +2096,12 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							if sz < 8 {
 								sz = 8
 							}
-							rbuf := C.malloc(C.size_t(sz))
+							rbuf := cMalloc(sz)
 							if rbuf == nil {
 								fail("ffi: OOM")
 							}
-							defer C.free(rbuf)
-							C.ms_ffi_call(cif, fn.SymbolPtr, rbuf, argvPtr)
+							defer cFree(rbuf)
+							cFFICall(cif, fn.SymbolPtr, rbuf, argvMem)
 							return unmarshalRet(mod, fn, rbuf)
 						}
 
@@ -1757,7 +2113,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						vaElems := vaVal.Data.(*ArrayObject).Elems
 
 						// Prepare fixed ffi_types vector
-						fixedTypes := make([]*C.ffi_type, len(fn.Params))
+						fixedTypes := make([]*ffi_type, len(fn.Params))
 						for i, pkey := range fn.Params {
 							pt, err := ffiTypeFor(mod.reg, pkey)
 							if err != nil {
@@ -1767,7 +2123,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						}
 
 						// Promote varargs + buffers and ffi_types
-						var vaTypes []*C.ffi_type
+						var vaTypes []*ffi_type
 						var vaBufs []unsafe.Pointer
 						release := []func(){}
 						promInt := &ffiType{Kind: ffiInt, Bits: 32, Signed: true}
@@ -1775,32 +2131,32 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						for i, a := range vaElems {
 							switch a.Tag {
 							case VTInt, VTBool:
-								buf := C.malloc(8)
+								buf := cMalloc(8)
 								if buf == nil {
 									fail("ffi: OOM")
 								}
 								writeValue(mod.reg, promInt, buf, a)
 								vaBufs = append(vaBufs, buf)
-								vaTypes = append(vaTypes, &C.ffi_type_sint32)
-								release = append(release, func() { C.free(buf) })
+								vaTypes = append(vaTypes, &ffi_type_sint32)
+								release = append(release, func() { cFree(buf) })
 							case VTNum:
-								buf := C.malloc(8)
+								buf := cMalloc(8)
 								if buf == nil {
 									fail("ffi: OOM")
 								}
 								writeValue(mod.reg, promDbl, buf, a)
 								vaBufs = append(vaBufs, buf)
-								vaTypes = append(vaTypes, &C.ffi_type_double)
-								release = append(release, func() { C.free(buf) })
+								vaTypes = append(vaTypes, &ffi_type_double)
+								release = append(release, func() { cFree(buf) })
 							case VTHandle:
-								buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+								buf := cMalloc(uintptr(unsafe.Sizeof(uintptr(0))))
 								if buf == nil {
 									fail("ffi: OOM")
 								}
 								*(*unsafe.Pointer)(buf) = expectPtr(a)
 								vaBufs = append(vaBufs, buf)
-								vaTypes = append(vaTypes, &C.ffi_type_pointer)
-								release = append(release, func() { C.free(buf) })
+								vaTypes = append(vaTypes, &ffi_type_pointer)
+								release = append(release, func() { cFree(buf) })
 							default:
 								fail(fmt.Sprintf("unsupported variadic arg[%d]", i))
 							}
@@ -1813,34 +2169,37 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 						// Build argv = fixed + varargs
 						total := len(argBufs) + len(vaBufs)
-						argvMem := C.malloc(C.size_t(total) * C.size_t(unsafe.Sizeof(uintptr(0))))
+						argvMem := cAllocVoidPtrArray(total)
 						if argvMem == nil {
 							fail("ffi: OOM")
 						}
-						defer C.free(argvMem)
-						argv := (*[1<<30 - 1]unsafe.Pointer)(argvMem)[:total:total]
+						defer cFree(argvMem)
+						argv := cVoidPtrSlice(argvMem, total)
 						copy(argv, argBufs)
 						copy(argv[len(argBufs):], vaBufs)
 
 						// Build combined ffi_type* array for ffi_prep_cif_var
-						typeMem := C.malloc(C.size_t(total) * C.size_t(unsafe.Sizeof(uintptr(0))))
+						typeMem := cAllocFFITypeArray(total)
 						if typeMem == nil {
 							fail("ffi: OOM")
 						}
-						defer C.free(typeMem)
-						typeVec := (*[1<<30 - 1]*C.ffi_type)(typeMem)[:total:total]
+						defer cFree(typeMem)
+						typeVec := cFFITypeSlice(typeMem, total)
 						copy(typeVec, fixedTypes)
 						copy(typeVec[len(fixedTypes):], vaTypes)
 
-						// Prepare CIF (variadic) on the stack
+						// Prepare CIF (variadic) using heap-allocated cif
 						rty, err := ffiTypeFor(mod.reg, fn.Ret)
 						if err != nil {
 							fail("ffi: " + err.Error())
 						}
-						var vc C.ffi_cif
-						if st := C.ms_ffi_prep_cif_var(&vc, C.FFI_DEFAULT_ABI,
-							C.uint(len(fixedTypes)), C.uint(total), rty, (**C.ffi_type)(typeMem)); st != C.FFI_OK {
-							fail(fmt.Sprintf("ffi_prep_cif_var failed: %d", int(st)))
+						cifVar := cAllocCIF()
+						if cifVar == nil {
+							fail("ffi_prep_cif_var: OOM")
+						}
+						defer cFree(unsafe.Pointer(cifVar))
+						if err := cFFIPrepCIFVar(cifVar, len(fixedTypes), total, rty, typeMem); err != nil {
+							fail(err.Error())
 						}
 
 						// Return buffer
@@ -1849,13 +2208,13 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						if sz < 8 {
 							sz = 8
 						}
-						rbuf := C.malloc(C.size_t(sz))
+						rbuf := cMalloc(sz)
 						if rbuf == nil {
 							fail("ffi: OOM")
 						}
-						defer C.free(rbuf)
+						defer cFree(rbuf)
 
-						C.ms_ffi_call(&vc, fn.SymbolPtr, rbuf, (*unsafe.Pointer)(argvMem))
+						cFFICall(cifVar, fn.SymbolPtr, rbuf, argvMem)
 						return unmarshalRet(mod, fn, rbuf)
 					},
 				)
@@ -2871,6 +3230,108 @@ func Test_Builtin_FFI_duplicate_variable_names_rejected(t *testing.T) {
 		  ]
 		})
 	`)
+}
+
+// Table-driven tests for __mem.gc behavior (attach, detach, errors, realloc carry, idempotence).
+func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
+	cases := []struct {
+		name    string
+		src     string
+		wantErr string // if non-empty, error substring to expect
+	}{
+		{
+			name: "attach free then manual free twice (idempotent)",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(16)
+			    C.__mem.gc(p, "free")
+			    C.__mem.free(p)   # first free triggers registered destructor
+			    C.__mem.free(p)   # second free must be a no-op
+			    0
+			  end
+			`,
+		},
+		{
+			name: "detach then free (no destructor invoked)",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(8)
+			    C.__mem.gc(p, "free")
+			    C.__mem.gc(p, null)   # detach finalizer
+			    C.__mem.free(p)       # plain free succeeds
+			    0
+			  end
+			`,
+		},
+		{
+			name:    "custom symbol resolve error surfaces dlsym",
+			wantErr: "dlsym",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  let p = C.__mem.malloc(4)
+			  C.__mem.gc(p, {sym:"__definitely_not_exists__"})
+			`,
+		},
+		{
+			name: "realloc carries destructor to new pointer; double free is safe",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(8)
+			    C.__mem.gc(p, "free")
+			    let q = C.__mem.realloc(p, 16)   # move destructor to q
+			    C.__mem.free(q)
+			    C.__mem.free(q)                  # idempotent
+			    0
+			  end
+			`,
+		},
+		{
+			name:    "string finalizer must be exactly \"free\"",
+			wantErr: "string finalizer must be \"free\"",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  let p = C.__mem.malloc(1)
+			  C.__mem.gc(p, "close")
+			`,
+		},
+		{
+			name:    "first argument must be a pointer handle",
+			wantErr: "pointer handle",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  C.__mem.gc(123, "free")
+			`,
+		},
+		{
+			name: "re-attach overwrites finalizer, then detach",
+			src: `
+			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			  do
+			    let p = C.__mem.malloc(8)
+			    C.__mem.gc(p, "free")
+			    # overwrite with the same (no-op behavior change, but allowed)
+			    C.__mem.gc(p, "free")
+			    # now detach and free
+			    C.__mem.gc(p, null)
+			    C.__mem.free(p)
+			    0
+			  end
+			`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantErr == "" {
+				ok(t, tc.src)
+			} else {
+				err(t, tc.wantErr, tc.src)
+			}
+		})
+	}
 }
 === END FILE: builtin_ffi_test.go ===
 

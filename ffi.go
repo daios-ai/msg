@@ -1334,6 +1334,198 @@ func isCharPtr(reg *ffiRegistry, t *ffiType) bool {
 	return pt.Kind == ffiInt && pt.Bits == 8
 }
 
+// Pointer/handle to aggregate?
+func isPtrToAggregate(reg *ffiRegistry, t *ffiType) (*ffiType, bool) {
+	if t.Kind != ffiPointer && t.Kind != ffiHandle {
+		return nil, false
+	}
+	to := reg.mustGet(t.To)
+	switch to.Kind {
+	case ffiStruct, ffiUnion, ffiArray:
+		return to, true
+	}
+	return nil, false
+}
+
+// ---------- Auto-boxing (map/array literal → temp aggregate buffer) ----------
+const autoBoxMaxAlloc = uintptr(16 << 20) // 16 MiB per arg
+func mulOvf(a, b uintptr) bool {
+	const M = ^uint64(0)
+	return b != 0 && uint64(a) > M/uint64(b)
+}
+
+// Builds a zeroed C buffer for an aggregate and initializes it from a literal.
+// Returns (ptr, cleanup), freeing nested temporaries before the main buffer.
+func autoBoxAggregateLiteral(reg *ffiRegistry, agg *ffiType, lit Value) (unsafe.Pointer, func(), error) {
+	// size
+	var sz uintptr
+	switch agg.Kind {
+	case ffiStruct, ffiUnion:
+		sz = agg.Size
+	case ffiArray:
+		el := reg.mustGet(agg.Elem)
+		if agg.Len >= 0 {
+			if mulOvf(uintptr(agg.Len), el.Size) {
+				return nil, nil, fmt.Errorf("size overflow")
+			}
+			sz = uintptr(agg.Len) * el.Size
+		} else {
+			if lit.Tag != VTArray {
+				return nil, nil, fmt.Errorf("flexible array requires array literal")
+			}
+			n := len(lit.Data.(*ArrayObject).Elems)
+			if mulOvf(uintptr(n), el.Size) {
+				return nil, nil, fmt.Errorf("size overflow")
+			}
+			sz = uintptr(n) * el.Size
+		}
+	default:
+		return nil, nil, fmt.Errorf("internal: not an aggregate")
+	}
+	if sz == 0 {
+		sz = 1
+	}
+	if sz > autoBoxMaxAlloc {
+		return nil, nil, fmt.Errorf("allocation exceeds cap")
+	}
+	base := cMalloc(sz)
+	if base == nil {
+		return nil, nil, fmt.Errorf("out of memory")
+	}
+	cMemset(base, 0, sz)
+	var nested []func()
+	cleanup := func() {
+		for i := len(nested) - 1; i >= 0; i-- {
+			nested[i]()
+		}
+		cFree(base)
+	}
+
+	// Write one slot (scalar/pointer or nested aggregate-by-value)
+	var writeAgg func(t *ffiType, dst unsafe.Pointer, v Value) error
+	writeSlot := func(t *ffiType, dst unsafe.Pointer, v Value) error {
+		switch t.Kind {
+		case ffiPointer, ffiHandle:
+			if v.Tag == VTNull {
+				*(*unsafe.Pointer)(dst) = nil
+				return nil
+			}
+			if isCharPtr(reg, t) && v.Tag == VTStr {
+				cs := C.CString(v.Data.(string))
+				*(*unsafe.Pointer)(dst) = unsafe.Pointer(cs)
+				nested = append(nested, func() { C.free(unsafe.Pointer(cs)) })
+				return nil
+			}
+			if v.Tag != VTHandle {
+				return fmt.Errorf("expected pointer handle")
+			}
+			*(*unsafe.Pointer)(dst) = expectPtr(v)
+			return nil
+		case ffiInt, ffiFloat, ffiEnum:
+			writeValue(reg, t, dst, v)
+			return nil
+		default:
+			return writeAgg(t, dst, v)
+		}
+	}
+
+	writeAgg = func(t *ffiType, dst unsafe.Pointer, v Value) error {
+		switch t.Kind {
+		case ffiStruct:
+			if v.Tag != VTMap {
+				return fmt.Errorf("struct literal must be a map")
+			}
+			m := v.Data.(*MapObject)
+			seen := make(map[string]struct{}, len(t.Fields))
+			for _, f := range t.Fields {
+				seen[f.Name] = struct{}{}
+			}
+			for _, k := range m.Keys {
+				if _, ok := seen[k]; !ok {
+					return fmt.Errorf("unknown field %q", k)
+				}
+			}
+			for i, f := range t.Fields {
+				if f.Bits != 0 {
+					return fmt.Errorf("bitfields not supported")
+				}
+				val, ok := m.Entries[f.Name]
+				if !ok {
+					continue
+				}
+				ft := reg.mustGet(f.Type)
+				if err := writeSlot(ft, unsafe.Pointer(uintptr(dst)+t.Offsets[i]), val); err != nil {
+					return fmt.Errorf("field %s: %w", f.Name, err)
+				}
+			}
+			return nil
+		case ffiUnion:
+			if v.Tag != VTMap {
+				return fmt.Errorf("union literal must be a map with exactly one member")
+			}
+			m := v.Data.(*MapObject)
+			if len(m.Keys) != 1 {
+				return fmt.Errorf("union literal must set exactly one member")
+			}
+			k := m.Keys[0]
+			var ft *ffiType
+			ok := false
+			for _, f := range t.Fields {
+				if f.Name == k {
+					ft, ok = reg.mustGet(f.Type), true
+					break
+				}
+			}
+			if !ok {
+				return fmt.Errorf("unknown union member %q", k)
+			}
+			return writeSlot(ft, dst, m.Entries[k])
+		case ffiArray:
+			el := reg.mustGet(t.Elem)
+			switch v.Tag {
+			case VTArray:
+				arr := v.Data.(*ArrayObject).Elems
+				if t.Len >= 0 && len(arr) > t.Len {
+					return fmt.Errorf("array literal length %d exceeds %d", len(arr), t.Len)
+				}
+				limit := len(arr)
+				if t.Len >= 0 && t.Len < limit {
+					limit = t.Len
+				}
+				for i := 0; i < limit; i++ {
+					if err := writeSlot(el, unsafe.Pointer(uintptr(dst)+uintptr(i)*el.Size), arr[i]); err != nil {
+						return fmt.Errorf("index %d: %w", i, err)
+					}
+				}
+				return nil
+			case VTMap:
+				m := v.Data.(*MapObject)
+				for _, k := range m.Keys {
+					var idx int
+					if _, err := fmt.Sscanf(k, "%d", &idx); err != nil || idx < 0 {
+						return fmt.Errorf("array index %q must be non-negative integer", k)
+					}
+					if t.Len >= 0 && idx >= t.Len {
+						return fmt.Errorf("index %d out of range (len=%d)", idx, t.Len)
+					}
+					if err := writeSlot(el, unsafe.Pointer(uintptr(dst)+uintptr(idx)*el.Size), m.Entries[k]); err != nil {
+						return fmt.Errorf("index %d: %w", idx, err)
+					}
+				}
+				return nil
+			}
+			return fmt.Errorf("array literal must be an array or index map")
+		}
+		return fmt.Errorf("internal: not an aggregate")
+	}
+
+	if err := writeAgg(agg, base, lit); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return base, cleanup, nil
+}
+
 // Range & numeric conversions
 
 func mustIntRange(v Value, t *ffiType) int64 {
@@ -1487,6 +1679,22 @@ func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) 
 	for i, key := range fn.Params {
 		pt := mod.reg.mustGet(key)
 		val := ctx.Arg(fmt.Sprintf("p%d", i))
+		// Auto-box: pass literal as temp buffer for pointer/handle-to-aggregate (in-only).
+		if agg, ok := isPtrToAggregate(mod.reg, pt); ok && (val.Tag == VTMap || val.Tag == VTArray) {
+			tmp, rel, err := autoBoxAggregateLiteral(mod.reg, agg, val)
+			if err != nil {
+				fail(fmt.Sprintf("ffi: %s: p%d: %s", fn.Name, i, err.Error()))
+			}
+			buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+			if buf == nil {
+				rel()
+				fail("ffi: OOM")
+			}
+			*(*unsafe.Pointer)(buf) = tmp
+			argBufs[i] = buf
+			cleanups = append(cleanups, func() { C.free(buf); rel() })
+			continue
+		}
 		// char*/uchar* bridge for strings
 		if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
 			cs := C.CString(val.Data.(string))

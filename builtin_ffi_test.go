@@ -1010,3 +1010,72 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 		})
 	}
 }
+
+func Test_FFI_qsort_callback_sorts(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    size_t:{kind:"int",bits:64,signed:false},
+		    voidp:{kind:"pointer",to:{kind:"void"}},
+		    Cmp:{kind:"funcptr",ret:{kind:"int",bits:32,signed:true},
+		         params:[{kind:"pointer",to:{kind:"void"}},{kind:"pointer",to:{kind:"void"}}]}
+		  },
+		  functions:[
+		    {name:"qsort",ret:{kind:"void"},params:["voidp","size_t","size_t","Cmp"]},
+		    {name:"memcmp",ret:{kind:"int",bits:32,signed:true},params:["voidp","voidp","size_t"]}
+		  ]
+		})
+		do
+		  let N=5
+		  let SZ=4
+		  let BYTES=N*SZ
+		  let buf=C.__mem.malloc(BYTES)
+		  let exp=C.__mem.malloc(BYTES)
+		  C.__mem.copy(buf,"\u0003\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0004\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0005\u0000\u0000\u0000",BYTES)
+		  C.__mem.copy(exp,"\u0001\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0003\u0000\u0000\u0000\u0004\u0000\u0000\u0000\u0005\u0000\u0000\u0000",BYTES)
+		  let calls=0
+		  let cmp=fun(a,b) do calls=calls+1; C.memcmp(a,b,4) end
+		  C.qsort(buf,N,SZ,cmp)
+		  {rc:C.memcmp(buf,exp,BYTES),calls:calls}
+		end
+	`)
+	m := mustMap(t, v)
+	if mustInt64(t, m.Entries["rc"]) != 0 {
+		t.Fatalf("memcmp != 0")
+	}
+	if mustInt64(t, m.Entries["calls"]) <= 0 {
+		t.Fatalf("callback not invoked")
+	}
+}
+
+func Test_FFI_callback_captures_and_returns(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C=ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    size_t:{kind:"int",bits:64,signed:false},
+		    voidp:{kind:"pointer",to:{kind:"void"}},
+		    Cmp:{kind:"funcptr",ret:{kind:"int",bits:32,signed:true},
+		         params:[{kind:"pointer",to:{kind:"void"}},{kind:"pointer",to:{kind:"void"}}]}
+		  },
+		  functions:[{name:"qsort",ret:{kind:"void"},params:["voidp","size_t","size_t","Cmp"]}]
+		})
+		do
+		  let N=8
+		  let SZ=4
+		  let B=N*SZ
+		  let buf=C.__mem.malloc(B); C.__mem.fill(buf,0,B)
+		  let s=1
+		  let c=0
+		  let cmp=fun(a,b) do c=c+1; s=0-s; s end
+		  C.qsort(buf,N,SZ,cmp)
+		  c
+		end
+	`)
+	if v.Tag != VTInt || v.Data.(int64) <= 0 {
+		t.Fatalf("callback not invoked, got %#v", v)
+	}
+}

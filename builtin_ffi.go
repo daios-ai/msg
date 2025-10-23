@@ -720,7 +720,7 @@ Implements:
   • Functions are real callables (scalars/pointers); vars expose get/set/addr
 
 Limitations:
-  • Aggregates by value and callbacks are not supported yet.
+  • Aggregates by value are not supported yet.
   • Variadics are supported (MindScript last arg = array; C default promotions applied).
 `)
 }

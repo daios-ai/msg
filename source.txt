@@ -17,7 +17,7 @@ package mindscript
 #include <stdint.h> // uintptr_t
 
 // Thin wrapper so cgo/gopls reliably sees the symbol.
-int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
+static int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
     unsigned int nfixedargs, unsigned int ntotalargs,
     ffi_type* rtype, ffi_type** atypes) {
   return ffi_prep_cif_var(cif, abi, nfixedargs, ntotalargs, rtype, atypes);
@@ -25,34 +25,34 @@ int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
 
 // ffi_call wrapper: accept a generic void* fn and a void** argv vector.
 // This avoids cgo’s function-pointer type constraints at the call site.
-void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue) {
+static void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue) {
     ffi_call(cif, (void (*)(void))fn, rvalue, avalue);
 }
 
-int ms_default_abi(void) {
+static int ms_default_abi(void) {
   return FFI_DEFAULT_ABI;
 }
 
 // Allocate a cif on the C heap (so it outlives the Go stack frame).
-ffi_cif* ms_alloc_cif(void) {
+static ffi_cif* ms_alloc_cif(void) {
     return (ffi_cif*)malloc(sizeof(ffi_cif));
 }
 
-void* ms_dlopen(const char* path) {
+static void* ms_dlopen(const char* path) {
 	return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
 }
-const char* ms_dlerror(void) {
+static const char* ms_dlerror(void) {
 	return dlerror();
 }
-void* ms_dlsym(void* h, const char* name) {
+static void* ms_dlsym(void* h, const char* name) {
 	return dlsym(h, name);
 }
-int ms_dlclose(void* h) {
+static int ms_dlclose(void* h) {
 	return dlclose(h);
 }
 
 // Clear dlerror, call dlsym, and return the error (if any) alongside the symbol.
-void* ms_dlsym_clear(void* h, const char* name, char** err) {
+static void* ms_dlsym_clear(void* h, const char* name, char** err) {
  	dlerror(); // clear
  	void* p = dlsym(h, name);
 	char* e = dlerror();
@@ -62,7 +62,7 @@ void* ms_dlsym_clear(void* h, const char* name, char** err) {
 }
 
 // errno helpers
-int* ms_errno_loc(void) {
+static int* ms_errno_loc(void) {
 #if defined(__GLIBC__)
   extern int* __errno_location(void);
   return __errno_location();
@@ -73,33 +73,34 @@ int* ms_errno_loc(void) {
 
 // Call a destructor with signature: void (*)(void*)
 typedef void (*ms_destructor_fn)(void*);
-inline void ms_call_destructor(void* fn, void* p) {
+static inline void ms_call_destructor(void* fn, void* p) {
   ((ms_destructor_fn)fn)(p);
 }
 
 // -------- libffi closure helpers (callbacks) ----------
-void* ms_closure_alloc(void** executable) {
+static void* ms_closure_alloc(void** executable) {
   return ffi_closure_alloc(sizeof(ffi_closure), executable);
 }
-int ms_prep_closure(void* closure, ffi_cif* cif,
+static int ms_prep_closure(void* closure, ffi_cif* cif,
                     void (*thunk)(ffi_cif*, void*, void**, void*),
                     void* userdata, void* executable) {
   return ffi_prep_closure_loc((ffi_closure*)closure, cif, thunk, userdata, executable);
 }
 // Wrapper that binds the thunk on the C side to avoid cgo func-ptr typing pitfalls.
-int ms_prep_closure_with_thunk(void* closure, ffi_cif* cif,
+// Forward declare the static thunk we define below.
+static void ms_callback_thunk(ffi_cif*, void*, void**, void*);
+static int ms_prep_closure_with_thunk(void* closure, ffi_cif* cif,
                                void* userdata, void* executable) {
-  extern void ms_callback_thunk(ffi_cif*, void*, void**, void*);
   return ffi_prep_closure_loc((ffi_closure*)closure, cif,
                               ms_callback_thunk, userdata, executable);
 }
-void ms_closure_free(void* closure) {
+static void ms_closure_free(void* closure) {
   ffi_closure_free((ffi_closure*)closure);
 }
 
 // Forward decl to Go; C thunk forwards into it with integer handle.
 extern void msCallbackInvoke(ffi_cif*, void*, void**, uintptr_t);
-void ms_callback_thunk(ffi_cif* cif, void* ret, void** args, void* user) {
+static void ms_callback_thunk(ffi_cif* cif, void* ret, void** args, void* user) {
   msCallbackInvoke(cif, ret, args, (uintptr_t)user);
 }
 */
@@ -237,6 +238,44 @@ func cAllocFFITypeArray(n int) unsafe.Pointer {
 }
 func cFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
 	return (*[1<<30 - 1]*C.ffi_type)(mem)[:n:n]
+}
+
+// --- Opaque libffi type helpers (keep all C references in this file) ---
+
+// Return opaque pointers to common builtin ffi_type objects.
+func ffiTypeSint32Ptr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_sint32) }
+func ffiTypeDoublePtr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_double) }
+func ffiTypePointerPtr() unsafe.Pointer { return unsafe.Pointer(&C.ffi_type_pointer) }
+
+// Fill a ffi_type** array (allocated via cAllocFFITypeArray) from registry keys.
+func fillFFITypesFromKeys(reg *ffiRegistry, mem unsafe.Pointer, keys []string) error {
+	vec := cFFITypeSlice(mem, len(keys)) // uses *C.ffi_type internally (C access kept here)
+	for i, k := range keys {
+		t, err := ffiTypeFor(reg, k)
+		if err != nil {
+			return err
+		}
+		vec[i] = t
+	}
+	return nil
+}
+
+// Set one entry in a ffi_type** array at index idx using an opaque pointer.
+func setFFITypeAt(mem unsafe.Pointer, idx int, ty unsafe.Pointer) {
+	vec := cFFITypeSlice(mem, idx+1)
+	vec[idx] = (*C.ffi_type)(ty)
+}
+
+func ffiReturnTypePtr(reg *ffiRegistry, key string) (unsafe.Pointer, error) {
+	t, err := ffiTypeFor(reg, key)
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Pointer(t), nil
+}
+
+func cFFIPrepCIFVarOpaque(cif *C.ffi_cif, nfixed, ntotal int, rtype unsafe.Pointer, atypes unsafe.Pointer) error {
+	return cFFIPrepCIFVar(cif, nfixed, ntotal, (*C.ffi_type)(rtype), atypes)
 }
 
 // --- Internal FFI model ------------------------------------------------------
@@ -2112,19 +2151,9 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						}
 						vaElems := vaVal.Data.(*ArrayObject).Elems
 
-						// Prepare fixed ffi_types vector
-						fixedTypes := make([]*ffi_type, len(fn.Params))
-						for i, pkey := range fn.Params {
-							pt, err := ffiTypeFor(mod.reg, pkey)
-							if err != nil {
-								fail("ffi: " + err.Error())
-							}
-							fixedTypes[i] = pt
-						}
-
-						// Promote varargs + buffers and ffi_types
-						var vaTypes []*ffi_type
+						// Promote varargs + buffers and collect opaque ffi_type* for each vararg
 						var vaBufs []unsafe.Pointer
+						var vaTypePtrs []unsafe.Pointer
 						release := []func(){}
 						promInt := &ffiType{Kind: ffiInt, Bits: 32, Signed: true}
 						promDbl := &ffiType{Kind: ffiFloat, Bits: 64}
@@ -2137,7 +2166,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 								}
 								writeValue(mod.reg, promInt, buf, a)
 								vaBufs = append(vaBufs, buf)
-								vaTypes = append(vaTypes, &ffi_type_sint32)
+								vaTypePtrs = append(vaTypePtrs, ffiTypeSint32Ptr())
 								release = append(release, func() { cFree(buf) })
 							case VTNum:
 								buf := cMalloc(8)
@@ -2146,7 +2175,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 								}
 								writeValue(mod.reg, promDbl, buf, a)
 								vaBufs = append(vaBufs, buf)
-								vaTypes = append(vaTypes, &ffi_type_double)
+								vaTypePtrs = append(vaTypePtrs, ffiTypeDoublePtr())
 								release = append(release, func() { cFree(buf) })
 							case VTHandle:
 								buf := cMalloc(uintptr(unsafe.Sizeof(uintptr(0))))
@@ -2155,7 +2184,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 								}
 								*(*unsafe.Pointer)(buf) = expectPtr(a)
 								vaBufs = append(vaBufs, buf)
-								vaTypes = append(vaTypes, &ffi_type_pointer)
+								vaTypePtrs = append(vaTypePtrs, ffiTypePointerPtr())
 								release = append(release, func() { cFree(buf) })
 							default:
 								fail(fmt.Sprintf("unsupported variadic arg[%d]", i))
@@ -2184,12 +2213,17 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							fail("ffi: OOM")
 						}
 						defer cFree(typeMem)
-						typeVec := cFFITypeSlice(typeMem, total)
-						copy(typeVec, fixedTypes)
-						copy(typeVec[len(fixedTypes):], vaTypes)
+						// Fill fixed portion from registry keys
+						if err := fillFFITypesFromKeys(mod.reg, typeMem, fn.Params); err != nil {
+							fail("ffi: " + err.Error())
+						}
+						// Append vararg promoted types
+						for i, ty := range vaTypePtrs {
+							setFFITypeAt(typeMem, len(fn.Params)+i, ty)
+						}
 
 						// Prepare CIF (variadic) using heap-allocated cif
-						rty, err := ffiTypeFor(mod.reg, fn.Ret)
+						rty, err := ffiReturnTypePtr(mod.reg, fn.Ret)
 						if err != nil {
 							fail("ffi: " + err.Error())
 						}
@@ -2198,7 +2232,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							fail("ffi_prep_cif_var: OOM")
 						}
 						defer cFree(unsafe.Pointer(cifVar))
-						if err := cFFIPrepCIFVar(cifVar, len(fixedTypes), total, rty, typeMem); err != nil {
+						if err := cFFIPrepCIFVarOpaque(cifVar, len(fn.Params), total, rty, typeMem); err != nil {
 							fail(err.Error())
 						}
 

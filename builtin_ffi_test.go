@@ -1233,3 +1233,117 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 		})
 	}
 }
+
+func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	type tc struct {
+		name  string
+		src   string
+		check func(*testing.T, Value, error)
+	}
+	cases := []tc{
+		{
+			name: "read_single_byte_bits_3_from_bit1",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(1)
+				  C.__mem.fill(p, 214, 1)        # 214 == 0xD6 (1101 0110)
+				  C.__mem.readBits(p, 0, 1, 3, true)   # bits 1..3 -> 0b011 = 3
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt || v.Data.(int64) != 3 {
+					t.Fatalf("want 3, got %#v", v)
+				}
+			},
+		},
+		{
+			name: "read_crosses_bytes_width8_from_bit4_le",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(2)
+				  C.__mem.fill(p, 0, 2)
+				  # Set explicit bytes [0]=0xAA, [1]=0x55 using writeBits on each byte
+				  C.__mem.writeBits(p, 0, 0, 8, 170)   # 170 == 0xAA
+				  C.__mem.writeBits(p, 1, 0, 8, 85)    #  85 == 0x55
+				  # Read 8 bits starting at bit 4 → 0x5A = 90
+				  C.__mem.readBits(p, 0, 4, 8, null)
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt || v.Data.(int64) != 90 { // 0x5A
+					t.Fatalf("want 90 (0x5A), got %#v", v)
+				}
+			},
+		},
+		{
+			name: "write_across_two_bytes_and_verify_split",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(2)
+				  C.__mem.fill(p, 0, 2)
+				  C.__mem.writeBits(p, 0, 4, 8, 171)   # 171 == 0xAB, spans bits 4..11
+				  { b0: C.__mem.readBits(p, 0, 0, 8, null),
+				    b1: C.__mem.readBits(p, 1, 0, 8, null),
+				    val: C.__mem.readBits(p, 0, 4, 8, null) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := v.Data.(*MapObject)
+				b0 := m.Entries["b0"]
+				b1 := m.Entries["b1"]
+				val := m.Entries["val"]
+				// Expected split after writing 0xAB at bit 4: bytes become {0xB0, 0x0A}
+				if b0.Tag != VTInt || b0.Data.(int64) != 176 {
+					t.Fatalf("b0 want 176 (0xB0), got %#v", b0)
+				}
+				if b1.Tag != VTInt || b1.Data.(int64) != 10 {
+					t.Fatalf("b1 want 10  (0x0A), got %#v", b1)
+				}
+				if val.Tag != VTInt || val.Data.(int64) != 171 {
+					t.Fatalf("val want 171 (0xAB), got %#v", val)
+				}
+			},
+		},
+		{
+			name: "read_with_sign_extension_width5_negative",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(1)
+				  C.__mem.fill(p, 240, 1)     # 240 == 0xF0 (1111 0000)
+				  # bits 3..7 are 11110 (0x1E); signed width 5 => -2 after sign-ext
+				  C.__mem.readBits(p, 0, 3, 5, true)
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt || v.Data.(int64) != -2 {
+					t.Fatalf("want -2, got %#v", v)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v, e := ip.EvalSource(c.src)
+			c.check(t, v, e)
+		})
+	}
+}

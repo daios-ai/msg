@@ -2227,6 +2227,131 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				"Attach/detach a destructor for a pointer; one-shot per allocation.",
 			)
 
+			// ---- Minimal packed-bit helpers (little-endian only, x86-64/SysV) ----
+			// readBits(ptr, byteOffset, bitOffset, width, signed?)
+			//  - width: 1..64; returns Int (sign-extended when signed=true)
+			registerMem("readBits",
+				[]ParamSpec{
+					{Name: "ptr", Type: S{"id", "Any"}},
+					{Name: "byteOffset", Type: S{"id", "Int"}},
+					{Name: "bitOffset", Type: S{"id", "Int"}},
+					{Name: "width", Type: S{"id", "Int"}},
+					{Name: "signed", Type: S{"id", "Any"}},
+				},
+				S{"id", "Int"},
+				func(ctx CallCtx) Value {
+					p := expectPtr(ctx.Arg("ptr"))
+					bo := ctx.Arg("byteOffset").Data.(int64)
+					bi := ctx.Arg("bitOffset").Data.(int64)
+					w := ctx.Arg("width").Data.(int64)
+					if bo < 0 || bi < 0 {
+						fail("readBits: offsets must be >= 0")
+					}
+					if w < 1 || w > 64 {
+						fail("readBits: width must be in 1..64")
+					}
+					sgn := false
+					if s := ctx.Arg("signed"); s.Tag == VTBool {
+						sgn = s.Data.(bool)
+					} else if s.Tag != VTNull {
+						fail("readBits: signed must be bool or null")
+					}
+
+					start := int(bi % 8)
+					need := int((int64(start) + w + 7) / 8) // 1..9
+					if need < 1 || need > 9 {
+						fail("readBits: internal length check failed")
+					}
+
+					base := unsafe.Pointer(uintptr(p) + uintptr(bo))
+					var buf [9]byte
+					cMemcpy(unsafe.Pointer(&buf[0]), base, uintptr(need))
+
+					// assemble little-endian chunk
+					var x uint64
+					for i := 0; i < need; i++ {
+						x |= uint64(buf[i]) << (8 * i)
+					}
+					x >>= uint(start)
+
+					var mask uint64
+					if w == 64 {
+						mask = ^uint64(0)
+					} else {
+						mask = (uint64(1) << uint(w)) - 1
+					}
+					val := x & mask
+					if sgn && w < 64 && ((val>>(uint(w)-1))&1) == 1 {
+						val |= ^mask
+					} // sign-extend
+					return Int(int64(val))
+				},
+				"Read up to 64 bits from a packed little-endian field: readBits(ptr, byteOffset, bitOffset, width, signed?).",
+			)
+
+			// writeBits(ptr, byteOffset, bitOffset, width, value)
+			//  - value must be unsigned (>=0) and fit within width
+			registerMem("writeBits",
+				[]ParamSpec{
+					{Name: "ptr", Type: S{"id", "Any"}},
+					{Name: "byteOffset", Type: S{"id", "Int"}},
+					{Name: "bitOffset", Type: S{"id", "Int"}},
+					{Name: "width", Type: S{"id", "Int"}},
+					{Name: "value", Type: S{"id", "Int"}},
+				},
+				S{"id", "Null"},
+				func(ctx CallCtx) Value {
+					p := expectPtr(ctx.Arg("ptr"))
+					bo := ctx.Arg("byteOffset").Data.(int64)
+					bi := ctx.Arg("bitOffset").Data.(int64)
+					w := ctx.Arg("width").Data.(int64)
+					if bo < 0 || bi < 0 {
+						fail("writeBits: offsets must be >= 0")
+					}
+					if w < 1 || w > 64 {
+						fail("writeBits: width must be in 1..64")
+					}
+					v := ctx.Arg("value").Data.(int64)
+					if v < 0 {
+						fail("writeBits: negative value not allowed")
+					}
+
+					var mask uint64
+					if w == 64 {
+						mask = ^uint64(0)
+					} else {
+						mask = (uint64(1) << uint(w)) - 1
+					}
+					if uint64(v) > mask {
+						fail("writeBits: value does not fit width")
+					}
+
+					start := int(bi % 8)
+					need := int((int64(start) + w + 7) / 8) // 1..9
+					if need < 1 || need > 9 {
+						fail("writeBits: internal length check failed")
+					}
+
+					base := unsafe.Pointer(uintptr(p) + uintptr(bo))
+					var buf [9]byte
+					cMemcpy(unsafe.Pointer(&buf[0]), base, uintptr(need))
+
+					var x uint64
+					for i := 0; i < need; i++ {
+						x |= uint64(buf[i]) << (8 * i)
+					}
+					field := mask << uint(start)
+					x &^= field
+					x |= (uint64(v) & mask) << uint(start)
+					for i := 0; i < need; i++ {
+						buf[i] = byte((x >> (8 * i)) & 0xFF)
+					}
+					cMemcpy(base, unsafe.Pointer(&buf[0]), uintptr(need))
+					return Null
+				},
+				"Write up to 64 bits into a packed little-endian field: writeBits(ptr, byteOffset, bitOffset, width, value).",
+			)
+
 			// Export __mem
 			modMap.Entries["__mem"] = Value{Tag: VTMap, Data: memMap}
 			modMap.Keys = append(modMap.Keys, "__mem")
@@ -3610,11 +3735,10 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 				  ]
 				})
 				do
-				  let res = C.div(7,3)         # MUST be a handle (boxed aggregate)
-				  let expect = C.__mem.malloc(8)
-				  # little-endian bytes: 2,1 as int32
-				  C.__mem.copy(expect, "\u0002\u0000\u0000\u0000\u0001\u0000\u0000\u0000", 8)
-				  { eq: C.memcmp(res, expect, 8) }
+				let res = C.div(7,3)         # handle (boxed struct)
+				let expect = C.__mem.malloc(8)
+				C.__mem.copy(expect, "\u0002\u0000\u0000\u0000\u0001\u0000\u0000\u0000", 8)
+				{ res: res, eq: C.memcmp(res, expect, 8) }
 				end
 			`,
 			check: func(t *testing.T, v Value, err error) {
@@ -3622,10 +3746,11 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 					t.Fatalf("eval error: %v", err)
 				}
 				m := mustMap(t, v)
-				if m.Entries["isHandle"].Tag != VTBool || !m.Entries["isHandle"].Data.(bool) {
-					t.Fatalf("div() should return VTHandle (boxed struct), got %#v", v)
+				res := m.Entries["res"]
+				if res.Tag != VTHandle {
+					t.Fatalf("div() should return VTHandle (boxed struct), got %#v", res)
 				}
-				if m.Entries["eq"].Tag != VTInt || m.Entries["eq"].Data.(int64) != 0 {
+				if mustInt64(t, m.Entries["eq"]) != 0 {
 					t.Fatalf("div result bytes mismatch (memcmp != 0): %#v", v)
 				}
 			},
@@ -3735,6 +3860,120 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v, err := ip.EvalSource(tc.src)
 			tc.check(t, v, err)
+		})
+	}
+}
+
+func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	type tc struct {
+		name  string
+		src   string
+		check func(*testing.T, Value, error)
+	}
+	cases := []tc{
+		{
+			name: "read_single_byte_bits_3_from_bit1",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(1)
+				  C.__mem.fill(p, 214, 1)        # 214 == 0xD6 (1101 0110)
+				  C.__mem.readBits(p, 0, 1, 3, true)   # bits 1..3 -> 0b011 = 3
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt || v.Data.(int64) != 3 {
+					t.Fatalf("want 3, got %#v", v)
+				}
+			},
+		},
+		{
+			name: "read_crosses_bytes_width8_from_bit4_le",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(2)
+				  C.__mem.fill(p, 0, 2)
+				  # Set explicit bytes [0]=0xAA, [1]=0x55 using writeBits on each byte
+				  C.__mem.writeBits(p, 0, 0, 8, 170)   # 170 == 0xAA
+				  C.__mem.writeBits(p, 1, 0, 8, 85)    #  85 == 0x55
+				  # Read 8 bits starting at bit 4 → 0x5A = 90
+				  C.__mem.readBits(p, 0, 4, 8, null)
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt || v.Data.(int64) != 90 { // 0x5A
+					t.Fatalf("want 90 (0x5A), got %#v", v)
+				}
+			},
+		},
+		{
+			name: "write_across_two_bytes_and_verify_split",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(2)
+				  C.__mem.fill(p, 0, 2)
+				  C.__mem.writeBits(p, 0, 4, 8, 171)   # 171 == 0xAB, spans bits 4..11
+				  { b0: C.__mem.readBits(p, 0, 0, 8, null),
+				    b1: C.__mem.readBits(p, 1, 0, 8, null),
+				    val: C.__mem.readBits(p, 0, 4, 8, null) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := v.Data.(*MapObject)
+				b0 := m.Entries["b0"]
+				b1 := m.Entries["b1"]
+				val := m.Entries["val"]
+				// Expected split after writing 0xAB at bit 4: bytes become {0xB0, 0x0A}
+				if b0.Tag != VTInt || b0.Data.(int64) != 176 {
+					t.Fatalf("b0 want 176 (0xB0), got %#v", b0)
+				}
+				if b1.Tag != VTInt || b1.Data.(int64) != 10 {
+					t.Fatalf("b1 want 10  (0x0A), got %#v", b1)
+				}
+				if val.Tag != VTInt || val.Data.(int64) != 171 {
+					t.Fatalf("val want 171 (0xAB), got %#v", val)
+				}
+			},
+		},
+		{
+			name: "read_with_sign_extension_width5_negative",
+			src: `
+				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+				do
+				  let p = C.__mem.malloc(1)
+				  C.__mem.fill(p, 240, 1)     # 240 == 0xF0 (1111 0000)
+				  # bits 3..7 are 11110 (0x1E); signed width 5 => -2 after sign-ext
+				  C.__mem.readBits(p, 0, 3, 5, true)
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt || v.Data.(int64) != -2 {
+					t.Fatalf("want -2, got %#v", v)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v, e := ip.EvalSource(c.src)
+			c.check(t, v, e)
 		})
 	}
 }

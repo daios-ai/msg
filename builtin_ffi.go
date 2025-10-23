@@ -485,6 +485,131 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				"Attach/detach a destructor for a pointer; one-shot per allocation.",
 			)
 
+			// ---- Minimal packed-bit helpers (little-endian only, x86-64/SysV) ----
+			// readBits(ptr, byteOffset, bitOffset, width, signed?)
+			//  - width: 1..64; returns Int (sign-extended when signed=true)
+			registerMem("readBits",
+				[]ParamSpec{
+					{Name: "ptr", Type: S{"id", "Any"}},
+					{Name: "byteOffset", Type: S{"id", "Int"}},
+					{Name: "bitOffset", Type: S{"id", "Int"}},
+					{Name: "width", Type: S{"id", "Int"}},
+					{Name: "signed", Type: S{"id", "Any"}},
+				},
+				S{"id", "Int"},
+				func(ctx CallCtx) Value {
+					p := expectPtr(ctx.Arg("ptr"))
+					bo := ctx.Arg("byteOffset").Data.(int64)
+					bi := ctx.Arg("bitOffset").Data.(int64)
+					w := ctx.Arg("width").Data.(int64)
+					if bo < 0 || bi < 0 {
+						fail("readBits: offsets must be >= 0")
+					}
+					if w < 1 || w > 64 {
+						fail("readBits: width must be in 1..64")
+					}
+					sgn := false
+					if s := ctx.Arg("signed"); s.Tag == VTBool {
+						sgn = s.Data.(bool)
+					} else if s.Tag != VTNull {
+						fail("readBits: signed must be bool or null")
+					}
+
+					start := int(bi % 8)
+					need := int((int64(start) + w + 7) / 8) // 1..9
+					if need < 1 || need > 9 {
+						fail("readBits: internal length check failed")
+					}
+
+					base := unsafe.Pointer(uintptr(p) + uintptr(bo))
+					var buf [9]byte
+					cMemcpy(unsafe.Pointer(&buf[0]), base, uintptr(need))
+
+					// assemble little-endian chunk
+					var x uint64
+					for i := 0; i < need; i++ {
+						x |= uint64(buf[i]) << (8 * i)
+					}
+					x >>= uint(start)
+
+					var mask uint64
+					if w == 64 {
+						mask = ^uint64(0)
+					} else {
+						mask = (uint64(1) << uint(w)) - 1
+					}
+					val := x & mask
+					if sgn && w < 64 && ((val>>(uint(w)-1))&1) == 1 {
+						val |= ^mask
+					} // sign-extend
+					return Int(int64(val))
+				},
+				"Read up to 64 bits from a packed little-endian field: readBits(ptr, byteOffset, bitOffset, width, signed?).",
+			)
+
+			// writeBits(ptr, byteOffset, bitOffset, width, value)
+			//  - value must be unsigned (>=0) and fit within width
+			registerMem("writeBits",
+				[]ParamSpec{
+					{Name: "ptr", Type: S{"id", "Any"}},
+					{Name: "byteOffset", Type: S{"id", "Int"}},
+					{Name: "bitOffset", Type: S{"id", "Int"}},
+					{Name: "width", Type: S{"id", "Int"}},
+					{Name: "value", Type: S{"id", "Int"}},
+				},
+				S{"id", "Null"},
+				func(ctx CallCtx) Value {
+					p := expectPtr(ctx.Arg("ptr"))
+					bo := ctx.Arg("byteOffset").Data.(int64)
+					bi := ctx.Arg("bitOffset").Data.(int64)
+					w := ctx.Arg("width").Data.(int64)
+					if bo < 0 || bi < 0 {
+						fail("writeBits: offsets must be >= 0")
+					}
+					if w < 1 || w > 64 {
+						fail("writeBits: width must be in 1..64")
+					}
+					v := ctx.Arg("value").Data.(int64)
+					if v < 0 {
+						fail("writeBits: negative value not allowed")
+					}
+
+					var mask uint64
+					if w == 64 {
+						mask = ^uint64(0)
+					} else {
+						mask = (uint64(1) << uint(w)) - 1
+					}
+					if uint64(v) > mask {
+						fail("writeBits: value does not fit width")
+					}
+
+					start := int(bi % 8)
+					need := int((int64(start) + w + 7) / 8) // 1..9
+					if need < 1 || need > 9 {
+						fail("writeBits: internal length check failed")
+					}
+
+					base := unsafe.Pointer(uintptr(p) + uintptr(bo))
+					var buf [9]byte
+					cMemcpy(unsafe.Pointer(&buf[0]), base, uintptr(need))
+
+					var x uint64
+					for i := 0; i < need; i++ {
+						x |= uint64(buf[i]) << (8 * i)
+					}
+					field := mask << uint(start)
+					x &^= field
+					x |= (uint64(v) & mask) << uint(start)
+					for i := 0; i < need; i++ {
+						buf[i] = byte((x >> (8 * i)) & 0xFF)
+					}
+					cMemcpy(base, unsafe.Pointer(&buf[0]), uintptr(need))
+					return Null
+				},
+				"Write up to 64 bits into a packed little-endian field: writeBits(ptr, byteOffset, bitOffset, width, value).",
+			)
+
 			// Export __mem
 			modMap.Entries["__mem"] = Value{Tag: VTMap, Data: memMap}
 			modMap.Keys = append(modMap.Keys, "__mem")

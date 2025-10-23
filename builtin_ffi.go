@@ -21,7 +21,23 @@ func unmarshalRet(mod *ffiModule, fn *ffiFunction, rbuf unsafe.Pointer) Value {
 		}
 		return Str(cGoString(p))
 	}
-	return readValue(mod.reg, rt, rbuf)
+	// Aggregates-by-value: always boxed → return a pointer handle to copied storage.
+	switch rt.Kind {
+	case ffiStruct, ffiUnion, ffiArray:
+		sz := rt.Size
+		if sz == 0 {
+			sz = 1
+		}
+		p := cMalloc(sz)
+		if p == nil {
+			fail("ffi: OOM")
+		}
+		cMemcpy(p, rbuf, sz)
+		// Tag handle using the canonical key for this type.
+		return HandleVal(canonicalPtrTagKey(mod.reg, rt), p)
+	default:
+		return readValue(mod.reg, rt, rbuf)
+	}
 }
 
 // registerFFIBuiltins wires the user-facing ffiOpen builtin and builds the

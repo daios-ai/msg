@@ -1079,3 +1079,157 @@ func Test_FFI_callback_captures_and_returns(t *testing.T) {
 		t.Fatalf("callback not invoked, got %#v", v)
 	}
 }
+
+func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	cases := []struct {
+		name  string
+		src   string
+		check func(t *testing.T, v Value, err error)
+	}{
+		{
+			name: "byvalue_return_struct_div_returns_handle_and_bytes_match",
+			// div(7,3) -> struct div_t { int quot=2; int rem=1; } (SysV/glibc: int32,int32)
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    i32:   {kind:"int",bits:32,signed:true},
+				    Div:   {kind:"struct",fields:[{name:"quot",type:"i32"},{name:"rem",type:"i32"}]},
+				    charp: {kind:"pointer",to:{kind:"int",bits:8,signed:true}}
+				  },
+				  functions:[
+				    {name:"div", ret:"Div", params:["i32","i32"]},
+				    {name:"memcmp", ret:"i32", params:[{kind:"pointer",to:{kind:"void"}},{kind:"pointer",to:{kind:"void"}},{kind:"int",bits:64,signed:false}]}
+				  ]
+				})
+				do
+				let res = C.div(7,3)         # handle (boxed struct)
+				let expect = C.__mem.malloc(8)
+				C.__mem.copy(expect, "\u0002\u0000\u0000\u0000\u0001\u0000\u0000\u0000", 8)
+				{ res: res, eq: C.memcmp(res, expect, 8) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				res := m.Entries["res"]
+				if res.Tag != VTHandle {
+					t.Fatalf("div() should return VTHandle (boxed struct), got %#v", res)
+				}
+				if mustInt64(t, m.Entries["eq"]) != 0 {
+					t.Fatalf("div result bytes mismatch (memcmp != 0): %#v", v)
+				}
+			},
+		},
+		{
+			name: "pointer_to_aggregate_param_requires_handle_no_literals",
+			// nanosleep(const struct timespec *req, struct timespec *rem)
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    long: {kind:"int",bits:64,signed:true},
+				    Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
+				    Tsp: {kind:"pointer",to:"Timespec"},
+				    i32: {kind:"int",bits:32,signed:true}
+				  },
+				  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
+				})
+				C.nanosleep({ tv_sec:0, tv_nsec:0 }, null)  # MUST error: literal rejected
+			`,
+			check: func(t *testing.T, _ Value, err error) {
+				wantErrContains(t, err, "aggregate parameter requires handle")
+			},
+		},
+		{
+			name: "pointer_to_aggregate_param_with_handle_works",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    long: {kind:"int",bits:64,signed:true},
+                    Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
+				    Tsp: {kind:"pointer",to:"Timespec"},
+				    i32: {kind:"int",bits:32,signed:true}
+				  },
+				  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
+				})
+				do
+				  let req = C.__mem.new("Timespec",1)   # allocate storage → handle
+				  C.__mem.fill(req, 0, C.__mem.sizeof("Timespec"))
+				  C.nanosleep(req, null)                 # should succeed (likely 0)
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt && v.Tag != VTNum {
+					t.Fatalf("nanosleep rc should be scalar, got %#v", v)
+				}
+			},
+		},
+		{
+			name: "ret_as_str_for_charp_unchanged",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{ charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}} },
+				  functions:[ {name:"getenv", ret:"charp", params:["charp"], ret_as_str:true } ]
+				})
+				C.getenv("PATH")
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTStr || v.Data.(string) == "" {
+					t.Fatalf("expected PATH string, got %#v", v)
+				}
+			},
+		},
+		{
+			name: "variadic_still_ok_snprintf",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    size_t:{kind:"int",bits:64,signed:false},
+				    charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},
+				    i32:{kind:"int",bits:32,signed:true},
+				    dbl:{kind:"float",bits:64}
+				  },
+				  functions:[ {name:"snprintf", ret:"i32", params:["charp","size_t","charp"], variadic:true} ]
+				})
+				do
+				  let buf = C.__mem.malloc(64)
+				  let n = C.snprintf(buf, 64, "%d %.2f", [123, 3.14159])
+				  { n: n, s: C.__mem.string(buf, null) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				if mustInt64(t, m.Entries["n"]) <= 0 {
+					t.Fatalf("snprintf n <= 0: %#v", v)
+				}
+				if m.Entries["s"].Tag != VTStr || m.Entries["s"].Data.(string) != "123 3.14" {
+					t.Fatalf("snprintf out mismatch: %#v", v)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := ip.EvalSource(tc.src)
+			tc.check(t, v, err)
+		})
+	}
+}

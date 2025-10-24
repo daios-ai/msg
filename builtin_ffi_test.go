@@ -1438,3 +1438,370 @@ func Test_Builtin_FFI_mem_box_array_init_bytes(t *testing.T) {
 		t.Fatalf("array bytes mismatch (memcmp != 0): %#v", v)
 	}
 }
+
+func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	type tc struct {
+		name  string
+		src   string
+		check func(*testing.T, Value, error)
+	}
+
+	cases := []tc{
+		{
+			name: "byvalue_return_struct_div_returns_handle_and_bytes_match",
+			// div(7,3) -> struct div_t { int quot=2; int rem=1; } (SysV/glibc: int32,int32)
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    i32:   {kind:"int",bits:32,signed:true},
+				    Div:   {kind:"struct",fields:[{name:"quot",type:"i32"},{name:"rem",type:"i32"}]},
+				    charp: {kind:"pointer",to:{kind:"int",bits:8,signed:true}}
+				  },
+				  functions:[
+				    {name:"div", ret:"Div", params:["i32","i32"]},
+				    {name:"memcmp", ret:"i32", params:[{kind:"pointer",to:{kind:"void"}},{kind:"pointer",to:{kind:"void"}},{kind:"int",bits:64,signed:false}]}
+				  ]
+				})
+				do
+				  let res = C.div(7,3)         # handle (boxed struct)
+				  let expect = C.__mem.malloc(8)
+				  C.__mem.copy(expect, "\u0002\u0000\u0000\u0000\u0001\u0000\u0000\u0000", 8)
+				  { res: res, resFmt: formatValue(res), eq: C.memcmp(res, expect, 8) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				// Handle identity via formatValue
+				resFmt := m.Entries["resFmt"]
+				if resFmt.Tag != VTStr || !strings.HasPrefix(resFmt.Data.(string), "<handle:") {
+					t.Fatalf("div() should return a handle; got formatValue=%#v", resFmt)
+				}
+				// Byte-equivalence
+				if mustInt64(t, m.Entries["eq"]) != 0 {
+					t.Fatalf("div result bytes mismatch (memcmp != 0): %#v", v)
+				}
+			},
+		},
+		{
+			name: "pointer_to_aggregate_param_requires_handle_no_literals",
+			// nanosleep(const struct timespec *req, struct timespec *rem)
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    long: {kind:"int",bits:64,signed:true},
+				    Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
+				    Tsp: {kind:"pointer",to:"Timespec"},
+				    i32: {kind:"int",bits:32,signed:true}
+				  },
+				  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
+				})
+				C.nanosleep({ tv_sec:0, tv_nsec:0 }, null)  # MUST error: literal rejected
+			`,
+			check: func(t *testing.T, _ Value, err error) {
+				wantErrContains(t, err, "aggregate parameter requires handle")
+			},
+		},
+		{
+			name: "pointer_to_aggregate_param_with_handle_works",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    long: {kind:"int",bits:64,signed:true},
+                    Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
+				    Tsp: {kind:"pointer",to:"Timespec"},
+				    i32: {kind:"int",bits:32,signed:true}
+				  },
+				  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
+				})
+				do
+				  let req = C.__mem.new("Timespec",1)   # allocate storage → handle
+				  C.__mem.fill(req, 0, C.__mem.sizeof("Timespec"))
+				  C.nanosleep(req, null)                 # should succeed (likely 0)
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTInt && v.Tag != VTNum {
+					t.Fatalf("nanosleep rc should be scalar, got %#v", v)
+				}
+			},
+		},
+		{
+			name: "ret_as_str_for_charp_unchanged",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{ charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}} },
+				  functions:[ {name:"getenv", ret:"charp", params:["charp"], ret_as_str:true } ]
+				})
+				C.getenv("PATH")
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				if v.Tag != VTStr || v.Data.(string) == "" {
+					t.Fatalf("expected PATH string, got %#v", v)
+				}
+			},
+		},
+		{
+			name: "variadic_still_ok_snprintf",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    size_t:{kind:"int",bits:64,signed:false},
+				    charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},
+				    i32:{kind:"int",bits:32,signed:true},
+				    dbl:{kind:"float",bits:64}
+				  },
+				  functions:[ {name:"snprintf", ret:"i32", params:["charp","size_t","charp"], variadic:true} ]
+				})
+				do
+				  let buf = C.__mem.malloc(64)
+				  let n = C.snprintf(buf, 64, "%d %.2f", [123, 3.14159])
+				  { n: n, s: C.__mem.string(buf, null) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				if mustInt64(t, m.Entries["n"]) <= 0 {
+					t.Fatalf("snprintf n <= 0: %#v", v)
+				}
+				if m.Entries["s"].Tag != VTStr || m.Entries["s"].Data.(string) != "123 3.14" {
+					t.Fatalf("snprintf out mismatch: %#v", v)
+				}
+			},
+		},
+		{
+			name: "struct_aggregate_field_getf_returns_handle_and_setf_copies",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    I32:{kind:"int",bits:32,signed:true},
+				    Inner:{kind:"struct",fields:[{name:"x",type:"I32"},{name:"y",type:"I32"}]},
+				    Outer:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"inner",type:"Inner"}]},
+				    SZ:{kind:"int",bits:64,signed:false},
+				    Voidp:{kind:"pointer",to:{kind:"void"}}
+				  },
+				  functions:[ {name:"memcmp", ret:"I32", params:["Voidp","Voidp","SZ"]} ]
+				})
+				do
+				  let src = C.__mem.box("Inner", { x:7, y:11 })
+				  let out = C.__mem.box("Outer", { a:0 })   # 'inner' zeroed
+				  # getf(inner) must return a handle → return its formatted string
+				  let gotH = C.__mem.getf("Outer", out, "inner")
+				  let gotFmt = formatValue(gotH)
+				  # setf(inner, handle) must copy bytes
+				  C.__mem.setf("Outer", out, "inner", src)
+				  let after = C.__mem.getf("Outer", out, "inner")
+				  let n = C.__mem.sizeof("Inner")
+				  let eq = C.memcmp(after, src, n)
+				  { gotFmt: gotFmt, eq: eq }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				ff := m.Entries["gotFmt"]
+				if ff.Tag != VTStr || !strings.HasPrefix(ff.Data.(string), "<handle:") {
+					t.Fatalf("getf(inner) should return handle; formatValue=%#v", ff)
+				}
+				if mustInt64(t, m.Entries["eq"]) != 0 {
+					t.Fatalf("setf(inner, handle) did not copy matching bytes")
+				}
+			},
+		},
+		{
+			name: "struct_aggregate_field_setf_with_non_handle_fails",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    I32:{kind:"int",bits:32,signed:true},
+				    Inner:{kind:"struct",fields:[{name:"x",type:"I32"},{name:"y",type:"I32"}]},
+				    Outer:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"inner",type:"Inner"}]}
+				  }
+				})
+				let out = C.__mem.box("Outer", { a:0 })
+				# ERROR: value is not a handle
+				C.__mem.setf("Outer", out, "inner", { x:1, y:2 })
+			`,
+			check: func(t *testing.T, _ Value, err error) {
+				wantErrContains(t, err, "aggregate field requires handle")
+			},
+		},
+		{
+			name: "union_aggregate_field_getf_returns_handle_and_setf_copies",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    I32:{kind:"int",bits:32,signed:true},
+				    Inner:{kind:"struct",fields:[{name:"x",type:"I32"},{name:"y",type:"I32"}]},
+				    U:{kind:"union",fields:[{name:"i",type:"I32"},{name:"in",type:"Inner"}]},
+				    SZ:{kind:"int",bits:64,signed:false},
+				    Voidp:{kind:"pointer",to:{kind:"void"}}
+				  },
+				  functions:[ {name:"memcmp", ret:"I32", params:["Voidp","Voidp","SZ"]} ]
+				})
+				do
+				  let u  = C.__mem.box("U", { i: 0 })
+				  let i = C.__mem.box("Inner", { x: 9, y: 4 })
+				  let h  = C.__mem.getf("U", u, "in")   # must be a handle
+				  let gotFmt = formatValue(h)
+				  C.__mem.setf("U", u, "in", i)
+				  let h2 = C.__mem.getf("U", u, "in")
+				  let n = C.__mem.sizeof("Inner")
+				  { gotFmt: gotFmt, eq: C.memcmp(h2, i, n) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				ff := m.Entries["gotFmt"]
+				if ff.Tag != VTStr || !strings.HasPrefix(ff.Data.(string), "<handle:") {
+					t.Fatalf("union getf(in) should return handle; formatValue=%#v", ff)
+				}
+				if mustInt64(t, m.Entries["eq"]) != 0 {
+					t.Fatalf("union aggregate setf did not copy bytes")
+				}
+			},
+		},
+		{
+			name: "struct_array_field_getf_returns_handle_and_setf_copies",
+			src: `
+				let C = ffiOpen({
+				  version:"1", lib:"libc.so.6",
+				  types:{
+				    U8:{kind:"int",bits:8,signed:false},
+				    A4:{kind:"array",of:"U8",len:4},
+				    S:{kind:"struct",fields:[{name:"arr",type:"A4"}]},
+				    SZ:{kind:"int",bits:64,signed:false},
+				    Voidp:{kind:"pointer",to:{kind:"void"}}
+				  },
+				  functions:[ {name:"memcmp", ret:{kind:"int",bits:32,signed:true}, params:["Voidp","Voidp","SZ"]} ]
+				})
+				do
+				  let s   = C.__mem.box("S", null)
+				  let src = C.__mem.box("A4", [1,2,3,4])
+				  let fh  = C.__mem.getf("S", s, "arr")
+				  let gotFmt = formatValue(fh)
+				  C.__mem.setf("S", s, "arr", src)
+				  let fh2 = C.__mem.getf("S", s, "arr")
+				  { gotFmt: gotFmt, eq: C.memcmp(fh2, src, 4) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				ff := m.Entries["gotFmt"]
+				if ff.Tag != VTStr || !strings.HasPrefix(ff.Data.(string), "<handle:") {
+					t.Fatalf("getf(array) should return handle; formatValue=%#v", ff)
+				}
+				if mustInt64(t, m.Entries["eq"]) != 0 {
+					t.Fatalf("array field setf did not copy bytes")
+				}
+			},
+		},
+		{
+			name: "variable_scalar_errno_roundtrip",
+			src: `
+				let C = ffiOpen({ version:"1", lib:"libc.so.6",
+				  types:{ i32:{kind:"int",bits:32,signed:true} },
+				  variables:[ {name:"errno", type:"i32"} ]
+				})
+				do
+				  let before = C.errno.get()
+				  C.errno.set(0)
+				  let after = C.errno.get()
+				  { before: before, after: after }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				if mustInt64(t, m.Entries["after"]) != 0 {
+					t.Fatalf("errno set/get mismatch: %#v", v)
+				}
+				_ = m.Entries["before"] // value may vary by environment
+			},
+		},
+		{
+			name: "variable_aggregate_tzname_get_returns_handle_and_set_rejects_non_handle",
+			// tzname is: extern char *tzname[2];
+			src: `
+				let C = ffiOpen({
+				  version:"1",
+				  lib:"libc.so.6",
+				  types:{
+				    Char:{kind:"int",bits:8,signed:true},
+				    Charp:{kind:"pointer",to:"Char"},
+				    TzArr:{kind:"array",of:"Charp",len:2}
+				  },
+				  variables:[ {name:"tzname", type:"TzArr"} ]
+				})
+				do
+				  let g = C.tzname.get()
+				  { fmt: formatValue(g) }
+				end
+			`,
+			check: func(t *testing.T, v Value, err error) {
+				if err != nil {
+					t.Fatalf("eval error: %v", err)
+				}
+				m := mustMap(t, v)
+				ff := m.Entries["fmt"]
+				if ff.Tag != VTStr || !strings.HasPrefix(ff.Data.(string), "<handle:") {
+					t.Fatalf("tzname.get() should return handle; formatValue=%#v", ff)
+				}
+				// Separate negative test: set() must reject non-handle for aggregate variable.
+				_, e := ip.EvalSource(`
+					let C = ffiOpen({
+					  version:"1",
+					  lib:"libc.so.6",
+					  types:{
+					    Char:{kind:"int",bits:8,signed:true},
+					    Charp:{kind:"pointer",to:"Char"},
+					    TzArr:{kind:"array",of:"Charp",len:2}
+					  },
+					  variables:[ {name:"tzname", type:"TzArr"} ]
+					})
+					# ERROR: aggregate variable requires a handle
+					C.tzname.set([null,null])
+				`)
+				wantErrContains(t, e, "aggregate variable requires handle")
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v, e := ip.EvalSource(c.src)
+			c.check(t, v, e)
+		})
+	}
+}

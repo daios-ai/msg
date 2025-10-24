@@ -11,6 +11,8 @@ import (
 	"unsafe"
 )
 
+// This file cannot touch C code directly. It must rely on ffi.go.
+
 // Convert the return buffer into a Value, honoring ret_as_str for char*/uchar*.
 func unmarshalRet(mod *ffiModule, fn *ffiFunction, rbuf unsafe.Pointer) Value {
 	rt := mod.reg.mustGet(fn.Ret)
@@ -579,6 +581,9 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							if f.Name == name {
 								ft := reg.mustGet(f.Type)
 								src := unsafe.Pointer(uintptr(p) + t.Offsets[i])
+								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
+									return HandleVal(typeKey(reg, ft), src)
+								}
 								return readValue(reg, ft, src)
 							}
 						}
@@ -587,6 +592,9 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						for _, f := range t.Fields {
 							if f.Name == name {
 								ft := reg.mustGet(f.Type)
+								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
+									return HandleVal(typeKey(reg, ft), p)
+								}
 								return readValue(reg, ft, p) // unions start at offset 0
 							}
 						}
@@ -619,6 +627,14 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							if f.Name == name {
 								ft := reg.mustGet(f.Type)
 								dst := unsafe.Pointer(uintptr(p) + t.Offsets[i])
+								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
+									if val.Tag != VTHandle {
+										fail("setf: aggregate field requires handle to compatible storage")
+									}
+									src := expectPtr(val)
+									cMemcpy(dst, src, ft.Size)
+									return Null
+								}
 								writeValue(reg, ft, dst, val)
 								return Null
 							}
@@ -628,6 +644,14 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						for _, f := range t.Fields {
 							if f.Name == name {
 								ft := reg.mustGet(f.Type)
+								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
+									if val.Tag != VTHandle {
+										fail("setf: aggregate field requires handle to compatible storage")
+									}
+									src := expectPtr(val)
+									cMemcpy(p, src, ft.Size)
+									return Null
+								}
 								writeValue(reg, ft, p, val) // unions start at offset 0
 								return Null
 							}
@@ -932,7 +956,17 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					S{"id", "Any"},
 					func(_ *Interpreter, _ CallCtx) Value {
 						t := mod.reg.mustGet(v.Type)
-						return readValue(mod.reg, t, v.SymbolPtr)
+						switch t.Kind {
+						case ffiStruct, ffiUnion, ffiArray:
+							if t.Size == 0 {
+								fail("ffi: get(): aggregate has zero size")
+							}
+							p := mustMalloc(t.Size)
+							cMemcpy(p, v.SymbolPtr, t.Size)
+							return HandleVal(canonicalPtrTagKey(mod.reg, t), p)
+						default:
+							return readValue(mod.reg, t, v.SymbolPtr)
+						}
 					},
 				)
 				// set()
@@ -942,8 +976,23 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					S{"id", "Null"},
 					func(_ *Interpreter, ctx CallCtx) Value {
 						t := mod.reg.mustGet(v.Type)
-						writeValue(mod.reg, t, v.SymbolPtr, ctx.Arg("value"))
-						return Null
+						// Aggregates require a handle value whose bytes are copied into the variable.
+						switch t.Kind {
+						case ffiStruct, ffiUnion, ffiArray:
+							val := ctx.Arg("value")
+							if val.Tag != VTHandle {
+								fail("ffi: set(): aggregate variable requires handle to compatible storage")
+							}
+							src := expectPtr(val)
+							if t.Size == 0 {
+								fail("ffi: set(): aggregate has zero size")
+							}
+							cMemcpy(v.SymbolPtr, src, t.Size)
+							return Null
+						default:
+							writeValue(mod.reg, t, v.SymbolPtr, ctx.Arg("value"))
+							return Null
+						}
 					},
 				)
 

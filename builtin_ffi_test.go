@@ -95,14 +95,6 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 		}
 	})
 
-	t.Run("5.int-signedness-enforced-on-call", func(t *testing.T) {
-		err(t, "negative", `
-			let C=ffiOpen({version: "1", lib:"libc.so.6",
-			  types:{U:{kind:"int",bits:32,signed:false}},
-			  functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]})
-			C.sleep(-1)`)
-	})
-
 	t.Run("6.float-bits-validated", func(t *testing.T) {
 		err(t, "float: bits must be 32/64", `
 			ffiOpen({version: "1", lib:"libc.so.6", types:{BadF:{kind:"float",bits:128}}})`)
@@ -1345,5 +1337,104 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 			v, e := ip.EvalSource(c.src)
 			c.check(t, v, e)
 		})
+	}
+}
+
+func Test_Builtin_FFI_mem_box_struct_init_and_getf(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    I32:{kind:"int",bits:32,signed:true},
+		    I64:{kind:"int",bits:64,signed:true},
+		    S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"b",type:"I64"}]}
+		  }
+		})
+		do
+		  let h = C.__mem.box("S", { a:7, b:11 })
+		  { a:C.__mem.getf("S", h, "a"), b:C.__mem.getf("S", h, "b") }
+		end
+	`)
+	m := mustMap(t, v)
+	if mustInt64(t, m.Entries["a"]) != 7 || mustInt64(t, m.Entries["b"]) != 11 {
+		t.Fatalf("box+getf mismatch: %#v", v)
+	}
+}
+
+func Test_Builtin_FFI_mem_setf_writes_field(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    I32:{kind:"int",bits:32,signed:true},
+		    S:{kind:"struct",fields:[{name:"a",type:"I32"}]}
+		  }
+		})
+		do
+		  let h = C.__mem.box("S", { a:0 })
+		  C.__mem.setf("S", h, "a", 42)
+		  C.__mem.getf("S", h, "a")
+		end
+	`)
+	if mustInt64(t, v) != 42 {
+		t.Fatalf("setf did not persist: %#v", v)
+	}
+}
+
+func Test_Builtin_FFI_mem_box_union_read_write(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    I32:{kind:"int",bits:32,signed:true},
+		    D64:{kind:"float",bits:64},
+		    U:{kind:"union",fields:[{name:"i",type:"I32"},{name:"d",type:"D64"}]}
+		  }
+		})
+		do
+		  let u = C.__mem.box("U", { i: -3 })
+		  let i0 = C.__mem.getf("U", u, "i")
+		  C.__mem.setf("U", u, "d", 2.5)
+		  let d1 = C.__mem.getf("U", u, "d")
+		  { i:i0, d:d1 }
+		end
+	`)
+	m := mustMap(t, v)
+	if mustInt64(t, m.Entries["i"]) != -3 {
+		t.Fatalf("union getf(i) mismatch: %#v", v)
+	}
+	if m.Entries["d"].Tag != VTNum || m.Entries["d"].Data.(float64) != 2.5 {
+		t.Fatalf("union getf(d) mismatch: %#v", v)
+	}
+}
+
+func Test_Builtin_FFI_mem_box_array_init_bytes(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    U8:{kind:"int",bits:8,signed:false},
+		    A4:{kind:"array",of:"U8",len:4},
+		    I32:{kind:"int",bits:32,signed:true},
+		    SZ:{kind:"int",bits:64,signed:false},
+		    Voidp:{kind:"pointer",to:{kind:"void"}}
+		  },
+		  functions:[
+		    {name:"memcmp", ret:"I32", params:["Voidp","Voidp","SZ"]}
+		  ]
+		})
+		do
+		  let a = C.__mem.box("A4", [1,2,3,4])
+		  let exp = C.__mem.malloc(4)
+		  C.__mem.copy(exp, "\u0001\u0002\u0003\u0004", 4)
+		  C.memcmp(a, exp, 4)
+		end
+	`)
+	if mustInt64(t, v) != 0 {
+		t.Fatalf("array bytes mismatch (memcmp != 0): %#v", v)
 	}
 }

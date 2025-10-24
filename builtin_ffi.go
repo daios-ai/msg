@@ -24,15 +24,8 @@ func unmarshalRet(mod *ffiModule, fn *ffiFunction, rbuf unsafe.Pointer) Value {
 	// Aggregates-by-value: always boxed → return a pointer handle to copied storage.
 	switch rt.Kind {
 	case ffiStruct, ffiUnion, ffiArray:
-		sz := rt.Size
-		if sz == 0 {
-			sz = 1
-		}
-		p := cMalloc(sz)
-		if p == nil {
-			fail("ffi: OOM")
-		}
-		cMemcpy(p, rbuf, sz)
+		p := mustMalloc(rt.Size)
+		cMemcpy(p, rbuf, rt.Size)
 		// Tag handle using the canonical key for this type.
 		return HandleVal(canonicalPtrTagKey(mod.reg, rt), p)
 	default:
@@ -84,7 +77,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				if err != nil {
 					fail(fmt.Sprintf("ffiOpen: %s", err.Error()))
 				}
-				ptr, err := symChecked(libH, f.Name)
+				ptr, err := cDlsymClear(libH, f.Name)
 				if err != nil {
 					fail("ffiOpen: " + err.Error())
 				}
@@ -96,7 +89,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				if err != nil {
 					fail(fmt.Sprintf("ffiOpen: %s", err.Error()))
 				}
-				ptr, err := symChecked(libH, v.Name)
+				ptr, err := cDlsymClear(libH, v.Name)
 				if err != nil {
 					fail("ffiOpen: " + err.Error())
 				}
@@ -155,6 +148,8 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							f.cif = nil
 						}
 					}
+					// free cached aggregate ffi_type allocations
+					freeModuleFFIResources(mod)
 					for i := len(mod.openLibs) - 1; i >= 0; i-- {
 						ptr := mod.openLibs[i]
 						if ptr == nil {
@@ -392,8 +387,8 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					sv := ctx.Arg("src")
 					switch sv.Tag {
 					case VTStr:
-						cs := cCString(sv.Data.(string))
-						defer cCStringFree(cs)
+						cs, freeCS := tmpCString(sv.Data.(string))
+						defer freeCS()
 						cMemcpy(dst, cs, uintptr(n))
 					default:
 						src := expectPtr(sv)
@@ -483,6 +478,167 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					return vp
 				},
 				"Attach/detach a destructor for a pointer; one-shot per allocation.",
+			)
+
+			// box(T, initMap?) -> PtrHandle
+			// Allocate storage for an aggregate type and optionally initialize fields/elements.
+			registerMem("box",
+				[]ParamSpec{{Name: "T", Type: S{"id", "Any"}}, {Name: "init", Type: S{"id", "Any"}}},
+				S{"id", "Any"},
+				func(ctx CallCtx) Value {
+					t := resolveTypeArg(ctx.Arg("T"))
+					if !(t.Kind == ffiStruct || t.Kind == ffiUnion || t.Kind == ffiArray) {
+						fail("box: aggregate type required (struct/union/array)")
+					}
+					if t.Kind == ffiArray && t.Len < 0 {
+						fail("box: flexible arrays require explicit size; use __mem.new with count")
+					}
+					if t.Size == 0 {
+						fail("box: type has zero size")
+					}
+					p := cMalloc(t.Size)
+					if p == nil {
+						fail("box: OOM")
+					}
+					// Zero-initialize
+					cMemset(p, 0, t.Size)
+
+					initv := ctx.Arg("init")
+					switch t.Kind {
+					case ffiStruct:
+						if initv.Tag == VTMap {
+							m := initv.Data.(*MapObject)
+							for i, f := range t.Fields {
+								if v, ok := m.Entries[f.Name]; ok {
+									ft := reg.mustGet(f.Type)
+									dst := unsafe.Pointer(uintptr(p) + t.Offsets[i])
+									writeValue(reg, ft, dst, v)
+								}
+							}
+						} else if initv.Tag != VTNull {
+							fail("box: struct init must be a map or null")
+						}
+					case ffiUnion:
+						if initv.Tag == VTMap {
+							m := initv.Data.(*MapObject)
+							var set bool
+							for _, f := range t.Fields {
+								if v, ok := m.Entries[f.Name]; ok {
+									ft := reg.mustGet(f.Type)
+									writeValue(reg, ft, p, v) // unions start at offset 0
+									set = true
+									break
+								}
+							}
+							if !set && len(m.Keys) > 0 {
+								fail("box: union init must specify exactly one known field")
+							}
+						} else if initv.Tag != VTNull {
+							fail("box: union init must be a map or null")
+						}
+					case ffiArray:
+						if initv.Tag == VTArray {
+							elem := reg.mustGet(t.Elem)
+							avs := initv.Data.(*ArrayObject).Elems
+							n := len(avs)
+							if n > t.Len {
+								n = t.Len
+							}
+							// Only scalar/pointer elements supported for initialization.
+							if elem.Kind == ffiStruct || elem.Kind == ffiUnion || elem.Kind == ffiArray {
+								fail("box: array element initialization for aggregates is not supported")
+							}
+							for i := 0; i < n; i++ {
+								dst := unsafe.Pointer(uintptr(p) + uintptr(i)*elem.Size)
+								writeValue(reg, elem, dst, avs[i])
+							}
+						} else if initv.Tag != VTNull {
+							fail("box: array init must be an array or null")
+						}
+					}
+					return HandleVal(typeKey(reg, t), p)
+				},
+				"Allocate storage for an aggregate T and optionally initialize fields/elements; returns a tagged pointer.",
+			)
+
+			// getf(T, ptr, fieldName) -> Any  (struct/union field read)
+			registerMem("getf",
+				[]ParamSpec{
+					{Name: "T", Type: S{"id", "Any"}},
+					{Name: "ptr", Type: S{"id", "Any"}},
+					{Name: "field", Type: S{"id", "Str"}},
+				},
+				S{"id", "Any"},
+				func(ctx CallCtx) Value {
+					t := resolveTypeArg(ctx.Arg("T"))
+					p := expectPtr(ctx.Arg("ptr"))
+					name := ctx.Arg("field").Data.(string)
+					switch t.Kind {
+					case ffiStruct:
+						for i, f := range t.Fields {
+							if f.Name == name {
+								ft := reg.mustGet(f.Type)
+								src := unsafe.Pointer(uintptr(p) + t.Offsets[i])
+								return readValue(reg, ft, src)
+							}
+						}
+						fail("getf: unknown struct field: " + name)
+					case ffiUnion:
+						for _, f := range t.Fields {
+							if f.Name == name {
+								ft := reg.mustGet(f.Type)
+								return readValue(reg, ft, p) // unions start at offset 0
+							}
+						}
+						fail("getf: unknown union field: " + name)
+					default:
+						fail("getf: T must be a struct or union")
+					}
+					return Null
+				},
+				"Read a field from a struct/union instance.",
+			)
+
+			// setf(T, ptr, fieldName, value) -> Null  (struct/union field write)
+			registerMem("setf",
+				[]ParamSpec{
+					{Name: "T", Type: S{"id", "Any"}},
+					{Name: "ptr", Type: S{"id", "Any"}},
+					{Name: "field", Type: S{"id", "Str"}},
+					{Name: "value", Type: S{"id", "Any"}},
+				},
+				S{"id", "Null"},
+				func(ctx CallCtx) Value {
+					t := resolveTypeArg(ctx.Arg("T"))
+					p := expectPtr(ctx.Arg("ptr"))
+					name := ctx.Arg("field").Data.(string)
+					val := ctx.Arg("value")
+					switch t.Kind {
+					case ffiStruct:
+						for i, f := range t.Fields {
+							if f.Name == name {
+								ft := reg.mustGet(f.Type)
+								dst := unsafe.Pointer(uintptr(p) + t.Offsets[i])
+								writeValue(reg, ft, dst, val)
+								return Null
+							}
+						}
+						fail("setf: unknown struct field: " + name)
+					case ffiUnion:
+						for _, f := range t.Fields {
+							if f.Name == name {
+								ft := reg.mustGet(f.Type)
+								writeValue(reg, ft, p, val) // unions start at offset 0
+								return Null
+							}
+						}
+						fail("setf: unknown union field: " + name)
+					default:
+						fail("setf: T must be a struct or union")
+					}
+					return Null
+				},
+				"Write a field in a struct/union instance.",
 			)
 
 			// ---- Minimal packed-bit helpers (little-endian only, x86-64/SysV) ----
@@ -650,26 +806,16 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							// Build C argv (void**)
 							var argvMem unsafe.Pointer
 							if n := len(argBufs); n > 0 {
-								argvMem = cAllocVoidPtrArray(n)
-								if argvMem == nil {
-									fail("ffi: OOM")
-								}
+								argvMem = allocPtrArray(n)
 								defer cFree(argvMem)
-								argv := cVoidPtrSlice(argvMem, n)
+								argv := ptrSlice(argvMem, n)
 								for i := 0; i < n; i++ {
 									argv[i] = argBufs[i]
 								}
 							}
 							// Ret buffer on C heap (min 8 bytes)
 							rt := mod.reg.mustGet(fn.Ret)
-							sz := rt.Size
-							if sz < 8 {
-								sz = 8
-							}
-							rbuf := cMalloc(sz)
-							if rbuf == nil {
-								fail("ffi: OOM")
-							}
+							rbuf := mustMalloc(abiSlotSize(rt))
 							defer cFree(rbuf)
 							cFFICall(cif, fn.SymbolPtr, rbuf, argvMem)
 							return unmarshalRet(mod, fn, rbuf)
@@ -686,33 +832,22 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var vaBufs []unsafe.Pointer
 						var vaTypePtrs []unsafe.Pointer
 						release := []func(){}
-						promInt := &ffiType{Kind: ffiInt, Bits: 32, Signed: true}
-						promDbl := &ffiType{Kind: ffiFloat, Bits: 64}
 						for i, a := range vaElems {
 							switch a.Tag {
 							case VTInt, VTBool:
-								buf := cMalloc(8)
-								if buf == nil {
-									fail("ffi: OOM")
-								}
+								buf := mustMalloc(8)
 								writeValue(mod.reg, promInt, buf, a)
 								vaBufs = append(vaBufs, buf)
 								vaTypePtrs = append(vaTypePtrs, ffiTypeSint32Ptr())
 								release = append(release, func() { cFree(buf) })
 							case VTNum:
-								buf := cMalloc(8)
-								if buf == nil {
-									fail("ffi: OOM")
-								}
+								buf := mustMalloc(8)
 								writeValue(mod.reg, promDbl, buf, a)
 								vaBufs = append(vaBufs, buf)
 								vaTypePtrs = append(vaTypePtrs, ffiTypeDoublePtr())
 								release = append(release, func() { cFree(buf) })
 							case VTHandle:
-								buf := cMalloc(uintptr(unsafe.Sizeof(uintptr(0))))
-								if buf == nil {
-									fail("ffi: OOM")
-								}
+								buf := mustMalloc(uintptr(unsafe.Sizeof(uintptr(0))))
 								*(*unsafe.Pointer)(buf) = expectPtr(a)
 								vaBufs = append(vaBufs, buf)
 								vaTypePtrs = append(vaTypePtrs, ffiTypePointerPtr())
@@ -729,20 +864,14 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 						// Build argv = fixed + varargs
 						total := len(argBufs) + len(vaBufs)
-						argvMem := cAllocVoidPtrArray(total)
-						if argvMem == nil {
-							fail("ffi: OOM")
-						}
+						argvMem := allocPtrArray(total)
 						defer cFree(argvMem)
-						argv := cVoidPtrSlice(argvMem, total)
+						argv := ptrSlice(argvMem, total)
 						copy(argv, argBufs)
 						copy(argv[len(argBufs):], vaBufs)
 
 						// Build combined ffi_type* array for ffi_prep_cif_var
-						typeMem := cAllocFFITypeArray(total)
-						if typeMem == nil {
-							fail("ffi: OOM")
-						}
+						typeMem := allocPtrArray(total)
 						defer cFree(typeMem)
 						// Fill fixed portion from registry keys
 						if err := fillFFITypesFromKeys(mod.reg, typeMem, fn.Params); err != nil {
@@ -759,9 +888,6 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							fail("ffi: " + err.Error())
 						}
 						cifVar := cAllocCIF()
-						if cifVar == nil {
-							fail("ffi_prep_cif_var: OOM")
-						}
 						defer cFree(unsafe.Pointer(cifVar))
 						if err := cFFIPrepCIFVarOpaque(cifVar, len(fn.Params), total, rty, typeMem); err != nil {
 							fail(err.Error())
@@ -769,14 +895,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 						// Return buffer
 						rt := mod.reg.mustGet(fn.Ret)
-						sz := rt.Size
-						if sz < 8 {
-							sz = 8
-						}
-						rbuf := cMalloc(sz)
-						if rbuf == nil {
-							fail("ffi: OOM")
-						}
+						rbuf := mustMalloc(abiSlotSize(rt))
 						defer cFree(rbuf)
 
 						cFFICall(cifVar, fn.SymbolPtr, rbuf, argvMem)
@@ -857,12 +976,13 @@ Implements:
   • Type registry and ABI layout (size/align/offsetof) for common kinds
   • Symbol binding via dlsym for functions and variables
   • __mem with: sizeof, alignof, offsetof, typeof, malloc/calloc/realloc/free,
-    new, cast, string, copy, fill, errno
+    new, cast, string, copy, fill, errno, box, getf, setf
   • Functions are real callables (scalars/pointers); vars expose get/set/addr
 
 Limitations:
-  • Aggregates by value are not supported yet.
-  • Variadics are supported (MindScript last arg = array; C default promotions applied).
+   • Bitfields in structs are not supported (use readBits/writeBits for packed fields).
+   • Variadics are supported (MindScript last arg = array; C default promotions applied).
+   • Aggregates: by-value params require handles; by-value returns are boxed and returned as handles.
 `)
 }
 

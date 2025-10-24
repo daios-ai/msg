@@ -9,7 +9,6 @@ package mindscript
 #cgo pkg-config: libffi
 #include <ffi.h>
 #include <dlfcn.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -29,10 +28,6 @@ static void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue) {
     ffi_call(cif, (void (*)(void))fn, rvalue, avalue);
 }
 
-static int ms_default_abi(void) {
-  return FFI_DEFAULT_ABI;
-}
-
 // Allocate a cif on the C heap (so it outlives the Go stack frame).
 static ffi_cif* ms_alloc_cif(void) {
     return (ffi_cif*)malloc(sizeof(ffi_cif));
@@ -43,9 +38,6 @@ static void* ms_dlopen(const char* path) {
 }
 static const char* ms_dlerror(void) {
 	return dlerror();
-}
-static void* ms_dlsym(void* h, const char* name) {
-	return dlsym(h, name);
 }
 static int ms_dlclose(void* h) {
 	return dlclose(h);
@@ -80,11 +72,6 @@ static inline void ms_call_destructor(void* fn, void* p) {
 // -------- libffi closure helpers (callbacks) ----------
 static void* ms_closure_alloc(void** executable) {
   return ffi_closure_alloc(sizeof(ffi_closure), executable);
-}
-static int ms_prep_closure(void* closure, ffi_cif* cif,
-                    void (*thunk)(ffi_cif*, void*, void**, void*),
-                    void* userdata, void* executable) {
-  return ffi_prep_closure_loc((ffi_closure*)closure, cif, thunk, userdata, executable);
 }
 // Wrapper that binds the thunk on the C side to avoid cgo func-ptr typing pitfalls.
 // Forward declare the static thunk we define below.
@@ -164,26 +151,12 @@ func (m *ffiModule) openLib(lib, defaultName string, hDefault unsafe.Pointer) (u
 	if lib == "" || lib == defaultName {
 		return hDefault, nil
 	}
-	cs := C.CString(lib)
-	defer C.free(unsafe.Pointer(cs))
-	h := C.ms_dlopen(cs)
-	if h == nil {
-		return nil, fmt.Errorf("dlopen(%q) failed: %s", lib, dlerr())
+	h, err := cDlopen(lib)
+	if err != nil {
+		return nil, err
 	}
-	m.openLibs = append(m.openLibs, unsafe.Pointer(h))
-	return unsafe.Pointer(h), nil
-}
-
-// symChecked resolves a symbol name in lib or returns an error with dlerror detail.
-func symChecked(lib unsafe.Pointer, name string) (unsafe.Pointer, error) {
-	cs := C.CString(name)
-	defer C.free(unsafe.Pointer(cs))
-	var cerr *C.char
-	p := C.ms_dlsym_clear(lib, cs, &cerr)
-	if cerr != nil {
-		return nil, fmt.Errorf("dlsym(%q) failed: %s", name, C.GoString(cerr))
-	}
-	return p, nil
+	m.openLibs = append(m.openLibs, h)
+	return h, nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -241,13 +214,6 @@ func cDlsymClear(h unsafe.Pointer, name string) (unsafe.Pointer, error) {
 type cif = *C.ffi_cif
 
 func cAllocCIF() *C.ffi_cif { return C.ms_alloc_cif() }
-func cFFIPrepCIFVar(cif *C.ffi_cif, nfixed, ntotal int, rtype *C.ffi_type, atypes unsafe.Pointer) error {
-	st := C.ms_ffi_prep_cif_var(cif, C.FFI_DEFAULT_ABI, C.uint(nfixed), C.uint(ntotal), rtype, (**C.ffi_type)(atypes))
-	if st != C.FFI_OK {
-		return fmt.Errorf("ffi_prep_cif_var failed: %d", int(st))
-	}
-	return nil
-}
 func cFFICall(cif *C.ffi_cif, fn unsafe.Pointer, rvalue unsafe.Pointer, argv unsafe.Pointer) {
 	C.ms_ffi_call(cif, fn, rvalue, (*unsafe.Pointer)(argv))
 }
@@ -256,18 +222,40 @@ func cFFICall(cif *C.ffi_cif, fn unsafe.Pointer, rvalue unsafe.Pointer, argv uns
 func cErrnoGet() int  { return int(*C.ms_errno_loc()) }
 func cErrnoSet(v int) { *C.ms_errno_loc() = C.int(v) }
 
-// void**/ffi_type** array helpers
-func cAllocVoidPtrArray(n int) unsafe.Pointer {
+// One generic pointer-array allocator + slice adapters.
+func allocPtrArray(n int) unsafe.Pointer {
 	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
 }
-func cVoidPtrSlice(mem unsafe.Pointer, n int) []unsafe.Pointer {
+func ptrSlice(mem unsafe.Pointer, n int) []unsafe.Pointer {
 	return (*[1<<30 - 1]unsafe.Pointer)(mem)[:n:n]
 }
-func cAllocFFITypeArray(n int) unsafe.Pointer {
-	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
-}
-func cFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
+func asFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
 	return (*[1<<30 - 1]*C.ffi_type)(mem)[:n:n]
+}
+
+// -------- Small allocation helpers to reduce boilerplate ----------
+
+// mustMalloc allocates n bytes on the C heap or hard-fails with a uniform OOM.
+func mustMalloc(n uintptr) unsafe.Pointer {
+	p := C.malloc(C.size_t(n))
+	if p == nil {
+		fail("ffi: OOM")
+	}
+	return p
+}
+
+var ptrSlotSize = uintptr(unsafe.Sizeof(uintptr(0)))
+
+// makePtrSlot allocates a pointer-sized slot and stores p into it.
+func makePtrSlot(p unsafe.Pointer) unsafe.Pointer {
+	buf := mustMalloc(ptrSlotSize)
+	*(*unsafe.Pointer)(buf) = p
+	return buf
+}
+
+// allocRetBuf allocates a return buffer honoring the ABI slot size rule.
+func allocRetBuf(rt *ffiType) unsafe.Pointer {
+	return mustMalloc(abiSlotSize(rt))
 }
 
 // --- Opaque libffi type helpers (keep all C references in this file) ---
@@ -277,9 +265,9 @@ func ffiTypeSint32Ptr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_sint
 func ffiTypeDoublePtr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_double) }
 func ffiTypePointerPtr() unsafe.Pointer { return unsafe.Pointer(&C.ffi_type_pointer) }
 
-// Fill a ffi_type** array (allocated via cAllocFFITypeArray) from registry keys.
+// Fill a ffi_type** array (allocated via allocPtrArray) from registry keys.
 func fillFFITypesFromKeys(reg *ffiRegistry, mem unsafe.Pointer, keys []string) error {
-	vec := cFFITypeSlice(mem, len(keys)) // uses *C.ffi_type internally (C access kept here)
+	vec := asFFITypeSlice(mem, len(keys)) // uses *C.ffi_type internally (C access kept here)
 	for i, k := range keys {
 		t, err := ffiTypeFor(reg, k)
 		if err != nil {
@@ -292,7 +280,7 @@ func fillFFITypesFromKeys(reg *ffiRegistry, mem unsafe.Pointer, keys []string) e
 
 // Set one entry in a ffi_type** array at index idx using an opaque pointer.
 func setFFITypeAt(mem unsafe.Pointer, idx int, ty unsafe.Pointer) {
-	vec := cFFITypeSlice(mem, idx+1)
+	vec := asFFITypeSlice(mem, idx+1)
 	vec[idx] = (*C.ffi_type)(ty)
 }
 
@@ -305,7 +293,11 @@ func ffiReturnTypePtr(reg *ffiRegistry, key string) (unsafe.Pointer, error) {
 }
 
 func cFFIPrepCIFVarOpaque(cif *C.ffi_cif, nfixed, ntotal int, rtype unsafe.Pointer, atypes unsafe.Pointer) error {
-	return cFFIPrepCIFVar(cif, nfixed, ntotal, (*C.ffi_type)(rtype), atypes)
+	st := C.ms_ffi_prep_cif_var(cif, C.FFI_DEFAULT_ABI, C.uint(nfixed), C.uint(ntotal), (*C.ffi_type)(rtype), (**C.ffi_type)(atypes))
+	if st != C.FFI_OK {
+		return fmt.Errorf("ffi_prep_cif_var failed: %d", int(st))
+	}
+	return nil
 }
 
 // --- Internal FFI model ------------------------------------------------------
@@ -354,12 +346,10 @@ type ffiType struct {
 	Offsets []uintptr // struct: per-field; union: nil; array: nil
 
 	// Cached libffi representation (C-heap); freed on module close
-	cffi   *C.ffi_type
-	celems unsafe.Pointer // ffi_type** for struct fields (if any)
+	cffi *C.ffi_type
 
-	// --- callbacks (funcptr): cached callback CIF + argv type vector (C-heap) ---
-	cbCIF      *C.ffi_cif
-	cbTypesVec unsafe.Pointer
+	// --- callbacks (funcptr): cached callback CIF (C-heap) ---
+	cbCIF *C.ffi_cif
 }
 
 type ffiField struct {
@@ -441,6 +431,12 @@ type cbContext struct {
 	reg *ffiRegistry
 }
 
+// -------- Small shared values (avoid repeat allocations) ---------------------
+var (
+	promInt = &ffiType{Kind: ffiInt, Bits: 32, Signed: true} // C default promotions
+	promDbl = &ffiType{Kind: ffiFloat, Bits: 64}
+)
+
 // ---------------- One-shot GC destructor registry (shared) --------------------
 type gcDtorKind uint8
 
@@ -488,7 +484,7 @@ func gcRunOnce(p unsafe.Pointer) bool {
 			}
 		}
 		if e.lib != nil {
-			C.ms_dlclose(e.lib)
+			_ = cDlclose(e.lib)
 			e.lib = nil
 		}
 	})
@@ -507,9 +503,6 @@ func gcMove(p, q unsafe.Pointer) {
 		gcReg.Store(q, e)
 	}
 }
-
-// -------- libffi thin helpers (minimal; structs-by-value/callbacks deferred) -------
-type _cif = *C.ffi_cif // kept to avoid breaking references in this file
 
 func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
 	t := reg.mustGet(key)
@@ -588,8 +581,6 @@ func ensureCFFIType(reg *ffiRegistry, t *ffiType) (*C.ffi_type, error) {
 			C.ms_struct_set_elem(tf, C.size_t(i), et)
 		}
 		t.cffi = tf
-		// keep pointer to elements for later free
-		t.celems = unsafe.Pointer(tf.elements)
 		return t.cffi, nil
 	case ffiUnion, ffiArray:
 		// Opaque aggregate with known size/alignment.
@@ -605,7 +596,6 @@ func ensureCFFIType(reg *ffiRegistry, t *ffiType) (*C.ffi_type, error) {
 			return nil, fmt.Errorf("ffi_type OOM")
 		}
 		t.cffi = tf
-		t.celems = nil
 		return t.cffi, nil
 	default:
 		return nil, fmt.Errorf("internal: ensureCFFIType non-aggregate")
@@ -620,12 +610,11 @@ func ensureFuncptrCIF(reg *ffiRegistry, ft *ffiType) error {
 	if ft.cbCIF != nil {
 		return nil
 	}
-	cf, tp, err := prepCIF(reg, ft.Ret, ft.Params)
+	cf, _, err := prepCIF(reg, ft.Ret, ft.Params)
 	if err != nil {
 		return err
 	}
 	ft.cbCIF = cf
-	ft.cbTypesVec = tp
 	return nil
 }
 
@@ -639,10 +628,7 @@ func prepCIF(reg *ffiRegistry, ret string, params []string) (cif, unsafe.Pointer
 	n := len(params)
 	var typesPtr **C.ffi_type
 	if n > 0 {
-		bytes := C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
-		if bytes == nil {
-			return nil, nil, fmt.Errorf("ffi_prep_cif: OOM")
-		}
+		bytes := mustMalloc(uintptr(n) * uintptr(unsafe.Sizeof(uintptr(0))))
 		types := (*[1<<30 - 1]*C.ffi_type)(bytes)[:n:n]
 		for i, p := range params {
 			pt, err := ffiTypeFor(reg, p)
@@ -1299,6 +1285,14 @@ func alignUp(x, a uintptr) uintptr {
 	return (x + m) &^ m
 }
 
+// abiSlotSize returns the ABI slot size for a return/arg buffer (min 8 bytes).
+func abiSlotSize(t *ffiType) uintptr {
+	if t.Size < 8 {
+		return 8
+	}
+	return t.Size
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Binding helpers used by runtime glue (builtin_ffi.go)
 ////////////////////////////////////////////////////////////////////////////////
@@ -1532,7 +1526,7 @@ func writeValue(reg *ffiRegistry, t *ffiType, dst unsafe.Pointer, v Value) {
 	case ffiEnum:
 		base := reg.mustGet(t.EnumBase)
 		writeValue(reg, base, dst, v)
-	case ffiPointer, ffiHandle:
+	case ffiPointer, ffiHandle, ffiFuncPtr:
 		if v.Tag == VTNull {
 			*(*unsafe.Pointer)(dst) = nil
 			return
@@ -1568,11 +1562,51 @@ func readValue(reg *ffiRegistry, t *ffiType, src unsafe.Pointer) Value {
 	case ffiEnum:
 		base := reg.mustGet(t.EnumBase)
 		return readValue(reg, base, src)
-	case ffiPointer, ffiHandle:
+	case ffiPointer, ffiHandle, ffiFuncPtr:
 		return HandleVal(canonicalPtrTagKey(reg, t), *(*unsafe.Pointer)(src))
 	}
 	fail("unsupported type (by-value aggregate)")
 	return Null
+}
+
+// makeFuncptrArg builds the argument slot for a funcptr parameter.
+// It supports: null, raw pointer handles, or MindScript callables (via libffi closure).
+func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (slot unsafe.Pointer, cleanup cleanupFn) {
+	switch val.Tag {
+	case VTNull:
+		s := makePtrSlot(nil)
+		return s, func() { C.free(s) }
+	case VTHandle:
+		p := makePtrSlot(expectPtr(val))
+		return p, func() { C.free(p) }
+	default:
+		// MindScript callable → libffi closure
+		if err := ensureFuncptrCIF(mod.reg, pt); err != nil {
+			fail("ffi: callback prep: " + err.Error())
+		}
+		var exec unsafe.Pointer
+		cl := C.ms_closure_alloc((*unsafe.Pointer)(unsafe.Pointer(&exec)))
+		if cl == nil {
+			fail("ffi: closure_alloc OOM")
+		}
+		ctxObj := &cbContext{ip: ip, fn: val, typ: pt, reg: mod.reg}
+		h := cgo.NewHandle(ctxObj)
+		if st := C.ms_prep_closure_with_thunk(cl, pt.cbCIF, unsafe.Pointer(uintptr(h)), exec); st != C.FFI_OK {
+			C.ms_closure_free(cl)
+			h.Delete()
+			fail(fmt.Sprintf("ffi: callback prep failed: %d", int(st)))
+		}
+		// retain in module for lifetime management
+		mod.cbs = append(mod.cbs, cbRecord{closure: cl, handle: h})
+		s := makePtrSlot(exec)
+		return s, func() { C.free(s) }
+	}
+}
+
+// tmpCString returns a newly allocated C string pointer and a cleanup function.
+func tmpCString(s string) (unsafe.Pointer, func()) {
+	cs := C.CString(s)
+	return unsafe.Pointer(cs), func() { C.free(unsafe.Pointer(cs)) }
 }
 
 func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) ([]unsafe.Pointer, cleanupFn) {
@@ -1588,72 +1622,18 @@ func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) 
 		}
 		// char*/uchar* bridge for strings
 		if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
-			cs := C.CString(val.Data.(string))
-			buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
-			if buf == nil {
-				fail("ffi: OOM")
-			}
-			*(*unsafe.Pointer)(buf) = unsafe.Pointer(cs)
-			argBufs[i] = buf
-			cleanups = append(cleanups, func() { C.free(buf); C.free(unsafe.Pointer(cs)) })
+			cs, freeCS := tmpCString(val.Data.(string))
+			slot := makePtrSlot(cs)
+			argBufs[i] = slot
+			cleanups = append(cleanups, func() { C.free(slot); freeCS() })
 			continue
 		}
 		// funcptr: accept MindScript callable → build libffi closure; or accept pointer handle/null.
 		if pt.Kind == ffiFuncPtr {
-			switch val.Tag {
-			case VTNull:
-				// write NULL
-				buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
-				if buf == nil {
-					fail("ffi: OOM")
-				}
-				*(*unsafe.Pointer)(buf) = nil
-				argBufs[i] = buf
-				cleanups = append(cleanups, func() { C.free(buf) })
-				continue
-			case VTHandle:
-				// user supplied raw function pointer
-				buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
-				if buf == nil {
-					fail("ffi: OOM")
-				}
-				*(*unsafe.Pointer)(buf) = expectPtr(val)
-				argBufs[i] = buf
-				cleanups = append(cleanups, func() { C.free(buf) })
-				continue
-			default:
-				// Treat as callable (MindScript function). Build a closure.
-				if err := ensureFuncptrCIF(mod.reg, pt); err != nil {
-					fail("ffi: callback prep: " + err.Error())
-				}
-				// Allocate libffi closure (+ executable entry)
-				var exec unsafe.Pointer
-				cl := C.ms_closure_alloc((*unsafe.Pointer)(unsafe.Pointer(&exec)))
-				if cl == nil {
-					fail("ffi: closure_alloc OOM")
-				}
-				// Package user context via cgo.Handle; pass as uintptr_t through the thunk.
-				ctxObj := &cbContext{ip: ip, fn: val, typ: pt, reg: mod.reg}
-				h := cgo.NewHandle(ctxObj)
-				// ffi_prep_closure_loc takes void* userdata; we pass the handle value as a pointer,
-				// then cast it to uintptr_t inside the C thunk.
-				if st := C.ms_prep_closure_with_thunk(cl, pt.cbCIF, unsafe.Pointer(uintptr(h)), exec); st != C.FFI_OK {
-					C.ms_closure_free(cl)
-					h.Delete()
-					fail(fmt.Sprintf("ffi: callback prep failed: %d", int(st)))
-				}
-				// Keep closure alive in module; free on module.close()
-				mod.cbs = append(mod.cbs, cbRecord{closure: cl, handle: h})
-				// Pass executable entry as the function pointer argument
-				buf := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
-				if buf == nil {
-					fail("ffi: OOM")
-				}
-				*(*unsafe.Pointer)(buf) = exec
-				argBufs[i] = buf
-				cleanups = append(cleanups, func() { C.free(buf) })
-				continue
-			}
+			slot, cl := makeFuncptrArg(ip, mod, pt, val)
+			argBufs[i] = slot
+			cleanups = append(cleanups, cl)
+			continue
 		}
 		// By-value aggregates: require a handle to caller-allocated storage; copy bytes.
 		if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
@@ -1661,30 +1641,16 @@ func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) 
 				fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
 			}
 			src := expectPtr(val)
-			// allocate slot (at least 8 bytes like scalars)
-			sz := pt.Size
-			if sz < 8 {
-				sz = 8
-			}
-			buf := C.malloc(C.size_t(sz))
-			if buf == nil {
-				fail("ffi: OOM")
-			}
+			// allocate slot (ABI slot size)
+			buf := mustMalloc(abiSlotSize(pt))
 			// copy only the aggregate's size
 			cMemcpy(buf, src, pt.Size)
 			argBufs[i] = buf
 			cleanups = append(cleanups, func() { C.free(buf) })
 			continue
 		}
-		// allocate at least 8 bytes for scalar/pointer slot
-		sz := pt.Size
-		if sz < 8 {
-			sz = 8
-		}
-		buf := C.malloc(C.size_t(sz))
-		if buf == nil {
-			fail("ffi: OOM")
-		}
+		// allocate scalar/pointer slot (ABI slot size)
+		buf := mustMalloc(abiSlotSize(pt))
 		writeValue(mod.reg, pt, buf, val)
 		argBufs[i] = buf
 		cleanups = append(cleanups, func() { C.free(buf) })
@@ -1732,7 +1698,20 @@ func freeCachedCFFITypes(reg *ffiRegistry) {
 			// elements (if any) are owned by cffi and freed by helper
 			C.ms_free_ffi_type_and_elems(t.cffi)
 			t.cffi = nil
-			t.celems = nil
 		}
 	}
+}
+
+// freeModuleFFIResources releases callbacks and cached aggregate ffi types.
+func freeModuleFFIResources(mod *ffiModule) {
+	// free callback closures and handles
+	for _, cb := range mod.cbs {
+		if cb.closure != nil {
+			C.ms_closure_free(cb.closure)
+		}
+		cb.handle.Delete()
+	}
+	mod.cbs = nil
+	// free cached aggregate ffi_type allocations
+	freeCachedCFFITypes(mod.reg)
 }

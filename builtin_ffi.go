@@ -91,6 +91,7 @@ func getBytes(n int) ([]byte, func()) {
 		}
 		out := (*p)[:n]
 		for i := range out {
+			i := i
 			out[i] = 0
 		}
 		return out, func() { bytePool.Put(p) }
@@ -218,7 +219,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					h,
 				},
 			}
-			//runtime.LockOSThread()
+			runtime.LockOSThread()
 
 			// ------------- dlsym functions/variables ---------------------------
 			for _, f := range funDecls {
@@ -281,7 +282,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
 				S{"id", "Null"},
 				func(_ *Interpreter, _ CallCtx) Value {
-					//runtime.UnlockOSThread()
+					runtime.UnlockOSThread()
 					// close all opened libs once
 					if len(mod.openLibs) == 0 {
 						fail("ffi.close: handle already closed")
@@ -977,7 +978,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var argv []uintptr
 						var putArgv func()
 						if nFixed <= len(argvSmall) {
-							argv, putArgv = argvSmall[:nFixed], func() {}
+							argv, _ = argvSmall[:nFixed], func() {}
 							for i := range argv {
 								argv[i] = 0
 							}
@@ -989,7 +990,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var args []uint64
 						var putArgs func()
 						if nFixed <= len(argsSmall) {
-							args, putArgs = argsSmall[:nFixed], func() {}
+							args, _ = argsSmall[:nFixed], func() {}
 							for i := range args {
 								args[i] = 0
 							}
@@ -1000,7 +1001,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 						// buffers we must keep alive until after ffi_call (Go heap)
 						var keepBytes [][]byte
-						var cleanups []func() // for callback closures (returns free func)
+						var cleanups []func() // for callback closures and temp C strings
 
 						// ----- marshal fixed prefix -----
 						for i, key := range fn.Params {
@@ -1086,45 +1087,10 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 						// ----- non-variadic fast path -----
 						if !fn.Variadic {
-							// Build avalue (void**) in C memory using C-allocated scalar/aggregate slots.
 							var av unsafe.Pointer
-							var cslots []unsafe.Pointer
 							if nFixed > 0 {
-								av = allocPtrArray(nFixed)
-								defer cFree(av)
-								avec := ptrSlice(av, nFixed)
-								cslots = make([]unsafe.Pointer, nFixed)
-								for i, key := range fn.Params {
-									pt := mod.reg.mustGet(key)
-									slotSize := uintptr(8)
-									if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
-										slotSize = abiSlotSize(pt)
-									}
-									slot := cMalloc(slotSize)
-									cMemset(slot, 0, slotSize)
-									cslots[i] = slot
-									avec[i] = slot
-									switch pt.Kind {
-									case ffiStruct, ffiUnion, ffiArray:
-										src := expectPtr(ctx.Arg(fmt.Sprintf("p%d", i)))
-										if pt.Size > 0 {
-											cMemcpy(slot, src, pt.Size)
-										}
-									case ffiPointer, ffiHandle, ffiFuncPtr, ffiInt, ffiFloat, ffiEnum:
-										*(*uint64)(slot) = args[i]
-									default:
-										fail("unsupported scalar slot type")
-									}
-								}
-								defer func() {
-									for _, s := range cslots {
-										if s != nil {
-											cFree(s)
-										}
-									}
-								}()
+								av = unsafe.Pointer(&argv[0]) // Go-managed avalue (void**)
 							}
-
 							// Return buffer on stack if ≤8, otherwise pooled
 							rt := mod.reg.mustGet(fn.Ret)
 							slot := int(abiSlotSize(rt))
@@ -1155,7 +1121,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var vaArgs []uint64
 						var putVArgs func()
 						if nVA <= len(vaArgsSmall) {
-							vaArgs, putVArgs = vaArgsSmall[:nVA], func() {}
+							vaArgs, _ = vaArgsSmall[:nVA], func() {}
 							for i := range vaArgs {
 								vaArgs[i] = 0
 							}
@@ -1186,55 +1152,20 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							}
 						}
 
-						// Build avalue (void**) in C memory with C-allocated slots for all args.
+						// Grow argv to hold fixed + varargs and plug pointers to our Go slots.
 						total := nFixed + nVA
-						var av unsafe.Pointer
-						var cslots []unsafe.Pointer
-						if total > 0 {
-							av = allocPtrArray(total)
-							defer cFree(av)
-							avec := ptrSlice(av, total)
-							cslots = make([]unsafe.Pointer, total)
-
-							// fixed
-							for i, key := range fn.Params {
-								pt := mod.reg.mustGet(key)
-								slotSize := uintptr(8)
-								if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
-									slotSize = abiSlotSize(pt)
-								}
-								slot := cMalloc(slotSize)
-								cMemset(slot, 0, slotSize)
-								cslots[i] = slot
-								avec[i] = slot
-								switch pt.Kind {
-								case ffiStruct, ffiUnion, ffiArray:
-									src := expectPtr(ctx.Arg(fmt.Sprintf("p%d", i)))
-									if pt.Size > 0 {
-										cMemcpy(slot, src, pt.Size)
-									}
-								case ffiPointer, ffiHandle, ffiFuncPtr, ffiInt, ffiFloat, ffiEnum:
-									*(*uint64)(slot) = args[i]
-								default:
-									fail("unsupported scalar slot type")
-								}
-							}
-							// varargs
-							for j := 0; j < nVA; j++ {
-								idx := nFixed + j
-								slot := cMalloc(uintptr(8))
-								cMemset(slot, 0, uintptr(8))
-								cslots[idx] = slot
-								avec[idx] = slot
-								*(*uint64)(slot) = vaArgs[j]
-							}
-							defer func() {
-								for _, s := range cslots {
-									if s != nil {
-										cFree(s)
-									}
-								}
-							}()
+						if total > len(argv) {
+							// Need a larger argv; copy existing fixed entries
+							newArgv, put2 := getArgv(total)
+							defer put2()
+							copy(newArgv[:nFixed], argv[:nFixed])
+							argv = newArgv
+						} else {
+							argv = argv[:total]
+						}
+						// Point varargs entries at vaArgs slots
+						for j := 0; j < nVA; j++ {
+							argv[nFixed+j] = uintptr(unsafe.Pointer(&vaArgs[j]))
 						}
 
 						// Build combined ffi_type* array for ffi_prep_cif_var (C memory for the array only)
@@ -1258,6 +1189,12 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						defer cFree(unsafe.Pointer(cifVar))
 						if err := cFFIPrepCIFVarOpaque(cifVar, nFixed, total, rty, typeMem); err != nil {
 							fail(err.Error())
+						}
+
+						// avalue points to Go-managed argv (void**)
+						var av unsafe.Pointer
+						if total > 0 {
+							av = unsafe.Pointer(&argv[0])
 						}
 
 						// Return buffer

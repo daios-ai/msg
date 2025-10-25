@@ -253,11 +253,6 @@ func makePtrSlot(p unsafe.Pointer) unsafe.Pointer {
 	return buf
 }
 
-// allocRetBuf allocates a return buffer honoring the ABI slot size rule.
-func allocRetBuf(rt *ffiType) unsafe.Pointer {
-	return mustMalloc(abiSlotSize(rt))
-}
-
 // --- Opaque libffi type helpers (keep all C references in this file) ---
 
 // Return opaque pointers to common builtin ffi_type objects.
@@ -1600,65 +1595,6 @@ func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (sl
 		mod.cbs = append(mod.cbs, cbRecord{closure: cl, handle: h})
 		s := makePtrSlot(exec)
 		return s, func() { C.free(s) }
-	}
-}
-
-// tmpCString returns a newly allocated C string pointer and a cleanup function.
-func tmpCString(s string) (unsafe.Pointer, func()) {
-	cs := C.CString(s)
-	return unsafe.Pointer(cs), func() { C.free(unsafe.Pointer(cs)) }
-}
-
-func marshalArgs(ip *Interpreter, mod *ffiModule, fn *ffiFunction, ctx CallCtx) ([]unsafe.Pointer, cleanupFn) {
-	n := len(fn.Params)
-	argBufs := make([]unsafe.Pointer, n)
-	cleanups := []func(){}
-	for i, key := range fn.Params {
-		pt := mod.reg.mustGet(key)
-		val := ctx.Arg(fmt.Sprintf("p%d", i))
-		// Reject aggregate literals for any aggregate parameter (pointer or by-value).
-		if _, ok := isPtrToAggregate(mod.reg, pt); ok && (val.Tag == VTMap || val.Tag == VTArray) {
-			fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
-		}
-		// char*/uchar* bridge for strings
-		if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
-			cs, freeCS := tmpCString(val.Data.(string))
-			slot := makePtrSlot(cs)
-			argBufs[i] = slot
-			cleanups = append(cleanups, func() { C.free(slot); freeCS() })
-			continue
-		}
-		// funcptr: accept MindScript callable → build libffi closure; or accept pointer handle/null.
-		if pt.Kind == ffiFuncPtr {
-			slot, cl := makeFuncptrArg(ip, mod, pt, val)
-			argBufs[i] = slot
-			cleanups = append(cleanups, cl)
-			continue
-		}
-		// By-value aggregates: require a handle to caller-allocated storage; copy bytes.
-		if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
-			if val.Tag != VTHandle {
-				fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
-			}
-			src := expectPtr(val)
-			// allocate slot (ABI slot size)
-			buf := mustMalloc(abiSlotSize(pt))
-			// copy only the aggregate's size
-			cMemcpy(buf, src, pt.Size)
-			argBufs[i] = buf
-			cleanups = append(cleanups, func() { C.free(buf) })
-			continue
-		}
-		// allocate scalar/pointer slot (ABI slot size)
-		buf := mustMalloc(abiSlotSize(pt))
-		writeValue(mod.reg, pt, buf, val)
-		argBufs[i] = buf
-		cleanups = append(cleanups, func() { C.free(buf) })
-	}
-	return argBufs, func() {
-		for _, f := range cleanups {
-			f()
-		}
 	}
 }
 

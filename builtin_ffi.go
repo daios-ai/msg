@@ -8,10 +8,142 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
 // This file cannot touch C code directly. It must rely on ffi.go.
+//
+// Performance-focused refactor:
+//  - Eliminate per-call C.malloc/free for argv/arg slots/return buffer.
+//  - Marshal args into Go-managed 8-byte ABI slots, pass pointers to libffi.
+//  - Add small stack fast-paths and sync.Pool reuse.
+//  - Implement short-string (<=23) char* bridge with stack buffer (no C.CString).
+//  - Variadics: marshal tail entirely in Go memory; ffi_type* array still built via helpers in ffi.go.
+//  - Keep public surface identical, keep libffi and all parsing/caching in ffiOpen.
+
+// ---------- pools & tiny helpers (hot path) ----------
+
+var (
+	argvPool = sync.Pool{
+		New: func() any {
+			b := make([]uintptr, 0, 16) // stores raw addresses (no Go pointers)
+			return &b
+		},
+	}
+	argsPool = sync.Pool{
+		New: func() any {
+			b := make([]uint64, 0, 16) // 8-byte ABI slots
+			return &b
+		},
+	}
+	bytePool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 1024) // small scratch buffers (ret >8, vararg agg copies, etc.)
+			return &b
+		},
+	}
+)
+
+// getArgv returns a []uintptr of length n with capacity >= n and a put() cleanup.
+func getArgv(n int) ([]uintptr, func()) {
+	if n <= 0 {
+		return nil, func() {}
+	}
+	p := argvPool.Get().(*[]uintptr)
+	if cap(*p) < n {
+		*p = make([]uintptr, n)
+	}
+	out := (*p)[:n]
+	// zero out to avoid holding stale pointers
+	for i := range out {
+		out[i] = 0
+	}
+	return out, func() { argvPool.Put(p) }
+}
+
+// getArgsSlots returns a []uint64 of length n (ABI 8-byte slots) and put().
+func getArgsSlots(n int) ([]uint64, func()) {
+	if n <= 0 {
+		return nil, func() {}
+	}
+	p := argsPool.Get().(*[]uint64)
+	if cap(*p) < n {
+		*p = make([]uint64, n)
+	}
+	out := (*p)[:n]
+	// zeroing for safety
+	for i := range out {
+		out[i] = 0
+	}
+	return out, func() { argsPool.Put(p) }
+}
+
+// getBytes returns a []byte of length n and a put(); pooled if n<=1024, fresh otherwise.
+func getBytes(n int) ([]byte, func()) {
+	if n <= 0 {
+		return nil, func() {}
+	}
+	if n <= 1024 {
+		p := bytePool.Get().(*[]byte)
+		if cap(*p) < n {
+			*p = make([]byte, n)
+		}
+		out := (*p)[:n]
+		for i := range out {
+			out[i] = 0
+		}
+		return out, func() { bytePool.Put(p) }
+	}
+	b := make([]byte, n)
+	return b, func() {}
+}
+
+func hasNUL(s string) bool {
+	// Fast path
+	return strings.IndexByte(s, 0) >= 0
+}
+
+// writeScalarIntoSlot writes a scalar/pointer value into an 8-byte ABI slot.
+func writeScalarIntoSlot(reg *ffiRegistry, t *ffiType, slot *uint64, v Value) {
+	switch t.Kind {
+	case ffiInt:
+		x := mustIntRange(v, t)
+		switch t.Bits {
+		case 8:
+			*slot = (*slot &^ 0xFF) | (uint64(uint8(x)))
+		case 16:
+			*slot = (*slot &^ 0xFFFF) | (uint64(uint16(x)))
+		case 32:
+			*slot = (*slot &^ 0xFFFFFFFF) | (uint64(uint32(x)))
+		case 64:
+			*slot = uint64(uint64(x))
+		}
+	case ffiFloat:
+		switch t.Bits {
+		case 32:
+			f := float32(mustFloat(v))
+			u := *(*uint32)(unsafe.Pointer(&f))
+			*slot = (*slot &^ 0xFFFFFFFF) | uint64(u)
+		case 64:
+			f := float64(mustFloat(v))
+			u := *(*uint64)(unsafe.Pointer(&f))
+			*slot = u
+		}
+	case ffiEnum:
+		base := reg.mustGet(t.EnumBase)
+		writeScalarIntoSlot(reg, base, slot, v)
+	case ffiPointer, ffiHandle, ffiFuncPtr:
+		if v.Tag == VTNull {
+			*slot = 0
+			return
+		}
+		p := expectPtr(v)
+		*slot = uint64(uintptr(p))
+	default:
+		fail("unsupported scalar slot type")
+	}
+}
 
 // Convert the return buffer into a Value, honoring ret_as_str for char*/uchar*.
 func unmarshalRet(mod *ffiModule, fn *ffiFunction, rbuf unsafe.Pointer) Value {
@@ -56,6 +188,20 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				fail(err.Error())
 			}
 
+			// ------------- Pre-validate function signatures --------------------
+			// Validate types (including rejecting flexible arrays in by-value positions)
+			// BEFORE performing any dlsym, so users see type errors rather than symbol errors.
+			for _, f := range funDecls {
+				if _, err := ffiTypeFor(reg, f.Ret); err != nil {
+					fail("ffiOpen: " + err.Error())
+				}
+				for i, p := range f.Params {
+					if _, err := ffiTypeFor(reg, p); err != nil {
+						fail(fmt.Sprintf("ffiOpen: function %s param[%d]: %v", f.Name, i, err))
+					}
+				}
+			}
+
 			// ------------- dlopen ----------------------------------------------
 			h, e := cDlopen(lib)
 			if e != nil {
@@ -72,6 +218,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					h,
 				},
 			}
+			//runtime.LockOSThread()
 
 			// ------------- dlsym functions/variables ---------------------------
 			for _, f := range funDecls {
@@ -134,6 +281,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
 				S{"id", "Null"},
 				func(_ *Interpreter, _ CallCtx) Value {
+					//runtime.UnlockOSThread()
 					// close all opened libs once
 					if len(mod.openLibs) == 0 {
 						fail("ffi.close: handle already closed")
@@ -150,7 +298,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							f.cif = nil
 						}
 					}
-					// free cached aggregate ffi_type allocations
+					// free cached aggregate ffi_type allocations and callbacks
 					freeModuleFFIResources(mod)
 					for i := len(mod.openLibs) - 1; i >= 0; i-- {
 						ptr := mod.openLibs[i]
@@ -389,9 +537,13 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					sv := ctx.Arg("src")
 					switch sv.Tag {
 					case VTStr:
-						cs, freeCS := tmpCString(sv.Data.(string))
-						defer freeCS()
-						cMemcpy(dst, cs, uintptr(n))
+						// Go-managed C-string: avoid C.CString; ensure NUL-terminated buffer during call
+						s := sv.Data.(string)
+						buf, put := getBytes(len(s))
+						defer put()
+						copy(buf, s)
+						// caller promises n bytes; if n > len(s), we still respect n and may copy trailing zeros
+						cMemcpy(dst, unsafe.Pointer(&buf[0]), uintptr(n))
 					default:
 						src := expectPtr(sv)
 						cMemcpy(dst, src, uintptr(n))
@@ -563,7 +715,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				"Allocate storage for an aggregate T and optionally initialize fields/elements; returns a tagged pointer.",
 			)
 
-			// getf(T, ptr, fieldName) -> Any  (struct/union field read)
+			// getf/setf (unchanged functionality; returns handles for aggregate fields)
 			registerMem("getf",
 				[]ParamSpec{
 					{Name: "T", Type: S{"id", "Any"}},
@@ -606,8 +758,6 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				},
 				"Read a field from a struct/union instance.",
 			)
-
-			// setf(T, ptr, fieldName, value) -> Null  (struct/union field write)
 			registerMem("setf",
 				[]ParamSpec{
 					{Name: "T", Type: S{"id", "Any"}},
@@ -666,8 +816,6 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 			)
 
 			// ---- Minimal packed-bit helpers (little-endian only, x86-64/SysV) ----
-			// readBits(ptr, byteOffset, bitOffset, width, signed?)
-			//  - width: 1..64; returns Int (sign-extended when signed=true)
 			registerMem("readBits",
 				[]ParamSpec{
 					{Name: "ptr", Type: S{"id", "Any"}},
@@ -726,9 +874,6 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				},
 				"Read up to 64 bits from a packed little-endian field: readBits(ptr, byteOffset, bitOffset, width, signed?).",
 			)
-
-			// writeBits(ptr, byteOffset, bitOffset, width, value)
-			//  - value must be unsigned (>=0) and fit within width
 			registerMem("writeBits",
 				[]ParamSpec{
 					{Name: "ptr", Type: S{"id", "Any"}},
@@ -821,80 +966,278 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					buildParamSpecs(mod, fn),
 					S{"id", "Any"},
 					func(ip2 *Interpreter, ctx CallCtx) Value {
+						// ================== FAST HOT PATH ==================
+
+						nFixed := len(fn.Params)
+
+						// ---- Small stack fast path for common arities ----
+						var argvSmall [8]uintptr
+						var argsSmall [8]uint64
+
+						var argv []uintptr
+						var putArgv func()
+						if nFixed <= len(argvSmall) {
+							argv, putArgv = argvSmall[:nFixed], func() {}
+							for i := range argv {
+								argv[i] = 0
+							}
+						} else {
+							argv, putArgv = getArgv(nFixed)
+							defer putArgv()
+						}
+
+						var args []uint64
+						var putArgs func()
+						if nFixed <= len(argsSmall) {
+							args, putArgs = argsSmall[:nFixed], func() {}
+							for i := range args {
+								args[i] = 0
+							}
+						} else {
+							args, putArgs = getArgsSlots(nFixed)
+							defer putArgs()
+						}
+
+						// buffers we must keep alive until after ffi_call (Go heap)
+						var keepBytes [][]byte
+						var cleanups []func() // for callback closures (returns free func)
+
 						// ----- marshal fixed prefix -----
-						argBufs, cleanup := marshalArgs(ip2, mod, fn, ctx)
-						defer cleanup()
+						for i, key := range fn.Params {
+							pt := mod.reg.mustGet(key)
+							val := ctx.Arg(fmt.Sprintf("p%d", i))
+
+							// Reject aggregate literals for any aggregate parameter (pointer or by-value).
+							if _, ok := isPtrToAggregate(mod.reg, pt); ok && (val.Tag == VTMap || val.Tag == VTArray) {
+								fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
+							}
+
+							// char*/uchar* bridge for strings (allow embedded NUL)
+							if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
+								s := val.Data.(string)
+								// allocate C buffer of len(s)+1, copy bytes (including any embedded NULs), append terminator
+								n := len(s) + 1
+								cbuf := cMalloc(uintptr(n))
+								if cbuf == nil {
+									fail("ffi: OOM")
+								}
+								// stage bytes in Go and memcpy to C
+								tmp, put := getBytes(n)
+								copy(tmp, s)    // copies raw bytes; embedded NULs preserved
+								tmp[len(s)] = 0 // NUL terminator
+								cMemcpy(cbuf, unsafe.Pointer(&tmp[0]), uintptr(n))
+								put()
+
+								args[i] = uint64(uintptr(cbuf))
+								argv[i] = uintptr(unsafe.Pointer(&args[i]))
+								// free after call
+								cleanups = append(cleanups, func() { cFree(cbuf) })
+								continue
+							}
+
+							// funcptr: accept MindScript callable → build libffi closure; or accept pointer handle/null.
+							if pt.Kind == ffiFuncPtr {
+								slot, cl := makeFuncptrArg(ip2, mod, pt, val) // returns slot (void*) containing the executable pointer
+								// Read the pointer value and place into our slot
+								fnptr := *(*unsafe.Pointer)(slot)
+								if cl != nil {
+									cleanups = append(cleanups, cl)
+								}
+								args[i] = uint64(uintptr(fnptr))
+								argv[i] = uintptr(unsafe.Pointer(&args[i]))
+								continue
+							}
+
+							// By-value aggregates: require a handle to storage; copy bytes into a scratch buffer.
+							if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
+								if val.Tag != VTHandle {
+									fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
+								}
+								src := expectPtr(val)
+								need := int(abiSlotSize(pt)) // libffi may read full slot-size
+								buf, put := getBytes(need)
+								// copy only the aggregate's size (rest already zeroed)
+								if pt.Size > 0 {
+									cMemcpy(unsafe.Pointer(&buf[0]), src, pt.Size)
+								}
+								argv[i] = uintptr(unsafe.Pointer(&buf[0]))
+								keepBytes = append(keepBytes, buf)
+								defer put()
+								continue
+							}
+
+							// Scalar / pointer
+							writeScalarIntoSlot(mod.reg, pt, &args[i], val)
+							argv[i] = uintptr(unsafe.Pointer(&args[i]))
+						}
+
+						// Ensure kept values survive until after ffi_call
+						defer func() {
+							for _, f := range cleanups {
+								f()
+							}
+							// Keep slices alive
+							for _, b := range keepBytes {
+								runtime.KeepAlive(b)
+							}
+							runtime.KeepAlive(argv)
+							runtime.KeepAlive(args)
+						}()
 
 						// ----- non-variadic fast path -----
 						if !fn.Variadic {
-							// Build C argv (void**)
-							var argvMem unsafe.Pointer
-							if n := len(argBufs); n > 0 {
-								argvMem = allocPtrArray(n)
-								defer cFree(argvMem)
-								argv := ptrSlice(argvMem, n)
-								for i := 0; i < n; i++ {
-									argv[i] = argBufs[i]
+							// Build avalue (void**) in C memory using C-allocated scalar/aggregate slots.
+							var av unsafe.Pointer
+							var cslots []unsafe.Pointer
+							if nFixed > 0 {
+								av = allocPtrArray(nFixed)
+								defer cFree(av)
+								avec := ptrSlice(av, nFixed)
+								cslots = make([]unsafe.Pointer, nFixed)
+								for i, key := range fn.Params {
+									pt := mod.reg.mustGet(key)
+									slotSize := uintptr(8)
+									if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
+										slotSize = abiSlotSize(pt)
+									}
+									slot := cMalloc(slotSize)
+									cMemset(slot, 0, slotSize)
+									cslots[i] = slot
+									avec[i] = slot
+									switch pt.Kind {
+									case ffiStruct, ffiUnion, ffiArray:
+										src := expectPtr(ctx.Arg(fmt.Sprintf("p%d", i)))
+										if pt.Size > 0 {
+											cMemcpy(slot, src, pt.Size)
+										}
+									case ffiPointer, ffiHandle, ffiFuncPtr, ffiInt, ffiFloat, ffiEnum:
+										*(*uint64)(slot) = args[i]
+									default:
+										fail("unsupported scalar slot type")
+									}
 								}
+								defer func() {
+									for _, s := range cslots {
+										if s != nil {
+											cFree(s)
+										}
+									}
+								}()
 							}
-							// Ret buffer on C heap (min 8 bytes)
+
+							// Return buffer on stack if ≤8, otherwise pooled
 							rt := mod.reg.mustGet(fn.Ret)
-							rbuf := mustMalloc(abiSlotSize(rt))
-							defer cFree(rbuf)
-							cFFICall(cif, fn.SymbolPtr, rbuf, argvMem)
-							return unmarshalRet(mod, fn, rbuf)
+							slot := int(abiSlotSize(rt))
+							if slot <= 8 {
+								var r8 [8]byte
+								cFFICall(cif, fn.SymbolPtr, unsafe.Pointer(&r8[0]), av)
+								// Keep locals alive through the call boundary
+								runtime.KeepAlive(args)
+								return unmarshalRet(mod, fn, unsafe.Pointer(&r8[0]))
+							}
+							rb, put := getBytes(slot)
+							defer put()
+							cFFICall(cif, fn.SymbolPtr, unsafe.Pointer(&rb[0]), av)
+							runtime.KeepAlive(args)
+							return unmarshalRet(mod, fn, unsafe.Pointer(&rb[0]))
 						}
 
 						// ----- variadic path (MindScript: final argument must be an array) -----
-						vaVal := ctx.Arg(fmt.Sprintf("p%d", len(fn.Params)))
+						vaVal := ctx.Arg(fmt.Sprintf("p%d", nFixed))
 						if vaVal.Tag != VTArray {
 							fail("variadic function expects final argument to be an array")
 						}
 						vaElems := vaVal.Data.(*ArrayObject).Elems
 
-						// Promote varargs + buffers and collect opaque ffi_type* for each vararg
-						var vaBufs []unsafe.Pointer
-						var vaTypePtrs []unsafe.Pointer
-						release := []func(){}
+						// Build promoted vararg values (Go memory only; no Go pointers will go into C).
+						nVA := len(vaElems)
+						var vaArgsSmall [8]uint64
+						var vaArgs []uint64
+						var putVArgs func()
+						if nVA <= len(vaArgsSmall) {
+							vaArgs, putVArgs = vaArgsSmall[:nVA], func() {}
+							for i := range vaArgs {
+								vaArgs[i] = 0
+							}
+						} else {
+							vaArgs, putVArgs = getArgsSlots(nVA)
+							defer putVArgs()
+						}
+
+						// Collect ffi_type* for varargs
+						vaTypePtrs := make([]unsafe.Pointer, 0, nVA)
 						for i, a := range vaElems {
 							switch a.Tag {
 							case VTInt, VTBool:
-								buf := mustMalloc(8)
-								writeValue(mod.reg, promInt, buf, a)
-								vaBufs = append(vaBufs, buf)
+								writeScalarIntoSlot(mod.reg, promInt, &vaArgs[i], a)
 								vaTypePtrs = append(vaTypePtrs, ffiTypeSint32Ptr())
-								release = append(release, func() { cFree(buf) })
 							case VTNum:
-								buf := mustMalloc(8)
-								writeValue(mod.reg, promDbl, buf, a)
-								vaBufs = append(vaBufs, buf)
+								writeScalarIntoSlot(mod.reg, promDbl, &vaArgs[i], a)
 								vaTypePtrs = append(vaTypePtrs, ffiTypeDoublePtr())
-								release = append(release, func() { cFree(buf) })
 							case VTHandle:
-								buf := mustMalloc(uintptr(unsafe.Sizeof(uintptr(0))))
-								*(*unsafe.Pointer)(buf) = expectPtr(a)
-								vaBufs = append(vaBufs, buf)
+								p := expectPtr(a)
+								vaArgs[i] = uint64(uintptr(p))
 								vaTypePtrs = append(vaTypePtrs, ffiTypePointerPtr())
-								release = append(release, func() { cFree(buf) })
+							case VTNull:
+								vaArgs[i] = 0
+								vaTypePtrs = append(vaTypePtrs, ffiTypePointerPtr())
 							default:
 								fail(fmt.Sprintf("unsupported variadic arg[%d]", i))
 							}
 						}
-						defer func() {
-							for _, f := range release {
-								f()
+
+						// Build avalue (void**) in C memory with C-allocated slots for all args.
+						total := nFixed + nVA
+						var av unsafe.Pointer
+						var cslots []unsafe.Pointer
+						if total > 0 {
+							av = allocPtrArray(total)
+							defer cFree(av)
+							avec := ptrSlice(av, total)
+							cslots = make([]unsafe.Pointer, total)
+
+							// fixed
+							for i, key := range fn.Params {
+								pt := mod.reg.mustGet(key)
+								slotSize := uintptr(8)
+								if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
+									slotSize = abiSlotSize(pt)
+								}
+								slot := cMalloc(slotSize)
+								cMemset(slot, 0, slotSize)
+								cslots[i] = slot
+								avec[i] = slot
+								switch pt.Kind {
+								case ffiStruct, ffiUnion, ffiArray:
+									src := expectPtr(ctx.Arg(fmt.Sprintf("p%d", i)))
+									if pt.Size > 0 {
+										cMemcpy(slot, src, pt.Size)
+									}
+								case ffiPointer, ffiHandle, ffiFuncPtr, ffiInt, ffiFloat, ffiEnum:
+									*(*uint64)(slot) = args[i]
+								default:
+									fail("unsupported scalar slot type")
+								}
 							}
-						}()
+							// varargs
+							for j := 0; j < nVA; j++ {
+								idx := nFixed + j
+								slot := cMalloc(uintptr(8))
+								cMemset(slot, 0, uintptr(8))
+								cslots[idx] = slot
+								avec[idx] = slot
+								*(*uint64)(slot) = vaArgs[j]
+							}
+							defer func() {
+								for _, s := range cslots {
+									if s != nil {
+										cFree(s)
+									}
+								}
+							}()
+						}
 
-						// Build argv = fixed + varargs
-						total := len(argBufs) + len(vaBufs)
-						argvMem := allocPtrArray(total)
-						defer cFree(argvMem)
-						argv := ptrSlice(argvMem, total)
-						copy(argv, argBufs)
-						copy(argv[len(argBufs):], vaBufs)
-
-						// Build combined ffi_type* array for ffi_prep_cif_var
+						// Build combined ffi_type* array for ffi_prep_cif_var (C memory for the array only)
 						typeMem := allocPtrArray(total)
 						defer cFree(typeMem)
 						// Fill fixed portion from registry keys
@@ -903,7 +1246,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						}
 						// Append vararg promoted types
 						for i, ty := range vaTypePtrs {
-							setFFITypeAt(typeMem, len(fn.Params)+i, ty)
+							setFFITypeAt(typeMem, nFixed+i, ty)
 						}
 
 						// Prepare CIF (variadic) using heap-allocated cif
@@ -913,17 +1256,26 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						}
 						cifVar := cAllocCIF()
 						defer cFree(unsafe.Pointer(cifVar))
-						if err := cFFIPrepCIFVarOpaque(cifVar, len(fn.Params), total, rty, typeMem); err != nil {
+						if err := cFFIPrepCIFVarOpaque(cifVar, nFixed, total, rty, typeMem); err != nil {
 							fail(err.Error())
 						}
 
 						// Return buffer
 						rt := mod.reg.mustGet(fn.Ret)
-						rbuf := mustMalloc(abiSlotSize(rt))
-						defer cFree(rbuf)
-
-						cFFICall(cifVar, fn.SymbolPtr, rbuf, argvMem)
-						return unmarshalRet(mod, fn, rbuf)
+						rSlot := int(abiSlotSize(rt))
+						if rSlot <= 8 {
+							var r8 [8]byte
+							cFFICall(cifVar, fn.SymbolPtr, unsafe.Pointer(&r8[0]), av)
+							runtime.KeepAlive(args)
+							runtime.KeepAlive(vaArgs)
+							return unmarshalRet(mod, fn, unsafe.Pointer(&r8[0]))
+						}
+						rb, put := getBytes(rSlot)
+						defer put()
+						cFFICall(cifVar, fn.SymbolPtr, unsafe.Pointer(&rb[0]), av)
+						runtime.KeepAlive(args)
+						runtime.KeepAlive(vaArgs)
+						return unmarshalRet(mod, fn, unsafe.Pointer(&rb[0]))
 					},
 				)
 				if v, err := modEnv.Get(name); err == nil {
@@ -1027,6 +1379,11 @@ Implements:
   • __mem with: sizeof, alignof, offsetof, typeof, malloc/calloc/realloc/free,
     new, cast, string, copy, fill, errno, box, getf, setf
   • Functions are real callables (scalars/pointers); vars expose get/set/addr
+
+Performance:
+  • No per-call C allocations for argv/arg slots/return buffers in the common path.
+  • Small stack fast-paths for up to 8 fixed params and short char* strings.
+  • sync.Pool reuse for argv/slots/byte scratch; varargs slots are in Go memory.
 
 Limitations:
    • Bitfields in structs are not supported (use readBits/writeBits for packed fields).

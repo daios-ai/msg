@@ -1805,3 +1805,205 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		})
 	}
 }
+
+func Test_FFI_Spec_Bitfields_Rejected(t *testing.T) {
+	ip, _ := NewInterpreter()
+	_, err := ip.EvalSource(`
+		ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    S:{ kind:"struct", fields:[
+		      { name:"mode",  type:{kind:"int",bits:32,signed:false}, bits:3 },
+		      { name:"ready", type:{kind:"int",bits:32,signed:false} }
+		    ]}
+		  }
+		})
+	`)
+	if err == nil || !strings.Contains(err.Error(), "bitfields") {
+		t.Fatalf("expected bitfields to be rejected, got err=%v", err)
+	}
+}
+
+func Test_FFI_Spec_FlexArray_Param_ByValue_Rejected(t *testing.T) {
+	ip, _ := NewInterpreter()
+	_, err := ip.EvalSource(`
+		ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    U8:{kind:"int",bits:8,signed:false},
+		    Flex:{kind:"array",of:"U8"}   # no len -> flexible
+		  },
+		  functions:[
+		    { name:"f", ret:{kind:"void"}, params:["Flex"] }   # by-value param must be rejected
+		  ]
+		})
+	`)
+	if err == nil || !strings.Contains(err.Error(), "flexible array") {
+		t.Fatalf("expected flexible array by-value param to be rejected, got err=%v", err)
+	}
+}
+
+func Test_FFI_Spec_FlexArray_Return_ByValue_Rejected(t *testing.T) {
+	ip, _ := NewInterpreter()
+	_, err := ip.EvalSource(`
+		ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    U8:{kind:"int",bits:8,signed:false},
+		    Flex:{kind:"array",of:"U8"}   # flexible
+		  },
+		  functions:[
+		    { name:"f", ret:"Flex", params:[] }   # by-value return must be rejected
+		  ]
+		})
+	`)
+	if err == nil || !strings.Contains(err.Error(), "flexible array") {
+		t.Fatalf("expected flexible array by-value return to be rejected, got err=%v", err)
+	}
+}
+
+func Test_FFI_Spec_FlexArray_Pointer_And_New_WithCount(t *testing.T) {
+	ip, _ := NewInterpreter()
+	// Allocate 4 bytes for flexible array of uint8 and check we can write/read them.
+	v, err := ip.EvalSource(`
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{ U8:{kind:"int",bits:8,signed:false} }
+		})
+		do
+		  let p = C.__mem.new({kind:"array",of:"U8"}, 4)  # count required for flex array
+		  C.__mem.copy(p, "\u0001\u0002\u0003\u0004", 4)
+		  let b0 = C.__mem.readBits(p, 0, 0, 8, null)
+		  let b1 = C.__mem.readBits(p, 1, 0, 8, null)
+		  let b2 = C.__mem.readBits(p, 2, 0, 8, null)
+		  let b3 = C.__mem.readBits(p, 3, 0, 8, null)
+		  { b0:b0, b1:b1, b2:b2, b3:b3 }
+		end
+	`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := v.Data.(*MapObject)
+	if !ok {
+		t.Fatalf("expected map result, got %#v", v)
+	}
+	if m.Entries["b0"].Data.(int64) != 1 || m.Entries["b1"].Data.(int64) != 2 ||
+		m.Entries["b2"].Data.(int64) != 3 || m.Entries["b3"].Data.(int64) != 4 {
+		t.Fatalf("flex array bytes mismatch: %#v", v)
+	}
+}
+
+func Test_FFI_Spec_ReadBits_WriteBits_ErrorBounds(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	// width > 64
+	_, err := ip.EvalSource(`
+		let C = ffiOpen({version:"1", lib:"libc.so.6"})
+		let p = C.__mem.malloc(2)
+		C.__mem.readBits(p, 0, 0, 65, null)
+	`)
+	if err == nil || !strings.Contains(err.Error(), "width") {
+		t.Fatalf("expected width>64 error, got %v", err)
+	}
+
+	// negative offsets
+	_, err = ip.EvalSource(`
+		let C = ffiOpen({version:"1", lib:"libc.so.6"})
+		let p = C.__mem.malloc(1)
+		C.__mem.writeBits(p, -1, 0, 8, 1)
+	`)
+	if err == nil || !strings.Contains(err.Error(), "offsets must be") {
+		t.Fatalf("expected negative offset error, got %v", err)
+	}
+
+	// write value that does not fit width
+	_, err = ip.EvalSource(`
+		let C = ffiOpen({version:"1", lib:"libc.so.6"})
+		let p = C.__mem.malloc(1)
+		C.__mem.writeBits(p, 0, 0, 3, 8)   # 8 does not fit in 3 bits
+	`)
+	if err == nil || !strings.Contains(err.Error(), "does not fit width") {
+		t.Fatalf("expected value-width error, got %v", err)
+	}
+}
+
+func Test_FFI_Spec_ret_as_str_NULL_ReturnsNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v, err := ip.EvalSource(`
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{ charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}} },
+		  functions:[ { name:"getenv", ret:"charp", params:["charp"], ret_as_str:true } ]
+		})
+		C.getenv("__NO_SUCH_ENV_VAR__")
+	`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v.Tag != VTNull {
+		t.Fatalf("expected null for getenv of missing variable, got %#v", v)
+	}
+}
+
+func Test_FFI_Spec___mem_string_FixedLen_IncludesEmbeddedNUL(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v, err := ip.EvalSource(`
+		let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+		do
+		  let p = C.__mem.malloc(3)
+		  C.__mem.copy(p, "a\u0000b", 3)
+		  C.__mem.string(p, 3)
+		end
+	`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v.Tag != VTStr {
+		t.Fatalf("expected Str, got %#v", v)
+	}
+	s := v.Data.(string)
+	if len(s) != 3 || s[0] != 'a' || s[1] != 0 || s[2] != 'b' {
+		t.Fatalf("fixed-len string should include embedded NUL, got %q (len=%d)", s, len(s))
+	}
+}
+
+func Test_FFI_Spec_Variadic_Promotions_Bool_Int_Double(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v, err := ip.EvalSource(`
+		let C = ffiOpen({
+		  version:"1", lib:"libc.so.6",
+		  types:{
+		    size_t:{kind:"int",bits:64,signed:false},
+		    charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},
+		    i32:{kind:"int",bits:32,signed:true},
+		    dbl:{kind:"float",bits:64}
+		  },
+		  functions:[
+		    { name:"snprintf", ret:"i32", params:["charp","size_t","charp"], variadic:true }
+		  ]
+		})
+		do
+		  let buf = C.__mem.malloc(64)
+		  # bool -> promoted to int, dbl remains double
+		  let n = C.snprintf(buf, 64, "%d %.1f", [true, 2.0])
+		  { n:n, s:C.__mem.string(buf, null) }
+		end
+	`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := v.Data.(*MapObject)
+	if !ok {
+		t.Fatalf("expected map result, got %#v", v)
+	}
+	if m.Entries["n"].Tag != VTInt || m.Entries["n"].Data.(int64) <= 0 {
+		t.Fatalf("snprintf should return >0, got %#v", m.Entries["n"])
+	}
+	out := m.Entries["s"]
+	if out.Tag != VTStr {
+		t.Fatalf("expected Str, got %#v", out)
+	}
+	if out.Data.(string) != "1 2.0" {
+		t.Fatalf("promotion/format mismatch: got %q", out.Data.(string))
+	}
+}

@@ -227,9 +227,6 @@ func cErrnoSet(v int) { *C.ms_errno_loc() = C.int(v) }
 func allocPtrArray(n int) unsafe.Pointer {
 	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
 }
-func ptrSlice(mem unsafe.Pointer, n int) []unsafe.Pointer {
-	return (*[1<<30 - 1]unsafe.Pointer)(mem)[:n:n]
-}
 func asFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
 	return (*[1<<30 - 1]*C.ffi_type)(mem)[:n:n]
 }
@@ -1769,11 +1766,6 @@ func getBytes(n int) ([]byte, func()) {
 	}
 	b := make([]byte, n)
 	return b, func() {}
-}
-
-func hasNUL(s string) bool {
-	// Fast path
-	return strings.IndexByte(s, 0) >= 0
 }
 
 // writeScalarIntoSlot writes a scalar/pointer value into an 8-byte ABI slot.

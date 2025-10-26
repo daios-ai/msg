@@ -226,9 +226,6 @@ func cErrnoSet(v int) { *C.ms_errno_loc() = C.int(v) }
 func allocPtrArray(n int) unsafe.Pointer {
 	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
 }
-func ptrSlice(mem unsafe.Pointer, n int) []unsafe.Pointer {
-	return (*[1<<30 - 1]unsafe.Pointer)(mem)[:n:n]
-}
 func asFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
 	return (*[1<<30 - 1]*C.ffi_type)(mem)[:n:n]
 }

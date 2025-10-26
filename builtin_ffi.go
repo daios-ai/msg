@@ -127,11 +127,6 @@ func getBytes(n int) ([]byte, func()) {
 	return b, func() {}
 }
 
-func hasNUL(s string) bool {
-	// Fast path
-	return strings.IndexByte(s, 0) >= 0
-}
-
 // writeScalarIntoSlot writes a scalar/pointer value into an 8-byte ABI slot.
 func writeScalarIntoSlot(reg *ffiRegistry, t *ffiType, slot *uint64, v Value) {
 	switch t.Kind {

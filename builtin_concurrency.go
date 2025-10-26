@@ -194,8 +194,6 @@ func registerConcurrencyBuiltins(ip *Interpreter, target *Env) {
 				defer func() {
 					if r := recover(); r != nil {
 						switch sig := r.(type) {
-						case returnSig:
-							pr.result = sig.v
 						case rtErr:
 							pr.result = errNull(sig.msg)
 						case error:

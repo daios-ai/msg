@@ -33,7 +33,6 @@ import (
 //                         PRIVATE PANIC / ERROR HELPERS
 ////////////////////////////////////////////////////////////////////////////////
 
-type returnSig struct{ v Value }
 type rtErr struct {
 	msg  string
 	src  *SourceRef

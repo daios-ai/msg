@@ -225,6 +225,8 @@ func (v Value) String() string {
 		return "<type>"
 	case VTModule:
 		return "<module>"
+	case VTHandle:
+		return "<handle>"
 	default:
 		return "<unknown>"
 	}
@@ -794,7 +796,6 @@ func (ip *Interpreter) Clone() *Interpreter {
 	}
 
 	// Fresh loader/source tracking
-	cl.modules = map[string]*moduleRec{}
 	cl.loadStack = nil
 	cl.currentSrc = nil
 

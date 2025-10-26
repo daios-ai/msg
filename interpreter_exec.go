@@ -121,8 +121,6 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 	defer func() {
 		if r := recover(); r != nil {
 			switch sig := r.(type) {
-			case returnSig:
-				out, err = sig.v, nil
 			case *Error:
 				if uncaught {
 					out, err = annotNull(sig.Msg), nil

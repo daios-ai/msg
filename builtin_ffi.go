@@ -12,15 +12,43 @@ import (
 	"unsafe"
 )
 
-// This file cannot touch C code directly. It must rely on ffi.go.
-//
-// Performance-focused refactor:
-//  - Eliminate per-call C.malloc/free for argv/arg slots/return buffer.
-//  - Marshal args into Go-managed 8-byte ABI slots, pass pointers to libffi.
-//  - Add small stack fast-paths and sync.Pool reuse.
-//  - Implement short-string (<=23) char* bridge with stack buffer (no C.CString).
-//  - Variadics: marshal tail entirely in Go memory; ffi_type* array still built via helpers in ffi.go.
-//  - Keep public surface identical, keep libffi and all parsing/caching in ffiOpen.
+// callFFI centralizes return-buffer sizing, ffi_call, and result unmarshalling.
+// keep... are values/slices that must remain alive across the ccall boundary.
+func callFFI(mod *ffiModule, fn *ffiFunction, cf cif, av unsafe.Pointer, keep ...interface{}) Value {
+	rt := mod.reg.mustGet(fn.Ret)
+	slot := int(abiSlotSize(rt))
+	if slot <= 8 {
+		var r8 [8]byte
+		cFFICall(cf, fn.SymbolPtr, unsafe.Pointer(&r8[0]), av)
+		for _, k := range keep {
+			runtime.KeepAlive(k)
+		}
+		return unmarshalRet(mod, fn, unsafe.Pointer(&r8[0]))
+	}
+	rb, put := getBytes(slot)
+	defer put()
+	cFFICall(cf, fn.SymbolPtr, unsafe.Pointer(&rb[0]), av)
+	for _, k := range keep {
+		runtime.KeepAlive(k)
+	}
+	return unmarshalRet(mod, fn, unsafe.Pointer(&rb[0]))
+}
+
+// tempCStringFromStr builds a temporary NUL-terminated copy of s on the C heap.
+// NOTE: Use ONLY for C APIs that require char*/unsigned char* parameters.
+func tempCStringFromStr(s string) (unsafe.Pointer, func()) {
+	n := len(s) + 1
+	p := cMalloc(uintptr(n))
+	if p == nil {
+		fail("ffi: OOM")
+	}
+	buf, put := getBytes(n)
+	copy(buf, s)
+	buf[len(s)] = 0
+	cMemcpy(p, unsafe.Pointer(&buf[0]), uintptr(n))
+	put()
+	return p, func() { cFree(p) }
+}
 
 // ---------- pools & tiny helpers (hot path) ----------
 
@@ -91,7 +119,6 @@ func getBytes(n int) ([]byte, func()) {
 		}
 		out := (*p)[:n]
 		for i := range out {
-			i := i
 			out[i] = 0
 		}
 		return out, func() { bytePool.Put(p) }
@@ -219,7 +246,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 					h,
 				},
 			}
-			runtime.LockOSThread()
+			//runtime.LockOSThread()
 
 			// ------------- dlsym functions/variables ---------------------------
 			for _, f := range funDecls {
@@ -282,7 +309,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
 				S{"id", "Null"},
 				func(_ *Interpreter, _ CallCtx) Value {
-					runtime.UnlockOSThread()
+					//runtime.UnlockOSThread()
 					// close all opened libs once
 					if len(mod.openLibs) == 0 {
 						fail("ffi.close: handle already closed")
@@ -759,6 +786,17 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				},
 				"Read a field from a struct/union instance.",
 			)
+
+			// copyAggregateFromHandle performs a byte copy from a handle's storage into dst.
+			// The caller supplies the error text to preserve exact messages.
+			copyAggregateFromHandle := func(t *ffiType, dst unsafe.Pointer, v Value, errText string) {
+				if v.Tag != VTHandle {
+					fail(errText)
+				}
+				src := expectPtr(v)
+				cMemcpy(dst, src, t.Size)
+			}
+
 			registerMem("setf",
 				[]ParamSpec{
 					{Name: "T", Type: S{"id", "Any"}},
@@ -779,11 +817,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 								ft := reg.mustGet(f.Type)
 								dst := unsafe.Pointer(uintptr(p) + t.Offsets[i])
 								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
-									if val.Tag != VTHandle {
-										fail("setf: aggregate field requires handle to compatible storage")
-									}
-									src := expectPtr(val)
-									cMemcpy(dst, src, ft.Size)
+									copyAggregateFromHandle(ft, dst, val, "setf: aggregate field requires handle to compatible storage")
 									return Null
 								}
 								writeValue(reg, ft, dst, val)
@@ -796,11 +830,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							if f.Name == name {
 								ft := reg.mustGet(f.Type)
 								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
-									if val.Tag != VTHandle {
-										fail("setf: aggregate field requires handle to compatible storage")
-									}
-									src := expectPtr(val)
-									cMemcpy(p, src, ft.Size)
+									copyAggregateFromHandle(ft, p, val, "setf: aggregate field requires handle to compatible storage")
 									return Null
 								}
 								writeValue(reg, ft, p, val) // unions start at offset 0
@@ -952,11 +982,11 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 				fn.cif = cf
 				fn.typesVec = tp
 				cif := fn.cif
-
-				// Validate ret_as_str early: must be char*/uchar*
+				// Keep the extra validation to preserve historical error text locality.
 				if fn.RetAsStr {
 					rt := mod.reg.mustGet(fn.Ret)
 					if !((rt.Kind == ffiPointer || rt.Kind == ffiHandle) && isCharPtr(mod.reg, rt)) {
+						// exact string preserved (do not change)
 						fail("ffi: " + fn.Name + ": ret_as_str valid only for char*/unsigned char*")
 					}
 				}
@@ -978,7 +1008,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var argv []uintptr
 						var putArgv func()
 						if nFixed <= len(argvSmall) {
-							argv, _ = argvSmall[:nFixed], func() {}
+							argv, putArgv = argvSmall[:nFixed], func() {}
 							for i := range argv {
 								argv[i] = 0
 							}
@@ -990,7 +1020,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var args []uint64
 						var putArgs func()
 						if nFixed <= len(argsSmall) {
-							args, _ = argsSmall[:nFixed], func() {}
+							args, putArgs = argsSmall[:nFixed], func() {}
 							for i := range args {
 								args[i] = 0
 							}
@@ -1015,32 +1045,16 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 
 							// char*/uchar* bridge for strings (allow embedded NUL)
 							if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
-								s := val.Data.(string)
-								// allocate C buffer of len(s)+1, copy bytes (including any embedded NULs), append terminator
-								n := len(s) + 1
-								cbuf := cMalloc(uintptr(n))
-								if cbuf == nil {
-									fail("ffi: OOM")
-								}
-								// stage bytes in Go and memcpy to C
-								tmp, put := getBytes(n)
-								copy(tmp, s)    // copies raw bytes; embedded NULs preserved
-								tmp[len(s)] = 0 // NUL terminator
-								cMemcpy(cbuf, unsafe.Pointer(&tmp[0]), uintptr(n))
-								put()
-
+								cbuf, free := tempCStringFromStr(val.Data.(string))
 								args[i] = uint64(uintptr(cbuf))
 								argv[i] = uintptr(unsafe.Pointer(&args[i]))
-								// free after call
-								cleanups = append(cleanups, func() { cFree(cbuf) })
+								cleanups = append(cleanups, free)
 								continue
 							}
 
 							// funcptr: accept MindScript callable → build libffi closure; or accept pointer handle/null.
 							if pt.Kind == ffiFuncPtr {
-								slot, cl := makeFuncptrArg(ip2, mod, pt, val) // returns slot (void*) containing the executable pointer
-								// Read the pointer value and place into our slot
-								fnptr := *(*unsafe.Pointer)(slot)
+								fnptr, cl := makeFuncptrArg(ip2, mod, pt, val)
 								if cl != nil {
 									cleanups = append(cleanups, cl)
 								}
@@ -1089,23 +1103,9 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						if !fn.Variadic {
 							var av unsafe.Pointer
 							if nFixed > 0 {
-								av = unsafe.Pointer(&argv[0]) // Go-managed avalue (void**)
+								av = unsafe.Pointer(&argv[0])
 							}
-							// Return buffer on stack if ≤8, otherwise pooled
-							rt := mod.reg.mustGet(fn.Ret)
-							slot := int(abiSlotSize(rt))
-							if slot <= 8 {
-								var r8 [8]byte
-								cFFICall(cif, fn.SymbolPtr, unsafe.Pointer(&r8[0]), av)
-								// Keep locals alive through the call boundary
-								runtime.KeepAlive(args)
-								return unmarshalRet(mod, fn, unsafe.Pointer(&r8[0]))
-							}
-							rb, put := getBytes(slot)
-							defer put()
-							cFFICall(cif, fn.SymbolPtr, unsafe.Pointer(&rb[0]), av)
-							runtime.KeepAlive(args)
-							return unmarshalRet(mod, fn, unsafe.Pointer(&rb[0]))
+							return callFFI(mod, fn, cif, av, args, argv)
 						}
 
 						// ----- variadic path (MindScript: final argument must be an array) -----
@@ -1121,7 +1121,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var vaArgs []uint64
 						var putVArgs func()
 						if nVA <= len(vaArgsSmall) {
-							vaArgs, _ = vaArgsSmall[:nVA], func() {}
+							vaArgs, putVArgs = vaArgsSmall[:nVA], func() {}
 							for i := range vaArgs {
 								vaArgs[i] = 0
 							}
@@ -1197,22 +1197,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 							av = unsafe.Pointer(&argv[0])
 						}
 
-						// Return buffer
-						rt := mod.reg.mustGet(fn.Ret)
-						rSlot := int(abiSlotSize(rt))
-						if rSlot <= 8 {
-							var r8 [8]byte
-							cFFICall(cifVar, fn.SymbolPtr, unsafe.Pointer(&r8[0]), av)
-							runtime.KeepAlive(args)
-							runtime.KeepAlive(vaArgs)
-							return unmarshalRet(mod, fn, unsafe.Pointer(&r8[0]))
-						}
-						rb, put := getBytes(rSlot)
-						defer put()
-						cFFICall(cifVar, fn.SymbolPtr, unsafe.Pointer(&rb[0]), av)
-						runtime.KeepAlive(args)
-						runtime.KeepAlive(vaArgs)
-						return unmarshalRet(mod, fn, unsafe.Pointer(&rb[0]))
+						return callFFI(mod, fn, cifVar, av, args, vaArgs, argv)
 					},
 				)
 				if v, err := modEnv.Get(name); err == nil {
@@ -1268,15 +1253,11 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						// Aggregates require a handle value whose bytes are copied into the variable.
 						switch t.Kind {
 						case ffiStruct, ffiUnion, ffiArray:
-							val := ctx.Arg("value")
-							if val.Tag != VTHandle {
-								fail("ffi: set(): aggregate variable requires handle to compatible storage")
-							}
-							src := expectPtr(val)
 							if t.Size == 0 {
 								fail("ffi: set(): aggregate has zero size")
 							}
-							cMemcpy(v.SymbolPtr, src, t.Size)
+							copyAggregateFromHandle(t, v.SymbolPtr, ctx.Arg("value"),
+								"ffi: set(): aggregate variable requires handle to compatible storage")
 							return Null
 						default:
 							writeValue(mod.reg, t, v.SymbolPtr, ctx.Arg("value"))

@@ -244,17 +244,7 @@ func mustMalloc(n uintptr) unsafe.Pointer {
 	return p
 }
 
-var ptrSlotSize = uintptr(unsafe.Sizeof(uintptr(0)))
-
-// makePtrSlot allocates a pointer-sized slot and stores p into it.
-func makePtrSlot(p unsafe.Pointer) unsafe.Pointer {
-	buf := mustMalloc(ptrSlotSize)
-	*(*unsafe.Pointer)(buf) = p
-	return buf
-}
-
 // --- Opaque libffi type helpers (keep all C references in this file) ---
-
 // Return opaque pointers to common builtin ffi_type objects.
 func ffiTypeSint32Ptr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_sint32) }
 func ffiTypeDoublePtr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_double) }
@@ -1564,16 +1554,14 @@ func readValue(reg *ffiRegistry, t *ffiType, src unsafe.Pointer) Value {
 	return Null
 }
 
-// makeFuncptrArg builds the argument slot for a funcptr parameter.
-// It supports: null, raw pointer handles, or MindScript callables (via libffi closure).
-func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (slot unsafe.Pointer, cleanup cleanupFn) {
+// makeFuncptrArg resolves a funcptr parameter to an executable pointer.
+// Supports: null, raw pointer handles, or MindScript callables (via libffi closure).
+func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (fnptr unsafe.Pointer, cleanup cleanupFn) {
 	switch val.Tag {
 	case VTNull:
-		s := makePtrSlot(nil)
-		return s, func() { C.free(s) }
+		return nil, nil
 	case VTHandle:
-		p := makePtrSlot(expectPtr(val))
-		return p, func() { C.free(p) }
+		return expectPtr(val), nil
 	default:
 		// MindScript callable → libffi closure
 		if err := ensureFuncptrCIF(mod.reg, pt); err != nil {
@@ -1582,7 +1570,7 @@ func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (sl
 		var exec unsafe.Pointer
 		cl := C.ms_closure_alloc((*unsafe.Pointer)(unsafe.Pointer(&exec)))
 		if cl == nil {
-			fail("ffi: closure_alloc OOM")
+			fail("ffi: closure_alloc OOT")
 		}
 		ctxObj := &cbContext{ip: ip, fn: val, typ: pt, reg: mod.reg}
 		h := cgo.NewHandle(ctxObj)
@@ -1593,8 +1581,7 @@ func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (sl
 		}
 		// retain in module for lifetime management
 		mod.cbs = append(mod.cbs, cbRecord{closure: cl, handle: h})
-		s := makePtrSlot(exec)
-		return s, func() { C.free(s) }
+		return exec, nil
 	}
 }
 

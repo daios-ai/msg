@@ -1,0 +1,167 @@
+// errors.go: unified diagnostics and pretty-print rendering (public-facing)
+//
+// Overview
+// --------
+// MindScript distinguishes between:
+//   • SOFT errors (operational) → represented as annotated-null Values (not here).
+//   • HARD errors (contractual) → represented by *Error and bubbled to the API.
+//
+// This module defines the single diagnostic type (*Error) and a pretty-printer
+// used ONLY by public entry points. Engine internals should construct *Error
+// (with correct src/line/col) and return it upward WITHOUT formatting.
+
+package mindscript
+
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
+
+/* ===========================
+   PUBLIC TYPES & HELPERS
+   =========================== */
+
+// DiagKind classifies a hard diagnostic.
+type DiagKind int
+
+const (
+	DiagLex DiagKind = iota
+	DiagParse
+	DiagRuntime
+	DiagIncomplete // REPL “need more input” (hard signal to prompt for more)
+)
+
+// Error is the single hard diagnostic that bubbles up to public APIs.
+// Msg is plain text (no snippets); pretty-printing happens at the API boundary.
+type Error struct {
+	Kind DiagKind
+	Msg  string
+	Src  *SourceRef // preferred source for rendering (<main>, <repl>, module)
+	Line int        // 1-based
+	Col  int        // 1-based
+}
+
+// Error implements the error interface, returning ONLY the message.
+// Pretty snippets are produced by FormatError at the API boundary.
+func (e *Error) Error() string { return e.Msg }
+
+// IsIncomplete reports whether err represents an incomplete-input condition.
+func IsIncomplete(err error) bool {
+	if e, ok := err.(*Error); ok {
+		return e.Kind == DiagIncomplete
+	}
+	return false
+}
+
+// FormatError renders a human-friendly, caret-annotated snippet for a *Error.
+// Call this ONLY at public entry points (Eval*/Parse*), never in engine internals.
+func FormatError(e *Error) string {
+	if e == nil {
+		return ""
+	}
+	header := diagHeader(e.Kind)
+
+	var name, src string
+	if e.Src != nil {
+		name = e.Src.Name
+		src = e.Src.Src
+	}
+	return prettyErrorStringLabeled(src, header, name, e.Line, e.Col, e.Msg)
+}
+
+/* ===========================
+   PRIVATE: rendering helpers
+   =========================== */
+
+func diagHeader(k DiagKind) string {
+	switch k {
+	case DiagLex:
+		return "LEXICAL ERROR"
+	case DiagParse:
+		return "PARSE ERROR"
+	case DiagRuntime:
+		return "RUNTIME ERROR"
+	case DiagIncomplete:
+		return "INCOMPLETE"
+	default:
+		return "ERROR"
+	}
+}
+
+// caretPadPrefix returns a prefix for the caret line that aligns with col (1-based)
+// on the original line. It preserves '\t' and emits exactly ONE pad unit per
+// *display rune* (not per byte), so multi-byte UTF-8 before the caret does not
+// cause rightward drift. Coordinates remain byte-based; alignment becomes visual.
+func caretPadPrefix(line string, col int) string {
+	if col < 1 {
+		col = 1
+	}
+	// Clamp to [1 .. byteLen+1] — columns are byte-oriented from offsetToLineCol.
+	bl := len(line)
+	if col > bl+1 {
+		col = bl + 1
+	}
+	limit := col - 1 // pad up to (but not including) byte offset 'limit'
+
+	var b strings.Builder
+	i := 0
+	for i < limit {
+		// Preserve literal tabs so the terminal expands them consistently
+		if line[i] == '\t' {
+			b.WriteByte('\t')
+			i++
+			continue
+		}
+		// Decode the next rune starting at byte i.
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if r == utf8.RuneError && size == 1 {
+			// Invalid byte; advance conservatively and pad once.
+			b.WriteByte(' ')
+			i++
+			continue
+		}
+		// For any non-tab rune, emit exactly one space regardless of byte length.
+		b.WriteByte(' ')
+		i += size
+	}
+	return b.String()
+}
+
+// prettyErrorStringLabeled builds a Python-like snippet with a header and caret.
+// It shows at most one previous and one next line when available.
+// Coordinates are treated as 1-based and clamped to the source bounds.
+func prettyErrorStringLabeled(src, header, name string, line, col int, msg string) string {
+	lines := strings.Split(src, "\n")
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	if line < 1 {
+		line = 1
+	}
+	if line > len(lines) {
+		line = len(lines)
+	}
+	if col < 1 {
+		col = 1
+	}
+
+	lineTxt := lines[line-1]
+	pad := caretPadPrefix(lineTxt, col)
+
+	var b strings.Builder
+	if name != "" {
+		fmt.Fprintf(&b, "%s in %s at %d:%d: %s\n\n", header, name, line, col, msg)
+	} else {
+		fmt.Fprintf(&b, "%s at %d:%d: %s\n\n", header, line, col, msg)
+	}
+	if line > 1 {
+		fmt.Fprintf(&b, "%4d | %s\n", line-1, lines[line-2])
+	}
+	fmt.Fprintf(&b, "%4d | %s\n", line, lineTxt)
+	fmt.Fprintf(&b, "     | %s^\n", pad)
+	if line < len(lines) {
+		fmt.Fprintf(&b, "%4d | %s\n", line+1, lines[line])
+	}
+	return b.String()
+}

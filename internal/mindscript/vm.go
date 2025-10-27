@@ -1,0 +1,582 @@
+// vm.go: minimal bytecode virtual machine for MindScript.
+//
+// OVERVIEW
+// --------
+// This file implements a compact, goroutine-safe-by-isolation, stack-based VM
+// that executes MindScript bytecode ("Chunk") and returns a result Value.
+// The VM is *internal to the package*: it exposes only the Chunk container;
+// everything else (opcodes, instruction encoding, VM loop) is private.
+//
+// Concurrency model (Lua-style isolates)
+// -------------------------------------
+//   - A single *Interpreter is **not re-entrant**. Do not invoke its methods from
+//     multiple goroutines at the same time.
+//   - For parallelism, create multiple *Interpreter instances (or use Clone if
+//     provided) and run each in its own goroutine. Each instance maintains its own
+//     Core/Global envs, module cache, current source tracking, and VM state.
+//   - This file has no package-level mutable state; all VM state is per-run and
+//     per-Interpreter. As long as an Interpreter isn't shared concurrently, there
+//     are no data races here.
+//   - Host natives may spin goroutines, but they must not touch a *shared*
+//     Interpreter/Env concurrently. Use isolated instances to run work in parallel.
+//
+// Execution model
+//   - The interpreter (see interpreter.go) lowers S-expr AST into a Chunk using
+//     a small emitter. This VM then executes that Chunk in a given lexical Env.
+//   - The VM keeps the public engine surface stable by delegating CALL to
+//     Interpreter.Apply semantics via a private helper (applyArgsScoped). That
+//     preserves currying, native dispatch, type checks, and call-site scoping.
+//   - Runtime errors inside the VM are reported as annotated null Values and
+//     surfaced via a vmRuntimeError status to the interpreter. The vmResult also
+//     carries the instruction PC where the error occurred so the interpreter can
+//     map it back to a source (line, col) using Chunk.Marks and SourceRef.
+//
+// Instruction encoding (private)
+//   - 32-bit instruction: [ opcode:8 | imm:24 ].
+//   - Opcodes cover constants/globals, stack ops, property/index access,
+//     arithmetic/compare/unary, control flow, and calls.
+//   - The emitter constructs instruction words via `pack`. Decoding uses `uop`
+//     and `uimm`. These are all private to the package.
+//
+// Data & semantics used by the VM
+//   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
+//   - Env (lexical chain) for resolving globals
+//   - Interpreter methods: deepEqual, applyArgsScoped
+//   - Negative array indices count from the end (Python-like -1 is last, -len is first),
+//     but indices < -len (and ≥ len) are out of bounds.
+//   - Property access on maps/modules; index access on arrays/maps
+//   - Numeric ops preserve integers where possible; division/mod guard zero;
+//     string relational comparisons are supported for <, <=, >, >=.
+//   - Control flow: Return yields vmReturn with a Value; fallthrough yields vmOK.
+//
+// DEPENDENCIES (other files)
+// --------------------------
+// • interpreter.go
+//   - Value/ValueTag/Null/Arr/Bool/Int/Num, MapObject, Env
+//   - (ip *Interpreter).deepEqual, (ip *Interpreter).applyArgsScoped
+//   - errNull, isNumber, toFloat helpers
+//
+// • modules.go (not shown here)
+//   - Module type and (m *Module).get(name) (used for VTModule property lookups)
+//
+// • parser.go / lexer.go (indirect; produce AST for the emitter that targets this VM)
+// • types.go (indirect; equality of types via deepEqual resolution)
+//
+// PUBLIC vs PRIVATE
+// -----------------
+// PUBLIC  : Chunk (bytecode container) — the only stable surface exported here.
+// PRIVATE : opcodes, instruction packing, VM loop/state, vmResult/status, helpers.
+package mindscript
+
+import (
+	"fmt"
+	"math"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+//                                   PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// SourceRef attaches source text and an optional SpanIndex to bytecode.
+type SourceRef struct {
+	Name     string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
+	Src      string     // full text
+	Spans    *SpanIndex // may be nil when unknown
+	PathBase NodePath   // optional absolute prefix for marks emitted in this chunk
+}
+
+// PCMark associates an instruction index with an AST node path.
+type PCMark struct {
+	PC   int
+	Path NodePath
+}
+
+// Chunk is an immutable bytecode container executed by the VM.
+//
+// Layout:
+//
+//	Code   — instruction stream; each instruction is a 32-bit word where the
+//	         high 8 bits encode the opcode and the low 24 bits hold an unsigned
+//	         immediate (operand). The encoding details are private to the VM.
+//	Consts — constant pool referenced by instructions (e.g., opConst pushes
+//	         Consts[k], opLoadGlobal/opGetProp carry string names as VTStr).
+//	Src    — optional source reference (used for caret-runtime errors).
+//	Marks  — PC→AST path marks for mapping instructions back to source spans.
+//
+// Producer & consumer:
+//   - Produced by the internal emitter (see interpreter.go) from an S-expr AST.
+//   - Consumed only by the VM entry (private) to execute code in an Env.
+//
+// Stability contract:
+//   - The existence of Chunk and its fields is stable for code that needs to
+//     hand bytecode across subsystems within this package. The instruction set
+//     and encoding are *not* public API.
+type Chunk struct {
+	Code   []uint32
+	Consts []Value
+	Src    *SourceRef
+	Marks  []PCMark
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+/************* Instruction encoding (private) *************/
+
+type opcode uint8
+
+const (
+	opNop opcode = iota
+
+	// constants & globals
+	opConst      // push consts[k]
+	opLoadGlobal // push Env[name];  imm = const index (name as VTStr)
+
+	// stack/values
+	opMakeArr // pop N → array; imm = N
+	opPop     // pop and discard top of stack
+
+	// property & index
+	opGetProp // obj.get(name);   imm = const index (name as VTStr)
+	opGetIdx  // pop idx,obj → push obj[idx]
+
+	// arithmetic / compare / unary
+	opSub
+	opMul
+	opDiv
+	opMod
+	opEq
+	opNe
+	opLt
+	opLe
+	opGt
+	opGe
+	opNeg
+	opNot
+
+	// control flow
+	opJump        // ip = imm
+	opJumpIfFalse // pop cond; if false => ip = imm
+	opReturn      // pop v; signal Return with v
+
+	// calls/closures
+	opCall // argc = imm; pops argc args then callee; pushes result
+)
+
+// pack/unpack helpers
+func pack(op opcode, imm uint32) uint32 { return uint32(op)<<24 | (imm & 0xFFFFFF) }
+func uop(i uint32) opcode               { return opcode(i >> 24) }
+func uimm(i uint32) uint32              { return i & 0xFFFFFF }
+
+// unwrap a VTMap to *MapObject (nil if not a map)
+func asMap(v Value) *MapObject {
+	if v.Tag != VTMap {
+		return nil
+	}
+	return v.Data.(*MapObject)
+}
+
+/************* VM status/result (private) *************/
+
+type vmStatus int
+
+const (
+	vmOK vmStatus = iota
+	vmReturn
+	vmRuntimeError
+)
+
+type vmResult struct {
+	status vmStatus
+	value  Value
+	pc     int // instruction index where the status was produced (best-effort)
+}
+
+/************* VM state & helpers (private) *************/
+
+type vm struct {
+	ip    *Interpreter
+	chunk *Chunk
+	env   *Env
+	stack []Value
+	sp    int
+	iptr  int
+}
+
+func (m *vm) push(v Value) {
+	if m.sp >= len(m.stack) {
+		newCap := len(m.stack) * 2
+		if newCap == 0 {
+			newCap = 16
+		}
+		ns := make([]Value, newCap)
+		copy(ns, m.stack)
+		m.stack = ns
+	}
+	m.stack[m.sp] = v
+	m.sp++
+}
+
+func (m *vm) pop() Value {
+	if m.sp == 0 {
+		return errNull("stack underflow")
+	}
+	m.sp--
+	return m.stack[m.sp]
+}
+
+func (m *vm) top() Value {
+	if m.sp == 0 {
+		return Null
+	}
+	return m.stack[m.sp-1]
+}
+
+// fail returns a vmRuntimeError with the PC set to the currently executing
+// instruction (iptr-1, since iptr has advanced past the fetched instruction).
+func (m *vm) fail(msg string) vmResult {
+	return vmResult{status: vmRuntimeError, value: errNull(msg), pc: m.iptr - 1}
+}
+
+// Numeric helpers (mirror interpreter semantics)
+func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
+	// numbers
+	if isNumber(a) && isNumber(b) {
+		lf, rf := toFloat(a), toFloat(b)
+		bothInt := a.Tag == VTInt && b.Tag == VTInt
+		switch op {
+		case opSub:
+			if bothInt {
+				return Int(a.Data.(int64) - b.Data.(int64)), nil
+			}
+			return Num(lf - rf), nil
+		case opMul:
+			if bothInt {
+				return Int(a.Data.(int64) * b.Data.(int64)), nil
+			}
+			return Num(lf * rf), nil
+		case opDiv:
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("division by zero")
+				return Null, &res
+			}
+			if bothInt {
+				return Int(a.Data.(int64) / b.Data.(int64)), nil
+			}
+			return Num(lf / rf), nil
+		case opMod:
+			// guard zero (match division error text)
+			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
+				res := m.fail("modulo by zero")
+				return Null, &res
+			}
+			if bothInt {
+				return Int(a.Data.(int64) % b.Data.(int64)), nil
+			}
+			return Num(math.Mod(lf, rf)), nil
+		case opLt:
+			if bothInt {
+				return Bool(a.Data.(int64) < b.Data.(int64)), nil
+			}
+			return Bool(lf < rf), nil
+		case opLe:
+			if bothInt {
+				return Bool(a.Data.(int64) <= b.Data.(int64)), nil
+			}
+			return Bool(lf <= rf), nil
+		case opGt:
+			if bothInt {
+				return Bool(a.Data.(int64) > b.Data.(int64)), nil
+			}
+			return Bool(lf > rf), nil
+		case opGe:
+			if bothInt {
+				return Bool(a.Data.(int64) >= b.Data.(int64)), nil
+			}
+			return Bool(lf >= rf), nil
+		}
+	}
+
+	// string comparisons
+	if a.Tag == VTStr && b.Tag == VTStr {
+		as, bs := a.Data.(string), b.Data.(string)
+		switch op {
+		case opLt:
+			return Bool(as < bs), nil
+		case opLe:
+			return Bool(as <= bs), nil
+		case opGt:
+			return Bool(as > bs), nil
+		case opGe:
+			return Bool(as >= bs), nil
+		}
+	}
+	res := m.fail("bad numeric operator")
+	return Value{}, &res
+}
+
+/************* VM entry point (private) *************/
+
+// runChunk executes a bytecode Chunk in the provided environment.
+// It implements the full instruction set and returns:
+//   - vmOK           with the top-of-stack (or Null) if the program fell through,
+//   - vmReturn       with the explicit return value,
+//   - vmRuntimeError with an annotated-null explaining the error, plus a PC.
+//
+// Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
+// currying, native dispatch, type checks, and call-site scoping.
+//
+// Concurrency: this method uses the *Interpreter instance* provided on the vm.
+// Do not call it concurrently on the same Interpreter from multiple goroutines.
+func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
+	m := &vm{
+		ip:    ip,
+		chunk: chunk,
+		// evaluate in the provided environment (global-chain root for this run)
+		env:   env,
+		stack: make([]Value, 0, initStackCap),
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			// Structured inner-source error? Re-throw so the outer trampoline can
+			// surface it with the callee's SourceRef and exact (line,col).
+			if e, ok := r.(rtErr); ok {
+				if e.src != nil && e.line > 0 && e.col > 0 {
+					panic(e) // propagate structured inner-caret error
+				}
+				res.status = vmRuntimeError
+				res.value = annotNull(e.msg)
+				res.pc = m.iptr - 1
+				return
+			}
+			panic(r) // rethrow non-runtime panics
+		}
+	}()
+
+	code := chunk.Code
+	consts := chunk.Consts
+
+	for m.iptr < len(code) {
+		raw := code[m.iptr]
+		m.iptr++
+		opc := uop(raw)
+		imm := uimm(raw)
+
+		switch opc {
+
+		case opNop:
+			// no-op
+
+		// ---- constants & globals ----
+		case opConst:
+			if int(imm) >= len(consts) {
+				return m.fail("const index out of range")
+			}
+			m.push(consts[imm])
+
+		case opLoadGlobal:
+			if int(imm) >= len(consts) {
+				return m.fail("name index out of range")
+			}
+			k := consts[imm]
+			if k.Tag != VTStr {
+				return m.fail("global name must be string const")
+			}
+			v, err := m.env.Get(k.Data.(string))
+			if err != nil {
+				return m.fail(err.Error())
+			}
+			m.push(v)
+
+		// ---- arrays ----
+		case opMakeArr:
+			n := int(imm)
+			if n < 0 || n > m.sp {
+				return m.fail("bad array length")
+			}
+			start := m.sp - n
+			elems := make([]Value, n)
+			copy(elems, m.stack[start:m.sp])
+			m.sp = start
+			m.push(Arr(elems))
+
+		// ---- pop value from stack ----
+		case opPop:
+			if m.sp == 0 {
+				return m.fail("pop on empty stack")
+			}
+			m.sp--
+
+		// ---- properties / indices ----
+		case opGetProp:
+			if int(imm) >= len(consts) {
+				return m.fail("name index out of range")
+			}
+			k := consts[imm]
+			if k.Tag != VTStr {
+				return m.fail("property name must be string const")
+			}
+			obj := m.pop()
+			key := k.Data.(string)
+
+			// Map lookup: use MapObject entries (annotation on keys is meta)
+			if obj.Tag == VTMap {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("property get requires map or module with string key")
+				}
+				if v, ok := mo.Entries[key]; ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown property %q", key))
+			}
+
+			// Module export lookup
+			if obj.Tag == VTModule {
+				mod := obj.Data.(*Module)
+				if v, ok := mod.get(key); ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown property %q on module", key))
+			}
+
+			return m.fail("property get requires map or module with string key")
+
+		case opGetIdx:
+			idx := m.pop()
+			obj := m.pop()
+
+			// array[int]
+			if obj.Tag == VTArray && idx.Tag == VTInt {
+				ao := obj.Data.(*ArrayObject)
+				xs := ao.Elems
+				if len(xs) == 0 {
+					return m.fail("index on empty array")
+				}
+				i := int(idx.Data.(int64))
+				if i < 0 {
+					i = len(xs) + i // -1 -> last, -len -> 0
+				}
+				if i < 0 || i >= len(xs) {
+					return m.fail("array index out of range")
+				}
+				m.push(xs[i])
+				break
+			}
+
+			// map[string]
+			if obj.Tag == VTMap && idx.Tag == VTStr {
+				mo := asMap(obj)
+				if mo == nil {
+					return m.fail("index requires array[int] or map[string]")
+				}
+				k := idx.Data.(string)
+				if v, ok := mo.Entries[k]; ok {
+					m.push(v)
+					break
+				}
+				return m.fail(fmt.Sprintf("unknown key %q", k))
+			}
+
+			return m.fail("index requires array[int] or map[string]")
+
+		// ---- arithmetic / compare / unary ----
+		case opSub, opMul, opDiv, opMod, opLt, opLe, opGt, opGe:
+			b := m.pop()
+			a := m.pop()
+			if out, failRes := m.binNum(opc, a, b); failRes != nil {
+				return *failRes
+			} else {
+				m.push(out)
+			}
+
+		case opEq, opNe:
+			b := m.pop()
+			a := m.pop()
+			eq := m.ip.deepEqual(a, b)
+			if opc == opEq {
+				m.push(Bool(eq))
+			} else {
+				m.push(Bool(!eq))
+			}
+
+		case opNeg:
+			x := m.pop()
+			switch x.Tag {
+			case VTInt:
+				m.push(Int(-x.Data.(int64)))
+			case VTNum:
+				m.push(Num(-x.Data.(float64)))
+			default:
+				return m.fail("unary - expects number")
+			}
+
+		case opNot:
+			x := m.pop()
+			if x.Tag != VTBool {
+				return m.fail("not expects boolean")
+			}
+			m.push(Bool(!x.Data.(bool)))
+
+		// ---- control flow ----
+		case opJump:
+			m.iptr = int(imm)
+
+		case opJumpIfFalse:
+			cond := m.pop()
+			if cond.Tag != VTBool {
+				return m.fail("condition must be boolean")
+			}
+			if !cond.Data.(bool) {
+				m.iptr = int(imm)
+			}
+
+		case opReturn:
+			var v Value = Null
+			if m.sp > 0 {
+				v = m.pop()
+			}
+			return vmResult{status: vmReturn, value: v, pc: m.iptr - 1}
+
+		// ---- calls ----
+		case opCall:
+			nargs := int(imm)
+
+			// Stack layout (top on the right):
+			// [..., callee, arg1, ..., argN]
+			calleeIdx := m.sp - nargs - 1
+			if calleeIdx < 0 {
+				return m.fail("stack underflow in call")
+			}
+			callee := m.stack[calleeIdx]
+
+			// Collect args in order
+			args := make([]Value, nargs)
+			copy(args, m.stack[calleeIdx+1:m.sp])
+
+			// Pop callee + args
+			m.sp = calleeIdx
+			m.stack = m.stack[:m.sp]
+
+			// Use current frame env as the call-site (for natives & closures)
+			res := m.ip.applyArgsScoped(callee, args, m.env)
+
+			// Push result
+			m.push(res)
+
+		default:
+			return m.fail("unknown opcode")
+		}
+	}
+
+	if m.sp == 0 {
+		return vmResult{status: vmOK, value: Null, pc: m.iptr - 1}
+	}
+	return vmResult{status: vmOK, value: m.top(), pc: m.iptr - 1}
+}

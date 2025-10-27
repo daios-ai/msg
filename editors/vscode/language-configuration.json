@@ -1,0 +1,12 @@
+ {
+  "autoClosingPairs": [
+    { "open": "(", "close": ")" },
+    { "open": "[", "close": "]" },
+    { "open": "{", "close": "}" },
+    { "open": "\"", "close": "\"" },
+    { "open": "'", "close": "'" },
+    { "open": "do", "close": "\nend"},
+    { "open": "then", "close": "\nend"},
+    { "open": "else", "close": "\nend"}
+  ]
+}

@@ -7,6 +7,10 @@
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Programming Languages"],
   "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:mindscript",
+    "onCommand:mindscript.startServer"
+  ],
   "contributes": {
     "languages": [
       {
@@ -16,11 +20,11 @@
         "configuration": "./language-configuration.json"
       }
     ],
-        "grammars": [
+    "grammars": [
       {
         "language": "mindscript",
         "scopeName": "source.mindscript",
-        "path": "./syntaxes/mindscript.tmLanguage.json"
+        "path": "./syntaxes/syntaxes/mindscript.tmLanguage.json"
       }
     ],
     "commands": [
@@ -32,8 +36,8 @@
       "properties": {
         "mindscript.serverPath": {
           "type": "string",
-          "description": "Path to the MindScript LSP server binary",
-          "default": "server/msg-lsp"
+          "default": "bin/msg-lsp",
+          "markdownDescription": "Relative path (inside the extension folder) to the MindScript LSP server binary. If not found, the extension falls back to `msg-lsp` on your system PATH."
         }
       }
     }

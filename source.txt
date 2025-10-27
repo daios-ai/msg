@@ -17,6 +17,8 @@
 │   └── ffi.md
 ├── editors
 │   └── vscode
+│       ├── bin
+│       │   └── msg-lsp
 │       ├── dist
 │       │   └── extension.js
 │       ├── language-configuration.json
@@ -632,11 +634,9 @@
 │       │       └── thirdpartynotices.txt
 │       ├── package.json
 │       ├── package-lock.json
-│       ├── server
-│       │   └── msg-lsp
+│       ├── source.txt
 │       ├── src
-│       │   ├── extension.ts
-│       │   └── launch.json
+│       │   └── extension.ts
 │       ├── syntaxes
 │       │   └── syntaxes
 │       │       └── mindscript.tmLanguage.json
@@ -720,6 +720,7 @@
 │   ├── canon_test.ms
 │   ├── codegen2.ms
 │   ├── codegen.ms
+│   ├── ggml.ms
 │   ├── helper.ms
 │   ├── llm.ms
 │   ├── llm_test.ms
@@ -754,4 +755,4 @@
 ├── source.txt
 └── startup.ms
 
-83 directories, 672 files
+83 directories, 673 files

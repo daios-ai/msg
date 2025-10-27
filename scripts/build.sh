@@ -13,6 +13,6 @@ go build -trimpath -ldflags="-s -w" -o ./msg ./cmd/msg
 
 echo "LSP: testing and building"
 go test -v ./cmd/msg-lsp
-go build -trimpath -ldflags="-s -w" -o ./cmd/msg-lsp/vscode/server/msg-lsp ./cmd/lsp
+go build -trimpath -ldflags="-s -w" -o ./editors/vscode/bin/msg-lsp ./cmd/msg-lsp
 
 echo "Done."

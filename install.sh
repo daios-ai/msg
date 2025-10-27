@@ -1,90 +1,91 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="mindscript-lang/mindscript"   # <-- change if needed
-DEFAULT_BASE="${HOME}/.mindscript"
-VERSION="${VERSION:-$(curl -fsSL https://raw.githubusercontent.com/${REPO}/main/VERSION)}"
+REPO="mindscript-lang/mindscript"   # <-- change to your org/name
+INSTALL_DIR_DEFAULT="${HOME}/.mindscript"
+INSTALL_DIR_SYSTEM="/opt/mindscript"
+PROFILE_SNIPPET_BASH="${HOME}/.profile"
+PROFILE_SNIPPET_ZSH="${HOME}/.zprofile"
+FISH_CONF_DIR="${HOME}/.config/fish/conf.d"
+VERSION="${MSG_VERSION:-latest}"    # allow override: MSG_VERSION=v0.3.0
 
-# Detect OS/arch
-uname_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-case "$uname_os" in
-  linux)  OS=linux ;;
-  darwin) OS=darwin ;;
-  *) echo "Unsupported OS: $uname_os"; exit 1 ;;
-esac
-
-uname_arch="$(uname -m)"
-case "$uname_arch" in
-  x86_64|amd64) ARCH=amd64 ;;
-  arm64|aarch64) ARCH=arm64 ;;
-  *) echo "Unsupported arch: $uname_arch"; exit 1 ;;
-esac
-
-# Where to install
-BASE="${MSGPATH:-$DEFAULT_BASE}"
-TARGET="${BASE}/versions/${VERSION}"
-BINLINK="${BASE}/current"
-
-# URLs
-BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
-TARBALL="mindscript-${OS}-${ARCH}-${VERSION}.tar.gz"
-SHAFILE="checksums.txt"
-
-echo "MindScript ${VERSION} for ${OS}/${ARCH}"
-echo "Install base: ${BASE}"
-
-mkdir -p "${BASE}/downloads"
-cd "${BASE}/downloads"
-
-# Fetch tarball + checksums
-curl -fL -o "${TARBALL}" "${BASE_URL}/${TARBALL}"
-curl -fL -o "${SHAFILE}" "${BASE_URL}/${SHAFILE}"
-
-# Verify checksum
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum --check <(grep " ${TARBALL}\$" "${SHAFILE}") --status || { echo "Checksum failed"; exit 1; }
-else
-  shasum -a 256 -c <(grep " ${TARBALL}\$" "${SHAFILE}") || { echo "Checksum failed"; exit 1; }
-fi
-
-# Unpack into versioned dir
-mkdir -p "${TARGET}"
-tar -C "${TARGET}" -xzf "${TARBALL}"
-
-# Update 'current' symlink
-ln -sfn "${TARGET}" "${BINLINK}"
-
-# Write profile snippet(s)
-MSGPATH_EXPORT="export MSGPATH=\"${BINLINK}\""
-PATH_EXPORT='export PATH="$MSGPATH/bin:$PATH"'
-
-write_snippet() {
-  local file="$1"
-  local line="$2"
-  grep -Fq "$line" "$file" 2>/dev/null || echo "$line" >> "$file"
+usage() {
+  echo "Usage: $0 [--system] [--prefix DIR] [--version vX.Y.Z]"
+  exit 1
 }
 
-mkdir -p "${HOME}/.config" 2>/dev/null || true
+PREFIX="${INSTALL_DIR_DEFAULT}"
+SYSTEM=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --system) SYSTEM=1; PREFIX="${INSTALL_DIR_SYSTEM}"; shift ;;
+    --prefix) PREFIX="$2"; shift 2 ;;
+    --version) VERSION="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
 
-# bash/zsh
-PROFILE="${HOME}/.profile"
-touch "$PROFILE"
-write_snippet "$PROFILE" "$MSGPATH_EXPORT"
-write_snippet "$PROFILE" "$PATH_EXPORT"
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in
+  x86_64|amd64) arch="amd64" ;;
+  arm64|aarch64) arch="arm64" ;;
+  *) echo "Unsupported architecture: $arch"; exit 1 ;;
+esac
+case "$os" in
+  linux)  target="linux-${arch}" ;;
+  darwin) target="darwin-${arch}" ;;
+  *) echo "Unsupported OS: $os"; exit 1 ;;
+esac
 
-# fish
-FISHDIR="${HOME}/.config/fish/conf.d"
-mkdir -p "$FISHDIR"
-cat > "${FISHDIR}/mindscript.fish" <<EOF
-set -gx MSGPATH "${BINLINK}"
-if not contains \$MSGPATH/bin \$fish_user_paths
-  set -g fish_user_paths \$MSGPATH/bin \$fish_user_paths
-end
-EOF
+# determine version
+if [[ "$VERSION" == "latest" ]]; then
+  # lightweight latest resolution without jq
+  VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+fi
+echo "Installing MindScript ${VERSION} for ${target} to ${PREFIX}"
+
+TARBALL="mindscript-${target}.tar.gz"
+BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+curl -fL "${BASE_URL}/${TARBALL}" -o "${TMPDIR}/${TARBALL}"
+curl -fL "${BASE_URL}/SHA256SUMS" -o "${TMPDIR}/SHA256SUMS" || true
+
+if command -v sha256sum >/dev/null 2>&1 && [[ -f "${TMPDIR}/SHA256SUMS" ]]; then
+  (cd "${TMPDIR}" && sha256sum -c --ignore-missing SHA256SUMS)
+fi
+
+# install
+if [[ "$SYSTEM" -eq 1 ]]; then
+  sudo mkdir -p "${PREFIX}"
+  sudo tar -xzf "${TMPDIR}/${TARBALL}" -C "${PREFIX}" --strip-components=1
+else
+  mkdir -p "${PREFIX}"
+  tar -xzf "${TMPDIR}/${TARBALL}" -C "${PREFIX}" --strip-components=1
+fi
+
+# write env snippets
+write_shell_snippets() {
+  local root="$1"
+  local line1="export MSGPATH=\"${root}\""
+  local line2='export PATH="$MSGPATH/bin:$PATH"'
+  grep -qxF "$line1" "$PROFILE_SNIPPET_BASH" 2>/dev/null || echo "$line1" >> "$PROFILE_SNIPPET_BASH"
+  grep -qxF "$line2" "$PROFILE_SNIPPET_BASH" 2>/dev/null || echo "$line2" >> "$PROFILE_SNIPPET_BASH"
+  grep -qxF "$line1" "$PROFILE_SNIPPET_ZSH" 2>/dev/null || echo "$line1" >> "$PROFILE_SNIPPET_ZSH"
+  grep -qxF "$line2" "$PROFILE_SNIPPET_ZSH" 2>/dev/null || echo "$line2" >> "$PROFILE_SNIPPET_ZSH"
+  mkdir -p "$FISH_CONF_DIR"
+  echo "set -gx MSGPATH \"${root}\"" > "${FISH_CONF_DIR}/mindscript.fish"
+  echo 'set -gx PATH "$MSGPATH/bin" $PATH' >> "${FISH_CONF_DIR}/mindscript.fish"
+}
+if [[ "$SYSTEM" -eq 1 ]]; then
+  sudo sh -c "echo 'export MSGPATH=${PREFIX}' >/etc/profile.d/mindscript.sh; echo 'export PATH=\$MSGPATH/bin:\$PATH' >> /etc/profile.d/mindscript.sh"
+else
+  write_shell_snippets "${PREFIX}"
+fi
 
 echo
-echo "Installed to: ${TARGET}"
-echo "MSGPATH -> ${BINLINK}"
-echo "Add to current shell: run 'source ${PROFILE}' (or open a new terminal)."
-echo
-echo "Try: msg --version && msg run examples/hello.ms"
+echo "MindScript installed to ${PREFIX}"
+echo "Open a new shell or run:  source ${PROFILE_SNIPPET_BASH}  (or your shell's profile)"
+echo "Verify with:  msg --version"

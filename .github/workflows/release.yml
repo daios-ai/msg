@@ -1,74 +1,55 @@
-name: Release
-
+name: release
 on:
   push:
-    tags:
-      - "v*"
-
-permissions:
-  contents: write  # to create release
+    tags: ["v*"]
 
 jobs:
-  linux-amd64:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
-      - run: echo "${GITHUB_REF_NAME#v}" > VERSION
-      - run: make package
-      - uses: softprops/action-gh-release@v2
+        with: { go-version: "1.23.x" }
+      - name: Install cross compiler for arm64
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build & Package
+        run: make release
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/mindscript-linux-amd64-*.tar.gz
+          name: linux-artifacts
+          path: dist/*/*.tar.gz
 
-  linux-arm64:
-    runs-on: ubuntu-24.04-arm64  # native arm64 runner (or self-hosted)
+  macos:
+    runs-on: macos-14  # Apple Silicon runner; supports building both arches
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
-      - run: echo "${GITHUB_REF_NAME#v}" > VERSION
-      - run: make package
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/mindscript-linux-arm64-*.tar.gz
-
-  macos-amd64:
-    runs-on: macos-13  # x86_64 runner
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
-      - run: echo "${GITHUB_REF_NAME#v}" > VERSION
-      - run: make package
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/mindscript-darwin-amd64-*.tar.gz
-
-  macos-arm64:
-    runs-on: macos-14  # Apple Silicon runner
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
-      - run: echo "${GITHUB_REF_NAME#v}" > VERSION
-      - run: make package
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/mindscript-darwin-arm64-*.tar.gz
-
-  finalize:
-    needs: [linux-amd64, linux-arm64, macos-amd64, macos-arm64]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with: { path: dist }
-      - name: Recompute checksums
+        with: { go-version: "1.23.x" }
+      - name: Build darwin only
         run: |
-          cd dist
-          (sha256sum *.tar.gz || shasum -a 256 *.tar.gz) > checksums.txt
-      - uses: softprops/action-gh-release@v2
+          make clean
+          make pack-darwin-amd64
+          make pack-darwin-arm64
+          (cd dist/$(cat VERSION) && sha256sum mindscript-*.tar.gz > SHA256SUMS || shasum -a 256 mindscript-*.tar.gz > SHA256SUMS)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/checksums.txt
+          name: macos-artifacts
+          path: dist/*/*.tar.gz
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [linux, macos]
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: linux-artifacts, path: ./rel }
+      - uses: actions/download-artifact@v4
+        with: { name: macos-artifacts, path: ./rel }
+      - name: Create combined checksums
+        run: |
+          cd rel && (sha256sum *.tar.gz > SHA256SUMS || shasum -a 256 *.tar.gz > SHA256SUMS)
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rel/*

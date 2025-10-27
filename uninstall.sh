@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
-INSTALL_ROOT="${MS_INSTALL_ROOT:-$HOME/.mindscript}"
-echo "This will remove $INSTALL_ROOT and PATH snippets in ~/.profile (if present)."
-read -r -p "Continue? [y/N] " ans
-[[ "$ans" =~ ^[Yy]$ ]] || exit 0
-rm -rf "$INSTALL_ROOT"
-sed -i.bak '/# MindScript/,+2 d' "$HOME/.profile" || true
-echo "Removed. You may need to open a new shell."
+
+PREFIX="${MSGPATH:-$HOME/.mindscript}"
+echo "This will remove ${PREFIX} and shell snippets (bash/zsh/fish). Continue? [y/N]"
+read -r ans
+[[ "$ans" == "y" || "$ans" == "Y" ]] || exit 0
+
+rm -rf "$PREFIX"
+sed -i.bak '/export MSGPATH=/d;/\$MSGPATH\/bin/d' "$HOME/.profile" 2>/dev/null || true
+sed -i.bak '/export MSGPATH=/d;/\$MSGPATH\/bin/d' "$HOME/.zprofile" 2>/dev/null || true
+rm -f "$HOME/.config/fish/conf.d/mindscript.fish" 2>/dev/null || true
+echo "Uninstalled. Restart your shell."

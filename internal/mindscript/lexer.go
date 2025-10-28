@@ -381,6 +381,7 @@ var keywords = map[string]TokenType{
 	"Num":      TYPE,
 	"Bool":     TYPE,
 	"Any":      TYPE,
+	"Handle":   TYPE,
 	"Enum":     ENUM,
 }
 

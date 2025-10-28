@@ -346,7 +346,7 @@ type Env struct {
 
 // ---- Builtin type names/constructors (value-namespace guards) ----
 var builtinTypeAtoms = map[string]struct{}{
-	"Any": {}, "Null": {}, "Bool": {}, "Int": {}, "Num": {}, "Str": {}, "Type": {}, "Enum": {},
+	"Any": {}, "Null": {}, "Bool": {}, "Int": {}, "Num": {}, "Str": {}, "Handle": {}, "Type": {}, "Enum": {},
 }
 
 func isBuiltinTypeAtom(name string) bool { _, ok := builtinTypeAtoms[name]; return ok }

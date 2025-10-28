@@ -116,7 +116,7 @@ func stripAnnot(t S) S {
 
 func isBuiltinTypeName(name string) bool {
 	switch name {
-	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
+	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type", "Handle":
 		return true
 	default:
 		return false
@@ -247,6 +247,27 @@ func equalLiteralS(a, b S) bool {
 		}
 	}
 	return true
+}
+
+// --- Handle type helpers ---
+
+// handleType builds the canonical type S for a given handle kind.
+func handleType(kind string) S {
+	return S{"get", S{"id", "Handle"}, S{"str", kind}}
+}
+
+// isHandleKindNode reports whether t is of the form: ("get", ("id","Handle"), ("str", kind)).
+func isHandleKindNode(t S) (kind string, ok bool) {
+	if len(t) < 3 || t[0].(string) != "get" {
+		return "", false
+	}
+	base, _ := t[1].(S)
+	key, _ := t[2].(S)
+	if len(base) >= 2 && base[0].(string) == "id" && base[1].(string) == "Handle" &&
+		len(key) >= 2 && key[0].(string) == "str" {
+		return key[1].(string), true
+	}
+	return "", false
 }
 
 // Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
@@ -389,6 +410,13 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 				rt = S{"binop", "->", pt, rt}
 			}
 			return rt
+
+		case VTHandle:
+			h := v.Data.(*Handle)
+			if h == nil || h.Kind == "" {
+				return S{"id", "Any"}
+			}
+			return handleType(h.Kind)
 
 		case VTType:
 			return S{"id", "Type"}
@@ -591,6 +619,15 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 // It fully supports nested function types and alias nodes.
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 	t = stripAnnot(ip.resolveType(t, env))
+
+	// Recognize Handle."kind" upfront (nominal by kind)
+	if kind, ok := isHandleKindNode(t); ok {
+		if v.Tag != VTHandle {
+			return false
+		}
+		h := v.Data.(*Handle)
+		return h != nil && h.Kind == kind
+	}
 
 	// Coinductive memo: (valuePtr, nodeKey(t))
 	// nodeKey mirrors isSubtype: aliases key by *TypeValue, others by &t[0].
@@ -798,6 +835,14 @@ func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
 		isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
 		unwrap := func(t S) S { return t[2].(S) }
 
+		// Handle kinds: nominal equality only
+		if ak, okA := isHandleKindNode(x); okA {
+			if bk, okB := isHandleKindNode(y); okB {
+				return ak == bk
+			}
+			// So x <: y is false when y isn't the same Handle."kind".
+		}
+
 		if isOpt(y) {
 			if sub(x, unwrap(y)) {
 				return true
@@ -983,6 +1028,16 @@ func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
 	}
 	if len(t2) >= 2 && t2[0].(string) == "alias" {
 		t2 = expandAlias(t2)
+	}
+
+	// ---- Handle kinds (nominal) ----
+	if k1, ok1 := isHandleKindNode(t1); ok1 {
+		if k2, ok2 := isHandleKindNode(t2); ok2 {
+			if k1 == k2 {
+				return t1
+			}
+			return S{"id", "Any"}
+		}
 	}
 
 	// ---- Primitives (incl. Int ⊔ Num = Num) ----

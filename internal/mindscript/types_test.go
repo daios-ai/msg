@@ -1327,3 +1327,106 @@ func Test_Types_Validate_Map_Simple_OK(t *testing.T) {
 		t.Fatalf("expected OK, got validator error: %s", msg)
 	}
 }
+
+func Test_Types_Handle_IsType_SameKind(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `chanOpen(1)`)
+	ts := typeS(t, ip, `Handle."chan"`)
+	if !ip.isType(v, ts, ip.Global) {
+		t.Fatalf("expected handle to match Handle.\"chan\"")
+	}
+}
+
+func Test_Types_Handle_IsType_DifferentKind(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `chanOpen(1)`)
+	ts := typeS(t, ip, `Handle."opengroup"`)
+	if ip.isType(v, ts, ip.Global) {
+		t.Fatalf("did not expect Handle.\"chan\" value to match Handle.\"opengroup\"")
+	}
+}
+
+func Test_Types_Handle_Subtype_Same_Diff_Any_Nullable(t *testing.T) {
+	ip, _ := NewInterpreter()
+	hChan := typeS(t, ip, `Handle."chan"`)
+	hOther := typeS(t, ip, `Handle."opengroup"`)
+
+	// same kind
+	if !ip.isSubtype(hChan, hChan, ip.Global) {
+		t.Fatalf("Handle.\"chan\" <: Handle.\"chan\" expected")
+	}
+	// different kinds
+	if ip.isSubtype(hChan, hOther, ip.Global) {
+		t.Fatalf("Handle.\"chan\" </: Handle.\"opengroup\" expected")
+	}
+	// Any is top
+	if !ip.isSubtype(hChan, typeS(t, ip, `Any`), ip.Global) {
+		t.Fatalf("Handle.\"chan\" <: Any expected")
+	}
+	// Null <: Handle.kind?
+	if !ip.isSubtype(typeS(t, ip, `Null`), typeS(t, ip, `Handle."chan"?`), ip.Global) {
+		t.Fatalf("Null <: Handle.\"chan\"? expected")
+	}
+}
+
+func Test_Types_Handle_Unify_Same_Diff_Nullable(t *testing.T) {
+	ip, _ := NewInterpreter()
+	hChan := typeS(t, ip, `Handle."chan"`)
+	hOther := typeS(t, ip, `Handle."opengroup"`)
+	gotSame := ip.unifyTypes(hChan, hChan, ip.Global)
+	if !ip.isSubtype(gotSame, hChan, ip.Global) || !ip.isSubtype(hChan, gotSame, ip.Global) {
+		t.Fatalf("LUB same-kinds mismatch: got %#v", gotSame)
+	}
+	gotDiff := ip.unifyTypes(hChan, hOther, ip.Global)
+	if !ip.isSubtype(typeS(t, ip, `Any`), gotDiff, ip.Global) || !ip.isSubtype(gotDiff, typeS(t, ip, `Any`), ip.Global) {
+		t.Fatalf("LUB different-kinds should be Any, got %#v", gotDiff)
+	}
+	gotNull := ip.unifyTypes(typeS(t, ip, `Null`), hChan, ip.Global)
+	wantNull := typeS(t, ip, `Handle."chan"?`)
+	if !ip.isSubtype(gotNull, wantNull, ip.Global) || !ip.isSubtype(wantNull, gotNull, ip.Global) {
+		t.Fatalf("LUB with Null mismatch: got %#v, want %#v", gotNull, wantNull)
+	}
+}
+
+func Test_Types_Handle_Infer_Solo_And_ArrayNullable(t *testing.T) {
+	ip, _ := NewInterpreter()
+	// Single handle infers its kind
+	h := evalWithIP(t, ip, `chanOpen(1)`)
+	got := ip.valueToTypeS(h, ip.Global)
+	want := typeS(t, ip, `Handle."chan"`)
+	if !ip.isSubtype(got, want, ip.Global) || !ip.isSubtype(want, got, ip.Global) {
+		t.Fatalf("inferred handle type mismatch: got %#v, want %#v", got, want)
+	}
+
+	// Array unifies to [Handle.kind?] with null
+	arr := evalWithIP(t, ip, `[chanOpen(1), null]`)
+	gotArr := ip.valueToTypeS(arr, ip.Global)
+	wantArr := typeS(t, ip, `[Handle."chan"?]`)
+	if !ip.isSubtype(gotArr, wantArr, ip.Global) || !ip.isSubtype(wantArr, gotArr, ip.Global) {
+		t.Fatalf("inferred array type mismatch: got %#v, want %#v", gotArr, wantArr)
+	}
+}
+
+func Test_Types_Handle_ReservedName_ShadowingForbidden(t *testing.T) {
+	ip, _ := NewInterpreter()
+	// Parser should reject binding the reserved name "Handle" (mirrors Int/Num/etc.)
+	evalExpectError(t, ip, `let Handle = type Int`, "expected let pattern")
+}
+
+func Test_Types_Handle_PropertyName_Allowed(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `{Handle: 1}.Handle`)
+	if v.Tag != VTInt || v.Data.(int64) != 1 {
+		t.Fatalf("expected property access to yield Int(1), got %#v", v)
+	}
+}
+
+func Test_Types_Handle_ArrayOfSameKind(t *testing.T) {
+	ip, _ := NewInterpreter()
+	arr := evalWithIP(t, ip, `[chanOpen(1), chanOpen(2)]`)
+	got := ip.valueToTypeS(arr, ip.Global)
+	want := typeS(t, ip, `[Handle."chan"]`)
+	if !ip.isSubtype(got, want, ip.Global) || !ip.isSubtype(want, got, ip.Global) {
+		t.Fatalf("array of same-kind handles inference mismatch: got %#v, want %#v", got, want)
+	}
+}

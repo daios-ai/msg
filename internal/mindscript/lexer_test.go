@@ -217,9 +217,9 @@ func Test_Lexer_Brackets_WhitespaceSensitive(t *testing.T) {
 }
 
 func Test_Lexer_Identifiers_And_Keywords(t *testing.T) {
-	src := `true false null Type Int Num Bool Any and or not`
+	src := `true false null Type Int Num Bool Any Handle and or not`
 	got := wantTypes(t, src, []TokenType{
-		BOOLEAN, BOOLEAN, NULL, TYPE, TYPE, TYPE, TYPE, TYPE, AND, OR, NOT,
+		BOOLEAN, BOOLEAN, NULL, TYPE, TYPE, TYPE, TYPE, TYPE, TYPE, AND, OR, NOT,
 	})
 	if got[0].Literal.(bool) != true || got[1].Literal.(bool) != false {
 		t.Fatalf("boolean literals wrong: %v %v", got[0].Literal, got[1].Literal)
@@ -408,6 +408,14 @@ func Test_Lexer_PropertyChain_IntegerAfterDot(t *testing.T) {
 	}
 	if got[4].Lexeme != "name" || got[4].Type != ID {
 		t.Fatalf("expected ID 'name' after second dot, got %v (%v)", got[4].Lexeme, got[4].Type)
+	}
+}
+
+func Test_Lexer_AfterDot_ForcesID_ForHandle(t *testing.T) {
+	src := `obj.Handle`
+	got := wantTypes(t, src, []TokenType{ID, PERIOD, ID})
+	if got[2].Type != ID || got[2].Literal != "Handle" {
+		t.Fatalf("property after '.' should be ID with Literal \"Handle\"; got %#v", got[2])
 	}
 }
 
@@ -853,5 +861,18 @@ func Test_Lexer_Semicolon_DoesNotTerminate_Annotation(t *testing.T) {
 	}
 	if got[1].Literal.(string) != "id" {
 		t.Fatalf("expected following identifier 'id', got %v (%q)", got[1].Type, got[1].Literal)
+	}
+}
+
+func Test_Lexer_Handle_QualifiedKind(t *testing.T) {
+	src := `Handle."sqlite.conn"`
+	got := wantTypes(t, src, []TokenType{TYPE, PERIOD, ID})
+	lit, ok := got[2].Literal.(string)
+	if !ok || lit != "sqlite.conn" {
+		t.Fatalf("expected ID literal \"sqlite.conn\" after Handle., got %#v", got[2].Literal)
+	}
+	// Lexeme retains quotes for the quoted key
+	if got[2].Lexeme != `"sqlite.conn"` {
+		t.Fatalf("expected quoted Lexeme, got %q", got[2].Lexeme)
 	}
 }

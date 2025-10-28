@@ -1,77 +1,94 @@
-PROJECT   := mindscript
-BIN1      := msg
-BIN2      := msg-lsp
-VERSION   := $(shell cat VERSION)
-DISTDIR   := dist/$(VERSION)
-TMPBIN    := dist/.tmp
-GOFLAGS   := -trimpath -ldflags "-s -w"
+# Minimal MindScript Makefile (auto-detects host OS/arch and builds that one)
+# Targets:
+#   make            → build + package for the current machine
+#   make build      → just build binaries into dist/mindscript/bin
+#   make package    → tar.gz + checksum
+#   make clean      → remove dist/
 
-COPY_DIRS := lib examples docs data
-COPY_FILES:= VERSION LICENSE README.md
+# --- autodetect host ---
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 
-# ----- helpers -----
-define stage_layout
-	rm -rf $(1)/$(PROJECT)
-	mkdir -p $(1)/$(PROJECT)/bin
-	[ -f VERSION ] && cp VERSION $(1)/$(PROJECT)/ || true
-	for f in $(COPY_FILES); do [ -f $$f ] && cp $$f $(1)/$(PROJECT)/ || true; done
-	for d in $(COPY_DIRS); do [ -d $$d ] && cp -R $$d $(1)/$(PROJECT)/ || true; done
-endef
+# Map to Go’s GOOS/GOARCH and to our tarball naming
+ifeq ($(UNAME_S),Darwin)
+  GOOS := darwin
+  ifeq ($(UNAME_M),arm64)
+    GOARCH := arm64
+    TARNAME := mindscript-macos-arm64
+  else
+    $(error macOS x86_64 is not a supported release target)
+  endif
+else ifeq ($(UNAME_S),Linux)
+  GOOS := linux
+  ifeq ($(UNAME_M),x86_64)
+    GOARCH := amd64
+    TARNAME := mindscript-linux-x86_64
+  else ifeq ($(UNAME_M),aarch64)
+    GOARCH := arm64
+    TARNAME := mindscript-linux-arm64
+  else ifeq ($(UNAME_M),arm64)
+    GOARCH := arm64
+    TARNAME := mindscript-linux-arm64
+  else
+    $(error Unsupported Linux arch: $(UNAME_M). Expected x86_64 or (aarch64/arm64))
+  endif
+else
+  $(error Unsupported OS: $(UNAME_S))
+endif
 
-# ----- builds (CGO ON) -----
-build-linux-amd64:
-	@echo ">> build linux/amd64 (CGO ON)"
-	mkdir -p $(TMPBIN)
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN1) ./cmd/$(BIN1)
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN2) ./cmd/$(BIN2)
+# --- version & paths ---
+VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo 0.0.0)
+DIST_DIR := dist
+ROOT     := $(DIST_DIR)/mindscript
+BIN_DIR  := $(ROOT)/bin
 
-build-linux-arm64:
-	@echo ">> build linux/arm64 (CGO ON)"
-	mkdir -p $(TMPBIN)
-	CGO_ENABLED=1 CC?=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN1) ./cmd/$(BIN1)
-	CGO_ENABLED=1 CC?=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN2) ./cmd/$(BIN2)
+# --- CGO + libffi ---
+export CGO_ENABLED := 1
+# For macOS Homebrew libffi (pkg-config lives off the default path)
+ifeq ($(UNAME_S),Darwin)
+  export PKG_CONFIG_PATH ?= $(shell brew --prefix 2>/dev/null)/opt/libffi/lib/pkgconfig
+endif
 
-build-darwin-amd64:
-	@echo ">> build darwin/amd64 (CGO ON)"
-	mkdir -p $(TMPBIN)
-	SDKROOT=$$(xcrun --sdk macosx --show-sdk-path) \
-	CGO_ENABLED=1 CC=clang GOOS=darwin GOARCH=amd64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN1) ./cmd/$(BIN1)
-	SDKROOT=$$(xcrun --sdk macosx --show-sdk-path) \
-	CGO_ENABLED=1 CC=clang GOOS=darwin GOARCH=amd64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN2) ./cmd/$(BIN2)
+# --- checksum tool ---
+ifeq ($(UNAME_S),Darwin)
+  SHASUM := shasum -a 256
+else
+  SHASUM := sha256sum
+endif
 
-build-darwin-arm64:
-	@echo ">> build darwin/arm64 (CGO ON)"
-	mkdir -p $(TMPBIN)
-	SDKROOT=$$(xcrun --sdk macosx --show-sdk-path) \
-	CGO_ENABLED=1 CC=clang GOOS=darwin GOARCH=arm64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN1) ./cmd/$(BIN1)
-	SDKROOT=$$(xcrun --sdk macosx --show-sdk-path) \
-	CGO_ENABLED=1 CC=clang GOOS=darwin GOARCH=arm64 \
-	  go build $(GOFLAGS) -o $(TMPBIN)/$(BIN2) ./cmd/$(BIN2)
+# --- default ---
+.PHONY: all build package clean print
+all: print check-deps build package
 
-# ----- packaging -----
-pack-%: build-%
-	@target=$*; out="$(DISTDIR)"; tmp="$(TMPBIN)"; \
-	mkdir -p "$$out"; \
-	$(call stage_layout,$$out); \
-	mv "$$tmp/$(BIN1)" "$$out/$(PROJECT)/bin/$(BIN1)"; \
-	mv "$$tmp/$(BIN2)" "$$out/$(PROJECT)/bin/$(BIN2)"; \
-	( cd "$$out" && tar -czf "$(PROJECT)-$$target.tar.gz" "$(PROJECT)" && rm -rf "$(PROJECT)" ); \
-	echo ">> packaged $$out/$(PROJECT)-$$target.tar.gz"
+print:
+	@echo "Building for: GOOS=$(GOOS) GOARCH=$(GOARCH)  VERSION=$(VERSION)"
 
-release: clean \
-         pack-linux-amd64 \
-         pack-linux-arm64 \
-         pack-darwin-amd64 \
-         pack-darwin-arm64
-	@cd $(DISTDIR) && (sha256sum $(PROJECT)-*.tar.gz > SHA256SUMS || shasum -a 256 $(PROJECT)-*.tar.gz > SHA256SUMS)
+check-deps:
+	@command -v pkg-config >/dev/null 2>&1 || { echo "Error: pkg-config not found."; exit 1; }
+	@pkg-config --exists libffi || { \
+		echo "Error: libffi dev files not found (pkg-config name: libffi)."; \
+		echo "  Ubuntu:  sudo apt-get install -y libffi-dev pkg-config"; \
+		echo "  macOS:   brew install libffi"; \
+		exit 1; }
+
+build:
+	@rm -rf $(ROOT)
+	@mkdir -p $(BIN_DIR)
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@test -d lib      && cp -R lib      $(ROOT)/ || true
+	@test -d examples && cp -R examples $(ROOT)/ || true
+	@test -d docs     && cp -R docs     $(ROOT)/ || true
+	@test -d data     && cp -R data     $(ROOT)/ || true
+	@test -f LICENSE  && cp LICENSE     $(ROOT)/ || true
+	@test -f README.md && cp README.md  $(ROOT)/ || true
+	@echo "$(VERSION)" > $(ROOT)/VERSION
+
+package:
+	@mkdir -p $(DIST_DIR)
+	tar -C $(DIST_DIR) -czf $(TARNAME).tar.gz mindscript
+	@$(SHASUM) $(TARNAME).tar.gz > $(TARNAME).tar.gz.sha256
+	@echo "Created: $(TARNAME).tar.gz (+ .sha256)"
 
 clean:
-	rm -rf dist
-.PHONY: build-* pack-* release clean
+	@rm -rf $(DIST_DIR)

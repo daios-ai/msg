@@ -876,3 +876,82 @@ func Test_Lexer_Handle_QualifiedKind(t *testing.T) {
 		t.Fatalf("expected quoted Lexeme, got %q", got[2].Lexeme)
 	}
 }
+
+func wantScanError(t *testing.T, src string) {
+	t.Helper()
+	l := NewLexer(src)
+	_, err := l.Scan()
+	if err == nil {
+		t.Fatalf("expected Scan error for %q, got nil", src)
+	}
+}
+
+func Test_Lexer_Int_Bases_And_Underscores(t *testing.T) {
+	src := `0b1010 0o755 0xFF 1_000_000 0xFF_FF`
+	got := wantTypes(t, src, []TokenType{
+		INTEGER, INTEGER, INTEGER, INTEGER, INTEGER,
+	})
+	if got[0].Literal.(int64) != 10 {
+		t.Fatalf("0b1010 => 10, got %v", got[0].Literal)
+	}
+	if got[1].Literal.(int64) != 493 {
+		t.Fatalf("0o755 => 493, got %v", got[1].Literal)
+	}
+	if got[2].Literal.(int64) != 255 {
+		t.Fatalf("0xFF => 255, got %v", got[2].Literal)
+	}
+	if got[3].Literal.(int64) != 1000000 {
+		t.Fatalf("1_000_000 => 1000000, got %v", got[3].Literal)
+	}
+	if got[4].Literal.(int64) != 65535 {
+		t.Fatalf("0xFF_FF => 65535, got %v", got[4].Literal)
+	}
+}
+
+func Test_Lexer_Number_Underscores_Fraction_Exponent(t *testing.T) {
+	src := `3.14_15 1e1_0 1_000.0_5`
+	got := wantTypes(t, src, []TokenType{NUMBER, NUMBER, NUMBER})
+
+	if v := got[0].Literal.(float64); v < 3.14149 || v > 3.14151 {
+		t.Fatalf("3.14_15 ≈ 3.1415, got %v", v)
+	}
+	if v := got[1].Literal.(float64); v != 1e10 {
+		t.Fatalf("1e1_0 => 1e10, got %v", v)
+	}
+	if v := got[2].Literal.(float64); v < 1000.0499 || v > 1000.0501 {
+		t.Fatalf("1_000.0_5 ≈ 1000.05, got %v", v)
+	}
+}
+
+func Test_Lexer_Number_Decimal_LeadingZero_Errors(t *testing.T) {
+	// Decimal integers must not have leading zeros (except the single digit "0")
+	wantScanError(t, `00`)
+	wantScanError(t, `00 1`)  // still an error at the first token
+	wantScanError(t, `00.5`)  // "00" part is illegal
+	wantScanError(t, `0_1`)   // underscore after leading zero not allowed for decimal
+	wantScanError(t, `0_1e2`) // same rule even if exponent follows
+	// Valid edge-cases:
+	wantTypes(t, `0 0.5 0e10`, []TokenType{INTEGER, NUMBER, NUMBER})
+}
+
+func Test_Lexer_Number_Underscore_Misplacements_Errors(t *testing.T) {
+	// Underscores cannot be adjacent to '.' or at the start/end of a digit run.
+	wantScanError(t, `3._14`)
+	wantScanError(t, `3_.14`)
+	wantScanError(t, `1e_10`)
+	wantScanError(t, `1e+_10`)
+	wantScanError(t, `0x_FF`)    // not allowed right after base prefix
+	wantScanError(t, `0b101__0`) // double underscore
+	wantScanError(t, `123_`)     // trailing underscore
+}
+
+func Test_Lexer_UnarySigns_AreSeparateTokens(t *testing.T) {
+	src := `+1 -0xF`
+	got := wantTypes(t, src, []TokenType{PLUS, INTEGER, MINUS, INTEGER})
+	if got[1].Literal.(int64) != 1 {
+		t.Fatalf("+1 should yield INTEGER 1, got %v", got[1].Literal)
+	}
+	if got[3].Literal.(int64) != 15 {
+		t.Fatalf("-0xF should lex as MINUS + INTEGER(15), got %v", got[3].Literal)
+	}
+}

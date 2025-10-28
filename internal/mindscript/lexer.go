@@ -493,12 +493,60 @@ func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 func isHex(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
-func isAlpha(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' }
+func isBin(b byte) bool { return b == '0' || b == '1' }
+func isOct(b byte) bool { return b >= '0' && b <= '7' }
+func isAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
+}
 func isAlphaNum(b byte) bool {
-	return (b >= 'a' && b <= 'z') ||
-		(b >= 'A' && b <= 'Z') ||
-		(b >= '0' && b <= '9') ||
-		b == '_'
+	return isAlpha(b) || (b >= '0' && b <= '9')
+}
+
+// readDigitsUS reads a run of digits (per pred) allowing single underscores
+// between digits. It returns (hadDigits, endedOnUnderscore, err).
+// Rules enforced:
+//   - first char must be a digit (no leading '_')
+//   - underscores must be single and between digits (no "__", no trailing '_')
+func (l *Lexer) readDigitsUS(pred func(byte) bool) (bool, bool, error) {
+	had := false
+	lastUnd := false
+	for {
+		b, ok := l.peek()
+		if !ok {
+			break
+		}
+		if b == '_' {
+			// underscore must follow a digit and be followed by a digit
+			if !had || lastUnd {
+				return had, true, l.err("misplaced '_' in number")
+			}
+			// lookahead must be a digit
+			if b2, ok2 := l.peekN(1); !ok2 || !pred(b2) {
+				return had, true, l.err("misplaced '_' in number")
+			}
+			lastUnd = true
+			l.advance()
+			continue
+		}
+		if !pred(b) {
+			break
+		}
+		l.advance()
+		had = true
+		lastUnd = false
+	}
+	return had, lastUnd, nil
+}
+
+func stripUnderscores(s string) string {
+	// small, allocation-friendly strip
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '_' {
+			out = append(out, s[i])
+		}
+	}
+	return string(out)
 }
 
 func (l *Lexer) afterDotIsProperty() bool {
@@ -678,54 +726,113 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	sawDot := false
 	sawExp := false
 
-	// integral part (optional for leading '.')
-	for {
-		b, ok := l.peek()
-		if !ok || !isDigit(b) {
-			break
-		}
+	startCur := l.cur
+
+	// --- Base-prefixed integers: 0b..., 0o..., 0x...
+	if b0, ok := l.peek(); ok && b0 == '0' {
+		// Tentatively consume '0' and inspect next char
 		l.advance()
+		if pfx, ok2 := l.peek(); ok2 && (pfx == 'b' || pfx == 'B' || pfx == 'o' || pfx == 'O' || pfx == 'x' || pfx == 'X') {
+			l.advance()
+			var pred func(byte) bool
+			var base int
+			switch pfx {
+			case 'b', 'B':
+				pred, base = isBin, 2
+			case 'o', 'O':
+				pred, base = isOct, 8
+			default:
+				pred, base = isHex, 16
+			}
+			had, endedUnd, usErr := l.readDigitsUS(pred)
+			if usErr != nil {
+				return ILLEGAL, nil, usErr
+			}
+			if !had || endedUnd {
+				return ILLEGAL, nil, l.err("invalid integer literal")
+			}
+			lex := l.src[l.start:l.cur]
+			valStr := stripUnderscores(lex[2:]) // strip digits after prefix
+			v, convErr := strconv.ParseInt(valStr, base, 64)
+			if convErr != nil {
+				return ILLEGAL, nil, l.err("invalid integer literal")
+			}
+			return INTEGER, v, nil
+		}
+		// Not a base prefix → decimal starting with 0.
+		// If next is another digit or underscore, it's a leading-zeros error
+		// unless we immediately form a float/exponent (e.g., "0.5", "0e10").
+		if nb, ok3 := l.peek(); ok3 && (nb == '_' || isDigit(nb)) {
+			return ILLEGAL, nil, l.err("leading zeros not allowed in decimal integer")
+		}
+		// Else keep sawDigits=true and let fraction/exp logic run (for "0.5", "0e10"),
+		// or finalize as integer zero if neither appears.
 		sawDigits = true
+	}
+
+	// integral part (optional for leading '.'); allow underscores
+	if !sawDigits {
+		had, endedUnd, usErr := l.readDigitsUS(isDigit)
+		if usErr != nil {
+			return ILLEGAL, nil, usErr
+		}
+		sawDigits = had
+		if endedUnd {
+			return ILLEGAL, nil, l.err("misplaced '_' in number")
+		}
 	}
 
 	// fractional part
 	if b, ok := l.peek(); ok && b == '.' {
-		// Do NOT consume '.' if we're after a property PERIOD (obj.<digits>)
-		// OR if the next char is also '.' (e.g. "1..2").
+		// Do NOT consume '.' if after property or doubled '..'
 		if !(l.afterDotIsProperty()) {
 			if b2, ok2 := l.peekN(1); !(ok2 && b2 == '.') {
-				l.advance() // consume '.'
+				// disallow underscore immediately before '.'
+				if l.cur > startCur && l.src[l.cur-1] == '_' {
+					return ILLEGAL, nil, l.err("misplaced '_' in number")
+				}
+				l.advance() // '.'
 				sawDot = true
-				for {
-					b2, ok2 := l.peek()
-					if !ok2 || !isDigit(b2) {
-						break
-					}
-					l.advance()
+				// fraction digits with underscores; must start with a digit (no leading '_')
+				had, endedUnd, usErr := l.readDigitsUS(isDigit)
+				if usErr != nil {
+					return ILLEGAL, nil, usErr
+				}
+				// It's valid to have no fractional digits only if we will have an exponent later.
+				if endedUnd {
+					return ILLEGAL, nil, l.err("misplaced '_' in number")
+				}
+				if had {
 					sawDigits = true
 				}
 			}
 		}
 	}
 
-	// exponent part: ([eE][+-]?digits)?
+	// exponent part: ([eE][+-]?digits with underscores)?
 	if b, ok := l.peek(); ok && (b == 'e' || b == 'E') {
 		save := l.cur
-		l.advance() // consume e/E
+		l.advance() // e/E
 		if b2, ok := l.peek(); ok && (b2 == '+' || b2 == '-') {
 			l.advance()
 		}
+		// disallow '_' immediately after 'e' or sign
+		if b3, ok := l.peek(); ok && b3 == '_' {
+			return ILLEGAL, nil, l.err("invalid float literal")
+		}
+		// first exponent char must be a digit
 		if b3, ok := l.peek(); ok && isDigit(b3) {
-			sawExp = true
-			for {
-				b4, ok := l.peek()
-				if !ok || !isDigit(b4) {
-					break
-				}
-				l.advance()
+			had, endedUnd, usErr := l.readDigitsUS(isDigit)
+			if usErr != nil {
+				return ILLEGAL, nil, usErr
 			}
+			if !had || endedUnd {
+				return ILLEGAL, nil, l.err("invalid float literal")
+			}
+			sawExp = true
 		} else {
-			l.cur = save // no exponent
+			// no exponent digits → backtrack
+			l.cur = save
 		}
 	}
 
@@ -734,14 +841,22 @@ func (l *Lexer) scanNumber() (tok TokenType, lit interface{}, err error) {
 	}
 
 	lex := l.src[l.start:l.cur]
+
+	// If it's a pure decimal integer (no dot/exp), enforce no leading zeros (except "0").
 	if !sawDot && !sawExp {
-		v, convErr := strconv.ParseInt(lex, 10, 64)
+		decStr := stripUnderscores(lex)
+		if len(decStr) > 1 && decStr[0] == '0' {
+			return ILLEGAL, nil, l.err("leading zeros not allowed in decimal integer")
+		}
+		v, convErr := strconv.ParseInt(decStr, 10, 64)
 		if convErr != nil {
 			return ILLEGAL, nil, l.err("invalid integer literal")
 		}
 		return INTEGER, v, nil
 	}
-	vf, convErr := strconv.ParseFloat(lex, 64)
+
+	// Float: strip underscores before ParseFloat
+	vf, convErr := strconv.ParseFloat(stripUnderscores(lex), 64)
 	if convErr != nil {
 		return ILLEGAL, nil, l.err("invalid float literal")
 	}

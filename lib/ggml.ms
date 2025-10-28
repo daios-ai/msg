@@ -1,310 +1,704 @@
-# ggml.ms — public wrapper module for GGML (https://github.com/ggml-org/ggml)
+# ggml.ms — MindScript wrapper for libggml.so (ELF + SysV ABI)
+# Policy: Aggregates cross the FFI boundary as handles only.
+# Opaque C pointers are exposed as tagged VTHandle values.
 #
-# Wraps a useful, curated subset of the GGML C API using MindScript `ffiOpen`.
-# Policy: **aggregates = handles only**. No inline struct/array literals cross FFI.
+# Coverage:
+# - Context / memory / enumeration
+# - Tensor meta & introspection
+# - Naming / flags
+# - Core math (binary/unary), broadcast, rows/indexing, reductions
+# - Matmul (incl. precision), out-prods, softmax (fused), RoPE (+multi, +back)
+# - Flash attention (ext + back)
+# - Convolutions / pooling / resize / pad / roll / windows / rel-pos
+# - Graph build/dup/size/traversal/compute/status
+# - Custom ops (map*, custom_4d/inplace)
+# - Loss/optimizers
+# - Quantization (incl. row helpers) + type traits
+# - fp16/bf16 scalar + row conversions
+# - Logging / abort callbacks
+# - Threadpool params helpers
+# - Misc: GUID, UTF-8 fopen, unravel_index
 #
-# --- 1) Load raw FFI privately -------------------------------------------------
+# NOTE:
+# - Enums are bound as 32-bit signed ints.
+# - In-place variants return a view handle, matching C API docs.
+# - When C returns structs (e.g., ggml_bf16_t), ffiOpen boxes the return into heap storage and returns a handle.
 
 let _C = ffiOpen({
-  version: "1",
-  lib: "libggml.so",
-  types: {
-    # scalars
-    i32:   { kind:"int",   bits:32, signed:true  },
-    u32:   { kind:"int",   bits:32, signed:false },
-    i64:   { kind:"int",   bits:64, signed:true  },
-    u64:   { kind:"int",   bits:64, signed:false },
-    size_t:{ kind:"int",   bits:64, signed:false },  # SysV/ELF (LP64)
-    bool:  { kind:"int",   bits:8,  signed:false },   # _Bool
-    f32:   { kind:"float", bits:32 },
-    f64:   { kind:"float", bits:64 },
+  "version": "1",
+  "lib": "./libggml.so",
 
-    # common pointers / handles
-    voidp: { kind:"pointer", to:{kind:"void"}, tag:"ggml.ptr.void" },
-    charp: { kind:"pointer", to:{kind:"int", bits:8, signed:true}, tag:"c.str*" },
+  "types": {
+    # -------- scalars --------
+    "bool":   { "kind":"int", "bits":8,  "signed":false },
+    "i16":    { "kind":"int", "bits":16, "signed":true },
+    "u16":    { "kind":"int", "bits":16, "signed":false },
+    "i32":    { "kind":"int", "bits":32, "signed":true },
+    "u32":    { "kind":"int", "bits":32, "signed":false },
+    "i64":    { "kind":"int", "bits":64, "signed":true },
+    "size_t": { "kind":"int", "bits":64, "signed":false },
 
-    Ctx:   { kind:"pointer", to:{kind:"void"}, tag:"ggml.context*" },
-    Tensor:{ kind:"pointer", to:{kind:"void"}, tag:"ggml.tensor*" },
-    CGraph:{ kind:"pointer", to:{kind:"void"}, tag:"ggml.cgraph*" },
-    FILEp: { kind:"pointer", to:{kind:"void"}, tag:"FILE*" },
+    "f32": { "kind":"float", "bits":32 },
+    "f64": { "kind":"float", "bits":64 },
 
-    # enums (as i32)
-    ggml_type: { kind:"int", bits:32, signed:true },
-    ggml_log_level: { kind:"int", bits:32, signed:true },
+    # -------- pointers / handles --------
+    "charp":  { "kind":"pointer", "to": { "kind":"int", "bits":8, "signed":true } },
+    "voidp":  { "kind":"pointer", "to": { "kind":"void" }, "tag":"c.void*" },
+    "f32ptr": { "kind":"pointer", "to": { "kind":"float","bits":32 }, "tag":"c.float*" },
 
-    # struct ggml_init_params (by-value aggregate param to ggml_init)
-    ggml_init_params: { kind:"struct", fields:[
-      { name:"mem_size",   type:"size_t" },
-      { name:"mem_buffer", type:"voidp"   },
-      { name:"no_alloc",   type:"bool"    }
-    ]},
+    "ggml_context": { "kind":"pointer", "to": { "kind":"void" }, "tag":"ggml.context*" },
+    "ggml_tensor":  { "kind":"pointer", "to": { "kind":"void" }, "tag":"ggml.tensor*"  },
+    "ggml_cgraph":  { "kind":"pointer", "to": { "kind":"void" }, "tag":"ggml.cgraph*"  },
 
-    # helpers for arrays
-    i64p: { kind:"pointer", to:"i64", tag:"i64*" },
-    Tensorp: { kind:"pointer", to:"Tensor", tag:"ggml.tensor**" }
+    # pointer-to-pointer (for ggml_build_backward_expand grad_accs**)
+    "ggml_tensor_ptr": { "kind":"pointer", "to":"ggml_tensor", "tag":"ggml.tensor**" },
+
+    # -------- enums as ints --------
+    "ggml_type":     { "kind":"int", "bits":32, "signed":true },
+    "ggml_op":       { "kind":"int", "bits":32, "signed":true },
+    "ggml_prec":     { "kind":"int", "bits":32, "signed":true },
+    "ggml_status":   { "kind":"int", "bits":32, "signed":true },
+    "ggml_log_level":{ "kind":"int", "bits":32, "signed":true },
+    "ggml_op_pool":  { "kind":"int", "bits":32, "signed":true },
+    "ggml_sort_order":{ "kind":"int","bits":32, "signed":true },
+
+    # -------- small structs --------
+    # struct ggml_init_params { size_t mem_size; void * mem_buffer; bool no_alloc; }
+    "ggml_init_params": {
+      "kind":"struct",
+      "fields":[
+        { "name":"mem_size",   "type":"size_t" },
+        { "name":"mem_buffer", "type":"voidp"  },
+        { "name":"no_alloc",   "type":"bool"   }
+      ]
+    },
+
+    # struct ggml_bf16_t { uint16_t bits; }
+    "ggml_bf16_t": {
+      "kind":"struct",
+      "fields":[ { "name":"bits", "type":"u16" } ]
+    },
+
+    # -------- function pointers --------
+    # void (*ggml_abort_callback_t)(const char * msg)
+    "ggml_abort_cb": {
+      "kind":"funcptr",
+      "ret": { "kind":"void" },
+      "params": [ { "kind":"pointer", "to": { "kind":"int","bits":8,"signed":true } } ],
+      "variadic": false
+    },
+    # void ggml_log_callback(enum ggml_log_level level, const char * text, void * user_data)
+    "ggml_log_cb": {
+      "kind":"funcptr",
+      "ret": { "kind":"void" },
+      "params": [ "ggml_log_level", "charp", "voidp" ],
+      "variadic": false
+    }
   },
-  functions: [
-    # misc / version
-    { name:"ggml_version", ret:"charp", params:[], ret_as_str:true },
-    { name:"ggml_commit",  ret:"charp", params:[], ret_as_str:true },
 
-    # time utils
-    { name:"ggml_time_init",    ret:{kind:"void"}, params:[] },
-    { name:"ggml_time_ms",      ret:"i64", params:[] },
-    { name:"ggml_time_us",      ret:"i64", params:[] },
-    { name:"ggml_cycles",       ret:"i64", params:[] },
-    { name:"ggml_cycles_per_ms",ret:"i64", params:[] },
+  "functions": [
+    # ======= Version / timing =======
+    { "name":"ggml_version",   "ret":"charp", "params":[], "ret_as_str":true },
+    { "name":"ggml_commit",    "ret":"charp", "params":[], "ret_as_str":true },
+    { "name":"ggml_time_init", "ret":{ "kind":"void" }, "params":[] },
+    { "name":"ggml_time_ms",   "ret":"i64", "params":[] },
+    { "name":"ggml_time_us",   "ret":"i64", "params":[] },
+    { "name":"ggml_cycles",         "ret":"i64", "params":[] },
+    { "name":"ggml_cycles_per_ms",  "ret":"i64", "params":[] },
 
-    # file helper
-    { name:"ggml_fopen", ret:"FILEp", params:["charp","charp"] },
+    # ======= Context / memory =======
+    { "name":"ggml_init",  "ret":"ggml_context", "params":[ "ggml_init_params" ] },
+    { "name":"ggml_free",  "ret":{ "kind":"void" }, "params":[ "ggml_context" ] },
+    { "name":"ggml_reset", "ret":{ "kind":"void" }, "params":[ "ggml_context" ] },
+    { "name":"ggml_used_mem", "ret":"size_t", "params":[ "ggml_context" ] },
+    { "name":"ggml_get_no_alloc", "ret":"bool", "params":[ "ggml_context" ] },
+    { "name":"ggml_set_no_alloc", "ret":{ "kind":"void" }, "params":[ "ggml_context","bool" ] },
+    { "name":"ggml_get_mem_buffer", "ret":"voidp", "params":[ "ggml_context" ] },
+    { "name":"ggml_get_mem_size", "ret":"size_t", "params":[ "ggml_context" ] },
+    { "name":"ggml_get_max_tensor_size", "ret":"size_t","params":[ "ggml_context" ] },
+    { "name":"ggml_new_buffer", "ret":"voidp", "params":[ "ggml_context","size_t" ] },
 
-    # type / size helpers
-    { name:"ggml_type_size", ret:"size_t", params:["ggml_type"] },
-    { name:"ggml_row_size",  ret:"size_t", params:["ggml_type","i64"] },
-    { name:"ggml_type_name",  ret:"charp", params:["ggml_type"], ret_as_str:true },
+    # Context enumeration / lookup
+    { "name":"ggml_get_first_tensor", "ret":"ggml_tensor", "params":[ "ggml_context" ] },
+    { "name":"ggml_get_next_tensor",  "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_get_tensor",       "ret":"ggml_tensor", "params":[ "ggml_context","charp" ] },
 
-    # context lifecycle
-    { name:"ggml_init",  ret:"Ctx", params:[ "ggml_init_params" ] },   # NOTE: by-value struct → pass handle
-    { name:"ggml_reset", ret:{kind:"void"}, params:["Ctx"] },
-    { name:"ggml_free",  ret:{kind:"void"}, params:["Ctx"] },
+    # ======= Tensor meta & introspection =======
+    { "name":"ggml_nelements",   "ret":"i64",   "params":[ "ggml_tensor" ] },
+    { "name":"ggml_nrows",       "ret":"i64",   "params":[ "ggml_tensor" ] },
+    { "name":"ggml_nbytes",      "ret":"size_t","params":[ "ggml_tensor" ] },
+    { "name":"ggml_nbytes_pad",  "ret":"size_t","params":[ "ggml_tensor" ] },
+    { "name":"ggml_element_size","ret":"size_t","params":[ "ggml_tensor" ] },
+    { "name":"ggml_blck_size",   "ret":"i64",   "params":[ "ggml_type" ] },
+    { "name":"ggml_row_size",    "ret":"size_t","params":[ "ggml_type","i64" ] },
 
-    { name:"ggml_used_mem",        ret:"size_t", params:["Ctx"] },
-    { name:"ggml_get_no_alloc",    ret:"bool", params:["Ctx"] },
-    { name:"ggml_set_no_alloc",    ret:{kind:"void"}, params:["Ctx","bool"] },
-    { name:"ggml_get_mem_buffer",  ret:"voidp", params:["Ctx"] },
-    { name:"ggml_get_mem_size",    ret:"size_t", params:["Ctx"] },
-    { name:"ggml_get_max_tensor_size", ret:"size_t", params:["Ctx"] },
+    { "name":"ggml_type_name",   "ret":"charp", "params":[ "ggml_type" ], "ret_as_str":true },
+    { "name":"ggml_op_name",     "ret":"charp", "params":[ "ggml_op" ],   "ret_as_str":true },
+    { "name":"ggml_op_symbol",   "ret":"charp", "params":[ "ggml_op" ],   "ret_as_str":true },
 
-    # tensor creation
-    { name:"ggml_new_tensor",   ret:"Tensor", params:["Ctx","ggml_type","i32","i64p"] },
-    { name:"ggml_new_tensor_1d",ret:"Tensor", params:["Ctx","ggml_type","i64"] },
-    { name:"ggml_new_tensor_2d",ret:"Tensor", params:["Ctx","ggml_type","i64","i64"] },
-    { name:"ggml_new_tensor_3d",ret:"Tensor", params:["Ctx","ggml_type","i64","i64","i64"] },
-    { name:"ggml_new_tensor_4d",ret:"Tensor", params:["Ctx","ggml_type","i64","i64","i64","i64"] },
+    { "name":"ggml_is_transposed", "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_permuted",   "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_empty",      "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_scalar",     "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_vector",     "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_matrix",     "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_3d",         "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_n_dims",        "ret":"i32",  "params":[ "ggml_tensor" ] },
 
-    { name:"ggml_dup_tensor",   ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_view_tensor",  ret:"Tensor", params:["Ctx","Tensor"] },
+    { "name":"ggml_is_contiguous",   "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_contiguous_0", "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_contiguous_1", "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_contiguous_2", "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_contiguously_allocated","ret":"bool","params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_contiguous_channels", "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_is_contiguous_rows",     "ret":"bool", "params":[ "ggml_tensor" ] },
 
-    # tensor queries
-    { name:"ggml_nelements", ret:"i64", params:["Tensor"] },
-    { name:"ggml_nrows",     ret:"i64", params:["Tensor"] },
-    { name:"ggml_nbytes",    ret:"size_t", params:["Tensor"] },
-    { name:"ggml_nbytes_pad",ret:"size_t", params:["Tensor"] },
-    { name:"ggml_element_size", ret:"size_t", params:["Tensor"] },
+    { "name":"ggml_can_repeat",    "ret":"bool", "params":[ "ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_tensor_overhead", "ret":"size_t", "params":[] },
+    { "name":"ggml_validate_row_data","ret":"bool","params":[ "ggml_type","voidp","size_t" ] },
 
-    { name:"ggml_get_data",      ret:"voidp", params:["Tensor"] },
-    { name:"ggml_get_data_f32",  ret:{ kind:"pointer", to:"f32", tag:"float*" }, params:["Tensor"] },
-    { name:"ggml_get_name",      ret:"charp", params:["Tensor"], ret_as_str:true },
-    { name:"ggml_set_name",      ret:"Tensor", params:["Tensor","charp"] },
+    { "name":"ggml_unravel_index", "ret":{ "kind":"void" },
+      "params":[ "ggml_tensor","i64",{ "kind":"pointer","to":"i64" },{ "kind":"pointer","to":"i64" },{ "kind":"pointer","to":"i64" },{ "kind":"pointer","to":"i64" } ] },
 
-    # tensor flags
-    { name:"ggml_set_input",  ret:{kind:"void"}, params:["Tensor"] },
-    { name:"ggml_set_output", ret:{kind:"void"}, params:["Tensor"] },
-    { name:"ggml_set_param",  ret:{kind:"void"}, params:["Tensor"] },
-    { name:"ggml_set_loss",   ret:{kind:"void"}, params:["Tensor"] },
+    { "name":"ggml_get_unary_op","ret":"i32", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_get_glu_op",  "ret":"i32", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_op_desc",     "ret":"charp", "params":[ "ggml_tensor" ], "ret_as_str":true },
 
-    # basic operations (representative set)
-    { name:"ggml_add",   ret:"Tensor", params:["Ctx","Tensor","Tensor"] },
-    { name:"ggml_mul",   ret:"Tensor", params:["Ctx","Tensor","Tensor"] },
-    { name:"ggml_div",   ret:"Tensor", params:["Ctx","Tensor","Tensor"] },
-    { name:"ggml_sum",   ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_mul_mat", ret:"Tensor", params:["Ctx","Tensor","Tensor"] },
-    { name:"ggml_relu",  ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_gelu",  ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_soft_max", ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_norm",  ret:"Tensor", params:["Ctx","Tensor","f32"] },
+    # ======= Data access =======
+    { "name":"ggml_get_data",     "ret":"voidp",  "params":[ "ggml_tensor" ] },
+    { "name":"ggml_get_data_f32", "ret":"f32ptr", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_set_zero",     "ret":"ggml_tensor", "params":[ "ggml_tensor" ] },
 
-    # view/shape utilities
-    { name:"ggml_transpose", ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_cont",      ret:"Tensor", params:["Ctx","Tensor"] },
-    { name:"ggml_reshape_2d",ret:"Tensor", params:["Ctx","Tensor","i64","i64"] },
+    # ======= Tensor creation / views =======
+    { "name":"ggml_new_tensor",    "ret":"ggml_tensor", "params":[ "ggml_context","ggml_type","i32",{ "kind":"pointer","to":"i64" } ] },
+    { "name":"ggml_new_tensor_1d", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_type","i64" ] },
+    { "name":"ggml_new_tensor_2d", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_type","i64","i64" ] },
+    { "name":"ggml_new_tensor_3d", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_type","i64","i64","i64" ] },
+    { "name":"ggml_new_tensor_4d", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_type","i64","i64","i64","i64" ] },
+    { "name":"ggml_dup_tensor",    "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_view_tensor",   "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor" ] },
 
-    # data movement / cast
-    { name:"ggml_cpy",   ret:"Tensor", params:["Ctx","Tensor","Tensor"] },
-    { name:"ggml_cast",  ret:"Tensor", params:["Ctx","Tensor","ggml_type"] },
+    # ======= Names & flags =======
+    { "name":"ggml_get_name",   "ret":"charp", "params":[ "ggml_tensor" ], "ret_as_str":true },
+    { "name":"ggml_set_name",   "ret":"ggml_tensor", "params":[ "ggml_tensor","charp" ] },
+    { "name":"ggml_format_name","ret":"ggml_tensor", "params":[ "ggml_tensor","charp" ] },
+    { "name":"ggml_set_input",  "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
+    { "name":"ggml_set_output", "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
+    { "name":"ggml_set_param",  "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
+    { "name":"ggml_set_loss",   "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
 
-    # graph
-    { name:"ggml_new_graph", ret:"CGraph", params:["Ctx"] },
-    { name:"ggml_new_graph_custom", ret:"CGraph", params:["Ctx","size_t","bool"] },
-    { name:"ggml_build_forward_expand", ret:{kind:"void"}, params:["CGraph","Tensor"] },
-    { name:"ggml_graph_size",  ret:"i32", params:["CGraph"] },
-    { name:"ggml_graph_node",  ret:"Tensor", params:["CGraph","i32"] },
-    { name:"ggml_graph_print", ret:{kind:"void"}, params:["CGraph"] }
+    # ======= Core binary ops =======
+    { "name":"ggml_add", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_add_inplace", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_sub", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_sub_inplace", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_mul", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_mul_inplace", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_div", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_div_inplace", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+
+    # ======= Unary & activation =======
+    { "name":"ggml_sqr",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sqr_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sqrt", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sqrt_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_log",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_log_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sin",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sin_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_cos",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_cos_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_exp",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_exp_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+
+    { "name":"ggml_abs", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_abs_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sgn", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sgn_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_neg", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_neg_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_step", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_step_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+
+    { "name":"ggml_tanh", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_tanh_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_elu", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_elu_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_relu", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_relu_inplace", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_leaky_relu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32","bool" ] },
+    { "name":"ggml_sigmoid","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sigmoid_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_gelu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_gelu_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_gelu_erf","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_gelu_erf_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_gelu_quick","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_gelu_quick_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_silu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_silu_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_silu_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_hardswish","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_hardsigmoid","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_xielu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32","f32","f32","f32" ] },
+
+    # ======= Reductions / rows / broadcast =======
+    { "name":"ggml_sum", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_sum_rows","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_mean","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_argmax","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_count_equal","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+
+    { "name":"ggml_repeat","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_repeat_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","i64" ] },
+    { "name":"ggml_repeat_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_concat","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32" ] },
+
+    { "name":"ggml_add1","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_add1_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_add_id","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_acc","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t","size_t","size_t","size_t" ] },
+    { "name":"ggml_acc_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t","size_t","size_t","size_t" ] },
+
+    # ======= Rows / indexing =======
+    { "name":"ggml_get_rows", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_get_rows_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_set_rows","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+
+    { "name":"ggml_diag", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_diag_mask_inf","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+    { "name":"ggml_diag_mask_inf_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+    { "name":"ggml_diag_mask_zero","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+    { "name":"ggml_diag_mask_zero_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+
+    # ======= Softmax & fused softmax =======
+    { "name":"ggml_soft_max","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_soft_max_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+
+    { "name":"ggml_soft_max_ext","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","f32","f32" ] },
+    { "name":"ggml_soft_max_ext_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","f32","f32" ] },
+    { "name":"ggml_soft_max_add_sinks","ret":{ "kind":"void" },"params":[ "ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_soft_max_ext_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","f32","f32" ] },
+    { "name":"ggml_soft_max_ext_back_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","f32","f32" ] },
+
+    # ======= Norms =======
+    { "name":"ggml_norm","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_norm_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_rms_norm","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_rms_norm_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_group_norm","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","f32" ] },
+    { "name":"ggml_group_norm_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","f32" ] },
+    { "name":"ggml_l2_norm","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_l2_norm_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_rms_norm_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","f32" ] },
+
+    # ======= Matmul / products =======
+    { "name":"ggml_mul_mat","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_mul_mat_set_prec","ret":{ "kind":"void" },"params":[ "ggml_tensor","ggml_prec" ] },
+    { "name":"ggml_mul_mat_id","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_out_prod","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+
+    # ======= Movement / reshape / cast / set =======
+    { "name":"ggml_scale","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_scale_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32" ] },
+    { "name":"ggml_scale_bias","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32","f32" ] },
+    { "name":"ggml_scale_bias_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32","f32" ] },
+
+    { "name":"ggml_set","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t","size_t","size_t","size_t" ] },
+    { "name":"ggml_set_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t","size_t","size_t","size_t" ] },
+    { "name":"ggml_set_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t" ] },
+    { "name":"ggml_set_1d_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t" ] },
+    { "name":"ggml_set_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t","size_t" ] },
+    { "name":"ggml_set_2d_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","size_t","size_t" ] },
+
+    { "name":"ggml_cpy","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_cast","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_type" ] },
+    { "name":"ggml_add_cast","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_type" ] },
+
+    { "name":"ggml_cont","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_cont_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64" ] },
+    { "name":"ggml_cont_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64" ] },
+    { "name":"ggml_cont_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64" ] },
+    { "name":"ggml_cont_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","i64" ] },
+
+    { "name":"ggml_reshape","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_reshape_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64" ] },
+    { "name":"ggml_reshape_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64" ] },
+    { "name":"ggml_reshape_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64" ] },
+    { "name":"ggml_reshape_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","i64" ] },
+
+    { "name":"ggml_view_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","size_t" ] },
+    { "name":"ggml_view_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","size_t","size_t" ] },
+    { "name":"ggml_view_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","size_t","size_t","size_t" ] },
+    { "name":"ggml_view_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","i64","size_t","size_t","size_t","size_t" ] },
+
+    { "name":"ggml_permute","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] },
+    { "name":"ggml_transpose","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+
+    # ======= Clamp / arange / argsort / topk =======
+    { "name":"ggml_clamp","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","f32","f32" ] },
+    { "name":"ggml_arange","ret":"ggml_tensor","params":[ "ggml_context","f32","f32","f32" ] },
+    { "name":"ggml_argsort","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_sort_order" ] },
+    { "name":"ggml_top_k","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+
+    # ======= Trunc / floor / ceil / round =======
+    { "name":"ggml_trunc","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_trunc_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_floor","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_floor_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_ceil","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_ceil_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_round","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_round_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+
+    # ======= GLU family =======
+    { "name":"ggml_glu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","bool" ] },
+    { "name":"ggml_reglu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_reglu_swapped","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_geglu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_geglu_swapped","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_swiglu","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_swiglu_swapped","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_geglu_erf","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_geglu_erf_swapped","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_geglu_quick","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_geglu_quick_swapped","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_glu_split","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32" ] },
+    { "name":"ggml_reglu_split","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_geglu_split","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_swiglu_split","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_geglu_erf_split","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_geglu_quick_split","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_swiglu_oai","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","f32","f32" ] },
+
+    # ======= RoPE =======
+    { "name":"ggml_rope","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32" ] },
+    { "name":"ggml_rope_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32" ] },
+    { "name":"ggml_rope_ext","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","i32","i32","i32","f32","f32","f32","f32","f32","f32" ] },
+    { "name":"ggml_rope_multi","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","i32",{ "kind":"pointer","to":"i32" },"i32","i32","f32","f32","f32","f32","f32","f32" ] },
+    { "name":"ggml_rope_ext_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","i32","i32","i32","f32","f32","f32","f32","f32","f32" ] },
+    { "name":"ggml_rope_multi_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","i32",{ "kind":"pointer","to":"i32" },"i32","i32","f32","f32","f32","f32","f32","f32" ] },
+    { "name":"ggml_rope_yarn_corr_dims","ret":{ "kind":"void" }, "params":[ "i32","i32","f32","f32","f32",{ "kind":"pointer","to":"f32" } ] },
+    { "name":"ggml_rope_ext_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","i32","i32","i32","f32","f32","f32","f32","f32","f32" ] },
+    { "name":"ggml_rope_multi_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","i32",{ "kind":"pointer","to":"i32" },"i32","i32","f32","f32","f32","f32","f32","f32" ] },
+
+    # ======= Flash attention =======
+    { "name":"ggml_flash_attn_ext","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","f32","f32","f32" ] },
+    { "name":"ggml_flash_attn_ext_set_prec","ret":{ "kind":"void" }, "params":[ "ggml_tensor","ggml_prec" ] },
+    { "name":"ggml_flash_attn_ext_get_prec","ret":"ggml_prec", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_flash_attn_ext_add_sinks","ret":{ "kind":"void" }, "params":[ "ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_flash_attn_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","bool" ] },
+
+    # ======= SSM / RWKV / Gated linear attn =======
+    { "name":"ggml_ssm_conv","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_ssm_scan","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_rwkv_wkv6","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_gated_linear_attn","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","f32" ] },
+    { "name":"ggml_rwkv_wkv7","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+
+    # ======= Convolution / pooling / resize / pad / roll =======
+    { "name":"ggml_im2col","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32","bool","ggml_type" ] },
+    { "name":"ggml_im2col_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":"i64" },"i32","i32","i32","i32","i32","i32","bool" ] },
+
+    { "name":"ggml_conv_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32" ] },
+    { "name":"ggml_conv_1d_ph","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32" ] },
+    { "name":"ggml_conv_1d_dw","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32" ] },
+    { "name":"ggml_conv_1d_dw_ph","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32" ] },
+    { "name":"ggml_conv_transpose_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32" ] },
+
+    { "name":"ggml_conv_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_conv_2d_dw","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_conv_2d_dw_direct","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_conv_2d_direct","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_conv_transpose_2d_p0","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32" ] },
+    { "name":"ggml_conv_2d_sk_p0","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_conv_2d_s1_ph","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+
+    { "name":"ggml_im2col_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i64","i32","i32","i32","i32","i32","i32","i32","i32","ggml_type" ] },
+    { "name":"ggml_conv_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i64","i32","i32","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_conv_3d_direct","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32","i32","i32","i32","i32","i32" ] },
+
+    { "name":"ggml_pool_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] }, # op as i32 (enum)
+    { "name":"ggml_pool_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32","i32","f32","f32" ] },
+    { "name":"ggml_pool_2d_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","f32","f32" ] },
+
+    { "name":"ggml_upscale","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32" ] }, # mode as i32
+    { "name":"ggml_interpolate","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","i64","u32" ] },
+
+    { "name":"ggml_pad","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] },
+    { "name":"ggml_pad_ext","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_pad_reflect_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32" ] },
+
+    { "name":"ggml_roll","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] },
+
+    { "name":"ggml_timestep_embedding","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32" ] },
+
+    # Windows / relative position
+    { "name":"ggml_win_part","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+    { "name":"ggml_win_unpart","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32" ] },
+    { "name":"ggml_get_rel_pos","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32" ] },
+    { "name":"ggml_add_rel_pos","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_add_rel_pos_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+
+    # ======= Generic unary dispatcher =======
+    { "name":"ggml_unary","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+    { "name":"ggml_unary_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32" ] },
+
+    # ======= Graph API =======
+    { "name":"ggml_new_graph",            "ret":"ggml_cgraph", "params":[ "ggml_context" ] },
+    { "name":"ggml_new_graph_custom",     "ret":"ggml_cgraph", "params":[ "ggml_context","size_t","bool" ] },
+    { "name":"ggml_build_forward_expand", "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_tensor" ] },
+    { "name":"ggml_build_backward_expand","ret":{ "kind":"void" }, "params":[ "ggml_context","ggml_cgraph","ggml_tensor_ptr" ] },
+
+    { "name":"ggml_graph_dup",            "ret":"ggml_cgraph", "params":[ "ggml_context","ggml_cgraph","bool" ] },
+    { "name":"ggml_graph_cpy",            "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_cgraph" ] },
+    { "name":"ggml_graph_reset",          "ret":{ "kind":"void" }, "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_clear",          "ret":{ "kind":"void" }, "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_size",           "ret":"i32", "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_node",           "ret":"ggml_tensor", "params":[ "ggml_cgraph","i32" ] },
+    { "name":"ggml_graph_nodes",          "ret":{ "kind":"pointer","to":"ggml_tensor" }, "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_add_node",       "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_tensor" ] },
+    { "name":"ggml_graph_overhead",       "ret":"size_t", "params":[] },
+    { "name":"ggml_graph_overhead_custom","ret":"size_t", "params":[ "size_t","bool" ] },
+
+    { "name":"ggml_graph_get_tensor",     "ret":"ggml_tensor", "params":[ { "kind":"pointer","to":"ggml_cgraph" },"charp" ] },
+    { "name":"ggml_graph_get_grad",       "ret":"ggml_tensor", "params":[ { "kind":"pointer","to":"ggml_cgraph" },"ggml_tensor" ] },
+    { "name":"ggml_graph_get_grad_acc",   "ret":"ggml_tensor", "params":[ { "kind":"pointer","to":"ggml_cgraph" },"ggml_tensor" ] },
+
+    { "name":"ggml_graph_print",          "ret":{ "kind":"void" }, "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_dump_dot",       "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_cgraph","charp" ] },
+
+    # Compute (returns ggml_status)
+    { "name":"ggml_graph_compute_with_ctx","ret":"ggml_status", "params":[ "ggml_context","ggml_cgraph","i32" ] },
+    { "name":"ggml_status_to_string",     "ret":"charp", "params":[ "ggml_status" ], "ret_as_str":true },
+
+    # Element get/set (f32)
+    { "name":"ggml_set_f32_1d", "ret":{ "kind":"void" }, "params":[ "ggml_tensor","i32","f32" ] },
+    { "name":"ggml_get_f32_1d", "ret":"f32", "params":[ "ggml_tensor","i32" ] },
+
+    # ======= Custom ops =======
+    { "name":"ggml_map_custom1","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_map_custom1_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_map_custom2","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_map_custom2_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_map_custom3","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_map_custom3_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+
+    { "name":"ggml_custom_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_type","i64","i64","i64","i64",{ "kind":"pointer","to":"ggml_tensor" },"i32",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_custom_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":"ggml_tensor" },"i32",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+
+    # ======= Loss / Optimizers =======
+    { "name":"ggml_cross_entropy_loss","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_cross_entropy_loss_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_opt_step_adamw","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_opt_step_sgd","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor" ] },
+
+    # ======= Quantization =======
+    { "name":"ggml_ftype_to_ggml_type",        "ret":"ggml_type", "params":[ "i32" ] },
+    { "name":"ggml_quantize_init",              "ret":{ "kind":"void" }, "params":[ "ggml_type" ] },
+    { "name":"ggml_quantize_free",              "ret":{ "kind":"void" }, "params":[] },
+    { "name":"ggml_quantize_requires_imatrix",  "ret":"bool", "params":[ "ggml_type" ] },
+    { "name":"ggml_quantize_chunk", "ret":"size_t",
+      "params":[
+        "ggml_type",
+        { "kind":"pointer","to":"f32" },
+        "voidp",
+        "i64","i64","i64",
+        { "kind":"pointer","to":"f32" }
+      ]
+    },
+
+    # ======= fp16 / bf16 conversions (scalar + row) =======
+    { "name":"ggml_fp16_to_fp32", "ret":"f32", "params":[ "u16" ] },
+    { "name":"ggml_fp32_to_fp16", "ret":"u16", "params":[ "f32" ] },
+    { "name":"ggml_fp16_to_fp32_row", "ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"u16" }, { "kind":"pointer","to":"f32" }, "i64" ] },
+    { "name":"ggml_fp32_to_fp16_row", "ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"f32" }, { "kind":"pointer","to":"u16" }, "i64" ] },
+
+    { "name":"ggml_bf16_to_fp32","ret":"f32","params":[ "ggml_bf16_t" ] },
+    { "name":"ggml_fp32_to_bf16","ret":"ggml_bf16_t","params":[ "f32" ] },
+    { "name":"ggml_bf16_to_fp32_row","ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"ggml_bf16_t" }, { "kind":"pointer","to":"f32" }, "i64" ] },
+    { "name":"ggml_fp32_to_bf16_row_ref","ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"f32" }, { "kind":"pointer","to":"ggml_bf16_t" }, "i64" ] },
+    { "name":"ggml_fp32_to_bf16_row","ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"f32" }, { "kind":"pointer","to":"ggml_bf16_t" }, "i64" ] },
+
+    # ======= Type traits =======
+    { "name":"ggml_get_type_traits","ret":{ "kind":"pointer","to":{ "kind":"void" } }, "params":[ "ggml_type" ] },
+
+    # ======= Logging / abort =======
+    { "name":"ggml_log_set",           "ret":{ "kind":"void" }, "params":[ "ggml_log_cb", "voidp" ] },
+    { "name":"ggml_set_abort_callback","ret":"ggml_abort_cb", "params":[ "ggml_abort_cb" ] },
+
+    # ======= Threadpool params =======
+    { "name":"ggml_threadpool_params_default","ret":{ "kind":"struct","fields":[
+        { "name":"cpumask0","type":"bool" },  # Placeholder: we only expose helper entrypoints (opaque use)
+      ] }, "params":[ "i32" ] }, # We don't use the returned struct directly; see note below.
+    { "name":"ggml_threadpool_params_init","ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":{ "kind":"void" } },"i32" ] },
+    { "name":"ggml_threadpool_params_match","ret":"bool", "params":[ { "kind":"pointer","to":{ "kind":"void" } }, { "kind":"pointer","to":{ "kind":"void" } } ] },
+
+    # ======= Misc =======
+    { "name":"ggml_guid_matches","ret":"bool","params":[ { "kind":"pointer","to":{ "kind":"int","bits":8,"signed":false } }, { "kind":"pointer","to":{ "kind":"int","bits":8,"signed":false } } ] },
+    { "name":"ggml_fopen","ret":{ "kind":"pointer","to":{ "kind":"void" }, "tag":"c.FILE*" }, "params":[ "charp","charp" ] }
   ]
 })
 
-# --- 2) Public surface ---------------------------------------------------------
+# -------------------------
+# Public metadata & enums
+# -------------------------
+let version = "ggml@wrap-1.0.0"
+let close = _C.close
 
-let version = "ggml@wrap-0.1.0"
-let close   = _C.close
+# ggml_type (subset)
+let TYPE_F32 = 0
+let TYPE_F16 = 1
+let TYPE_Q4_0 = 2
+let TYPE_Q4_1 = 3
+let TYPE_Q5_0 = 6
+let TYPE_Q5_1 = 7
+let TYPE_Q8_0 = 8
+let TYPE_Q8_1 = 9
+let TYPE_I8  = 24
+let TYPE_I16 = 25
+let TYPE_I32 = 26
+let TYPE_I64 = 27
+let TYPE_F64 = 28
+let TYPE_BF16 = 30
+let TYPE_TQ1_0 = 34
+let TYPE_TQ2_0 = 35
+let TYPE_MXFP4 = 39
 
-# GGML types (enum ggml_type)
-let TYPE_F32      = 0
-let TYPE_F16      = 1
-let TYPE_Q4_0     = 2
-let TYPE_Q4_1     = 3
-let TYPE_Q5_0     = 6
-let TYPE_Q5_1     = 7
-let TYPE_Q8_0     = 8
-let TYPE_Q8_1     = 9
-let TYPE_Q2_K     = 10
-let TYPE_Q3_K     = 11
-let TYPE_Q4_K     = 12
-let TYPE_Q5_K     = 13
-let TYPE_Q6_K     = 14
-let TYPE_Q8_K     = 15
-let TYPE_IQ2_XXS  = 16
-let TYPE_IQ2_XS   = 17
-let TYPE_IQ3_XXS  = 18
-let TYPE_IQ1_S    = 19
-let TYPE_IQ4_NL   = 20
-let TYPE_IQ3_S    = 21
-let TYPE_IQ2_S    = 22
-let TYPE_IQ4_XS   = 23
-let TYPE_I8       = 24
-let TYPE_I16      = 25
-let TYPE_I32      = 26
-let TYPE_I64      = 27
-let TYPE_F64      = 28
-let TYPE_IQ1_M    = 29
-let TYPE_BF16     = 30
-let TYPE_TQ1_0    = 34
-let TYPE_TQ2_0    = 35
-let TYPE_MXFP4    = 39
+# ggml_prec
+let PREC_DEFAULT = 0
+let PREC_F32     = 10
 
-# Logging levels (subset)
-let LOG_NONE  = 0
-let LOG_DEBUG = 1
-let LOG_INFO  = 2
-let LOG_WARN  = 3
-let LOG_ERROR = 4
+# ggml_status
+let STATUS_ALLOC_FAILED = -2
+let STATUS_FAILED       = -1
+let STATUS_SUCCESS      = 0
+let STATUS_ABORTED      = 1
 
-# Convenience: strings
-let versionString = _C.ggml_version
-let commitString  = _C.ggml_commit
+# ggml_sort_order
+let SORT_ASC  = 0
+let SORT_DESC = 1
 
-# --- Helpers following the wrapper pattern ------------------------------------
+# ggml_op_pool
+let POOL_MAX = 0
+let POOL_AVG = 1
 
-# Make ggml_init_params as a handle (required: aggregates are handles only)
-let makeInitParams = fun(memSizeBytes, memBuffer, noAlloc) {
-  # memBuffer: either Null or a handle to previously-allocated memory
-  _C.__mem.box("ggml_init_params", { mem_size: memSizeBytes, mem_buffer: memBuffer, no_alloc: noAlloc })
-}
+# -------------------------
+# Raw aliases (few highlights; most are kept under _C.*)
+# -------------------------
+let versionStr = _C.ggml_version
+let commitStr  = _C.ggml_commit
 
-# Create / free context
-let createContext = fun(memSizeBytes, noAlloc=false) {
-  let params = makeInitParams(memSizeBytes, null, noAlloc)
+let timeInit   = _C.ggml_time_init
+let timeMs     = _C.ggml_time_ms
+let timeUs     = _C.ggml_time_us
+let cycles     = _C.ggml_cycles
+let cyclesPerMs= _C.ggml_cycles_per_ms
+
+let statusStr  = _C.ggml_status_to_string
+
+# Core ops (examples)
+let add = _C.ggml_add
+let mul = _C.ggml_mul
+let div = _C.ggml_div
+let softMax = _C.ggml_soft_max
+let mulMat = _C.ggml_mul_mat
+let setMatmulPrec = _C.ggml_mul_mat_set_prec
+
+# Graph
+let newGraph       = _C.ggml_new_graph
+let newGraphCustom = _C.ggml_new_graph_custom
+let buildForward   = _C.ggml_build_forward_expand
+let buildBackward  = _C.ggml_build_backward_expand
+let graphPrint     = _C.ggml_graph_print
+let graphDumpDot   = _C.ggml_graph_dump_dot
+let computeRaw     = _C.ggml_graph_compute_with_ctx
+
+# Data access
+let getData     = _C.ggml_get_data
+let getDataF32  = _C.ggml_get_data_f32
+let setZero     = _C.ggml_set_zero
+let setF32_1d   = _C.ggml_set_f32_1d
+let getF32_1d   = _C.ggml_get_f32_1d
+
+# Quantization
+let qInit         = _C.ggml_quantize_init
+let qFree         = _C.ggml_quantize_free
+let qNeedsImatrix = _C.ggml_quantize_requires_imatrix
+let qChunk        = _C.ggml_quantize_chunk
+
+# fp16/bf16
+let fp16ToF32 = _C.ggml_fp16_to_fp32
+let f32ToFp16 = _C.ggml_fp32_to_fp16
+let fp16RowToF32 = _C.ggml_fp16_to_fp32_row
+let f32RowToFp16 = _C.ggml_fp32_to_fp16_row
+
+let bf16ToF32 = _C.ggml_bf16_to_fp32
+let f32ToBf16 = _C.ggml_fp32_to_bf16
+let bf16RowToF32 = _C.ggml_bf16_to_fp32_row
+let f32RowToBf16Ref = _C.ggml_fp32_to_bf16_row_ref
+let f32RowToBf16    = _C.ggml_fp32_to_bf16_row
+
+# Logging / abort
+let logSet       = _C.ggml_log_set
+let setAbortCB   = _C.ggml_set_abort_callback
+
+# -------------------------
+# Helpers (handles only; no defaults)
+# -------------------------
+
+# Create a ggml context and auto-free it with ggml_free on GC.
+let createContext = fun(memBytes: Int, noAlloc: Bool, memBuffer: Any?) -> Any? do
+  let params = _C.__mem.box("ggml_init_params", {
+    mem_size: memBytes,
+    mem_buffer: memBuffer,   # null or a valid void* handle you manage
+    no_alloc: noAlloc
+  })
   let ctx = _C.ggml_init(params)
-  if ctx == null then fail("createContext: ggml_init returned null") end
-  # Attach destructor so users don't leak if they drop the handle
-  _C.__mem.gc(ctx, { sym:"ggml_free" })
+  if ctx == null then return null end
+  _C.__mem.gc(ctx, { sym: "ggml_free" })
   ctx
-}
+end
 
-let resetContext   = _C.ggml_reset
-let freeContext    = _C.ggml_free         # explicit free if you want manual control
-let usedMem        = _C.ggml_used_mem
-let setNoAlloc     = _C.ggml_set_no_alloc
-let getNoAlloc     = _C.ggml_get_no_alloc
-let getMemSize     = _C.ggml_get_mem_size
-let getMaxTensorSz = _C.ggml_get_max_tensor_size
+# Convenience F32 tensor creators (no implicit init)
+let f32_1d = fun(ctx: Any, ne0: Int) -> Any? do _C.ggml_new_tensor_1d(ctx, TYPE_F32, ne0) end
+let f32_2d = fun(ctx: Any, ne0: Int, ne1: Int) -> Any? do _C.ggml_new_tensor_2d(ctx, TYPE_F32, ne0, ne1) end
+let f32_3d = fun(ctx: Any, ne0: Int, ne1: Int, ne2: Int) -> Any? do _C.ggml_new_tensor_3d(ctx, TYPE_F32, ne0, ne1, ne2) end
+let f32_4d = fun(ctx: Any, ne0: Int, ne1: Int, ne2: Int, ne3: Int) -> Any? do _C.ggml_new_tensor_4d(ctx, TYPE_F32, ne0, ne1, ne2, ne3) end
 
-# Tensor builders (thin)
-let tensor1d = fun(ctx, type, ne0) { _C.ggml_new_tensor_1d(ctx, type, ne0) }
-let tensor2d = fun(ctx, type, ne0, ne1) { _C.ggml_new_tensor_2d(ctx, type, ne0, ne1) }
-let tensor3d = fun(ctx, type, ne0, ne1, ne2) { _C.ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2) }
-let tensor4d = fun(ctx, type, ne0, ne1, ne2, ne3) { _C.ggml_new_tensor_4d(ctx, type, ne0, ne1, ne2, ne3) }
+# Set a tensor's name (returns the same tensor handle)
+let nameTensor = fun(t: Any, s: Str) -> Any do _C.ggml_set_name(t, s) end
 
-# Names & roles
-let getName   = _C.ggml_get_name
-let setName   = _C.ggml_set_name
-let setInput  = _C.ggml_set_input
-let setOutput = _C.ggml_set_output
-let setParam  = _C.ggml_set_param
-let setLoss   = _C.ggml_set_loss
+# Build a forward graph from one or more roots.
+let buildForwardGraph = fun(ctx: Any, roots: [Any]) -> Any? do
+  let g = _C.ggml_new_graph(ctx)
+  if g == null then return null end
+  for t in roots do _C.ggml_build_forward_expand(g, t) end
+  g
+end
 
-# Raw data access (unsafe if you write inconsistent types; keep as handles)
-let dataPtr     = _C.ggml_get_data            # -> void*
-let dataPtrF32  = _C.ggml_get_data_f32        # -> float*
-let nelements   = _C.ggml_nelements
-let nrows       = _C.ggml_nrows
-let nbytes      = _C.ggml_nbytes
-let nbytesPadded= _C.ggml_nbytes_pad
-let elementSize = _C.ggml_element_size
+# Dump a graph to a DOT file (filename: Str).
+# C signature is (gb, gf, filename). Pass null for gb if unused.
+let dumpGraphDotFile = fun(gf: Any, gb: Any?, filename: Str) -> Void do
+  _C.ggml_graph_dump_dot(gb, gf, filename)
+end
 
-# Arithmetic / ops (representative selection)
-let add      = _C.ggml_add
-let mul      = _C.ggml_mul
-let div      = _C.ggml_div
-let sum      = _C.ggml_sum
-let mulMat   = _C.ggml_mul_mat
-let relu     = _C.ggml_relu
-let gelu     = _C.ggml_gelu
-let softMax  = _C.ggml_soft_max
-let norm     = _C.ggml_norm
+# Compute wrapper: returns struct-like record with status info.
+let compute = fun(ctx: Any, g: Any, nThreads: Int) -> { status: Int, ok: Bool, text: Str } do
+  let st = _C.ggml_graph_compute_with_ctx(ctx, g, nThreads)
+  { status: st, ok: (st == STATUS_SUCCESS), text: _C.ggml_status_to_string(st) }
+end
 
-# Shape / layout
-let transpose = _C.ggml_transpose
-let cont      = _C.ggml_cont
-let reshape2d = _C.ggml_reshape_2d
+# Matmul precision helper (PREC_F32 is safer for some models)
+let setMatmulPrecision = fun(node: Any, prec: Int) -> Void do
+  _C.ggml_mul_mat_set_prec(node, prec)
+end
 
-# Data movement / cast
-let copy = _C.ggml_cpy
-let cast = _C.ggml_cast
+# BF16 bits accessor from boxed struct
+let bf16Bits = fun(bf16Box: Any) -> Int do
+  _C.__mem.getf("ggml_bf16_t", bf16Box, "bits")
+end
 
-# Graph helpers (forward-only build; execute via your chosen backend)
-let newGraph        = _C.ggml_new_graph
-let newGraphCustom  = _C.ggml_new_graph_custom
-let buildForward    = _C.ggml_build_forward_expand
-let graphSize       = _C.ggml_graph_size
-let graphNode       = _C.ggml_graph_node
-let graphPrint      = _C.ggml_graph_print
-
-# --- Higher-level ergonomic helpers -------------------------------------------
-
-# Convenience: create a 1D F32 tensor and fill from a JS-style array of numbers
-# NOTE: copies via __mem; you still pass/receive handles.
-let tensor1dF32 = fun(ctx, len, valuesArrOrNull) {
-  let t = tensor1d(ctx, TYPE_F32, len)
-  if t == null then fail("tensor1dF32: allocation failed") end
-  if valuesArrOrNull != null then
-    let p = dataPtrF32(t)
-    _C.__mem.copy(p, valuesArrOrNull, len * 4)
-  end
-  t
-}
-
-# Read back a tensor of F32 into a MindScript array (when contiguous)
-let readF32 = fun(t) {
-  # Best-effort: require contiguous layout
-  # (You can explicitly call cont(ctx, t) yourself.)
-  let bytes = nbytes(t)
-  let p = dataPtrF32(t)
-  _C.__mem.string(p, bytes)  # raw bytes; consumer can reinterpret if needed
-}
-
-# Build a tiny demo graph: y = a*x^2 + b
-let demoQuad = fun(ctx) {
-  let x  = tensor1d(ctx, TYPE_F32, 1)
-  setParam(x)
-  setName(x, "x")
-  let a  = tensor1d(ctx, TYPE_F32, 1)
-  let b  = tensor1d(ctx, TYPE_F32, 1)
-  setName(a, "a")
-  setName(b, "b")
-  let x2 = mul(ctx, x, x)
-  let ax2= mul(ctx, a, x2)
-  let y  = add(ctx, ax2, b)
-  let gf = newGraph(ctx)
-  buildForward(gf, y)
-  { x:x, a:a, b:b, y:y, g:gf }
-}
-
-# --- Notes --------------------------------------------------------------------
-# * Many GGML APIs return pointers to internal arena memory. We do not auto-free
-#   tensors; the context owns them. The context handle has a destructor attached
-#   by default (ggml_free).
-# * Functions taking struct-by-value (e.g., ggml_init) require a handle created
-#   via _C.__mem.box("ggml_init_params", { ... }).
-# * If you need more ops, expose them 1:1 by adding to `_C.functions` above, then
-#   re-export an alias here. Keep to the "handles only" rule for aggregates.
+# 1D f32 element IO (native)
+let writeF32_1d = fun(t: Any, i: Int, value: Num) -> Void do _C.ggml_set_f32_1d(t, i, value) end
+let readF32_1d  = fun(t: Any, i: Int) -> Num do _C.ggml_get_f32_1d(t, i) end

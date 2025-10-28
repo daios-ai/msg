@@ -35,7 +35,7 @@ if [[ -d "$INSTALL_DIR" ]]; then
   rm -rf "$INSTALL_DIR"
   echo "✔ Removed $INSTALL_DIR"
 else
-  echo "ℹ Install directory not found; skipping: $INSTALL_DIR"
+  echo "WARNING: Install directory not found; skipping: $INSTALL_DIR"
 fi
 
 # 2) Clean bash/zsh profiles
@@ -46,7 +46,7 @@ clean_rc "$HOME/.zshrc"
 FISH_SNIPPET="$HOME/.config/fish/conf.d/mindscript.fish"
 if [[ -f "$FISH_SNIPPET" ]]; then
   rm -f "$FISH_SNIPPET"
-  echo "✔ Removed $FISH_SNIPPET"
+  echo "OK: Removed $FISH_SNIPPET"
 fi
 
 # 4) Final message

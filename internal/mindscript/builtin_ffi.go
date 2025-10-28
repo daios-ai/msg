@@ -1002,7 +1002,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var argv []uintptr
 						var putArgv func()
 						if nFixed <= len(argvSmall) {
-							argv, putArgv = argvSmall[:nFixed], func() {}
+							argv, _ = argvSmall[:nFixed], func() {}
 							for i := range argv {
 								argv[i] = 0
 							}
@@ -1014,7 +1014,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var args []uint64
 						var putArgs func()
 						if nFixed <= len(argsSmall) {
-							args, putArgs = argsSmall[:nFixed], func() {}
+							args, _ = argsSmall[:nFixed], func() {}
 							for i := range args {
 								args[i] = 0
 							}
@@ -1115,7 +1115,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						var vaArgs []uint64
 						var putVArgs func()
 						if nVA <= len(vaArgsSmall) {
-							vaArgs, putVArgs = vaArgsSmall[:nVA], func() {}
+							vaArgs, _ = vaArgsSmall[:nVA], func() {}
 							for i := range vaArgs {
 								vaArgs[i] = 0
 							}

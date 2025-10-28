@@ -1,91 +1,160 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="mindscript-lang/mindscript"   # <-- change to your org/name
-INSTALL_DIR_DEFAULT="${HOME}/.mindscript"
-INSTALL_DIR_SYSTEM="/opt/mindscript"
-PROFILE_SNIPPET_BASH="${HOME}/.profile"
-PROFILE_SNIPPET_ZSH="${HOME}/.zprofile"
-FISH_CONF_DIR="${HOME}/.config/fish/conf.d"
-VERSION="${MSG_VERSION:-latest}"    # allow override: MSG_VERSION=v0.3.0
+# -----------------------------
+# Config
+# -----------------------------
+APP_NAME="mindscript"
+BIN1="msg"
+BIN2="msg-lsp"
+INSTALL_DIR="${HOME}/.mindscript"
 
-usage() {
-  echo "Usage: $0 [--system] [--prefix DIR] [--version vX.Y.Z]"
-  exit 1
-}
+# Online source (works if repo is public)
+# - "latest" uses GitHub's latest/download endpoint (no latest.txt needed)
+VERSION="${VERSION:-latest}"
+BASE_URL_LATEST="https://github.com/DAIOS-AI/msg/releases/latest/download"
+BASE_URL_TAGGED="https://github.com/DAIOS-AI/msg/releases/download"
 
-PREFIX="${INSTALL_DIR_DEFAULT}"
-SYSTEM=0
+# -----------------------------
+# Args: --local [dir]
+# -----------------------------
+LOCAL_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --system) SYSTEM=1; PREFIX="${INSTALL_DIR_SYSTEM}"; shift ;;
-    --prefix) PREFIX="$2"; shift 2 ;;
-    --version) VERSION="$2"; shift 2 ;;
-    *) usage ;;
+    --local)
+      # optional argument: if the next token is missing or starts with '-', use '.'
+      if [[ $# -ge 2 && "${2:0:1}" != "-" ]]; then
+        LOCAL_DIR="$2"; shift 2
+      else
+        LOCAL_DIR="."; shift 1
+      fi
+      ;;
+    --version)  # optional convenience (ENV VERSION also works)
+      VERSION="$2"; shift 2;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--local [dir]] [--version vX.Y.Z]"
+      exit 1;;
   esac
 done
 
-os=$(uname -s | tr '[:upper:]' '[:lower:]')
-arch=$(uname -m)
-case "$arch" in
-  x86_64|amd64) arch="amd64" ;;
-  arm64|aarch64) arch="arm64" ;;
-  *) echo "Unsupported architecture: $arch"; exit 1 ;;
-esac
+# -----------------------------
+# Detect OS/arch → tarball name
+# -----------------------------
+os="$(uname -s)"
+arch="$(uname -m)"
+
 case "$os" in
-  linux)  target="linux-${arch}" ;;
-  darwin) target="darwin-${arch}" ;;
+  Darwin) osn="macos" ;;
+  Linux)  osn="linux" ;;
   *) echo "Unsupported OS: $os"; exit 1 ;;
 esac
 
-# determine version
-if [[ "$VERSION" == "latest" ]]; then
-  # lightweight latest resolution without jq
-  VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+case "$arch" in
+  x86_64)            archn="x86_64" ;;
+  aarch64|arm64)     archn="arm64"  ;;
+  *) echo "Unsupported arch: $arch"; exit 1 ;;
+esac
+
+TAR="${APP_NAME}-${osn}-${archn}.tar.gz"
+SHA="${TAR}.sha256"
+
+# -----------------------------
+# Try online first, else local
+# -----------------------------
+tmp="$(mktemp -d)"
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT
+
+download_failed=false
+if [[ -z "$LOCAL_DIR" ]]; then
+  echo "→ Attempting online download: ${TAR} (VERSION=${VERSION})"
+  if [[ "$VERSION" == "latest" ]]; then
+    CURL_URL_TAR="${BASE_URL_LATEST}/${TAR}"
+    CURL_URL_SHA="${BASE_URL_LATEST}/${SHA}"
+  else
+    CURL_URL_TAR="${BASE_URL_TAGGED}/${VERSION}/${TAR}"
+    CURL_URL_SHA="${BASE_URL_TAGGED}/${VERSION}/${SHA}"
+  fi
+  set +e
+  curl -fL --retry 2 -o "${tmp}/${TAR}" "${CURL_URL_TAR}"
+  rc1=$?
+  curl -fL --retry 2 -o "${tmp}/${SHA}" "${CURL_URL_SHA}"
+  rc2=$?
+  set -e
+  if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
+    echo "WARNING: Online download unavailable. Falling back to local artifacts."
+    download_failed=true
+  else
+    SRC_TAR="${tmp}/${TAR}"
+    SRC_SHA="${tmp}/${SHA}"
+  fi
 fi
-echo "Installing MindScript ${VERSION} for ${target} to ${PREFIX}"
 
-TARBALL="mindscript-${target}.tar.gz"
-BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
-
-curl -fL "${BASE_URL}/${TARBALL}" -o "${TMPDIR}/${TARBALL}"
-curl -fL "${BASE_URL}/SHA256SUMS" -o "${TMPDIR}/SHA256SUMS" || true
-
-if command -v sha256sum >/dev/null 2>&1 && [[ -f "${TMPDIR}/SHA256SUMS" ]]; then
-  (cd "${TMPDIR}" && sha256sum -c --ignore-missing SHA256SUMS)
+# Local fallback (explicit --local or after download failure)
+if [[ -n "$LOCAL_DIR" || "$download_failed" == "true" ]]; then
+  # default dir is '.' if --local had no argument; if no --local provided and failed, also use '.'
+  FALLBACK_DIR="${LOCAL_DIR:-.}"
+  SRC_TAR="${FALLBACK_DIR}/${TAR}"
+  SRC_SHA="${FALLBACK_DIR}/${SHA}"
+  [[ -f "$SRC_TAR" ]] || { echo "Missing local tarball: $SRC_TAR"; exit 1; }
+  if [[ ! -f "$SRC_SHA" ]]; then
+    echo "WARNING: Checksum not found at $SRC_SHA; proceeding without verification."
+    SRC_SHA=""
+  fi
 fi
 
-# install
-if [[ "$SYSTEM" -eq 1 ]]; then
-  sudo mkdir -p "${PREFIX}"
-  sudo tar -xzf "${TMPDIR}/${TARBALL}" -C "${PREFIX}" --strip-components=1
+# -----------------------------
+# Verify checksum (if present)
+# -----------------------------
+if [[ -n "${SRC_SHA:-}" && -f "$SRC_SHA" ]]; then
+  echo "→ Verifying checksum"
+  ( cd "$(dirname "$SRC_TAR")"
+    if command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 -c "$(basename "$SRC_SHA")"
+    else
+      sha256sum -c "$(basename "$SRC_SHA")"
+    fi
+  )
+fi
+
+# -----------------------------
+# Install
+# -----------------------------
+echo "→ Installing to $INSTALL_DIR"
+work="${tmp}/unpack"
+mkdir -p "$work"
+tar -C "$work" -xzf "$SRC_TAR"
+
+# tar should contain a top-level 'mindscript/' directory
+if [[ -d "${work}/${APP_NAME}" ]]; then
+  rm -rf "$INSTALL_DIR"
+  mv "${work}/${APP_NAME}" "$INSTALL_DIR"
 else
-  mkdir -p "${PREFIX}"
-  tar -xzf "${TMPDIR}/${TARBALL}" -C "${PREFIX}" --strip-components=1
+  echo "Archive format unexpected (no '${APP_NAME}/' dir)."
+  exit 1
 fi
 
-# write env snippets
-write_shell_snippets() {
-  local root="$1"
-  local line1="export MSGPATH=\"${root}\""
-  local line2='export PATH="$MSGPATH/bin:$PATH"'
-  grep -qxF "$line1" "$PROFILE_SNIPPET_BASH" 2>/dev/null || echo "$line1" >> "$PROFILE_SNIPPET_BASH"
-  grep -qxF "$line2" "$PROFILE_SNIPPET_BASH" 2>/dev/null || echo "$line2" >> "$PROFILE_SNIPPET_BASH"
-  grep -qxF "$line1" "$PROFILE_SNIPPET_ZSH" 2>/dev/null || echo "$line1" >> "$PROFILE_SNIPPET_ZSH"
-  grep -qxF "$line2" "$PROFILE_SNIPPET_ZSH" 2>/dev/null || echo "$line2" >> "$PROFILE_SNIPPET_ZSH"
-  mkdir -p "$FISH_CONF_DIR"
-  echo "set -gx MSGPATH \"${root}\"" > "${FISH_CONF_DIR}/mindscript.fish"
-  echo 'set -gx PATH "$MSGPATH/bin" $PATH' >> "${FISH_CONF_DIR}/mindscript.fish"
-}
-if [[ "$SYSTEM" -eq 1 ]]; then
-  sudo sh -c "echo 'export MSGPATH=${PREFIX}' >/etc/profile.d/mindscript.sh; echo 'export PATH=\$MSGPATH/bin:\$PATH' >> /etc/profile.d/mindscript.sh"
-else
-  write_shell_snippets "${PREFIX}"
+# Ensure binaries exist
+[[ -x "${INSTALL_DIR}/bin/${BIN1}" ]] || { echo "Missing ${BIN1} in bin/"; exit 1; }
+[[ -x "${INSTALL_DIR}/bin/${BIN2}" ]] || { echo "Missing ${BIN2} in bin/"; exit 1; }
+
+# -----------------------------
+# Shell profile setup (bash/zsh + fish)
+# -----------------------------
+SNIPPET='export MSGPATH="$HOME/.mindscript"
+case ":$PATH:" in *":$MSGPATH/bin:"*) ;; *) export PATH="$MSGPATH/bin:$PATH";; esac'
+
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  if [[ -f "$rc" ]]; then
+    grep -q 'MSGPATH=.*\.mindscript' "$rc" 2>/dev/null || printf '\n%s\n' "$SNIPPET" >> "$rc"
+  fi
+done
+
+if [[ -d "$HOME/.config/fish/conf.d" ]]; then
+  printf 'set -gx MSGPATH "%s"\nset -gx PATH "$MSGPATH/bin" $PATH\n' "$INSTALL_DIR" \
+    > "$HOME/.config/fish/conf.d/mindscript.fish"
 fi
 
-echo
-echo "MindScript installed to ${PREFIX}"
-echo "Open a new shell or run:  source ${PROFILE_SNIPPET_BASH}  (or your shell's profile)"
-echo "Verify with:  msg --version"
+echo "OK: Installed. Open a new terminal or run:  source ~/.bashrc   (or ~/.zshrc)"
+"${INSTALL_DIR}/bin/${BIN1}" --version || true

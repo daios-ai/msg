@@ -4,52 +4,47 @@ on:
     tags: ["v*"]
 
 jobs:
-  linux:
+  linux-amd64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.23.x" }
-      - name: Install cross compiler for arm64
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build & Package
-        run: make release
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - uses: goreleaser/goreleaser-action@v6
         with:
-          name: linux-artifacts
-          path: dist/*/*.tar.gz
+          version: latest
+          args: release --clean --skip=publish
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "dist/*linux-amd64*.tar.gz,dist/*SHA256SUMS*"
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23.x" }
+      - run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean --skip=publish
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "dist/*linux-arm64*.tar.gz,dist/*SHA256SUMS*"
 
   macos:
-    runs-on: macos-14  # Apple Silicon runner; supports building both arches
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.23.x" }
-      - name: Build darwin only
+      - run: brew install libffi
+      - name: Build with GoReleaser
         run: |
-          make clean
-          make pack-darwin-amd64
-          make pack-darwin-arm64
-          (cd dist/$(cat VERSION) && sha256sum mindscript-*.tar.gz > SHA256SUMS || shasum -a 256 mindscript-*.tar.gz > SHA256SUMS)
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+          export PKG_CONFIG_PATH="$(brew --prefix libffi)/lib/pkgconfig:${PKG_CONFIG_PATH}"
+          goreleaser release --clean --skip=publish
+      - uses: softprops/action-gh-release@v2
         with:
-          name: macos-artifacts
-          path: dist/*/*.tar.gz
-
-  publish:
-    runs-on: ubuntu-latest
-    needs: [linux, macos]
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { name: linux-artifacts, path: ./rel }
-      - uses: actions/download-artifact@v4
-        with: { name: macos-artifacts, path: ./rel }
-      - name: Create combined checksums
-        run: |
-          cd rel && (sha256sum *.tar.gz > SHA256SUMS || shasum -a 256 *.tar.gz > SHA256SUMS)
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: rel/*
+          files: "dist/*darwin-*.tar.gz,dist/*SHA256SUMS*"

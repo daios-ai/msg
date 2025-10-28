@@ -1,5 +1,4 @@
-//go:build linux
-// +build linux
+//go:build (linux || darwin) && cgo
 
 package mindscript
 

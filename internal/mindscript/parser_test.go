@@ -2498,3 +2498,146 @@ func Test_Parser_Incomplete_Table(t *testing.T) {
 		})
 	}
 }
+
+// --- New tests for exponentiation, bitwise ops, and precedence/assoc ---
+
+func Test_Parser_Pow_RightAssociative(t *testing.T) {
+	root := mustParse(t, `2 ** 3 ** 2`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "**" {
+		t.Fatalf("top op not **: %s", dump(top))
+	}
+	rhs := top[3].(S)
+	wantTag(t, rhs, "binop")
+	if rhs[1].(string) != "**" {
+		t.Fatalf("rhs not power: %s", dump(rhs))
+	}
+}
+
+func Test_Parser_Unary_Neg_BindsLooserThanPow(t *testing.T) {
+	root := mustParse(t, `-3 ** 2`)
+	top := first(root)
+	wantTag(t, top, "unop")
+	if top[1].(string) != "-" {
+		t.Fatalf("top not unary -: %s", dump(top))
+	}
+	inner := top[2].(S)
+	wantTag(t, inner, "binop")
+	if inner[1].(string) != "**" {
+		t.Fatalf("inner not power: %s", dump(inner))
+	}
+}
+
+func Test_Parser_Pow_Vs_Mult_Precedence(t *testing.T) {
+	root := mustParse(t, `2 ** 3 * 4`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "*" {
+		t.Fatalf("top not '*': %s", dump(top))
+	}
+	left := top[2].(S)
+	wantTag(t, left, "binop")
+	if left[1].(string) != "**" {
+		t.Fatalf("left not '**': %s", dump(left))
+	}
+}
+
+func Test_Parser_Shift_Precedence_Vs_Add(t *testing.T) {
+	root := mustParse(t, `1 + 2 << 3`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "<<" {
+		t.Fatalf("top not '<<': %s", dump(top))
+	}
+	left := top[2].(S)
+	wantTag(t, left, "binop")
+	if left[1].(string) != "+" {
+		t.Fatalf("left of '<<' not '+': %s", dump(left))
+	}
+}
+
+func Test_Parser_Bitwise_Tiers_Order(t *testing.T) {
+	root := mustParse(t, `a & b ^ c | d`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "|" {
+		t.Fatalf("top not '|': %s", dump(top))
+	}
+	lhs := top[2].(S)
+	wantTag(t, lhs, "binop")
+	if lhs[1].(string) != "^" {
+		t.Fatalf("lhs of '|' not '^': %s", dump(lhs))
+	}
+	lhslhs := lhs[2].(S)
+	wantTag(t, lhslhs, "binop")
+	if lhslhs[1].(string) != "&" {
+		t.Fatalf("left of '^' not '&': %s", dump(lhslhs))
+	}
+}
+
+func Test_Parser_BitwiseNot_Prefix(t *testing.T) {
+	root := mustParse(t, `~x & y`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "&" {
+		t.Fatalf("top not '&': %s", dump(top))
+	}
+	lhs := top[2].(S)
+	wantTag(t, lhs, "unop")
+	if lhs[1].(string) != "~" {
+		t.Fatalf("lhs not unary '~': %s", dump(lhs))
+	}
+}
+
+func Test_Parser_Shift_Tokenization_PrefersShiftOverRelEq(t *testing.T) {
+	root := mustParse(t, `a << b <= c`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "<=" {
+		t.Fatalf("top not '<=': %s", dump(top))
+	}
+	lhs := top[2].(S)
+	wantTag(t, lhs, "binop")
+	if lhs[1].(string) != "<<" {
+		t.Fatalf("lhs of '<=' not '<<': %s", dump(lhs))
+	}
+}
+
+func Test_Parser_Pow_Chains_With_Add_And_Shift(t *testing.T) {
+	root := mustParse(t, `2 ** 3 + 4 << 1`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "<<" {
+		t.Fatalf("top not '<<': %s", dump(top))
+	}
+	left := top[2].(S)
+	wantTag(t, left, "binop")
+	if left[1].(string) != "+" {
+		t.Fatalf("left of '<<' not '+': %s", dump(left))
+	}
+	addLeft := left[2].(S)
+	wantTag(t, addLeft, "binop")
+	if addLeft[1].(string) != "**" {
+		t.Fatalf("left of '+' not '**': %s", dump(addLeft))
+	}
+}
+
+func Test_Parser_Bitwise_Combine_With_Logical(t *testing.T) {
+	root := mustParse(t, `a & b | c and d`)
+	top := first(root)
+	wantTag(t, top, "binop")
+	if top[1].(string) != "and" {
+		t.Fatalf("top not 'and': %s", dump(top))
+	}
+	left := top[2].(S)
+	wantTag(t, left, "binop")
+	if left[1].(string) != "|" {
+		t.Fatalf("left of 'and' not '|': %s", dump(left))
+	}
+	lhs2 := left[2].(S)
+	wantTag(t, lhs2, "binop")
+	if lhs2[1].(string) != "&" {
+		t.Fatalf("left of '|' not '&': %s", dump(lhs2))
+	}
+}

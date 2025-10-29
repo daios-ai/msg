@@ -386,16 +386,26 @@ func (p *parser) skipNoops() {
 
 func lbp(t TokenType) (int, bool) {
 	switch t {
+	case POW:
+		return 80, true
 	case ARROW:
 		return 15, true
 	case MULT, DIV, MOD:
 		return 70, true
 	case PLUS, MINUS:
 		return 60, true
+	case LSHIFT, RSHIFT:
+		return 55, true
 	case LESS, LESS_EQ, GREATER, GREATER_EQ:
 		return 50, true
 	case EQ, NEQ:
 		return 40, true
+	case BITAND:
+		return 35, true
+	case BITXOR:
+		return 34, true
+	case BITOR:
+		return 33, true
 	case AND:
 		return 30, true
 	case OR:
@@ -405,7 +415,10 @@ func lbp(t TokenType) (int, bool) {
 	}
 	return 0, false
 }
-func isRightAssoc(tt TokenType) bool { return tt == ASSIGN || tt == ARROW }
+func isRightAssoc(tt TokenType) bool {
+	// Assignment and arrow are right-associative; exponentiation is also commonly right-assoc.
+	return tt == ASSIGN || tt == ARROW || tt == POW
+}
 
 // ───────────────────────────── span emission (core) ─────────────────────────
 //
@@ -822,6 +835,16 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 
 		case MINUS, NOT:
+			r, err := p.parseExprAfterBP(t, "expected expression after unary operator", 80)
+			if err != nil {
+				return nil, err
+			}
+			endTok := p.lastSpanEndTok
+			if endTok < 0 {
+				endTok = tokIndexOfThis
+			}
+			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
+		case BITNOT:
 			r, err := p.parseExprAfterBP(t, "expected expression after unary operator", 80)
 			if err != nil {
 				return nil, err

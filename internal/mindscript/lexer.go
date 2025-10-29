@@ -173,6 +173,7 @@ const (
 	MULT
 	DIV
 	MOD
+	POW    // "**"
 	ASSIGN // "="
 	EQ     // "=="
 	NEQ    // "!="
@@ -180,8 +181,14 @@ const (
 	LESS_EQ
 	GREATER
 	GREATER_EQ
-	BANG  // "!" (required-field marker in object/type literals)
-	ARROW // "->"
+	LSHIFT // "<<"
+	RSHIFT // ">>"
+	BITAND // "&"
+	BITXOR // "^"
+	BITOR  // "|"
+	BITNOT // "~" (unary)
+	BANG   // "!" (required-field marker in object/type literals)
+	ARROW  // "->"
 
 	// Literals & identifiers
 	ID
@@ -1123,11 +1130,24 @@ func (l *Lexer) scanToken() (Token, error) {
 		case '+':
 			return l.addToken(PLUS, "+"), nil
 		case '*':
+			// Support '**' (power) before single '*' (MULT)
+			if b, ok := l.peek(); ok && b == '*' {
+				l.advance()
+				return l.addToken(POW, "**"), nil
+			}
 			return l.addToken(MULT, "*"), nil
 		case '/':
 			return l.addToken(DIV, "/"), nil
 		case '%':
 			return l.addToken(MOD, "%"), nil
+		case '&':
+			return l.addToken(BITAND, "&"), nil
+		case '|':
+			return l.addToken(BITOR, "|"), nil
+		case '^':
+			return l.addToken(BITXOR, "^"), nil
+		case '~':
+			return l.addToken(BITNOT, "~"), nil
 		case ':':
 			return l.addToken(COLON, ":"), nil
 		case ',':
@@ -1170,15 +1190,29 @@ func (l *Lexer) scanToken() (Token, error) {
 			}
 			return l.addToken(BANG, "!"), nil
 		case '<':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(LESS_EQ, "<="), nil
+			// Prefer shift '<<' over '<=' when present
+			if b, ok := l.peek(); ok {
+				if b == '<' {
+					l.advance()
+					return l.addToken(LSHIFT, "<<"), nil
+				}
+				if b == '=' {
+					l.advance()
+					return l.addToken(LESS_EQ, "<="), nil
+				}
 			}
 			return l.addToken(LESS, "<"), nil
 		case '>':
-			if b, ok := l.peek(); ok && b == '=' {
-				l.advance()
-				return l.addToken(GREATER_EQ, ">="), nil
+			// Prefer shift '>>' over '>=' when present
+			if b, ok := l.peek(); ok {
+				if b == '>' {
+					l.advance()
+					return l.addToken(RSHIFT, ">>"), nil
+				}
+				if b == '=' {
+					l.advance()
+					return l.addToken(GREATER_EQ, ">="), nil
+				}
 			}
 			return l.addToken(GREATER, ">"), nil
 		}

@@ -813,6 +813,9 @@ func (e *emitter) emitExpr(n S) {
 			e.emitWithMarkChild(opNot, 1, 0)
 		case "-":
 			e.emitWithMarkChild(opNeg, 1, 0)
+		case "~":
+			// bitwise not (unary)
+			e.emitWithMarkChild(opBnot, 1, 0)
 		default:
 			e.emit(opConst, e.k(errNull("unknown unary op")))
 		}
@@ -890,6 +893,31 @@ func (e *emitter) emitExpr(n S) {
 			e.withChild(1, func() { e.emitExpr(a) })
 			e.withChild(2, func() { e.emitExpr(b) })
 			e.emitWithMarkChild(opGe, 2, 0)
+		case "**":
+			// exponentiation
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opPow, 2, 0)
+		case "&":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opBand, 2, 0)
+		case "|":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opBor, 2, 0)
+		case "^":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opBxor, 2, 0)
+		case "<<":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opShl, 2, 0)
+		case ">>":
+			e.withChild(1, func() { e.emitExpr(a) })
+			e.withChild(2, func() { e.emitExpr(b) })
+			e.emitWithMarkChild(opShr, 2, 0)
 		default:
 			e.emit(opConst, e.k(errNull("unsupported operator")))
 		}

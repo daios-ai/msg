@@ -2319,3 +2319,71 @@ end
 		t.Fatalf("error should not print '<type>': %v", err)
 	}
 }
+
+// --- exponentiation --------------------------------------------------------
+
+func Test_Interpreter_Exponentiation_Int_And_Float(t *testing.T) {
+	// Int ** Int (non-negative) stays Int
+	wantInt(t, evalSrc(t, "2 ** 3"), 8)
+	wantInt(t, evalSrc(t, "7 ** 0"), 1)
+
+	// Int ** Int (negative exponent) becomes Num (via math.Pow)
+	wantNum(t, evalSrc(t, "2 ** -1"), 0.5)
+	wantNum(t, evalSrc(t, "4 ** -2"), 0.0625)
+
+	// Float participation yields Num
+	wantNum(t, evalSrc(t, "2.0 ** 3"), 8.0)
+	wantNum(t, evalSrc(t, "2 ** 3.0"), 8.0)
+}
+
+func Test_Interpreter_Exponentiation_RightAssociative_And_Precedence(t *testing.T) {
+	// Right associative: 2 ** 3 ** 2  ==  2 ** (3 ** 2) == 2 ** 9 == 512
+	wantInt(t, evalSrc(t, "2 ** 3 ** 2"), 512)
+
+	// Precedence: ** binds tighter than * and +
+	// 2 * 3 ** 2 == 2 * (9) == 18
+	wantInt(t, evalSrc(t, "2 * 3 ** 2"), 18)
+	// Parens sanity
+	wantInt(t, evalSrc(t, "(2 ** 3) * 2"), 16)
+}
+
+// --- bitwise ---------------------------------------------------------------
+
+func Test_Interpreter_Bitwise_Basics(t *testing.T) {
+	// & | ^ on ints
+	wantInt(t, evalSrc(t, "5 & 3"), 1)
+	wantInt(t, evalSrc(t, "5 | 2"), 7)
+	wantInt(t, evalSrc(t, "5 ^ 1"), 4)
+
+	// ~ (bitwise not) is unary and requires Int
+	// (~1) & 3  → (-2) & 3 == 2 (two's complement)
+	wantInt(t, evalSrc(t, "(~1) & 3"), 2)
+}
+
+func Test_Interpreter_Bitwise_Shifts_And_Errors(t *testing.T) {
+	// Shifts
+	wantInt(t, evalSrc(t, "1 << 3"), 8)
+	wantInt(t, evalSrc(t, "8 >> 1"), 4)
+
+	// Shift count validation: out of range produces a hard runtime error
+	err := evalSrcExpectError(t, "1 << 64")
+	wantErrContains(t, err, "shift count out of range")
+
+	err = evalSrcExpectError(t, "1 >> -1")
+	wantErrContains(t, err, "shift count out of range")
+}
+
+func Test_Interpreter_Bitwise_TypeErrors(t *testing.T) {
+	// Non-integers in bitwise binary ops → hard runtime error
+	err := evalSrcExpectError(t, `"a" & 1`)
+	wantErrContains(t, err, "bitwise operators expect integers")
+
+	err = evalSrcExpectError(t, `1.5 | 1`)
+	wantErrContains(t, err, "bitwise operators expect integers")
+}
+
+func Test_Interpreter_Bitwise_Not_TypeError(t *testing.T) {
+	// Unary ~ requires integer
+	err := evalSrcExpectError(t, `~1.5`)
+	wantErrContains(t, err, "bitwise not expects integer")
+}

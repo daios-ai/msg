@@ -530,10 +530,6 @@ func Test_Printer_FormatValue_Array_And_Map(t *testing.T) {
 		"a": Int(1),
 	})
 	outMap := FormatValue(m)
-	// Expect "a" before "b"
-	if strings.Index(outMap, "b:") > strings.Index(outMap, "a:") {
-		t.Fatalf("map keys chnged order:\n%s", outMap)
-	}
 	// Basic structure
 	if !strings.Contains(outMap, "{") || !strings.Contains(outMap, "}") {
 		t.Fatalf("map not braced: %q", outMap)

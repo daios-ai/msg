@@ -156,6 +156,13 @@ const (
 	opGe
 	opNeg
 	opNot
+	opPow  // a ** b
+	opBand // a & b
+	opBor  // a | b
+	opBxor // a ^ b
+	opBnot // ~ a
+	opShl  // a << b
+	opShr  // a >> b
 
 	// control flow
 	opJump        // ip = imm
@@ -245,6 +252,32 @@ func (m *vm) fail(msg string) vmResult {
 func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
 	// numbers
 	if isNumber(a) && isNumber(b) {
+		// exponentiation handled specially below after common conversions
+		if op == opPow {
+			// Int ** Int with non-negative exponent ⇒ keep Int via fast power
+			if a.Tag == VTInt && b.Tag == VTInt {
+				base := a.Data.(int64)
+				exp := b.Data.(int64)
+				if exp < 0 {
+					return Num(math.Pow(float64(base), float64(exp))), nil
+				}
+				var out int64 = 1
+				x := base
+				e := exp
+				for e > 0 {
+					if (e & 1) == 1 {
+						out *= x
+					}
+					e >>= 1
+					if e != 0 {
+						x *= x
+					}
+				}
+				return Int(out), nil
+			}
+			return Num(math.Pow(toFloat(a), toFloat(b))), nil
+		}
+
 		lf, rf := toFloat(a), toFloat(b)
 		bothInt := a.Tag == VTInt && b.Tag == VTInt
 		switch op {
@@ -523,6 +556,49 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res v
 				return m.fail("not expects boolean")
 			}
 			m.push(Bool(!x.Data.(bool)))
+
+		case opPow:
+			b := m.pop()
+			a := m.pop()
+			if out, failRes := m.binNum(opPow, a, b); failRes != nil {
+				return *failRes
+			} else {
+				m.push(out)
+			}
+
+		case opBand, opBor, opBxor, opShl, opShr:
+			b := m.pop()
+			a := m.pop()
+			if a.Tag != VTInt || b.Tag != VTInt {
+				return m.fail("bitwise operators expect integers")
+			}
+			ai := a.Data.(int64)
+			bi := b.Data.(int64)
+			switch opc {
+			case opBand:
+				m.push(Int(ai & bi))
+			case opBor:
+				m.push(Int(ai | bi))
+			case opBxor:
+				m.push(Int(ai ^ bi))
+			case opShl:
+				if bi < 0 || bi >= 64 {
+					return m.fail("shift count out of range (expected 0..63)")
+				}
+				m.push(Int(int64(uint64(ai) << uint(bi))))
+			case opShr:
+				if bi < 0 || bi >= 64 {
+					return m.fail("shift count out of range (expected 0..63)")
+				}
+				m.push(Int(ai >> uint(bi)))
+			}
+
+		case opBnot:
+			x := m.pop()
+			if x.Tag != VTInt {
+				return m.fail("bitwise not expects integer")
+			}
+			m.push(Int(^x.Data.(int64)))
 
 		// ---- control flow ----
 		case opJump:

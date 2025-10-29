@@ -955,3 +955,89 @@ func Test_Lexer_UnarySigns_AreSeparateTokens(t *testing.T) {
 		t.Fatalf("-0xF should lex as MINUS + INTEGER(15), got %v", got[3].Literal)
 	}
 }
+
+func Test_Lexer_Operator_PowerTokenization(t *testing.T) {
+	src := `2**3`
+	got := wantTypes(t, src, []TokenType{INTEGER, POW, INTEGER})
+	if len(got) < 3 {
+		t.Fatalf("unexpected tokens: %v", got)
+	}
+	if got[1].Lexeme != "**" {
+		t.Fatalf("expected POW lexeme '**', got %q", got[1].Lexeme)
+	}
+}
+
+func Test_Lexer_Operator_PowerVsMult_PriorityInScan(t *testing.T) {
+	// Ensure '**' is not split into '*' '*', and a lone '*' is still MULT.
+	src := `** *`
+	got := wantTypes(t, src, []TokenType{POW, MULT})
+	if got[0].Lexeme != "**" || got[1].Lexeme != "*" {
+		t.Fatalf("bad lexemes: %q, %q", got[0].Lexeme, got[1].Lexeme)
+	}
+}
+
+func Test_Lexer_Operator_ShiftsTokenization(t *testing.T) {
+	src := `<< <= < >> >= >`
+	got := wantTypes(t, src, []TokenType{
+		LSHIFT, LESS_EQ, LESS, RSHIFT, GREATER_EQ, GREATER,
+	})
+	lex := []string{got[0].Lexeme, got[1].Lexeme, got[2].Lexeme, got[3].Lexeme, got[4].Lexeme, got[5].Lexeme}
+	wantLex := []string{"<<", "<=", "<", ">>", ">=", ">"}
+	if !reflect.DeepEqual(lex, wantLex) {
+		t.Fatalf("unexpected shift/relational lexemes: got %v want %v", lex, wantLex)
+	}
+}
+
+func Test_Lexer_Operator_BitwiseSingleChar(t *testing.T) {
+	src := `& ^ |`
+	got := wantTypes(t, src, []TokenType{BITAND, BITXOR, BITOR})
+	if got[0].Lexeme != "&" || got[1].Lexeme != "^" || got[2].Lexeme != "|" {
+		t.Fatalf("bad bitwise lexemes: %q %q %q", got[0].Lexeme, got[1].Lexeme, got[2].Lexeme)
+	}
+}
+
+func Test_Lexer_Unary_BitNot(t *testing.T) {
+	src := `~foo`
+	got := wantTypes(t, src, []TokenType{BITNOT, ID})
+	if got[0].Lexeme != "~" || got[1].Literal.(string) != "foo" {
+		t.Fatalf("unexpected tokens for bitnot: %v %v", got[0], got[1])
+	}
+}
+
+func Test_Lexer_Mixed_NewOps_DoNotAffectExistingOnes(t *testing.T) {
+	// Mix new and existing operators; ensure all tokenize distinctly.
+	src := `a**b + c<<2 and d|e == f^g or h&~i`
+	want := []TokenType{
+		ID, POW, ID, PLUS, ID, LSHIFT, INTEGER, AND, ID, BITOR, ID,
+		EQ, ID, BITXOR, ID, OR, ID, BITAND, BITNOT, ID,
+	}
+	got := wantTypes(t, src, want)
+	// Spot-check a few lexemes to ensure exact spelling.
+	checks := []struct {
+		i   int
+		exp string
+	}{
+		{1, "**"},
+		{5, "<<"},
+		{9, "|"},
+		{11, "=="},
+		{13, "^"},
+		{17, "&"},
+		{18, "~"},
+	}
+	for _, c := range checks {
+		if got[c.i].Lexeme != c.exp {
+			t.Fatalf("at index %d, want lexeme %q, got %q", c.i, c.exp, got[c.i].Lexeme)
+		}
+	}
+}
+
+func Test_Lexer_ShiftsPreferredOverRelationalWhenAdjacent(t *testing.T) {
+	src := `<<= >>=` // should lex as: '<<' '='  '>>' '='
+	got := wantTypes(t, src, []TokenType{LSHIFT, ASSIGN, RSHIFT, ASSIGN})
+	lex := []string{got[0].Lexeme, got[1].Lexeme, got[2].Lexeme, got[3].Lexeme}
+	wantLex := []string{"<<", "=", ">>", "="}
+	if !reflect.DeepEqual(lex, wantLex) {
+		t.Fatalf("unexpected lexing for <<= >>= : got %v want %v", lex, wantLex)
+	}
+}

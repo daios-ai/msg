@@ -620,15 +620,6 @@ func (ip *Interpreter) resolveType(t S, env *Env) S {
 func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 	t = stripAnnot(ip.resolveType(t, env))
 
-	// Recognize Handle."kind" upfront (nominal by kind)
-	if kind, ok := isHandleKindNode(t); ok {
-		if v.Tag != VTHandle {
-			return false
-		}
-		h := v.Data.(*Handle)
-		return h != nil && h.Kind == kind
-	}
-
 	// Coinductive memo: (valuePtr, nodeKey(t))
 	// nodeKey mirrors isSubtype: aliases key by *TypeValue, others by &t[0].
 	seen := make(map[[2]unsafe.Pointer]struct{})
@@ -661,6 +652,15 @@ func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
 		t = stripAnnot(t)
 		if len(t) == 0 {
 			return false
+		}
+
+		// Recognize Handle."kind" at any depth (e.g., under nullable T?).
+		if kind, ok := isHandleKindNode(t); ok {
+			if v.Tag != VTHandle {
+				return false
+			}
+			h := v.Data.(*Handle)
+			return h != nil && h.Kind == kind
 		}
 
 		// Modules behave structurally as maps.

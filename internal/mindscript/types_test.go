@@ -1430,3 +1430,18 @@ func Test_Types_Handle_ArrayOfSameKind(t *testing.T) {
 		t.Fatalf("array of same-kind handles inference mismatch: got %#v, want %#v", got, want)
 	}
 }
+
+func Test_Types_Handle_IsType_Nullable_AcceptsValueAndNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	// Non-null handle should match Handle.kind?
+	val := evalWithIP(t, ip, `chanOpen(1)`)
+	tn := typeS(t, ip, `Handle."chan"?`)
+	if !ip.isType(val, tn, ip.Global) {
+		t.Fatalf("expected Handle.\"chan\" to match nullable Handle.\"chan\"?")
+	}
+	// Null should also match Handle.kind?
+	nv := evalWithIP(t, ip, `null`)
+	if !ip.isType(nv, tn, ip.Global) {
+		t.Fatalf("expected null to match nullable Handle.\"chan\"?")
+	}
+}

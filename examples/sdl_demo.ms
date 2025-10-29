@@ -46,10 +46,10 @@ let SDL = ffiOpen({
 })
 
 # Wrap the module to run on one OS thread
-let SDL_owner = ownerWrap(SDL, true)
+let SDL_actor = actorStart(SDL, true)
 
-# Run the whole program body on the owner thread; inside we refer to SDL as 'm'.
-ownerRun(SDL_owner, fun(m: Any) -> Any do
+# Run the whole program body on the actor thread; inside we refer to SDL as 'm'.
+actorRun(SDL_actor, fun(m: Any) -> Any do
   # ---- Constants ----
   let SDL_INIT_VIDEO = 32
   let SDL_WINDOWPOS_X = 100
@@ -145,4 +145,4 @@ ownerRun(SDL_owner, fun(m: Any) -> Any do
   return true
 end)
 
-# Optionally: let _ = ownerClose(SDL_owner)
+# Optionally: let _ = actorClose(SDL_actor)

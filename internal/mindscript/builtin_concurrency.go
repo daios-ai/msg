@@ -29,12 +29,6 @@ type chanBox struct {
 	ch chan Value
 }
 
-func safeClose(ch chan Value) {
-	// Close is idempotent via recover guard.
-	defer func() { _ = recover() }()
-	close(ch)
-}
-
 // ---------- deep cloning for isolates ----------
 
 type cloneCtx struct {
@@ -155,7 +149,7 @@ func registerConcurrencyBuiltins(ip *Interpreter, target *Env) {
 		target,
 		"procSpawn",
 		[]ParamSpec{{Name: "f", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
+		S{"get", S{"id", "Handle"}, S{"str", "proc"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			fv := ctx.Arg("f")
 			if fv.Tag != VTFun {
@@ -219,13 +213,13 @@ Params:
 	f: Fun
 
 Returns:
-	Any   # proc handle (opaque)`)
+	Handle.proc   # proc handle (opaque)`)
 
 	// procJoin(p) -> Any
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"procJoin",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
@@ -236,7 +230,7 @@ Returns:
 	setBuiltinDoc(target, "procJoin", `Wait for a process to finish and return its result.
 
 Params:
-	p: Any   # proc handle
+	p: Handle.proc
 
 Returns:
 	Any`)
@@ -245,7 +239,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"procCancel",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
@@ -270,7 +264,7 @@ Returns:
 See also: procCancelled.
 
 Params:
-	p: Any   # proc handle
+	p: Handle.proc   # proc handle
 
 Returns:
 	Bool?   # true if cancellation was newly requested; Null(err) if already cancelled`)
@@ -279,7 +273,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"procCancelled",
-		[]ParamSpec{{Name: "p", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
@@ -296,7 +290,7 @@ Returns:
 See also: procCancel.
 
 Params:
-	p: Any   # proc handle
+	p: Handle.proc
 
 Returns:
 	Bool`)
@@ -305,7 +299,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"procJoinAll",
-		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
+		[]ParamSpec{{Name: "ps", Type: S{"array", S{"get", S{"id", "Handle"}, S{"str", "proc"}}}}},
 		S{"array", S{"id", "Any"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			ps := ctx.Arg("ps").Data.(*ArrayObject).Elems
@@ -321,7 +315,7 @@ Returns:
 	setBuiltinDoc(target, "procJoinAll", `Wait for all processes to finish and return their results in order.
 
 Params:
-	ps: [Any]   # list of proc handles
+	ps: [Handle.proc]
 
 Returns:
 	[Any]`)
@@ -330,7 +324,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"procJoinAny",
-		[]ParamSpec{{Name: "ps", Type: S{"array", S{"id", "Any"}}}},
+		[]ParamSpec{{Name: "ps", Type: S{"array", S{"get", S{"id", "Handle"}, S{"str", "proc"}}}}},
 		S{"unop", "?", S{"map"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			ps := ctx.Arg("ps").Data.(*ArrayObject).Elems
@@ -360,7 +354,7 @@ Returns:
 	setBuiltinDoc(target, "procJoinAny", `Wait for any process to finish; return its index and value.
 
 Params:
-	ps: [Any]   # list of proc handles (non-empty)
+	ps: [Handle.proc]   # list of proc handles (non-empty)
 
 Returns:
 	{ index: Int, value: Any }?
@@ -374,7 +368,7 @@ Errors:
 		target,
 		"chanOpen",
 		[]ParamSpec{{Name: "cap", Type: S{"unop", "?", S{"id", "Int"}}}},
-		S{"id", "Any"},
+		S{"get", S{"id", "Handle"}, S{"str", "chan"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			capacity := int64(0)
 			if v := ctx.Arg("cap"); v.Tag == VTInt {
@@ -394,13 +388,13 @@ Params:
 	cap: Int?   # capacity (default 0)
 
 Returns:
-	Any   # channel handle (opaque)`)
+	Handle.chan   # channel handle (opaque)`)
 
 	// chanSend(c, x) -> Bool?  (true on success; Null("channel closed") on error)
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"chanSend",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "c", Type: S{"get", S{"id", "Handle"}, S{"str", "chan"}}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
@@ -423,7 +417,7 @@ Returns:
 	setBuiltinDoc(target, "chanSend", `Send a value on a channel (blocking).
 
 Params:
-	c: Any   # channel handle
+	c: Handle.chan
 	x: Any
 
 Returns:
@@ -433,7 +427,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"chanRecv",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "c", Type: S{"get", S{"id", "Handle"}, S{"str", "chan"}}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
@@ -447,7 +441,7 @@ Returns:
 	setBuiltinDoc(target, "chanRecv", `Receive a value from a channel (blocking).
 
 Params:
-	c: Any   # channel handle
+	c: Handle.chan
 
 Returns:
 	Any
@@ -459,7 +453,7 @@ Errors:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"chanTrySend",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}, {Name: "x", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "c", Type: S{"get", S{"id", "Handle"}, S{"str", "chan"}}}, {Name: "x", Type: S{"id", "Any"}}},
 		S{"id", "Bool"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
@@ -484,7 +478,7 @@ Errors:
 	setBuiltinDoc(target, "chanTrySend", `Attempt a non-blocking send on a channel.
 
 Params:
-	c: Any   # channel handle
+	c: Handle.chan
 	x: Any
 
 Returns:
@@ -494,7 +488,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"chanTryRecv",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "c", Type: S{"get", S{"id", "Handle"}, S{"str", "chan"}}}},
 		S{"map"},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
@@ -526,7 +520,7 @@ If the channel is closed and empty, returns {ok:true, value: <annotated null "ch
 If no value is available and the channel is open, returns {ok:false, value:null}.
 
 Params:
-	c: Any   # channel handle
+	c: Handle.chan
 
 Returns:
 	{ ok: Bool, value: Any }`)
@@ -535,7 +529,7 @@ Returns:
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"chanClose",
-		[]ParamSpec{{Name: "c", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "c", Type: S{"get", S{"id", "Handle"}, S{"str", "chan"}}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			cb := asHandle(ctx.Arg("c"), "chan").Data.(*chanBox)
@@ -559,7 +553,7 @@ Returns:
 On first close returns true; on subsequent closes returns Null("channel already closed").
 
 Params:
-	c: Any   # channel handle
+	c: Handle.chan
 
 Returns:
 	Bool?`)
@@ -570,7 +564,7 @@ Returns:
 		target,
 		"timerAfter",
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
-		S{"id", "Any"},
+		S{"get", S{"id", "Handle"}, S{"str", "chan"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			ms := ctx.Arg("ms").Data.(int64)
 			if ms < 0 {
@@ -595,7 +589,7 @@ Params:
 	ms: Int   # delay in milliseconds (>= 0)
 
 Returns:
-	Any   # channel handle
+	Handle.chan   # channel handle
 
 Errors:
 	annotated Null if ms < 0`)
@@ -604,7 +598,7 @@ Errors:
 		target,
 		"ticker",
 		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
-		S{"id", "Any"},
+		S{"get", S{"id", "Handle"}, S{"str", "chan"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			ms := ctx.Arg("ms").Data.(int64)
 			if ms <= 0 {
@@ -641,7 +635,7 @@ Params:
 	ms: Int   # period in milliseconds (> 0)
 
 Returns:
-	Any   # channel handle
+	Handle.chan   # channel handle
 
 Errors:
 	annotated Null if ms <= 0`)

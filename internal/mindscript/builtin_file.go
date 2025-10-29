@@ -380,7 +380,7 @@ func registerIOBuiltins(ip *Interpreter, target *Env) {
 			{Name: "path", Type: S{"id", "Str"}},
 			{Name: "mode", Type: S{"enum", S{"str", "r"}, S{"str", "w"}, S{"str", "a"}, S{"str", "rw"}}},
 		},
-		S{"unop", "?", S{"id", "Any"}}, // Any?
+		S{"unop", "?", S{"get", S{"id", "Handle"}, S{"str", "file"}}}, // Handle.file?
 		func(ip *Interpreter, ctx CallCtx) Value {
 			pv := ctx.Arg("path")
 			mv := ctx.Arg("mode")
@@ -397,7 +397,7 @@ func registerIOBuiltins(ip *Interpreter, target *Env) {
 			return HandleVal("file", h)
 		},
 	)
-	setBuiltinDoc(target, "open", `Open a file and return a handle.
+	setBuiltinDoc(target, "open", `Open a file and return a file handle (Handle.file).
 
 Modes:
 	"r"  — read-only
@@ -410,7 +410,7 @@ Params:
 	mode: Str ("r" | "w" | "a" | "rw")
 
 Returns:
-	file handle usable with read*/write/flush/close,
+	Handle.file, usable with read*/write/flush/close,
 	or null (annotated) on I/O failure.`)
 
 	// close(h: Any) -> Bool?
@@ -490,6 +490,7 @@ Returns:
 	setBuiltinDoc(target, "readAll", `Read all remaining bytes from a handle.
 
 Blocks until EOF and returns the data as Str.
+Accepted kinds: Handle.file, Handle.net.
 Returns null (annotated) on I/O error.`)
 
 	ip.RegisterRuntimeBuiltin(
@@ -515,6 +516,7 @@ Returns null (annotated) on I/O error.`)
 	setBuiltinDoc(target, "readN", `Read up to n bytes from a handle.
 
 May return fewer than n bytes at EOF. Returns data as Str.
+Accepted kinds: Handle.file, Handle.net.
 Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 
 	ip.RegisterRuntimeBuiltin(
@@ -537,6 +539,7 @@ Hard-error if n < 0. Returns null (annotated) on I/O error.`)
 	)
 	setBuiltinDoc(target, "readLine", `Read one line from a handle (without the trailing newline).
 
+Accepted kinds: Handle.file, Handle.net.
 Returns null at EOF. Returns null (annotated) on I/O error.`)
 
 	ip.RegisterRuntimeBuiltin(
@@ -557,6 +560,7 @@ Returns null at EOF. Returns null (annotated) on I/O error.`)
 	setBuiltinDoc(target, "write", `Write a string to a file or network handle.
 
 Returns the number of bytes written as Int, or null (annotated) on I/O error.
+Accepted kinds: Handle.file, Handle.net.
 Output is buffered; call flush to ensure delivery.`)
 
 	ip.RegisterRuntimeBuiltin(
@@ -575,6 +579,7 @@ Output is buffered; call flush to ensure delivery.`)
 	setBuiltinDoc(target, "flush", `Flush buffered output for a handle.
 
 Ensures written data is visible to readers/peers.
+Accepted kinds: Handle.file, Handle.net.
 Returns annotated null on I/O error.
 
 Returns:

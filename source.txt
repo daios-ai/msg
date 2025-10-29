@@ -1,2923 +1,1799 @@
-=== BEGIN FILE: internal/mindscript/types.go ===
-// types.go: runtime type & schema system for MindScript.
+
+
+=== BEGIN FILE: internal/mindscript/builtin_net.go ===
+// net_builtins.go
 //
-// IMPLEMENTATION-ONLY FILE
-// ------------------------
-// This file contains the *private implementation* of the type engine used by
-// the public methods on *Interpreter* that live in interpreter.go:
+// Builtins surfaced:
+//   • netConnect(addr: Str) -> Any
+//   • netListen(addr: Str)  -> Any
+//   • netAccept(l: Any)     -> Any
+//   • http(req: {...})      -> { ... }?
+//   • httpStream(req: {...}) -> { ... }?
 //
-//   ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
-//
-// Those exported methods are thin wrappers that delegate to the lower-case
-// functions defined here: resolveType, isType, isSubtype, unifyTypes,
-// valueToTypeS (plus helpers like litToValue/equalS).
-//
-// Goals / design (practical, JSON-friendly, duck-typed):
-//
-// OVERVIEW
-// --------
-// This file implements MindScript’s *runtime* type system. Types are represented
-// as S-expressions (the same light-weight shape the parser produces) and remain
-// entirely structural. The system is designed for practical, JSON-friendly
-// validation and inference:
-//
-//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
-//     {name:"Raffa"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
-//     Arrays unify element types conservatively; objects are “open-world”.
-//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
-//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
-//   - Arrays are covariant in element type.
-//   - Objects require that all *required* fields of `B` exist, with compatible
-//     types, and *requiredness cannot be relaxed*.
-//   - Extra fields on values are allowed (open-world).
-//   - Functions use parameter contravariance and return covariance.
-//   - `Int <: Num`, and `T?` means nullable.
-//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
-//     inference (e.g., arrays with mixed contents).
-//   - **Modules:** Runtime values tagged `VTModule` are treated as **maps** for
-//     type-checking and inference purposes (they normalize via `AsMapValue`).
-//
-// CANONICALIZATION (alias nodes)
-// ------------------------------
-// A key improvement in this implementation is *alias canonicalization*.
-//
-//  • Any non-builtin type reference (local or module-qualified) is resolved to a
-//    stable, pointer-identified alias node:   ("alias", *TypeValue)
-//
-//  • Builtin type names remain as ("id", "Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type").
-//
-//  • Structural nodes ("array", "map", "unop ?","binop ->", "enum") are resolved
-//    recursively while keeping alias nodes *opaque* — we *do not* inline-expand
-//    aliases during ResolveType. This produces a canonical, name-agnostic
-//    representation so that `M.T` and a local `T = M.T` unify by *pointer
-//    identity* of the exported `*TypeValue`.
-//
-// EQUIRECURSIVE COMPARISON
-// ------------------------
-// Both `isType` and `isSubtype` are implemented coinductively with cycle
-// breaking using memo tables keyed on:
-//   • value-pointer × type-node-pointer (for isType), and
-//   • (left-node, right-node) identity (for isSubtype),
-// augmented so that ("alias", *TypeValue) keys by the *TypeValue pointer*.
-// This makes recursive types and module-qualified aliases compare correctly.
-//
-// DEPENDENCIES (other files)
-// --------------------------
-// • parser.go
-//   - `type S = []any`  (S-expression node type)
-//
-// • interpreter.go
-//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
-//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
-//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
-//   - Environments: `Env` with `Get/Set/Define`
-//   - `type Interpreter` (receiver for public API methods)
-//
-// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
-//
-// PUBLIC VS PRIVATE
-// -----------------
-// PUBLIC  : Nothing.
-//
-// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
-//           isSubtype, unifyTypes, valueToTypeS, literal conversion,
-//           structural S-equality, and field extraction.
+// Notes:
+//   - http(req) returns the whole body as Str (as before), but now also fills
+//     statusText/url/proto/durationMs (end-to-end).
+//   - httpStream(req) returns headers + a *streaming* body handle under `bodyH`.
+//     The handle is Kind "net" so readN/readAll/close work unchanged.
+//   - Uploads: req.body (Str) or req.bodyH (handle) for streaming uploads.
+//   - Timeouts: req.timeoutMs (default 30000).
+//   - Errors: contract mistakes hard-fail; network/IO return annotated null.
 
 package mindscript
 
 import (
-	"unsafe"
+	"bufio"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"time"
 )
 
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-// -----------------------------
-// Helpers
-// -----------------------------
-
-// stripAnnot unwraps annotation wrappers inside type ASTs:
+// These handle types are shared with I/O code:
 //
-//	("annot", ("str", doc), T)  =>  T
+// type netConnH struct {
+// 	c  net.Conn
+// 	rb *bufio.Reader
+// 	wb *bufio.Writer
+// }
 //
-// It repeats until the outer node is not "annot".
-func stripAnnot(t S) S {
-	for len(t) >= 3 {
-		tag, ok := t[0].(string)
-		if !ok || tag != "annot" {
-			break
-		}
-		t = t[2].(S)
-	}
-	return t
+// type netListenerH struct {
+// 	ln net.Listener
+// }
+
+// readOnlyConn adapts an io.ReadCloser (HTTP response body) to net.Conn,
+// enough for our buffered reads + close. Writes are not supported.
+type readOnlyConn struct {
+	rc io.ReadCloser
 }
 
-func isBuiltinTypeName(name string) bool {
-	switch name {
-	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type", "Handle":
-		return true
-	default:
-		return false
+func (c *readOnlyConn) Read(b []byte) (int, error)         { return c.rc.Read(b) }
+func (c *readOnlyConn) Write(_ []byte) (int, error)        { return 0, io.ErrClosedPipe }
+func (c *readOnlyConn) Close() error                       { return c.rc.Close() }
+func (c *readOnlyConn) LocalAddr() net.Addr                { return staticAddr("http-body") }
+func (c *readOnlyConn) RemoteAddr() net.Addr               { return staticAddr("http-body") }
+func (c *readOnlyConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *readOnlyConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *readOnlyConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+type staticAddr string
+
+func (a staticAddr) Network() string { return string(a) }
+func (a staticAddr) String() string  { return string(a) }
+
+// helper: build headers map {Str: Str} (multi-values joined with ", ")
+func headersToMap(h http.Header) Value {
+	hm := make(map[string]Value, len(h))
+	for k, vs := range h {
+		hm[k] = Str(strings.Join(vs, ", "))
 	}
+	return Map(hm)
 }
 
-func isId(t S, name string) bool {
-	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
-}
-
-// ("map", ("pair"| "pair!", ("str",k), T)...)
-type objField struct {
-	required bool
-	typ      S
-}
-
-func mapTypeFields(t S) map[string]objField {
-	fs := map[string]objField{}
-	for i := 1; i < len(t); i++ {
-		p := t[i].(S)
-		if len(p) < 3 {
-			continue
-		}
-		ptag := p[0].(string)           // "pair" or "pair!"
-		keyNode := stripAnnot(p[1].(S)) // allow annotated keys
-		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-			continue
-		}
-		k := keyNode[1].(string)
-		required := ptag == "pair!"
-		fs[k] = objField{required: required, typ: stripAnnot(p[2].(S))}
-	}
-	return fs
-}
-
-// Structural equality for S-exprs with special cases:
-//   - "map" and "enum" stay order-insensitive as before.
-//   - NEW: ("alias", *TypeValue) compares by pointer identity.
-func equalLiteralS(a, b S) bool {
-
-	// Compares two primitive S nodes or scalars used inside S.
-	equalPrimitiveS := func(x, y any) bool {
-		switch xv := x.(type) {
-		case []any: // covers S too
-			yv, ok := y.([]any)
-			if !ok {
-				return false
-			}
-			return equalLiteralS(xv, yv)
-		case string:
-			ys, ok := y.(string)
-			return ok && xv == ys
-		case int64:
-			yi, ok := y.(int64)
-			return ok && xv == yi
-		case float64:
-			yf, ok := y.(float64)
-			return ok && xv == yf
-		case bool:
-			yb, ok := y.(bool)
-			return ok && xv == yb
-		default:
-			return x == y
-		}
-	}
-
-	if len(a) != len(b) {
-		return false
-	}
-	if len(a) == 0 {
-		return true
-	}
-
-	ta, ok := a[0].(string)
-	if !ok {
-		return false
-	}
-	tb, ok := b[0].(string)
-	if !ok || ta != tb {
-		return false
-	}
-
-	if ta == "alias" {
-		if len(a) < 2 || len(b) < 2 {
-			return false
-		}
-		atv, ok1 := a[1].(*TypeValue)
-		btv, ok2 := b[1].(*TypeValue)
-		return ok1 && ok2 && atv == btv
-	}
-
-	// Order-insensitive equality for maps.
-	if ta == "map" {
-		fa := mapTypeFields(a)
-		fb := mapTypeFields(b)
-		if len(fa) != len(fb) {
-			return false
-		}
-		for k, va := range fa {
-			vb, ok := fb[k]
-			if !ok || va.required != vb.required || !equalLiteralS(va.typ, vb.typ) {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Order-insensitive equality for enums.
-	if ta == "enum" {
-		if len(a) != len(b) { // quick length check
-			return false
-		}
-	outer:
-		for i := 1; i < len(a); i++ {
-			for j := 1; j < len(b); j++ {
-				if equalLiteralS(a[i].(S), b[j].(S)) {
-					continue outer
-				}
-			}
-			return false
-		}
-		return true
-	}
-
-	for i := 1; i < len(a); i++ {
-		if !equalPrimitiveS(a[i], b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// --- Handle type helpers ---
-
-// handleType builds the canonical type S for a given handle kind.
-func handleType(kind string) S {
-	return S{"get", S{"id", "Handle"}, S{"str", kind}}
-}
-
-// isHandleKindNode reports whether t is of the form: ("get", ("id","Handle"), ("str", kind)).
-func isHandleKindNode(t S) (kind string, ok bool) {
-	if len(t) < 3 || t[0].(string) != "get" {
-		return "", false
-	}
-	base, _ := t[1].(S)
-	key, _ := t[2].(S)
-	if len(base) >= 2 && base[0].(string) == "id" && base[1].(string) == "Handle" &&
-		len(key) >= 2 && key[0].(string) == "str" {
-		return key[1].(string), true
-	}
-	return "", false
-}
-
-// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
-// Allowed forms: null/bool/int/num/str/array/map with literal children.
-// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
-func (ip *Interpreter) litToValue(lit S) (Value, bool) {
-	if len(lit) == 0 {
-		return Null, false
-	}
-	switch lit[0].(string) {
-	case "null":
-		return Null, true
-	case "bool":
-		return Bool(lit[1].(bool)), true
-	case "int":
-		return Int(lit[1].(int64)), true
-	case "num":
-		return Num(lit[1].(float64)), true
-	case "str":
-		return Str(lit[1].(string)), true
-	case "array":
-		out := make([]Value, 0, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			v, ok := ip.litToValue(lit[i].(S))
-			if !ok {
-				return Null, false
-			}
-			out = append(out, v)
-		}
-		return Arr(out), true
-	case "map":
-		m := make(map[string]Value, len(lit)-1)
-		for i := 1; i < len(lit); i++ {
-			p := lit[i].(S)
-			if len(p) < 3 {
-				return Null, false
-			}
-			keyNode := p[1].(S)
-			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-				return Null, false
-			}
-			k := keyNode[1].(string)
-			v, ok := ip.litToValue(p[2].(S))
-			if !ok {
-				return Null, false
-			}
-			m[k] = v
-		}
-		return Map(m), true
-	default:
-		return Null, false
-	}
-}
-
-// -----------------------------
-// Value → Type inference (typeOf-like behavior)
-// -----------------------------
-
-// valueToTypeS infers a structural type for v. This wrapper seeds cycle guards.
-func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
-	// Cycle guards for arrays and maps so self-references don't produce
-	// infinitely deep or self-nested element/object types. Any back-edge
-	// collapses to Any (conservative, JSON-friendly).
-	seenArr := map[*ArrayObject]bool{}
-	seenMap := map[*MapObject]bool{}
-
-	var infer func(Value) S
-	infer = func(v Value) S {
-		switch v.Tag {
-		case VTNull:
-			return S{"id", "Null"}
-		case VTBool:
-			return S{"id", "Bool"}
-		case VTInt:
-			return S{"id", "Int"}
-		case VTNum:
-			return S{"id", "Num"}
-		case VTStr:
-			return S{"id", "Str"}
-
-		case VTArray:
-			ao := v.Data.(*ArrayObject)
-
-			// If we're already walking this array, it's a cycle → Any.
-			if seenArr[ao] {
-				return S{"id", "Any"}
-			}
-			seenArr[ao] = true
-			defer func() { delete(seenArr, ao) }()
-
-			xs := ao.Elems
-			if len(xs) == 0 {
-				return S{"array", S{"id", "Any"}}
-			}
-
-			// If any element is exactly this array → element type Any.
-			for _, e := range xs {
-				if e.Tag == VTArray && e.Data.(*ArrayObject) == ao {
-					return S{"array", S{"id", "Any"}}
-				}
-			}
-
-			elem := infer(xs[0])
-			for i := 1; i < len(xs); i++ {
-				elem = ip.unifyTypes(elem, infer(xs[i]), env)
-				if isId(elem, "Any") {
-					// Can't get more specific; bail early.
-					break
-				}
-			}
-			return S{"array", elem}
-
-		case VTMap:
-			mo := v.Data.(*MapObject)
-
-			// Cycle guard for maps.
-			if seenMap[mo] {
-				return S{"id", "Any"}
-			}
-			seenMap[mo] = true
-			defer func() { delete(seenMap, mo) }()
-
-			out := S{"map"}
-			// Open-world: infer observed fields as optional ("pair").
-			for k, vv := range mo.Entries {
-				out = append(out, S{"pair", S{"str", k}, infer(vv)})
-			}
-			return out
-
-		case VTModule:
-			// Treat modules structurally as maps.
-			return infer(AsMapValue(v))
-
-		case VTFun:
-			f := v.Data.(*Fun)
-			// Resolve each piece in the function's own env to avoid <type>
-			rt := ip.resolveType(f.ReturnType, f.Env)
-			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-				pt := ip.resolveType(f.ParamTypes[i], f.Env)
-				rt = S{"binop", "->", pt, rt}
-			}
-			return rt
-
-		case VTHandle:
-			h := v.Data.(*Handle)
-			if h == nil || h.Kind == "" {
-				return S{"id", "Any"}
-			}
-			return handleType(h.Kind)
-
-		case VTType:
-			return S{"id", "Type"}
-
-		default:
-			return S{"id", "Any"}
-		}
-	}
-
-	return infer(v)
-}
-
-// -----------------------------
-// Alias-based canonical resolution
-// -----------------------------
-
-// --- replace the old resolveModuleTypeAlias with these helpers ---
-
-// peelGetChain collects rightward keys from nested ("get", base, "str") nodes.
-// It returns (baseNode, keysRightToLeft).
-func peelGetChain(t S) (S, []string) {
-	t = stripAnnot(t)
-	keys := []string{}
-	node := t
-	for len(node) >= 3 && node[0].(string) == "get" {
-		keyNode, _ := node[2].(S)
-		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
-			return t, nil
-		}
-		keys = append(keys, keyNode[1].(string))
-		base, _ := node[1].(S)
-		node = base
-	}
-	return node, keys
-}
-
-// resolveTypePath walks a ("get", ...) chain against runtime values, switching
-// the lookup view when encountering a Type (use its Env) and stepping through
-// modules by reading their exported map. On success returns the terminal *TypeValue.
-func (ip *Interpreter) resolveTypePath(env *Env, t S) (*TypeValue, bool) {
-	base, keysRL := peelGetChain(t)
-	if len(keysRL) == 0 {
-		return nil, false
-	}
-
-	// Resolve the base to a runtime Value in the given env.
-	var cur Value
-	switch {
-	case len(base) >= 2 && base[0].(string) == "id":
-		v, err := env.Get(base[1].(string))
-		if err != nil {
-			return nil, false
-		}
-		cur = v
-
-	case len(base) >= 3 && base[0].(string) == "get":
-		// Recurse: resolve the inner path first.
-		tv, ok := ip.resolveTypePath(env, base)
-		if !ok {
-			return nil, false
-		}
-		// The base resolved to a Type; switch view to its Env to continue.
-		cur = TypeValIn(tv.Ast, tv.Env)
-
-	default:
-		return nil, false
-	}
-
-	// Walk keys left→right (we collected right→left).
-	for i := len(keysRL) - 1; i >= 0; i-- {
-		switch cur.Tag {
-		case VTModule:
-			mod := cur.Data.(*Module)
-			v, ok := mod.get(keysRL[i])
-			if !ok {
-				return nil, false
-			}
-			cur = v
-
-		case VTType:
-			// Switch lookup view to the type's own environment.
-			tv := cur.Data.(*TypeValue)
-			if tv.Env == nil {
-				return nil, false
-			}
-			v, err := tv.Env.Get(keysRL[i])
+func registerNetBuiltins(ip *Interpreter, target *Env) {
+	// netConnect("host:port") -> "net" handle
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"netConnect",
+		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			av := ctx.Arg("addr")
+			conn, err := net.Dial("tcp", av.Data.(string))
 			if err != nil {
-				return nil, false
+				return annotNull(err.Error()) // soft
 			}
-			cur = v
+			return HandleVal("net", &netConnH{
+				c:  conn,
+				rb: bufio.NewReader(conn),
+				wb: bufio.NewWriter(conn),
+			})
+		},
+	)
+	setBuiltinDoc(target, "netConnect", `Open a TCP connection to "host:port".
 
-		default:
-			return nil, false
-		}
+Returns a network handle usable with read*/write/flush/close,
+or null (annotated) on network error.`)
+
+	// netListen("host:port") -> "listener" handle
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"netListen",
+		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			av := ctx.Arg("addr")
+			ln, err := net.Listen("tcp", av.Data.(string))
+			if err != nil {
+				return annotNull(err.Error()) // soft
+			}
+			return HandleVal("listener", &netListenerH{ln: ln})
+		},
+	)
+	setBuiltinDoc(target, "netListen", `Listen on a TCP address "host:port".
+
+Returns a listener handle for netAccept. Use close(listener) to stop listening.
+Returns null (annotated) on bind/listen error.`)
+
+	// netAccept(listener) -> "net" handle
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"netAccept",
+		[]ParamSpec{{Name: "l", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			ln := asHandle(ctx.Arg("l"), "listener").Data.(*netListenerH).ln
+			conn, err := ln.Accept()
+			if err != nil {
+				return annotNull(err.Error()) // soft
+			}
+			return HandleVal("net", &netConnH{
+				c:  conn,
+				rb: bufio.NewReader(conn),
+				wb: bufio.NewWriter(conn),
+			})
+		},
+	)
+	setBuiltinDoc(target, "netAccept", `Accept one TCP connection from a listener.
+
+Blocks until a client connects. Returns a network handle,
+or null (annotated) on accept error.`)
+
+	// HTTP input and output types.
+	var httpReqT = S{
+		"map",
+		S{"pair!", S{"str", "url"}, S{"id", "Str"}},
+		S{"pair", S{"str", "method"}, S{"id", "Str"}},
+		S{"pair", S{"str", "headers"}, S{"map"}},
+		S{"pair", S{"str", "body"}, S{"id", "Str"}},  // optional text body
+		S{"pair", S{"str", "bodyH"}, S{"id", "Any"}}, // optional upload handle
+		S{"pair", S{"str", "timeoutMs"}, S{"id", "Int"}},
 	}
 
-	if cur.Tag != VTType {
-		return nil, false
-	}
-	return cur.Data.(*TypeValue), true
-}
-
-// resolveType canonicalizes a type S-expression in env:
-//   - Builtins stay as ("id", "...").
-//   - Any non-builtin type identifier or qualified get resolves to a stable,
-//     *pointer-identified* alias node: ("alias", *TypeValue).
-//   - Structure nodes ("array", "map", "unop ?","binop ->", "enum") are
-//     recursively resolved while *keeping* alias nodes opaque (no inline
-//     expansion). This gives us a canonical, name-agnostic graph suitable for
-//     equirecursive comparison across modules.
-//
-// NOTE: By avoiding inline expansion and using ("alias", *TypeValue), two
-// references to the same exported type (e.g., M.T and a local T = M.T) become
-// literally the same anchor, regardless of spelling.
-func (ip *Interpreter) resolveType(t S, env *Env) S {
-	t = stripAnnot(t)
-	if len(t) == 0 {
-		return t
+	var httpRespT = S{
+		"unop", "?", S{
+			"map",
+			S{"pair!", S{"str", "status"}, S{"id", "Int"}},
+			S{"pair", S{"str", "statusText"}, S{"id", "Str"}},
+			S{"pair!", S{"str", "headers"}, S{"map"}},
+			S{"pair", S{"str", "url"}, S{"id", "Str"}},
+			S{"pair", S{"str", "proto"}, S{"id", "Str"}},
+			S{"pair", S{"str", "durationMs"}, S{"id", "Int"}},
+			S{"pair", S{"str", "body"}, S{"id", "Str"}},  // for http()
+			S{"pair", S{"str", "bodyH"}, S{"id", "Any"}}, // for httpStream()
+		},
 	}
 
-	// Helper: build alias if a local name resolves to a VTType.
-	// Self-cycle guard: let T = type T  must not aliasify; keep ("id","T").
-	aliasOf := func(e *Env, name string) (S, bool) {
-		if e == nil || isBuiltinTypeName(name) {
-			return nil, false
-		}
-		v, err := e.Get(name)
-		if err != nil || v.Tag != VTType {
-			return nil, false
-		}
-		tv := v.Data.(*TypeValue)
-		root := stripAnnot(tv.Ast)
-		if len(root) >= 2 && root[0].(string) == "id" && root[1].(string) == name {
-			return nil, false
-		}
-		return S{"alias", tv}, true
-	}
-
-	switch t[0].(string) {
-	case "id":
-		if a, ok := aliasOf(env, t[1].(string)); ok {
-			return a
-		}
-		return t // builtin or unknown stays as-is
-
-	case "get":
-		// Robust qualified resolution: walk through modules and types (env switch on type).
-		if tv, ok := ip.resolveTypePath(env, t); ok {
-			return S{"alias", tv}
-		}
-		return t
-
-	case "unop":
-		if len(t) >= 3 && t[1].(string) == "?" {
-			return S{"unop", "?", ip.resolveType(t[2].(S), env)}
-		}
-		return t
-
-	case "array":
-		if len(t) == 2 {
-			return S{"array", ip.resolveType(t[1].(S), env)}
-		}
-		out := S{"array"}
-		for i := 1; i < len(t); i++ {
-			out = append(out, ip.resolveType(t[i].(S), env))
-		}
-		return out
-
-	case "map":
-		out := S{"map"}
-		for i := 1; i < len(t); i++ {
-			p := t[i].(S) // ("pair"|"pair!", ("str",k), T)
-			tag := p[0].(string)
-			key := p[1].(S)
-			out = append(out, S{tag, key, ip.resolveType(p[2].(S), env)})
-		}
-		return out
-
-	case "enum":
-		// Enum literals stay literal; we don't resolve inside.
-		return t
-
-	case "binop":
-		if len(t) >= 4 && t[1].(string) == "->" {
-			return S{"binop", "->", ip.resolveType(t[2].(S), env), ip.resolveType(t[3].(S), env)}
-		}
-		return t
-
-	default:
-		return t
-	}
-}
-
-// -----------------------------
-// Runtime type checking
-// -----------------------------
-
-// isType checks whether runtime value v conforms to type t under env.
-// We canonicalize t once (resolveType), then check structurally.
-// It fully supports nested function types and alias nodes.
-func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
-	t = stripAnnot(ip.resolveType(t, env))
-
-	// Recognize Handle."kind" upfront (nominal by kind)
-	if kind, ok := isHandleKindNode(t); ok {
-		if v.Tag != VTHandle {
-			return false
-		}
-		h := v.Data.(*Handle)
-		return h != nil && h.Kind == kind
-	}
-
-	// Coinductive memo: (valuePtr, nodeKey(t))
-	// nodeKey mirrors isSubtype: aliases key by *TypeValue, others by &t[0].
-	seen := make(map[[2]unsafe.Pointer]struct{})
-
-	nodeKey := func(t S) unsafe.Pointer {
-		if len(t) >= 2 && t[0].(string) == "alias" {
-			if tv, ok := t[1].(*TypeValue); ok {
-				return unsafe.Pointer(tv)
+	// -----------------------------------------
+	// http: buffered body (as text)
+	// -----------------------------------------
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"http",
+		[]ParamSpec{{Name: "req", Type: httpReqT}},
+		httpRespT,
+		func(_ *Interpreter, ctx CallCtx) Value {
+			rv := ctx.Arg("req")
+			if rv.Tag != VTMap {
+				fail("http expects a request map") // contractual
 			}
-		}
-		return unsafe.Pointer(&t[0])
-	}
+			mo := rv.Data.(*MapObject)
 
-	// Build value pointer key for arrays/maps/funs for memoization.
-	valKey := func(v Value) unsafe.Pointer {
-		switch v.Tag {
-		case VTMap:
-			return unsafe.Pointer(v.Data.(*MapObject))
-		case VTArray:
-			return unsafe.Pointer(v.Data.(*ArrayObject))
-		case VTFun:
-			return unsafe.Pointer(v.Data.(*Fun))
-		default:
-			return nil
-		}
-	}
-
-	var check func(Value, S) bool
-	check = func(v Value, t S) bool {
-		t = stripAnnot(t)
-		if len(t) == 0 {
-			return false
-		}
-
-		// Modules behave structurally as maps.
-		v = AsMapValue(v)
-
-		vp := valKey(v)
-		nk := nodeKey(t)
-		// For structured values (vp != nil), memoize all nodes.
-		// For scalars (vp == nil), memoize only alias nodes to break unfold cycles.
-		if vp != nil || (len(t) >= 2 && t[0].(string) == "alias") {
-			k := [2]unsafe.Pointer{vp, nk}
-			if _, ok := seen[k]; ok {
-				return true
+			// url (required)
+			uv, ok := mo.Entries["url"]
+			if !ok || uv.Tag != VTStr {
+				fail("http req.url must be a string") // contractual
 			}
-			seen[k] = struct{}{}
-		}
+			url := uv.Data.(string)
 
-		switch t[0].(string) {
-		case "id":
-			switch t[1].(string) {
-			case "Any":
-				return true
-			case "Null":
-				return v.Tag == VTNull
-			case "Bool":
-				return v.Tag == VTBool
-			case "Int":
-				return v.Tag == VTInt
-			case "Num":
-				return v.Tag == VTInt || v.Tag == VTNum
-			case "Str":
-				return v.Tag == VTStr
-			case "Type":
-				return v.Tag == VTType
-			default:
-				// Non-builtin unresolved id: reject (canonical resolver leaves only builtins or aliases)
-				return false
-			}
-
-		case "alias":
-			// Unfold against the alias's own env; the unified memo above
-			// prevents both structured and scalar infinite unfolding.
-			tv := t[1].(*TypeValue)
-			return check(v, ip.resolveType(tv.Ast, tv.Env))
-
-		case "unop": // nullable
-			if t[1].(string) != "?" {
-				return false
-			}
-			if v.Tag == VTNull {
-				return true
-			}
-			return check(v, t[2].(S))
-
-		case "array":
-			if v.Tag != VTArray {
-				return false
-			}
-			elemT := S{"id", "Any"}
-			if len(t) == 2 {
-				elemT = t[1].(S)
-			}
-			for _, e := range v.Data.(*ArrayObject).Elems {
-				if !check(e, elemT) {
-					return false
+			// method (optional, default GET)
+			method := "GET"
+			if mv, ok := mo.Entries["method"]; ok {
+				if mv.Tag != VTStr {
+					fail("http req.method must be a string") // contractual
+				}
+				if m := strings.TrimSpace(strings.ToUpper(mv.Data.(string))); m != "" {
+					method = m
 				}
 			}
-			return true
 
-		case "map":
-			if v.Tag != VTMap {
-				return false
+			// body or bodyH (prefer handle if both provided)
+			var bodyReader io.Reader
+			if hv, ok := mo.Entries["bodyH"]; ok && hv.Tag != VTNull {
+				// Accept file/net handle as upload source (read side).
+				h := asHandle(hv, "")
+				switch h.Kind {
+				case "file":
+					bodyReader = h.Data.(*fileH).rb
+				case "net":
+					bodyReader = h.Data.(*netConnH).rb
+				default:
+					fail("http req.bodyH must be a readable handle (file/net)")
+				}
+			} else if bv, ok := mo.Entries["body"]; ok {
+				if bv.Tag != VTStr {
+					fail("http req.body must be a string") // contractual
+				}
+				bodyReader = strings.NewReader(bv.Data.(string))
 			}
-			fs := mapTypeFields(t)
-			m := v.Data.(*MapObject).Entries
-			for name, f := range fs {
-				val, ok := m[name]
-				if !ok {
-					if f.required {
-						return false
+
+			req, err := http.NewRequest(method, url, bodyReader)
+			if err != nil {
+				return annotNull(err.Error()) // soft (bad URL, etc.)
+			}
+
+			// headers (optional)
+			if hv, ok := mo.Entries["headers"]; ok {
+				if hv.Tag != VTMap {
+					fail("http req.headers must be a map") // contractual
+				}
+				hm := hv.Data.(*MapObject).Entries
+				for k, vv := range hm {
+					if vv.Tag != VTStr {
+						fail("http header values must be strings") // contractual
 					}
-					continue
-				}
-				if !check(val, f.typ) {
-					return false
+					req.Header.Set(k, vv.Data.(string))
 				}
 			}
-			return true
 
-		case "enum":
-			for i := 1; i < len(t); i++ {
-				if lit, ok := ip.litToValue(t[i].(S)); ok && ip.deepEqual(lit, v) {
-					return true
+			// timeoutMs (optional)
+			timeout := 30 * time.Second
+			if tv, ok := mo.Entries["timeoutMs"]; ok {
+				if tv.Tag != VTInt {
+					fail("http req.timeoutMs must be an Int (milliseconds)")
 				}
+				timeout = time.Duration(tv.Data.(int64)) * time.Millisecond
 			}
-			return false
 
-		case "binop": // function type expected
-			if t[1].(string) != "->" || v.Tag != VTFun {
-				return false
+			start := time.Now()
+			client := &http.Client{Timeout: timeout}
+			resp, err := client.Do(req)
+			if err != nil {
+				return annotNull(err.Error()) // soft (network timeout, DNS, etc.)
 			}
-			// Build the function value's fully-resolved signature in its own env.
-			f := v.Data.(*Fun)
-			rt := stripAnnot(ip.resolveType(f.ReturnType, f.Env))
-			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
-				pt := stripAnnot(ip.resolveType(f.ParamTypes[i], f.Env))
-				rt = S{"binop", "->", pt, rt}
-			}
-			// CRITICAL: Compare under the *expected-type's* env (the env passed into isType),
-			// so module-qualified names/aliases from the expected side resolve properly.
-			// 'rt' already contains alias nodes for the value side and does not require this env.
-			return ip.isSubtype(rt, t, env)
-		}
+			defer resp.Body.Close()
 
-		return false
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return annotNull(err.Error()) // soft
+			}
+			durMs := int64(time.Since(start) / time.Millisecond)
+
+			out := map[string]Value{
+				"status":     Int(int64(resp.StatusCode)),
+				"statusText": Str(resp.Status),
+				"headers":    headersToMap(resp.Header),
+				"body":       Str(string(b)),
+				"url":        Str(resp.Request.URL.String()),
+				"proto":      Str(resp.Proto),
+				"durationMs": Int(durMs),
+			}
+			return Map(out)
+		},
+	)
+	setBuiltinDoc(target, "http", `Make an HTTP request (buffered).
+
+Input:
+	req: {
+		url!:       Str
+		method:     Str?         # default "GET"
+		headers:    {}?
+		body:       Str?         # text body
+		bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
+		timeoutMs:  Int?         # default 30000
 	}
 
-	return check(v, t)
-}
+Output:
+	{
+		status!:     Int
+		statusText:  Str
+		headers!:    {Str: Str}   # multi-values joined by ", "
+		body!:       Str           # full response body (text/binary-as-text)
+		url:         Str           # final URL after redirects
+		proto:       Str           # "HTTP/1.1", "HTTP/2.0"
+		durationMs:  Int           # end-to-end (including body read)
+	}?  # annotated null on network/IO error`)
 
-// -----------------------------
-// Structural subtyping  t1 <: t2
-// -----------------------------
-
-// isSubtype checks a <: b structurally. Both sides are first canonicalized by
-// resolveType(t, env). It supports equirecursive types via a coinductive memo
-// keyed by the underlying node identity; for ("alias", *TypeValue) it keys on
-// the *TypeValue pointer*, so module-qualified names unify with local aliases.
-func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
-	a = stripAnnot(ip.resolveType(a, env))
-	b = stripAnnot(ip.resolveType(b, env))
-
-	// Produce a stable pointer identity for memo keys:
-	//  • for ("alias", *TypeValue) use the tv pointer,
-	//  • otherwise use &node[0] (address of tag cell).
-	nodeKey := func(t S) unsafe.Pointer {
-		if len(t) >= 2 && t[0].(string) == "alias" {
-			if tv, ok := t[1].(*TypeValue); ok {
-				return unsafe.Pointer(tv)
+	// -----------------------------------------
+	// httpStream: streaming body (as a "net" handle)
+	// -----------------------------------------
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"httpStream",
+		[]ParamSpec{{Name: "req", Type: httpReqT}},
+		httpRespT,
+		func(_ *Interpreter, ctx CallCtx) Value {
+			rv := ctx.Arg("req")
+			if rv.Tag != VTMap {
+				fail("httpStream expects a request map") // contractual
 			}
-		}
-		return unsafe.Pointer(&t[0])
-	}
+			mo := rv.Data.(*MapObject)
 
-	seen := make(map[[2]unsafe.Pointer]struct{})
-
-	var sub func(S, S) bool
-	sub = func(x, y S) bool {
-		x = stripAnnot(x)
-		y = stripAnnot(y)
-		if len(x) == 0 || len(y) == 0 {
-			return false
-		}
-
-		k := [2]unsafe.Pointer{nodeKey(x), nodeKey(y)}
-		if _, ok := seen[k]; ok {
-			return true
-		}
-		seen[k] = struct{}{}
-
-		// Fast equality
-		if equalLiteralS(x, y) {
-			return true
-		}
-
-		// Top
-		if isId(y, "Any") {
-			return true
-		}
-
-		// Nullable helpers
-		isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
-		unwrap := func(t S) S { return t[2].(S) }
-
-		// Handle kinds: nominal equality only
-		if ak, okA := isHandleKindNode(x); okA {
-			if bk, okB := isHandleKindNode(y); okB {
-				return ak == bk
+			// url (required)
+			uv, ok := mo.Entries["url"]
+			if !ok || uv.Tag != VTStr {
+				fail("httpStream req.url must be a string") // contractual
 			}
-			// So x <: y is false when y isn't the same Handle."kind".
-		}
+			url := uv.Data.(string)
 
-		if isOpt(y) {
-			if sub(x, unwrap(y)) {
-				return true
+			// method (optional, default GET)
+			method := "GET"
+			if mv, ok := mo.Entries["method"]; ok {
+				if mv.Tag != VTStr {
+					fail("httpStream req.method must be a string")
+				}
+				if m := strings.TrimSpace(strings.ToUpper(mv.Data.(string))); m != "" {
+					method = m
+				}
 			}
-			if isId(x, "Null") {
-				return true
-			}
-		}
-		// Int <: Num
-		if isId(x, "Int") && isId(y, "Num") {
-			return true
-		}
-		// A? <: B? iff A <: B
-		if isOpt(x) && isOpt(y) {
-			return sub(unwrap(x), unwrap(y))
-		}
-		// Identical primitive ids
-		if len(x) >= 2 && x[0].(string) == "id" && len(y) >= 2 && y[0].(string) == "id" {
-			return x[1].(string) == y[1].(string)
-		}
 
-		// Alias unfolding (lazily)
-		if len(x) >= 2 && x[0].(string) == "alias" {
-			tv := x[1].(*TypeValue)
-			return sub(ip.resolveType(tv.Ast, tv.Env), y)
-		}
-		if len(y) >= 2 && y[0].(string) == "alias" {
-			tv := y[1].(*TypeValue)
-			return sub(x, ip.resolveType(tv.Ast, tv.Env))
-		}
+			// body or bodyH (prefer handle if both provided)
+			var bodyReader io.Reader
+			if hv, ok := mo.Entries["bodyH"]; ok && hv.Tag != VTNull {
+				h := asHandle(hv, "")
+				switch h.Kind {
+				case "file":
+					bodyReader = h.Data.(*fileH).rb
+				case "net":
+					bodyReader = h.Data.(*netConnH).rb
+				default:
+					fail("httpStream req.bodyH must be a readable handle (file/net)")
+				}
+			} else if bv, ok := mo.Entries["body"]; ok {
+				if bv.Tag != VTStr {
+					fail("httpStream req.body must be a string")
+				}
+				bodyReader = strings.NewReader(bv.Data.(string))
+			}
 
-		switch x[0].(string) {
-		case "array":
-			if y[0].(string) != "array" {
-				return false
+			req, err := http.NewRequest(method, url, bodyReader)
+			if err != nil {
+				return annotNull(err.Error())
 			}
-			xe := S{"id", "Any"}
-			ye := S{"id", "Any"}
-			if len(x) == 2 {
-				xe = x[1].(S)
-			}
-			if len(y) == 2 {
-				ye = y[1].(S)
-			}
-			return sub(xe, ye) // covariance
 
-		case "map":
-			if y[0].(string) != "map" {
-				return false
-			}
-			reqY := mapTypeFields(y)
-			haveX := mapTypeFields(x)
-			for name, fy := range reqY {
-				fx, ok := haveX[name]
-				if !ok {
-					if fy.required {
-						return false
+			// headers (optional)
+			if hv, ok := mo.Entries["headers"]; ok {
+				if hv.Tag != VTMap {
+					fail("httpStream req.headers must be a map")
+				}
+				hm := hv.Data.(*MapObject).Entries
+				for k, vv := range hm {
+					if vv.Tag != VTStr {
+						fail("http header values must be strings")
 					}
-					continue
-				}
-				if fy.required && !fx.required {
-					return false
-				}
-				if !sub(fx.typ, fy.typ) {
-					return false
+					req.Header.Set(k, vv.Data.(string))
 				}
 			}
-			return true
 
-		case "enum":
-			// Enum⊆Enum by literal inclusion
-			if y[0].(string) == "enum" {
-				for i := 1; i < len(x); i++ {
-					found := false
-					for j := 1; j < len(y); j++ {
-						if equalLiteralS(x[i].(S), y[j].(S)) {
-							found = true
-							break
-						}
-					}
-					if !found {
-						return false
-					}
+			// timeoutMs (optional)
+			timeout := 30 * time.Second
+			if tv, ok := mo.Entries["timeoutMs"]; ok {
+				if tv.Tag != VTInt {
+					fail("httpStream req.timeoutMs must be an Int (milliseconds)")
 				}
-				return true
+				timeout = time.Duration(tv.Data.(int64)) * time.Millisecond
 			}
-			// Enum <: T if each member fits T
-			for i := 1; i < len(x); i++ {
-				lv, ok := ip.litToValue(x[i].(S))
-				if !ok || !ip.isType(lv, y, nil) {
-					return false
-				}
-			}
-			return true
 
-		case "binop":
-			if x[1].(string) != "->" || y[0].(string) != "binop" || y[1].(string) != "->" {
-				return false
+			start := time.Now()
+			client := &http.Client{Timeout: timeout}
+			resp, err := client.Do(req)
+			if err != nil {
+				return annotNull(err.Error())
 			}
-			xp, xr := x[2].(S), x[3].(S)
-			yp, yr := y[2].(S), y[3].(S)
-			// Param contravariance, return covariance
-			return sub(yp, xp) && sub(xr, yr)
-		}
+			// Wrap the response body in a readOnlyConn so it looks like a "net" handle.
+			ro := &readOnlyConn{rc: resp.Body}
+			h := &netConnH{
+				c:  ro,
+				rb: bufio.NewReader(ro),
+				// wb is nil (read-only)
+			}
+			durMs := int64(time.Since(start) / time.Millisecond) // until headers received
 
-		return false
+			out := map[string]Value{
+				"status":     Int(int64(resp.StatusCode)),
+				"statusText": Str(resp.Status),
+				"headers":    headersToMap(resp.Header),
+				"bodyH":      HandleVal("net", h), // works with readN/readAll/close
+				"url":        Str(resp.Request.URL.String()),
+				"proto":      Str(resp.Proto),
+				"durationMs": Int(durMs),
+			}
+			return Map(out)
+		},
+	)
+	setBuiltinDoc(target, "httpStream", `Make an HTTP request (streaming).
+
+Input:
+	req: {
+		url!:       Str
+		method:     Str?         # default "GET"
+		headers:    {}?
+		body:       Str?         # text body
+		bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
+		timeoutMs:  Int?         # default 30000
 	}
 
-	return sub(a, b)
+Output:
+	{
+		status!:     Int
+		statusText:  Str
+		headers!:    {Str: Str}
+		bodyH!:      Any          # readable handle (Kind "net"); use readN/readAll/close
+		url:         Str
+		proto:       Str
+		durationMs:  Int          # time until headers (body not read)
+	}?  # annotated null on network/IO error
+
+Notes:
+	• The returned bodyH is *read-only*. Writing to it will fail.
+	• Use close(bodyH) when done to release the connection early.`)
 }
+=== END FILE: internal/mindscript/builtin_net.go ===
 
-// -----------------------------
-// Unification (least common supertype)
-// -----------------------------
-
-func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
-	// Canonicalize both sides first (alias-aware)
-	t1 = stripAnnot(ip.resolveType(t1, env))
-	t2 = stripAnnot(ip.resolveType(t2, env))
-
-	// Helper: expand a single alias once (for LUB we can unfold to compare)
-	expandAlias := func(t S) S {
-		if len(t) >= 2 && t[0].(string) == "alias" {
-			tv := t[1].(*TypeValue)
-			return stripAnnot(ip.resolveType(tv.Ast, tv.Env))
-		}
-		return t
-	}
-
-	// Any absorbs
-	if isId(t1, "Any") {
-		return t1
-	}
-	if isId(t2, "Any") {
-		return t2
-	}
-
-	// ---- Null / Nullable ----
-	if isId(t1, "Null") && isId(t2, "Null") {
-		return t1
-	}
-	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
-		return t2
-	}
-	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
-		return t1
-	}
-	if isId(t1, "Null") {
-		return S{"unop", "?", t2}
-	}
-	if isId(t2, "Null") {
-		return S{"unop", "?", t1}
-	}
-
-	// Nullable normalization
-	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
-	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
-	if isOpt1 && isOpt2 {
-		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt1 {
-		u := ip.unifyTypes(t1[2].(S), t2, env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-	if isOpt2 {
-		u := ip.unifyTypes(t1, t2[2].(S), env)
-		if isId(u, "Any") {
-			return u
-		}
-		return S{"unop", "?", u}
-	}
-
-	// If either side is an alias, unfold once for comparison.
-	if len(t1) >= 2 && t1[0].(string) == "alias" {
-		t1 = expandAlias(t1)
-	}
-	if len(t2) >= 2 && t2[0].(string) == "alias" {
-		t2 = expandAlias(t2)
-	}
-
-	// ---- Handle kinds (nominal) ----
-	if k1, ok1 := isHandleKindNode(t1); ok1 {
-		if k2, ok2 := isHandleKindNode(t2); ok2 {
-			if k1 == k2 {
-				return t1
-			}
-			return S{"id", "Any"}
-		}
-	}
-
-	// ---- Primitives (incl. Int ⊔ Num = Num) ----
-	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
-		n1 := t1[1].(string)
-		n2 := t2[1].(string)
-		if n1 == n2 {
-			return t1
-		}
-		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
-			return S{"id", "Num"}
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Arrays ----
-	if t1[0].(string) == "array" && t2[0].(string) == "array" {
-		e1 := S{"id", "Any"}
-		e2 := S{"id", "Any"}
-		if len(t1) == 2 {
-			e1 = t1[1].(S)
-		}
-		if len(t2) == 2 {
-			e2 = t2[1].(S)
-		}
-		elem := ip.unifyTypes(e1, e2, env)
-		return S{"array", elem}
-	}
-	if t1[0].(string) == "array" || t2[0].(string) == "array" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Maps: fieldwise unify; required OR ----
-	if t1[0].(string) == "map" && t2[0].(string) == "map" {
-		f1 := mapTypeFields(t1)
-		f2 := mapTypeFields(t2)
-		keys := map[string]struct{}{}
-		for k := range f1 {
-			keys[k] = struct{}{}
-		}
-		for k := range f2 {
-			keys[k] = struct{}{}
-		}
-		out := S{"map"}
-		for k := range keys {
-			s1, ok1 := f1[k]
-			s2, ok2 := f2[k]
-			switch {
-			case ok1 && ok2:
-				ut := ip.unifyTypes(s1.typ, s2.typ, env)
-				req := s1.required && s2.required
-				tag := "pair"
-				if req {
-					tag = "pair!"
-				}
-				out = append(out, S{tag, S{"str", k}, ut})
-			case ok1 && !ok2:
-				out = append(out, S{"pair", S{"str", k}, s1.typ})
-			case !ok1 && ok2:
-				out = append(out, S{"pair", S{"str", k}, s2.typ})
-			}
-		}
-		return out
-	}
-	if t1[0].(string) == "map" || t2[0].(string) == "map" {
-		return S{"id", "Any"}
-	}
-
-	// ---- Enums ----
-	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
-		union := S{"enum"}
-		seen := func(x S) bool {
-			for i := 1; i < len(union); i++ {
-				if equalLiteralS(union[i].(S), x) {
-					return true
-				}
-			}
-			return false
-		}
-		for i := 1; i < len(t1); i++ {
-			x := t1[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		for i := 1; i < len(t2); i++ {
-			x := t2[i].(S)
-			if !seen(x) {
-				union = append(union, x)
-			}
-		}
-		return union
-	}
-	// enum ⊔ Type → Type if all members fit; else Any
-	if t1[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t1); i++ {
-			lv, ok := ip.litToValue(t1[i].(S))
-			if !ok || !ip.isType(lv, t2, env) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return t2
-		}
-		return S{"id", "Any"}
-	}
-	if t2[0].(string) == "enum" {
-		all := true
-		for i := 1; i < len(t2); i++ {
-			lv, ok := ip.litToValue(t2[i].(S))
-			if !ok || !ip.isType(lv, t1, env) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return t1
-		}
-		return S{"id", "Any"}
-	}
-
-	// ---- Functions: pointwise ----
-	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
-		// f1 = A1 -> B1, f2 = A2 -> B2
-		a1, b1 := t1[2].(S), t1[3].(S)
-		a2, b2 := t2[2].(S), t2[3].(S)
-
-		// Param GLB (contravariant):
-		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
-		var param S
-		if ip.isSubtype(a1, a2, env) {
-			param = a1
-		} else if ip.isSubtype(a2, a1, env) {
-			param = a2
-		} else {
-			return S{"id", "Any"}
-		}
-
-		// Return LUB (covariant):
-		ret := ip.unifyTypes(b1, b2, env)
-		return S{"binop", "->", param, ret}
-	}
-	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
-		return S{"id", "Any"}
-	}
-
-	return S{"id", "Any"}
-}
-
-// validateTypeShape checks that an S-expression is a *type-shaped* AST.
-// It is purely syntactic: it does not resolve identifiers or paths.
-// Returns "" if OK; otherwise a short human-friendly error message.
+=== BEGIN FILE: internal/mindscript/builtin_path.go ===
+// path_builtins.go
 //
-// Allowed forms (with arity):
+// Builtins surfaced:
+//  1. pathJoin(parts: [Str]) -> Str
+//  2. pathBase(path: Str) -> Str
+//  3. pathDir(path: Str) -> Str
+//  4. pathExt(path: Str) -> Str
+//  5. pathClean(path: Str) -> Str
 //
-//	("id", name)
-//	("get", base=id|get, ("str", key))
-//	("unop","?", T)
-//	("binop","->", A, B)
-//	("array", T)
-//	("map", ("pair"| "pair!", ("str", key), T)*)
-//	("enum", <JSON-literal>...)
-//	("annot", ("str", doc), T)   // stripped and T validated
-//
-// Disallowed:
-//
-//	raw literals as types (e.g., ("int", 1)), ("fun", ...), ("type", ...),
-//	("module", ...), raw ("alias", *TypeValue) (internal canonical form),
-//	malformed arities, non-string map keys, duplicate keys within one map type.
-//
-// validateTypeShape checks that an S-expression is a syntactically valid *type*
-// shape (purely structural; no name resolution). It returns "" if OK, else a
-// short human-readable error message. Aliases/self-references are allowed
-// because ("id", ...) and ("get", ...) are accepted without resolution.
-//
-// Allowed nodes:
-//
-//	("id", name)
-//	("get", base, ("str", key))        // base must be id|get
-//	("unop", "?", T)                   // nullable
-//	("binop", "->", A, B)              // function type
-//	("array", T)                       // exactly one elem type
-//	("map", ("pair"| "pair!", ("str",k), T)...)  // no duplicate keys
-//	("enum", <anything>)               // JSON-literal check is done elsewhere
-//	("annot", ("str", doc), T)         // allowed wrapper anywhere
-//
-// Disallowed: literal value nodes ("int"/"num"/"str"/... as types), "fun",
-// "module", raw internal "alias" nodes, wrong arities, non-string keys, etc.
-func validateTypeShape(t S) string {
-	// Local helper to strip "annot" wrappers *and* validate their doc fields.
-	strip := func(n S) (S, string) {
-		for len(n) >= 3 {
-			tag, ok := n[0].(string)
-			if !ok || tag != "annot" {
-				break
-			}
-			// validate ("annot", ("str", doc), subj)
-			doc, ok := n[1].(S)
-			if !ok || len(doc) < 2 || doc[0].(string) != "str" {
-				return nil, "annotation must have a string doc"
-			}
-			subj, _ := n[2].(S)
-			n = subj
-		}
-		return n, ""
-	}
-
-	var walk func(S) string
-	walk = func(n S) string {
-		if len(n) == 0 {
-			return "invalid type: empty"
-		}
-		// peel/validate annot wrappers
-		var msg string
-		if n, msg = strip(n); msg != "" {
-			return msg
-		}
-		if len(n) == 0 {
-			return "invalid type: empty"
-		}
-
-		tag, ok := n[0].(string)
-		if !ok {
-			return "invalid type: corrupt node tag"
-		}
-
-		switch tag {
-		case "id":
-			if len(n) != 2 {
-				return "id type must have exactly one name"
-			}
-			if _, ok := n[1].(string); !ok {
-				return "id name must be a string"
-			}
-			return ""
-
-		case "get":
-			if len(n) != 3 {
-				return `qualified type must be ("get", base, ("str", key))`
-			}
-			base, okb := n[1].(S)
-			if !okb || len(base) == 0 {
-				return "qualified type has invalid base"
-			}
-			if btag, _ := base[0].(string); btag != "id" && btag != "get" && btag != "annot" {
-				return "qualified type base must be id or get"
-			}
-			// walk the base (allows nested get/annot/id)
-			if err := walk(base); err != "" {
-				return err
-			}
-			key, okk := n[2].(S)
-			if !okk || len(key) < 2 || key[0].(string) != "str" {
-				return "qualified type key must be a string literal"
-			}
-			return ""
-
-		case "unop":
-			if len(n) != 3 || n[1] != "?" {
-				return `nullable type must be ("unop", "?", T)`
-			}
-			sub, _ := n[2].(S)
-			return walk(sub)
-
-		case "binop":
-			if len(n) != 4 || n[1] != "->" {
-				return `function type must be ("binop", "->", A, B)`
-			}
-			if err := walk(n[2].(S)); err != "" {
-				return err
-			}
-			return walk(n[3].(S))
-
-		case "array":
-			if len(n) != 2 {
-				return "array type must have exactly one element type"
-			}
-			return walk(n[1].(S))
-
-		case "map":
-			seen := map[string]struct{}{}
-			for i := 1; i < len(n); i++ {
-				p, okp := n[i].(S)
-				if !okp || len(p) < 3 {
-					return `map field must be ("pair"|"pair!", ("str", key), T)`
-				}
-				// Forbid annot-wrapping the entire pair node.
-				ptag, ok := p[0].(string)
-				if !ok || (ptag != "pair" && ptag != "pair!") {
-					return `map field must start with "pair" or "pair!"`
-				}
-
-				// Allow annotations on the KEY: ("annot", ("str",doc), ("str", key))
-				key, okk := p[1].(S)
-				if !okk {
-					return "map field key must be a string literal"
-				}
-				key = stripAnnot(key)
-				if len(key) < 2 || key[0].(string) != "str" {
-					return "map field key must be a string literal"
-				}
-				k := key[1].(string)
-				if _, dup := seen[k]; dup {
-					return "duplicate field '" + k + "' in map type"
-				}
-				seen[k] = struct{}{}
-				// Value type may itself be annotated; walk handles that.
-				if err := walk(p[2].(S)); err != "" {
-					return err
-				}
-			}
-			return ""
-
-		case "enum":
-			// Members must be JSON literals (null/bool/int/num/str/array/map of literals).
-			for i := 1; i < len(n); i++ {
-				member, ok := n[i].(S)
-				if !ok || !isJSONLiteralNode(member) {
-					return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
-				}
-			}
-			return ""
-
-		case "annot":
-			// Should have been stripped; treat as error to avoid silent loops.
-			return "internal error: unexpected annot after strip"
-
-		// Explicitly disallow internal/user-nonsensical nodes in type shapes.
-		case "int", "num", "str", "bool", "null", "fun", "module", "type", "alias":
-			return "invalid type: unexpected node " + tag
-
-		default:
-			return "invalid type: unexpected node " + tag
-		}
-	}
-
-	return walk(t)
-}
-
-// -----------------------------
-// Enum literal-only validation
-// -----------------------------
-
-// isJSONLiteralNode reports whether n is one of the literal forms that
-// litToValue accepts: null/bool/int/num/str/array/map (with literal children).
-func isJSONLiteralNode(n S) bool {
-	if len(n) == 0 {
-		return false
-	}
-	switch n[0].(string) {
-	case "null", "bool", "int", "num", "str":
-		return true
-	case "array":
-		for i := 1; i < len(n); i++ {
-			child, ok := n[i].(S)
-			if !ok || !isJSONLiteralNode(child) {
-				return false
-			}
-		}
-		return true
-	case "map":
-		for i := 1; i < len(n); i++ {
-			p, ok := n[i].(S)
-			if !ok || len(p) < 3 {
-				return false
-			}
-			// p = ("pair" | "pair!", ("str", key), valueLit)
-			tag := p[0].(string)
-			if tag != "pair" && tag != "pair!" {
-				return false
-			}
-			key, ok := p[1].(S)
-			if !ok || len(key) < 2 || key[0].(string) != "str" {
-				return false
-			}
-			val, ok := p[2].(S)
-			if !ok || !isJSONLiteralNode(val) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
-}
-
-// validateEnumsJSONOnly walks a type AST and ensures any ("enum", ...)
-// contains only JSON-style literals. It returns an empty string if OK,
-// otherwise a short human message.
-func validateEnumsJSONOnly(t S) string {
-	if len(t) == 0 {
-		return ""
-	}
-	switch t[0].(string) {
-	case "annot":
-		if len(t) >= 3 {
-			if sub, ok := t[2].(S); ok {
-				return validateEnumsJSONOnly(sub)
-			}
-		}
-		return ""
-	case "enum":
-		for i := 1; i < len(t); i++ {
-			member, ok := t[i].(S)
-			if !ok || !isJSONLiteralNode(member) {
-				return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
-			}
-		}
-		return ""
-	case "unop", "binop", "array", "map", "get", "id", "alias", "type", "module":
-		for i := 1; i < len(t); i++ {
-			if sub, ok := t[i].(S); ok {
-				if msg := validateEnumsJSONOnly(sub); msg != "" {
-					return msg
-				}
-			}
-		}
-		return ""
-	default:
-		return ""
-	}
-}
-=== END FILE: internal/mindscript/types.go ===
-
-=== BEGIN FILE: internal/mindscript/printer.go ===
-// printer.go: pretty-printers for MindScript ASTs, types, and runtime values.
-//
-// What this file does
-// -------------------
-// This module provides the formatting layer for MindScript. It renders two
-// kinds of data to human-readable, stable strings:
-//
-//  1. Parsed source ASTs (S-expressions) → MindScript source code.
-//     - Entry points: Pretty, Standardize, FormatSExpr.
-//     - Produces whitespace- and newline-stable output with minimal
-//     parentheses, based on operator precedence. It understands all
-//     statement and expression tags emitted by the parser (e.g. "fun",
-//     "oracle", "for", "if/elif/else", "type", "block", "assign",
-//     "return/break/continue", arrays, maps, calls, indexing, properties,
-//     unary and binary operators).
-//     - Annotation nodes use the simplified 3-ary form:
-//     ("annot", ("str", text), wrappedNode)
-//     PRE/POST is *not* encoded by the parser anymore. All annotations are
-//     attached to values (or noops), and the pretty-printer decides PRE vs POST
-//     based on layout at binding sites.
-//     - Formatting emits no space before '(' for calls and for 'fun(...)'
-//     and 'oracle(...)' parameter lists, matching the lexer’s CLROUND rule.
-//     - Control keywords render without parens:
-//     return expr
-//     break expr
-//     continue [expr]
-//     A `null` payload prints as the bare keyword (e.g., `continue`).
-//
-//  2. Type ASTs (S-expressions) → compact type strings.
-//     - Entry point: FormatType.
-//     - Supported forms:
-//     ("id", "Any"|"Null"|"Bool"|"Int"|"Num"|"Str"|"Type")
-//     ("unop","?", T)         → prints as `T?`
-//     ("array", T)            → prints as `[T]`
-//     ("map", ("pair"| "pair!", ("str",k), T) ...)
-//     Required fields print with a trailing `!` on the key.
-//     Value annotations (if wrapped in "annot") are respected and decided
-//     PRE vs POST by the same centralized policy as expressions.
-//     ("enum", literalS... )  → prints as `Enum[ ... ]`, where members
-//     may be scalars, arrays, or maps.
-//     ("binop","->", A, B)    → prints as `(A) -> B`, flattened across
-//     right-associated chains.
-//     - Output is stable. Multi-line maps are rendered with sorted keys to
-//     avoid visual churn.
-//     - When the last field ends with a POST, the closing `}` appears on the
-//     next line without an extra blank line.
-//
-// Dependencies (other files)
-// --------------------------
-// • parser.go
-//   - S = []any (AST payload shape)
-//   - ParseSExpr(string) / ParseSExprInteractive (used by Pretty/Standardize)
-//   - AST tags: "block", "fun", "oracle", "for", "while", "if",
-//     "type", "return", "break", "continue", "assign", "array", "map",
-//     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
-//     "null", "unop", "binop", "decl", "darr", "dobj", "annot", "noop".
-//
-// • interpreter.go (runtime model)
-//   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
-//     VTFun, VTType, VTModule, VTHandle)
-//   - Fun, TypeValue, MapObject (Entries/Keys).
-//
-// • modules.go (module loader)
-//   - Module struct and prettySpec(string) (used for VTModule display).
-//
-// • errors.go (shared errors)
-//   - WrapErrorWithSource(err, src) (used by Pretty/Standardize).
-//
-// PUBLIC vs PRIVATE layout
-// ------------------------
-// This file is organized in two blocks:
-//  1. PUBLIC: the user-facing constants & functions with thorough docstrings.
-//  2. PRIVATE: helper types and functions that implement the printers.
-//
-// Formatting policy highlights
-// ----------------------------
-//   - Indentation uses **tabs** only (gofmt-style).
-//   - Canonical output (`Standardize`) ends with exactly one trailing '\n'.
-//
-// Requiredness in value maps
-// --------------------------
-// The printer never emits required fields ("pair!") in **expression/value maps**:
-// requiredness is a **type-level** concept only. If the AST carried "pair!" in a
-// value map (e.g., via parser sugar), it is dropped in the printed code.
-//
-// Canonicalizations & Omissions (parser ↔ printer contract)
-// ---------------------------------------------------------
-// These are deliberate simplifications made by the parser and normalized by
-// the printer; users may not see certain syntactic sugar re-emitted:
-//   - Param types default to `Any` and are not printed (e.g., `fun(x)` not `x: Any`).
-//   - Function return type defaults to `Any` and is not printed (`fun(...) do ... end`
-//     without `-> Any`).
-//   - `oracle(...)` without `from` carries an empty default source; `from ...` is omitted.
-//   - Bare `return` / `break` / `continue` carry an implicit `null` value and print
-//     as the bare keyword (no `null`).
-//   - Redundant parentheses are removed; only minimal parentheses are emitted.
-//   - Calls print with no space before '(' (canonical `f(x)` form).
-//   - Property indices written as `obj.(expr)` or `obj.12` are printed canonically
-//     as `obj[expr]` / `obj[12]`.
-//   - Trailing commas in arrays/maps/parameter lists are dropped in output.
-//   - Map keys that are identifier-like print without quotes; others are quoted.
-//   - **Expression maps** ignore the required marker `!` at runtime; the printer
-//     therefore **drops `!` in value maps** (e.g., `{ id!: 1 }` → `{ id: 1 }`).
-//     (Type maps still print required keys as `key!`.)
+// Conventions:
+//   - Functions are camelCase; docs are docstring-style (first line, blank, details).
+//   - Uses public API only; hard errors via fail(...).
+//   - Tabs for indentation.
 package mindscript
 
 import (
 	"fmt"
-	"sort"
+	"path/filepath"
+)
+
+func registerPathBuiltins(ip *Interpreter, target *Env) {
+	// pathJoin(parts: [Str]) -> Str
+	// Join path elements using the OS-specific separator.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"pathJoin",
+		[]ParamSpec{{Name: "parts", Type: S{"array", S{"id", "Str"}}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			pv := ctx.Arg("parts")
+			if pv.Tag != VTArray {
+				fail("pathJoin: parts must be [Str]")
+			}
+			items := pv.Data.(*ArrayObject).Elems
+			elems := make([]string, 0, len(items))
+			for i, v := range items {
+				if v.Tag != VTStr {
+					fail(fmt.Sprintf("pathJoin: parts[%d] must be Str", i))
+				}
+				elems = append(elems, v.Data.(string))
+			}
+			return Str(filepath.Join(elems...))
+		},
+	)
+	setBuiltinDoc(target, "pathJoin", `Join path elements using the OS-specific separator.
+
+Params:
+	parts: [Str] — path fragments
+
+Returns:
+	Str — joined path
+
+Notes:
+	• Mirrors Go's filepath.Join semantics (cleans the result, removes empty segments).
+	• Works cross-platform (Windows/POSIX).`)
+
+	// pathBase(path: Str) -> Str
+	// Return the last element of path. For empty string, returns ".".
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"pathBase",
+		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			p := mustStrArg("pathBase", ctx, "path")
+			return Str(filepath.Base(p))
+		},
+	)
+	setBuiltinDoc(target, "pathBase", `Return the last element of a path (OS-specific).
+
+Params:
+	path: Str
+
+Returns:
+	Str — base name
+
+Notes:
+	• Mirrors Go's filepath.Base semantics ("" → ".", strips trailing separators).`)
+
+	// pathDir(path: Str) -> Str
+	// Return all but the last element of path, typically the parent directory.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"pathDir",
+		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			p := mustStrArg("pathDir", ctx, "path")
+			return Str(filepath.Dir(p))
+		},
+	)
+	setBuiltinDoc(target, "pathDir", `Return all but the last element of a path.
+
+Params:
+	path: Str
+
+Returns:
+	Str — directory component
+
+Notes:
+	• Mirrors Go's filepath.Dir semantics ("" → ".", root stays root).`)
+
+	// pathExt(path: Str) -> Str
+	// Return the file name extension including the leading dot, or "" if none.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"pathExt",
+		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			p := mustStrArg("pathExt", ctx, "path")
+			return Str(filepath.Ext(p))
+		},
+	)
+	setBuiltinDoc(target, "pathExt", `Return the file extension (including the leading dot), or "" if none.
+
+Params:
+	path: Str
+
+Returns:
+	Str — extension
+
+Notes:
+	• Mirrors Go's filepath.Ext semantics (".bashrc" → ".bashrc", "archive.tar.gz" → ".gz").`)
+
+	// pathClean(path: Str) -> Str
+	// Clean up a path by applying lexical simplifications.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"pathClean",
+		[]ParamSpec{{Name: "path", Type: S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			p := mustStrArg("pathClean", ctx, "path")
+			return Str(filepath.Clean(p))
+		},
+	)
+	setBuiltinDoc(target, "pathClean", `Clean a path by applying lexical simplifications.
+
+Params:
+	path: Str
+
+Returns:
+	Str — cleaned path
+
+Notes:
+	• Removes redundant separators and up-levels like "." and ".." where possible.
+	• Mirrors Go's filepath.Clean semantics; no I/O performed.
+	• Cross-platform behavior handled by filepath.`)
+}
+
+// mustStrArg is a tiny helper for native implementations in this file.
+// It fails with a consistent message if the named argument is not a Str.
+func mustStrArg(fn string, ctx CallCtx, name string) string {
+	v := ctx.Arg(name)
+	if v.Tag != VTStr {
+		fail(fmt.Sprintf("%s: %s must be Str", fn, name))
+	}
+	return v.Data.(string)
+}
+=== END FILE: internal/mindscript/builtin_path.go ===
+
+=== BEGIN FILE: internal/mindscript/builtin_strings.go ===
+// === FILE: std_sys.go ===
+package mindscript
+
+import (
+	"regexp"
+	"strings"
+	"unicode"
+)
+
+func registerStringBuiltins(ip *Interpreter, target *Env) {
+	// substr(s, i, j)
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"substr",
+		[]ParamSpec{{"s", S{"id", "Str"}}, {"i", S{"id", "Int"}}, {"j", S{"id", "Int"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.Arg("s").Data.(string)
+			i := int(ctx.Arg("i").Data.(int64))
+			j := int(ctx.Arg("j").Data.(int64))
+			r := []rune(s)
+			if i < 0 {
+				i = 0
+			}
+			if j < i {
+				j = i
+			}
+			if i > len(r) {
+				i = len(r)
+			}
+			if j > len(r) {
+				j = len(r)
+			}
+			return Str(string(r[i:j]))
+		},
+	)
+	setBuiltinDoc(target, "substr", `Unicode-safe substring by rune index.
+
+Takes the half-open slice [i, j). Indices are clamped to bounds and negative
+values are treated as 0.
+
+Params:
+  s: Str — source string
+  i: Int — start index (inclusive)
+  j: Int — end index (exclusive)
+
+Returns:
+  Str`)
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"toLower",
+		[]ParamSpec{{"s", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToLower(ctx.Arg("s").Data.(string))) },
+	)
+	setBuiltinDoc(target, "toLower", `Lowercase conversion (Unicode aware).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"toUpper",
+		[]ParamSpec{{"s", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value { return Str(strings.ToUpper(ctx.Arg("s").Data.(string))) },
+	)
+	setBuiltinDoc(target, "toUpper", `Uppercase conversion (Unicode aware).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	trimFunc := func(left, right bool) func(string) string {
+		return func(s string) string {
+			if left && right {
+				return strings.TrimSpace(s)
+			}
+			if left {
+				return strings.TrimLeftFunc(s, unicode.IsSpace)
+			}
+			return strings.TrimRightFunc(s, unicode.IsSpace)
+		}
+	}
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"strip",
+		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Str(trimFunc(true, true)(ctx.Arg("s").Data.(string)))
+		},
+	)
+	setBuiltinDoc(target, "strip", `Remove leading and trailing whitespace (Unicode).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"lstrip",
+		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Str(trimFunc(true, false)(ctx.Arg("s").Data.(string)))
+		},
+	)
+	setBuiltinDoc(target, "lstrip", `Remove leading whitespace (Unicode).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"rstrip",
+		[]ParamSpec{{"s", S{"id", "Str"}}}, S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			return Str(trimFunc(false, true)(ctx.Arg("s").Data.(string)))
+		},
+	)
+	setBuiltinDoc(target, "rstrip", `Remove trailing whitespace (Unicode).
+
+Params:
+  s: Str
+
+Returns:
+  Str`)
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"split",
+		[]ParamSpec{{"s", S{"id", "Str"}}, {"sep", S{"id", "Str"}}},
+		S{"array", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.Arg("s").Data.(string)
+			sep := ctx.Arg("sep").Data.(string)
+			parts := strings.Split(s, sep)
+			out := make([]Value, len(parts))
+			for i := range parts {
+				out[i] = Str(parts[i])
+			}
+			return Arr(out)
+		},
+	)
+	setBuiltinDoc(target, "split", `Split a string on a separator (no regex).
+
+If sep is empty (""), splits between UTF-8 code points.
+
+Params:
+  s: Str   — source string
+  sep: Str — separator
+
+Returns:
+  [Str]`)
+
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"join",
+		[]ParamSpec{{"xs", S{"array", S{"id", "Str"}}}, {"sep", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			xs := ctx.Arg("xs").Data.(*ArrayObject).Elems
+			sep := ctx.Arg("sep").Data.(string)
+			strs := make([]string, len(xs))
+			for i := range xs {
+				strs[i] = xs[i].Data.(string)
+			}
+			return Str(strings.Join(strs, sep))
+		},
+	)
+	setBuiltinDoc(target, "join", `Join strings with a separator.
+
+Params:
+  xs: [Str] — pieces to join
+  sep: Str  — separator
+
+Returns:
+  Str`)
+
+	// match(pattern: Str, s: Str) -> [Str]
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"match",
+		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
+		S{"array", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			pat := ctx.Arg("pattern").Data.(string)
+			s := ctx.Arg("string").Data.(string)
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				// Soft error: invalid regex
+				return annotNull("invalid regex: " + err.Error())
+			}
+			ms := re.FindAllString(s, -1)
+			out := make([]Value, len(ms))
+			for i := range ms {
+				out[i] = Str(ms[i])
+			}
+			return Arr(out)
+		},
+	)
+	setBuiltinDoc(target, "match", `Find all non-overlapping matches of a regex.
+
+Params:
+  pattern: Str — RE2-compatible regular expression
+  string:  Str — input
+
+Returns:
+  [Str] — matched substrings (no capture groups)`)
+
+	// replace(pattern: Str, repl: Str, s: Str) -> Str
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"replace",
+		[]ParamSpec{{"pattern", S{"id", "Str"}}, {"replace", S{"id", "Str"}}, {"string", S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			pat := ctx.Arg("pattern").Data.(string)
+			rep := ctx.Arg("replace").Data.(string)
+			s := ctx.Arg("string").Data.(string)
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				// Soft error: invalid regex
+				return annotNull("invalid regex: " + err.Error())
+			}
+			return Str(re.ReplaceAllString(s, rep))
+		},
+	)
+	setBuiltinDoc(target, "replace", `Replace all non-overlapping regex matches.
+
+Params:
+  pattern: Str — RE2-compatible regular expression
+  replace: Str — replacement (no backrefs)
+  string:  Str — input
+
+Returns:
+  Str`)
+}
+=== END FILE: internal/mindscript/builtin_strings.go ===
+
+=== BEGIN FILE: internal/mindscript/builtin_thread_lock.go ===
+// === FILE: builtin_thread_lock.go ===
+package mindscript
+
+import (
+	"fmt"
+	"runtime"
+)
+
+//
+// Single-thread / owner affinity builtins
+//
+// Overview:
+//   - ownerWrap(m: Any, pinOSThread?: Bool) -> Any
+//       Creates a dedicated interpreter isolate + owner goroutine processing
+//       requests serially. If pinOSThread==true, the goroutine calls
+//       runtime.LockOSThread() so all work runs on a single OS thread.
+//       Returns an opaque Handle("owner").
+//
+//   - ownerRun(o: Any, f: Fun) -> Any
+//       Deep-snapshots f into the owner's isolate and invokes f(m) there.
+//
+//   - ownerCall(o: Any, f: Fun, args: [Any]) -> Any
+//       Deep-snapshots f and args into the owner's isolate and calls Apply(f,args).
+//
+//   - ownerGet(o: Any, key: Str) -> Any
+//   - ownerSet(o: Any, key: Str, v: Any) -> Any
+//       Property access/mutation of the wrapped value m when it's a map/module.
+//
+//   - ownerClose(o: Any) -> Bool?
+//       Closes the request queue; returns true on first close,
+//       Null("already closed") otherwise.
+//
+// Semantics:
+//   • Success never returns bare Null.
+//   • Operational failures use annotated Null (errNull/annotNull).
+//   • Panics in owner-executed code are caught and surfaced as annotated Null.
+//   • The wrapped value 'm' lives only in the owner isolate.
+//   • All owner ops are non-reentrant and strictly ordered.
+//
+
+// ownerReq is a single RPC into the owner goroutine.
+type ownerReq struct {
+	run func() Value
+	ret chan Value
+}
+
+// owner holds the dedicated isolate and the serialized request queue.
+type owner struct {
+	ip   *Interpreter // dedicated isolate
+	m    Value        // wrapped value (lives in owner's isolate)
+	reqs chan ownerReq
+	done chan struct{}
+}
+
+// startOwner creates a new owner isolate and goroutine.
+// If pin==true, the goroutine is pinned to a single OS thread.
+func startOwner(src *Interpreter, m Value, pin bool) *owner {
+	child := src.Clone()
+
+	// Snapshot m into the child's Core (same strategy as builtin_concurrency.go).
+	cc := &cloneCtx{}
+	mSnap := deepCloneValue(cc, m, child.Core)
+
+	o := &owner{
+		ip:   child,
+		m:    mSnap,
+		reqs: make(chan ownerReq),
+		done: make(chan struct{}),
+	}
+
+	go func() {
+		if pin {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+		}
+		defer close(o.done)
+
+		for req := range o.reqs {
+			var out Value
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						switch e := r.(type) {
+						case rtErr:
+							out = errNull(e.msg)
+						case error:
+							out = errNull(e.Error())
+						default:
+							out = errNull(fmt.Sprintf("panic: %v", r))
+						}
+					}
+				}()
+				out = req.run()
+			}()
+			// Deliver response; if receiver went away, don't panic.
+			func() { defer func() { _ = recover() }(); req.ret <- out }()
+		}
+	}()
+
+	return o
+}
+
+// enqueueOwner serializes a unit of work onto the owner; returns annotated Null
+// if the owner has been closed.
+func enqueueOwner(o *owner, run func() Value) Value {
+	ret := make(chan Value, 1)
+	req := ownerReq{run: run, ret: ret}
+
+	// Sending on a closed channel panics; guard with recover.
+	sent := true
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				sent = false
+			}
+		}()
+		o.reqs <- req
+	}()
+	if !sent {
+		return annotNull("owner closed")
+	}
+	return <-ret
+}
+
+// registerSingleThreadBuiltins installs the owner/affinity builtins into 'target'.
+// Call this during runtime seeding (similar to registerConcurrencyBuiltins).
+func registerThreadLockBuiltins(ip *Interpreter, target *Env) {
+	// ownerWrap(m: Any, pinOSThread?: Bool) -> Any
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"ownerWrap",
+		[]ParamSpec{
+			{Name: "m", Type: S{"id", "Any"}},
+			{Name: "pinOSThread", Type: S{"unop", "?", S{"id", "Bool"}}},
+		},
+		S{"id", "Any"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			m := ctx.Arg("m")
+			pin := false
+			if v := ctx.Arg("pinOSThread"); v.Tag == VTBool {
+				pin = v.Data.(bool)
+			}
+			o := startOwner(ip, m, pin)
+			return HandleVal("owner", o)
+		},
+	)
+	setBuiltinDoc(target, "ownerWrap", `Create a single-thread owner wrapper for value 'm'.
+
+All operations submitted to the owner run sequentially on one goroutine.
+If pinOSThread is true, the goroutine is pinned to a single OS thread.
+
+Params:
+  m: Any
+  pinOSThread: Bool?   # default false
+
+Returns:
+  Any   # owner handle (opaque)`)
+
+	// ownerRun(o: Any, f: Fun) -> Any
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"ownerRun",
+		[]ParamSpec{
+			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "f", Type: S{"id", "Any"}},
+		},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			o := asHandle(ctx.Arg("o"), "owner").Data.(*owner)
+			fv := ctx.Arg("f")
+			if fv.Tag != VTFun {
+				return errNull("ownerRun: f must be a function")
+			}
+
+			// Deep-snapshot f into owner's isolate.
+			cc := &cloneCtx{}
+			fSnap := deepCloneValue(cc, fv, o.ip.Core)
+
+			return enqueueOwner(o, func() Value {
+				// Call fSnap(m) inside the owner.
+				return o.ip.Apply(fSnap, []Value{o.m})
+			})
+		},
+	)
+	setBuiltinDoc(target, "ownerRun", `Run function f(m) inside the owner's single thread.
+
+Params:
+  o: Any   # owner handle
+  f: Fun
+
+Returns:
+  Any`)
+
+	// ownerCall(o: Any, f: Fun, args: [Any]) -> Any
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"ownerCall",
+		[]ParamSpec{
+			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "f", Type: S{"id", "Any"}},
+			{Name: "args", Type: S{"array", S{"id", "Any"}}},
+		},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			o := asHandle(ctx.Arg("o"), "owner").Data.(*owner)
+			fv := ctx.Arg("f")
+			if fv.Tag != VTFun {
+				return errNull("ownerCall: f must be a function")
+			}
+			args := ctx.Arg("args").Data.(*ArrayObject).Elems
+
+			cc := &cloneCtx{}
+			fSnap := deepCloneValue(cc, fv, o.ip.Core)
+			aSnap := make([]Value, len(args))
+			for i := range args {
+				aSnap[i] = deepCloneValue(cc, args[i], o.ip.Core)
+			}
+
+			return enqueueOwner(o, func() Value {
+				return o.ip.Apply(fSnap, aSnap)
+			})
+		},
+	)
+	setBuiltinDoc(target, "ownerCall", `Call f(...args) inside the owner's single thread.
+
+Params:
+  o: Any     # owner handle
+  f: Fun
+  args: [Any]
+
+Returns:
+  Any`)
+
+	// ownerGet(o: Any, key: Str) -> Any
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"ownerGet",
+		[]ParamSpec{
+			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "key", Type: S{"id", "Str"}},
+		},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			o := asHandle(ctx.Arg("o"), "owner").Data.(*owner)
+			key := ctx.Arg("key").Data.(string)
+
+			return enqueueOwner(o, func() Value {
+				mv := AsMapValue(o.m)
+				if mv.Tag != VTMap {
+					return errNull("ownerGet: wrapped value is not a map/module")
+				}
+				mo := mv.Data.(*MapObject)
+				if v, ok := mo.Entries[key]; ok {
+					return v
+				}
+				return annotNull(fmt.Sprintf("missing key '%s'", key))
+			})
+		},
+	)
+	setBuiltinDoc(target, "ownerGet", `Get a property from the wrapped value (map/module) inside the owner.
+
+Params:
+  o: Any    # owner handle
+  key: Str
+
+Returns:
+  Any   # annotated Null if missing key`)
+
+	// ownerSet(o: Any, key: Str, v: Any) -> Any
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"ownerSet",
+		[]ParamSpec{
+			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "key", Type: S{"id", "Str"}},
+			{Name: "v", Type: S{"id", "Any"}},
+		},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			o := asHandle(ctx.Arg("o"), "owner").Data.(*owner)
+			key := ctx.Arg("key").Data.(string)
+			v := ctx.Arg("v")
+
+			// Snapshot v to owner's isolate.
+			cc := &cloneCtx{}
+			vSnap := deepCloneValue(cc, v, o.ip.Core)
+
+			return enqueueOwner(o, func() Value {
+				mv := AsMapValue(o.m)
+				if mv.Tag != VTMap {
+					return errNull("ownerSet: wrapped value is not a map/module")
+				}
+				mo := mv.Data.(*MapObject)
+				if _, ok := mo.Entries[key]; !ok {
+					mo.Keys = append(mo.Keys, key)
+				}
+				mo.Entries[key] = vSnap
+				return vSnap
+			})
+		},
+	)
+	setBuiltinDoc(target, "ownerSet", `Set a property on the wrapped value (map/module) inside the owner.
+
+Params:
+  o: Any
+  key: Str
+  v: Any
+
+Returns:
+  Any`)
+
+	// ownerClose(o: Any) -> Bool?
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"ownerClose",
+		[]ParamSpec{{Name: "o", Type: S{"id", "Any"}}},
+		S{"unop", "?", S{"id", "Bool"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			o := asHandle(ctx.Arg("o"), "owner").Data.(*owner)
+			first := true
+			func() {
+				defer func() {
+					if r := recover(); r != nil { // close of closed channel
+						first = false
+					}
+				}()
+				close(o.reqs)
+			}()
+			if !first {
+				return annotNull("already closed")
+			}
+			<-o.done
+			return Bool(true)
+		},
+	)
+	setBuiltinDoc(target, "ownerClose", `Close the owner's request queue (idempotent).
+
+On first close returns true; on subsequent closes returns Null("already closed").
+
+Params:
+  o: Any
+
+Returns:
+  Bool?`)
+}
+=== END FILE: internal/mindscript/builtin_thread_lock.go ===
+
+=== BEGIN FILE: internal/mindscript/builtin_time.go ===
+// time_builtins.go
+//
+// Builtins surfaced:
+//  1. nowMillis() -> Int
+//  2. nowNanos() -> Int
+//  3. sleep(ms: Int) -> Null
+//  4. dateNow() -> { year, month, day, hour, minute, second, millisecond }
+//  5. timeFormatRFC3339(millis: Int) -> Str
+//  6. timeParseRFC3339(s: Str) -> Int?
+//
+// Conventions:
+//   - Functions are camelCase; docs are docstring-style (first line, blank, details).
+//   - Uses public API only; hard errors via fail(...); soft errors via annotated nulls.
+//   - Tabs for indentation.
+package mindscript
+
+import (
+	"time"
+)
+
+func registerTimeBuiltins(ip *Interpreter, target *Env) {
+	// nowMillis() -> Int
+	// Current wall-clock time in milliseconds since the Unix epoch.
+	ip.RegisterRuntimeBuiltin(target, "nowMillis", nil, S{"id", "Int"}, func(_ *Interpreter, _ CallCtx) Value {
+		return Int(time.Now().UnixMilli())
+	})
+	setBuiltinDoc(target, "nowMillis", `Current wall-clock time in milliseconds since the Unix epoch.
+
+Returns:
+	Int`)
+
+	// nowNanos() -> Int
+	// Current wall-clock time in nanoseconds since the Unix epoch.
+	ip.RegisterRuntimeBuiltin(target, "nowNanos", nil, S{"id", "Int"}, func(_ *Interpreter, _ CallCtx) Value {
+		return Int(time.Now().UnixNano())
+	})
+	setBuiltinDoc(target, "nowNanos", `Current wall-clock time in nanoseconds since the Unix epoch.
+
+Returns:
+	Int`)
+
+	// sleep(ms: Int) -> Null
+	// Pause execution for a number of milliseconds.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"sleep",
+		[]ParamSpec{{Name: "ms", Type: S{"id", "Int"}}},
+		S{"id", "Null"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			ms := ctx.Arg("ms").Data.(int64)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			return Null
+		},
+	)
+	setBuiltinDoc(target, "sleep", `Pause execution for a number of milliseconds.
+
+Params:
+	ms: Int — milliseconds to sleep
+
+Returns:
+	Null`)
+
+	// dateNow() -> { year, month, day, hour, minute, second, millisecond }
+	// Current local date/time components.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"dateNow",
+		nil,
+		S{"map"}, // open-world object: {}
+		func(_ *Interpreter, _ CallCtx) Value {
+			now := time.Now()
+			mo := &MapObject{
+				Entries: map[string]Value{
+					"year":        Int(int64(now.Year())),
+					"month":       Int(int64(int(now.Month()))), // 1–12
+					"day":         Int(int64(now.Day())),
+					"hour":        Int(int64(now.Hour())),
+					"minute":      Int(int64(now.Minute())),
+					"second":      Int(int64(now.Second())),
+					"millisecond": Int(int64(now.Nanosecond() / int(time.Millisecond))),
+				},
+				Keys: []string{
+					"year", "month", "day",
+					"hour", "minute", "second", "millisecond",
+				},
+			}
+			return Value{Tag: VTMap, Data: mo}
+		},
+	)
+	setBuiltinDoc(target, "dateNow", `Current local date/time components.
+
+Fields:
+	year, month(1–12), day(1–31),
+	hour(0–23), minute(0–59), second(0–59),
+	millisecond(0–999)
+
+Returns:
+	{Str: Any} — a map with the fields above`)
+
+	// timeFormatRFC3339(millis: Int) -> Str
+	// Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"timeFormatRFC3339",
+		[]ParamSpec{{Name: "millis", Type: S{"id", "Int"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			ms := ctx.Arg("millis").Data.(int64)
+			t := time.Unix(0, ms*int64(time.Millisecond)).UTC()
+			// RFC3339Nano emits fractional seconds only when needed.
+			return Str(t.Format(time.RFC3339Nano))
+		},
+	)
+	setBuiltinDoc(target, "timeFormatRFC3339", `Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
+
+Params:
+	millis: Int — milliseconds since the Unix epoch
+
+Returns:
+	Str
+
+Notes:
+	• Uses UTC and emits fractional seconds only when needed (RFC3339Nano).`)
+
+	// timeParseRFC3339(s: Str) -> Int?
+	// Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
+	// Accepts both second-precision and fractional (nano) variants.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"timeParseRFC3339",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"id", "Int"}}, // Int?
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.Arg("s").Data.(string)
+			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				return Int(t.UnixNano() / 1e6)
+			}
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				return Int(t.UnixNano() / 1e6)
+			} else {
+				return annotNull("invalid RFC3339 time: " + err.Error())
+			}
+		},
+	)
+	setBuiltinDoc(target, "timeParseRFC3339", `Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
+
+Accepts both second-precision (RFC3339) and fractional (RFC3339Nano) forms.
+
+Params:
+	s: Str — RFC 3339 timestamp (e.g., "2024-06-18T12:34:56Z")
+
+Returns:
+	Int? — milliseconds since the Unix epoch, or null (annotated) on parse error`)
+}
+=== END FILE: internal/mindscript/builtin_time.go ===
+
+=== BEGIN FILE: internal/mindscript/builtin_url_enc.go ===
+// encoding_url_builtins.go
+//
+// Builtins surfaced:
+//  1. base64Encode(x: Str) -> Str
+//  2. base64Decode(s: Str) -> Str?              // soft error (annotated null) on invalid input
+//  3. hexEncode(x: Str)    -> Str
+//  4. hexDecode(s: Str)    -> Str?              // soft error (annotated null) on invalid input
+//  5. urlParse(s: Str) -> { scheme:Str, host:Str, port:Int?, path:Str, query:{}, fragment:Str? }
+//  6. urlBuild(u: { scheme:Str, host:Str, port:Int?, path:Str?, query:{}, fragment:Str? }) -> Str
+//  7. urlQueryParse(s: Str) -> {}               // map Str -> [Str]
+//  8. urlQueryString(q: {}) -> Str              // accepts map Str -> Str|[Str]
+//
+// Conventions:
+//   - Functions are camelCase; docs are docstring-style (first line, blank, details).
+//   - Tabs for indentation.
+//   - Param/return types use public S-expr type forms (open-world maps as S{"map"}).
+//   - Contract mistakes hard-fail via fail(...); data/parse errors return annotated null.
+//
+// Notes on "query" maps:
+//   - The type system uses open-world maps ({}). Docs specify value semantics as Str -> [Str].
+//   - urlQueryString accepts either Str or [Str] values for convenience; anything else hard-fails.
+package mindscript
+
+import (
+	"encoding/base64"
+	"encoding/hex"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 )
 
-// ==============================
-// ========== PUBLIC ============
-// ==============================
+func registerEncodingURLBuiltins(ip *Interpreter, target *Env) {
+	annNull := func(msg string) Value {
+		v := Null
+		v.Annot = msg
+		return v
+	}
 
-// MaxInlineWidth controls when arrays/maps are rendered on a single line by
-// FormatValue / FormatType / FormatSExpr. The single-line decision accounts for
-// the current indentation; i.e., it uses the remaining space on the line after
-// tabs (tab width = 4) and any preceding text.
-var MaxInlineWidth = 80
-
-// Pretty parses a MindScript source string and returns a formatted version.
-//
-// Behavior:
-//   - Parses src via ParseSExpr. If parsing fails, the error is wrapped with
-//     source context via WrapErrorWithSource.
-//   - On success, pretty-prints the AST using FormatSExpr, producing stable,
-//     whitespace-normalized code with minimal parentheses.
-//   - Supports annotations using the 3-ary form:
-//     ("annot", ("str", text), X)
-//     PRE/POST is chosen by the pretty-printer at binding sites.
-//
-// Errors:
-//   - Returns a non-nil error if parsing fails; otherwise returns the formatted text.
-func Pretty(src string) (string, error) {
-	ast, err := ParseSExpr(src)
-	if err != nil {
-		if e, ok := err.(*Error); ok {
-			if e.Src == nil {
-				e.Src = &SourceRef{Name: "<main>", Src: src}
+	// base64Encode(x: Str) -> Str
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"base64Encode",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			x := ctx.Arg("x")
+			if x.Tag != VTStr {
+				fail("base64Encode: x must be Str")
 			}
-			return "", fmt.Errorf("%s", FormatError(e))
-		}
-		return "", err
-	}
-	return FormatSExpr(ast), nil
-}
+			out := base64.StdEncoding.EncodeToString([]byte(x.Data.(string)))
+			return Str(out)
+		},
+	)
+	setBuiltinDoc(target, "base64Encode", `Base64-encode bytes from a string.
 
-// Standardize returns the canonical source form:
-//   - deterministic layout
-//   - indentation using tabs
-//   - exactly one trailing newline
-//
-// It is equivalent to Pretty(src), but ensures precisely one '\n' at the end.
-func Standardize(src string) (string, error) {
-	ast, err := ParseSExpr(src)
-	if err != nil {
-		if e, ok := err.(*Error); ok {
-			if e.Src == nil {
-				e.Src = &SourceRef{Name: "<standardize>", Src: src}
+Params:
+	x: Str — input bytes (string may contain arbitrary bytes)
+
+Returns:
+	Str — standard Base64 with '=' padding (RFC 4648).`)
+
+	// base64Decode(s: Str) -> Str?
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"base64Decode",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"id", "Str"}}, // Str?
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.Arg("s")
+			if s.Tag != VTStr {
+				fail("base64Decode: s must be Str")
 			}
-			return "", fmt.Errorf("%s", FormatError(e))
-		}
-		return "", err
-	}
-	out := FormatSExpr(ast)
-	if !strings.HasSuffix(out, "\n") {
-		out += "\n"
-	} else {
-		out = strings.TrimRight(out, "\n") + "\n"
-	}
-	return out, nil
-}
-
-// FormatSExpr renders a parsed MindScript AST (S-expr) to a stable source string.
-//
-// Inputs:
-//   - n: an AST produced by parser.go (e.g., the result of ParseSExpr).
-//
-// Output policy:
-//   - Statements (fun/oracle/for/if/type/block/return/break/continue/assign)
-//     are rendered with keywords and indentation.
-//   - Expressions use minimal parentheses according to a fixed precedence table;
-//     property access vs calls/indexing binds tightly.
-//   - Arrays and maps are printed inline (AST form).
-//   - Annotation nodes wrap the printed construct; PRE vs POST is chosen centrally.
-//   - **POST-after-separator rule** is enforced for inline cases.
-//
-// This function does not parse; it strictly formats the provided AST.
-func FormatSExpr(n S) string {
-	doc := docProgram(n)
-	var b strings.Builder
-	r := renderer{
-		out:      &b,
-		maxWidth: MaxInlineWidth,
-		tabWidth: 4,
-	}
-	r.render(doc)
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// FormatType renders a type S-expression into a compact, human-readable string.
-// It uses the same centralized PRE/POST policy for value annotations inside
-// type maps and enum literals.
-func FormatType(t S) string {
-	doc := docType(t)
-	var b strings.Builder
-	r := renderer{
-		out:      &b,
-		maxWidth: MaxInlineWidth,
-		tabWidth: 4,
-	}
-	r.render(doc)
-	return b.String()
-}
-
-// FormatValue renders a runtime Value by first adapting it to the printer’s AST
-// (with cycle guards and opaque fallbacks) and then delegating to FormatSExpr.
-func FormatValue(v Value) string {
-	ast := ValueToAST(v)
-	return FormatSExpr(ast)
-}
-
-//// END_OF_PUBLIC
-
-// ===============================
-// ========= PRIVATE =============
-// ===============================
-
-/* ---------- small globals & utilities ---------- */
-
-func isIdent(s string) bool {
-	if s == "" {
-		return false
-	}
-	b := []byte(s)
-	c := b[0]
-	if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
-		return false
-	}
-	for i := 1; i < len(b); i++ {
-		c = b[i]
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
-			return false
-		}
-	}
-	return true
-}
-
-func quoteString(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '\\':
-			b.WriteString(`\\`)
-		case '"':
-			b.WriteString(`\"`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		default:
-			b.WriteRune(r)
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
-}
-
-func oneLine(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	return strings.TrimSpace(s)
-}
-
-// unwrap VTType payload to its AST (supports legacy S too).
-func typeAst(data any) S {
-	switch tv := data.(type) {
-	case *TypeValue:
-		return tv.Ast
-	case S:
-		return tv
-	default:
-		return S{}
-	}
-}
-
-// NOTE: The parser no longer encodes PRE vs POST; all annotations live on values.
-// The pretty-printer chooses PRE vs POST purely by layout at binding sites.
-
-/* ---------- Doc engine (tiny) ---------- */
-
-type docKind int
-
-const (
-	dText     docKind = iota
-	dLine             // space if flat, newline if broken
-	dSoftLine         // empty if flat, newline if broken
-	dHardLine         // always newline
-	dGroup
-	dNest
-	dConcat
-)
-
-type Doc struct {
-	k      docKind
-	s      string
-	a      *Doc
-	kids   []*Doc
-	indent int // for Nest
-}
-
-func Text(s string) *Doc      { return &Doc{k: dText, s: s} }
-func LineDoc() *Doc           { return &Doc{k: dLine} }
-func SoftLineDoc() *Doc       { return &Doc{k: dSoftLine} }
-func HardLineDoc() *Doc       { return &Doc{k: dHardLine} }
-func Group(d *Doc) *Doc       { return &Doc{k: dGroup, a: d} }
-func Nest(n int, d *Doc) *Doc { return &Doc{k: dNest, a: d, indent: n} }
-func Concat(ds ...*Doc) *Doc  { return &Doc{k: dConcat, kids: ds} }
-
-func Join(sep *Doc, items []*Doc) *Doc {
-	if len(items) == 0 {
-		return Concat()
-	}
-	out := make([]*Doc, 0, len(items)*2-1)
-	for i, it := range items {
-		if i > 0 {
-			out = append(out, sep)
-		}
-		out = append(out, it)
-	}
-	return Concat(out...)
-}
-
-type renderer struct {
-	out      *strings.Builder
-	maxWidth int
-	tabWidth int
-
-	col         int  // current column in characters (tabs count as tabWidth)
-	depth       int  // indentation depth (tabs)
-	atLineStart bool // just after newline
-}
-
-func (r *renderer) writeIndentIfNeeded() {
-	if r.atLineStart {
-		for i := 0; i < r.depth; i++ {
-			r.out.WriteByte('\t')
-		}
-		r.col = r.depth * r.tabWidth
-		r.atLineStart = false
-	}
-}
-func (r *renderer) writeString(s string) {
-	if s == "" {
-		return
-	}
-	r.writeIndentIfNeeded()
-	r.out.WriteString(s)
-	r.col += len(s)
-}
-func (r *renderer) newline() {
-	r.out.WriteByte('\n')
-	r.atLineStart = true
-	// col will be set when indent is written
-}
-
-func (r *renderer) render(d *Doc) {
-	r.atLineStart = false // caller controls leading indentation
-	r.renderGroup(d)
-}
-
-func (r *renderer) renderGroup(d *Doc) {
-	// Render a group with "flat if fits" policy.
-	if r.fitsFlat(d, r.maxWidth-r.col) {
-		r.renderFlat(d)
-	} else {
-		r.renderBroken(d)
-	}
-}
-
-func (r *renderer) renderFlat(d *Doc) {
-	switch d.k {
-	case dText:
-		r.writeString(d.s)
-	case dLine:
-		r.writeString(" ")
-	case dSoftLine:
-		// nothing
-	case dHardLine:
-		// hard line cannot appear in flat mode if fitsFlat was true,
-		// but guard just in case: break the line.
-		r.newline()
-	case dGroup:
-		r.renderFlat(d.a)
-	case dNest:
-		old := r.depth
-		r.depth += d.indent
-		r.renderFlat(d.a)
-		r.depth = old
-	case dConcat:
-		for _, k := range d.kids {
-			r.renderFlat(k)
-		}
-	}
-}
-
-func (r *renderer) renderBroken(d *Doc) {
-	switch d.k {
-	case dText:
-		r.writeString(d.s)
-	case dLine:
-		r.newline()
-	case dSoftLine:
-		r.newline()
-	case dHardLine:
-		r.newline()
-	case dGroup:
-		// In broken mode, nested groups still try flat if they fit at this point.
-		r.renderGroup(d.a)
-	case dNest:
-		old := r.depth
-		r.depth += d.indent
-		r.renderBroken(d.a)
-		r.depth = old
-	case dConcat:
-		for _, k := range d.kids {
-			r.renderBroken(k)
-		}
-	}
-}
-
-// fitsFlat reports whether the doc can be rendered flat within the given budget.
-// Any HardLine inside makes it not flat-fit.
-func (r *renderer) fitsFlat(d *Doc, budget int) bool {
-	if budget < 0 {
-		return false
-	}
-	switch d.k {
-	case dText:
-		return len(d.s) <= budget
-	case dLine:
-		return 1 <= budget
-	case dSoftLine:
-		return 0 <= budget
-	case dHardLine:
-		return false
-	case dGroup:
-		return r.fitsFlat(d.a, budget)
-	case dNest:
-		return r.fitsFlat(d.a, budget)
-	case dConcat:
-		for _, k := range d.kids {
-			if !r.fitsFlat(k, budget) {
-				return false
+			b, err := base64.StdEncoding.DecodeString(s.Data.(string))
+			if err != nil {
+				return annNull("invalid base64: " + err.Error())
 			}
-			// reduce budget by flat width of k
-			budget -= flatWidth(k)
-		}
-		return true
-	default:
-		return false
-	}
-}
+			return Str(string(b))
+		},
+	)
+	setBuiltinDoc(target, "base64Decode", `Decode a standard Base64 string.
 
-func flatWidth(d *Doc) int {
-	switch d.k {
-	case dText:
-		return len(d.s)
-	case dLine:
-		return 1
-	case dSoftLine:
-		return 0
-	case dHardLine:
-		return 1 // arbitrary; but any hardline makes fitsFlat false before using this
-	case dGroup:
-		return flatWidth(d.a)
-	case dNest:
-		return flatWidth(d.a)
-	case dConcat:
-		sum := 0
-		for _, k := range d.kids {
-			sum += flatWidth(k)
-		}
-		return sum
-	default:
-		return 0
-	}
-}
+Params:
+	s: Str — standard Base64 with '=' padding
 
-/* ---------- shared Doc helpers ---------- */
+Returns:
+	Str? — decoded bytes as Str, or null (annotated) on invalid input.`)
 
-func idOrQuoted(name string) *Doc {
-	if isIdent(name) {
-		return Text(name)
-	}
-	return Text(quoteString(name))
-}
-
-// PRE annotations (block/head) — prints as lines above current position.
-func annotPre(text string) *Doc {
-	if strings.TrimSpace(text) == "" {
-		return Concat()
-	}
-	lines := strings.Split(text, "\n")
-	ds := make([]*Doc, 0, len(lines)*2)
-	for _, ln := range lines {
-		ln = strings.TrimSpace(ln)
-		ds = append(ds, Text("# "+ln), HardLineDoc())
-	}
-	return Concat(ds...)
-}
-
-// POST annotations (inline/trailing) — prints on the same line.
-// IMPORTANT: POST captures the rest of the line, so we force a newline here.
-func annotInline(text string) *Doc {
-	trim := oneLine(text)
-	if trim == "" {
-		return Concat()
-	}
-	return Concat(Text(" # "+trim), HardLineDoc())
-}
-
-func braced(open string, inside *Doc, close string) *Doc {
-	return Concat(Text(open), inside, Text(close))
-}
-
-// inlineOrMultiAdvanced builds a `[ a, b ]` or multi-line with indentation.
-// If endsLastLine is true, the trailing SoftLine is omitted to avoid an extra
-// blank line before the closing bracket/brace.
-func inlineOrMultiAdvanced(open string, elems []*Doc, close string, endsLastLine bool) *Doc {
-	if len(elems) == 0 {
-		// exact-empty without spaces: [] or {}
-		return Text(open + close)
-	}
-	sep := Concat(Text(","), LineDoc())
-	inside := Join(sep, elems)
-	body := Concat(SoftLineDoc(), inside)
-	if !endsLastLine {
-		body = Concat(body, SoftLineDoc())
-	}
-	return Group(braced(open, Nest(1, body), close))
-}
-
-// inlineOrMulti is the default variant when the last element does not force
-// a newline (or when callers don't track it).
-func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
-	return inlineOrMultiAdvanced(open, elems, close, false)
-}
-
-// Minimal entry builder; annotation handling is centralized elsewhere.
-func kvEntry(keyDoc *Doc, valDoc *Doc) *Doc {
-	return Concat(keyDoc, Text(": "), valDoc)
-}
-
-/* ---------- Comma-aware joining (centralized POST-after-comma logic) ---------- */
-
-type sepItem struct {
-	main *Doc // rendered item (element or entry) without its trailing POST
-	post string
-}
-
-// joinCommaWithPost joins items with commas, printing any item's POST
-// *after the comma that follows that item*. The last item's POST (if any)
-// prints after the item (no comma). POST forces newline via annotInline.
-func joinCommaWithPost(items []sepItem) *Doc {
-	if len(items) == 0 {
-		return Concat()
-	}
-	out := make([]*Doc, 0, len(items)*3)
-	for i, it := range items {
-		out = append(out, it.main)
-		if i < len(items)-1 {
-			out = append(out, Text(","))
-			if it.post != "" {
-				out = append(out, annotInline(it.post))
-			} else {
-				out = append(out, LineDoc())
+	// hexEncode(x: Str) -> Str
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"hexEncode",
+		[]ParamSpec{{Name: "x", Type: S{"id", "Str"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			x := ctx.Arg("x")
+			if x.Tag != VTStr {
+				fail("hexEncode: x must be Str")
 			}
-		} else if it.post != "" {
-			out = append(out, annotInline(it.post))
-		}
-	}
-	return Concat(out...)
-}
+			out := hex.EncodeToString([]byte(x.Data.(string)))
+			return Str(out)
+		},
+	)
+	setBuiltinDoc(target, "hexEncode", `Hex-encode bytes to a lowercase hexadecimal string.
 
-/* ---------- AST helpers: tags, shapes, precedence ---------- */
+Params:
+	x: Str — input bytes
 
-func tag(n S) string   { return n[0].(string) }
-func getId(n S) string { return n[1].(string) }
-func getStr(n S) string {
-	// Used for ("str", s), but safe for ("id", name) too.
-	return n[1].(string)
-}
-func listS(n S, from int) []S {
-	if len(n) <= from {
-		return nil
-	}
-	out := make([]S, 0, len(n)-from)
-	for i := from; i < len(n); i++ {
-		out = append(out, n[i].(S))
-	}
-	return out
-}
+Returns:
+	Str — lowercase hex (two chars per byte).`)
 
-// Keys/names are not annotated; unwrap name only.
-func unwrapKeyName(n S) string { return n[1].(string) }
-
-var binPrec = map[string]struct {
-	p     int
-	right bool
-}{
-	"->": {15, true},
-	"*":  {70, false}, "/": {70, false}, "%": {70, false},
-	"+": {60, false}, "-": {60, false},
-	"<": {50, false}, "<=": {50, false}, ">": {50, false}, ">=": {50, false},
-	"==": {40, false}, "!=": {40, false},
-	"and": {30, false},
-	"or":  {20, false},
-}
-
-func exprPrec(n S) int {
-	switch tag(n) {
-	case "assign":
-		return 10
-	case "binop":
-		if pr, ok := binPrec[n[1].(string)]; ok {
-			return pr.p
-		}
-		return 60
-	case "unop":
-		if n[1].(string) == "?" {
-			return 90
-		}
-		return 80
-	case "call", "idx", "get":
-		return 90
-	default:
-		return 100
-	}
-}
-
-func parenIf(need int, d *Doc, n S) *Doc {
-	if exprPrec(n) < need {
-		return Concat(Text("("), d, Text(")"))
-	}
-	return d
-}
-
-func parenIfLE(need int, d *Doc, n S) *Doc {
-	if exprPrec(n) <= need {
-		return Concat(Text("("), d, Text(")"))
-	}
-	return d
-}
-
-/* ---------- AST → Doc ---------- */
-
-func docProgram(n S) *Doc {
-	if tag(n) != "block" {
-		return docStmt(n)
-	}
-	kids := listS(n, 1)
-	var ds []*Doc
-	firstReal := true
-	for _, k := range kids {
-		if tag(k) == "noop" {
-			continue
-		}
-		if !firstReal {
-			ds = append(ds, HardLineDoc())
-		}
-		ds = append(ds, docStmt(k))
-		firstReal = false
-	}
-	return Concat(ds...)
-}
-
-func docStmt(n S) *Doc {
-	switch tag(n) {
-	case "noop":
-		return Concat()
-
-	case "annot":
-		// Apply the centralized inline-vs-PRE policy even at statement level.
-		// If it fits, place as a trailing inline comment on the same line;
-		// otherwise render as a PRE header.
-		text, wrapped, _ := asAnnotASTRaw(n)
-		body := docStmt(wrapped)
-		main, post := attachInlineOrPre(body, text)
-		if post != "" {
-			// Inline comments consume the rest of the line; force newline.
-			return Concat(body, annotInline(post))
-		}
-		return main
-
-	case "fun":
-		params, ret, body := n[1].(S), n[2].(S), n[3].(S)
-		header := Concat(Text("fun("), docParams(params), Text(")"))
-		if !(tag(ret) == "id" && getId(ret) == "Any") {
-			header = Concat(header, Text(" -> "), docType(ret))
-		}
-		return Concat(
-			header, Text(" do"), HardLineDoc(),
-			Nest(1, docBlock(body)), HardLineDoc(),
-			Text("end"),
-		)
-
-	case "oracle":
-		params, outT, src := n[1].(S), n[2].(S), n[3].(S)
-		header := Concat(Text("oracle("), docParams(params), Text(")"))
-		if !(tag(outT) == "id" && getId(outT) == "Any") {
-			header = Concat(header, Text(" -> "), docType(outT))
-		}
-		if !(tag(src) == "array" && len(src) == 1) {
-			header = Concat(header, Text(" from "), docExpr(src))
-		}
-		return header
-
-	case "for":
-		tgt, iter, body := n[1].(S), n[2].(S), n[3].(S)
-		// Target never prints "let" — it's implied in the surface syntax.
-		head := Concat(Text("for "), docPattern(tgt), Text(" in "), docExpr(iter), Text(" do"))
-		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
-
-	case "while":
-		cond, body := n[1].(S), n[2].(S)
-		head := Concat(Text("while "), docExpr(cond), Text(" do"))
-		return Concat(head, HardLineDoc(), Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
-
-	case "if":
-		arms := listS(n, 1)
-		first := arms[0]
-		d := Concat(
-			Text("if "), docExpr(first[1].(S)), Text(" then"), HardLineDoc(),
-			Nest(1, docBlock(first[2].(S))),
-		)
-		for i := 1; i < len(arms) && tag(arms[i]) == "pair"; i++ {
-			arm := arms[i]
-			d = Concat(d, HardLineDoc(),
-				Text("elif "), docExpr(arm[1].(S)), Text(" then"), HardLineDoc(),
-				Nest(1, docBlock(arm[2].(S))),
-			)
-		}
-		// possible else block
-		if last := arms[len(arms)-1]; tag(last) != "pair" {
-			d = Concat(d, HardLineDoc(), Text("else"), HardLineDoc(), Nest(1, docBlock(last)))
-		}
-		return Concat(d, HardLineDoc(), Text("end"))
-
-	case "module":
-		nameExpr, body := n[1].(S), n[2].(S)
-		return Concat(Text("module "), docExpr(nameExpr), Text(" do"), HardLineDoc(),
-			Nest(1, docBlock(body)), HardLineDoc(), Text("end"))
-
-	case "type":
-		return Concat(Text("type "), docType(n[1].(S)))
-
-	case "return":
-		arg := n[1].(S)
-		if tag(arg) == "null" {
-			return Text("return")
-		}
-		return Concat(Text("return "), docExpr(arg))
-	case "break":
-		arg := n[1].(S)
-		if tag(arg) == "null" {
-			return Text("break")
-		}
-		return Concat(Text("break "), docExpr(arg))
-	case "continue":
-		arg := n[1].(S)
-		if tag(arg) == "null" {
-			return Text("continue")
-		}
-		return Concat(Text("continue "), docExpr(arg))
-
-	case "decl", "darr", "dobj":
-		return Concat(Text("let "), docPattern(n))
-	case "assign":
-		// Decide PRE vs POST for the whole binding (let-or-assign).
-		lhs, rhs := n[1].(S), n[2].(S)
-		var head *Doc
-		if isDeclPattern(lhs) {
-			head = Concat(Text("let "), docPattern(lhs), Text(" = "))
-		} else {
-			head = Concat(docExprMin(lhs, 10), Text(" = "))
-		}
-		if txt, inner, ok := asAnnotASTRaw(rhs); ok && strings.TrimSpace(txt) != "" {
-			val := docExprMin(inner, 10)
-			probe := Concat(head, val)
-			main, post := attachInlineOrPre(probe, txt)
-			if post != "" {
-				return Concat(head, val, annotInline(post))
+	// hexDecode(s: Str) -> Str?
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"hexDecode",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"id", "Str"}}, // Str?
+		func(_ *Interpreter, ctx CallCtx) Value {
+			s := ctx.Arg("s")
+			if s.Tag != VTStr {
+				fail("hexDecode: s must be Str")
 			}
-			return main
-		}
-		return Concat(head, docExprMin(rhs, 10))
-
-	case "block":
-		return Concat(Text("do"), HardLineDoc(), Nest(1, docBlock(n)), HardLineDoc(), Text("end"))
-
-	default:
-		return docExpr(n)
-	}
-}
-
-func docBlock(n S) *Doc {
-	if tag(n) != "block" {
-		return docStmt(n)
-	}
-	kids := listS(n, 1)
-	var ds []*Doc
-	firstReal := true
-	for _, k := range kids {
-		if tag(k) == "noop" {
-			continue
-		}
-		if !firstReal {
-			ds = append(ds, HardLineDoc())
-		}
-		ds = append(ds, docStmt(k))
-		firstReal = false
-	}
-	return Concat(ds...)
-}
-
-func docParams(arr S) *Doc {
-	if tag(arr) != "array" || len(arr) == 1 {
-		return Concat()
-	}
-	items := listS(arr, 1)
-	var parts []*Doc
-	for i, pi := range items {
-		name := getId(pi[1].(S))
-		ty := pi[2].(S)
-		if !(tag(ty) == "id" && getId(ty) == "Any") {
-			parts = append(parts, Concat(Text(name), Text(": "), docType(ty)))
-		} else {
-			parts = append(parts, Text(name))
-		}
-		if i < len(items)-1 {
-			parts = append(parts, Text(", "))
-		}
-	}
-	return Concat(parts...)
-}
-
-func docExprMin(n S, need int) *Doc {
-	return parenIf(need, docExpr(n), n)
-}
-
-// (old trailing-post helpers removed; annotation policy is centralized)
-
-func docExpr(n S) *Doc {
-	switch tag(n) {
-	case "id":
-		return Text(getId(n))
-	case "int":
-		return Text(fmt.Sprint(n[1]))
-	case "num":
-		s := strconv.FormatFloat(n[1].(float64), 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		return Text(s)
-	case "str":
-		return Text(quoteString(getStr(n)))
-	case "bool":
-		if n[1].(bool) {
-			return Text("true")
-		}
-		return Text("false")
-	case "null":
-		return Text("null")
-
-	case "unop":
-		op, rhs := n[1].(string), n[2].(S)
-		if op == "?" {
-			return Concat(docExprMin(rhs, 90), Text("?"))
-		}
-		if op == "not" {
-			return Concat(Text("not "), docExprMin(rhs, 80))
-		}
-		return Concat(Text(op), docExprMin(rhs, 80))
-
-	case "binop":
-		op, l, r := n[1].(string), n[2].(S), n[3].(S)
-		my, right := 60, false
-		if pr, ok := binPrec[op]; ok {
-			my, right = pr.p, pr.right
-		}
-		// Associativity-aware parentheses:
-		//  - right-assoc:  paren LEFT if prec(left) <= my; RIGHT if prec(right) < my
-		//  - left-assoc:   paren LEFT if prec(left) <  my; RIGHT if prec(right) <= my
-		lDoc := docExpr(l)
-		rDoc := docExpr(r)
-		if right {
-			lDoc = parenIfLE(my, lDoc, l) // inclusive on left
-			rDoc = parenIf(my, rDoc, r)   // exclusive on right
-		} else {
-			lDoc = parenIf(my, lDoc, l)   // exclusive on left
-			rDoc = parenIfLE(my, rDoc, r) // inclusive on right
-		}
-		return Concat(lDoc, Text(" "+op+" "), rDoc)
-
-	case "assign":
-		l, r := n[1].(S), n[2].(S)
-		return Concat(docExprMin(l, 10), Text(" = "), docExprMin(r, 10))
-
-	case "call":
-		recv := n[1].(S)
-		args := listS(n, 2)
-		var argDocs []*Doc
-		for _, a := range args {
-			argDocs = append(argDocs, docExpr(a))
-		}
-		return Concat(docExprMin(recv, 90), Text("("), Join(Text(", "), argDocs), Text(")"))
-
-	case "idx":
-		recv, ix := n[1].(S), n[2].(S)
-		// Be careful with array indices: this is indexing, not array literal.
-		return Concat(docExprMin(recv, 90), Text("["), docExpr(ix), Text("]"))
-
-	case "get":
-		recv, name := n[1].(S), n[2].(S)[1].(string)
-		if isIdent(name) {
-			return Concat(docExprMin(recv, 90), Text("."+name))
-		}
-		return Concat(docExprMin(recv, 90), Text("."+quoteString(name)))
-
-	case "array":
-		elems := listS(n, 1)
-		if len(elems) == 0 {
-			return Text("[]")
-		}
-		items := make([]sepItem, 0, len(elems))
-		for _, e := range elems {
-			if txt, inner, ok := asAnnotASTRaw(e); ok {
-				main, post := attachInlineOrPre(docExpr(inner), txt)
-				items = append(items, sepItem{main: main, post: post})
-			} else {
-				items = append(items, sepItem{main: docExpr(e), post: ""})
+			in := s.Data.(string)
+			b, err := hex.DecodeString(in)
+			if err != nil {
+				return annNull("invalid hex: " + err.Error())
 			}
-		}
-		inside := joinCommaWithPost(items)
-		lastEnds := items[len(items)-1].post != ""
-		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
+			return Str(string(b))
+		},
+	)
+	setBuiltinDoc(target, "hexDecode", `Decode a hexadecimal string.
+
+Params:
+	s: Str — hex string (case-insensitive), even length
+
+Returns:
+	Str? — decoded bytes as Str, or null (annotated) on invalid input.`)
+
+	// urlParse(s: Str) -> { scheme, host, port?, path, query:{}, fragment? }?
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"urlParse",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"map"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			sv := ctx.Arg("s")
+			if sv.Tag != VTStr {
+				fail("urlParse: s must be Str")
 			}
-			return SoftLineDoc()
-		}())), "]"))
-
-	case "map":
-		items := listS(n, 1)
-		if len(items) == 0 {
-			return Text("{}")
-		}
-		joined := make([]sepItem, 0, len(items))
-		for _, pr := range items {
-			key := unwrapKeyName(pr[1].(S))
-			val := pr[2].(S)
-			if txt, inner, ok := asAnnotASTRaw(val); ok {
-				joined = append(joined, entryWithAnn(idOrQuoted(key), docExpr(inner), txt))
-			} else {
-				joined = append(joined, sepItem{main: kvEntry(idOrQuoted(key), docExpr(val)), post: ""})
+			raw := sv.Data.(string)
+			u, err := url.Parse(raw)
+			if err != nil {
+				return annNull("invalid URL: " + err.Error())
 			}
-		}
-		inside := joinCommaWithPost(joined)
-		lastEnds := joined[len(joined)-1].post != ""
-		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
+
+			// Build query map Str -> [Str]
+			q := u.Query() // url.Values (map[string][]string)
+			qOut := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
+			// stable key order
+			keys := make([]string, 0, len(q))
+			for k := range q {
+				keys = append(keys, k)
 			}
-			return SoftLineDoc()
-		}())), "}"))
-
-	case "enum":
-		elems := listS(n, 1)
-		if len(elems) == 0 {
-			return Text("Enum[]")
-		}
-		items := make([]sepItem, 0, len(elems))
-		for _, e := range elems {
-			if txt, inner, ok := asAnnotASTRaw(e); ok {
-				main, post := attachInlineOrPre(docExpr(inner), txt)
-				items = append(items, sepItem{main: main, post: post})
-			} else {
-				items = append(items, sepItem{main: docExpr(e), post: ""})
+			if len(keys) > 1 {
+				sortStrings(keys)
 			}
-		}
-		inside := joinCommaWithPost(items)
-		lastEnds := items[len(items)-1].post != ""
-		return Group(braced("Enum[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
+			for _, k := range keys {
+				arr := make([]Value, 0, len(q[k]))
+				for _, s := range q[k] {
+					arr = append(arr, Str(s))
+				}
+				qOut.Entries[k] = Arr(arr)
+				qOut.Keys = append(qOut.Keys, k)
 			}
-			return SoftLineDoc()
-		}())), "]"))
 
-	case "decl", "darr", "dobj":
-		return docPattern(n)
-
-	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot", "module":
-		return docStmt(n)
-
-	case "opaque":
-		return Text(getStr(n))
-
-	default:
-		return Text("<" + tag(n) + ">")
-	}
-}
-
-/* ---------- patterns ---------- */
-
-func isDeclPattern(n S) bool {
-	switch tag(n) {
-	case "decl", "darr", "dobj":
-		return true
-	case "annot":
-		return isDeclPattern(n[2].(S))
-	default:
-		return false
-	}
-}
-
-func docPattern(n S) *Doc {
-	switch tag(n) {
-	case "decl":
-		return Text(getId(n))
-	case "darr":
-		items := listS(n, 1)
-		if len(items) == 0 {
-			return Text("[]")
-		}
-		joined := make([]sepItem, 0, len(items))
-		for _, it := range items {
-			if txt, inner, ok := asAnnotASTRaw(it); ok {
-				main, post := attachInlineOrPre(docPattern(inner), txt)
-				joined = append(joined, sepItem{main: main, post: post})
-			} else {
-				joined = append(joined, sepItem{main: docPattern(it), post: ""})
+			out := &MapObject{
+				Entries: map[string]Value{},
+				Keys:    []string{},
 			}
-		}
-		inside := joinCommaWithPost(joined)
-		lastEnds := joined[len(joined)-1].post != ""
-		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
-			}
-			return SoftLineDoc()
-		}())), "]"))
-	case "dobj":
-		items := listS(n, 1)
-		if len(items) == 0 {
-			return Text("{}")
-		}
-		joined := make([]sepItem, 0, len(items))
-		for _, it := range items {
-			key := unwrapKeyName(it[1].(S))
-			val := it[2].(S)
-			if txt, inner, ok := asAnnotASTRaw(val); ok {
-				joined = append(joined, entryWithAnn(idOrQuoted(key), docPattern(inner), txt))
-			} else {
-				joined = append(joined, sepItem{main: kvEntry(idOrQuoted(key), docPattern(val)), post: ""})
-			}
-		}
-		inside := joinCommaWithPost(joined)
-		lastEnds := joined[len(joined)-1].post != ""
-		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
-			}
-			return SoftLineDoc()
-		}())), "}"))
-	case "annot":
-		text, wrapped, _ := asAnnotASTRaw(n)
-		// Pattern wrapper: render as PRE. Entry/element sites decide inline.
-		return Concat(annotPre(text), docPattern(wrapped))
-	default:
-		return docExpr(n)
-	}
-}
+			put := func(k string, v Value) { out.Entries[k] = v; out.Keys = append(out.Keys, k) }
 
-/* ---------- AST "annot" helpers ---------- */
-
-// Neutral unwrap: ("annot", ("str", txt), wrapped) → (txt, wrapped, true)
-func asAnnotASTRaw(n S) (text string, wrapped S, ok bool) {
-	if tag(n) == "annot" {
-		return n[1].(S)[1].(string), n[2].(S), true
-	}
-	return "", n, false
-}
-
-/* ---------- Type pretty-printer (as Doc) ---------- */
-
-func docType(t S) *Doc {
-	if len(t) == 0 {
-		return Text("<type>")
-	}
-	switch tag(t) {
-	case "id":
-		return Text(getStr(t))
-	case "get":
-		recv := t[1].(S)
-		prop := t[2].(S)[1].(string)
-		// Reuse docType for the receiver so nested gets print as a.b.c
-		// If the receiver were ever non-type-ish, docType will fall back gracefully.
-		return Concat(docType(recv), Text("."), idOrQuoted(prop))
-	case "unop":
-		if t[1].(string) == "?" {
-			return Concat(docType(t[2].(S)), Text("?"))
-		}
-		return Text("<unop>")
-	case "array":
-		elem := S{"id", "Any"}
-		if len(t) == 2 {
-			elem = t[1].(S)
-		}
-		return Concat(Text("["), docType(elem), Text("]"))
-	case "enum":
-		elems := listS(t, 1)
-		if len(elems) == 0 {
-			return Text("Enum[]")
-		}
-		var ds []*Doc
-		for _, e := range elems {
-			ds = append(ds, docTypeLiteral(e))
-		}
-		return inlineOrMulti("Enum[", ds, "]")
-	case "map":
-		type fld struct {
-			name string
-			req  bool
-			typ  S
-			vAnn string
-		}
-		var fs []fld
-		for _, raw := range listS(t, 1) {
-			req := raw[0].(string) == "pair!"
-			k := unwrapKeyName(raw[1].(S))
-			ft := raw[2].(S)
-			txt, inner, ok := asAnnotASTRaw(ft)
-			if ok {
-				ft = inner
-			}
-			fs = append(fs, fld{name: k, req: req, typ: ft, vAnn: strings.TrimSpace(txt)})
-		}
-		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
-		if len(fs) == 0 {
-			return Text("{}")
-		}
-		joined := make([]sepItem, 0, len(fs))
-		for _, f := range fs {
-			key := idOrQuoted(f.name)
-			if f.req {
-				key = Concat(key, Text("!"))
-			}
-			if f.vAnn != "" {
-				joined = append(joined, entryWithAnn(key, docType(f.typ), f.vAnn))
-			} else {
-				joined = append(joined, sepItem{main: kvEntry(key, docType(f.typ)), post: ""})
-			}
-		}
-		inside := joinCommaWithPost(joined)
-		lastEnds := joined[len(joined)-1].post != ""
-		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
-			if lastEnds {
-				return Concat()
-			}
-			return SoftLineDoc()
-		}())), "}"))
-	case "binop":
-		if t[1].(string) == "->" && len(t) >= 4 {
-			left := t[2].(S)
-			right := t[3].(S)
-			// Right-associative printing:
-			// - If LEFT is itself an arrow, parenthesize it.
-			// - Always render RIGHT via docType (which will continue the chain).
-			leftDoc := docType(left)
-			if tag(left) == "binop" && left[1].(string) == "->" {
-				leftDoc = Concat(Text("("), leftDoc, Text(")"))
-			}
-			return Concat(leftDoc, Text(" -> "), docType(right))
-		}
-		return Text("<binop>")
-	case "annot":
-		txt, wrapped, _ := asAnnotASTRaw(t)
-		// Outside binding sites, render as PRE.
-		return Concat(annotPre(txt), docType(wrapped))
-	default:
-		return Text("<type>")
-	}
-}
-
-func docTypeLiteral(lit S) *Doc {
-	switch tag(lit) {
-	case "null":
-		return Text("null")
-	case "bool":
-		if lit[1].(bool) {
-			return Text("true")
-		}
-		return Text("false")
-	case "int":
-		return Text(fmt.Sprint(lit[1]))
-	case "num":
-		return Text(strconv.FormatFloat(lit[1].(float64), 'g', -1, 64))
-	case "str":
-		return Text(quoteString(getStr(lit)))
-	case "array":
-		items := listS(lit, 1)
-		if len(items) == 0 {
-			return Text("[]")
-		}
-		var ds []*Doc
-		for _, s := range items {
-			ds = append(ds, docTypeLiteral(s))
-		}
-		return inlineOrMulti("[", ds, "]")
-	case "map":
-		items := listS(lit, 1)
-		if len(items) == 0 {
-			return Text("{}")
-		}
-		joined := make([]sepItem, 0, len(items))
-		for _, pr := range items {
-			k := pr[1].(S)[1].(string)
-			val := docTypeLiteral(pr[2].(S))
-			entry := kvEntry(idOrQuoted(k), val)
-			joined = append(joined, sepItem{main: entry, post: ""})
-		}
-		inside := joinCommaWithPost(joined)
-		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, SoftLineDoc())), "}"))
-	default:
-		return Text("<lit>")
-	}
-}
-
-/* ---------- Central annotation policy (single place) ---------- */
-
-// Decide inline vs PRE for a candidate: if `candidate + " # ann"` fits flat
-// under a conservative width budget, return (candidate, ann) so callers can
-// trail as inline (or after-comma). Otherwise return (PRE+candidate, "").
-func attachInlineOrPre(candidate *Doc, ann string) (*Doc, string) {
-	ann = strings.TrimSpace(ann)
-	if ann == "" {
-		return candidate, ""
-	}
-	// Multi-line annotations always become PRE headers.
-	if strings.Contains(ann, "\n") {
-		return Concat(annotPre(ann), candidate), ""
-	}
-	// Conservative budget: avoid over-inlining.
-	r := renderer{maxWidth: MaxInlineWidth - 8, tabWidth: 4}
-	if r.fitsFlat(Concat(candidate, Text(" # "+oneLine(ann))), r.maxWidth) {
-		return candidate, ann
-	}
-	return Concat(annotPre(ann), candidate), ""
-}
-
-// Entry helper applying the policy to `key: value`.
-// If inline, the POST returns via .post (rendered after the following comma).
-// If PRE, the header is part of .main (no trailing POST).
-func entryWithAnn(keyDoc, valDoc *Doc, ann string) sepItem {
-	probe := kvEntry(keyDoc, valDoc)
-	main, post := attachInlineOrPre(probe, ann)
-	if post != "" {
-		return sepItem{main: probe, post: post}
-	}
-	return sepItem{main: main, post: ""}
-}
-
-/* ---------- Value → AST adapter (single source of truth) ---------- */
-
-// ValueToAST converts a runtime Value into the printer/parser AST (S), preserving:
-//   - annotations (as ("annot", ("str", ...), node))
-//   - insertion order of maps (MapObject.Keys)
-//   - cycle guards (arrays, maps) with python-style markers via ("opaque", "[...]") / ("opaque", "{...}")
-//
-// Non-source forms (functions, types, modules, handles, unknown) render as ("opaque", "<...>").
-func ValueToAST(v Value) S {
-	seenA := make(map[*ArrayObject]bool)
-	seenM := make(map[*MapObject]bool)
-	n := valueToASTRec(v, seenA, seenM)
-	if s := strings.TrimSpace(v.Annot); s != "" {
-		return S{"annot", S{"str", s}, n}
-	}
-	return n
-}
-
-func valueToASTRec(v Value, seenA map[*ArrayObject]bool, seenM map[*MapObject]bool) S {
-	switch v.Tag {
-	case VTNull:
-		return S{"null"}
-	case VTBool:
-		return S{"bool", v.Data.(bool)}
-	case VTInt:
-		return S{"int", v.Data.(int64)}
-	case VTNum:
-		return S{"num", v.Data.(float64)}
-	case VTStr:
-		return S{"str", v.Data.(string)}
-
-	case VTArray:
-		ao := v.Data.(*ArrayObject)
-		if ao == nil {
-			return S{"array"} // treat nil as empty
-		}
-		if seenA[ao] {
-			return S{"opaque", "[...]"}
-		}
-		seenA[ao] = true
-		out := S{"array"}
-		for _, ev := range ao.Elems {
-			node := valueToASTRec(ev, seenA, seenM)
-			if ann := strings.TrimSpace(ev.Annot); ann != "" {
-				node = S{"annot", S{"str", ann}, node}
-			}
-			out = append(out, node)
-		}
-		return out
-
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		if mo == nil {
-			return S{"map"}
-		}
-		if seenM[mo] {
-			return S{"opaque", "{...}"}
-		}
-		seenM[mo] = true
-		out := S{"map"}
-		for _, k := range mo.Keys {
-			val := mo.Entries[k]
-			node := valueToASTRec(val, seenA, seenM)
-			// Annotations live on the VALUE.
-			if ann := strings.TrimSpace(val.Annot); ann != "" {
-				node = S{"annot", S{"str", ann}, node}
-			}
-			out = append(out, S{"pair", S{"str", k}, node})
-		}
-		return out
-
-	case VTFun, VTType, VTModule, VTHandle:
-		return S{"opaque", valueOpaqueString(v)}
-	default:
-		return S{"opaque", valueOpaqueString(v)}
-	}
-}
-
-func valueOpaqueString(v Value) string {
-	switch v.Tag {
-	case VTFun:
-		if f, ok := v.Data.(*Fun); ok && f != nil {
-			label := "fun"
-			if f.IsOracle {
-				label = "oracle"
-			}
-			var parts []string
-			if len(f.ParamTypes) == 0 {
-				parts = append(parts, "_:Null")
-			} else {
-				for i := range f.ParamTypes {
-					name := "_"
-					if i < len(f.Params) && f.Params[i] != "" {
-						name = f.Params[i]
-					}
-					pt := FormatType(f.ParamTypes[i])
-					// Parenthesize arrow types in param position for readability.
-					if len(f.ParamTypes[i]) >= 4 && f.ParamTypes[i][0] == "binop" && f.ParamTypes[i][1] == "->" {
-						pt = "(" + pt + ")"
-					}
-					if i > 0 {
-						parts = append(parts, "-> "+name+":"+pt)
-					} else {
-						parts = append(parts, name+":"+pt)
-					}
+			put("scheme", Str(u.Scheme))
+			host := u.Hostname()
+			put("host", Str(host))
+			if p := u.Port(); p != "" {
+				if n, err := strconv.Atoi(p); err == nil {
+					put("port", Int(int64(n)))
 				}
 			}
-			ret := FormatType(f.ReturnType)
-			if len(parts) > 0 {
-				return "<" + label + ": " + strings.Join(parts, " ") + " -> " + ret + ">"
+			// Path: prefer RawPath if set; else Path.
+			path := u.EscapedPath()
+			put("path", Str(path))
+			put("query", Value{Tag: VTMap, Data: qOut})
+			if u.Fragment != "" {
+				put("fragment", Str(u.Fragment))
 			}
-			return "<" + label + ": " + ret + ">"
-		}
-		return "<fun>"
-	case VTType:
-		return "<type: " + FormatType(typeAst(v.Data)) + ">"
-	case VTModule:
-		name := "<module>"
-		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
-			disp := prettySpec(m.Name)
-			if disp == "" {
-				disp = m.Name
+			return Value{Tag: VTMap, Data: out}
+		},
+	)
+	setBuiltinDoc(target, "urlParse", `Parse a URL into components.
+
+Params:
+	s: Str — URL string
+
+Returns:
+	{
+		scheme!:   Str,
+		host!:     Str,
+		port:      Int?,         # present if URL has an explicit numeric port
+		path!:     Str,          # escaped path
+		query!:    {},           # map Str -> [Str]
+		fragment:  Str?
+	}?
+
+Notes:
+	• Query values preserve multiplicity as arrays.
+	• IPv6 hosts are returned without brackets in 'host'.`)
+
+	// urlBuild(u: { scheme, host, port?, path?, query:{}, fragment? }) -> Str
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"urlBuild",
+		[]ParamSpec{{Name: "u", Type: S{"map"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			uv := ctx.Arg("u")
+			if uv.Tag != VTMap {
+				fail("urlBuild: u must be {}")
 			}
-			name = "<module: " + disp + ">"
-		}
-		return name
-	case VTHandle:
-		if h, ok := v.Data.(*Handle); ok && h != nil && h.Kind != "" {
-			return "<handle: " + h.Kind + ">"
-		}
-		return "<handle>"
-	case VTNull:
-		return "null"
-	case VTBool:
-		if b, _ := v.Data.(bool); b {
-			return "true"
-		}
-		return "false"
-	case VTInt:
-		return strconv.FormatInt(v.Data.(int64), 10)
-	case VTNum:
-		s := strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		return s
-	case VTStr:
-		// Reuse the same quoting policy for visibility; the opaque string is expected raw.
-		return quoteString(v.Data.(string))
-	default:
-		return "<unknown>"
+			m := uv.Data.(*MapObject).Entries
+
+			getStr := func(key string, required bool) string {
+				v, ok := m[key]
+				if !ok {
+					if required {
+						fail("urlBuild: missing required field: " + key)
+					}
+					return ""
+				}
+				if v.Tag != VTStr {
+					fail("urlBuild: " + key + " must be Str")
+				}
+				return v.Data.(string)
+			}
+			getPort := func() (int, bool) {
+				v, ok := m["port"]
+				if !ok || v.Tag == VTNull {
+					return 0, false
+				}
+				if v.Tag != VTInt {
+					fail("urlBuild: port must be Int")
+				}
+				return int(v.Data.(int64)), true
+			}
+			buildQuery := func() string {
+				v, ok := m["query"]
+				if !ok || v.Tag == VTNull {
+					return ""
+				}
+				if v.Tag != VTMap {
+					fail("urlBuild: query must be {}")
+				}
+				mv := v.Data.(*MapObject)
+				qs := url.Values{}
+				for _, k := range mv.Keys {
+					val := mv.Entries[k]
+					switch val.Tag {
+					case VTStr:
+						qs.Add(k, val.Data.(string))
+					case VTArray:
+						ao := val.Data.(*ArrayObject)
+						for _, it := range ao.Elems {
+							if it.Tag != VTStr {
+								fail("urlBuild: query values must be Str or [Str]")
+							}
+							qs.Add(k, it.Data.(string))
+						}
+					default:
+						fail("urlBuild: query values must be Str or [Str]")
+					}
+				}
+				if enc := qs.Encode(); enc != "" {
+					return "?" + enc
+				}
+				return ""
+			}
+
+			scheme := getStr("scheme", true)
+			host := getStr("host", true)
+			path := getStr("path", false)
+			port, hasPort := getPort()
+			frag := getStr("fragment", false)
+
+			u := url.URL{Scheme: scheme}
+			if hasPort {
+				u.Host = net.JoinHostPort(host, strconv.Itoa(port))
+			} else {
+				// If host already includes brackets/port, respect it as-is.
+				u.Host = host
+			}
+			// Path is expected to be an escaped path already; set RawPath/Path to preserve it.
+			if path != "" {
+				// url.URL expects Path unescaped; attempt to unescape once.
+				if unesc, err := url.PathUnescape(path); err == nil {
+					u.Path = unesc
+					u.RawPath = path
+				} else {
+					// Fallback: set Path only.
+					u.Path = path
+				}
+			}
+			out := u.Scheme + "://"
+			out += u.Host
+			if u.RawPath != "" {
+				out += u.RawPath
+			} else if u.Path != "" {
+				out += u.EscapedPath()
+			}
+			out += buildQuery()
+			if frag != "" {
+				out += "#" + url.PathEscape(frag)
+			}
+			return Str(out)
+		},
+	)
+	setBuiltinDoc(target, "urlBuild", `Build a URL string from components.
+
+Params:
+	u: {
+		scheme!:  Str,
+		host!:    Str,           # hostname only; port via 'port'
+		port:     Int?,
+		path:     Str?,          # escaped path (e.g. "/a%20b")
+		query:    {},            # map Str -> Str|[Str]
+		fragment: Str?
 	}
+
+Returns:
+	Str — URL string.
+
+Notes:
+	• Use 'port' to add a port; IPv6 hosts are handled via proper bracket formatting.
+	• 'query' values accept Str or [Str].`)
+
+	// urlQueryParse(s: Str) -> {}?
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"urlQueryParse",
+		[]ParamSpec{{Name: "s", Type: S{"id", "Str"}}},
+		S{"unop", "?", S{"map"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			sv := ctx.Arg("s")
+			if sv.Tag != VTStr {
+				fail("urlQueryParse: s must be Str")
+			}
+			raw := strings.TrimPrefix(sv.Data.(string), "?")
+			vals, err := url.ParseQuery(raw)
+			if err != nil {
+				return annNull("invalid query: " + err.Error())
+			}
+			out := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
+			keys := make([]string, 0, len(vals))
+			for k := range vals {
+				keys = append(keys, k)
+			}
+			if len(keys) > 1 {
+				sortStrings(keys)
+			}
+			for _, k := range keys {
+				arr := make([]Value, 0, len(vals[k]))
+				for _, s := range vals[k] {
+					arr = append(arr, Str(s))
+				}
+				out.Entries[k] = Arr(arr)
+				out.Keys = append(out.Keys, k)
+			}
+			return Value{Tag: VTMap, Data: out}
+		},
+	)
+	setBuiltinDoc(target, "urlQueryParse", `Parse a URL query string into a map.
+
+Params:
+	s: Str — query string with or without the leading '?'
+
+Returns:
+	{}? — map Str -> [Str], or null on invalid input.
+
+Notes:
+	• Percent-decoding is applied to keys and values.`)
+
+	// urlQueryString(q: {}) -> Str
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"urlQueryString",
+		[]ParamSpec{{Name: "q", Type: S{"map"}}},
+		S{"id", "Str"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			qv := ctx.Arg("q")
+			if qv.Tag != VTMap {
+				fail("urlQueryString: q must be {}")
+			}
+			mv := qv.Data.(*MapObject)
+			qs := url.Values{}
+			for _, k := range mv.Keys {
+				val := mv.Entries[k]
+				switch val.Tag {
+				case VTStr:
+					qs.Add(k, val.Data.(string))
+				case VTArray:
+					ao := val.Data.(*ArrayObject)
+					for _, it := range ao.Elems {
+						if it.Tag != VTStr {
+							fail("urlQueryString: values must be Str or [Str]")
+						}
+						qs.Add(k, it.Data.(string))
+					}
+				default:
+					fail("urlQueryString: values must be Str or [Str]")
+				}
+			}
+			return Str(qs.Encode())
+		},
+	)
+	setBuiltinDoc(target, "urlQueryString", `Serialize a query map to 'application/x-www-form-urlencoded'.
+
+Params:
+	q: {} — map Str -> Str|[Str]
+
+Returns:
+	Str — percent-encoded query string (without leading '?').`)
 }
 
-// Local helper to avoid depending on parser.go's joinNonEmpty.
-// Concatenates non-empty strings with a single space.
-func joinNonEmptyLocal(a, b string) string {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	switch {
-	case a == "" && b == "":
-		return ""
-	case a == "":
-		return b
-	case b == "":
-		return a
-	default:
-		return a + " " + b
+// Small local sort helper to avoid importing "sort" at top-level of the file if undesired.
+func sortStrings(xs []string) {
+	// Simple insertion sort; tiny inputs typical for query maps.
+	for i := 1; i < len(xs); i++ {
+		j := i
+		for j > 0 && xs[j-1] > xs[j] {
+			xs[j-1], xs[j] = xs[j], xs[j-1]
+			j--
+		}
 	}
 }
-=== END FILE: internal/mindscript/printer.go ===
+=== END FILE: internal/mindscript/builtin_url_enc.go ===
 

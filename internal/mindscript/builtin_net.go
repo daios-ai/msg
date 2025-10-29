@@ -74,7 +74,7 @@ func registerNetBuiltins(ip *Interpreter, target *Env) {
 		target,
 		"netConnect",
 		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
+		S{"unop", "?", S{"get", S{"id", "Handle"}, S{"str", "net"}}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			av := ctx.Arg("addr")
 			conn, err := net.Dial("tcp", av.Data.(string))
@@ -90,8 +90,9 @@ func registerNetBuiltins(ip *Interpreter, target *Env) {
 	)
 	setBuiltinDoc(target, "netConnect", `Open a TCP connection to "host:port".
 
-Returns a network handle usable with read*/write/flush/close,
-or null (annotated) on network error.`)
+Returns:
+	Handle.net — usable with read*/write/flush/close,
+	or null (annotated) on network error.`)
 
 	// netListen("host:port") -> "listener" handle
 	ip.RegisterRuntimeBuiltin(
@@ -110,16 +111,16 @@ or null (annotated) on network error.`)
 	)
 	setBuiltinDoc(target, "netListen", `Listen on a TCP address "host:port".
 
-Returns a listener handle for netAccept. Use close(listener) to stop listening.
-Returns null (annotated) on bind/listen error.`)
+Returns:
+	Handle.listener — pass to netAccept; close(listener) to stop;
+	null (annotated) on bind/listen error.`)
 
 	// netAccept(listener) -> "net" handle
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"netAccept",
-		[]ParamSpec{{Name: "l", Type: S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
+		[]ParamSpec{{Name: "l", Type: S{"get", S{"id", "Handle"}, S{"str", "listener"}}}},
+		S{"unop", "?", S{"get", S{"id", "Handle"}, S{"str", "net"}}}, func(ip *Interpreter, ctx CallCtx) Value {
 			ln := asHandle(ctx.Arg("l"), "listener").Data.(*netListenerH).ln
 			conn, err := ln.Accept()
 			if err != nil {
@@ -134,8 +135,10 @@ Returns null (annotated) on bind/listen error.`)
 	)
 	setBuiltinDoc(target, "netAccept", `Accept one TCP connection from a listener.
 
-Blocks until a client connects. Returns a network handle,
-or null (annotated) on accept error.`)
+Blocks until a client connects.
+
+Returns:
+	Handle.net? — network handle, or null (annotated) on accept error.`)
 
 	// HTTP input and output types.
 	var httpReqT = S{
@@ -157,8 +160,8 @@ or null (annotated) on accept error.`)
 			S{"pair", S{"str", "url"}, S{"id", "Str"}},
 			S{"pair", S{"str", "proto"}, S{"id", "Str"}},
 			S{"pair", S{"str", "durationMs"}, S{"id", "Int"}},
-			S{"pair", S{"str", "body"}, S{"id", "Str"}},  // for http()
-			S{"pair", S{"str", "bodyH"}, S{"id", "Any"}}, // for httpStream()
+			S{"pair", S{"str", "body"}, S{"id", "Str"}}, // for http()
+			S{"pair", S{"str", "bodyH"}, S{"get", S{"id", "Handle"}, S{"str", "net"}}},
 		},
 	}
 
@@ -277,7 +280,7 @@ Input:
 		method:     Str?         # default "GET"
 		headers:    {}?
 		body:       Str?         # text body
-		bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
+		bodyH:      Any          # readable handle (file/net) for upload; preferred over body
 		timeoutMs:  Int?         # default 30000
 	}
 
@@ -285,11 +288,11 @@ Output:
 	{
 		status!:     Int
 		statusText:  Str
-		headers!:    {Str: Str}   # multi-values joined by ", "
-		body!:       Str           # full response body (text/binary-as-text)
-		url:         Str           # final URL after redirects
-		proto:       Str           # "HTTP/1.1", "HTTP/2.0"
-		durationMs:  Int           # end-to-end (including body read)
+		headers!:    {}          # multi-values joined by ", "
+		body!:       Str         # full response body (text/binary-as-text)
+		url:         Str         # final URL after redirects
+		proto:       Str         # "HTTP/1.1", "HTTP/2.0"
+		durationMs:  Int         # end-to-end (including body read)
 	}?  # annotated null on network/IO error`)
 
 	// -----------------------------------------
@@ -407,7 +410,7 @@ Input:
 		method:     Str?         # default "GET"
 		headers:    {}?
 		body:       Str?         # text body
-		bodyH:      Any?         # readable handle (file/net) for upload; preferred over body
+		bodyH:      Any          # readable handle (file/net) for upload; preferred over body
 		timeoutMs:  Int?         # default 30000
 	}
 
@@ -416,7 +419,7 @@ Output:
 		status!:     Int
 		statusText:  Str
 		headers!:    {Str: Str}
-		bodyH!:      Any          # readable handle (Kind "net"); use readN/readAll/close
+		bodyH!:      Handle.net   # readable handle (Kind "net"); use readN/readAll/close
 		url:         Str
 		proto:       Str
 		durationMs:  Int          # time until headers (body not read)

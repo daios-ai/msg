@@ -10,23 +10,23 @@ import (
 // Single-thread / owner affinity builtins
 //
 // Overview:
-//   - ownerWrap(m: Any, pinOSThread?: Bool) -> Any
+//   - ownerWrap(m: Any, pinOSThread?: Bool) -> Handle.owner
 //       Creates a dedicated interpreter isolate + owner goroutine processing
 //       requests serially. If pinOSThread==true, the goroutine calls
 //       runtime.LockOSThread() so all work runs on a single OS thread.
 //       Returns an opaque Handle("owner").
 //
-//   - ownerRun(o: Any, f: Fun) -> Any
+//   - ownerRun(o: Handle.owner, f: Fun|Any) -> Any
 //       Deep-snapshots f into the owner's isolate and invokes f(m) there.
 //
-//   - ownerCall(o: Any, f: Fun, args: [Any]) -> Any
+//   - ownerCall(o: Handle.owner, f: Fun|Any, args: [Any]) -> Any
 //       Deep-snapshots f and args into the owner's isolate and calls Apply(f,args).
 //
-//   - ownerGet(o: Any, key: Str) -> Any
-//   - ownerSet(o: Any, key: Str, v: Any) -> Any
+//   - ownerGet(o: Handle.owner, key: Str) -> Any
+//   - ownerSet(o: Handle.owner, key: Str, v: Any) -> Any
 //       Property access/mutation of the wrapped value m when it's a map/module.
 //
-//   - ownerClose(o: Any) -> Bool?
+//   - ownerClose(o: Handle.owner) -> Bool?
 //       Closes the request queue; returns true on first close,
 //       Null("already closed") otherwise.
 //
@@ -122,10 +122,10 @@ func enqueueOwner(o *owner, run func() Value) Value {
 	return <-ret
 }
 
-// registerSingleThreadBuiltins installs the owner/affinity builtins into 'target'.
+// registerThreadLockBuiltins installs the owner/affinity builtins into 'target'.
 // Call this during runtime seeding (similar to registerConcurrencyBuiltins).
 func registerThreadLockBuiltins(ip *Interpreter, target *Env) {
-	// ownerWrap(m: Any, pinOSThread?: Bool) -> Any
+	// ownerWrap(m: Any, pinOSThread?: Bool) -> Handle.owner
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"ownerWrap",
@@ -133,7 +133,7 @@ func registerThreadLockBuiltins(ip *Interpreter, target *Env) {
 			{Name: "m", Type: S{"id", "Any"}},
 			{Name: "pinOSThread", Type: S{"unop", "?", S{"id", "Bool"}}},
 		},
-		S{"id", "Any"},
+		S{"get", S{"id", "Handle"}, S{"str", "owner"}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			m := ctx.Arg("m")
 			pin := false
@@ -154,14 +154,14 @@ Params:
   pinOSThread: Bool?   # default false
 
 Returns:
-  Any   # owner handle (opaque)`)
+  Handle.owner   # opaque owner handle`)
 
-	// ownerRun(o: Any, f: Fun) -> Any
+	// ownerRun(o: Handle.owner, f: Fun|Any) -> Any
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"ownerRun",
 		[]ParamSpec{
-			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "o", Type: S{"get", S{"id", "Handle"}, S{"str", "owner"}}},
 			{Name: "f", Type: S{"id", "Any"}},
 		},
 		S{"id", "Any"},
@@ -185,18 +185,18 @@ Returns:
 	setBuiltinDoc(target, "ownerRun", `Run function f(m) inside the owner's single thread.
 
 Params:
-  o: Any   # owner handle
+  o: Handle.owner
   f: Fun
 
 Returns:
   Any`)
 
-	// ownerCall(o: Any, f: Fun, args: [Any]) -> Any
+	// ownerCall(o: Handle.owner, f: Fun|Any, args: [Any]) -> Any
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"ownerCall",
 		[]ParamSpec{
-			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "o", Type: S{"get", S{"id", "Handle"}, S{"str", "owner"}}},
 			{Name: "f", Type: S{"id", "Any"}},
 			{Name: "args", Type: S{"array", S{"id", "Any"}}},
 		},
@@ -224,19 +224,19 @@ Returns:
 	setBuiltinDoc(target, "ownerCall", `Call f(...args) inside the owner's single thread.
 
 Params:
-  o: Any     # owner handle
+  o: Handle.owner
   f: Fun
   args: [Any]
 
 Returns:
   Any`)
 
-	// ownerGet(o: Any, key: Str) -> Any
+	// ownerGet(o: Handle.owner, key: Str) -> Any
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"ownerGet",
 		[]ParamSpec{
-			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "o", Type: S{"get", S{"id", "Handle"}, S{"str", "owner"}}},
 			{Name: "key", Type: S{"id", "Str"}},
 		},
 		S{"id", "Any"},
@@ -260,18 +260,18 @@ Returns:
 	setBuiltinDoc(target, "ownerGet", `Get a property from the wrapped value (map/module) inside the owner.
 
 Params:
-  o: Any    # owner handle
+  o: Handle.owner
   key: Str
 
 Returns:
   Any   # annotated Null if missing key`)
 
-	// ownerSet(o: Any, key: Str, v: Any) -> Any
+	// ownerSet(o: Handle.owner, key: Str, v: Any) -> Any
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"ownerSet",
 		[]ParamSpec{
-			{Name: "o", Type: S{"id", "Any"}},
+			{Name: "o", Type: S{"get", S{"id", "Handle"}, S{"str", "owner"}}},
 			{Name: "key", Type: S{"id", "Str"}},
 			{Name: "v", Type: S{"id", "Any"}},
 		},
@@ -302,18 +302,18 @@ Returns:
 	setBuiltinDoc(target, "ownerSet", `Set a property on the wrapped value (map/module) inside the owner.
 
 Params:
-  o: Any
+  o: Handle.owner
   key: Str
   v: Any
 
 Returns:
   Any`)
 
-	// ownerClose(o: Any) -> Bool?
+	// ownerClose(o: Handle.owner) -> Bool?
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"ownerClose",
-		[]ParamSpec{{Name: "o", Type: S{"id", "Any"}}},
+		[]ParamSpec{{Name: "o", Type: S{"get", S{"id", "Handle"}, S{"str", "owner"}}}},
 		S{"unop", "?", S{"id", "Bool"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			o := asHandle(ctx.Arg("o"), "owner").Data.(*owner)
@@ -338,7 +338,7 @@ Returns:
 On first close returns true; on subsequent closes returns Null("already closed").
 
 Params:
-  o: Any
+  o: Handle.owner
 
 Returns:
   Bool?`)

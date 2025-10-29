@@ -467,6 +467,27 @@ func ValidateCanonicalS(s S) Value {
 			return
 		}
 		switch tagOf(t) {
+
+		case "get":
+			// Qualified type paths: ["get", base, ["str", key]]
+			if len(t) != 3 {
+				push(path, "E_TYPE_GET_ARITY", "qualified type must have base and key", arity(t), `3`)
+				return
+			}
+			// base can be id|get|annot; recurse structurally so nested gets are fine
+			base, ok := t[1].(S)
+			if !ok {
+				push(path+"/get/base", "E_NODE_SHAPE", "qualified type base must be a node", fmt.Sprintf("%T", t[1]), "node")
+			} else {
+				walkType(base, path+"/get/base")
+			}
+			key, ok := t[2].(S)
+			if !ok || tagOf(key) != "str" {
+				push(path+"/get/key", "E_TYPE_GET_KEY", "qualified type key must be a string node", tagOf(t[2]), `["str",key]`)
+				return
+			}
+			checkScalarPayload(path+"/get/key", key, "str")
+
 		case "id":
 			checkScalarPayload(path, t, "id")
 

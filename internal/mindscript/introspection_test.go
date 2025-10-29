@@ -874,3 +874,101 @@ func Test_Interpreter_DeepEqual_IntVsNum(t *testing.T) {
 		t.Fatalf("did not expect Int(3) == Num(3.1)")
 	}
 }
+
+func Test_Introspection_Handle_Type_Get_Validate_And_Reify(t *testing.T) {
+	// S: type Handle.file  — should validate and reify to a VTType with that AST.
+	s := S{"type", S{"get", S{"id", "Handle"}, S{"str", "file"}}}
+
+	// Validate: expect empty error array.
+	verrs := IxValidateS(s)
+	if verrs.Tag != VTArray || len(verrs.Data.(*ArrayObject).Elems) != 0 {
+		t.Fatalf("expected no validation errors, got %#v", verrs)
+	}
+
+	// Reify via runtime-S roundtrip.
+	rt := IxToS(s)
+	ip, _ := NewInterpreter()
+	v, err := ip.IxReify(rt)
+	if err != nil {
+		t.Fatalf("IxReify failed: %v", err)
+	}
+	if v.Tag != VTType {
+		t.Fatalf("expected VTType, got %v", v.Tag)
+	}
+	tv := v.Data.(*TypeValue)
+	wantAst := S{"get", S{"id", "Handle"}, S{"str", "file"}}
+	if !reflect.DeepEqual(stripAnnot(tv.Ast), wantAst) {
+		t.Fatalf("type AST mismatch\n got : %#v\n want: %#v", tv.Ast, wantAst)
+	}
+}
+
+func Test_Introspection_Handle_Type_NestedGet_Validate_And_Reify(t *testing.T) {
+	// S: type M.T.U — nested get chain should validate and reify unchanged.
+	s := S{"type", S{"get", S{"get", S{"id", "M"}, S{"str", "T"}}, S{"str", "U"}}}
+
+	verrs := IxValidateS(s)
+	if verrs.Tag != VTArray || len(verrs.Data.(*ArrayObject).Elems) != 0 {
+		t.Fatalf("expected no validation errors, got %#v", verrs)
+	}
+
+	rt := IxToS(s)
+	ip, _ := NewInterpreter()
+	v, err := ip.IxReify(rt)
+	if err != nil {
+		t.Fatalf("IxReify failed: %v", err)
+	}
+	if v.Tag != VTType {
+		t.Fatalf("expected VTType, got %v", v.Tag)
+	}
+	tv := v.Data.(*TypeValue)
+	wantAst := S{"get", S{"get", S{"id", "M"}, S{"str", "T"}}, S{"str", "U"}}
+	if !reflect.DeepEqual(stripAnnot(tv.Ast), wantAst) {
+		t.Fatalf("type AST mismatch\n got : %#v\n want: %#v", tv.Ast, wantAst)
+	}
+}
+
+func Test_Introspection_Handle_Value_Reflect_SoftError(t *testing.T) {
+	// Reflecting an actual handle value must soft-fail as annotated-null.
+	h := &Handle{Kind: "file"}
+	got := IxReflect(Value{Tag: VTHandle, Data: h})
+
+	if got.Tag != VTArray {
+		t.Fatalf("expected VTArray, got %v", got.Tag)
+	}
+	top := got.Data.(*ArrayObject).Elems
+	if len(top) != 3 || top[0].Tag != VTStr || top[0].Data.(string) != "annot" {
+		t.Fatalf("expected annotated-null; got %#v", got)
+	}
+	// Final child must be ["null"]
+	nullNode := top[2]
+	wantNull := vArray(vStr("null"))
+	mustEqValue(t, nullNode, wantNull)
+}
+
+func Test_Introspection_Fun_Param_Allows_HandleKind_Type(t *testing.T) {
+	// fun(h: Handle.socket) -> Any { } must validate.
+	s := S{
+		"fun",
+		S{"array",
+			S{"pair",
+				S{"id", "h"},
+				S{"get", S{"id", "Handle"}, S{"str", "socket"}},
+			},
+		},
+		S{"id", "Any"},
+		S{"block"},
+	}
+	verrs := IxValidateS(s)
+	if verrs.Tag != VTArray || len(verrs.Data.(*ArrayObject).Elems) != 0 {
+		t.Fatalf("expected no validation errors, got %#v", verrs)
+	}
+}
+
+func Test_Introspection_Enum_Members_Accept_Expressions_In_Types(t *testing.T) {
+	// type Enum[ 1 + 2 ] — validator accepts expression members (evaluation will enforce literal).
+	s := S{"type", S{"enum", S{"binop", "+", S{"int", int64(1)}, S{"int", int64(2)}}}}
+	verrs := IxValidateS(s)
+	if verrs.Tag != VTArray || len(verrs.Data.(*ArrayObject).Elems) != 0 {
+		t.Fatalf("expected no validation errors, got %#v", verrs)
+	}
+}

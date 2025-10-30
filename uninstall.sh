@@ -24,10 +24,21 @@ clean_rc() {
   local rcfile="$1"
   [[ -f "$rcfile" ]] || return 0
   cp -p "$rcfile" "${rcfile}.bak-$(date +%Y%m%d%H%M%S)"
-  # Remove lines that set MSGPATH to ~/.mindscript or add MSGPATH/bin to PATH
-  # (these match what install.sh wrote)
-  sed -i '' -e '/MSGPATH=.*\.mindscript/d' -e '/\$MSGPATH\/bin/d' "$rcfile" 2>/dev/null || \
-  sed -i     -e '/MSGPATH=.*\.mindscript/d' -e '/\$MSGPATH\/bin/d' "$rcfile"
+  # Remove legacy MSGPATH lines and PATH entries pointing at ~/.mindscript/bin
+  # Works on both macOS (BSD sed) and Linux (GNU sed)
+  if sed -E -i '' \
+      -e '/MSGPATH=.*\.mindscript/d' \
+      -e '/\$MSGPATH\/bin/d' \
+      -e '/\.mindscript\/bin/d' \
+      "$rcfile" 2>/dev/null; then
+    :
+  else
+    sed -E -i \
+      -e '/MSGPATH=.*\.mindscript/d' \
+      -e '/\$MSGPATH\/bin/d' \
+      -e '/\.mindscript\/bin/d' \
+      "$rcfile"
+  fi
 }
 
 # 1) Remove install dir

@@ -142,18 +142,17 @@ fi
 # -----------------------------
 # Shell profile setup (bash/zsh + fish)
 # -----------------------------
-SNIPPET='export MSGPATH="$HOME/.mindscript"
-case ":$PATH:" in *":$MSGPATH/bin:"*) ;; *) export PATH="$MSGPATH/bin:$PATH";; esac'
+SNIPPET='case ":$PATH:" in *":$HOME/.mindscript/bin:"*) ;; *) export PATH="$HOME/.mindscript/bin:$PATH";; esac'
 
 for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
   if [[ -f "$rc" ]]; then
-    grep -q 'MSGPATH=.*\.mindscript' "$rc" 2>/dev/null || printf '\n%s\n' "$SNIPPET" >> "$rc"
+    grep -q '\.mindscript/bin' "$rc" 2>/dev/null || printf '\n%s\n' "$SNIPPET" >> "$rc"
   fi
 done
 
 if [[ -d "$HOME/.config/fish/conf.d" ]]; then
-  printf 'set -gx MSGPATH "%s"\nset -gx PATH "$MSGPATH/bin" $PATH\n' "$INSTALL_DIR" \
-    > "$HOME/.config/fish/conf.d/mindscript.fish"
+  # Overwrite/update fish snippet with PATH-only addition
+  printf 'set -gx PATH "%s/bin" $PATH\n' "$INSTALL_DIR" > "$HOME/.config/fish/conf.d/mindscript.fish"
 fi
 
 echo "OK: Installed. Open a new terminal or run:  source ~/.bashrc   (or ~/.zshrc)"

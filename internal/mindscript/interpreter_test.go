@@ -1,7 +1,6 @@
 package mindscript
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2240,7 +2239,6 @@ doesNotExist()   # force a hard runtime error after a successful import
 	}
 	wantErrContains(t, err, "std.ms")
 	wantErrContains(t, err, "runtime")
-	_ = fmt.Sprintf("") // keep fmt import if build tags vary
 }
 
 func Test_Interpreter_Constructor_Prelude_Imports_Module_Succeeds(t *testing.T) {

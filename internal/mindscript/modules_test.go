@@ -1,4 +1,4 @@
-// modules_autoload_test.go
+// modules_test.go
 package mindscript
 
 import (
@@ -100,8 +100,8 @@ a.y`)
 	wantInt(t, v, 12)
 }
 
-// Search via MindScriptPath when not found in importer dir or CWD.
-func Test_FileImport_Search_MindScriptPath_LibSubdir(t *testing.T) {
+// Search via standard library (<install-root>/lib) when not found in importer dir or CWD.
+func Test_FileImport_Search_Stdlib_LibSubdir(t *testing.T) {
 	root, done := withTempDir(t)
 	defer done()
 
@@ -114,10 +114,10 @@ func Test_FileImport_Search_MindScriptPath_LibSubdir(t *testing.T) {
 	_ = write(t, libDir, "util.ms", `let name = "Bob"`)
 	_ = write(t, libDir, "std.ms", ``) // tiny valid program
 
-	// Empty CWD; rely on MSGPATH roots (loader appends /lib)
-	old := os.Getenv(MindScriptPath)
-	_ = os.Setenv(MindScriptPath, root)
-	defer os.Setenv(MindScriptPath, old)
+	// Point the test process at a fake install root so stdlib fallback finds <root>/lib.
+	oldInstall := installRoot
+	installRoot = root
+	defer func() { installRoot = oldInstall }()
 
 	ip, err := NewInterpreter()
 	if err != nil {
@@ -612,7 +612,7 @@ func Test_Module_HTTP_ParseError_Is_Hard(t *testing.T) {
 	wantErrContains(t, err, "parse error")
 }
 
-// Import resolution should prefer the importer's directory over CWD/MSGPATH.
+// Import resolution should prefer the importer's directory over CWD/stdlib.
 func Test_Module_Resolution_Prefers_Importer_Dir(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()

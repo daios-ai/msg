@@ -184,7 +184,6 @@ func cmdRun(args []string) int {
 	ip, rtErr := mindscript.NewInterpreter()
 	if rtErr != nil {
 		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
 		return 1
 	}
 
@@ -272,7 +271,6 @@ func cmdRepl(_ []string) (ret int) {
 	ip, rtErr := mindscript.NewInterpreter()
 	if rtErr != nil {
 		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
 		return 1
 	}
 
@@ -372,7 +370,6 @@ func cmdFmt(args []string) int {
 	ip, rtErr := mindscript.NewInterpreter()
 	if rtErr != nil {
 		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
 		return 1
 	}
 
@@ -520,7 +517,6 @@ func cmdTest(args []string) int {
 	ip, rtErr := mindscript.NewInterpreter()
 	if rtErr != nil {
 		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		fmt.Fprintf(os.Stderr, red("Perhaps the environment variable %s is undefined?\n"), mindscript.MindScriptPath)
 		return 1
 	}
 

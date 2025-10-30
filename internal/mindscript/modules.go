@@ -35,22 +35,15 @@
 //     • ImportCode / ImportAST: the exact `name` you pass in (no "mem:" prefix).
 //     • Inline `module "Name"`: the string literal "Name".
 //
-// 3) Source mapping is **precise** for *every* entry point.
+//  3. Source mapping is **precise** for *every* entry point.
 //
-//   - ImportFile/ImportCode: parse with spans via ParseSExprWithSpans.
+//     - ImportFile/ImportCode: parse with spans via ParseSExprWithSpans.
+//     - ImportAST: first render to source via FormatSExpr, then parse with spans.
+//     - Inline `module …`: VM re-roots spans to the body using an absolute NodePath.
 //
-//   - ImportAST: first render to source via FormatSExpr, then parse with spans.
-//
-//   - Inline `module …`: VM re-roots spans to the body using an absolute NodePath.
-//
-//     4. Module names are **not mutated** post-construction. The value passed as the
+//  4. Module names are **not mutated** post-construction. The value passed as the
 //     "name" argument to `nativeMakeModule` **is** the Module.Name (the canonical
 //     identity). We do not overwrite it afterward.
-//
-// MIND SCRIPT PATH
-// ----------------
-// The environment variable MSGPATH remains the library search path for files.
-// The resolution order is unchanged (importer dir → CWD → each root in MSGPATH).
 package mindscript
 
 import (
@@ -69,9 +62,6 @@ import (
 ////////////////////////////////////////////////////////////////////////////////
 //                                   PUBLIC API
 ////////////////////////////////////////////////////////////////////////////////
-
-// MindScript Library Path (preserved)
-const MindScriptPath = "MSGPATH"
 
 // Module is the payload carried by a VTModule value.
 type Module struct {
@@ -133,15 +123,15 @@ func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
 //
 // Behavior:
 //   - Canonical identity: absolute path (filesystem) or full URL (http/https).
-//   - Resolution & fetching follow the preserved rules (see header).
+//   - Resolution & fetching follow the no-MSGPATH policy:
+//   - Relative specs resolve against the importing file's directory,
+//     or the REPL's current working directory if there is no importer.
+//   - If not found, fall back to the standard library at <install-root>/lib.
 //   - If resolution/fetch fails, returns **annotated null** with nil Go error.
 //   - Parses with spans for precise carets and evaluates in a fresh env.
 //
 // Caching:
-//   - Uniform caching is centralized in nativeMakeModule (so inline/AST/code/file
-//     all share the same semantics). ImportFile still resolves+reads the source;
-//     if the canonical module is already loaded, execution short-circuits inside
-//     nativeMakeModule and reuses the cached module.
+//   - Uniform caching is centralized in nativeMakeModule.
 func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
 	src, display, canon, rerr := resolveAndFetch(spec, importer)
 	if rerr != nil {
@@ -318,12 +308,11 @@ const defaultModuleExt = ".ms" // preserved
 //   - If the URL path has no extension, defaultModuleExt is appended.
 //
 // Filesystem:
-//   - Resolve relative specs against importer dir → CWD → MindScriptPath (MSGPATH).
+//   - Resolve relative specs against importer dir → (REPL) CWD → stdlib <install-root>/lib.
 //   - If spec has no extension, try spec+defaultModuleExt then spec.
 //   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
 //
 // NOTE: This function returns Go errors; ImportFile is responsible for classifying
-// resolution/fetch failures as soft (annotated null) at the API boundary.
 func resolveAndFetch(spec string, importer string) (string, string, string, error) {
 	// Network?
 	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
@@ -357,7 +346,7 @@ func resolveFS(spec string, importer string) (string, error) {
 	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
 		bases = append(bases, filepath.Dir(importer))
 	}
-	// Then the current working directory.
+	// In REPL (no importer), or as a fallback, use the current working directory.
 	if cwd, err := os.Getwd(); err == nil {
 		bases = append(bases, cwd)
 	}
@@ -383,7 +372,7 @@ func resolveFS(spec string, importer string) (string, error) {
 		if p, ok := try("", spec); ok {
 			return p, nil
 		}
-		// fallthrough to MindScriptPath for completeness.
+		// fallthrough to stdlib for completeness.
 	} else {
 		for _, b := range bases {
 			if p, ok := try(b, spec); ok {
@@ -392,17 +381,11 @@ func resolveFS(spec string, importer string) (string, error) {
 		}
 	}
 
-	// MindScriptPath (MSGPATH) — preserved behavior
-	if sp := os.Getenv(MindScriptPath); sp != "" {
-		for _, root := range filepath.SplitList(sp) {
-			if root == "" {
-				continue
-			}
-			// Only look under a conventional "lib" subdir of each root.
-			libRoot := filepath.Join(root, "lib")
-			if p, ok := try(libRoot, spec); ok {
-				return p, nil
-			}
+	// Standard library fallback: <install-root>/lib
+	if installRoot != "" {
+		libRoot := filepath.Join(installRoot, "lib")
+		if p, ok := try(libRoot, spec); ok {
+			return p, nil
 		}
 	}
 

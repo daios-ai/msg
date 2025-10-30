@@ -3,6 +3,12 @@ PI: 3.141592653589793 — Mathematical constant π.
 STDERR: <handle: file> — Writable handle for the process standard error.
 STDIN: <handle: file> — Readable handle for the process standard input.
 STDOUT: <handle: file> — Writable handle for the process standard output.
+actorCall: <fun: a:Handle.actor -> f:Any -> args:[Any] -> Any> — Call f(...args) inside the actor's single thread.
+actorClose: <fun: a:Handle.actor -> Bool?> — Close the actor's request queue (idempotent).
+actorGet: <fun: a:Handle.actor -> key:Str -> Any> — Get a property from the wrapped value (map/module) inside the actor.
+actorRun: <fun: a:Handle.actor -> f:Any -> Any> — Run function f(m) inside the actor's single thread.
+actorSet: <fun: a:Handle.actor -> key:Str -> v:Any -> Any> — Set a property on the wrapped value (map/module) inside the actor.
+actorStart: <fun: m:Any -> pinOSThread:Bool? -> Handle.actor> — Create a single-thread actor wrapper for value 'm'.
 assert: <fun: cond:Bool -> Bool> — Assert that a condition holds.
 astEval: <fun: ast:[Any] -> Any> — Evaluate a runtime-S AST in the caller's scope.
 astFormat: <fun: ast:[Any] -> Str?> — Format a runtime-S AST into stable source.
@@ -11,12 +17,12 @@ astValidate: <fun: ast:[Any] -> [Any]> — Validate a runtime-S AST.
 base64Decode: <fun: s:Str -> Str?> — Decode a standard Base64 string.
 base64Encode: <fun: x:Str -> Str> — Base64-encode bytes from a string.
 bool: <fun: x:Any -> Bool?> — Convert to Bool using common "truthiness" rules; otherwise errs.
-chanClose: <fun: c:Any -> Bool?> — Close a channel (idempotent).
-chanOpen: <fun: cap:Int? -> Any> — Create a new channel for Values.
-chanRecv: <fun: c:Any -> Any> — Receive a value from a channel (blocking).
-chanSend: <fun: c:Any -> x:Any -> Bool?> — Send a value on a channel (blocking).
-chanTryRecv: <fun: c:Any -> {}> — Attempt a non-blocking receive from a channel.
-chanTrySend: <fun: c:Any -> x:Any -> Bool> — Attempt a non-blocking send on a channel.
+chanClose: <fun: c:Handle.chan -> Bool?> — Close a channel (idempotent).
+chanOpen: <fun: cap:Int? -> Handle.chan> — Create a new channel for Values.
+chanRecv: <fun: c:Handle.chan -> Any> — Receive a value from a channel (blocking).
+chanSend: <fun: c:Handle.chan -> x:Any -> Bool?> — Send a value on a channel (blocking).
+chanTryRecv: <fun: c:Handle.chan -> {}> — Attempt a non-blocking receive from a channel.
+chanTrySend: <fun: c:Handle.chan -> x:Any -> Bool> — Attempt a non-blocking send on a channel.
 chdir: <fun: path:Str -> Bool?> — Change the current working directory.
 clone: <fun: x:Any -> Any> — Clone a value (deep-copy).
 close: <fun: h:Any -> Bool?> — Close a file, network connection, or listener handle.
@@ -41,8 +47,8 @@ gzipDecompress: <fun: data:Str -> Str?> — Decompress a gzip payload.
 hexDecode: <fun: s:Str -> Str?> — Decode a hexadecimal string.
 hexEncode: <fun: x:Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
 hmacSha256: <fun: key:Str -> msg:Str -> Str> — HMAC-SHA256 authentication tag (raw bytes).
-http: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
-httpStream: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
+http: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Handle.net, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
+httpStream: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Handle.net, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
 import: <fun: path:Str -> Any> — Load a module from filesystem or HTTP(S).
 importCode: <fun: name:Str -> src:Str -> Any> — Evaluate source text as a module in memory.
 importUrl: <fun: url:Str -> {}?> — Import a module from a URL.
@@ -70,15 +76,15 @@ mkdir: <fun: path:Str -> Bool?> — Create a directory (creating parents as need
 mute: <fun: _:Any -> Null> — Mute (sink) a value.
 naturals: <fun: _:Null -> Null -> Int> — Infinite iterator: 1, 2, 3, ...
 naturals0: <fun: _:Null -> Null -> Int> — Infinite iterator: 0, 1, 2, ...
-netAccept: <fun: l:Any -> Any> — Accept one TCP connection from a listener.
-netConnect: <fun: addr:Str -> Any> — Open a TCP connection to "host:port".
+netAccept: <fun: l:Handle.listener -> Handle.net?> — Accept one TCP connection from a listener.
+netConnect: <fun: addr:Str -> Handle.net?> — Open a TCP connection to "host:port".
 netListen: <fun: addr:Str -> Any> — Listen on a TCP address "host:port".
 noteGet: <fun: x:Any -> Str?> — Get the annotation attached to a value, if any.
 noteSet: <fun: text:Str -> value:Any -> Any> — Attach or replace an annotation on a value.
 nowMillis: <fun: _:Null -> Int> — Current wall-clock time in milliseconds since the Unix epoch.
 nowNanos: <fun: _:Null -> Int> — Current wall-clock time in nanoseconds since the Unix epoch.
 num: <fun: x:Any -> Num?> — Convert to Num when possible; otherwise errs.
-open: <fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Any?> — Open a file and return a handle.
+open: <fun: path:Str -> mode:Enum["r", "w", "a", "rw"] -> Handle.file?> — Open a file and return a file handle (Handle.file).
 oracleHealth: <fun: _:Null -> {}?> — Quick oracle health check (real call, tiny).
 oracleInstall: <fun: exec:(Str -> Str?) -> Bool> — Install a new global oracle executor.
 oracleInstallWithTap: <fun: exec:(Str -> Str?) -> Bool> — Install an oracle executor that records each prompt before forwarding.
@@ -87,12 +93,6 @@ oracleLog: <fun: _:Null -> [[Str]]> — Return the full recorded oracle prompt/o
 oracleStatus: <fun: _:Null -> Str> — Show oracle installation status.
 osEnv: <fun: name:Str -> Str?> — Read an environment variable.
 osSetEnv: <fun: name:Str -> value:Str? -> Bool?> — Set or unset an environment variable.
-ownerCall: <fun: o:Any -> f:Any -> args:[Any] -> Any> — Call f(...args) inside the owner's single thread.
-ownerClose: <fun: o:Any -> Bool?> — Close the owner's request queue (idempotent).
-ownerGet: <fun: o:Any -> key:Str -> Any> — Get a property from the wrapped value (map/module) inside the owner.
-ownerRun: <fun: o:Any -> f:Any -> Any> — Run function f(m) inside the owner's single thread.
-ownerSet: <fun: o:Any -> key:Str -> v:Any -> Any> — Set a property on the wrapped value (map/module) inside the owner.
-ownerWrap: <fun: m:Any -> pinOSThread:Bool? -> Any> — Create a single-thread owner wrapper for value 'm'.
 panic: <fun: message:Str? -> Null> — Fail: throw a runtime error (hard fault).
 pathBase: <fun: path:Str -> Str> — Return the last element of a path (OS-specific).
 pathClean: <fun: path:Str -> Str> — Clean a path by applying lexical simplifications.
@@ -104,12 +104,12 @@ pow: <fun: base:Num -> exp:Num -> Num> — Power: base^exp.
 print: <fun: x:Any -> Any> — Print a value and return it.
 printf: <fun: fmt:Str -> args:[Any] -> Str?> — Print a formatted string to standard output.
 println: <fun: x:Any -> Any> — Print a value with newline and return it.
-procCancel: <fun: p:Any -> Bool?> — Request cooperative cancellation of a process (best effort).
-procCancelled: <fun: p:Any -> Bool> — Check whether cancellation was requested for a process.
-procJoin: <fun: p:Any -> Any> — Wait for a process to finish and return its result.
-procJoinAll: <fun: ps:[Any] -> [Any]> — Wait for all processes to finish and return their results in order.
-procJoinAny: <fun: ps:[Any] -> {}?> — Wait for any process to finish; return its index and value.
-procSpawn: <fun: f:Any -> Any> — Run a function concurrently in an isolated process (clone of the current interpreter).
+procCancel: <fun: p:Handle.proc -> Bool?> — Request cooperative cancellation of a process (best effort).
+procCancelled: <fun: p:Handle.proc -> Bool> — Check whether cancellation was requested for a process.
+procJoin: <fun: p:Handle.proc -> Any> — Wait for a process to finish and return its result.
+procJoinAll: <fun: ps:[Handle.proc] -> [Any]> — Wait for all processes to finish and return their results in order.
+procJoinAny: <fun: ps:[Handle.proc] -> {}?> — Wait for any process to finish; return its index and value.
+procSpawn: <fun: f:Any -> Handle.proc> — Run a function concurrently in an isolated process (clone of the current interpreter).
 push: <fun: arr:[Any] -> v:Any -> [Any]> — Append an element to an array (in place).
 randBytes: <fun: n:Int -> Str?> — Uniform cryptographically secure random bytes.
 randFloat: <fun: _:Null -> Num> — Uniform random number in [0.0, 1.0).
@@ -144,10 +144,10 @@ strip: <fun: s:Str -> Str> — Remove leading and trailing whitespace (Unicode).
 substr: <fun: s:Str -> i:Int -> j:Int -> Str> — Unicode-safe substring by rune index.
 tan: <fun: x:Num -> Num> — Tangent of an angle in radians.
 tempDir: <fun: _:Null -> Str> — Return the system temporary directory.
-ticker: <fun: ms:Int -> Any> — Create a channel that emits periodic ticks until closed by the consumer.
+ticker: <fun: ms:Int -> Handle.chan> — Create a channel that emits periodic ticks until closed by the consumer.
 timeFormatRFC3339: <fun: millis:Int -> Str> — Format a Unix-epoch timestamp (milliseconds) as RFC 3339 (UTC).
 timeParseRFC3339: <fun: s:Str -> Int?> — Parse an RFC 3339 timestamp into milliseconds since the Unix epoch.
-timerAfter: <fun: ms:Int -> Any> — Create a channel that emits one tick after a delay, then closes.
+timerAfter: <fun: ms:Int -> Handle.chan> — Create a channel that emits one tick after a delay, then closes.
 toLower: <fun: s:Str -> Str> — Lowercase conversion (Unicode aware).
 toUpper: <fun: s:Str -> Str> — Uppercase conversion (Unicode aware).
 try: <fun: f:(Null -> Any) -> {ok!: Bool, value!: Any}> — Run a zero-arg function and capture panics.

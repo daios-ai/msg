@@ -1,6 +1,7 @@
 package mindscript
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2201,11 +2202,11 @@ end
 }
 
 func Test_Interpreter_Constructor_Prelude_Imports_Module_FailsGracefully(t *testing.T) {
-	// Arrange a temp MSGPATH/lib with:
-	//   - llm.ms: exists (so import hits nativeMakeModule -> newBaseFromTemplate)
-	//   - std.ms: imports llm, then triggers a runtime error
-	t.Setenv(MindScriptPath, t.TempDir())
-	lib := filepath.Join(os.Getenv(MindScriptPath), "lib")
+	// Arrange a temp install root with:
+	//   <root>/lib/llm.ms  (exists)
+	//   <root>/lib/std.ms  (imports llm, then triggers a runtime error)
+	root := t.TempDir()
+	lib := filepath.Join(root, "lib")
 	if err := os.MkdirAll(lib, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2225,6 +2226,11 @@ doesNotExist()   # force a hard runtime error after a successful import
 		t.Fatal(err)
 	}
 
+	// Override installRoot just for this test.
+	prev := installRoot
+	installRoot = root
+	defer func() { installRoot = prev }()
+
 	// Act: construct the interpreter (this seeds prelude).
 	ip, err := NewInterpreter()
 
@@ -2232,14 +2238,15 @@ doesNotExist()   # force a hard runtime error after a successful import
 	if err == nil {
 		t.Fatalf("expected constructor to fail due to prelude runtime error, got ip=%v, err=nil", ip)
 	}
-	wantErrContains(t, err, "std.ms")  // should reference the prelude file
-	wantErrContains(t, err, "runtime") // caret-style runtime error message
+	wantErrContains(t, err, "std.ms")
+	wantErrContains(t, err, "runtime")
+	_ = fmt.Sprintf("") // keep fmt import if build tags vary
 }
 
 func Test_Interpreter_Constructor_Prelude_Imports_Module_Succeeds(t *testing.T) {
-	// Arrange a temp MSGPATH/lib with a benign prelude that imports a module.
-	t.Setenv(MindScriptPath, t.TempDir())
-	lib := filepath.Join(os.Getenv(MindScriptPath), "lib")
+	// Arrange a temp install root with a benign prelude that imports a module.
+	root := t.TempDir()
+	lib := filepath.Join(root, "lib")
 	if err := os.MkdirAll(lib, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2258,6 +2265,11 @@ let ok = 1
 	if err := os.WriteFile(filepath.Join(lib, "std.ms"), []byte(std), 0o644); err != nil {
 		t.Fatal(err)
 	}
+
+	// Override detected install root just for this test.
+	prev := installRoot
+	installRoot = root
+	defer func() { installRoot = prev }()
 
 	// Act
 	ip, err := NewInterpreter()

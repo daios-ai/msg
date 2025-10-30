@@ -13,10 +13,10 @@
 # - Graph build/dup/size/traversal/compute/status
 # - Custom ops (map*, custom_4d/inplace)
 # - Loss/optimizers
-# - Quantization (incl. row helpers) + type traits
+# - Quantization + type traits
 # - fp16/bf16 scalar + row conversions
 # - Logging / abort callbacks
-# - Threadpool params helpers
+# - Threadpool params
 # - Misc: GUID, UTF-8 fopen, unravel_index
 #
 # NOTE:
@@ -51,16 +51,17 @@ let _C = ffiOpen({
     "ggml_cgraph":  { "kind":"pointer", "to": { "kind":"void" }, "tag":"ggml.cgraph*"  },
 
     # pointer-to-pointer (for ggml_build_backward_expand grad_accs**)
-    "ggml_tensor_ptr": { "kind":"pointer", "to":"ggml_tensor", "tag":"ggml.tensor**" },
+    "ggml_tensor_ptr": { "kind":"pointer", "to": { "kind":"pointer", "to":"ggml_tensor" }, "tag":"ggml.tensor**" },
 
     # -------- enums as ints --------
-    "ggml_type":     { "kind":"int", "bits":32, "signed":true },
-    "ggml_op":       { "kind":"int", "bits":32, "signed":true },
-    "ggml_prec":     { "kind":"int", "bits":32, "signed":true },
-    "ggml_status":   { "kind":"int", "bits":32, "signed":true },
-    "ggml_log_level":{ "kind":"int", "bits":32, "signed":true },
-    "ggml_op_pool":  { "kind":"int", "bits":32, "signed":true },
-    "ggml_sort_order":{ "kind":"int","bits":32, "signed":true },
+    "ggml_type":       { "kind":"int", "bits":32, "signed":true },
+    "ggml_op":         { "kind":"int", "bits":32, "signed":true },
+    "ggml_prec":       { "kind":"int", "bits":32, "signed":true },
+    "ggml_status":     { "kind":"int", "bits":32, "signed":true },
+    "ggml_log_level":  { "kind":"int", "bits":32, "signed":true },
+    "ggml_op_pool":    { "kind":"int", "bits":32, "signed":true },
+    "ggml_sort_order": { "kind":"int", "bits":32, "signed":true },
+    "ggml_sched_priority": { "kind":"int", "bits":32, "signed":true },
 
     # -------- small structs --------
     # struct ggml_init_params { size_t mem_size; void * mem_buffer; bool no_alloc; }
@@ -79,6 +80,41 @@ let _C = ffiOpen({
       "fields":[ { "name":"bits", "type":"u16" } ]
     },
 
+    # struct ggml_type_traits (partial layout sufficient for safe reads)
+    "ggml_type_traits": {
+      "kind":"struct",
+      "fields":[
+        { "name":"type_name",            "type":"charp"  },
+        { "name":"blck_size",            "type":"i64"    },
+        { "name":"blck_size_interleave", "type":"i64"    },
+        { "name":"type_size",            "type":"size_t" },
+        { "name":"is_quantized",         "type":"bool"   },
+        { "name":"to_float",             "type":"voidp"  },
+        { "name":"from_float_ref",       "type":"voidp"  }
+      ]
+    },
+
+    # struct ggml_threadpool_params
+    # {
+    #   bool   cpumask[GGML_MAX_N_THREADS]; // 512
+    #   int    n_threads;
+    #   int    prio;       // enum ggml_sched_priority
+    #   uint32_t poll;
+    #   bool   strict_cpu;
+    #   bool   paused;
+    # }
+    "ggml_threadpool_params": {
+      "kind":"struct",
+      "fields":[
+        { "name":"cpumask",   "type": { "kind":"array", "of":"bool", "len":512 } },
+        { "name":"n_threads", "type":"i32" },
+        { "name":"prio",      "type":"ggml_sched_priority" },
+        { "name":"poll",      "type":"u32" },
+        { "name":"strict_cpu","type":"bool" },
+        { "name":"paused",    "type":"bool" }
+      ]
+    },
+
     # -------- function pointers --------
     # void (*ggml_abort_callback_t)(const char * msg)
     "ggml_abort_cb": {
@@ -93,6 +129,32 @@ let _C = ffiOpen({
       "ret": { "kind":"void" },
       "params": [ "ggml_log_level", "charp", "voidp" ],
       "variadic": false
+    },
+
+    # -------- custom-op function pointers --------
+    "ggml_custom1_op_t": {
+      "kind":"funcptr",
+      "ret": { "kind":"void" },
+      "params": [ "ggml_tensor", "ggml_tensor", "i32", "i32", "voidp" ],
+      "variadic": false
+    },
+    "ggml_custom2_op_t": {
+      "kind":"funcptr",
+      "ret": { "kind":"void" },
+      "params": [ "ggml_tensor", "ggml_tensor", "ggml_tensor", "i32", "i32", "voidp" ],
+      "variadic": false
+    },
+    "ggml_custom3_op_t": {
+      "kind":"funcptr",
+      "ret": { "kind":"void" },
+      "params": [ "ggml_tensor", "ggml_tensor", "ggml_tensor", "ggml_tensor", "i32", "i32", "voidp" ],
+      "variadic": false
+    },
+    "ggml_custom_op_t": {
+      "kind":"funcptr",
+      "ret": { "kind":"void" },
+      "params":[ "ggml_tensor","i32","i32","voidp" ],
+      "variadic":false
     }
   },
 
@@ -131,10 +193,15 @@ let _C = ffiOpen({
     { "name":"ggml_element_size","ret":"size_t","params":[ "ggml_tensor" ] },
     { "name":"ggml_blck_size",   "ret":"i64",   "params":[ "ggml_type" ] },
     { "name":"ggml_row_size",    "ret":"size_t","params":[ "ggml_type","i64" ] },
+    { "name":"ggml_type_size",   "ret":"size_t","params":[ "ggml_type" ] },
+    { "name":"ggml_type_sizef",  "ret":"f64",   "params":[ "ggml_type" ] }, # deprecated in C, still exported
+    { "name":"ggml_is_quantized","ret":"bool",  "params":[ "ggml_type" ] },
 
     { "name":"ggml_type_name",   "ret":"charp", "params":[ "ggml_type" ], "ret_as_str":true },
     { "name":"ggml_op_name",     "ret":"charp", "params":[ "ggml_op" ],   "ret_as_str":true },
     { "name":"ggml_op_symbol",   "ret":"charp", "params":[ "ggml_op" ],   "ret_as_str":true },
+    { "name":"ggml_unary_op_name","ret":"charp","params":[ "i32" ], "ret_as_str":true },
+    { "name":"ggml_glu_op_name",  "ret":"charp","params":[ "i32" ], "ret_as_str":true },
 
     { "name":"ggml_is_transposed", "ret":"bool", "params":[ "ggml_tensor" ] },
     { "name":"ggml_is_permuted",   "ret":"bool", "params":[ "ggml_tensor" ] },
@@ -152,6 +219,8 @@ let _C = ffiOpen({
     { "name":"ggml_is_contiguously_allocated","ret":"bool","params":[ "ggml_tensor" ] },
     { "name":"ggml_is_contiguous_channels", "ret":"bool", "params":[ "ggml_tensor" ] },
     { "name":"ggml_is_contiguous_rows",     "ret":"bool", "params":[ "ggml_tensor" ] },
+    { "name":"ggml_are_same_shape",         "ret":"bool", "params":[ "ggml_tensor","ggml_tensor" ] },
+    { "name":"ggml_are_same_stride",        "ret":"bool", "params":[ "ggml_tensor","ggml_tensor" ] },
 
     { "name":"ggml_can_repeat",    "ret":"bool", "params":[ "ggml_tensor","ggml_tensor" ] },
     { "name":"ggml_tensor_overhead", "ret":"size_t", "params":[] },
@@ -181,7 +250,7 @@ let _C = ffiOpen({
     # ======= Names & flags =======
     { "name":"ggml_get_name",   "ret":"charp", "params":[ "ggml_tensor" ], "ret_as_str":true },
     { "name":"ggml_set_name",   "ret":"ggml_tensor", "params":[ "ggml_tensor","charp" ] },
-    { "name":"ggml_format_name","ret":"ggml_tensor", "params":[ "ggml_tensor","charp" ] },
+    { "name":"ggml_format_name","ret":"ggml_tensor", "params":[ "ggml_tensor","charp" ], "variadic": true },
     { "name":"ggml_set_input",  "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
     { "name":"ggml_set_output", "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
     { "name":"ggml_set_param",  "ret":{ "kind":"void" }, "params":[ "ggml_tensor" ] },
@@ -198,6 +267,8 @@ let _C = ffiOpen({
     { "name":"ggml_div_inplace", "ret":"ggml_tensor", "params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
 
     # ======= Unary & activation =======
+    { "name":"ggml_dup",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
+    { "name":"ggml_dup_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
     { "name":"ggml_sqr",  "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
     { "name":"ggml_sqr_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
     { "name":"ggml_sqrt", "ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor" ] },
@@ -416,13 +487,13 @@ let _C = ffiOpen({
 
     { "name":"ggml_im2col_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i64","i32","i32","i32","i32","i32","i32","i32","i32","ggml_type" ] },
     { "name":"ggml_conv_3d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i64","i32","i32","i32","i32","i32","i32","i32","i32" ] },
-    { "name":"ggml_conv_3d_direct","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32","i32","i32","i32","i32","i32" ] },
+    { "name":"ggml_conv_3d_direct","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","i32","i32","i32","i32","i32" ] },
 
-    { "name":"ggml_pool_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] }, # op as i32 (enum)
+    { "name":"ggml_pool_1d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] },
     { "name":"ggml_pool_2d","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32","i32","f32","f32" ] },
     { "name":"ggml_pool_2d_back","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","i32","i32","i32","i32","i32","f32","f32" ] },
 
-    { "name":"ggml_upscale","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32" ] }, # mode as i32
+    { "name":"ggml_upscale","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32" ] },
     { "name":"ggml_interpolate","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i64","i64","i64","i64","u32" ] },
 
     { "name":"ggml_pad","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","i32","i32","i32","i32" ] },
@@ -454,16 +525,17 @@ let _C = ffiOpen({
     { "name":"ggml_graph_cpy",            "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_cgraph" ] },
     { "name":"ggml_graph_reset",          "ret":{ "kind":"void" }, "params":[ "ggml_cgraph" ] },
     { "name":"ggml_graph_clear",          "ret":{ "kind":"void" }, "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_n_nodes",        "ret":"i32", "params":[ "ggml_cgraph" ] },
     { "name":"ggml_graph_size",           "ret":"i32", "params":[ "ggml_cgraph" ] },
     { "name":"ggml_graph_node",           "ret":"ggml_tensor", "params":[ "ggml_cgraph","i32" ] },
-    { "name":"ggml_graph_nodes",          "ret":{ "kind":"pointer","to":"ggml_tensor" }, "params":[ "ggml_cgraph" ] },
+    { "name":"ggml_graph_nodes",          "ret":{ "kind":"pointer","to":{ "kind":"pointer","to":"ggml_tensor" } }, "params":[ "ggml_cgraph" ] },
     { "name":"ggml_graph_add_node",       "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_tensor" ] },
     { "name":"ggml_graph_overhead",       "ret":"size_t", "params":[] },
     { "name":"ggml_graph_overhead_custom","ret":"size_t", "params":[ "size_t","bool" ] },
 
-    { "name":"ggml_graph_get_tensor",     "ret":"ggml_tensor", "params":[ { "kind":"pointer","to":"ggml_cgraph" },"charp" ] },
-    { "name":"ggml_graph_get_grad",       "ret":"ggml_tensor", "params":[ { "kind":"pointer","to":"ggml_cgraph" },"ggml_tensor" ] },
-    { "name":"ggml_graph_get_grad_acc",   "ret":"ggml_tensor", "params":[ { "kind":"pointer","to":"ggml_cgraph" },"ggml_tensor" ] },
+    { "name":"ggml_graph_get_tensor",     "ret":"ggml_tensor", "params":[ "ggml_cgraph","charp" ] },
+    { "name":"ggml_graph_get_grad",       "ret":"ggml_tensor", "params":[ "ggml_cgraph","ggml_tensor" ] },
+    { "name":"ggml_graph_get_grad_acc",   "ret":"ggml_tensor", "params":[ "ggml_cgraph","ggml_tensor" ] },
 
     { "name":"ggml_graph_print",          "ret":{ "kind":"void" }, "params":[ "ggml_cgraph" ] },
     { "name":"ggml_graph_dump_dot",       "ret":{ "kind":"void" }, "params":[ "ggml_cgraph","ggml_cgraph","charp" ] },
@@ -471,21 +543,23 @@ let _C = ffiOpen({
     # Compute (returns ggml_status)
     { "name":"ggml_graph_compute_with_ctx","ret":"ggml_status", "params":[ "ggml_context","ggml_cgraph","i32" ] },
     { "name":"ggml_status_to_string",     "ret":"charp", "params":[ "ggml_status" ], "ret_as_str":true },
+    { "name":"ggml_print_object",          "ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":{ "kind":"void" } } ] },
+    { "name":"ggml_print_objects",         "ret":{ "kind":"void" }, "params":[ "ggml_context" ] },
 
     # Element get/set (f32)
     { "name":"ggml_set_f32_1d", "ret":{ "kind":"void" }, "params":[ "ggml_tensor","i32","f32" ] },
     { "name":"ggml_get_f32_1d", "ret":"f32", "params":[ "ggml_tensor","i32" ] },
 
     # ======= Custom ops =======
-    { "name":"ggml_map_custom1","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
-    { "name":"ggml_map_custom1_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
-    { "name":"ggml_map_custom2","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
-    { "name":"ggml_map_custom2_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
-    { "name":"ggml_map_custom3","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
-    { "name":"ggml_map_custom3_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_map_custom1","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_custom1_op_t","i32","voidp" ] },
+    { "name":"ggml_map_custom1_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_custom1_op_t","i32","voidp" ] },
+    { "name":"ggml_map_custom2","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_custom2_op_t","i32","voidp" ] },
+    { "name":"ggml_map_custom2_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_custom2_op_t","i32","voidp" ] },
+    { "name":"ggml_map_custom3","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_custom3_op_t","i32","voidp" ] },
+    { "name":"ggml_map_custom3_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor","ggml_tensor","ggml_custom3_op_t","i32","voidp" ] },
 
-    { "name":"ggml_custom_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_type","i64","i64","i64","i64",{ "kind":"pointer","to":"ggml_tensor" },"i32",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
-    { "name":"ggml_custom_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":"ggml_tensor" },"i32",{ "kind":"pointer","to":{ "kind":"void" } },"i32","voidp" ] },
+    { "name":"ggml_custom_4d","ret":"ggml_tensor","params":[ "ggml_context","ggml_type","i64","i64","i64","i64",{ "kind":"pointer","to":"ggml_tensor" },"i32","ggml_custom_op_t","i32","voidp" ] },
+    { "name":"ggml_custom_inplace","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor",{ "kind":"pointer","to":"ggml_tensor" },"i32","ggml_custom_op_t","i32","voidp" ] },
 
     # ======= Loss / Optimizers =======
     { "name":"ggml_cross_entropy_loss","ret":"ggml_tensor","params":[ "ggml_context","ggml_tensor","ggml_tensor" ] },
@@ -521,18 +595,17 @@ let _C = ffiOpen({
     { "name":"ggml_fp32_to_bf16_row","ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"f32" }, { "kind":"pointer","to":"ggml_bf16_t" }, "i64" ] },
 
     # ======= Type traits =======
-    { "name":"ggml_get_type_traits","ret":{ "kind":"pointer","to":{ "kind":"void" } }, "params":[ "ggml_type" ] },
+    { "name":"ggml_get_type_traits","ret":{ "kind":"pointer","to":"ggml_type_traits" }, "params":[ "ggml_type" ] },
 
     # ======= Logging / abort =======
     { "name":"ggml_log_set",           "ret":{ "kind":"void" }, "params":[ "ggml_log_cb", "voidp" ] },
     { "name":"ggml_set_abort_callback","ret":"ggml_abort_cb", "params":[ "ggml_abort_cb" ] },
+    { "name":"ggml_abort",             "ret":{ "kind":"void" }, "params":[ "charp","i32","charp" ], "variadic": true },
 
     # ======= Threadpool params =======
-    { "name":"ggml_threadpool_params_default","ret":{ "kind":"struct","fields":[
-        { "name":"cpumask0","type":"bool" },  # Placeholder: we only expose helper entrypoints (opaque use)
-      ] }, "params":[ "i32" ] }, # We don't use the returned struct directly; see note below.
-    { "name":"ggml_threadpool_params_init","ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":{ "kind":"void" } },"i32" ] },
-    { "name":"ggml_threadpool_params_match","ret":"bool", "params":[ { "kind":"pointer","to":{ "kind":"void" } }, { "kind":"pointer","to":{ "kind":"void" } } ] },
+    { "name":"ggml_threadpool_params_default", "ret":"ggml_threadpool_params", "params":[ "i32" ] },
+    { "name":"ggml_threadpool_params_init",    "ret":{ "kind":"void" }, "params":[ { "kind":"pointer","to":"ggml_threadpool_params" }, "i32" ] },
+    { "name":"ggml_threadpool_params_match",   "ret":"bool", "params":[ { "kind":"pointer","to":"ggml_threadpool_params" }, { "kind":"pointer","to":"ggml_threadpool_params" } ] },
 
     # ======= Misc =======
     { "name":"ggml_guid_matches","ret":"bool","params":[ { "kind":"pointer","to":{ "kind":"int","bits":8,"signed":false } }, { "kind":"pointer","to":{ "kind":"int","bits":8,"signed":false } } ] },
@@ -543,10 +616,10 @@ let _C = ffiOpen({
 # -------------------------
 # Public metadata & enums
 # -------------------------
-let version = "ggml@wrap-1.0.0"
+let version = "ggml@wrap-1.1.0"
 let close = _C.close
 
-# ggml_type (subset)
+# ggml_type (subset of current public enum)
 let TYPE_F32 = 0
 let TYPE_F16 = 1
 let TYPE_Q4_0 = 2
@@ -583,8 +656,26 @@ let SORT_DESC = 1
 let POOL_MAX = 0
 let POOL_AVG = 1
 
+# ggml_scale_mode and flags
+let SCALE_NEAREST  = 0
+let SCALE_BILINEAR = 1
+let SCALE_ALIGN_CORNERS = (1 << 8)
+
+# ggml_rope_type (modes)
+let ROPE_TYPE_NORMAL = 0
+let ROPE_TYPE_NEOX   = 2
+let ROPE_TYPE_MROPE  = 8
+let ROPE_TYPE_VISION = 24
+
+# ggml_sched_priority
+let SCHED_PRIO_LOW      = -1
+let SCHED_PRIO_NORMAL   = 0
+let SCHED_PRIO_MEDIUM   = 1
+let SCHED_PRIO_HIGH     = 2
+let SCHED_PRIO_REALTIME = 3
+
 # -------------------------
-# Raw aliases (few highlights; most are kept under _C.*)
+# Raw aliases (high-usage helpers)
 # -------------------------
 let versionStr = _C.ggml_version
 let commitStr  = _C.ggml_commit
@@ -596,6 +687,15 @@ let cycles     = _C.ggml_cycles
 let cyclesPerMs= _C.ggml_cycles_per_ms
 
 let statusStr  = _C.ggml_status_to_string
+let typeSize   = _C.ggml_type_size
+let typeSizef  = _C.ggml_type_sizef
+let isQuantized= _C.ggml_is_quantized
+let unaryOpName= _C.ggml_unary_op_name
+let gluOpName  = _C.ggml_glu_op_name
+let printObject= _C.ggml_print_object
+let printObjects= _C.ggml_print_objects
+let abortC     = _C.ggml_abort
+let getTypeTraits = _C.ggml_get_type_traits
 
 # Core ops (examples)
 let add = _C.ggml_add
@@ -643,6 +743,11 @@ let f32RowToBf16    = _C.ggml_fp32_to_bf16_row
 let logSet       = _C.ggml_log_set
 let setAbortCB   = _C.ggml_set_abort_callback
 
+# Threadpool params
+let threadpoolParamsDefault = _C.ggml_threadpool_params_default
+let threadpoolParamsInit    = _C.ggml_threadpool_params_init
+let threadpoolParamsMatch   = _C.ggml_threadpool_params_match
+
 # -------------------------
 # Helpers (handles only; no defaults)
 # -------------------------
@@ -686,7 +791,9 @@ end
 # Compute wrapper: returns struct-like record with status info.
 let compute = fun(ctx: Any, g: Any, nThreads: Int) -> { status: Int, ok: Bool, text: Str } do
   let st = _C.ggml_graph_compute_with_ctx(ctx, g, nThreads)
-  { status: st, ok: (st == STATUS_SUCCESS), text: _C.ggml_status_to_string(st) }
+  let s  = _C.ggml_status_to_string(st)
+  let txt = if s == null then "GGML status: (unknown)" else s end
+  { status: st, ok: (st == STATUS_SUCCESS), text: txt }
 end
 
 # Matmul precision helper (PREC_F32 is safer for some models)
@@ -702,3 +809,7 @@ end
 # 1D f32 element IO (native)
 let writeF32_1d = fun(t: Any, i: Int, value: Num) -> Void do _C.ggml_set_f32_1d(t, i, value) end
 let readF32_1d  = fun(t: Any, i: Int) -> Num do _C.ggml_get_f32_1d(t, i) end
+
+# dup helpers
+let dup        = _C.ggml_dup
+let dupInplace = _C.ggml_dup_inplace

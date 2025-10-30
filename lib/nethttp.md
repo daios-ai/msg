@@ -4,8 +4,6 @@ Build fast, streaming-friendly HTTP services in MindScript with a tiny, predicta
 
 You’ll start from “hello world,” then add validation, streaming, middleware, OpenAPI docs, a TCP server, and tests. Along the way you’ll learn how routing works, what contracts do, how the server behaves under edge cases, and how to structure an app you can ship.
 
----
-
 ## 0. What is `nethttp`?
 
 `nethttp` is three pieces that fit together:
@@ -30,7 +28,6 @@ Public surface (you’ll use these all manual long):
 `mwRecover()`, `mwRequestID(name)`, `mwTimeout(ms)`, `mwCors(opts)`, `mwAccessLog()`
 `serve(listener, router, opts)`, `shutdown(server, timeoutMs?)`
 
----
 
 ## 1. Your First Route
 
@@ -70,7 +67,6 @@ let _ = http.shutdown(srv, 0)
 
 > Tip: The router mounts **`GET /openapi.json`** automatically—use it to see what it inferred from your contracts. We’ll customize it later.
 
----
 
 ## 2. Contracts: Binding and Validation, Explained
 
@@ -91,7 +87,6 @@ http.contract({
 
 **Query arrays** are convenient: `?tag=a&tag=b` or `?tag=["a","b"]` both bind to `type { tag: [Str] }`. Scalars coerce from string or JSON scalar where sensible (`Int`, `Num`, `Bool`, `Str`).
 
----
 
 ## 3. Value vs Streaming: Pick the Right Tool
 
@@ -130,7 +125,6 @@ end)
 
 **HEAD on streaming:** not auto-supported. If a client sends `HEAD /ticks`, they’ll get **405** with `Allow: GET` unless you add an explicit HEAD route.
 
----
 
 ## 4. Middleware: Cross-cutting, Streaming-Safe
 
@@ -151,7 +145,6 @@ r.use(http.mwAccessLog())              # status/bytes/duration after response
 * With `credentials:true`, the middleware reflects the request `Origin` and sets `Vary: Origin`.
 * `OPTIONS` handling: for known path *shapes* the router returns **204**. If **any** middleware is installed, unknown shapes also get **204** (useful for generic preflights). With no middleware, unknown shapes return **404**.
 
----
 
 ## 5. Mounting: Compose Routers
 
@@ -170,7 +163,6 @@ root.mount("/v1", v1)   # GET /v1/ping
 
 The child router sees paths without the parent prefix; the outer middleware stack still applies.
 
----
 
 ## 6. Server: What the Wire Looks Like
 
@@ -208,7 +200,6 @@ let _ = http.shutdown(srv, 0)
 **Reason phrases** are clean (e.g., `422 Unprocessable Entity`, `302 Found`).
 **Date header** is off by default—toggle with `addDateHeader: true`.
 
----
 
 ## 7. OpenAPI: First-class, Auto-generated
 
@@ -242,7 +233,6 @@ What ends up in the document?
 
 This is a **full OpenAPI 3.1** doc—connect it to UI tooling, client generation, or validation pipelines.
 
----
 
 ## 8. Testing Without Sockets
 
@@ -265,7 +255,6 @@ let res2 = c.call({
 
 Use this for unit tests: deterministic, fast, and validates your contracts and middleware logic.
 
----
 
 ## 9. Building a Small Service (End-to-End)
 
@@ -361,7 +350,6 @@ What you get:
 * Access logs that summarize each request with duration and status.
 * A live **OpenAPI** endpoint your tools can consume.
 
----
 
 ## 10. Operational Notes (Deep Cuts)
 
@@ -371,7 +359,6 @@ What you get:
 * **Header safety**: CR/LF in header values → **400**. The server will bail out early instead of sending a poisoned response.
 * **Allow header**: when a path shape exists but the method doesn’t, the server replies **405** and lists permitted methods in `Allow`.
 
----
 
 ## 11. Troubleshooting
 
@@ -380,7 +367,6 @@ What you get:
 * *Why is my HEAD returning the whole body?* Ensure the route is a **value** route. Streaming routes don’t auto-support HEAD.
 * *Client uploads via TE: chunked fail.* Correct—unsupported by design. Send `Content-Length` and keep under `maxBodyBytes`.
 
----
 
 ## 12. Reference (for when you forget names)
 

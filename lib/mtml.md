@@ -1,10 +1,9 @@
+
 # MTML — A Gentle Guide
 
 MTML is a tiny, safe, HTML templating engine for MindScript. It aims for “less is more”: a short, ergonomic surface with strong defaults (context-aware autoescape, jailed loader, strict undefined) and a clear extension story (typed filters/helpers).
 
 This tutorial walks you from zero to productive in ~15 minutes.
-
----
 
 ## 1) What you get (and what you don’t)
 
@@ -23,8 +22,6 @@ This tutorial walks you from zero to productive in ~15 minutes.
 * `|safe` in templates (forbidden by policy)
 * Logic-heavy code inside templates (helpers/filters are allowed, mutation and side effects are not)
 * Interpolation in `style=` or event handler attributes (e.g., `onclick`)
-
----
 
 ## 2) Quick start
 
@@ -54,7 +51,6 @@ let t = mtml.load(e, "page.html")
 let html = mtml.render(e, t, { title: "Home" })
 ```
 
----
 
 ## 3) Interpolation & expressions
 
@@ -73,7 +69,6 @@ Examples:
 <p>{{ ('HI' if loud else 'hi') | lower }}</p>
 ```
 
----
 
 ## 4) Control flow
 
@@ -109,7 +104,6 @@ Map iteration:
 {% end %}
 ```
 
----
 
 ## 5) Includes, blocks, and layout inheritance
 
@@ -142,7 +136,6 @@ The `with` expression must evaluate to a **map**. It’s merged on top of the cu
 
 > MTML does full replacement of blocks (no `super()` by design).
 
----
 
 ## 6) Whitespace control
 
@@ -168,7 +161,6 @@ A
 XB
 ```
 
----
 
 ## 7) Safety model (read this!)
 
@@ -220,7 +212,6 @@ Template usage:
 <div>{{ snippet }}</div>  <!-- inserted verbatim; brand checked -->
 ```
 
----
 
 ## 8) Built-in filters
 
@@ -234,7 +225,6 @@ Template usage:
 * `tojson(x: Any) -> SafeHTML` (for `<script>`)
 * `url(u: Str) -> SafeURL?` (policy-checked)
 
----
 
 ## 9) Your own filters & helpers
 
@@ -273,7 +263,6 @@ let _ = mtml.registerHelper(e, "repeat", repeat)
 # Usage: {{ repeat("ha", 3) }}  => "hahaha"
 ```
 
----
 
 ## 10) Rendering APIs
 
@@ -293,7 +282,6 @@ if out == null then
 end
 ```
 
----
 
 ## 11) Project layout example
 
@@ -351,7 +339,6 @@ let data = {
 let html = mtml.render(e, t, data)
 ```
 
----
 
 ## 12) Common pitfalls & how to avoid them
 
@@ -364,7 +351,6 @@ let html = mtml.render(e, t, data)
 * **Unknown filter/helper names:** Make sure you `installBuiltins` or register your custom ones.
 * **Path escapes:** `{% include "../x.html" %}` → blocked by the loader jail.
 
----
 
 ## 13) FAQ
 
@@ -380,7 +366,6 @@ A: No. MTML favors full replacement for simplicity.
 **Q: Can I access globals?**
 A: Yes. Register them via `registerGlobal(e, "name", value)`. They merge into scope (locals win).
 
----
 
 ## 14) Cheatsheet
 
@@ -395,7 +380,6 @@ A: Yes. Register them via `registerGlobal(e, "name", value)`. They merge into sc
 * **URL attrs:** `{{ url | url }}` (or plain strings that pass policy)
 * **Built-ins:** `upper`, `lower`, `default`, `join`, `tojson`, `url`
 
----
 
 ## 15) Troubleshooting with diagnostics
 
@@ -410,6 +394,3 @@ On parse or render errors, MTML returns **annotated null** with messages like:
 
 Use these to jump straight to the offending spot.
 
----
-
-That’s it! With this small surface you can build clean, safe templates, and push complexity into typed filters/helpers where it belongs. If you’d like, I can add a few “exercise” templates (blog, dashboard card grid, email layout) to practice each feature.

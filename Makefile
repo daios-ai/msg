@@ -50,9 +50,6 @@ ifeq ($(UNAME_S),Darwin)
   export PKG_CONFIG_PATH ?= $(shell brew --prefix 2>/dev/null)/opt/libffi/lib/pkgconfig
 endif
 
-# Where libffi lives on the build host
-FFI_LIBDIR := $(shell pkg-config --variable=libdir libffi 2>/dev/null)
-
 # RPATH so binaries search ../lib next to themselves
 # NOTE: backslash escapes '$' for the shell so the linker sees literal $ORIGIN
 RPATH_LINUX := -Wl,-rpath,\$$ORIGIN/../lib
@@ -90,7 +87,14 @@ ifeq ($(UNAME_S),Linux)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
 	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
 	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
-	@if [ -n "$(FFI_LIBDIR)" ]; then cp -a "$(FFI_LIBDIR)"/libffi.so* $(LIB_DIR)/ 2>/dev/null || true; fi
+	@set -e; \
+	 CAND=$$(ldd $(BIN_DIR)/msg | awk '/libffi\.so/{print $$3; exit}'); \
+	 test -n "$$CAND"; \
+	 REAL=$$(readlink -f "$$CAND"); \
+	 BASENAME=$$(basename "$$REAL"); \
+	 cp -v "$$REAL" "$(LIB_DIR)/$$BASENAME"; \
+	 SONAME=$$(readelf -d "$$REAL" | awk '/SONAME/{gsub(/[\[\]]/,"");print $$5; exit}'); \
+	 [ -n "$$SONAME" ] && ln -sfn "$$BASENAME" "$(LIB_DIR)/$$SONAME" || true
 else ifeq ($(UNAME_S),Darwin)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
 	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
@@ -98,7 +102,12 @@ else ifeq ($(UNAME_S),Darwin)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
 	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
 	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
-	@if [ -n "$(FFI_LIBDIR)" ]; then cp -a "$(FFI_LIBDIR)"/libffi*.dylib $(LIB_DIR)/ 2>/dev/null || true; fi
+	@set -e; \
+	 LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1; exit}'); \
+	 BASE=$$(basename "$$LIB"); cp -av "$$LIB" "$(LIB_DIR)/"; \
+	 install_name_tool -id "@loader_path/../lib/$$BASE" "$(LIB_DIR)/$$BASE"; \
+	 for B in $(BIN_DIR)/msg $(BIN_DIR)/msg-lsp; do \
+	   install_name_tool -change "$$LIB" "@loader_path/../lib/$$BASE" $$B; done
 endif
 	@test -d lib      && cp -R lib      $(ROOT)/ || true
 	@test -d examples && cp -R examples $(ROOT)/ || true

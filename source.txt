@@ -255,6 +255,14 @@ jobs:
         run: |
           make clean
           make
+      - name: Verify rpath + bundled lib (Linux)
+        run: |
+          set -euo pipefail
+          ls -l dist/mindscript/lib | grep -E 'libffi\.so'
+          readelf -d dist/mindscript/bin/msg      | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
+          readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
+          ldd dist/mindscript/bin/msg     | grep libffi
+          ldd dist/mindscript/bin/msg-lsp | grep libffi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -280,6 +288,14 @@ jobs:
         run: |
           make clean
           make
+      - name: Verify rpath + bundled lib (Linux)
+        run: |
+          set -euo pipefail
+          ls -l dist/mindscript/lib | grep -E 'libffi\.so'
+          readelf -d dist/mindscript/bin/msg      | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
+          readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
+          ldd dist/mindscript/bin/msg     | grep libffi
+          ldd dist/mindscript/bin/msg-lsp | grep libffi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -308,6 +324,14 @@ jobs:
         run: |
           make clean
           make
+      - name: Verify rpath + bundled lib (macOS)
+        run: |
+          set -euo pipefail
+          ls -l dist/mindscript/lib | grep -E 'libffi.*\.dylib'
+          otool -l dist/mindscript/bin/msg     | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
+          otool -l dist/mindscript/bin/msg-lsp | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
+          otool -L dist/mindscript/bin/msg     | grep -E 'libffi.*\.dylib'
+          otool -L dist/mindscript/bin/msg-lsp | grep -E 'libffi.*\.dylib'
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -384,6 +408,7 @@ VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo 0.0.0)
 DIST_DIR := dist
 ROOT     := $(DIST_DIR)/mindscript
 BIN_DIR  := $(ROOT)/bin
+LIB_DIR  := $(ROOT)/lib
 
 # --- CGO + libffi ---
 export CGO_ENABLED := 1
@@ -391,6 +416,11 @@ export CGO_ENABLED := 1
 ifeq ($(UNAME_S),Darwin)
   export PKG_CONFIG_PATH ?= $(shell brew --prefix 2>/dev/null)/opt/libffi/lib/pkgconfig
 endif
+
+# RPATH so binaries search ../lib next to themselves
+# NOTE: backslash escapes '$' for the shell so the linker sees literal $ORIGIN
+RPATH_LINUX := -Wl,-rpath,\$$ORIGIN/../lib
+RPATH_MACOS := -Wl,-rpath,@loader_path/../lib
 
 # --- checksum tool ---
 ifeq ($(UNAME_S),Darwin)
@@ -416,9 +446,33 @@ check-deps:
 
 build:
 	@rm -rf $(ROOT)
-	@mkdir -p $(BIN_DIR)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/msg     ./cmd/msg
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@mkdir -p $(BIN_DIR) $(LIB_DIR)
+ifeq ($(UNAME_S),Linux)
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
+	 -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
+	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@set -e; \
+	 LIB=$$(ldd $(BIN_DIR)/msg | awk '/libffi\.so/{print $$3; exit}'); \
+	 test -n "$$LIB"; cp -av "$$LIB" "$(LIB_DIR)/"; \
+	 SONAME=$$(readelf -d "$$LIB" | awk '/SONAME/{gsub(/[\[\]]/,"");print $$5; exit}'); \
+	 [ -n "$$SONAME" ] && ln -sf "$$(basename "$$LIB")" "$(LIB_DIR)/$$SONAME" || true
+else ifeq ($(UNAME_S),Darwin)
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
+	 -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
+	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@set -e; \
+	 LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1; exit}'); \
+	 BASE=$$(basename "$$LIB"); cp -av "$$LIB" "$(LIB_DIR)/"; \
+	 install_name_tool -id "@loader_path/../lib/$$BASE" "$(LIB_DIR)/$$BASE"; \
+	 for B in $(BIN_DIR)/msg $(BIN_DIR)/msg-lsp; do \
+	   install_name_tool -change "$$LIB" "@loader_path/../lib/$$BASE" $$B; done
+endif
 	@test -d lib      && cp -R lib      $(ROOT)/ || true
 	@test -d examples && cp -R examples $(ROOT)/ || true
 	@test -d docs     && cp -R docs     $(ROOT)/ || true

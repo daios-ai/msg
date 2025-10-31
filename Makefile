@@ -103,7 +103,8 @@ else ifeq ($(UNAME_S),Darwin)
 	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
 	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
 	@set -e; \
-	 LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1; exit}'); \
+	 LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1}' | grep -v '^/usr/lib/' | head -n1); \
+	 [ -n "$$LIB" ] || LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1; exit}'); \
 	 BASE=$$(basename "$$LIB"); cp -av "$$LIB" "$(LIB_DIR)/"; \
 	 install_name_tool -id "@loader_path/../lib/$$BASE" "$(LIB_DIR)/$$BASE"; \
 	 for B in $(BIN_DIR)/msg $(BIN_DIR)/msg-lsp; do \

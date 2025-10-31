@@ -455,10 +455,13 @@ ifeq ($(UNAME_S),Linux)
 	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
 	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
 	@set -e; \
-	 LIB=$$(ldd $(BIN_DIR)/msg | awk '/libffi\.so/{print $$3; exit}'); \
-	 test -n "$$LIB"; cp -av "$$LIB" "$(LIB_DIR)/"; \
-	 SONAME=$$(readelf -d "$$LIB" | awk '/SONAME/{gsub(/[\[\]]/,"");print $$5; exit}'); \
-	 [ -n "$$SONAME" ] && ln -sf "$$(basename "$$LIB")" "$(LIB_DIR)/$$SONAME" || true
+	 CAND=$$(ldd $(BIN_DIR)/msg | awk '/libffi\.so/{print $$3; exit}'); \
+	 test -n "$$CAND"; \
+	 REAL=$$(readlink -f "$$CAND"); \
+	 BASENAME=$$(basename "$$REAL"); \
+	 cp -v "$$REAL" "$(LIB_DIR)/$$BASENAME"; \
+	 SONAME=$$(readelf -d "$$REAL" | awk '/SONAME/{gsub(/[\[\]]/,"");print $$5; exit}'); \
+	 [ -n "$$SONAME" ] && ln -sfn "$$BASENAME" "$(LIB_DIR)/$$SONAME" || true
 else ifeq ($(UNAME_S),Darwin)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
 	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
@@ -467,7 +470,8 @@ else ifeq ($(UNAME_S),Darwin)
 	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
 	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
 	@set -e; \
-	 LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1; exit}'); \
+	 LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1}' | grep -v '^/usr/lib/' | head -n1); \
+	 [ -n "$$LIB" ] || LIB=$$(otool -L $(BIN_DIR)/msg | awk '/libffi.*dylib/{print $$1; exit}'); \
 	 BASE=$$(basename "$$LIB"); cp -av "$$LIB" "$(LIB_DIR)/"; \
 	 install_name_tool -id "@loader_path/../lib/$$BASE" "$(LIB_DIR)/$$BASE"; \
 	 for B in $(BIN_DIR)/msg $(BIN_DIR)/msg-lsp; do \

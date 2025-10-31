@@ -24,18 +24,14 @@ clean_rc() {
   local rcfile="$1"
   [[ -f "$rcfile" ]] || return 0
   cp -p "$rcfile" "${rcfile}.bak-$(date +%Y%m%d%H%M%S)"
-  # Remove legacy MSGPATH lines and PATH entries pointing at ~/.mindscript/bin
+  # Remove PATH entries pointing at ~/.mindscript/bin
   # Works on both macOS (BSD sed) and Linux (GNU sed)
   if sed -E -i '' \
-      -e '/MSGPATH=.*\.mindscript/d' \
-      -e '/\$MSGPATH\/bin/d' \
       -e '/\.mindscript\/bin/d' \
       "$rcfile" 2>/dev/null; then
     :
   else
     sed -E -i \
-      -e '/MSGPATH=.*\.mindscript/d' \
-      -e '/\$MSGPATH\/bin/d' \
       -e '/\.mindscript\/bin/d' \
       "$rcfile"
   fi

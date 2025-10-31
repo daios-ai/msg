@@ -142,6 +142,7 @@ endif
 # --- tests ---
 test-go:
 	@echo "Running Go tests..."
+	@mkdir -p bin
 	MSGPATH=$(PWD) go test -v ./internal/mindscript
 	MSGPATH=$(PWD) go test -v ./cmd/msg-lsp
 

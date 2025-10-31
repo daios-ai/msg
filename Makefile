@@ -1,3 +1,28 @@
+# MindScript packaging notes (WHY this Makefile is structured this way)
+# --------------------------------------------------------------------
+# Problem:
+# - We must ensure the binaries always use the bundled libffi (in mindscript/lib) rather than
+#   whatever is installed on a user’s system.
+# - macOS and Linux behave differently:
+#   • macOS binaries record a dylib’s “install name”. If that points to a Homebrew path, things
+#     can break when Homebrew updates or moves files. Discovering/copying *after* build was brittle.
+#   • Linux resolves .so files from filesystem search paths, and distros place libffi.so.N in
+#     different locations (/usr/lib/x86_64-linux-gnu, /usr/lib64, etc.), so guessing one path can fail.
+#
+# Fix (combined strategy):
+# - We set RPATH so binaries look in ../lib relative to themselves at runtime.
+# - macOS: Always pre-vendor. Copy libffi*.dylib into repo ./lib and set its install name to
+#   @loader_path/../lib/<file>. Build against that vendored copy, and ship the same file.
+# - Linux: Prefer pre-vendor. Try to find libffi.so.* up front (pkg-config + common multi-arch
+#   dirs), copy the real file into repo ./lib and create a SONAME symlink; build against it.
+#   If pre-vendoring isn’t possible, fall back *after* build: use ldd on the built binary to
+#   discover the actual resolved libffi path, then copy that exact file (plus SONAME symlink)
+#   into dist/mindscript/lib.
+# Result:
+# - macOS gets a stable, bundle-relative install name we control.
+# - Linux remains resilient to distro layout differences while still shipping the exact .so that
+#   satisfies the binary’s NEEDED entry.
+#
 # Minimal MindScript Makefile (auto-detects host OS/arch and builds that one)
 # Targets:
 #   make            → build + package for the current machine

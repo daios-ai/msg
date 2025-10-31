@@ -54,7 +54,8 @@ endif
 FFI_LIBDIR := $(shell pkg-config --variable=libdir libffi 2>/dev/null)
 
 # RPATH so binaries search ../lib next to themselves
-RPATH_LINUX := -Wl,-rpath,$$ORIGIN/../lib
+# NOTE: backslash escapes '$' for the shell so the linker sees literal $ORIGIN
+RPATH_LINUX := -Wl,-rpath,\$$ORIGIN/../lib
 RPATH_MACOS := -Wl,-rpath,@loader_path/../lib
 
 # --- checksum tool ---

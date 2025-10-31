@@ -141,9 +141,9 @@ endif
 
 # --- tests ---
 test-go:
-	@echo "Running Go tests (MSGPATH=repo root)..."
-	MSGPATH=$(shell pwd) go test -v ./internal/mindscript
-	MSGPATH=$(shell pwd) go test -v ./cmd/msg-lsp
+	@echo "Running Go tests..."
+	MSGPATH=$(PWD) go test -v ./internal/mindscript
+	MSGPATH=$(PWD) go test -v ./cmd/msg-lsp
 
 test-ms:
 	@echo "Running MindScript stdlib tests with staged binary..."

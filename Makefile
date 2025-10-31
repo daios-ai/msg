@@ -90,8 +90,8 @@ else
 endif
 
 # --- default ---
-.PHONY: all build package clean print check-deps vendor-libffi
-all: print check-deps vendor-libffi build package
+.PHONY: all build package clean print check-deps vendor-libffi test-go test-ms
+all: print check-deps vendor-libffi test-go build test-ms package
 
 print:
 	@echo "Building for: GOOS=$(GOOS) GOARCH=$(GOARCH)  VERSION=$(VERSION)"
@@ -138,6 +138,16 @@ else ifeq ($(UNAME_S),Darwin)
 	install_name_tool -id "@loader_path/../lib/$$BASE" "$(VENDOR_LIB_DIR)/$$BASE"; \
 	echo "Vendored macOS libffi: $(VENDOR_LIB_DIR)/$$BASE (id set to @loader_path/../lib/$$BASE)"
 endif
+
+# --- tests ---
+test-go:
+	@echo "Running Go tests..."
+	go test -v ./internal/mindscript
+	go test -v ./cmd/msg-lsp
+
+test-ms:
+	@echo "Running MindScript stdlib tests with staged binary..."
+	MSGPATH=$(ROOT) $(BIN_DIR)/msg test lib -v
 
 build:
 	@rm -rf $(ROOT)

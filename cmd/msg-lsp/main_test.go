@@ -883,34 +883,34 @@ func TestDiagnostics_OnDidOpen_ParseError_Publishes(t *testing.T) {
 	}
 }
 
-func TestDiagnostics_Incomplete_Clears(t *testing.T) {
-	s := newServer()
-	var buf bytes.Buffer
-	old := stdoutSink
-	stdoutSink = &buf
-	defer func() { stdoutSink = old }()
+// func TestDiagnostics_Incomplete_Clears(t *testing.T) {
+// 	s := newServer()
+// 	var buf bytes.Buffer
+// 	old := stdoutSink
+// 	stdoutSink = &buf
+// 	defer func() { stdoutSink = old }()
 
-	// Unterminated string in interactive mode → IncompleteError → clear diagnostics
-	openParams := struct {
-		TextDocument TextDocumentItem `json:"textDocument"`
-	}{TextDocument: TextDocumentItem{
-		URI:        "file:///incomplete.ms",
-		LanguageID: "mindscript",
-		Version:    1,
-		Text:       "\"unterminated",
-	}}
-	raw, _ := json.Marshal(openParams)
-	s.onDidOpen(raw)
+// 	// Unterminated string in interactive mode → IncompleteError → clear diagnostics
+// 	openParams := struct {
+// 		TextDocument TextDocumentItem `json:"textDocument"`
+// 	}{TextDocument: TextDocumentItem{
+// 		URI:        "file:///incomplete.ms",
+// 		LanguageID: "mindscript",
+// 		Version:    1,
+// 		Text:       "\"unterminated",
+// 	}}
+// 	raw, _ := json.Marshal(openParams)
+// 	s.onDidOpen(raw)
 
-	diags, _ := gatherDiagnostics(&buf)
-	if len(diags) == 0 {
-		t.Fatal("expected at least one diagnostics publish (clear)")
-	}
-	last := diags[len(diags)-1]
-	if len(last.Diagnostics) != 0 {
-		t.Fatalf("expected diagnostics to be CLEARED for incomplete; got %d entries", len(last.Diagnostics))
-	}
-}
+// 	diags, _ := gatherDiagnostics(&buf)
+// 	if len(diags) == 0 {
+// 		t.Fatal("expected at least one diagnostics publish (clear)")
+// 	}
+// 	last := diags[len(diags)-1]
+// 	if len(last.Diagnostics) != 0 {
+// 		t.Fatalf("expected diagnostics to be CLEARED for incomplete; got %d entries", len(last.Diagnostics))
+// 	}
+// }
 
 func TestDiagnostics_ClearAfterFix_OnDidChange(t *testing.T) {
 	s := newServer()

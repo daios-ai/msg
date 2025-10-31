@@ -1,557 +1,2115 @@
-=== BEGIN FILE: install.sh ===
-#!/usr/bin/env bash
-set -euo pipefail
+=== BEGIN FILE: cmd/msg-lsp/core.go ===
+// cmd/lsp/core.go
+//
+// ROLE: Shared infrastructure for the LSP server: transport helpers, server
+//       state, text/position math, diagnostics, token/span utilities, and the
+//       analysis pipeline (lex + parse + symbol extraction).
+//
+// What lives here
+//   • Transport helpers for framed stdio (Content-Length) and convenience
+//     send/notify wrappers (used by handlers).
+//   • Server model:
+//        - server: global state (open docs, mutex, interpreter handle).
+//        - docState: per-document caches (raw text, line starts, tokens, AST,
+//          span index, lightweight symbol table).
+//   • Unicode/UTF-16 column math and byte↔position conversions consistent with
+//     the LSP spec (positions are UTF-16 code units).
+//   • Diagnostics plumbing: mapping lexer/parser errors to LSP ranges and
+//     publishing them, including “incomplete” heuristics for on-type feedback.
+//   • Token & span helpers: locate tokens at offsets, compute exact byte spans,
+//     comment/annotation region detection for semantic tokens & folding.
+//   • Analysis pipeline (`analyze`):
+//        1) Lex (interactive), 2) Parse (interactive), 3) Collect top-level
+//           symbols (no code execution), 4) Publish/clear diagnostics.
+//     Results populate docState so feature handlers can be fast and side-effect-free.
+//
+// What does NOT live here
+//   • No LSP feature handlers themselves (hover, completion, etc.).
+//   • No business rules about how to format responses—handlers own that.
+//   • No interpreter-driven execution of user code. (We only build tokens/AST
+//     and extract symbols; see features.go for the optional, guarded lookup of
+//     global/builtin metadata.)
+//
+// Why this separation
+//   • Centralizes shared mechanics so features stay small and consistent.
+//   • Makes unit testing of text math and analysis independent of UI features.
+//
+// Dependencies
+//   • Relies on internal/mindscript lexer & parser (no VM/interpreter internals).
+//   • Holds an *Interpreter pointer only for feature-level metadata queries;
+//     core analysis itself does not execute user programs.
 
-# -----------------------------
-# Config
-# -----------------------------
-APP_NAME="mindscript"
-BIN1="msg"
-BIN2="msg-lsp"
-INSTALL_DIR="${HOME}/.mindscript"
+// cmd/lsp/core.go
+package main
 
-# Online source (works if repo is public)
-# - "latest" uses GitHub's latest/download endpoint (no latest.txt needed)
-VERSION="${VERSION:-latest}"
-BASE_URL_LATEST="https://github.com/DAIOS-AI/msg/releases/latest/download"
-BASE_URL_TAGGED="https://github.com/DAIOS-AI/msg/releases/download"
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"unicode/utf8"
 
-# -----------------------------
-# Args: --local [dir]
-# -----------------------------
-LOCAL_DIR=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --local)
-      # optional argument: if the next token is missing or starts with '-', use '.'
-      if [[ $# -ge 2 && "${2:0:1}" != "-" ]]; then
-        LOCAL_DIR="$2"; shift 2
-      else
-        LOCAL_DIR="."; shift 1
-      fi
-      ;;
-    --version)  # optional convenience (ENV VERSION also works)
-      VERSION="$2"; shift 2;;
-    *)
-      echo "Unknown option: $1"
-      echo "Usage: $0 [--local [dir]] [--version vX.Y.Z]"
-      exit 1;;
-  esac
-done
+	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+)
 
-# -----------------------------
-# Detect OS/arch → tarball name
-# -----------------------------
-os="$(uname -s)"
-arch="$(uname -m)"
+////////////////////////////////////////////////////////////////////////////////
+// Transport (stdio framing) + send/notify
+////////////////////////////////////////////////////////////////////////////////
 
-case "$os" in
-  Darwin) osn="macos" ;;
-  Linux)  osn="linux" ;;
-  *) echo "Unsupported OS: $os"; exit 1 ;;
-esac
+var stdoutSink io.Writer = os.Stdout
 
-case "$arch" in
-  x86_64)            archn="x86_64" ;;
-  aarch64|arm64)     archn="arm64"  ;;
-  *) echo "Unsupported arch: $arch"; exit 1 ;;
-esac
-
-TAR="${APP_NAME}-${osn}-${archn}.tar.gz"
-SHA="${TAR}.sha256"
-
-# -----------------------------
-# Try online first, else local
-# -----------------------------
-tmp="$(mktemp -d)"
-cleanup() { rm -rf "$tmp"; }
-trap cleanup EXIT
-
-download_failed=false
-if [[ -z "$LOCAL_DIR" ]]; then
-  echo "→ Attempting online download: ${TAR} (VERSION=${VERSION})"
-  if [[ "$VERSION" == "latest" ]]; then
-    CURL_URL_TAR="${BASE_URL_LATEST}/${TAR}"
-    CURL_URL_SHA="${BASE_URL_LATEST}/${SHA}"
-  else
-    CURL_URL_TAR="${BASE_URL_TAGGED}/${VERSION}/${TAR}"
-    CURL_URL_SHA="${BASE_URL_TAGGED}/${VERSION}/${SHA}"
-  fi
-  set +e
-  curl -fL --retry 2 -o "${tmp}/${TAR}" "${CURL_URL_TAR}"
-  rc1=$?
-  curl -fL --retry 2 -o "${tmp}/${SHA}" "${CURL_URL_SHA}"
-  rc2=$?
-  set -e
-  if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
-    echo "WARNING: Online download unavailable. Falling back to local artifacts."
-    download_failed=true
-  else
-    SRC_TAR="${tmp}/${TAR}"
-    SRC_SHA="${tmp}/${SHA}"
-  fi
-fi
-
-# Local fallback (explicit --local or after download failure)
-if [[ -n "$LOCAL_DIR" || "$download_failed" == "true" ]]; then
-  # default dir is '.' if --local had no argument; if no --local provided and failed, also use '.'
-  FALLBACK_DIR="${LOCAL_DIR:-.}"
-  SRC_TAR="${FALLBACK_DIR}/${TAR}"
-  SRC_SHA="${FALLBACK_DIR}/${SHA}"
-  [[ -f "$SRC_TAR" ]] || { echo "Missing local tarball: $SRC_TAR"; exit 1; }
-  if [[ ! -f "$SRC_SHA" ]]; then
-    echo "WARNING: Checksum not found at $SRC_SHA; proceeding without verification."
-    SRC_SHA=""
-  fi
-fi
-
-# -----------------------------
-# Verify checksum (if present)
-# -----------------------------
-if [[ -n "${SRC_SHA:-}" && -f "$SRC_SHA" ]]; then
-  echo "→ Verifying checksum"
-  ( cd "$(dirname "$SRC_TAR")"
-    if command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 -c "$(basename "$SRC_SHA")"
-    else
-      sha256sum -c "$(basename "$SRC_SHA")"
-    fi
-  )
-fi
-
-# -----------------------------
-# Install
-# -----------------------------
-echo "→ Installing to $INSTALL_DIR"
-work="${tmp}/unpack"
-mkdir -p "$work"
-tar -C "$work" -xzf "$SRC_TAR"
-
-# tar should contain a top-level 'mindscript/' directory
-if [[ -d "${work}/${APP_NAME}" ]]; then
-  rm -rf "$INSTALL_DIR"
-  mv "${work}/${APP_NAME}" "$INSTALL_DIR"
-else
-  echo "Archive format unexpected (no '${APP_NAME}/' dir)."
-  exit 1
-fi
-
-# Ensure binaries exist
-[[ -x "${INSTALL_DIR}/bin/${BIN1}" ]] || { echo "Missing ${BIN1} in bin/"; exit 1; }
-[[ -x "${INSTALL_DIR}/bin/${BIN2}" ]] || { echo "Missing ${BIN2} in bin/"; exit 1; }
-
-# -----------------------------
-# Shell profile setup (bash/zsh + fish)
-# -----------------------------
-SNIPPET='case ":$PATH:" in *":$HOME/.mindscript/bin:"*) ;; *) export PATH="$HOME/.mindscript/bin:$PATH";; esac'
-
-for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-  if [[ -f "$rc" ]]; then
-    grep -q '\.mindscript/bin' "$rc" 2>/dev/null || printf '\n%s\n' "$SNIPPET" >> "$rc"
-  fi
-done
-
-if [[ -d "$HOME/.config/fish/conf.d" ]]; then
-  # Overwrite/update fish snippet with PATH-only addition
-  printf 'set -gx PATH "%s/bin" $PATH\n' "$INSTALL_DIR" > "$HOME/.config/fish/conf.d/mindscript.fish"
-fi
-
-echo "OK: Installed. Open a new terminal or run:  source ~/.bashrc   (or ~/.zshrc)"
-"${INSTALL_DIR}/bin/${BIN1}" --version || true
-=== END FILE: install.sh ===
-
-=== BEGIN FILE: uninstall.sh ===
-#!/usr/bin/env bash
-set -euo pipefail
-
-INSTALL_DIR="${HOME}/.mindscript"
-YES=0
-
-# Parse args
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --yes|-y) YES=1; shift ;;
-    *) echo "Unknown option: $1"; echo "Usage: $0 [--yes]"; exit 1 ;;
-  esac
-done
-
-echo "MindScript uninstaller"
-echo "Target install dir: $INSTALL_DIR"
-if [[ $YES -ne 1 ]]; then
-  read -r -p "This will remove MindScript and update your shell config files. Continue? [y/N] " ans
-  case "${ans:-}" in [yY][eE][sS]|[yY]) ;; *) echo "Aborted."; exit 0;; esac
-fi
-
-# Helper: clean a shell rc file (bash/zsh)
-clean_rc() {
-  local rcfile="$1"
-  [[ -f "$rcfile" ]] || return 0
-  cp -p "$rcfile" "${rcfile}.bak-$(date +%Y%m%d%H%M%S)"
-  # Remove PATH entries pointing at ~/.mindscript/bin
-  # Works on both macOS (BSD sed) and Linux (GNU sed)
-  if sed -E -i '' \
-      -e '/\.mindscript\/bin/d' \
-      "$rcfile" 2>/dev/null; then
-    :
-  else
-    sed -E -i \
-      -e '/\.mindscript\/bin/d' \
-      "$rcfile"
-  fi
+func init() {
+	// Silence unsolicited output during `go test` unless opted in.
+	if strings.HasSuffix(os.Args[0], ".test") && os.Getenv("LSP_STDOUT") == "" {
+		stdoutSink = io.Discard
+	}
 }
 
-# 1) Remove install dir
-if [[ -d "$INSTALL_DIR" ]]; then
-  rm -rf "$INSTALL_DIR"
-  echo "✔ Removed $INSTALL_DIR"
-else
-  echo "WARNING: Install directory not found; skipping: $INSTALL_DIR"
-fi
+func readMsg(r *bufio.Reader) ([]byte, error) {
+	var contentLen int
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		if i := strings.IndexByte(line, ':'); i >= 0 {
+			key := strings.ToLower(strings.TrimSpace(line[:i]))
+			val := strings.TrimSpace(line[i+1:])
+			if key == "content-length" {
+				_, _ = fmt.Sscanf(val, "%d", &contentLen)
+			}
+		}
+	}
+	if contentLen <= 0 {
+		return nil, io.EOF
+	}
+	buf := make([]byte, contentLen)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
 
-# 2) Clean bash/zsh profiles
-clean_rc "$HOME/.bashrc"
-clean_rc "$HOME/.zshrc"
+func writeMsg(w io.Writer, v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
+	b.Write(body)
+	_, err = w.Write(b.Bytes())
+	return err
+}
 
-# 3) Remove fish snippet
-FISH_SNIPPET="$HOME/.config/fish/conf.d/mindscript.fish"
-if [[ -f "$FISH_SNIPPET" ]]; then
-  rm -f "$FISH_SNIPPET"
-  echo "OK: Removed $FISH_SNIPPET"
-fi
+func (s *server) sendResponse(id json.RawMessage, result any, respErr *ResponseError) {
+	if respErr == nil && result == nil {
+		rawNull := json.RawMessage([]byte("null"))
+		_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: rawNull})
+		return
+	}
+	_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: result, Error: respErr})
+}
 
-# 4) Final message
-echo "OK: Uninstall complete."
-echo "• Backups of modified files (if any) are saved as *.bak-<timestamp>."
-echo "• Open a new terminal or reload your shell config (e.g., 'source ~/.bashrc')."
-echo "• If 'msg' still resolves, your shell session may still have old PATH values cached."
-=== END FILE: uninstall.sh ===
+func (s *server) notify(method string, params any) {
+	_ = writeMsg(stdoutSink, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	})
+}
 
-=== BEGIN FILE: .github/workflows/release.yml ===
-name: Build & Release MindScript
+////////////////////////////////////////////////////////////////////////////////
+// Server state & document model
+////////////////////////////////////////////////////////////////////////////////
 
-on:
-  push:
-    tags: ["v*.*.*"]     # tag like v0.3.0 to trigger a release build
-  workflow_dispatch:
+type symbolDef struct {
+	Name  string
+	Kind  string // "let" | "fun" | "type"
+	Range Range  // where it's declared
+	Doc   string // first line, if available
+	Sig   string // pretty signature for fun/oracle
+}
 
-permissions:
-  contents: write        # needed to create/upload the GitHub Release
+type docState struct {
+	uri     string
+	text    string
+	lines   []int // line start offsets (byte indices)
+	symbols []symbolDef
+	tokens  []mindscript.Token
+	ast     mindscript.S
+	spans   *mindscript.SpanIndex
+}
 
-jobs:
-  linux-amd64:
-    name: Linux x86_64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-          cache: true
-      - name: Install deps (libffi)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libffi-dev
-      - name: Build + package (host-only)
-        run: |
-          make clean
-          make
-      - name: Verify rpath + bundled lib (Linux)
-        run: |
-          set -euo pipefail
-          ls -l dist/mindscript/lib | grep -E 'libffi\.so'
-          readelf -d dist/mindscript/bin/msg      | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
-          readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
-          ldd dist/mindscript/bin/msg     | grep libffi
-          ldd dist/mindscript/bin/msg-lsp | grep libffi
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-x86_64
-          path: |
-            mindscript-linux-x86_64.tar.gz
-            mindscript-linux-x86_64.tar.gz.sha256
+type server struct {
+	mu   sync.RWMutex
+	docs map[string]*docState
+	ip   *mindscript.Interpreter
+}
 
-  linux-arm64:
-    name: Raspberry Pi (Linux arm64)
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-          cache: true
-      - name: Install deps (libffi)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libffi-dev
-      - name: Build + package (host-only)
-        run: |
-          make clean
-          make
-      - name: Verify rpath + bundled lib (Linux)
-        run: |
-          set -euo pipefail
-          ls -l dist/mindscript/lib | grep -E 'libffi\.so'
-          readelf -d dist/mindscript/bin/msg      | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
-          readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
-          ldd dist/mindscript/bin/msg     | grep libffi
-          ldd dist/mindscript/bin/msg-lsp | grep libffi
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-arm64
-          path: |
-            mindscript-linux-arm64.tar.gz
-            mindscript-linux-arm64.tar.gz.sha256
+func newServer() *server {
+	ip, _ := mindscript.NewInterpreter()
+	return &server{
+		docs: make(map[string]*docState),
+		ip:   ip,
+	}
+}
 
-  macos-arm64:
-    name: macOS (Apple Silicon)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-          cache: true
-      - name: Install deps (libffi)
-        run: |
-          brew update
-          brew install libffi pkg-config
-      - name: Build + package (host-only)
-        env:
-          # Makefile already sets PKG_CONFIG_PATH, but keep env visible for clarity.
-          PKG_CONFIG_PATH: "$(brew --prefix)/opt/libffi/lib/pkgconfig"
-        run: |
-          make clean
-          make
-      - name: Verify rpath + bundled lib (macOS)
-        run: |
-          set -euo pipefail
-          ls -l dist/mindscript/lib | grep -E 'libffi.*\.dylib'
-          otool -l dist/mindscript/bin/msg     | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
-          otool -l dist/mindscript/bin/msg-lsp | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
-          otool -L dist/mindscript/bin/msg     | grep -E 'libffi.*\.dylib'
-          otool -L dist/mindscript/bin/msg-lsp | grep -E 'libffi.*\.dylib'
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-arm64
-          path: |
-            mindscript-macos-arm64.tar.gz
-            mindscript-macos-arm64.tar.gz.sha256
+// snapshotDoc returns a consistent, read-only snapshot of a document.
+func (s *server) snapshotDoc(uri string) *docState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d := s.docs[uri]
+	if d == nil {
+		return nil
+	}
+	cp := *d // shallow copy
+	if d.lines != nil {
+		cp.lines = append([]int(nil), d.lines...)
+	}
+	if d.tokens != nil {
+		cp.tokens = append([]mindscript.Token(nil), d.tokens...)
+	}
+	if d.symbols != nil {
+		cp.symbols = append([]symbolDef(nil), d.symbols...)
+	}
+	// ast/spans are immutable enough to share (spans is read-only).
+	cp.ast = d.ast
+	cp.spans = d.spans
+	return &cp
+}
 
-  release:
-    name: Create GitHub Release
-    if: github.ref_type == 'tag'
-    needs: [linux-amd64, linux-arm64, macos-arm64]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-      - name: Create Release and upload assets
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          prerelease: false
-          files: |
-            dist/linux-x86_64/mindscript-linux-x86_64.tar.gz
-            dist/linux-x86_64/mindscript-linux-x86_64.tar.gz.sha256
-            dist/linux-arm64/mindscript-linux-arm64.tar.gz
-            dist/linux-arm64/mindscript-linux-arm64.tar.gz.sha256
-            dist/macos-arm64/mindscript-macos-arm64.tar.gz
-            dist/macos-arm64/mindscript-macos-arm64.tar.gz.sha256
-=== END FILE: .github/workflows/release.yml ===
+////////////////////////////////////////////////////////////////////////////////
+// Text & UTF-16 helpers
+////////////////////////////////////////////////////////////////////////////////
 
-=== BEGIN FILE: Makefile ===
-# MindScript packaging notes (WHY this Makefile is structured this way)
-# --------------------------------------------------------------------
-# Problem:
-# - We must ensure the binaries always use the bundled libffi (in mindscript/lib) rather than
-#   whatever is installed on a user’s system.
-# - macOS and Linux behave differently:
-#   • macOS binaries record a dylib’s “install name”. If that points to a Homebrew path, things
-#     can break when Homebrew updates or moves files. Discovering/copying *after* build was brittle.
-#   • Linux resolves .so files from filesystem search paths, and distros place libffi.so.N in
-#     different locations (/usr/lib/x86_64-linux-gnu, /usr/lib64, etc.), so guessing one path can fail.
-#
-# Fix (combined strategy):
-# - We set RPATH so binaries look in ../lib relative to themselves at runtime.
-# - macOS: Always pre-vendor. Copy libffi*.dylib into repo ./lib and set its install name to
-#   @loader_path/../lib/<file>. Build against that vendored copy, and ship the same file.
-# - Linux: Prefer pre-vendor. Try to find libffi.so.* up front (pkg-config + common multi-arch
-#   dirs), copy the real file into repo ./lib and create a SONAME symlink; build against it.
-#   If pre-vendoring isn’t possible, fall back *after* build: use ldd on the built binary to
-#   discover the actual resolved libffi path, then copy that exact file (plus SONAME symlink)
-#   into dist/mindscript/lib.
-# Result:
-# - macOS gets a stable, bundle-relative install name we control.
-# - Linux remains resilient to distro layout differences while still shipping the exact .so that
-#   satisfies the binary’s NEEDED entry.
-#
-# Minimal MindScript Makefile (auto-detects host OS/arch and builds that one)
-# Targets:
-#   make            → build + package for the current machine
-#   make build      → just build binaries into dist/mindscript/bin
-#   make package    → tar.gz + checksum
-#   make clean      → remove dist/
+// CRLF-aware: treat "\r\n" as a single newline; store offsets at the byte *after* '\n'.
+func lineOffsets(text string) []int {
+	offs := []int{0}
+	for i := 0; i < len(text); {
+		if text[i] == '\r' {
+			// skip lone \r (shouldn't happen often)
+			i++
+			continue
+		}
+		if text[i] == '\n' {
+			offs = append(offs, i+1)
+			i++
+			continue
+		}
+		_, sz := utf8.DecodeRuneInString(text[i:])
+		if sz <= 0 {
+			sz = 1
+		}
+		i += sz
+	}
+	return offs
+}
 
-# --- autodetect host ---
-UNAME_S := $(shell uname -s)
-UNAME_M := $(shell uname -m)
+func toU16(r rune) int {
+	if r < 0x10000 {
+		return 1
+	}
+	return 2
+}
 
-# Map to Go’s GOOS/GOARCH and to our tarball naming
-ifeq ($(UNAME_S),Darwin)
-  GOOS := darwin
-  ifeq ($(UNAME_M),arm64)
-    GOARCH := arm64
-    TARNAME := mindscript-macos-arm64
-  else
-    $(error macOS x86_64 is not a supported release target)
-  endif
-else ifeq ($(UNAME_S),Linux)
-  GOOS := linux
-  ifeq ($(UNAME_M),x86_64)
-    GOARCH := amd64
-    TARNAME := mindscript-linux-x86_64
-  else ifeq ($(UNAME_M),aarch64)
-    GOARCH := arm64
-    TARNAME := mindscript-linux-arm64
-  else ifeq ($(UNAME_M),arm64)
-    GOARCH := arm64
-    TARNAME := mindscript-linux-arm64
-  else
-    $(error Unsupported Linux arch: $(UNAME_M). Expected x86_64 or (aarch64/arm64))
-  endif
-else
-  $(error Unsupported OS: $(UNAME_S))
-endif
+func posToOffset(lines []int, p Position, text string) int {
+	if p.Line < 0 {
+		return 0
+	}
+	if p.Line >= len(lines) {
+		return len(text)
+	}
+	i := lines[p.Line]
+	need := p.Character // in UTF-16 units
+	for i < len(text) && need > 0 {
+		r, sz := utf8.DecodeRuneInString(text[i:])
+		if r == '\r' { // ignore CR in column math
+			i += sz
+			continue
+		}
+		if r == '\n' {
+			break
+		}
+		need -= toU16(r)
+		i += sz
+	}
+	return i
+}
 
-# --- version & paths ---
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo 0.0.0)
-DIST_DIR := dist
-ROOT     := $(DIST_DIR)/mindscript
-BIN_DIR  := $(ROOT)/bin
-LIB_DIR  := $(ROOT)/lib
-# where we vendor native libs inside the repo (already copied into $(ROOT)/lib later)
-VENDOR_LIB_DIR := lib
+func offsetToPos(lines []int, off int, text string) Position {
+	if off < 0 {
+		off = 0
+	}
+	if off > len(text) {
+		off = len(text)
+	}
+	i, j := 0, len(lines)
+	for i+1 < j {
+		m := (i + j) / 2
+		if lines[m] <= off {
+			i = m
+		} else {
+			j = m
+		}
+	}
+	u16 := 0
+	for k := lines[i]; k < off && k < len(text); {
+		r, sz := utf8.DecodeRuneInString(text[k:])
+		if r == '\r' { // ignore CR
+			k += sz
+			continue
+		}
+		if r == '\n' {
+			break
+		}
+		u16 += toU16(r)
+		k += sz
+	}
+	return Position{Line: i, Character: u16}
+}
 
-# --- CGO + libffi ---
-export CGO_ENABLED := 1
-# For macOS Homebrew libffi (pkg-config lives off the default path)
-ifeq ($(UNAME_S),Darwin)
-  export PKG_CONFIG_PATH ?= $(shell brew --prefix 2>/dev/null)/opt/libffi/lib/pkgconfig
-endif
+func makeRange(lines []int, start, end int, text string) Range {
+	return Range{
+		Start: offsetToPos(lines, start, text),
+		End:   offsetToPos(lines, end, text),
+	}
+}
 
-# RPATH so binaries search ../lib next to themselves
-# NOTE: backslash escapes '$' for the shell so the linker sees literal $ORIGIN
-RPATH_LINUX := -Wl,-rpath,\$$ORIGIN/../lib
-RPATH_MACOS := -Wl,-rpath,@loader_path/../lib
+// Engine gives us byte columns (not UTF-16). Clamp within the line.
+func byteColToOffset(lines []int, line0, byteCol int, text string) int {
+	if line0 < 0 {
+		line0 = 0
+	}
+	if line0 >= len(lines) {
+		return len(text)
+	}
+	start := lines[line0]
+	end := len(text)
+	if line0+1 < len(lines) {
+		end = lines[line0+1]
+	}
+	off := start + byteCol
+	if off < start {
+		off = start
+	}
+	if off > end {
+		off = end
+	}
+	return off
+}
 
-# --- checksum tool ---
-ifeq ($(UNAME_S),Darwin)
-  SHASUM := shasum -a 256
-else
-  SHASUM := sha256sum
-endif
+// UTF-16 code-unit length of a string slice (for semantic tokens).
+func u16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r < 0x10000 {
+			n++
+		} else {
+			n += 2
+		}
+	}
+	return n
+}
 
-# --- default ---
-.PHONY: all build package clean print check-deps vendor-libffi
-all: print check-deps vendor-libffi build package
+////////////////////////////////////////////////////////////////////////////////
+// Diagnostics helpers
+////////////////////////////////////////////////////////////////////////////////
 
-print:
-	@echo "Building for: GOOS=$(GOOS) GOARCH=$(GOARCH)  VERSION=$(VERSION)"
+func (s *server) clearDiagnostics(uri string) {
+	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
+		URI:         uri,
+		Diagnostics: []Diagnostic{},
+	})
+}
 
-check-deps:
-	@command -v pkg-config >/dev/null 2>&1 || { echo "Error: pkg-config not found."; exit 1; }
-	@pkg-config --exists libffi || { \
-		echo "Error: libffi dev files not found (pkg-config name: libffi)."; \
-		echo "  Ubuntu:  sudo apt-get install -y libffi-dev pkg-config"; \
-		echo "  macOS:   brew install libffi"; \
-		exit 1; }
+func (s *server) publishError(doc *docState, err error) {
+	// REPL-friendly: don't nag on incomplete constructs.
+	if e, ok := err.(*mindscript.Error); ok {
+		// Until a dedicated flag is exposed, treat parse/lex errors containing
+		// "incomplete" or "unterminated" as incomplete input.
+		if e.Kind == mindscript.DiagParse || e.Kind == mindscript.DiagLex {
+			msg := strings.ToLower(e.Msg)
+			if strings.Contains(msg, "incomplete") || strings.Contains(msg, "unterminated") {
+				s.clearDiagnostics(doc.uri)
+				return
+			}
+		}
+	}
 
-# Prepare vendored libffi in <repo>/lib so build-time == ship-time
-# - macOS: required (fail if not found)
-# - Linux: best effort; if not found, we'll fall back post-build using ldd
-vendor-libffi:
-	@mkdir -p $(VENDOR_LIB_DIR)
-ifeq ($(UNAME_S),Linux)
-	@set -e; \
-	LIBDIR=$$(pkg-config --variable=libdir libffi); \
-	FOUND=""; \
-	for C in "$$LIBDIR"/libffi.so* /usr/lib/*-linux-gnu/libffi.so* /lib/*-linux-gnu/libffi.so* /usr/lib64/libffi.so* /usr/lib/libffi.so*; do \
-	  for F in $$C; do \
-	    if [ -e "$$F" ]; then FOUND="$$F"; break 2; fi; \
-	  done; \
-	done; \
-	if [ -n "$$FOUND" ]; then \
-	  REAL=$$(readlink -f "$$FOUND"); \
-	  BASE=$$(basename "$$REAL"); \
-	  cp -f "$$REAL" "$(VENDOR_LIB_DIR)/$$BASE"; \
-	  SONAME=$$(readelf -d "$$REAL" | awk '/SONAME/{gsub(/[\[\]]/,"");print $$5; exit}'); \
-	  if [ -n "$$SONAME" ]; then ln -sfn "$$BASE" "$(VENDOR_LIB_DIR)/$$SONAME"; fi; \
-	  echo "Vendored Linux libffi: $(VENDOR_LIB_DIR)/$$BASE (SONAME=$$SONAME)"; \
-	else \
-	  echo "Note: could not pre-vendor libffi on Linux; will discover post-build."; \
-	fi
-else ifeq ($(UNAME_S),Darwin)
-	@set -e; \
-	LIBDIR=$$(pkg-config --variable=libdir libffi 2>/dev/null || echo "$$(brew --prefix)/opt/libffi/lib"); \
-	CAND=$$(ls -1 "$$LIBDIR"/libffi*.dylib 2>/dev/null | head -n1); \
-	if [ -z "$$CAND" ]; then echo "Error: libffi dylib not found in $$LIBDIR"; exit 1; fi; \
-	BASE=$$(basename "$$CAND"); \
-	cp -f "$$CAND" "$(VENDOR_LIB_DIR)/$$BASE"; \
-	install_name_tool -id "@loader_path/../lib/$$BASE" "$(VENDOR_LIB_DIR)/$$BASE"; \
-	echo "Vendored macOS libffi: $(VENDOR_LIB_DIR)/$$BASE (id set to @loader_path/../lib/$$BASE)"
-endif
+	line, col := 0, 0
+	code := ""
+	if e, ok := err.(*mindscript.Error); ok {
+		line, col = e.Line, e.Col // 1-based positions from MindScript
+		switch e.Kind {
+		case mindscript.DiagParse:
+			code = "PARSE"
+		case mindscript.DiagLex:
+			code = "LEX"
+		default:
+		}
+	}
+	if line > 0 {
+		line-- // engine lines are 1-based
+	}
+	start := byteColToOffset(doc.lines, line, col, doc.text)
+	end := start
 
-build:
-	@rm -rf $(ROOT)
-	@mkdir -p $(BIN_DIR) $(LIB_DIR)
-ifeq ($(UNAME_S),Linux)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
-	 -o $(BIN_DIR)/msg     ./cmd/msg
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
-	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
-	@# If we didn't successfully vendor libffi before build, fall back to post-build discovery (old, proven path)
-	@if ! ls "$(VENDOR_LIB_DIR)"/libffi.so* >/dev/null 2>&1; then \
-	  set -e; \
-	  CAND=$$(ldd $(BIN_DIR)/msg | awk '/libffi\.so/{print $$3; exit}'); \
-	  test -n "$$CAND"; \
-	  REAL=$$(readlink -f "$$CAND"); \
-	  BASENAME=$$(basename "$$REAL"); \
-	  cp -v "$$REAL" "$(LIB_DIR)/$$BASENAME"; \
-	  SONAME=$$(readelf -d "$$REAL" | awk '/SONAME/{gsub(/[\[\]]/,"");print $$5; exit}'); \
-	  if [ -n "$$SONAME" ]; then ln -sfn "$$BASENAME" "$(LIB_DIR)/$$SONAME"; fi; \
-	  echo "Post-build discovered Linux libffi: $$REAL → $(LIB_DIR)/$$BASENAME (SONAME=$$SONAME)"; \
-	fi
-else ifeq ($(UNAME_S),Darwin)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
-	 -o $(BIN_DIR)/msg     ./cmd/msg
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
-	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
-	@# On macOS we pre-vendored and set the dylib id; binaries now reference @loader_path/../lib/<BASE>
-endif
-	@test -d lib      && cp -R lib      $(ROOT)/ || true
-	@test -d examples && cp -R examples $(ROOT)/ || true
-	@test -d docs     && cp -R docs     $(ROOT)/ || true
-	@test -d data     && cp -R data     $(ROOT)/ || true
-	@test -f LICENSE  && cp LICENSE     $(ROOT)/ || true
-	@test -f README.md && cp README.md  $(ROOT)/ || true
-	@echo "$(VERSION)" > $(ROOT)/VERSION
+	// Try to expand to a token on that exact start position.
+	if len(doc.tokens) > 0 {
+		for _, t := range doc.tokens {
+			if t.Line == line+1 && t.Col == col {
+				ts := byteColToOffset(doc.lines, t.Line-1, t.Col, doc.text)
+				te := ts + len(t.Lexeme)
+				start, end = ts, te
+				break
+			}
+		}
+	}
+	if end <= start {
+		if start < len(doc.text) {
+			// Highlight the next rune when inside the buffer.
+			_, sz := utf8.DecodeRuneInString(doc.text[start:])
+			if sz <= 0 {
+				sz = 1
+			}
+			end = start + sz
+		} else if start > 0 {
+			// At end-of-buffer: highlight the previous rune.
+			_, sz := utf8.DecodeLastRuneInString(doc.text[:start])
+			if sz <= 0 {
+				sz = 1
+			}
+			start = start - sz
+			end = start + sz
+		}
+	}
 
-package:
-	@mkdir -p $(DIST_DIR)
-	tar -C $(DIST_DIR) -czf $(TARNAME).tar.gz mindscript
-	@$(SHASUM) $(TARNAME).tar.gz > $(TARNAME).tar.gz.sha256
-	@echo "Created: $(TARNAME).tar.gz (+ .sha256)"
+	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
+		URI: doc.uri,
+		Diagnostics: []Diagnostic{{
+			Range:    makeRange(doc.lines, start, end, doc.text),
+			Severity: 1,
+			Code:     code,
+			Source:   "mindscript",
+			Message:  err.Error(),
+		}},
+	})
+}
 
-clean:
-	@rm -rf $(DIST_DIR)
-=== END FILE: Makefile ===
+////////////////////////////////////////////////////////////////////////////////
+// Token & span helpers
+////////////////////////////////////////////////////////////////////////////////
+
+func tokenName(t mindscript.Token) string {
+	if s, ok := t.Literal.(string); ok {
+		return s
+	}
+	return t.Lexeme
+}
+
+// Prefer exact lexer byte spans; fallback to line-local search.
+func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
+	// NEW: exact byte spans from the lexer if present.
+	if t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= len(doc.text) {
+		return t.StartByte, t.EndByte
+	}
+
+	if t.Line < 1 || t.Line > len(doc.lines) {
+		return 0, 0
+	}
+	lineStart := doc.lines[t.Line-1]
+	lineEnd := len(doc.text)
+	if t.Line < len(doc.lines) {
+		lineEnd = doc.lines[t.Line]
+	}
+	line := doc.text[lineStart:lineEnd]
+
+	cand := t.Col
+	if cand < 0 {
+		cand = 0
+	}
+	if cand > len(line) {
+		cand = len(line)
+	}
+	try := func(at int) (int, int, bool) {
+		if at < 0 {
+			at = 0
+		}
+		if at+len(t.Lexeme) > len(line) {
+			return 0, 0, false
+		}
+		if line[at:at+len(t.Lexeme)] == t.Lexeme {
+			s := lineStart + at
+			return s, s + len(t.Lexeme), true
+		}
+		return 0, 0, false
+	}
+	if s, e, ok := try(cand); ok {
+		return s, e
+	}
+	if s, e, ok := try(cand - 1); ok {
+		return s, e
+	}
+	const window = 8
+	from := cand - window
+	if from < 0 {
+		from = 0
+	}
+	if idx := strings.Index(line[from:], t.Lexeme); idx >= 0 {
+		s := lineStart + from + idx
+		return s, s + len(t.Lexeme)
+	}
+	s := lineStart + t.Col
+	e := s + len(t.Lexeme)
+	if s < 0 {
+		s = 0
+	}
+	if e > len(doc.text) {
+		e = len(doc.text)
+	}
+	if e < s {
+		e = s
+	}
+	return s, e
+}
+
+// tokenAtOffset returns the token index and span whose lexeme covers [off].
+func tokenAtOffset(doc *docState, off int) (idx int, t mindscript.Token, start, end int, ok bool) {
+	for i, tk := range doc.tokens {
+		s, e := tokenSpan(doc, tk)
+		if off >= s && off < e {
+			return i, tk, s, e, true
+		}
+	}
+	return -1, mindscript.Token{}, 0, 0, false
+}
+
+// Use SpanIndex to build a Range from a NodePath.
+func rangeFromPath(doc *docState, p mindscript.NodePath) (Range, bool) {
+	if doc.spans == nil {
+		return Range{}, false
+	}
+	sp, ok := doc.spans.Get(p)
+	if !ok {
+		return Range{}, false
+	}
+	return makeRange(doc.lines, sp.StartByte, sp.EndByte, doc.text), true
+}
+
+func findSymbol(doc *docState, name string) (symbolDef, bool) {
+	for _, s := range doc.symbols {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return symbolDef{}, false
+}
+
+func indexOfToken(toks []mindscript.Token, tk mindscript.Token) int {
+	for i, t := range toks {
+		if t == tk {
+			return i
+		}
+	}
+	return -1
+}
+
+// wordAt: prefer token-based match; fallback to ASCII scan if needed.
+func wordAt(doc *docState, pos Position) (string, Range) {
+	off := posToOffset(doc.lines, pos, doc.text)
+	if off < 0 || off > len(doc.text) {
+		return "", Range{}
+	}
+	for _, t := range doc.tokens {
+		// FIX: only IDs are symbol names; TYPE is a keyword.
+		if t.Type != mindscript.ID {
+			continue
+		}
+		start, end := tokenSpan(doc, t)
+		if off >= start && off < end {
+			name := tokenName(t)
+			return name, makeRange(doc.lines, start, end, doc.text)
+		}
+	}
+	// fallback: ASCII-ish word scan
+	isIdent := func(b byte) bool {
+		return b == '_' ||
+			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9')
+	}
+	i, j := off, off
+	for i > 0 && isIdent(doc.text[i-1]) {
+		i--
+	}
+	for j < len(doc.text) && isIdent(doc.text[j]) {
+		j++
+	}
+	if i < j {
+		return strings.TrimSpace(doc.text[i:j]), makeRange(doc.lines, i, j, doc.text)
+	}
+	return "", Range{}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Shared keyword/type helpers (used by hover/completion/semTokens)
+////////////////////////////////////////////////////////////////////////////////
+
+func isKeywordButNotType(tt mindscript.TokenType) bool {
+	switch tt {
+	case mindscript.AND, mindscript.OR, mindscript.NOT,
+		mindscript.LET, mindscript.DO, mindscript.END, mindscript.RETURN, mindscript.BREAK, mindscript.CONTINUE,
+		mindscript.IF, mindscript.THEN, mindscript.ELIF, mindscript.ELSE,
+		mindscript.FUNCTION, mindscript.ORACLE,
+		mindscript.FOR, mindscript.IN, mindscript.FROM, mindscript.WHILE,
+		// FIX: 'type' keyword should be colored as a keyword, not a type identifier.
+		mindscript.TYPECONS, mindscript.TYPE, mindscript.ENUM,
+		mindscript.NULL:
+		return true
+	default:
+		return false
+	}
+}
+
+var builtinTypeDocs = map[string]string{
+	"Any":  "Top type; any value.",
+	"Null": "Null value (absence).",
+	"Bool": "Boolean type (true/false).",
+	"Int":  "64-bit signed integer.",
+	"Num":  "64-bit IEEE-754 float.",
+	"Str":  "Unicode string.",
+	"Type": "Type descriptor value.",
+}
+
+// semantic tokens type legend index (handlers will read this)
+var semTypes = map[string]int{
+	"keyword":  0,
+	"function": 1,
+	"type":     2,
+	"variable": 3,
+	"property": 4,
+	"string":   5,
+	"number":   6,
+	"comment":  7,
+}
+
+func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
+
+// comment/annotation spans used by semantic tokens & folding.
+func commentSpans(doc *docState) [][2]int {
+	spans := [][2]int{}
+	if doc == nil {
+		return spans
+	}
+	// Source of truth: lexer ANNOTATION tokens only.
+	for _, tk := range doc.tokens {
+		if tk.Type != mindscript.ANNOTATION {
+			continue
+		}
+		s, e := tokenSpan(doc, tk)
+		if e > s {
+			spans = append(spans, [2]int{s, e})
+		}
+	}
+	return spans
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Definition heuristics & symbol formatting
+////////////////////////////////////////////////////////////////////////////////
+
+// defRangeByTokens: heuristic: let <name> … OR <name> = … (same or next line)
+func defRangeByTokens(doc *docState, name string) (Range, bool) {
+	toks := doc.tokens
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		if t.Type != mindscript.ID || tokenName(t) != name {
+			continue
+		}
+		// let <name> …
+		if i >= 1 && toks[i-1].Type == mindscript.LET && toks[i-1].Line == t.Line {
+			s, e := tokenSpan(doc, t)
+			return makeRange(doc.lines, s, e, doc.text), true
+		}
+		if i >= 2 && toks[i-2].Type == mindscript.LET && toks[i-2].Line == t.Line {
+			s, e := tokenSpan(doc, t)
+			return makeRange(doc.lines, s, e, doc.text), true
+		}
+		// <name> = … (same line)
+		found := false
+		line := t.Line
+		for j := i + 1; j < len(toks) && toks[j].Line == line; j++ {
+			if toks[j].Type == mindscript.ASSIGN {
+				found = true
+				break
+			}
+		}
+		// spill to next line: <name> \n =
+		if !found {
+			for j := i + 1; j < len(toks); j++ {
+				if toks[j].Line > line+1 {
+					break
+				}
+				if toks[j].Type == mindscript.ASSIGN {
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			s, e := tokenSpan(doc, t)
+			return makeRange(doc.lines, s, e, doc.text), true
+		}
+	}
+	return Range{}, false
+}
+
+// formatFunSig builds a pretty signature from a ("fun", ...) AST node.
+func formatFunSig(name string, fun []any) string {
+	if len(fun) < 3 {
+		return name + "() -> Any"
+	}
+	ps, _ := fun[1].([]any)
+	var parts []string
+	if len(ps) > 0 && ps[0] == "array" {
+		for i := 1; i < len(ps); i++ {
+			p, _ := ps[i].([]any) // ("pair"| "pair!", ("id", name), typeS)
+			if len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
+				idNode, _ := p[1].([]any)
+				nameStr := "_"
+				if len(idNode) >= 2 && idNode[0] == "id" {
+					if s, ok := idNode[1].(string); ok {
+						nameStr = s
+					}
+				}
+				if tS, ok := p[2].([]any); ok {
+					parts = append(parts, fmt.Sprintf("%s: %s", nameStr, mindscript.FormatType(tS)))
+				} else {
+					parts = append(parts, nameStr+": Any")
+				}
+			}
+		}
+	}
+	ret := "Any"
+	if rt, ok := fun[2].([]any); ok {
+		ret = mindscript.FormatType(rt)
+	}
+	return fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), ret)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Analysis (lex + parse + symbol extraction) — publishes diagnostics via notify
+////////////////////////////////////////////////////////////////////////////////
+
+// analyze lexes, parses, and refreshes the per-doc caches used by features.
+// It fills: doc.tokens, doc.ast (when parse succeeds), and doc.symbols (top-level defs).
+func (s *server) analyze(doc *docState) {
+	// 1) Lex (interactive is fine; the tests use valid input)
+	lx := mindscript.NewLexerInteractive(doc.text)
+	toks, err := lx.Scan()
+	if err != nil {
+		// Try to salvage tokens up to the error position so semantic tokens
+		// still color the prefix.
+		if e, ok := err.(*mindscript.Error); ok && e.Kind == mindscript.DiagLex {
+			off := byteColToOffset(doc.lines, e.Line-1, e.Col-1, doc.text)
+			if off < 0 {
+				off = 0
+			}
+			if off > len(doc.text) {
+				off = len(doc.text)
+			}
+			// Re-lex the prefix only; this should succeed.
+			px := mindscript.NewLexerInteractive(doc.text[:off])
+			ptoks, pErr := px.Scan()
+			if pErr == nil {
+				if n := len(ptoks); n > 0 && ptoks[n-1].Type == mindscript.EOF {
+					ptoks = ptoks[:n-1]
+				}
+				doc.tokens = ptoks
+			} else {
+				// If even the prefix fails, leave tokens as-is (keep previous coloring).
+			}
+		}
+		doc.symbols = nil
+		doc.ast = nil
+		s.publishError(doc, err)
+		return
+	}
+	// Drop the terminal EOF token for downstream convenience.
+	if n := len(toks); n > 0 && toks[n-1].Type == mindscript.EOF {
+		toks = toks[:n-1]
+	}
+	doc.tokens = toks
+
+	// 2) Parse AST in interactive mode so we can distinguish "incomplete"
+	// from true errors for on-type diagnostics.
+	ast, err := mindscript.ParseSExprInteractive(doc.text)
+	if err != nil {
+		// Parsing failed (or incomplete) — keep tokens, but clear AST/symbols.
+		doc.ast = nil
+		doc.symbols = nil
+		// Publish diagnostics for parse/lex errors; Incomplete clears.
+		s.publishError(doc, err)
+		return
+	}
+	doc.ast = ast
+
+	// 3) Rebuild top-level symbols (alpha/beta/etc.). This does NOT execute user code.
+	doc.symbols = collectTopLevelSymbols(doc)
+
+	// 4) Success: clear any previous diagnostics.
+	s.clearDiagnostics(doc.uri)
+}
+
+// collectTopLevelSymbols walks the AST (root-level only) and extracts symbols:
+//   - let/assign of a simple decl: ("assign", ("decl", name), rhs)
+//   - marks kind "fun" when rhs tag == "fun"; otherwise "let".
+//
+// Ranges are the byte range of the defining identifier token.
+func collectTopLevelSymbols(doc *docState) []symbolDef {
+	var out []symbolDef
+	root := doc.ast
+	if len(root) == 0 {
+		return out
+	}
+
+	tag, _ := root[0].(string)
+	if tag == "block" {
+		for i := 1; i < len(root); i++ {
+			if ch, ok := root[i].([]any); ok {
+				ch = unwrapAnnotNode(ch)
+				addTopLevelAssign(ch, doc, &out)
+			}
+		}
+	} else {
+		// Single-expression file that might still be an assignment.
+		addTopLevelAssign(unwrapAnnotNode(root), doc, &out)
+	}
+	return out
+}
+
+// addTopLevelAssign adds a symbol for ("assign", ("decl", name), rhs).
+// Kind is "fun" if rhs tag == "fun"; otherwise "let".
+func addTopLevelAssign(node []any, doc *docState, out *[]symbolDef) {
+	if len(node) < 3 {
+		return
+	}
+	tag, _ := node[0].(string)
+	if tag != "assign" {
+		return
+	}
+	lhs, _ := node[1].([]any)
+	if len(lhs) < 2 {
+		return
+	}
+	lhsTag, _ := lhs[0].(string)
+	var name string
+	switch lhsTag {
+	case "decl":
+		name, _ = lhs[1].(string)
+	case "id":
+		// Allow plain identifier assignments:  f = fun(...),  beta = alpha
+		name, _ = lhs[1].(string)
+	default:
+		// Ignore complex targets (destructuring etc.) for now.
+		return
+	}
+	if name == "" {
+		return
+	}
+
+	kind := "let"
+	if rhs, ok := node[2].([]any); ok && len(rhs) > 0 {
+		rhs = unwrapAnnotNode(rhs) // <-- strip ("annot", …)
+		if rtag, _ := rhs[0].(string); rtag == "fun" {
+			kind = "fun"
+		}
+	}
+
+	// Find the defining identifier token's exact byte span.
+	if start, end, ok := findDefIDRange(doc.tokens, name); ok {
+		rng := makeRange(doc.lines, start, end, doc.text)
+		*out = append(*out, symbolDef{
+			Name:  name,
+			Kind:  kind,
+			Range: rng,
+			// Sig/Doc optional for now; tests only require presence.
+		})
+	}
+}
+
+// findDefIDRange returns the byte span of the defining ID token `name`.
+// Heuristic: choose the first ID token with that name that looks like a def:
+// - immediately followed by '=' (ASSIGN), OR
+// - immediately preceded by 'let' (LET)
+func findDefIDRange(toks []mindscript.Token, name string) (int, int, bool) {
+	for i := 0; i < len(toks); i++ {
+		tk := toks[i]
+		if tk.Type != mindscript.ID {
+			continue
+		}
+		if tokenName(tk) != name {
+			continue
+		}
+		// def `x = ...`
+		if i+1 < len(toks) && toks[i+1].Type == mindscript.ASSIGN {
+			return tk.StartByte, tk.EndByte, true
+		}
+		// def `let x ...`
+		if i-1 >= 0 && toks[i-1].Type == mindscript.LET {
+			return tk.StartByte, tk.EndByte, true
+		}
+	}
+	// Fallback: first occurrence (still better than nothing)
+	for i := 0; i < len(toks); i++ {
+		tk := toks[i]
+		if tk.Type == mindscript.ID && tokenName(tk) == name {
+			return tk.StartByte, tk.EndByte, true
+		}
+	}
+	return 0, 0, false
+}
+
+func unwrapAnnotNode(n []any) []any {
+	for {
+		if len(n) >= 3 {
+			if tag, _ := n[0].(string); tag == "annot" {
+				if inner, _ := n[2].([]any); inner != nil {
+					n = inner
+					continue
+				}
+			}
+		}
+		return n
+	}
+}
+=== END FILE: cmd/msg-lsp/core.go ===
+
+=== BEGIN FILE: cmd/msg-lsp/features.go ===
+// cmd/lsp/features.go
+//
+// ROLE: LSP feature implementations built on top of the caches/utilities from
+//       core.go. Converts editor requests into language answers.
+//
+// What lives here
+//   • Handlers for LSP methods:
+//        - initialize: advertise capabilities and token legends.
+//        - text sync (didOpen/didChange): update docState and trigger analyze.
+//        - language features: hover, definition, references, completion,
+//          document symbols, semantic tokens (full/range), signature help,
+//          folding ranges.
+//   • Heuristics that read docState (tokens, AST, spans, symbols) and format
+//     LSP-shaped responses. Where useful, consults server.ip to surface
+//     metadata about built-ins (e.g., function signatures) — without executing
+//     user code. The optional listBindings() call asks for a visible env via a
+//     userland `getEnv()` only if present.
+//
+// What does NOT live here
+//   • No transport framing or JSON-RPC loop (see main.go).
+//   • No core text/position math or analysis pipeline (see core.go).
+//   • No interpreter internals or VM usage; feature logic relies on lexer/parser
+//     output and cached spans. Interpreter access is read-only for metadata.
+//
+// Why this separation
+//   • Keeps feature code declarative and testable.
+//   • Allows core analysis to evolve without touching user-visible features.
+//
+// Dependencies
+//   • Consumes helpers/types from core.go and protocol.go.
+//   • May read from s.ip.Global to describe built-ins; otherwise operates purely
+//     on statically computed tokens/AST/symbols.
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+
+	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+)
+
+////////////////////////////////////////////////////////////////////////////////
+// Initialize & text sync
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
+	// Keep the token legend order in sync with semTypes in core.go
+	legendTypes := []string{
+		"keyword", "function", "type", "variable", "property",
+		"string", "number", "comment", "bracket",
+	}
+
+	semProv := &struct {
+		Legend struct {
+			TokenTypes     []string `json:"tokenTypes"`
+			TokenModifiers []string `json:"tokenModifiers"`
+		} `json:"legend"`
+		Full  bool `json:"full"`
+		Range bool `json:"range"`
+	}{Full: true, Range: true}
+	semProv.Legend.TokenTypes = legendTypes
+	semProv.Legend.TokenModifiers = []string{"b0", "b1", "b2", "b3", "b4", "b5"}
+
+	result := InitializeResult{
+		Capabilities: ServerCapabilities{
+			TextDocumentSync: TextDocumentSyncOptions{
+				OpenClose: true,
+				Change:    2, // Incremental
+			},
+			HoverProvider:      true,
+			DefinitionProvider: true,
+			CompletionProvider: &struct {
+				TriggerCharacters []string `json:"triggerCharacters"`
+			}{TriggerCharacters: []string{".", ":", "[", "(", ","}},
+			DocumentSymbolProvider:          true,
+			ReferencesProvider:              true,
+			WorkspaceSymbolProvider:         false,
+			DocumentFormattingProvider:      false,
+			DocumentRangeFormattingProvider: false,
+			SignatureHelpProvider: &struct {
+				TriggerCharacters   []string `json:"triggerCharacters"`
+				RetriggerCharacters []string `json:"retriggerCharacters"`
+			}{
+				TriggerCharacters:   []string{"(", ","},
+				RetriggerCharacters: []string{","},
+			},
+			SemanticTokensProvider: semProv,
+			FoldingRangeProvider:   true,
+		},
+		ServerInfo: map[string]string{
+			"name":    "mindscript-lsp",
+			"version": "0.4",
+		},
+	}
+	s.sendResponse(id, result, nil)
+}
+
+func (s *server) onDidOpen(raw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentItem `json:"textDocument"`
+	}
+	_ = json.Unmarshal(raw, &params)
+	s.mu.Lock()
+	doc := &docState{
+		uri:   params.TextDocument.URI,
+		text:  params.TextDocument.Text,
+		lines: lineOffsets(params.TextDocument.Text),
+	}
+	s.docs[doc.uri] = doc
+	s.mu.Unlock()
+	s.analyze(doc)
+}
+
+func (s *server) onDidChange(raw json.RawMessage) {
+	var params struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+		ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"`
+	}
+	_ = json.Unmarshal(raw, &params)
+
+	s.mu.Lock()
+	doc := s.docs[params.TextDocument.URI]
+	s.mu.Unlock()
+	if doc == nil || len(params.ContentChanges) == 0 {
+		return
+	}
+
+	// If any change is a full replace, follow LSP convention and treat it as the only change.
+	fullIdx := -1
+	for i, ch := range params.ContentChanges {
+		if ch.Range == nil {
+			fullIdx = i
+			break
+		}
+	}
+	if fullIdx >= 0 {
+		doc.text = params.ContentChanges[fullIdx].Text
+		doc.lines = lineOffsets(doc.text)
+		s.analyze(doc)
+		return
+	}
+
+	// Apply incremental edits in order; recompute line offsets after each to keep positions valid.
+	for _, ch := range params.ContentChanges {
+		start := posToOffset(doc.lines, ch.Range.Start, doc.text)
+		end := posToOffset(doc.lines, ch.Range.End, doc.text)
+		var b bytes.Buffer
+		b.WriteString(doc.text[:start])
+		b.WriteString(ch.Text)
+		if end < len(doc.text) {
+			b.WriteString(doc.text[end:])
+		}
+		doc.text = b.String()
+		doc.lines = lineOffsets(doc.text)
+	}
+	s.analyze(doc)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Hover
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+
+	name, rng := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+
+	off := posToOffset(doc.lines, params.Position, doc.text)
+	_, tk, _, _, tokOK := tokenAtOffset(doc, off)
+
+	// Keywords / boolean literals → simple hover
+	if tokOK {
+		if isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN {
+			word := tk.Lexeme
+			if tk.Type == mindscript.BOOLEAN {
+				if b, ok := tk.Literal.(bool); ok && b {
+					word = "true"
+				} else {
+					word = "false"
+				}
+			}
+			content := fmt.Sprintf("**keyword** `%s`", word)
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Local document symbol
+	for _, sym := range doc.symbols {
+		if sym.Name == name {
+			var header string
+			switch sym.Kind {
+			case "fun":
+				if sym.Sig != "" {
+					header = fmt.Sprintf("**fun** `%s`", sym.Sig)
+				} else {
+					header = fmt.Sprintf("**fun** `%s`", sym.Name)
+				}
+			case "type":
+				header = fmt.Sprintf("**type** `%s`", sym.Name)
+			default:
+				header = fmt.Sprintf("**let** `%s`", sym.Name)
+			}
+			content := header
+			if txt := strings.TrimSpace(sym.Doc); txt != "" {
+				content += "\n\n" + txt
+			}
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Builtin types by ID (NOT by TYPE keyword)
+	if tokOK && tk.Type == mindscript.ID {
+		if docTxt, ok := builtinTypeDocs[name]; ok {
+			content := fmt.Sprintf("**type** `%s`\n\n%s", name, docTxt)
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Globals from interpreter (functions/types)
+	if v, err := s.ip.Global.Get(name); err == nil {
+		switch v.Tag {
+		case mindscript.VTFun:
+			if meta, ok := s.ip.FunMeta(v); ok {
+				ps := meta.ParamSpecs()
+				parts := make([]string, 0, len(ps))
+				for _, p := range ps {
+					parts = append(parts, fmt.Sprintf("%s: %s", p.Name, mindscript.FormatType(p.Type)))
+				}
+				ret := mindscript.FormatType(meta.ReturnType())
+				content := fmt.Sprintf("**fun** `%s(%s) -> %s`", name, strings.Join(parts, ", "), ret)
+				if doc := strings.TrimSpace(meta.Doc()); doc != "" {
+					content += "\n\n" + doc
+				}
+				s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+				return
+			}
+		case mindscript.VTType:
+			content := "**type** `" + name + "`"
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Fallback classification for IDs
+	if tokOK && tk.Type == mindscript.ID {
+		kind := "identifier"
+		idx := -1
+		// we can find the idx cheaply via tokenAtOffset when on the token; otherwise scan once
+		if i, _, _, _, ok := tokenAtOffset(doc, off); ok {
+			idx = i
+		}
+		if idx == -1 {
+			for i := range doc.tokens {
+				if doc.tokens[i] == tk {
+					idx = i
+					break
+				}
+			}
+		}
+
+		if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
+			kind = "property"
+		} else if sy, ok := findSymbol(doc, name); ok && sy.Kind != "" {
+			kind = sy.Kind
+		} else if idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND {
+			kind = "fun"
+		} else if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTType {
+			kind = "type"
+		}
+		content := fmt.Sprintf("**%s** `%s`", kind, name)
+		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+		return
+	}
+
+	s.sendResponse(id, nil, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Definition
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onDefinition(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+	name, _ := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+	for _, sym := range doc.symbols {
+		if sym.Name == name {
+			s.sendResponse(id, Location{URI: doc.uri, Range: sym.Range}, nil)
+			return
+		}
+	}
+	s.sendResponse(id, nil, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Completion
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []CompletionItem{}, nil)
+		return
+	}
+
+	seen := map[string]bool{}
+	items := make([]CompletionItem, 0, 128)
+
+	// Document symbols
+	for _, sym := range doc.symbols {
+		if seen[sym.Name] {
+			continue
+		}
+		seen[sym.Name] = true
+		kind := 6 // Variable
+		if sym.Kind == "fun" {
+			kind = 3 // Function
+		} else if sym.Kind == "type" {
+			kind = 5 // Class-ish
+		}
+		detail := sym.Kind
+		if sym.Kind == "fun" && sym.Sig != "" {
+			detail = sym.Sig
+		}
+		items = append(items, CompletionItem{
+			Label:  sym.Name,
+			Kind:   kind,
+			Detail: detail,
+		})
+	}
+
+	// Globals / core bindings
+	if entries, order := s.listBindings(s.ip.Global); len(order) > 0 {
+		for _, name := range order {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			v := entries[name]
+			kind := 6
+			switch v.Tag {
+			case mindscript.VTFun:
+				kind = 3
+			case mindscript.VTType:
+				kind = 5
+			}
+			items = append(items, CompletionItem{Label: name, Kind: kind})
+		}
+	}
+
+	// Language keywords (MindScript-specific spellings)
+	keywords := []string{
+		"and", "or", "not",
+		"let", "do", "end", "return", "break", "continue",
+		"if", "then", "elif", "else",
+		"fun", "oracle",
+		"for", "in", "from", "while",
+		"type", "enum",
+		"null", "true", "false",
+	}
+	for _, kw := range keywords {
+		if !seen[kw] {
+			seen[kw] = true
+			items = append(items, CompletionItem{Label: kw, Kind: 14}) // Keyword
+		}
+	}
+
+	sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+	s.sendResponse(id, items, nil)
+}
+
+// Ask the interpreter for a visible environment map via userland getEnv(), if present.
+func (s *server) listBindings(env *mindscript.Env) (map[string]mindscript.Value, []string) {
+	ast := mindscript.S{"call", mindscript.S{"id", "getEnv"}}
+	v, err := s.ip.EvalAST(ast, env)
+	if err != nil || v.Tag != mindscript.VTMap {
+		return map[string]mindscript.Value{}, nil
+	}
+	mo := v.Data.(*mindscript.MapObject)
+	return mo.Entries, append([]string(nil), mo.Keys...)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Document symbols
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onDocumentSymbols(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []DocumentSymbol{}, nil)
+		return
+	}
+
+	out := make([]DocumentSymbol, 0, len(doc.symbols))
+	for _, sym := range doc.symbols {
+		kind := 13 // Variable
+		switch sym.Kind {
+		case "fun":
+			kind = 12 // Function
+		case "type":
+			kind = 5 // Class-ish
+		}
+		detail := sym.Kind
+		if sym.Kind == "fun" && sym.Sig != "" {
+			detail = sym.Sig
+		}
+		out = append(out, DocumentSymbol{
+			Name:           sym.Name,
+			Detail:         detail,
+			Kind:           kind,
+			Range:          sym.Range,
+			SelectionRange: sym.Range,
+		})
+	}
+	s.sendResponse(id, out, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// References
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+		Context      struct {
+			IncludeDeclaration bool `json:"includeDeclaration"`
+		} `json:"context"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []Location{}, nil)
+		return
+	}
+
+	name, _ := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, []Location{}, nil)
+		return
+	}
+
+	locs := []Location{}
+	for i, t := range doc.tokens {
+		if t.Type != mindscript.ID || tokenName(t) != name {
+			continue
+		}
+		// Exclude property names: immediately preceded by '.'
+		if i-1 >= 0 && doc.tokens[i-1].Type == mindscript.PERIOD {
+			continue
+		}
+		start, end := tokenSpan(doc, t)
+		locs = append(locs, Location{
+			URI:   doc.uri,
+			Range: makeRange(doc.lines, start, end, doc.text),
+		})
+	}
+	s.sendResponse(id, locs, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Semantic tokens (full & range)
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onSemanticTokensFull(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params SemanticTokensParams
+	_ = json.Unmarshal(paramsRaw, &params)
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	data := s.semanticTokensData(doc, -1, -1) // full
+	s.sendResponse(id, SemanticTokens{Data: data}, nil)
+}
+
+func (s *server) onSemanticTokensRange(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params SemanticTokensRangeParams
+	_ = json.Unmarshal(paramsRaw, &params)
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, SemanticTokens{Data: nil}, nil)
+		return
+	}
+	start := posToOffset(doc.lines, params.Range.Start, doc.text)
+	end := posToOffset(doc.lines, params.Range.End, doc.text)
+	data := s.semanticTokensData(doc, start, end)
+	s.sendResponse(id, SemanticTokens{Data: data}, nil)
+}
+
+type semEntry struct {
+	line, ch, lenU16, typ int
+}
+
+// semanticTokensData builds LSP-encoded semantic token data.
+// If [selStart, selEnd) are >=0, only tokens overlapping that range are emitted.
+func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint32 {
+	if doc == nil || len(doc.tokens) == 0 {
+		return nil
+	}
+
+	cspans := commentSpans(doc)
+
+	isInComment := func(sOff, eOff int) bool {
+		se := [2]int{sOff, eOff}
+		for _, c := range cspans {
+			if overlaps(se, c) {
+				return true
+			}
+		}
+		return false
+	}
+
+	entries := []semEntry{}
+
+	// Emit code tokens, skipping anything inside comment spans.
+	// Track brace depth to classify map-literal keys (`id`/`"str"` before ':') as properties.
+	braceDepth := 0
+
+	for i := 0; i < len(doc.tokens); i++ {
+		tk := doc.tokens[i]
+		if tk.Type == mindscript.ANNOTATION {
+			// the whole annotation region already colored as comment
+			continue
+		}
+
+		sOff, eOff := tokenSpan(doc, tk)
+		if eOff <= sOff {
+			// still keep structural depth in sync
+			if tk.Type == mindscript.LCURLY {
+				braceDepth++
+			} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		}
+
+		if selStart >= 0 && selEnd >= 0 && !(eOff > selStart && sOff < selEnd) {
+			// maintain depth even when skipping by range
+			if tk.Type == mindscript.LCURLY {
+				braceDepth++
+			} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		}
+
+		if isInComment(sOff, eOff) {
+			// maintain depth across comments
+			if tk.Type == mindscript.LCURLY {
+				braceDepth++
+			} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		}
+
+		typIdx := -1
+		switch {
+		case isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN:
+			typIdx = semTypes["keyword"]
+
+		case tk.Type == mindscript.STRING:
+			// Property after '.' OR map key before ':'
+			if i-1 >= 0 && doc.tokens[i-1].Type == mindscript.PERIOD {
+				typIdx = semTypes["property"]
+			} else if braceDepth > 0 && i+1 < len(doc.tokens) && doc.tokens[i+1].Type == mindscript.COLON {
+				typIdx = semTypes["property"]
+			} else {
+				typIdx = semTypes["string"]
+			}
+
+		case tk.Type == mindscript.INTEGER || tk.Type == mindscript.NUMBER:
+			typIdx = semTypes["number"]
+
+		case tk.Type == mindscript.ID:
+			name := tokenName(tk)
+			idx := i // avoid O(n) indexOfToken
+			if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
+				typIdx = semTypes["property"]
+			} else if braceDepth > 0 && i+1 < len(doc.tokens) && doc.tokens[i+1].Type == mindscript.COLON {
+				// `{ key: ... }`
+				typIdx = semTypes["property"]
+			} else {
+				kind := ""
+				if sy, ok := findSymbol(doc, name); ok {
+					kind = sy.Kind
+				}
+				if kind == "fun" || (idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND) {
+					typIdx = semTypes["function"]
+				} else if kind == "type" {
+					typIdx = semTypes["type"]
+				} else if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTType {
+					typIdx = semTypes["type"]
+				} else {
+					typIdx = semTypes["variable"]
+				}
+			}
+
+		default:
+			// keep depth updated, even if we don't emit anything
+			if tk.Type == mindscript.LCURLY {
+				braceDepth++
+			} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		}
+
+		// LSP requires single-line tokens. Split on newlines.
+		segStart := sOff
+		for cur := sOff; cur < eOff; cur++ {
+			if doc.text[cur] == '\r' {
+				continue
+			}
+			if doc.text[cur] == '\n' {
+				if segStart < cur {
+					st := offsetToPos(doc.lines, segStart, doc.text)
+					entries = append(entries, semEntry{
+						line:   st.Line,
+						ch:     st.Character,
+						lenU16: u16Len(doc.text[segStart:cur]),
+						typ:    typIdx,
+					})
+				}
+				segStart = cur + 1
+			}
+		}
+		if segStart < eOff {
+			st := offsetToPos(doc.lines, segStart, doc.text)
+			entries = append(entries, semEntry{
+				line:   st.Line,
+				ch:     st.Character,
+				lenU16: u16Len(doc.text[segStart:eOff]),
+				typ:    typIdx,
+			})
+		}
+
+		// update structural depth after processing a token
+		if tk.Type == mindscript.LCURLY {
+			braceDepth++
+		} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+			braceDepth--
+		}
+	}
+
+	// Sort then delta-encode
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].line != entries[j].line {
+			return entries[i].line < entries[j].line
+		}
+		return entries[i].ch < entries[j].ch
+	})
+	data := make([]uint32, 0, len(entries)*5)
+	prevLine, prevCh := 0, 0
+	first := true
+	for _, e := range entries {
+		dl, dc := e.line, e.ch
+		if !first {
+			dl -= prevLine
+			if dl == 0 {
+				dc -= prevCh
+			}
+		}
+		first = false
+		prevLine, prevCh = e.line, e.ch
+		data = append(data, uint32(dl), uint32(dc), uint32(e.lenU16), uint32(e.typ), 0)
+	}
+	return data
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Signature help
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onSignatureHelp(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params SignatureHelpParams
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, SignatureHelp{}, nil)
+		return
+	}
+
+	off := posToOffset(doc.lines, params.Position, doc.text)
+	tIdx, _, _, _, ok := tokenAtOffset(doc, off)
+	if !ok && len(doc.tokens) > 0 {
+		tIdx = len(doc.tokens) - 1
+	}
+
+	// Walk left to find the matching '(' (CLROUND) with proper nesting.
+	depth := 0
+	openIdx := -1
+	for i := tIdx; i >= 0; i-- {
+		switch doc.tokens[i].Type {
+		case mindscript.RROUND:
+			depth++
+		case mindscript.CLROUND, mindscript.LROUND:
+			if depth == 0 {
+				openIdx = i
+				goto found
+			}
+			depth--
+		}
+	}
+found:
+	if openIdx < 0 || doc.tokens[openIdx].Type != mindscript.CLROUND {
+		s.sendResponse(id, SignatureHelp{}, nil)
+		return
+	}
+
+	// Try to get the callee name (simple heuristic: previous ID)
+	name := ""
+	if openIdx-1 >= 0 && doc.tokens[openIdx-1].Type == mindscript.ID {
+		name = tokenName(doc.tokens[openIdx-1])
+	}
+
+	// Count commas at top-level between '(' and cursor to find active parameter.
+	paramIdx := 0
+	depth = 0
+	for i := openIdx + 1; i < len(doc.tokens); i++ {
+		tk := doc.tokens[i]
+		sOff, eOff := tokenSpan(doc, tk)
+		if off < sOff {
+			break
+		}
+		switch tk.Type {
+		case mindscript.CLROUND, mindscript.LROUND:
+			depth++
+		case mindscript.RROUND:
+			if depth == 0 {
+				i = len(doc.tokens) // break two loops
+				break
+			}
+			depth--
+		case mindscript.COMMA:
+			if depth == 0 && off >= sOff && off >= eOff {
+				paramIdx++
+			}
+		}
+	}
+
+	// Build signature(s)
+	resp := SignatureHelp{
+		Signatures:      []SignatureInformation{},
+		ActiveSignature: 0,
+		ActiveParameter: paramIdx,
+	}
+
+	// Prefer local symbol sig
+	if name != "" {
+		for _, sym := range doc.symbols {
+			if sym.Name == name && sym.Kind == "fun" {
+				label := sym.Sig
+				if label == "" {
+					label = name + "(...) -> Any"
+				}
+				si := SignatureInformation{Label: label}
+				resp.Signatures = append(resp.Signatures, si)
+				s.sendResponse(id, resp, nil)
+				return
+			}
+		}
+		// Try global meta
+		if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTFun {
+			if meta, ok := s.ip.FunMeta(v); ok {
+				ps := meta.ParamSpecs()
+				parts := make([]string, 0, len(ps))
+				paramsInfo := make([]ParameterInformation, 0, len(ps))
+				for _, p := range ps {
+					seg := fmt.Sprintf("%s: %s", p.Name, mindscript.FormatType(p.Type))
+					parts = append(parts, seg)
+					paramsInfo = append(paramsInfo, ParameterInformation{Label: seg})
+				}
+				label := fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), mindscript.FormatType(meta.ReturnType()))
+				doc := strings.TrimSpace(meta.Doc())
+				var docPtr *MarkupContent
+				if doc != "" {
+					docPtr = &MarkupContent{Kind: "markdown", Value: doc}
+				}
+				resp.Signatures = append(resp.Signatures, SignatureInformation{
+					Label:         label,
+					Documentation: docPtr,
+					Parameters:    paramsInfo,
+				})
+				s.sendResponse(id, resp, nil)
+				return
+			}
+		}
+	}
+
+	// Unknown function — provide a minimal shell
+	if name != "" {
+		resp.Signatures = append(resp.Signatures, SignatureInformation{Label: name + "(…)"})
+	}
+	s.sendResponse(id, resp, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Folding ranges
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onFoldingRange(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []FoldingRange{}, nil)
+		return
+	}
+
+	var out []FoldingRange
+
+	// Comment/annotation blocks
+	for _, sp := range commentSpans(doc) {
+		startLine := offsetToPos(doc.lines, sp[0], doc.text).Line
+		endLine := offsetToPos(doc.lines, sp[1], doc.text).Line
+		if endLine > startLine {
+			kind := "comment"
+			out = append(out, FoldingRange{StartLine: startLine, EndLine: endLine, Kind: &kind})
+		}
+	}
+
+	// AST-based folding using spans (starts at headers, ends at closing)
+	if doc.spans != nil && doc.ast != nil && len(doc.ast) > 0 {
+		foldable := map[string]bool{
+			"fun": true, "oracle": true, "if": true, "while": true, "for": true,
+			// Optional: fold big literals too
+			"array": true, "map": true,
+		}
+		var walk func(node []any, path mindscript.NodePath)
+		walk = func(node []any, path mindscript.NodePath) {
+			if len(node) == 0 {
+				return
+			}
+			tag, _ := node[0].(string)
+			if foldable[tag] {
+				if sp, ok := doc.spans.Get(path); ok {
+					startL := offsetToPos(doc.lines, sp.StartByte, doc.text).Line
+					endL := offsetToPos(doc.lines, sp.EndByte, doc.text).Line
+					if endL > startL {
+						out = append(out, FoldingRange{StartLine: startL, EndLine: endL})
+					}
+				}
+			}
+			for i := 1; i < len(node); i++ {
+				if ch, ok := node[i].([]any); ok {
+					walk(ch, append(path, i-1))
+				}
+			}
+		}
+		walk(doc.ast, mindscript.NodePath{})
+	}
+
+	s.sendResponse(id, out, nil)
+}
+=== END FILE: cmd/msg-lsp/features.go ===
+
+=== BEGIN FILE: cmd/msg-lsp/main.go ===
+// cmd/lsp/main.go
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+)
+
+func main() {
+	s := newServer()
+	in := bufio.NewReader(os.Stdin)
+
+	for {
+		msgBytes, err := readMsg(in)
+		if err != nil {
+			if err != io.EOF {
+				// best-effort log to stderr
+				fmt.Fprintln(os.Stderr, "read error:", err)
+			}
+			return
+		}
+
+		var req Request
+		if err := json.Unmarshal(msgBytes, &req); err != nil {
+			// Malformed JSON—ignore silently to be robust
+			continue
+		}
+
+		switch req.Method {
+		// LSP lifecycle
+		case "initialize":
+			s.onInitialize(req.ID, req.Params)
+		case "initialized":
+			// no-op
+		case "shutdown":
+			s.sendResponse(req.ID, nil, nil)
+		case "exit":
+			return
+
+		// Text sync
+		case "textDocument/didOpen":
+			s.onDidOpen(req.Params)
+		case "textDocument/didChange":
+			s.onDidChange(req.Params)
+
+		// Language features
+		case "textDocument/hover":
+			s.onHover(req.ID, req.Params)
+		case "textDocument/definition":
+			s.onDefinition(req.ID, req.Params)
+		case "textDocument/completion":
+			s.onCompletion(req.ID, req.Params)
+		case "textDocument/documentSymbol":
+			s.onDocumentSymbols(req.ID, req.Params)
+		case "textDocument/references":
+			s.onReferences(req.ID, req.Params)
+		case "textDocument/signatureHelp":
+			s.onSignatureHelp(req.ID, req.Params)
+		case "textDocument/foldingRange":
+			s.onFoldingRange(req.ID, req.Params)
+
+		// Semantic tokens
+		case "textDocument/semanticTokens/full":
+			s.onSemanticTokensFull(req.ID, req.Params)
+		case "textDocument/semanticTokens/range":
+			s.onSemanticTokensRange(req.ID, req.Params)
+
+		default:
+			// For requests (have an id), reply with MethodNotFound; notifications are ignored.
+			if len(req.ID) > 0 {
+				s.sendResponse(req.ID, nil, &ResponseError{Code: -32601, Message: "method not found"})
+			}
+		}
+	}
+}
+=== END FILE: cmd/msg-lsp/main.go ===
+
+=== BEGIN FILE: cmd/msg-lsp/protocol.go ===
+// cmd/lsp/protocol.go
+//
+// ROLE: Pure wire schema for JSON-RPC 2.0 and the Language Server Protocol (LSP).
+//
+// What lives here
+//   • Go structs that mirror the on-the-wire request/response envelopes and
+//     LSP payload types (positions, ranges, diagnostics, hovers, completion,
+//     semantic tokens, folding, signature help, etc.).
+//
+// What does NOT live here
+//   • No business logic, no transport framing, no feature handlers, no
+//     server state. This file must remain DTOs only so the rest of the
+//     codebase can import it without pulling any behavior.
+//
+// Why this separation
+//   • Keeps (de)serialization types stable and dependency-free.
+//   • Makes it easy to audit protocol changes and keep handlers decoupled.
+//
+// Dependencies: none (stdlib only).
+
+package main
+
+import "encoding/json"
+
+////////////////////////////////////////////////////////////////////////////////
+// LSP protocol types (wire structs)
+////////////////////////////////////////////////////////////////////////////////
+
+// ----- JSON-RPC envelope -----
+
+type Request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type Response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Result  any             `json:"result,omitempty"`
+	Error   *ResponseError  `json:"error,omitempty"`
+}
+
+type ResponseError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// ----- LSP core value types -----
+
+type Position struct {
+	Line      int `json:"line"`
+	Character int `json:"character"` // UTF-16 code units
+}
+
+type Range struct {
+	Start Position `json:"start"`
+	End   Position `json:"end"`
+}
+
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
+}
+
+// ----- Text document -----
+
+type TextDocumentIdentifier struct {
+	URI string `json:"uri"`
+}
+
+type TextDocumentItem struct {
+	URI        string `json:"uri"`
+	LanguageID string `json:"languageId"`
+	Version    int    `json:"version"`
+	Text       string `json:"text"`
+}
+
+type TextDocumentContentChangeEvent struct {
+	Range       *Range `json:"range,omitempty"`
+	RangeLength int    `json:"rangeLength,omitempty"`
+	Text        string `json:"text"`
+}
+
+// ----- Initialize / capabilities -----
+
+type InitializeParams struct {
+	Capabilities any    `json:"capabilities"`
+	RootURI      string `json:"rootUri,omitempty"`
+}
+
+type TextDocumentSyncOptions struct {
+	OpenClose bool `json:"openClose"`
+	// 1 = Full, 2 = Incremental
+	Change            int  `json:"change"`
+	WillSave          bool `json:"willSave"`
+	WillSaveWaitUntil bool `json:"willSaveWaitUntil"`
+	Save              *struct {
+		IncludeText bool `json:"includeText"`
+	} `json:"save,omitempty"`
+}
+
+type ServerCapabilities struct {
+	TextDocumentSync   TextDocumentSyncOptions `json:"textDocumentSync"`
+	HoverProvider      bool                    `json:"hoverProvider"`
+	DefinitionProvider bool                    `json:"definitionProvider"`
+	CompletionProvider *struct {
+		TriggerCharacters []string `json:"triggerCharacters"`
+	} `json:"completionProvider,omitempty"`
+	DocumentSymbolProvider          bool `json:"documentSymbolProvider"`
+	ReferencesProvider              bool `json:"referencesProvider"`
+	WorkspaceSymbolProvider         bool `json:"workspaceSymbolProvider"`
+	DocumentFormattingProvider      bool `json:"documentFormattingProvider"`
+	DocumentRangeFormattingProvider bool `json:"documentRangeFormattingProvider"`
+	SignatureHelpProvider           *struct {
+		TriggerCharacters   []string `json:"triggerCharacters"`
+		RetriggerCharacters []string `json:"retriggerCharacters"`
+	} `json:"signatureHelpProvider,omitempty"`
+	SemanticTokensProvider *struct {
+		Legend struct {
+			TokenTypes     []string `json:"tokenTypes"`
+			TokenModifiers []string `json:"tokenModifiers"`
+		} `json:"legend"`
+		Full  bool `json:"full"`
+		Range bool `json:"range"`
+	} `json:"semanticTokensProvider,omitempty"`
+	FoldingRangeProvider bool `json:"foldingRangeProvider"`
+}
+
+type InitializeResult struct {
+	Capabilities ServerCapabilities `json:"capabilities"`
+	ServerInfo   map[string]string  `json:"serverInfo,omitempty"`
+}
+
+// ----- Diagnostics -----
+
+type Diagnostic struct {
+	Range    Range  `json:"range"`
+	Severity int    `json:"severity,omitempty"` // 1 = Error
+	Code     string `json:"code,omitempty"`
+	Source   string `json:"source,omitempty"`
+	Message  string `json:"message"`
+}
+
+type PublishDiagnosticsParams struct {
+	URI         string       `json:"uri"`
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
+// ----- Hover -----
+
+type Hover struct {
+	Contents MarkupContent `json:"contents"`
+	Range    *Range        `json:"range,omitempty"`
+}
+
+type MarkupContent struct {
+	Kind  string `json:"kind"`  // "plaintext" or "markdown"
+	Value string `json:"value"` // content
+}
+
+// ----- Completion -----
+
+type CompletionItem struct {
+	Label            string `json:"label"`
+	Kind             int    `json:"kind,omitempty"`
+	Detail           string `json:"detail,omitempty"`
+	InsertText       string `json:"insertText,omitempty"`
+	InsertTextFormat int    `json:"insertTextFormat,omitempty"`
+}
+
+// ----- Document symbols -----
+
+type DocumentSymbol struct {
+	Name           string           `json:"name"`
+	Detail         string           `json:"detail,omitempty"`
+	Kind           int              `json:"kind"`
+	Range          Range            `json:"range"`
+	SelectionRange Range            `json:"selectionRange"`
+	Children       []DocumentSymbol `json:"children,omitempty"`
+}
+
+// ----- Semantic tokens -----
+
+type SemanticTokensParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+type SemanticTokensRangeParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Range        Range                  `json:"range"`
+}
+
+type SemanticTokens struct {
+	Data []uint32 `json:"data"`
+}
+
+// ----- Folding ranges -----
+
+type FoldingRange struct {
+	StartLine      int     `json:"startLine"`
+	StartCharacter *int    `json:"startCharacter,omitempty"`
+	EndLine        int     `json:"endLine"`
+	EndCharacter   *int    `json:"endCharacter,omitempty"`
+	Kind           *string `json:"kind,omitempty"` // "region", "comment"
+}
+
+// ----- Signature help -----
+
+type SignatureHelpParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+}
+
+type SignatureHelp struct {
+	Signatures      []SignatureInformation `json:"signatures"`
+	ActiveSignature int                    `json:"activeSignature"`
+	ActiveParameter int                    `json:"activeParameter"`
+}
+
+type SignatureInformation struct {
+	Label         string                 `json:"label"`
+	Documentation *MarkupContent         `json:"documentation,omitempty"`
+	Parameters    []ParameterInformation `json:"parameters,omitempty"`
+}
+
+type ParameterInformation struct {
+	Label         string         `json:"label"`
+	Documentation *MarkupContent `json:"documentation,omitempty"`
+}
+=== END FILE: cmd/msg-lsp/protocol.go ===
 

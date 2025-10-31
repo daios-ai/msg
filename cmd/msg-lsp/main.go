@@ -1,4 +1,23 @@
 // cmd/lsp/main.go
+//
+// ROLE: Executable entrypoint and JSON-RPC dispatch loop.
+//
+// What lives here
+//   • Process startup and server construction.
+//   • Framed JSON-RPC read loop from stdin and write to stdout.
+//   • Method routing: decode → switch on req.Method → delegate to server
+//     handlers in features.go / core.go.
+//   • Minimal lifecycle handling (initialize/shutdown/exit).
+//
+// What does NOT live here
+//   • No language features, no text analysis, no diagnostics computation,
+//     no document state. Keep this file small so it’s easy to test/replace
+//     the transport without touching feature logic.
+//
+// Why this separation
+//   • Clear boundary between transport concerns and language intelligence.
+//   • Enables reuse of the server with different frontends/transports.
+
 package main
 
 import (

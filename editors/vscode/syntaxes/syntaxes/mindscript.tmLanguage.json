@@ -3,7 +3,6 @@
   "scopeName": "source.mindscript",
   "patterns": [
     { "include": "#comments" },
-    { "include": "#annotations" },
     { "include": "#strings" },
     { "include": "#numbers" },
     { "include": "#keywords" },
@@ -13,13 +12,7 @@
   "repository": {
     "comments": {
       "patterns": [
-        { "name": "comment.line.number-sign.mindscript", "match": "##.*$" }
-      ]
-    },
-    "annotations": {
-      "patterns": [
-        { "name": "markup.quote.annotation.mindscript", "begin": "^[ \\t]*#(?!#)", "end": "$" },
-        { "name": "comment.block.annotation.mindscript", "begin": "#\\(", "end": "\\)" } 
+        { "name": "comment.line.number-sign.mindscript",  "begin": "#", "end": "$" }
       ]
     },
     "strings": {

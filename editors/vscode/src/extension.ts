@@ -56,3 +56,4 @@ export async function activate(context: vscode.ExtensionContext) {
 export async function deactivate() {
   await client?.stop();
 }
+

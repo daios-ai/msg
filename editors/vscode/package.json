@@ -15,7 +15,7 @@
     "languages": [
       {
         "id": "mindscript",
-        "aliases": ["MindScript", "mindscript"],
+        "aliases": ["MindScript"],
         "extensions": [".ms"],
         "configuration": "./language-configuration.json"
       }
@@ -38,6 +38,21 @@
           "type": "string",
           "default": "bin/msg-lsp",
           "markdownDescription": "Relative path (inside the extension folder) to the MindScript LSP server binary. If not found, the extension falls back to `msg-lsp` on your system PATH."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[mindscript]": {
+        "editor.semanticTokenColorCustomizations": {
+          "enabled": true,
+          "rules": {
+            "bracket:b0": { "foreground": "#C792EA" },
+            "bracket:b1": { "foreground": "#82AAFF" },
+            "bracket:b2": { "foreground": "#89DDFF" },
+            "bracket:b3": { "foreground": "#ADDB67" },
+            "bracket:b4": { "foreground": "#FFD700" },
+            "bracket:b5": { "foreground": "#F78C6C" }
+          }
         }
       }
     }

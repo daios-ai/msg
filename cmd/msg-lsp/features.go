@@ -1,4 +1,36 @@
 // cmd/lsp/features.go
+//
+// ROLE: LSP feature implementations built on top of the caches/utilities from
+//       core.go. Converts editor requests into language answers.
+//
+// What lives here
+//   • Handlers for LSP methods:
+//        - initialize: advertise capabilities and token legends.
+//        - text sync (didOpen/didChange): update docState and trigger analyze.
+//        - language features: hover, definition, references, completion,
+//          document symbols, semantic tokens (full/range), signature help,
+//          folding ranges.
+//   • Heuristics that read docState (tokens, AST, spans, symbols) and format
+//     LSP-shaped responses. Where useful, consults server.ip to surface
+//     metadata about built-ins (e.g., function signatures) — without executing
+//     user code. The optional listBindings() call asks for a visible env via a
+//     userland `getEnv()` only if present.
+//
+// What does NOT live here
+//   • No transport framing or JSON-RPC loop (see main.go).
+//   • No core text/position math or analysis pipeline (see core.go).
+//   • No interpreter internals or VM usage; feature logic relies on lexer/parser
+//     output and cached spans. Interpreter access is read-only for metadata.
+//
+// Why this separation
+//   • Keeps feature code declarative and testable.
+//   • Allows core analysis to evolve without touching user-visible features.
+//
+// Dependencies
+//   • Consumes helpers/types from core.go and protocol.go.
+//   • May read from s.ip.Global to describe built-ins; otherwise operates purely
+//     on statically computed tokens/AST/symbols.
+
 package main
 
 import (
@@ -18,7 +50,8 @@ import (
 func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
 	// Keep the token legend order in sync with semTypes in core.go
 	legendTypes := []string{
-		"keyword", "function", "type", "variable", "property", "string", "number", "comment",
+		"keyword", "function", "type", "variable", "property",
+		"string", "number", "comment", "bracket",
 	}
 
 	semProv := &struct {
@@ -30,7 +63,7 @@ func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
 		Range bool `json:"range"`
 	}{Full: true, Range: true}
 	semProv.Legend.TokenTypes = legendTypes
-	semProv.Legend.TokenModifiers = []string{}
+	semProv.Legend.TokenModifiers = []string{"b0", "b1", "b2", "b3", "b4", "b5"}
 
 	result := InitializeResult{
 		Capabilities: ServerCapabilities{
@@ -510,18 +543,6 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 		return nil
 	}
 
-	cspans := commentSpans(doc)
-
-	isInComment := func(sOff, eOff int) bool {
-		se := [2]int{sOff, eOff}
-		for _, c := range cspans {
-			if overlaps(se, c) {
-				return true
-			}
-		}
-		return false
-	}
-
 	entries := []semEntry{}
 
 	// Emit code tokens, skipping anything inside comment spans.
@@ -530,12 +551,17 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 
 	for i := 0; i < len(doc.tokens); i++ {
 		tk := doc.tokens[i]
+		// Spans: treat annotations like string literals — rely on exact lexer span only.
+		var sOff, eOff int
 		if tk.Type == mindscript.ANNOTATION {
-			// the whole annotation region already colored as comment
-			continue
+			if !hasValidSpan(tk, len(doc.text)) {
+				// Requirement: ignore annotations without a concrete byte span.
+				continue
+			}
+			sOff, eOff = tk.StartByte, tk.EndByte
+		} else {
+			sOff, eOff = tokenSpan(doc, tk)
 		}
-
-		sOff, eOff := tokenSpan(doc, tk)
 		if eOff <= sOff {
 			// still keep structural depth in sync
 			if tk.Type == mindscript.LCURLY {
@@ -556,18 +582,12 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 			continue
 		}
 
-		if isInComment(sOff, eOff) {
-			// maintain depth across comments
-			if tk.Type == mindscript.LCURLY {
-				braceDepth++
-			} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
-				braceDepth--
-			}
-			continue
-		}
-
 		typIdx := -1
 		switch {
+		case tk.Type == mindscript.ANNOTATION:
+			// Paint comments green (semantic “comment”).
+			typIdx = semTypes["comment"]
+
 		case isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN:
 			typIdx = semTypes["keyword"]
 

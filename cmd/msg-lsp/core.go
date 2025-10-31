@@ -1,4 +1,44 @@
 // cmd/lsp/core.go
+//
+// ROLE: Shared infrastructure for the LSP server: transport helpers, server
+//       state, text/position math, diagnostics, token/span utilities, and the
+//       analysis pipeline (lex + parse + symbol extraction).
+//
+// What lives here
+//   • Transport helpers for framed stdio (Content-Length) and convenience
+//     send/notify wrappers (used by handlers).
+//   • Server model:
+//        - server: global state (open docs, mutex, interpreter handle).
+//        - docState: per-document caches (raw text, line starts, tokens, AST,
+//          span index, lightweight symbol table).
+//   • Unicode/UTF-16 column math and byte↔position conversions consistent with
+//     the LSP spec (positions are UTF-16 code units).
+//   • Diagnostics plumbing: mapping lexer/parser errors to LSP ranges and
+//     publishing them, including “incomplete” heuristics for on-type feedback.
+//   • Token & span helpers: locate tokens at offsets, compute exact byte spans,
+//     comment/annotation region detection for semantic tokens & folding.
+//   • Analysis pipeline (`analyze`):
+//        1) Lex (interactive), 2) Parse (interactive), 3) Collect top-level
+//           symbols (no code execution), 4) Publish/clear diagnostics.
+//     Results populate docState so feature handlers can be fast and side-effect-free.
+//
+// What does NOT live here
+//   • No LSP feature handlers themselves (hover, completion, etc.).
+//   • No business rules about how to format responses—handlers own that.
+//   • No interpreter-driven execution of user code. (We only build tokens/AST
+//     and extract symbols; see features.go for the optional, guarded lookup of
+//     global/builtin metadata.)
+//
+// Why this separation
+//   • Centralizes shared mechanics so features stay small and consistent.
+//   • Makes unit testing of text math and analysis independent of UI features.
+//
+// Dependencies
+//   • Relies on internal/mindscript lexer & parser (no VM/interpreter internals).
+//   • Holds an *Interpreter pointer only for feature-level metadata queries;
+//     core analysis itself does not execute user programs.
+
+// cmd/lsp/core.go
 package main
 
 import (
@@ -14,189 +54,6 @@ import (
 
 	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
 )
-
-////////////////////////////////////////////////////////////////////////////////
-// LSP protocol types (wire structs)
-////////////////////////////////////////////////////////////////////////////////
-
-type Position struct {
-	Line      int `json:"line"`
-	Character int `json:"character"` // UTF-16 code units
-}
-
-type Range struct {
-	Start Position `json:"start"`
-	End   Position `json:"end"`
-}
-
-type Location struct {
-	URI   string `json:"uri"`
-	Range Range  `json:"range"`
-}
-
-type TextDocumentIdentifier struct {
-	URI string `json:"uri"`
-}
-
-type TextDocumentItem struct {
-	URI        string `json:"uri"`
-	LanguageID string `json:"languageId"`
-	Version    int    `json:"version"`
-	Text       string `json:"text"`
-}
-
-type TextDocumentContentChangeEvent struct {
-	Range       *Range `json:"range,omitempty"`
-	RangeLength int    `json:"rangeLength,omitempty"`
-	Text        string `json:"text"`
-}
-
-type InitializeParams struct {
-	Capabilities any    `json:"capabilities"`
-	RootURI      string `json:"rootUri,omitempty"`
-}
-
-type TextDocumentSyncOptions struct {
-	OpenClose bool `json:"openClose"`
-	// 1 = Full, 2 = Incremental
-	Change            int  `json:"change"`
-	WillSave          bool `json:"willSave"`
-	WillSaveWaitUntil bool `json:"willSaveWaitUntil"`
-	Save              *struct {
-		IncludeText bool `json:"includeText"`
-	} `json:"save,omitempty"`
-}
-
-type ServerCapabilities struct {
-	TextDocumentSync   TextDocumentSyncOptions `json:"textDocumentSync"`
-	HoverProvider      bool                    `json:"hoverProvider"`
-	DefinitionProvider bool                    `json:"definitionProvider"`
-	CompletionProvider *struct {
-		TriggerCharacters []string `json:"triggerCharacters"`
-	} `json:"completionProvider,omitempty"`
-	DocumentSymbolProvider          bool `json:"documentSymbolProvider"`
-	ReferencesProvider              bool `json:"referencesProvider"`
-	WorkspaceSymbolProvider         bool `json:"workspaceSymbolProvider"`
-	DocumentFormattingProvider      bool `json:"documentFormattingProvider"`
-	DocumentRangeFormattingProvider bool `json:"documentRangeFormattingProvider"`
-	SignatureHelpProvider           *struct {
-		TriggerCharacters   []string `json:"triggerCharacters"`
-		RetriggerCharacters []string `json:"retriggerCharacters"`
-	} `json:"signatureHelpProvider,omitempty"`
-	SemanticTokensProvider *struct {
-		Legend struct {
-			TokenTypes     []string `json:"tokenTypes"`
-			TokenModifiers []string `json:"tokenModifiers"`
-		} `json:"legend"`
-		Full  bool `json:"full"`
-		Range bool `json:"range"`
-	} `json:"semanticTokensProvider,omitempty"`
-	FoldingRangeProvider bool `json:"foldingRangeProvider"`
-}
-
-type InitializeResult struct {
-	Capabilities ServerCapabilities `json:"capabilities"`
-	ServerInfo   map[string]string  `json:"serverInfo,omitempty"`
-}
-
-type Request struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
-type Response struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Result  any             `json:"result,omitempty"`
-	Error   *ResponseError  `json:"error,omitempty"`
-}
-
-type ResponseError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-type Diagnostic struct {
-	Range    Range  `json:"range"`
-	Severity int    `json:"severity,omitempty"` // 1 = Error
-	Code     string `json:"code,omitempty"`
-	Source   string `json:"source,omitempty"`
-	Message  string `json:"message"`
-}
-
-type PublishDiagnosticsParams struct {
-	URI         string       `json:"uri"`
-	Diagnostics []Diagnostic `json:"diagnostics"`
-}
-
-type Hover struct {
-	Contents MarkupContent `json:"contents"`
-	Range    *Range        `json:"range,omitempty"`
-}
-
-type MarkupContent struct {
-	Kind  string `json:"kind"`  // "plaintext" or "markdown"
-	Value string `json:"value"` // content
-}
-
-type CompletionItem struct {
-	Label            string `json:"label"`
-	Kind             int    `json:"kind,omitempty"`
-	Detail           string `json:"detail,omitempty"`
-	InsertText       string `json:"insertText,omitempty"`
-	InsertTextFormat int    `json:"insertTextFormat,omitempty"`
-}
-
-type DocumentSymbol struct {
-	Name           string           `json:"name"`
-	Detail         string           `json:"detail,omitempty"`
-	Kind           int              `json:"kind"`
-	Range          Range            `json:"range"`
-	SelectionRange Range            `json:"selectionRange"`
-	Children       []DocumentSymbol `json:"children,omitempty"`
-}
-
-type SemanticTokensParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-}
-
-type SemanticTokensRangeParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Range        Range                  `json:"range"`
-}
-
-type SemanticTokens struct {
-	Data []uint32 `json:"data"`
-}
-
-type FoldingRange struct {
-	StartLine      int     `json:"startLine"`
-	StartCharacter *int    `json:"startCharacter,omitempty"`
-	EndLine        int     `json:"endLine"`
-	EndCharacter   *int    `json:"endCharacter,omitempty"`
-	Kind           *string `json:"kind,omitempty"` // "region", "comment"
-}
-
-type SignatureHelpParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     Position               `json:"position"`
-}
-type SignatureHelp struct {
-	Signatures      []SignatureInformation `json:"signatures"`
-	ActiveSignature int                    `json:"activeSignature"`
-	ActiveParameter int                    `json:"activeParameter"`
-}
-type SignatureInformation struct {
-	Label         string                 `json:"label"`
-	Documentation *MarkupContent         `json:"documentation,omitempty"`
-	Parameters    []ParameterInformation `json:"parameters,omitempty"`
-}
-type ParameterInformation struct {
-	Label         string         `json:"label"`
-	Documentation *MarkupContent `json:"documentation,omitempty"`
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Transport (stdio framing) + send/notify
@@ -458,6 +315,12 @@ func u16Len(s string) int {
 		}
 	}
 	return n
+}
+
+// hasValidSpan reports whether the lexer provided concrete byte offsets.
+// Used for ANNOTATION tokens which must have StartByte/EndByte or be ignored.
+func hasValidSpan(t mindscript.Token, textLen int) bool {
+	return t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= textLen
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -745,75 +608,22 @@ func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
 
 // comment/annotation spans used by semantic tokens & folding.
 func commentSpans(doc *docState) [][2]int {
-	text := doc.text
 	spans := [][2]int{}
-
-	// ANNOTATION tokens from the lexer
+	if doc == nil {
+		return spans
+	}
+	// Source of truth: lexer ANNOTATION tokens only, and only when they carry a valid span.
 	for _, tk := range doc.tokens {
-		if tk.Type == mindscript.ANNOTATION {
-			s, e := tokenSpan(doc, tk)
-			if e > s {
-				spans = append(spans, [2]int{s, e})
-			}
-		}
-	}
-
-	// Build STRING spans once to avoid false-positive inline "#(" inside strings.
-	stringSpans := [][2]int{}
-	for _, tk := range doc.tokens {
-		if tk.Type == mindscript.STRING {
-			s, e := tokenSpan(doc, tk)
-			if e > s {
-				stringSpans = append(stringSpans, [2]int{s, e})
-			}
-		}
-	}
-	inString := func(off int) bool {
-		for _, sp := range stringSpans {
-			if off >= sp[0] && off < sp[1] {
-				return true
-			}
-		}
-		return false
-	}
-
-	// Lines whose first non-space is '#' or '##'
-	for li := 0; li < len(doc.lines); li++ {
-		lo := doc.lines[li]
-		hi := len(text)
-		if li+1 < len(doc.lines) {
-			hi = doc.lines[li+1]
-		}
-		line := text[lo:hi]
-		trim := strings.TrimLeft(line, " \t")
-		if len(trim) == 0 {
+		if tk.Type != mindscript.ANNOTATION {
 			continue
 		}
-		if strings.HasPrefix(trim, "##") || strings.HasPrefix(trim, "#") {
-			spans = append(spans, [2]int{lo, hi})
-		}
-	}
-
-	// Inline "#(" ... ")" (best effort; no nesting)
-	for start := 0; ; {
-		i := strings.Index(text[start:], "#(")
-		if i < 0 {
-			break
-		}
-		i += start
-		// Skip if inside a string literal
-		if inString(i) {
-			start = i + 2
+		if !hasValidSpan(tk, len(doc.text)) {
 			continue
 		}
-		j := strings.IndexByte(text[i+2:], ')')
-		if j < 0 {
-			spans = append(spans, [2]int{i, len(text)})
-			break
+		s, e := tk.StartByte, tk.EndByte
+		if e > s {
+			spans = append(spans, [2]int{s, e})
 		}
-		j = i + 2 + j // inclusive ')'
-		spans = append(spans, [2]int{i, j + 1})
-		start = j + 1
 	}
 	return spans
 }
@@ -967,7 +777,7 @@ func (s *server) analyze(doc *docState) {
 
 // collectTopLevelSymbols walks the AST (root-level only) and extracts symbols:
 //   - let/assign of a simple decl: ("assign", ("decl", name), rhs)
-//   - marks kind "fun" when rhs is ("fun", ...), else "let"
+//   - marks kind "fun" when rhs tag == "fun"; otherwise "let".
 //
 // Ranges are the byte range of the defining identifier token.
 func collectTopLevelSymbols(doc *docState) []symbolDef {

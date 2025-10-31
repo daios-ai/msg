@@ -1,10 +1,40 @@
 package mindscript
 
 import (
+	"fmt"
 	"math"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// Minimal platform-aware library name resolver for tests.
+func lib(which string) string {
+	switch runtime.GOOS {
+	case "darwin":
+		switch which {
+		case "c":
+			return "libSystem.B.dylib"
+		case "m":
+			return "libm.dylib"
+		}
+	case "linux":
+		switch which {
+		case "c":
+			return "libc.so.6"
+		case "m":
+			return "libm.so.6"
+		}
+	case "windows":
+		// CRT provides C + math. Prefer universal CRT.
+		switch which {
+		case "c", "m":
+			return "ucrtbase.dll"
+		}
+	}
+	// Fallback: return the key if we don't know it.
+	return which
+}
 
 // ===== Tiny helpers for a compact spec-compliance matrix (fixed NewInterpreter usage) =====
 
@@ -48,10 +78,10 @@ func eqi(t *testing.T, want int64, src string) {
 
 func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	t.Run("1.version-string-accepted", func(t *testing.T) {
-		ok(t, `ffiOpen({version:"1", lib:"libc.so.6"})`)
+		ok(t, fmt.Sprintf(`ffiOpen({version:"1", lib:"%s"})`, lib("c")))
 	})
 	t.Run("1.unknown-version-rejected", func(t *testing.T) {
-		err(t, "unsupported version", `ffiOpen({version:"2", lib:"libc.so.6"})`)
+		err(t, "unsupported version", fmt.Sprintf(`ffiOpen({version:"2", lib:"%s"})`, lib("c")))
 	})
 	t.Run("2.missing-lib-rejected", func(t *testing.T) {
 		err(t, "missing or invalid 'lib'", `ffiOpen({version: "1"})`)
@@ -61,75 +91,75 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	})
 
 	t.Run("3.types-empty-ok", func(t *testing.T) {
-		ok(t, `ffiOpen({version: "1", lib:"libc.so.6", types:{}})`)
+		ok(t, fmt.Sprintf(`ffiOpen({version: "1", lib:"%s", types:{}})`, lib("c")))
 	})
 	t.Run("3.types-nonmap-rejected", func(t *testing.T) {
-		err(t, "'types' must be a map", `ffiOpen({version: "1", lib:"libc.so.6", types: 7})`)
+		err(t, "'types' must be a map", fmt.Sprintf(`ffiOpen({version: "1", lib:"%s", types: 7})`, lib("c")))
 	})
 	t.Run("3.types-duplicate-rejected", func(t *testing.T) {
-		err(t, "duplicate type name", `
-			ffiOpen({version: "1", lib:"libc.so.6",
-			  types:{U8:{kind:"int",bits:8,signed:false},U8:{kind:"int",bits:8,signed:false}}})`)
+		err(t, "duplicate type name", fmt.Sprintf(`
+			ffiOpen({version: "1", lib:"%s",
+			  types:{U8:{kind:"int",bits:8,signed:false},U8:{kind:"int",bits:8,signed:false}}})`, lib("c")))
 	})
 
 	t.Run("4.alias-transitive-ok", func(t *testing.T) {
-		ok(t, `
-		  ffiOpen({version: "1", lib:"libc.so.6",
-		    types:{I32:{kind:"int",bits:32,signed:true},X:{kind:"alias",to:"I32"},Y:{kind:"alias",to:"X"}}})`)
+		ok(t, fmt.Sprintf(`
+		  ffiOpen({version: "1", lib:"%s",
+		    types:{I32:{kind:"int",bits:32,signed:true},X:{kind:"alias",to:"I32"},Y:{kind:"alias",to:"X"}}})`, lib("c")))
 	})
 	t.Run("4.alias-unknown-target", func(t *testing.T) {
-		err(t, "unknown target", `
-		  ffiOpen({version: "1", lib:"libc.so.6",types:{X:{kind:"alias",to:"NOPE"}}})`)
+		err(t, "unknown target", fmt.Sprintf(`
+		  ffiOpen({version: "1", lib:"%s",types:{X:{kind:"alias",to:"NOPE"}}})`, lib("c")))
 	})
 	t.Run("4.alias-cycle", func(t *testing.T) {
-		err(t, "alias cycle", `
-		  ffiOpen({version: "1", lib:"libc.so.6",types:{A:{kind:"alias",to:"B"},B:{kind:"alias",to:"A"}}})`)
+		err(t, "alias cycle", fmt.Sprintf(`
+		  ffiOpen({version: "1", lib:"%s",types:{A:{kind:"alias",to:"B"},B:{kind:"alias",to:"A"}}})`, lib("c")))
 	})
 
 	// 5) int-signedness enforced on call (reject negative → unsigned)
 	t.Run("5.int-signedness-enforced-on-call", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`)
+		_, err := ip.EvalSource(fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`, lib("c")))
 		if err == nil {
 			t.Fatalf("expected failure for negative→unsigned")
 		}
 	})
 
 	t.Run("6.float-bits-validated", func(t *testing.T) {
-		err(t, "float: bits must be 32/64", `
-			ffiOpen({version: "1", lib:"libc.so.6", types:{BadF:{kind:"float",bits:128}}})`)
+		err(t, "float: bits must be 32/64", fmt.Sprintf(`
+			ffiOpen({version: "1", lib:"%s", types:{BadF:{kind:"float",bits:128}}})`, lib("c")))
 	})
 
 	t.Run("7.pointer-size-align", func(t *testing.T) {
-		eqi(t, 8, `let C=ffiOpen({version: "1",lib:"libc.so.6",
-		 types:{P:{kind:"pointer",to:{kind:"void"}}}}); C.__mem.sizeof("P")`)
+		eqi(t, 8, fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s",
+		 types:{P:{kind:"pointer",to:{kind:"void"}}}}); C.__mem.sizeof("P")`, lib("c")))
 	})
 	t.Run("7.pointer-align", func(t *testing.T) {
-		eqi(t, 8, `let C=ffiOpen({version: "1",lib:"libc.so.6",
-		 types:{P:{kind:"pointer",to:{kind:"void"}}}}); C.__mem.alignof("P")`)
+		eqi(t, 8, fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s",
+		 types:{P:{kind:"pointer",to:{kind:"void"}}}}); C.__mem.alignof("P")`, lib("c")))
 	})
 
 	t.Run("8.handle-tag-required", func(t *testing.T) {
-		err(t, `missing "rep"`, `
-		  ffiOpen({version: "1",lib:"libc.so.6",types:{H:{kind:"handle",tag:"x"}}})`)
+		err(t, `missing "rep"`, fmt.Sprintf(`
+		  ffiOpen({version: "1",lib:"%s",types:{H:{kind:"handle",tag:"x"}}})`, lib("c")))
 	})
 
 	t.Run("9.array-fixed-size", func(t *testing.T) {
-		eqi(t, 5, `let C=ffiOpen({version: "1",lib:"libc.so.6",
-		  types:{U8:{kind:"int",bits:8,signed:false},A5:{kind:"array",of:"U8",len:5}}}); C.__mem.sizeof("A5")`)
+		eqi(t, 5, fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s",
+		  types:{U8:{kind:"int",bits:8,signed:false},A5:{kind:"array",of:"U8",len:5}}}); C.__mem.sizeof("A5")`, lib("c")))
 	})
 	t.Run("9.array-flexible-size0", func(t *testing.T) {
-		eqi(t, 0, `let C=ffiOpen({version: "1",lib:"libc.so.6",
-		  types:{U8:{kind:"int",bits:8,signed:false},Flex:{kind:"array",of:"U8"}}}); C.__mem.sizeof("Flex")`)
+		eqi(t, 0, fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s",
+		  types:{U8:{kind:"int",bits:8,signed:false},Flex:{kind:"array",of:"U8"}}}); C.__mem.sizeof("Flex")`, lib("c")))
 	})
 
 	// 10) struct layout: offsetof
 	t.Run("10.struct-layout-offset", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
+		v, err := ip.EvalSource(fmt.Sprintf(`do
+	  let C=ffiOpen({version: "1",lib:"%s",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
 	  C.__mem.offsetof("S","p")
-	end`)
+	end`, lib("c")))
 		if err != nil {
 			t.Fatalf("eval error: %v", err)
 		}
@@ -141,10 +171,10 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	// 10) struct layout: sizeof/alignof
 	t.Run("10.struct-size-align", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
+		v, err := ip.EvalSource(fmt.Sprintf(`do
+	  let C=ffiOpen({version: "1",lib:"%s",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},S:{kind:"struct",fields:[{name:"a",type:"I32"},{name:"p",type:"P"}]}}})
 	  {sz:C.__mem.sizeof("S"), al:C.__mem.alignof("S")}
-	end`)
+	end`, lib("c")))
 		if err != nil {
 			t.Fatalf("eval error: %v", err)
 		}
@@ -157,10 +187,10 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	// 11) union size/align = max(member)
 	t.Run("11.union-size-align", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},U:{kind:"union",fields:[{name:"x",type:"I32"},{name:"y",type:"P"}]}}})
+		v, err := ip.EvalSource(fmt.Sprintf(`do
+	  let C=ffiOpen({version: "1",lib:"%s",types:{I32:{kind:"int",bits:32,signed:true},P:{kind:"pointer",to:{kind:"void"}},U:{kind:"union",fields:[{name:"x",type:"I32"},{name:"y",type:"P"}]}}})
 	  {sz:C.__mem.sizeof("U"), al:C.__mem.alignof("U")}
-	end`)
+	end`, lib("c")))
 		if err != nil {
 			t.Fatalf("eval error: %v", err)
 		}
@@ -171,96 +201,96 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	})
 
 	t.Run("12.enum-base-required", func(t *testing.T) {
-		err(t, `missing "base"`, `
-		  ffiOpen({version: "1",lib:"libc.so.6",types:{E:{kind:"enum"}}})`)
+		err(t, `missing "base"`, fmt.Sprintf(`
+		  ffiOpen({version: "1",lib:"%s",types:{E:{kind:"enum"}}})`, lib("c")))
 	})
 
 	t.Run("13.funcptr-accepted-as-type", func(t *testing.T) {
-		ok(t, `ffiOpen({version: "1",lib:"libc.so.6",
-		  types:{CB:{kind:"funcptr",ret:{kind:"void"},params:[{kind:"pointer",to:{kind:"void"}}]}}})`)
+		ok(t, fmt.Sprintf(`ffiOpen({version: "1",lib:"%s",
+		  types:{CB:{kind:"funcptr",ret:{kind:"void"},params:[{kind:"pointer",to:{kind:"void"}}]}}})`, lib("c")))
 	})
 
 	t.Run("14.functions-need-name-ret-params", func(t *testing.T) {
-		err(t, "function: missing 'ret'", `
-		  ffiOpen({version: "1",lib:"libc.so.6",functions:[{name:"puts",params:[]}]})`)
+		err(t, "function: missing 'ret'", fmt.Sprintf(`
+		  ffiOpen({version: "1",lib:"%s",functions:[{name:"puts",params:[]}]})`, lib("c")))
 	})
 
 	t.Run("15.dlsym-missing-symbol-errors", func(t *testing.T) {
-		err(t, "dlsym", `
-		  ffiOpen({version: "1",lib:"libc.so.6",
+		err(t, "dlsym", fmt.Sprintf(`
+		  ffiOpen({version: "1",lib:"%s",
 		    types:{i32:{kind:"int",bits:32,signed:true}},
-		    functions:[{name:"__nope__",ret:"i32",params:[]}]})`)
+		    functions:[{name:"__nope__",ret:"i32",params:[]}]})`, lib("c")))
 	})
 
 	t.Run("16.variadic-final-arg-must-array", func(t *testing.T) {
-		err(t, "final argument to be an array", `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		err(t, "final argument to be an array", fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},sz:{kind:"int",bits:64,signed:false},i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"snprintf",ret:"i32",params:["charp","sz","charp"],variadic:true}]});
-		  C.snprintf(C.__mem.malloc(8),7,"%d", 1)`)
+		  C.snprintf(C.__mem.malloc(8),7,"%%d", 1)`, lib("c")))
 	})
 
 	// 17) scalar: negative → unsigned rejected
 	t.Run("17.scalar-negative-to-unsigned-rejected", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`)
+		_, err := ip.EvalSource(fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s",types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]}); C.sleep(-1)`, lib("c")))
 		if err == nil {
 			t.Fatalf("expected failure for negative→unsigned")
 		}
 	})
 
 	t.Run("17.float-to-int-must-be-integral", func(t *testing.T) {
-		err(t, "non-integral", `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		err(t, "non-integral", fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{U:{kind:"int",bits:32,signed:false}},functions:[{name:"sleep",ret:{kind:"int",bits:32,signed:true},params:["U"]}]});
-		  C.sleep(0.5)`)
+		  C.sleep(0.5)`, lib("c")))
 	})
 
 	t.Run("18.pointer-null-maps-to-NULL", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{voidp:{kind:"pointer",to:{kind:"void"}},i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"memchr",ret:"voidp",params:["voidp","i32",{kind:"int",bits:64,signed:false}]}]});
-		  C.memchr(null,0,0)`)
+		  C.memchr(null,0,0)`, lib("c")))
 	})
 
 	t.Run("19.string-bridge-only-for-charp", func(t *testing.T) {
-		err(t, "expected pointer handle", `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		err(t, "expected pointer handle", fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{voidp:{kind:"pointer",to:{kind:"void"}},i32:{kind:"int",bits:32,signed:true}},
 		    functions:[{name:"memchr",ret:"voidp",params:["voidp","i32",{kind:"int",bits:64,signed:false}]}]});
-		  C.memchr("abc",65,3)`)
+		  C.memchr("abc",65,3)`, lib("c")))
 	})
 
 	t.Run("20.return-pointer-becomes-handle", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}}},
 		    functions:[{name:"getenv",ret:"charp",params:["charp"]}]});
-		  C.getenv("PATH")`)
+		  C.getenv("PATH")`, lib("c")))
 	})
 
 	// 21) ret_as_str valid only for char*/uchar* (must error for non-char*)
 	t.Run("21.ret_as_str-valid-only-for-charp", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`ffiOpen({version: "1",lib:"libc.so.6",types:{I32:{kind:"int",bits:32,signed:true}},functions:[{name:"getpid",ret:"I32",params:[],ret_as_str:true}]})`)
+		_, err := ip.EvalSource(fmt.Sprintf(`ffiOpen({version: "1",lib:"%s",types:{I32:{kind:"int",bits:32,signed:true}},functions:[{name:"getpid",ret:"I32",params:[],ret_as_str:true}]})`, lib("c")))
 		if err == nil {
 			t.Fatalf("expected error: ret_as_str on non-char*")
 		} // spec requires rejection
 	})
 
 	t.Run("22.variables-get-set-addr", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{i32:{kind:"int",bits:32,signed:true}},
 		    variables:[{name:"errno",type:"i32"}]});
-		  C.errno.get(); C.errno.addr(); C.errno.set(0)`)
+		  C.errno.get(); C.errno.addr(); C.errno.set(0)`, lib("c")))
 	})
 
 	// 23) sizeof/alignof/offsetof accept inline type objects
 	t.Run("23.sizeof-alignof-offsetof-accept-inline", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		v, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6"}); C.__mem.sizeof({kind:"pointer",to:{kind:"void"}})`)
+		v, err := ip.EvalSource(fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s"}); C.__mem.sizeof({kind:"pointer",to:{kind:"void"}})`, lib("c")))
 		if err != nil {
 			t.Fatalf("eval error: %v", err)
 		}
@@ -270,40 +300,40 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	})
 
 	t.Run("24.typeof-normalizes", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6"});
-		  let T=C.__mem.typeof({kind:"int",bits:32,signed:true}); T`)
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s"});
+		  let T=C.__mem.typeof({kind:"int",bits:32,signed:true}); T`, lib("c")))
 	})
 
 	t.Run("25.new-fixed-alloc-size", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",types:{I:{kind:"int",bits:32,signed:true}}});
-		  C.__mem.new("I",1)`)
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",types:{I:{kind:"int",bits:32,signed:true}}});
+		  C.__mem.new("I",1)`, lib("c")))
 	})
 
 	// 26) malloc/calloc/realloc/free: negatives are errors (no message coupling)
 	t.Run("26.malloc-calloc-realloc-free-guards", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		_, err := ip.EvalSource(`let C=ffiOpen({version: "1",lib:"libc.so.6"}); C.__mem.malloc(-1)`)
+		_, err := ip.EvalSource(fmt.Sprintf(`let C=ffiOpen({version: "1",lib:"%s"}); C.__mem.malloc(-1)`, lib("c")))
 		if err == nil {
 			t.Fatalf("expected error on negative size")
 		}
 	})
 
 	t.Run("27.cast-retags-pointer", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6",
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s",
 		    types:{Voidp:{kind:"pointer",to:{kind:"void"}},I8:{kind:"int",bits:8,signed:true},Charp:{kind:"pointer",to:"I8"}}});
-		  let p=C.__mem.malloc(1); C.__mem.cast("Charp", p)`)
+		  let p=C.__mem.malloc(1); C.__mem.cast("Charp", p)`, lib("c")))
 	})
 
 	// 28) string(): NUL-terminated path without pointer arithmetic
 	t.Run("28.string-read-nul-or-fixed", func(t *testing.T) {
 		ip, _ := NewInterpreter()
-		v, err := ip.EvalSource(`do
-	  let C=ffiOpen({version: "1",lib:"libc.so.6"})
+		v, err := ip.EvalSource(fmt.Sprintf(`do
+	  let C=ffiOpen({version: "1",lib:"%s"})
 	  let p=C.__mem.malloc(3); C.__mem.copy(p,"hi\u0000",3); C.__mem.string(p,null)
-	end`)
+	end`, lib("c")))
 		if err != nil {
 			t.Fatalf("eval error: %v", err)
 		}
@@ -313,32 +343,32 @@ func Test_FFI_Spec_Compliance_Matrix(t *testing.T) {
 	})
 
 	t.Run("29.copy-fill-basic", func(t *testing.T) {
-		ok(t, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6"}); do
+		ok(t, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s"}); do
 		    let p=C.__mem.malloc(4); C.__mem.fill(p,65,4); C.__mem.string(p,4)
-		  end`)
+		  end`, lib("c")))
 	})
 
 	t.Run("30.errno-get-set", func(t *testing.T) {
-		eqi(t, 0, `
-		  let C=ffiOpen({version: "1",lib:"libc.so.6"}); do C.__mem.errno(0) end`)
+		eqi(t, 0, fmt.Sprintf(`
+		  let C=ffiOpen({version: "1",lib:"%s"}); do C.__mem.errno(0) end`, lib("c")))
 	})
 }
 
 // libm: scalar in/out path (dlopen+dlsym, libffi call, float marshalling).
 func Test_Builtin_FFI_libm_hypot(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libm.so.6",
+		  lib: "%s",
 		  types: { double: { kind:"float", bits:64 } },
 		  functions: [
 		    { name:"hypot", ret:"double", params:["double","double"] }
 		  ]
 		})
 		C.hypot(3.0, 4.0)
-	`)
+	`, lib("m")))
 	if v.Tag != VTNum {
 		t.Fatalf("hypot should return Num, got %#v", v)
 	}
@@ -350,10 +380,10 @@ func Test_Builtin_FFI_libm_hypot(t *testing.T) {
 // libc: string param bridge to char*, and ret_as_str for char* return.
 func Test_Builtin_FFI_libc_strlen_and_strdup_ret_as_str(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
 		    int32: { kind:"int", bits:32, signed:true }
@@ -366,7 +396,7 @@ func Test_Builtin_FFI_libc_strlen_and_strdup_ret_as_str(t *testing.T) {
 		let n = C.strlen("hello")
 		let s = C.strdup("world")
 		{ n: n, s: s }
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	n := m.Entries["n"]
 	s := m.Entries["s"]
@@ -381,8 +411,8 @@ func Test_Builtin_FFI_libc_strlen_and_strdup_ret_as_str(t *testing.T) {
 // __mem: raw malloc/copy/string/free round-trip (pointer ops + UTF-8 read).
 func Test_Builtin_FFI___mem_malloc_copy_string_free(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
-		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
+	v := evalWithIP(t, ip, fmt.Sprintf(`
+		let C = ffiOpen({ version: "1", lib:"%s" })
 		do
 			let p = C.__mem.malloc(6)
 			C.__mem.copy(p, "hello", 6)   # copies "hello\0"
@@ -390,7 +420,7 @@ func Test_Builtin_FFI___mem_malloc_copy_string_free(t *testing.T) {
 			C.__mem.free(p)
 			s
 		end
-	`)
+	`, lib("c")))
 	if v.Tag != VTStr || v.Data.(string) != "hello" {
 		t.Fatalf("__mem string round-trip expected 'hello', got %#v", v)
 	}
@@ -399,10 +429,10 @@ func Test_Builtin_FFI___mem_malloc_copy_string_free(t *testing.T) {
 // Layout queries: sizeof/alignof/offsetof for a simple struct (SysV, x86-64).
 func Test_Builtin_FFI___mem_sizeof_alignof_offsetof_struct(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    S: { kind:"struct", fields: [
 		      { name:"a", type:{ kind:"int", bits:32, signed:true } },
@@ -415,7 +445,7 @@ func Test_Builtin_FFI___mem_sizeof_alignof_offsetof_struct(t *testing.T) {
 		  al: C.__mem.alignof("S"),
 		  offp: C.__mem.offsetof("S", "p")
 		}
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	sz := mustInt64(t, m.Entries["sz"])
 	al := mustInt64(t, m.Entries["al"])
@@ -430,16 +460,16 @@ func Test_Builtin_FFI___mem_sizeof_alignof_offsetof_struct(t *testing.T) {
 // Error surface: missing symbol should hard-error with dlsym detail.
 func Test_Builtin_FFI_bad_symbol_errors(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
+	_, err := ip.EvalSource(fmt.Sprintf(`
 		ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: { int32: { kind:"int", bits:32, signed:true } },
 		  functions: [
 		    { name:"__definitely_not_exists__", ret:"int32", params:[] }
 		  ]
 		})
-	`)
+	`, lib("c")))
 	wantErrContains(t, err, "dlsym")
 }
 
@@ -456,10 +486,10 @@ func mustInt64(t *testing.T, v Value) int64 {
 
 func Test_Builtin_FFI_libm_sin_cos_zero(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libm.so.6",
+		  lib: "%s",
 		  types: { dbl: { kind:"float", bits:64 } },
 		  functions: [
 		    { name:"sin", ret:"dbl", params:["dbl"] },
@@ -467,7 +497,7 @@ func Test_Builtin_FFI_libm_sin_cos_zero(t *testing.T) {
 		  ]
 		})
 		{ s: C.sin(0.0), c: C.cos(0.0) }
-	`)
+	`, lib("m")))
 	m := mustMap(t, v)
 	if m.Entries["s"].Tag != VTNum || math.Abs(m.Entries["s"].Data.(float64)) > 1e-12 {
 		t.Fatalf("sin(0)=0, got %#v", m.Entries["s"])
@@ -479,10 +509,10 @@ func Test_Builtin_FFI_libm_sin_cos_zero(t *testing.T) {
 
 func Test_Builtin_FFI_libc_strlen_embedded_nul(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
 		    int32: { kind:"int", bits:32, signed:true }
@@ -491,7 +521,7 @@ func Test_Builtin_FFI_libc_strlen_embedded_nul(t *testing.T) {
 		})
 		# embedded NUL should stop strlen at 2
 		C.strlen("ab\u0000cd")
-	`)
+	`, lib("c")))
 	if v.Tag != VTInt || v.Data.(int64) != 2 {
 		t.Fatalf("strlen('ab\\0cd') expected 2, got %#v", v)
 	}
@@ -499,10 +529,10 @@ func Test_Builtin_FFI_libc_strlen_embedded_nul(t *testing.T) {
 
 func Test_Builtin_FFI_libc_snprintf_variadic(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    size_t: { kind:"int", bits:64, signed:false },
 		    charp:  { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -515,13 +545,13 @@ func Test_Builtin_FFI_libc_snprintf_variadic(t *testing.T) {
 		})
 		do
 			let buf = C.__mem.malloc(64)
-			# snprintf(buf, 64, "%d %.2f", 123, 3.14159)
-			let n = C.snprintf(buf, 64, "%d %.2f", [123, 3.14159])
+			# snprintf(buf, 64, "%%d %%.2f", 123, 3.14159)
+			let n = C.snprintf(buf, 64, "%%d %%.2f", [123, 3.14159])
 			let s = C.__mem.string(buf, null)
 			C.__mem.free(buf)
 			{ n: n, s: s }
 		end
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	if m.Entries["n"].Tag != VTInt || m.Entries["n"].Data.(int64) <= 0 {
 		t.Fatalf("snprintf n should be > 0, got %#v", m.Entries["n"])
@@ -538,10 +568,10 @@ func Test_Builtin_FFI_libc_snprintf_variadic(t *testing.T) {
 
 func Test_Builtin_FFI_libc_getenv_ret_as_str_PATH(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } }
 		  },
@@ -550,7 +580,7 @@ func Test_Builtin_FFI_libc_getenv_ret_as_str_PATH(t *testing.T) {
 		  ]
 		})
 		C.getenv("PATH")
-	`)
+	`, lib("c")))
 	if v.Tag != VTStr || v.Data.(string) == "" {
 		t.Fatalf("getenv('PATH') should return non-empty string, got %#v", v)
 	}
@@ -558,10 +588,10 @@ func Test_Builtin_FFI_libc_getenv_ret_as_str_PATH(t *testing.T) {
 
 func Test_Builtin_FFI_struct_union_nested_layout(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    U: { kind:"union", fields:[
 		      { name:"i", type:{ kind:"int", bits:32, signed:true } },
@@ -576,7 +606,7 @@ func Test_Builtin_FFI_struct_union_nested_layout(t *testing.T) {
 		{ su: C.__mem.sizeof("U"), au: C.__mem.alignof("U"),
 		  ss: C.__mem.sizeof("S"), as: C.__mem.alignof("S"),
 		  offu: C.__mem.offsetof("S","u") }
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	// U: size=max(8,4)=8 align=max(8,4)=8
 	if mustInt64(t, m.Entries["su"]) != 8 || mustInt64(t, m.Entries["au"]) != 8 {
@@ -591,10 +621,10 @@ func Test_Builtin_FFI_struct_union_nested_layout(t *testing.T) {
 
 func Test_Builtin_FFI_variadic_requires_array(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
+	_, err := ip.EvalSource(fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    size_t: { kind:"int", bits:64, signed:false },
 		    charp:  { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -607,27 +637,27 @@ func Test_Builtin_FFI_variadic_requires_array(t *testing.T) {
 		do
 		  let buf = C.__mem.malloc(16)
 		  # ERROR: last arg must be an array for variadic
-		  C.snprintf(buf, 16, "%d %d", 123)
+		  C.snprintf(buf, 16, "%%d %%d", 123)
 		end
-	`)
+	`, lib("c")))
 	wantErrContains(t, err, "variadic function expects final argument to be an array")
 }
 
 func Test_Builtin_FFI___mem_string_len_negative_error(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
-		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
+	_, err := ip.EvalSource(fmt.Sprintf(`
+		let C = ffiOpen({ version: "1", lib:"%s" })
 		C.__mem.string(C.__mem.malloc(1), -5)
-	`)
+	`, lib("c")))
 	wantErrContains(t, err, "len < 0")
 }
 
 func Test_Builtin_FFI_per_symbol_lib_override(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",     # default
+		  lib: "%s",     # default
 		  types: {
 		    int32: { kind:"int", bits:32, signed:true },
 		    dbl:   { kind:"float", bits:64 },
@@ -635,11 +665,11 @@ func Test_Builtin_FFI_per_symbol_lib_override(t *testing.T) {
 		  },
 		  functions: [
 		    { name:"strlen", ret:"int32", params:["charp"] },             # from libc
-		    { name:"cos",    ret:"dbl",   params:["dbl"], lib:"libm.so.6" } # override lib
+		    { name:"cos",    ret:"dbl",   params:["dbl"], lib:"%s" } # override lib
 		  ]
 		})
 		{ n: C.strlen("abc"), c: C.cos(0.0) }
-	`)
+	`, lib("c"), lib("m")))
 	m := mustMap(t, v)
 	if mustInt64(t, m.Entries["n"]) != 3 {
 		t.Fatalf("strlen override expected 3, got %#v", m.Entries["n"])
@@ -651,25 +681,25 @@ func Test_Builtin_FFI_per_symbol_lib_override(t *testing.T) {
 
 func Test_Builtin_FFI_open_close_twice_error(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
-		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
+	_, err := ip.EvalSource(fmt.Sprintf(`
+		let C = ffiOpen({ version: "1", lib:"%s" })
 		C.close()
 		C.close()   # second close should error
-	`)
+	`, lib("c")))
 	wantErrContains(t, err, "already closed")
 }
 
 func Test_Builtin_FFI___types_handles_into_sizeof(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
-		  version: "1", lib:"libc.so.6",
+		  version: "1", lib:"%s",
 		  types:{ X:{ kind:"int", bits:64, signed:true } }
 		})
 		# fetch handle from __types and feed to sizeof
 		let tx = C.__types.X
 		C.__mem.sizeof(tx)
-	`)
+	`, lib("c")))
 	if v.Tag != VTInt || v.Data.(int64) != 8 {
 		t.Fatalf("__types handle into sizeof expected 8, got %#v", v)
 	}
@@ -678,10 +708,10 @@ func Test_Builtin_FFI___types_handles_into_sizeof(t *testing.T) {
 // --- fixed: remove unsupported pipeline/lambda; just validate layout + rc ---
 func Test_Builtin_FFI_clock_gettime_timespec_layout_and_call(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    time_t:   { kind:"int", bits:64, signed:true },
 		    long:     { kind:"int", bits:64, signed:true },
@@ -705,7 +735,7 @@ func Test_Builtin_FFI_clock_gettime_timespec_layout_and_call(t *testing.T) {
 		  let rc = C.clock_gettime(0, p)   # CLOCK_REALTIME = 0
 		  { rc: rc, sz: sz, al: al, off: off_nsec }
 		end
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	if mustInt64(t, m.Entries["sz"]) != 16 ||
 		mustInt64(t, m.Entries["al"]) != 8 ||
@@ -721,10 +751,10 @@ func Test_Builtin_FFI_clock_gettime_timespec_layout_and_call(t *testing.T) {
 // --- fixed: actually declare snprintf in the spec, then pass a negative size_t ---
 func Test_Builtin_FFI_range_errors_int_and_unsigned(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
+	_, err := ip.EvalSource(fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    size_t: { kind:"int", bits:64, signed:false },
 		    charp:  { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
@@ -737,17 +767,17 @@ func Test_Builtin_FFI_range_errors_int_and_unsigned(t *testing.T) {
 		do
 		  let buf = C.__mem.malloc(8)
 		  # size_t with negative should hard-error during marshalling
-		  C.snprintf(buf, -1, "%d", [1])
+		  C.snprintf(buf, -1, "%%d", [1])
 		end
-	`)
+	`, lib("c")))
 	wantErrContains(t, err, "negative")
 }
 
 // --- fixed: no pointer arithmetic; zero-fill full buffer, then copy 5 bytes ---
 func Test_Builtin_FFI___mem_fill_and_copy_bytes(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
-		let C = ffiOpen({ version: "1", lib:"libc.so.6" })
+	v := evalWithIP(t, ip, fmt.Sprintf(`
+		let C = ffiOpen({ version: "1", lib:"%s" })
 		do
 		  let p = C.__mem.malloc(6)
 		  C.__mem.fill(p, 0, 6)         # ensure NUL-termination
@@ -756,7 +786,7 @@ func Test_Builtin_FFI___mem_fill_and_copy_bytes(t *testing.T) {
 		  C.__mem.free(p)
 		  s
 		end
-	`)
+	`, lib("c")))
 	if v.Tag != VTStr || v.Data.(string) != "AAAAA" {
 		t.Fatalf("fill/copy expected 'AAAAA', got %#v", v)
 	}
@@ -765,8 +795,8 @@ func Test_Builtin_FFI___mem_fill_and_copy_bytes(t *testing.T) {
 // --- fixed: avoid inline typeof (its layout isn’t computed); use __types handle ---
 func Test_Builtin_FFI___mem_typeof_inline_and_name(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
-		let C = ffiOpen({ version: "1", lib:"libc.so.6",
+	v := evalWithIP(t, ip, fmt.Sprintf(`
+		let C = ffiOpen({ version: "1", lib:"%s",
 		  types:{ I32:{ kind:"int", bits:32, signed:true } }
 		})
 		do
@@ -774,7 +804,7 @@ func Test_Builtin_FFI___mem_typeof_inline_and_name(t *testing.T) {
 		  let t_handle = C.__types.I32
 		  { a: C.__mem.sizeof("I32"), b: C.__mem.sizeof(t_handle) }
 		end
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	if mustInt64(t, m.Entries["a"]) != 4 || mustInt64(t, m.Entries["b"]) != 4 {
 		t.Fatalf("typeof/sizeof mismatch: got a=%d b=%d", mustInt64(t, m.Entries["a"]), mustInt64(t, m.Entries["b"]))
@@ -784,10 +814,10 @@ func Test_Builtin_FFI___mem_typeof_inline_and_name(t *testing.T) {
 // String bridge control: passing Str to char* still works.
 func Test_Builtin_FFI_string_bridge_charp_control(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
 		    int32: { kind:"int", bits:32, signed:true }
@@ -797,7 +827,7 @@ func Test_Builtin_FFI_string_bridge_charp_control(t *testing.T) {
 		  ]
 		})
 		C.strlen("hello")
-	`)
+	`, lib("c")))
 	if v.Tag != VTInt || v.Data.(int64) != 5 {
 		t.Fatalf("strlen('hello') expected 5, got %#v", v)
 	}
@@ -810,18 +840,18 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 
 	// Build one big source string: prepare M, thrash with many ffiOpen()s, then call M.hypot.
 	var b strings.Builder
-	b.WriteString(`
+	b.WriteString(fmt.Sprintf(`
 		let M = ffiOpen({
 		  version: "1",
-		  lib: "libm.so.6",
+		  lib: "%s",
 		  types: { dbl: { kind:"float", bits:64 } },
 		  functions: [ { name:"hypot", ret:"dbl", params:["dbl","dbl"] } ]
 		});
-	`)
-	thrashSnip := `
+	`, lib("m")))
+	thrashSnip := fmt.Sprintf(`
 		let _ = ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    int32: { kind:"int", bits:32, signed:true },
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } }
@@ -829,7 +859,7 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 		  functions: [ { name:"strlen", ret:"int32", params:["charp"] } ]
 		});
 		0;
-	`
+	`, lib("c"))
 	for i := 0; i < 3000; i++ {
 		b.WriteString(thrashSnip)
 	}
@@ -847,15 +877,15 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 	}
 
 	// Sanity: another call using a fresh program (normal path) still ok.
-	v = evalWithIP(t, ip, `
+	v = evalWithIP(t, ip, fmt.Sprintf(`
 		let M = ffiOpen({
 		  version: "1",
-		  lib: "libm.so.6",
+		  lib: "%s",
 		  types: { dbl: { kind:"float", bits:64 } },
 		  functions: [ { name:"hypot", ret:"dbl", params:["dbl","dbl"] } ]
 		});
 		M.hypot(6.0, 8.0)
-	`)
+	`, lib("m")))
 	if v.Tag != VTNum || math.Abs(v.Data.(float64)-10.0) > 1e-9 {
 		t.Fatalf("hypot(6,8)=10.0 mismatch: %#v", v)
 	}
@@ -863,17 +893,17 @@ func Test_Builtin_FFI_cif_lifetime_thrash_before_first_call(t *testing.T) {
 
 // Version contract: numeric 1 must be rejected; spec requires "1" (string).
 func Test_Builtin_FFI_version_must_be_string(t *testing.T) {
-	err(t, "version", `
-		ffiOpen({ version: 1, lib: "libc.so.6" })
-	`)
+	err(t, "version", fmt.Sprintf(`
+		ffiOpen({ version: 1, lib: "%s" })
+	`, lib("c")))
 }
 
 // Duplicate function names within the same spec must be rejected.
 func Test_Builtin_FFI_duplicate_function_names_rejected(t *testing.T) {
-	err(t, "duplicate", `
+	err(t, "duplicate", fmt.Sprintf(`
 		ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: {
 		    charp: { kind:"pointer", to:{ kind:"int", bits:8, signed:true } },
 		    int32: { kind:"int", bits:32, signed:true }
@@ -883,22 +913,22 @@ func Test_Builtin_FFI_duplicate_function_names_rejected(t *testing.T) {
 		    { name:"puts", ret:"int32", params:["charp"] }  # duplicate
 		  ]
 		})
-	`)
+	`, lib("c")))
 }
 
 // Duplicate variable names within the same spec must be rejected.
 func Test_Builtin_FFI_duplicate_variable_names_rejected(t *testing.T) {
-	err(t, "duplicate", `
+	err(t, "duplicate", fmt.Sprintf(`
 		ffiOpen({
 		  version: "1",
-		  lib: "libc.so.6",
+		  lib: "%s",
 		  types: { int32: { kind:"int", bits:32, signed:true } },
 		  variables: [
 		    { name:"errno", type:"int32" },
 		    { name:"errno", type:"int32" }   # duplicate
 		  ]
 		})
-	`)
+	`, lib("c")))
 }
 
 // Table-driven tests for __mem.gc behavior (attach, detach, errors, realloc carry, idempotence).
@@ -910,8 +940,8 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 	}{
 		{
 			name: "attach free then manual free twice (idempotent)",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  do
 			    let p = C.__mem.malloc(16)
 			    C.__mem.gc(p, "free")
@@ -919,12 +949,12 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 			    C.__mem.free(p)   # second free must be a no-op
 			    0
 			  end
-			`,
+			`, lib("c")),
 		},
 		{
 			name: "detach then free (no destructor invoked)",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  do
 			    let p = C.__mem.malloc(8)
 			    C.__mem.gc(p, "free")
@@ -932,21 +962,21 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 			    C.__mem.free(p)       # plain free succeeds
 			    0
 			  end
-			`,
+			`, lib("c")),
 		},
 		{
 			name:    "custom symbol resolve error surfaces dlsym",
 			wantErr: "dlsym",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  let p = C.__mem.malloc(4)
 			  C.__mem.gc(p, {sym:"__definitely_not_exists__"})
-			`,
+			`, lib("c")),
 		},
 		{
 			name: "realloc carries destructor to new pointer; double free is safe",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  do
 			    let p = C.__mem.malloc(8)
 			    C.__mem.gc(p, "free")
@@ -955,29 +985,29 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 			    C.__mem.free(q)                  # idempotent
 			    0
 			  end
-			`,
+			`, lib("c")),
 		},
 		{
 			name:    "string finalizer must be exactly \"free\"",
 			wantErr: "string finalizer must be \"free\"",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  let p = C.__mem.malloc(1)
 			  C.__mem.gc(p, "close")
-			`,
+			`, lib("c")),
 		},
 		{
 			name:    "first argument must be a pointer handle",
 			wantErr: "pointer handle",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  C.__mem.gc(123, "free")
-			`,
+			`, lib("c")),
 		},
 		{
 			name: "re-attach overwrites finalizer, then detach",
-			src: `
-			  let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+			src: fmt.Sprintf(`
+			  let C = ffiOpen({ version:"1", lib:"%s" })
 			  do
 			    let p = C.__mem.malloc(8)
 			    C.__mem.gc(p, "free")
@@ -988,7 +1018,7 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 			    C.__mem.free(p)
 			    0
 			  end
-			`,
+			`, lib("c")),
 		},
 	}
 
@@ -1005,9 +1035,9 @@ func Test_Builtin_FFI___mem_gc_Table(t *testing.T) {
 
 func Test_FFI_qsort_callback_sorts(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    size_t:{kind:"int",bits:64,signed:false},
 		    voidp:{kind:"pointer",to:{kind:"void"}},
@@ -1032,7 +1062,7 @@ func Test_FFI_qsort_callback_sorts(t *testing.T) {
 		  C.qsort(buf,N,SZ,cmp)
 		  {rc:C.memcmp(buf,exp,BYTES),calls:calls}
 		end
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	if mustInt64(t, m.Entries["rc"]) != 0 {
 		t.Fatalf("memcmp != 0")
@@ -1044,9 +1074,9 @@ func Test_FFI_qsort_callback_sorts(t *testing.T) {
 
 func Test_FFI_callback_captures_and_returns(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C=ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    size_t:{kind:"int",bits:64,signed:false},
 		    voidp:{kind:"pointer",to:{kind:"void"}},
@@ -1066,7 +1096,7 @@ func Test_FFI_callback_captures_and_returns(t *testing.T) {
 		  C.qsort(buf,N,SZ,cmp)
 		  c
 		end
-	`)
+	`, lib("c")))
 	if v.Tag != VTInt || v.Data.(int64) <= 0 {
 		t.Fatalf("callback not invoked, got %#v", v)
 	}
@@ -1083,9 +1113,9 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 		{
 			name: "byvalue_return_struct_div_returns_handle_and_bytes_match",
 			// div(7,3) -> struct div_t { int quot=2; int rem=1; } (SysV/glibc: int32,int32)
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    i32:   {kind:"int",bits:32,signed:true},
 				    Div:   {kind:"struct",fields:[{name:"quot",type:"i32"},{name:"rem",type:"i32"}]},
@@ -1102,7 +1132,7 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 				C.__mem.copy(expect, "\u0002\u0000\u0000\u0000\u0001\u0000\u0000\u0000", 8)
 				{ res: res, eq: C.memcmp(res, expect, 8) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1120,9 +1150,9 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 		{
 			name: "pointer_to_aggregate_param_requires_handle_no_literals",
 			// nanosleep(const struct timespec *req, struct timespec *rem)
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    long: {kind:"int",bits:64,signed:true},
 				    Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
@@ -1132,16 +1162,16 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 				  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
 				})
 				C.nanosleep({ tv_sec:0, tv_nsec:0 }, null)  # MUST error: literal rejected
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, _ Value, err error) {
 				wantErrContains(t, err, "aggregate parameter requires handle")
 			},
 		},
 		{
 			name: "pointer_to_aggregate_param_with_handle_works",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    long: {kind:"int",bits:64,signed:true},
                     Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
@@ -1155,7 +1185,7 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 				  C.__mem.fill(req, 0, C.__mem.sizeof("Timespec"))
 				  C.nanosleep(req, null)                 # should succeed (likely 0)
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1167,14 +1197,14 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 		},
 		{
 			name: "ret_as_str_for_charp_unchanged",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{ charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}} },
 				  functions:[ {name:"getenv", ret:"charp", params:["charp"], ret_as_str:true } ]
 				})
 				C.getenv("PATH")
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1186,9 +1216,9 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 		},
 		{
 			name: "variadic_still_ok_snprintf",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    size_t:{kind:"int",bits:64,signed:false},
 				    charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},
@@ -1199,10 +1229,10 @@ func Test_Builtin_FFI_Aggregates_HandlesOnly_Matrix(t *testing.T) {
 				})
 				do
 				  let buf = C.__mem.malloc(64)
-				  let n = C.snprintf(buf, 64, "%d %.2f", [123, 3.14159])
+				  let n = C.snprintf(buf, 64, "%%d %%.2f", [123, 3.14159])
 				  { n: n, s: C.__mem.string(buf, null) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1237,14 +1267,14 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 	cases := []tc{
 		{
 			name: "read_single_byte_bits_3_from_bit1",
-			src: `
-				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+			src: fmt.Sprintf(`
+				let C = ffiOpen({version:"1", lib:"%s"});
 				do
 				  let p = C.__mem.malloc(1)
 				  C.__mem.fill(p, 214, 1)        # 214 == 0xD6 (1101 0110)
 				  C.__mem.readBits(p, 0, 1, 3, true)   # bits 1..3 -> 0b011 = 3
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1256,8 +1286,8 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 		},
 		{
 			name: "read_crosses_bytes_width8_from_bit4_le",
-			src: `
-				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+			src: fmt.Sprintf(`
+				let C = ffiOpen({version:"1", lib:"%s"});
 				do
 				  let p = C.__mem.malloc(2)
 				  C.__mem.fill(p, 0, 2)
@@ -1267,7 +1297,7 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 				  # Read 8 bits starting at bit 4 → 0x5A = 90
 				  C.__mem.readBits(p, 0, 4, 8, null)
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1279,8 +1309,8 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 		},
 		{
 			name: "write_across_two_bytes_and_verify_split",
-			src: `
-				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+			src: fmt.Sprintf(`
+				let C = ffiOpen({version:"1", lib:"%s"});
 				do
 				  let p = C.__mem.malloc(2)
 				  C.__mem.fill(p, 0, 2)
@@ -1289,7 +1319,7 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 				    b1: C.__mem.readBits(p, 1, 0, 8, null),
 				    val: C.__mem.readBits(p, 0, 4, 8, null) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1312,15 +1342,15 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 		},
 		{
 			name: "read_with_sign_extension_width5_negative",
-			src: `
-				let C = ffiOpen({version:"1", lib:"libc.so.6"});
+			src: fmt.Sprintf(`
+				let C = ffiOpen({version:"1", lib:"%s"});
 				do
 				  let p = C.__mem.malloc(1)
 				  C.__mem.fill(p, 240, 1)     # 240 == 0xF0 (1111 0000)
 				  # bits 3..7 are 11110 (0x1E); signed width 5 => -2 after sign-ext
 				  C.__mem.readBits(p, 0, 3, 5, true)
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1342,9 +1372,9 @@ func Test_Builtin_FFI_bitfields_minops_matrix(t *testing.T) {
 
 func Test_Builtin_FFI_mem_box_struct_init_and_getf(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    I32:{kind:"int",bits:32,signed:true},
 		    I64:{kind:"int",bits:64,signed:true},
@@ -1355,7 +1385,7 @@ func Test_Builtin_FFI_mem_box_struct_init_and_getf(t *testing.T) {
 		  let h = C.__mem.box("S", { a:7, b:11 })
 		  { a:C.__mem.getf("S", h, "a"), b:C.__mem.getf("S", h, "b") }
 		end
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	if mustInt64(t, m.Entries["a"]) != 7 || mustInt64(t, m.Entries["b"]) != 11 {
 		t.Fatalf("box+getf mismatch: %#v", v)
@@ -1364,9 +1394,9 @@ func Test_Builtin_FFI_mem_box_struct_init_and_getf(t *testing.T) {
 
 func Test_Builtin_FFI_mem_setf_writes_field(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    I32:{kind:"int",bits:32,signed:true},
 		    S:{kind:"struct",fields:[{name:"a",type:"I32"}]}
@@ -1377,7 +1407,7 @@ func Test_Builtin_FFI_mem_setf_writes_field(t *testing.T) {
 		  C.__mem.setf("S", h, "a", 42)
 		  C.__mem.getf("S", h, "a")
 		end
-	`)
+	`, lib("c")))
 	if mustInt64(t, v) != 42 {
 		t.Fatalf("setf did not persist: %#v", v)
 	}
@@ -1385,9 +1415,9 @@ func Test_Builtin_FFI_mem_setf_writes_field(t *testing.T) {
 
 func Test_Builtin_FFI_mem_box_union_read_write(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    I32:{kind:"int",bits:32,signed:true},
 		    D64:{kind:"float",bits:64},
@@ -1401,7 +1431,7 @@ func Test_Builtin_FFI_mem_box_union_read_write(t *testing.T) {
 		  let d1 = C.__mem.getf("U", u, "d")
 		  { i:i0, d:d1 }
 		end
-	`)
+	`, lib("c")))
 	m := mustMap(t, v)
 	if mustInt64(t, m.Entries["i"]) != -3 {
 		t.Fatalf("union getf(i) mismatch: %#v", v)
@@ -1413,9 +1443,9 @@ func Test_Builtin_FFI_mem_box_union_read_write(t *testing.T) {
 
 func Test_Builtin_FFI_mem_box_array_init_bytes(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v := evalWithIP(t, ip, `
+	v := evalWithIP(t, ip, fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    U8:{kind:"int",bits:8,signed:false},
 		    A4:{kind:"array",of:"U8",len:4},
@@ -1433,7 +1463,7 @@ func Test_Builtin_FFI_mem_box_array_init_bytes(t *testing.T) {
 		  C.__mem.copy(exp, "\u0001\u0002\u0003\u0004", 4)
 		  C.memcmp(a, exp, 4)
 		end
-	`)
+	`, lib("c")))
 	if mustInt64(t, v) != 0 {
 		t.Fatalf("array bytes mismatch (memcmp != 0): %#v", v)
 	}
@@ -1451,10 +1481,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 	cases := []tc{
 		{
 			name: "byvalue_return_struct_div_returns_handle_and_bytes_match",
-			// div(7,3) -> struct div_t { int quot=2; int rem=1; } (SysV/glibc: int32,int32)
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    i32:   {kind:"int",bits:32,signed:true},
 				    Div:   {kind:"struct",fields:[{name:"quot",type:"i32"},{name:"rem",type:"i32"}]},
@@ -1471,7 +1500,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  C.__mem.copy(expect, "\u0002\u0000\u0000\u0000\u0001\u0000\u0000\u0000", 8)
 				  { res: res, resFmt: formatValue(res), eq: C.memcmp(res, expect, 8) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1490,10 +1519,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "pointer_to_aggregate_param_requires_handle_no_literals",
-			// nanosleep(const struct timespec *req, struct timespec *rem)
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    long: {kind:"int",bits:64,signed:true},
 				    Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
@@ -1503,16 +1531,16 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  functions:[ {name:"nanosleep", ret:"i32", params:["Tsp","Tsp"]} ]
 				})
 				C.nanosleep({ tv_sec:0, tv_nsec:0 }, null)  # MUST error: literal rejected
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, _ Value, err error) {
 				wantErrContains(t, err, "aggregate parameter requires handle")
 			},
 		},
 		{
 			name: "pointer_to_aggregate_param_with_handle_works",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    long: {kind:"int",bits:64,signed:true},
                     Timespec: {kind:"struct",fields:[{name:"tv_sec",type:"long"},{name:"tv_nsec",type:"long"}]},
@@ -1526,7 +1554,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  C.__mem.fill(req, 0, C.__mem.sizeof("Timespec"))
 				  C.nanosleep(req, null)                 # should succeed (likely 0)
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1538,14 +1566,14 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "ret_as_str_for_charp_unchanged",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{ charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}} },
 				  functions:[ {name:"getenv", ret:"charp", params:["charp"], ret_as_str:true } ]
 				})
 				C.getenv("PATH")
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1557,9 +1585,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "variadic_still_ok_snprintf",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    size_t:{kind:"int",bits:64,signed:false},
 				    charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},
@@ -1570,10 +1598,10 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				})
 				do
 				  let buf = C.__mem.malloc(64)
-				  let n = C.snprintf(buf, 64, "%d %.2f", [123, 3.14159])
+				  let n = C.snprintf(buf, 64, "%%d %%.2f", [123, 3.14159])
 				  { n: n, s: C.__mem.string(buf, null) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1589,9 +1617,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "struct_aggregate_field_getf_returns_handle_and_setf_copies",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    I32:{kind:"int",bits:32,signed:true},
 				    Inner:{kind:"struct",fields:[{name:"x",type:"I32"},{name:"y",type:"I32"}]},
@@ -1614,7 +1642,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  let eq = C.memcmp(after, src, n)
 				  { gotFmt: gotFmt, eq: eq }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1631,9 +1659,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "struct_aggregate_field_setf_with_non_handle_fails",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    I32:{kind:"int",bits:32,signed:true},
 				    Inner:{kind:"struct",fields:[{name:"x",type:"I32"},{name:"y",type:"I32"}]},
@@ -1643,16 +1671,16 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				let out = C.__mem.box("Outer", { a:0 })
 				# ERROR: value is not a handle
 				C.__mem.setf("Outer", out, "inner", { x:1, y:2 })
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, _ Value, err error) {
 				wantErrContains(t, err, "aggregate field requires handle")
 			},
 		},
 		{
 			name: "union_aggregate_field_getf_returns_handle_and_setf_copies",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    I32:{kind:"int",bits:32,signed:true},
 				    Inner:{kind:"struct",fields:[{name:"x",type:"I32"},{name:"y",type:"I32"}]},
@@ -1672,7 +1700,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  let n = C.__mem.sizeof("Inner")
 				  { gotFmt: gotFmt, eq: C.memcmp(h2, i, n) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1689,9 +1717,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "struct_array_field_getf_returns_handle_and_setf_copies",
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
-				  version:"1", lib:"libc.so.6",
+				  version:"1", lib:"%s",
 				  types:{
 				    U8:{kind:"int",bits:8,signed:false},
 				    A4:{kind:"array",of:"U8",len:4},
@@ -1710,7 +1738,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  let fh2 = C.__mem.getf("S", s, "arr")
 				  { gotFmt: gotFmt, eq: C.memcmp(fh2, src, 4) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1727,8 +1755,8 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		},
 		{
 			name: "variable_scalar_errno_roundtrip",
-			src: `
-				let C = ffiOpen({ version:"1", lib:"libc.so.6",
+			src: fmt.Sprintf(`
+				let C = ffiOpen({ version:"1", lib:"%s",
 				  types:{ i32:{kind:"int",bits:32,signed:true} },
 				  variables:[ {name:"errno", type:"i32"} ]
 				})
@@ -1738,7 +1766,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  let after = C.errno.get()
 				  { before: before, after: after }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1753,10 +1781,10 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 		{
 			name: "variable_aggregate_tzname_get_returns_handle_and_set_rejects_non_handle",
 			// tzname is: extern char *tzname[2];
-			src: `
+			src: fmt.Sprintf(`
 				let C = ffiOpen({
 				  version:"1",
-				  lib:"libc.so.6",
+				  lib:"%s",
 				  types:{
 				    Char:{kind:"int",bits:8,signed:true},
 				    Charp:{kind:"pointer",to:"Char"},
@@ -1768,7 +1796,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				  let g = C.tzname.get()
 				  { fmt: formatValue(g) }
 				end
-			`,
+			`, lib("c")),
 			check: func(t *testing.T, v Value, err error) {
 				if err != nil {
 					t.Fatalf("eval error: %v", err)
@@ -1779,10 +1807,10 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 					t.Fatalf("tzname.get() should return handle; formatValue=%#v", ff)
 				}
 				// Separate negative test: set() must reject non-handle for aggregate variable.
-				_, e := ip.EvalSource(`
+				_, e := ip.EvalSource(fmt.Sprintf(`
 					let C = ffiOpen({
 					  version:"1",
-					  lib:"libc.so.6",
+					  lib:"%s",
 					  types:{
 					    Char:{kind:"int",bits:8,signed:true},
 					    Charp:{kind:"pointer",to:"Char"},
@@ -1792,7 +1820,7 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 					})
 					# ERROR: aggregate variable requires a handle
 					C.tzname.set([null,null])
-				`)
+				`, lib("c")))
 				wantErrContains(t, e, "aggregate variable requires handle")
 			},
 		},
@@ -1808,9 +1836,9 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 
 func Test_FFI_Spec_Bitfields_Rejected(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
+	_, err := ip.EvalSource(fmt.Sprintf(`
 		ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    S:{ kind:"struct", fields:[
 		      { name:"mode",  type:{kind:"int",bits:32,signed:false}, bits:3 },
@@ -1818,7 +1846,7 @@ func Test_FFI_Spec_Bitfields_Rejected(t *testing.T) {
 		    ]}
 		  }
 		})
-	`)
+	`, lib("c")))
 	if err == nil || !strings.Contains(err.Error(), "bitfields") {
 		t.Fatalf("expected bitfields to be rejected, got err=%v", err)
 	}
@@ -1826,9 +1854,9 @@ func Test_FFI_Spec_Bitfields_Rejected(t *testing.T) {
 
 func Test_FFI_Spec_FlexArray_Param_ByValue_Rejected(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
+	_, err := ip.EvalSource(fmt.Sprintf(`
 		ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    U8:{kind:"int",bits:8,signed:false},
 		    Flex:{kind:"array",of:"U8"}   # no len -> flexible
@@ -1837,7 +1865,7 @@ func Test_FFI_Spec_FlexArray_Param_ByValue_Rejected(t *testing.T) {
 		    { name:"f", ret:{kind:"void"}, params:["Flex"] }   # by-value param must be rejected
 		  ]
 		})
-	`)
+	`, lib("c")))
 	if err == nil || !strings.Contains(err.Error(), "flexible array") {
 		t.Fatalf("expected flexible array by-value param to be rejected, got err=%v", err)
 	}
@@ -1845,9 +1873,9 @@ func Test_FFI_Spec_FlexArray_Param_ByValue_Rejected(t *testing.T) {
 
 func Test_FFI_Spec_FlexArray_Return_ByValue_Rejected(t *testing.T) {
 	ip, _ := NewInterpreter()
-	_, err := ip.EvalSource(`
+	_, err := ip.EvalSource(fmt.Sprintf(`
 		ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    U8:{kind:"int",bits:8,signed:false},
 		    Flex:{kind:"array",of:"U8"}   # flexible
@@ -1856,7 +1884,7 @@ func Test_FFI_Spec_FlexArray_Return_ByValue_Rejected(t *testing.T) {
 		    { name:"f", ret:"Flex", params:[] }   # by-value return must be rejected
 		  ]
 		})
-	`)
+	`, lib("c")))
 	if err == nil || !strings.Contains(err.Error(), "flexible array") {
 		t.Fatalf("expected flexible array by-value return to be rejected, got err=%v", err)
 	}
@@ -1865,9 +1893,9 @@ func Test_FFI_Spec_FlexArray_Return_ByValue_Rejected(t *testing.T) {
 func Test_FFI_Spec_FlexArray_Pointer_And_New_WithCount(t *testing.T) {
 	ip, _ := NewInterpreter()
 	// Allocate 4 bytes for flexible array of uint8 and check we can write/read them.
-	v, err := ip.EvalSource(`
+	v, err := ip.EvalSource(fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{ U8:{kind:"int",bits:8,signed:false} }
 		})
 		do
@@ -1879,7 +1907,7 @@ func Test_FFI_Spec_FlexArray_Pointer_And_New_WithCount(t *testing.T) {
 		  let b3 = C.__mem.readBits(p, 3, 0, 8, null)
 		  { b0:b0, b1:b1, b2:b2, b3:b3 }
 		end
-	`)
+	`, lib("c")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1897,31 +1925,31 @@ func Test_FFI_Spec_ReadBits_WriteBits_ErrorBounds(t *testing.T) {
 	ip, _ := NewInterpreter()
 
 	// width > 64
-	_, err := ip.EvalSource(`
-		let C = ffiOpen({version:"1", lib:"libc.so.6"})
+	_, err := ip.EvalSource(fmt.Sprintf(`
+		let C = ffiOpen({version:"1", lib:"%s"})
 		let p = C.__mem.malloc(2)
 		C.__mem.readBits(p, 0, 0, 65, null)
-	`)
+	`, lib("c")))
 	if err == nil || !strings.Contains(err.Error(), "width") {
 		t.Fatalf("expected width>64 error, got %v", err)
 	}
 
 	// negative offsets
-	_, err = ip.EvalSource(`
-		let C = ffiOpen({version:"1", lib:"libc.so.6"})
+	_, err = ip.EvalSource(fmt.Sprintf(`
+		let C = ffiOpen({version:"1", lib:"%s"})
 		let p = C.__mem.malloc(1)
 		C.__mem.writeBits(p, -1, 0, 8, 1)
-	`)
+	`, lib("c")))
 	if err == nil || !strings.Contains(err.Error(), "offsets must be") {
 		t.Fatalf("expected negative offset error, got %v", err)
 	}
 
 	// write value that does not fit width
-	_, err = ip.EvalSource(`
-		let C = ffiOpen({version:"1", lib:"libc.so.6"})
+	_, err = ip.EvalSource(fmt.Sprintf(`
+		let C = ffiOpen({version:"1", lib:"%s"})
 		let p = C.__mem.malloc(1)
 		C.__mem.writeBits(p, 0, 0, 3, 8)   # 8 does not fit in 3 bits
-	`)
+	`, lib("c")))
 	if err == nil || !strings.Contains(err.Error(), "does not fit width") {
 		t.Fatalf("expected value-width error, got %v", err)
 	}
@@ -1929,14 +1957,14 @@ func Test_FFI_Spec_ReadBits_WriteBits_ErrorBounds(t *testing.T) {
 
 func Test_FFI_Spec_ret_as_str_NULL_ReturnsNull(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v, err := ip.EvalSource(`
+	v, err := ip.EvalSource(fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{ charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}} },
 		  functions:[ { name:"getenv", ret:"charp", params:["charp"], ret_as_str:true } ]
 		})
 		C.getenv("__NO_SUCH_ENV_VAR__")
-	`)
+	`, lib("c")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1947,14 +1975,14 @@ func Test_FFI_Spec_ret_as_str_NULL_ReturnsNull(t *testing.T) {
 
 func Test_FFI_Spec___mem_string_FixedLen_IncludesEmbeddedNUL(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v, err := ip.EvalSource(`
-		let C = ffiOpen({ version:"1", lib:"libc.so.6" })
+	v, err := ip.EvalSource(fmt.Sprintf(`
+		let C = ffiOpen({ version:"1", lib:"%s" })
 		do
 		  let p = C.__mem.malloc(3)
 		  C.__mem.copy(p, "a\u0000b", 3)
 		  C.__mem.string(p, 3)
 		end
-	`)
+	`, lib("c")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1969,9 +1997,9 @@ func Test_FFI_Spec___mem_string_FixedLen_IncludesEmbeddedNUL(t *testing.T) {
 
 func Test_FFI_Spec_Variadic_Promotions_Bool_Int_Double(t *testing.T) {
 	ip, _ := NewInterpreter()
-	v, err := ip.EvalSource(`
+	v, err := ip.EvalSource(fmt.Sprintf(`
 		let C = ffiOpen({
-		  version:"1", lib:"libc.so.6",
+		  version:"1", lib:"%s",
 		  types:{
 		    size_t:{kind:"int",bits:64,signed:false},
 		    charp:{kind:"pointer",to:{kind:"int",bits:8,signed:true}},
@@ -1985,10 +2013,10 @@ func Test_FFI_Spec_Variadic_Promotions_Bool_Int_Double(t *testing.T) {
 		do
 		  let buf = C.__mem.malloc(64)
 		  # bool -> promoted to int, dbl remains double
-		  let n = C.snprintf(buf, 64, "%d %.1f", [true, 2.0])
+		  let n = C.snprintf(buf, 64, "%%d %%.1f", [true, 2.0])
 		  { n:n, s:C.__mem.string(buf, null) }
 		end
-	`)
+	`, lib("c")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -41,6 +41,7 @@ VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo 0.0.0)
 DIST_DIR := dist
 ROOT     := $(DIST_DIR)/mindscript
 BIN_DIR  := $(ROOT)/bin
+LIB_DIR  := $(ROOT)/lib
 
 # --- CGO + libffi ---
 export CGO_ENABLED := 1
@@ -48,6 +49,13 @@ export CGO_ENABLED := 1
 ifeq ($(UNAME_S),Darwin)
   export PKG_CONFIG_PATH ?= $(shell brew --prefix 2>/dev/null)/opt/libffi/lib/pkgconfig
 endif
+
+# Where libffi lives on the build host
+FFI_LIBDIR := $(shell pkg-config --variable=libdir libffi 2>/dev/null)
+
+# RPATH so binaries search ../lib next to themselves
+RPATH_LINUX := -Wl,-rpath,$$ORIGIN/../lib
+RPATH_MACOS := -Wl,-rpath,@loader_path/../lib
 
 # --- checksum tool ---
 ifeq ($(UNAME_S),Darwin)
@@ -73,9 +81,24 @@ check-deps:
 
 build:
 	@rm -rf $(ROOT)
-	@mkdir -p $(BIN_DIR)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/msg     ./cmd/msg
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@mkdir -p $(BIN_DIR) $(LIB_DIR)
+ifeq ($(UNAME_S),Linux)
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
+	 -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
+	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@if [ -n "$(FFI_LIBDIR)" ]; then cp -a "$(FFI_LIBDIR)"/libffi.so* $(LIB_DIR)/ 2>/dev/null || true; fi
+else ifeq ($(UNAME_S),Darwin)
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
+	 -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath \
+	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
+	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
+	@if [ -n "$(FFI_LIBDIR)" ]; then cp -a "$(FFI_LIBDIR)"/libffi*.dylib $(LIB_DIR)/ 2>/dev/null || true; fi
+endif
 	@test -d lib      && cp -R lib      $(ROOT)/ || true
 	@test -d examples && cp -R examples $(ROOT)/ || true
 	@test -d docs     && cp -R docs     $(ROOT)/ || true

@@ -342,7 +342,7 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 		b.WriteString(line)
 
 		src := b.String()
-		_, perr := mindscript.ParseSExprInteractive(src)
+		_, _, perr := mindscript.ParseSExprInteractiveWithSpans(src)
 		if perr == nil {
 			return src, true
 		}

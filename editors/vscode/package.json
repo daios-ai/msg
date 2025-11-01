@@ -1,7 +1,7 @@
 {
   "name": "mindscript-vscode",
   "displayName": "MindScript",
-  "publisher": "yourname",
+  "publisher": "Pedro A. Ortega",
   "version": "0.0.1",
   "description": "MindScript language support (LSP client)",
   "engines": { "vscode": "^1.85.0" },
@@ -24,7 +24,7 @@
       {
         "language": "mindscript",
         "scopeName": "source.mindscript",
-        "path": "./syntaxes/syntaxes/mindscript.tmLanguage.json"
+        "path": "./syntaxes/mindscript.tmLanguage.json"
       }
     ],
     "commands": [
@@ -42,20 +42,26 @@
       }
     },
     "configurationDefaults": {
-      "[mindscript]": {
-        "editor.semanticTokenColorCustomizations": {
-          "enabled": true,
-          "rules": {
-            "bracket:b0": { "foreground": "#C792EA" },
-            "bracket:b1": { "foreground": "#82AAFF" },
-            "bracket:b2": { "foreground": "#89DDFF" },
-            "bracket:b3": { "foreground": "#ADDB67" },
-            "bracket:b4": { "foreground": "#FFD700" },
-            "bracket:b5": { "foreground": "#F78C6C" }
-          }
+      "editor.semanticHighlighting.enabled": true,
+      "editor.semanticTokenColorCustomizations": {
+        "enabled": true,
+        "rules": {
+          "bracket.b0": {"foreground": "#ffd62c" },
+          "bracket.b1": {"foreground": "#e072d4" },
+          "bracket.b2": {"foreground": "#009ed8" },
+          "bracket.b3": { "foreground": "#ffd62c" },
+          "bracket.b4": { "foreground": "#e072d4" },
+          "bracket.b5": { "foreground": "#009ed8" }
         }
       }
-    }
+    },
+    "semanticTokenTypes": [
+      { "id": "bracket", "description": "Rainbow-colored block delimiters" }
+    ],
+    "semanticTokenModifiers": [
+      { "id": "b0" }, { "id": "b1" }, { "id": "b2" },
+      { "id": "b3" }, { "id": "b4" }, { "id": "b5" }
+    ]
   },
   "scripts": {
     "compile": "tsc -p .",
@@ -71,3 +77,5 @@
     "typescript": "^5.4.0"
   }
 }
+
+

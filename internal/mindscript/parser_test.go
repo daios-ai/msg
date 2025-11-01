@@ -23,7 +23,7 @@ func mustParse(t *testing.T, src string) S {
 
 func mustParseInteractive(t *testing.T, src string) S {
 	t.Helper()
-	sexpr, err := ParseSExprInteractive(src)
+	sexpr, _, err := ParseSExprInteractiveWithSpans(src)
 	if err != nil {
 		t.Fatalf("Parse (interactive) error: %v\nsource:\n%s", err, src)
 	}
@@ -32,7 +32,7 @@ func mustParseInteractive(t *testing.T, src string) S {
 
 func mustIncomplete(t *testing.T, src string) {
 	t.Helper()
-	_, err := ParseSExprInteractive(src)
+	_, _, err := ParseSExprInteractiveWithSpans(src)
 	if err == nil || !IsIncomplete(err) {
 		t.Fatalf("expected IncompleteError, got %v\nsource:\n%s", err, src)
 	}
@@ -85,7 +85,7 @@ func checkParseErr(t *testing.T, src string, wantLine, wantCol int, wantSubstr s
 
 func checkParseInc(t *testing.T, src string, wantLine, wantCol int, wantSubstr string) {
 	t.Helper()
-	_, err := ParseSExprInteractive(src)
+	_, _, err := ParseSExprInteractiveWithSpans(src)
 	if err == nil {
 		t.Fatalf("expected incomplete parse error, got nil\nsource:\n%q", src)
 	}

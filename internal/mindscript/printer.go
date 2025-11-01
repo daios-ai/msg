@@ -49,7 +49,7 @@
 // --------------------------
 // • parser.go
 //   - S = []any (AST payload shape)
-//   - ParseSExpr(string) / ParseSExprInteractive (used by Pretty/Standardize)
+//   - ParseSExpr(string) (used by Pretty/Standardize)
 //   - AST tags: "block", "fun", "oracle", "for", "while", "if",
 //     "type", "return", "break", "continue", "assign", "array", "map",
 //     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",

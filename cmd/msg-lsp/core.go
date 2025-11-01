@@ -602,6 +602,7 @@ var semTypes = map[string]int{
 	"string":   5,
 	"number":   6,
 	"comment":  7,
+	"bracket":  8,
 }
 
 func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
@@ -755,18 +756,20 @@ func (s *server) analyze(doc *docState) {
 	}
 	doc.tokens = toks
 
-	// 2) Parse AST in interactive mode so we can distinguish "incomplete"
-	// from true errors for on-type diagnostics.
-	ast, err := mindscript.ParseSExprInteractive(doc.text)
+	// 2) Parse with exact spans for every node.
+	//    We keep "don't nag while typing" behavior in publishError().
+	ast, spans, err := mindscript.ParseSExprWithSpans(doc.text)
 	if err != nil {
-		// Parsing failed (or incomplete) — keep tokens, but clear AST/symbols.
+		// Parsing failed (possibly incomplete). Keep tokens, clear AST/symbols.
+		// IMPORTANT: preserve last-good spans so folding/range features remain stable.
 		doc.ast = nil
 		doc.symbols = nil
-		// Publish diagnostics for parse/lex errors; Incomplete clears.
+		// doc.spans is intentionally NOT touched here.
 		s.publishError(doc, err)
 		return
 	}
 	doc.ast = ast
+	doc.spans = spans
 
 	// 3) Rebuild top-level symbols (alpha/beta/etc.). This does NOT execute user code.
 	doc.symbols = collectTopLevelSymbols(doc)

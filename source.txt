@@ -318,6 +318,12 @@ func u16Len(s string) int {
 	return n
 }
 
+// hasValidSpan reports whether the lexer provided concrete byte offsets.
+// Used for ANNOTATION tokens which must have StartByte/EndByte or be ignored.
+func hasValidSpan(t mindscript.Token, textLen int) bool {
+	return t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= textLen
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Diagnostics helpers
 ////////////////////////////////////////////////////////////////////////////////
@@ -597,6 +603,7 @@ var semTypes = map[string]int{
 	"string":   5,
 	"number":   6,
 	"comment":  7,
+	"bracket":  8,
 }
 
 func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
@@ -607,12 +614,15 @@ func commentSpans(doc *docState) [][2]int {
 	if doc == nil {
 		return spans
 	}
-	// Source of truth: lexer ANNOTATION tokens only.
+	// Source of truth: lexer ANNOTATION tokens only, and only when they carry a valid span.
 	for _, tk := range doc.tokens {
 		if tk.Type != mindscript.ANNOTATION {
 			continue
 		}
-		s, e := tokenSpan(doc, tk)
+		if !hasValidSpan(tk, len(doc.text)) {
+			continue
+		}
+		s, e := tk.StartByte, tk.EndByte
 		if e > s {
 			spans = append(spans, [2]int{s, e})
 		}
@@ -747,18 +757,20 @@ func (s *server) analyze(doc *docState) {
 	}
 	doc.tokens = toks
 
-	// 2) Parse AST in interactive mode so we can distinguish "incomplete"
-	// from true errors for on-type diagnostics.
-	ast, err := mindscript.ParseSExprInteractive(doc.text)
+	// 2) Parse with exact spans for every node.
+	//    We keep "don't nag while typing" behavior in publishError().
+	ast, spans, err := mindscript.ParseSExprWithSpans(doc.text)
 	if err != nil {
-		// Parsing failed (or incomplete) — keep tokens, but clear AST/symbols.
+		// Parsing failed (possibly incomplete). Keep tokens, clear AST/symbols.
+		// IMPORTANT: preserve last-good spans so folding/range features remain stable.
 		doc.ast = nil
 		doc.symbols = nil
-		// Publish diagnostics for parse/lex errors; Incomplete clears.
+		// doc.spans is intentionally NOT touched here.
 		s.publishError(doc, err)
 		return
 	}
 	doc.ast = ast
+	doc.spans = spans
 
 	// 3) Rebuild top-level symbols (alpha/beta/etc.). This does NOT execute user code.
 	doc.symbols = collectTopLevelSymbols(doc)
@@ -1428,6 +1440,18 @@ func (s *server) onSemanticTokensRange(id json.RawMessage, paramsRaw json.RawMes
 
 type semEntry struct {
 	line, ch, lenU16, typ int
+	mods                  uint32
+}
+
+// Keyword “brackets” for semantic coloring:
+func isKeywordOpen(t mindscript.Token) bool {
+	return t.Type == mindscript.DO || t.Type == mindscript.THEN
+}
+func isKeywordClose(t mindscript.Token) bool {
+	return t.Type == mindscript.END || t.Type == mindscript.ELIF
+}
+func isKeywordCloseReopen(t mindscript.Token) bool {
+	return t.Type == mindscript.ELSE
 }
 
 // semanticTokensData builds LSP-encoded semantic token data.
@@ -1496,6 +1520,16 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 		typIdx := -1
 		switch {
 		case isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN:
+			// Let the bracket pass own do/then/elif/else/end so we don't duplicate tokens.
+			if isKeywordOpen(tk) || isKeywordClose(tk) || isKeywordCloseReopen(tk) {
+				// maintain depth for braces only (not relevant here), then skip emission
+				if tk.Type == mindscript.LCURLY {
+					braceDepth++
+				} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+					braceDepth--
+				}
+				continue
+			}
 			typIdx = semTypes["keyword"]
 
 		case tk.Type == mindscript.STRING:
@@ -1559,6 +1593,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 						ch:     st.Character,
 						lenU16: u16Len(doc.text[segStart:cur]),
 						typ:    typIdx,
+						mods:   0,
 					})
 				}
 				segStart = cur + 1
@@ -1571,6 +1606,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 				ch:     st.Character,
 				lenU16: u16Len(doc.text[segStart:eOff]),
 				typ:    typIdx,
+				mods:   0,
 			})
 		}
 
@@ -1579,6 +1615,94 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 			braceDepth++
 		} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
 			braceDepth--
+		}
+	}
+
+	// ---------- Keyword bracket pass (adds entries; no duplication with main pass) ----------
+	const maxLevels = 6
+	level := 0
+	push := func() {
+		if level < maxLevels-1 {
+			level++
+		}
+	}
+	pop := func() {
+		if level > 0 {
+			level--
+		}
+	}
+
+	for i := 0; i < len(doc.tokens); i++ {
+		tk := doc.tokens[i]
+
+		// Compute token span; obey range filter & comment masking
+		sOff, eOff := tokenSpan(doc, tk)
+		if eOff <= sOff {
+			continue
+		}
+		if selStart >= 0 && selEnd >= 0 && !(eOff > selStart && sOff < selEnd) {
+			continue
+		}
+		if isInComment(sOff, eOff) {
+			continue
+		}
+		// Strings are opaque; keywords inside strings are not structure.
+		if tk.Type == mindscript.STRING {
+			continue
+		}
+		// Only bracket-like keywords
+		if !(isKeywordOpen(tk) || isKeywordClose(tk) || isKeywordCloseReopen(tk)) {
+			continue
+		}
+
+		typIdx := semTypes["bracket"]
+		// Use the *closing* level for close/close-reopen so matching pairs share the same color.
+		// Example: after 'then' we push (depth=1). On 'end', we want the same b* as 'then' → level-1.
+		lvl := level
+		if isKeywordClose(tk) || isKeywordCloseReopen(tk) {
+			if lvl > 0 {
+				lvl--
+			}
+		}
+		modBit := uint32(1 << lvl) // maps to b0..b5 in package.json
+
+		emit := func(segStart, segEnd int) {
+			st := offsetToPos(doc.lines, segStart, doc.text)
+			entries = append(entries, semEntry{
+				line:   st.Line,
+				ch:     st.Character,
+				lenU16: u16Len(doc.text[segStart:segEnd]),
+				typ:    typIdx,
+				mods:   modBit,
+			})
+		}
+
+		// Split by line exactly like the main pass
+		segStart := sOff
+		for cur := sOff; cur < eOff; cur++ {
+			if doc.text[cur] == '\r' {
+				continue
+			}
+			if doc.text[cur] == '\n' {
+				if segStart < cur {
+					emit(segStart, cur)
+				}
+				segStart = cur + 1
+			}
+		}
+		if segStart < eOff {
+			emit(segStart, eOff)
+		}
+
+		// Update nesting after emission
+		switch {
+		case isKeywordOpen(tk):
+			push()
+		case isKeywordCloseReopen(tk):
+			pop()
+			push()
+		case isKeywordClose(tk):
+			pop()
 		}
 	}
 
@@ -1602,7 +1726,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 		}
 		first = false
 		prevLine, prevCh = e.line, e.ch
-		data = append(data, uint32(dl), uint32(dc), uint32(e.lenU16), uint32(e.typ), 0)
+		data = append(data, uint32(dl), uint32(dc), uint32(e.lenU16), uint32(e.typ), e.mods)
 	}
 	return data
 }
@@ -1800,6 +1924,25 @@ func (s *server) onFoldingRange(id json.RawMessage, paramsRaw json.RawMessage) {
 
 === BEGIN FILE: cmd/msg-lsp/main.go ===
 // cmd/lsp/main.go
+//
+// ROLE: Executable entrypoint and JSON-RPC dispatch loop.
+//
+// What lives here
+//   • Process startup and server construction.
+//   • Framed JSON-RPC read loop from stdin and write to stdout.
+//   • Method routing: decode → switch on req.Method → delegate to server
+//     handlers in features.go / core.go.
+//   • Minimal lifecycle handling (initialize/shutdown/exit).
+//
+// What does NOT live here
+//   • No language features, no text analysis, no diagnostics computation,
+//     no document state. Keep this file small so it’s easy to test/replace
+//     the transport without touching feature logic.
+//
+// Why this separation
+//   • Clear boundary between transport concerns and language intelligence.
+//   • Enables reuse of the server with different frontends/transports.
+
 package main
 
 import (

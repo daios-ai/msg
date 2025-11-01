@@ -534,6 +534,18 @@ func (s *server) onSemanticTokensRange(id json.RawMessage, paramsRaw json.RawMes
 
 type semEntry struct {
 	line, ch, lenU16, typ int
+	mods                  uint32
+}
+
+// Keyword “brackets” for semantic coloring:
+func isKeywordOpen(t mindscript.Token) bool {
+	return t.Type == mindscript.DO || t.Type == mindscript.THEN
+}
+func isKeywordClose(t mindscript.Token) bool {
+	return t.Type == mindscript.END || t.Type == mindscript.ELIF
+}
+func isKeywordCloseReopen(t mindscript.Token) bool {
+	return t.Type == mindscript.ELSE
 }
 
 // semanticTokensData builds LSP-encoded semantic token data.
@@ -541,6 +553,18 @@ type semEntry struct {
 func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint32 {
 	if doc == nil || len(doc.tokens) == 0 {
 		return nil
+	}
+
+	cspans := commentSpans(doc)
+
+	isInComment := func(sOff, eOff int) bool {
+		se := [2]int{sOff, eOff}
+		for _, c := range cspans {
+			if overlaps(se, c) {
+				return true
+			}
+		}
+		return false
 	}
 
 	entries := []semEntry{}
@@ -551,17 +575,12 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 
 	for i := 0; i < len(doc.tokens); i++ {
 		tk := doc.tokens[i]
-		// Spans: treat annotations like string literals — rely on exact lexer span only.
-		var sOff, eOff int
 		if tk.Type == mindscript.ANNOTATION {
-			if !hasValidSpan(tk, len(doc.text)) {
-				// Requirement: ignore annotations without a concrete byte span.
-				continue
-			}
-			sOff, eOff = tk.StartByte, tk.EndByte
-		} else {
-			sOff, eOff = tokenSpan(doc, tk)
+			// the whole annotation region already colored as comment
+			continue
 		}
+
+		sOff, eOff := tokenSpan(doc, tk)
 		if eOff <= sOff {
 			// still keep structural depth in sync
 			if tk.Type == mindscript.LCURLY {
@@ -582,13 +601,29 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 			continue
 		}
 
+		if isInComment(sOff, eOff) {
+			// maintain depth across comments
+			if tk.Type == mindscript.LCURLY {
+				braceDepth++
+			} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		}
+
 		typIdx := -1
 		switch {
-		case tk.Type == mindscript.ANNOTATION:
-			// Paint comments green (semantic “comment”).
-			typIdx = semTypes["comment"]
-
 		case isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN:
+			// Let the bracket pass own do/then/elif/else/end so we don't duplicate tokens.
+			if isKeywordOpen(tk) || isKeywordClose(tk) || isKeywordCloseReopen(tk) {
+				// maintain depth for braces only (not relevant here), then skip emission
+				if tk.Type == mindscript.LCURLY {
+					braceDepth++
+				} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
+					braceDepth--
+				}
+				continue
+			}
 			typIdx = semTypes["keyword"]
 
 		case tk.Type == mindscript.STRING:
@@ -652,6 +687,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 						ch:     st.Character,
 						lenU16: u16Len(doc.text[segStart:cur]),
 						typ:    typIdx,
+						mods:   0,
 					})
 				}
 				segStart = cur + 1
@@ -664,6 +700,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 				ch:     st.Character,
 				lenU16: u16Len(doc.text[segStart:eOff]),
 				typ:    typIdx,
+				mods:   0,
 			})
 		}
 
@@ -672,6 +709,94 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 			braceDepth++
 		} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
 			braceDepth--
+		}
+	}
+
+	// ---------- Keyword bracket pass (adds entries; no duplication with main pass) ----------
+	const maxLevels = 6
+	level := 0
+	push := func() {
+		if level < maxLevels-1 {
+			level++
+		}
+	}
+	pop := func() {
+		if level > 0 {
+			level--
+		}
+	}
+
+	for i := 0; i < len(doc.tokens); i++ {
+		tk := doc.tokens[i]
+
+		// Compute token span; obey range filter & comment masking
+		sOff, eOff := tokenSpan(doc, tk)
+		if eOff <= sOff {
+			continue
+		}
+		if selStart >= 0 && selEnd >= 0 && !(eOff > selStart && sOff < selEnd) {
+			continue
+		}
+		if isInComment(sOff, eOff) {
+			continue
+		}
+		// Strings are opaque; keywords inside strings are not structure.
+		if tk.Type == mindscript.STRING {
+			continue
+		}
+		// Only bracket-like keywords
+		if !(isKeywordOpen(tk) || isKeywordClose(tk) || isKeywordCloseReopen(tk)) {
+			continue
+		}
+
+		typIdx := semTypes["bracket"]
+		// Use the *closing* level for close/close-reopen so matching pairs share the same color.
+		// Example: after 'then' we push (depth=1). On 'end', we want the same b* as 'then' → level-1.
+		lvl := level
+		if isKeywordClose(tk) || isKeywordCloseReopen(tk) {
+			if lvl > 0 {
+				lvl--
+			}
+		}
+		modBit := uint32(1 << lvl) // maps to b0..b5 in package.json
+
+		emit := func(segStart, segEnd int) {
+			st := offsetToPos(doc.lines, segStart, doc.text)
+			entries = append(entries, semEntry{
+				line:   st.Line,
+				ch:     st.Character,
+				lenU16: u16Len(doc.text[segStart:segEnd]),
+				typ:    typIdx,
+				mods:   modBit,
+			})
+		}
+
+		// Split by line exactly like the main pass
+		segStart := sOff
+		for cur := sOff; cur < eOff; cur++ {
+			if doc.text[cur] == '\r' {
+				continue
+			}
+			if doc.text[cur] == '\n' {
+				if segStart < cur {
+					emit(segStart, cur)
+				}
+				segStart = cur + 1
+			}
+		}
+		if segStart < eOff {
+			emit(segStart, eOff)
+		}
+
+		// Update nesting after emission
+		switch {
+		case isKeywordOpen(tk):
+			push()
+		case isKeywordCloseReopen(tk):
+			pop()
+			push()
+		case isKeywordClose(tk):
+			pop()
 		}
 	}
 
@@ -695,7 +820,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 		}
 		first = false
 		prevLine, prevCh = e.line, e.ch
-		data = append(data, uint32(dl), uint32(dc), uint32(e.lenU16), uint32(e.typ), 0)
+		data = append(data, uint32(dl), uint32(dc), uint32(e.lenU16), uint32(e.typ), e.mods)
 	}
 	return data
 }

@@ -152,16 +152,26 @@ func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
 	return ast, idx, nil
 }
 
-// ParseSExprInteractive parses in REPL-friendly mode.
-// Unterminated constructs at EOF produce *Error{Kind:DiagIncomplete}.
-func ParseSExprInteractive(src string) (S, error) {
+// ParseSExprInteractiveWithSpans parses in REPL-friendly mode and returns the AST plus
+// a SpanIndex with post-order node spans. Unterminated constructs at EOF
+// produce *Error{Kind:DiagIncomplete}.
+func ParseSExprInteractiveWithSpans(src string) (S, *SpanIndex, error) {
 	lex := NewLexerInteractive(src)
 	toks, err := lex.Scan()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	p := &parser{toks: toks, src: src, interactive: true, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
+	p := &parser{
+		toks: toks, src: src,
+		interactive:      true,
+		lastSpanStartTok: -1, lastSpanEndTok: -1,
+	}
+	ast, perr := p.program()
+	if perr != nil {
+		return nil, nil, perr
+	}
+	idx := BuildSpanIndexPostOrder(ast, p.post)
+	return ast, idx, nil
 }
 
 //// END_OF_PUBLIC

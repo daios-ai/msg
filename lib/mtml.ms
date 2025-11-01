@@ -2205,8 +2205,8 @@ let _installBuiltins = fun(e: Env) -> Null do
 		let s3 = replace("&", "\\u0026", s2)
 		let s4 = replace("<", "\\u003c", s3)
 		let s5 = replace(">", "\\u003e", s4)
-		let s6 = replace(" ", "\\u2028", s5)
-		let s7 = replace(" ", "\\u2029", s6)
+		let s6 = replace("", "\\u2028", s5)
+		let s7 = replace("", "\\u2029", s6)
 		safeHTML(s7)
 	end
 

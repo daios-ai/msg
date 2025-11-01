@@ -338,8 +338,12 @@ func (s *server) clearDiagnostics(uri string) {
 func (s *server) publishError(doc *docState, err error) {
 	// REPL-friendly: don't nag on incomplete constructs.
 	if e, ok := err.(*mindscript.Error); ok {
-		// Until a dedicated flag is exposed, treat parse/lex errors containing
-		// "incomplete" or "unterminated" as incomplete input.
+		// Prefer the engine’s explicit “incomplete” signal.
+		if e.Kind == mindscript.DiagIncomplete {
+			s.clearDiagnostics(doc.uri)
+			return
+		}
+		// Back-compat: older lexers/parsers may still surface text hints.
 		if e.Kind == mindscript.DiagParse || e.Kind == mindscript.DiagLex {
 			msg := strings.ToLower(e.Msg)
 			if strings.Contains(msg, "incomplete") || strings.Contains(msg, "unterminated") {
@@ -757,9 +761,9 @@ func (s *server) analyze(doc *docState) {
 	}
 	doc.tokens = toks
 
-	// 2) Parse with exact spans for every node.
-	//    We keep "don't nag while typing" behavior in publishError().
-	ast, spans, err := mindscript.ParseSExprWithSpans(doc.text)
+	// 2) Parse (interactive) with exact spans for every node.
+	//    Interactive mode yields DiagIncomplete for half-typed code.
+	ast, spans, err := mindscript.ParseSExprInteractiveWithSpans(doc.text)
 	if err != nil {
 		// Parsing failed (possibly incomplete). Keep tokens, clear AST/symbols.
 		// IMPORTANT: preserve last-good spans so folding/range features remain stable.

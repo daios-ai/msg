@@ -166,7 +166,7 @@ func TestCompletionInputsExist(t *testing.T) {
 
 func TestDiagnosticKindsFromInteractiveParse(t *testing.T) {
 	t.Run("invalid character → DiagLex", func(t *testing.T) {
-		if _, err := mindscript.ParseSExprInteractive("$"); err == nil {
+		if _, _, err := mindscript.ParseSExprInteractiveWithSpans("$"); err == nil {
 			t.Fatal("expected lexical error for invalid source")
 		} else if e, ok := err.(*mindscript.Error); !ok || e.Kind != mindscript.DiagLex {
 			t.Fatalf("want *mindscript.Error{Kind: DiagLex}, got %T: %v", err, err)
@@ -174,7 +174,7 @@ func TestDiagnosticKindsFromInteractiveParse(t *testing.T) {
 	})
 
 	t.Run("unterminated string → DiagIncomplete", func(t *testing.T) {
-		if _, err := mindscript.ParseSExprInteractive("\"unterminated"); err == nil {
+		if _, _, err := mindscript.ParseSExprInteractiveWithSpans("\"unterminated"); err == nil {
 			t.Fatal("expected incomplete error for unterminated string")
 		} else if e, ok := err.(*mindscript.Error); !ok || e.Kind != mindscript.DiagIncomplete {
 			t.Fatalf("want *mindscript.Error{Kind: DiagIncomplete}, got %T: %v", err, err)
@@ -272,21 +272,21 @@ func TestReferences_NoPartialMatches(t *testing.T) {
 
 func TestInteractive_IncompleteBlocksAndAnnotations(t *testing.T) {
 	// Unterminated block: missing 'end'
-	if _, err := mindscript.ParseSExprInteractive("do\n  x = 1\n"); err == nil {
+	if _, _, err := mindscript.ParseSExprInteractiveWithSpans("do\n  x = 1\n"); err == nil {
 		t.Fatal("expected error for unterminated block")
 	} else if _, ok := err.(*mindscript.Error); !ok {
 		t.Fatalf("want *mindscript.Error, got %T: %v", err, err)
 	}
 
 	// Lone PRE annotation (no following expression)
-	if _, err := mindscript.ParseSExprInteractive("# note"); err == nil {
+	if _, _, err := mindscript.ParseSExprInteractiveWithSpans("# note"); err == nil {
 		t.Fatal("expected error for lone annotation")
 	} else if _, ok := err.(*mindscript.Error); !ok {
 		t.Fatalf("want *mindscript.Error for lone '#', got %T: %v", err, err)
 	}
 
 	// True parse error (not incomplete)
-	if _, err := mindscript.ParseSExprInteractive("end"); err == nil {
+	if _, _, err := mindscript.ParseSExprInteractiveWithSpans("end"); err == nil {
 		t.Fatal("expected parse error for stray 'end'")
 	}
 }

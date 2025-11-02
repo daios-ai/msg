@@ -6,6 +6,14 @@
 # style/event attrs forbidden
 # <script> requires final | tojson
 
+
+# my fun
+# more
+let f = fun(x: Int, y: Int) -> Str do
+	let g = fun(z: Int) -> Int do z end
+	str(g(x + y))
+end
+
 # ---------------- Types & constructors ----------------
 
 let SafeHTML = type {__brand__!: Str, __safe_html__!: Bool, html!: Str}

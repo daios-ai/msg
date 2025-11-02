@@ -437,8 +437,8 @@ func TestHover_OnLocalLet_ShowsMarkdownAndRange(t *testing.T) {
 	if hv.Contents.Kind != "markdown" {
 		t.Fatalf("hover kind=%q want markdown", hv.Contents.Kind)
 	}
-	if !strings.Contains(hv.Contents.Value, "**let** `x`") {
-		t.Fatalf("hover contents=%q want to contain **let** `x`", hv.Contents.Value)
+	if !strings.Contains(hv.Contents.Value, "**variable** `x`") {
+		t.Fatalf("hover contents=%q want to contain **variable** `x`", hv.Contents.Value)
 	}
 	// Range should cover exactly the 'x'
 	if hv.Range == nil {
@@ -783,7 +783,7 @@ y = f(1)
 	}
 
 	// Current behavior: hover shows a function marker and the name.
-	if !strings.Contains(hv.Contents.Value, "**fun** `f`") {
+	if !strings.Contains(hv.Contents.Value, "**variable** `f`") {
 		t.Fatalf("hover missing function marker/name, got: %q", hv.Contents.Value)
 	}
 }

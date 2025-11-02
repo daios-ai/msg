@@ -13,8 +13,8 @@
 //   • Heuristics that read docState (tokens, AST, spans, symbols) and format
 //     LSP-shaped responses. Where useful, consults server.ip to surface
 //     metadata about built-ins (e.g., function signatures) — without executing
-//     user code. The optional listBindings() call asks for a visible env via a
-//     userland `getEnv()` only if present.
+//     user code. The optional listBindings() call that executed user code has
+//     been removed to respect “don’t run user code in LSP.”
 //
 // What does NOT live here
 //   • No transport framing or JSON-RPC loop (see main.go).
@@ -205,29 +205,36 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// Local document symbol
-	for _, sym := range doc.symbols {
-		if sym.Name == name {
-			var header string
-			switch sym.Kind {
-			case "fun":
-				if sym.Sig != "" {
-					header = fmt.Sprintf("**fun** `%s`", sym.Sig)
-				} else {
-					header = fmt.Sprintf("**fun** `%s`", sym.Name)
-				}
-			case "type":
-				header = fmt.Sprintf("**type** `%s`", sym.Name)
-			default:
-				header = fmt.Sprintf("**let** `%s`", sym.Name)
+	// Prefer the nearest binding (uniform; includes annotations for all kinds + type/sig)
+	if b, ok := nearestBinding(doc, name, off); ok {
+		var header string
+		switch b.Kind {
+		case "fun", "oracle":
+			sig := b.Sig
+			if sig == "" {
+				// fallback to minimal presentation
+				sig = name + "(...) -> Any"
 			}
-			content := header
-			if txt := strings.TrimSpace(sym.Doc); txt != "" {
-				content += "\n\n" + txt
+			header = fmt.Sprintf("**fun** `%s`", sig)
+		case "type":
+			header = fmt.Sprintf("**type** `%s`", name)
+		case "param":
+			ty := formatTypeNode(b.TypeNode)
+			header = fmt.Sprintf("**param** `%s: %s`", name, ty)
+		default:
+			ty := formatTypeNode(b.TypeNode)
+			if ty != "" && ty != "Any" {
+				header = fmt.Sprintf("**variable** `%s: %s`", name, ty)
+			} else {
+				header = fmt.Sprintf("**variable** `%s`", name)
 			}
-			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
-			return
 		}
+		content := header
+		if txt := strings.TrimSpace(b.DocFull); txt != "" {
+			content += "\n\n" + txt
+		}
+		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+		return
 	}
 
 	// Builtin types by ID (NOT by TYPE keyword)
@@ -239,7 +246,7 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// Globals from interpreter (functions/types)
+	// Globals from interpreter (functions/types) — metadata only, no user code execution
 	if v, err := s.ip.Global.Get(name); err == nil {
 		switch v.Tag {
 		case mindscript.VTFun:
@@ -264,11 +271,10 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// Fallback classification for IDs
+	// Fallback classification for IDs (kept for completeness)
 	if tokOK && tk.Type == mindscript.ID {
 		kind := "identifier"
 		idx := -1
-		// we can find the idx cheaply via tokenAtOffset when on the token; otherwise scan once
 		if i, _, _, _, ok := tokenAtOffset(doc, off); ok {
 			idx = i
 		}
@@ -319,6 +325,12 @@ func (s *server) onDefinition(id json.RawMessage, paramsRaw json.RawMessage) {
 		s.sendResponse(id, nil, nil)
 		return
 	}
+	off := posToOffset(doc.lines, params.Position, doc.text)
+	if b, ok := nearestBinding(doc, name, off); ok {
+		s.sendResponse(id, Location{URI: doc.uri, Range: b.Range}, nil)
+		return
+	}
+	// Fallback: old top-level heuristic
 	for _, sym := range doc.symbols {
 		if sym.Name == name {
 			s.sendResponse(id, Location{URI: doc.uri, Range: sym.Range}, nil)
@@ -345,49 +357,59 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 		return
 	}
 
+	// If cursor is inside a STRING or any ANNOTATION span, suppress completions.
+	off := posToOffset(doc.lines, params.Position, doc.text)
+	if _, tk, _, _, ok := tokenAtOffset(doc, off); ok {
+		if tk.Type == mindscript.STRING {
+			s.sendResponse(id, []CompletionItem{}, nil)
+			return
+		}
+	}
+	for _, sp := range commentSpans(doc) {
+		if off >= sp[0] && off < sp[1] {
+			s.sendResponse(id, []CompletionItem{}, nil)
+			return
+		}
+	}
+
 	seen := map[string]bool{}
 	items := make([]CompletionItem, 0, 128)
 
-	// Document symbols
-	for _, sym := range doc.symbols {
-		if seen[sym.Name] {
+	// Uniform: suggest from all bindings we know in this file (with kind/signature or type)
+	for _, b := range doc.binds {
+		if seen[b.Name] {
 			continue
 		}
-		seen[sym.Name] = true
+		seen[b.Name] = true
 		kind := 6 // Variable
-		if sym.Kind == "fun" {
+		switch b.Kind {
+		case "fun", "oracle":
 			kind = 3 // Function
-		} else if sym.Kind == "type" {
+		case "type":
 			kind = 5 // Class-ish
+		case "param":
+			kind = 6 // Variable (parameter)
 		}
-		detail := sym.Kind
-		if sym.Kind == "fun" && sym.Sig != "" {
-			detail = sym.Sig
+		detail := b.Kind
+		if b.Kind == "fun" || b.Kind == "oracle" {
+			if b.Sig != "" {
+				detail = b.Sig
+			}
+		} else {
+			ty := formatTypeNode(b.TypeNode)
+			if ty != "" && ty != "Any" {
+				if detail != "" {
+					detail = detail + " · " + ty
+				} else {
+					detail = ty
+				}
+			}
 		}
 		items = append(items, CompletionItem{
-			Label:  sym.Name,
+			Label:  b.Name,
 			Kind:   kind,
 			Detail: detail,
 		})
-	}
-
-	// Globals / core bindings
-	if entries, order := s.listBindings(s.ip.Global); len(order) > 0 {
-		for _, name := range order {
-			if seen[name] {
-				continue
-			}
-			seen[name] = true
-			v := entries[name]
-			kind := 6
-			switch v.Tag {
-			case mindscript.VTFun:
-				kind = 3
-			case mindscript.VTType:
-				kind = 5
-			}
-			items = append(items, CompletionItem{Label: name, Kind: kind})
-		}
 	}
 
 	// Language keywords (MindScript-specific spellings)
@@ -409,17 +431,6 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 
 	sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
 	s.sendResponse(id, items, nil)
-}
-
-// Ask the interpreter for a visible environment map via userland getEnv(), if present.
-func (s *server) listBindings(env *mindscript.Env) (map[string]mindscript.Value, []string) {
-	ast := mindscript.S{"call", mindscript.S{"id", "getEnv"}}
-	v, err := s.ip.EvalAST(ast, env)
-	if err != nil || v.Tag != mindscript.VTMap {
-		return map[string]mindscript.Value{}, nil
-	}
-	mo := v.Data.(*mindscript.MapObject)
-	return mo.Entries, append([]string(nil), mo.Keys...)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -488,6 +499,30 @@ func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
 		return
 	}
 
+	// Resolve the specific binding at the query position.
+	qOff := posToOffset(doc.lines, params.Position, doc.text)
+	bOrigin, ok := nearestBinding(doc, name, qOff)
+	if !ok {
+		// fallback: all occurrences of the bare identifier (minus properties)
+		locs := []Location{}
+		for i, t := range doc.tokens {
+			if t.Type != mindscript.ID || tokenName(t) != name {
+				continue
+			}
+			if i-1 >= 0 && doc.tokens[i-1].Type == mindscript.PERIOD {
+				continue
+			}
+			start, end := tokenSpan(doc, t)
+			locs = append(locs, Location{
+				URI:   doc.uri,
+				Range: makeRange(doc.lines, start, end, doc.text),
+			})
+		}
+		s.sendResponse(id, locs, nil)
+		return
+	}
+
+	// Shadowing-aware: include only occurrences that resolve to the same nearest binding.
 	locs := []Location{}
 	for i, t := range doc.tokens {
 		if t.Type != mindscript.ID || tokenName(t) != name {
@@ -497,11 +532,16 @@ func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
 		if i-1 >= 0 && doc.tokens[i-1].Type == mindscript.PERIOD {
 			continue
 		}
-		start, end := tokenSpan(doc, t)
-		locs = append(locs, Location{
-			URI:   doc.uri,
-			Range: makeRange(doc.lines, start, end, doc.text),
-		})
+		sOff, eOff := tokenSpan(doc, t)
+		// Use the start of the token as its "position"
+		if bTok, ok := nearestBinding(doc, name, sOff); ok {
+			if bTok.Range == bOrigin.Range {
+				locs = append(locs, Location{
+					URI:   doc.uri,
+					Range: makeRange(doc.lines, sOff, eOff, doc.text),
+				})
+			}
+		}
 	}
 	s.sendResponse(id, locs, nil)
 }
@@ -570,7 +610,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 	entries := []semEntry{}
 
 	// Emit code tokens, skipping anything inside comment spans.
-	// Track brace depth to classify map-literal keys (`id`/`"str"` before ':') as properties.
+	// Track brace depth to classify map-literal keys (`id`/`"str"`) as properties.
 	braceDepth := 0
 
 	for i := 0; i < len(doc.tokens); i++ {
@@ -904,21 +944,28 @@ found:
 		ActiveParameter: paramIdx,
 	}
 
-	// Prefer local symbol sig
+	// Prefer a local binding signature if available
 	if name != "" {
+		for _, b := range doc.binds {
+			if b.Name == name && (b.Kind == "fun" || b.Kind == "oracle") && b.Sig != "" {
+				resp.Signatures = append(resp.Signatures, SignatureInformation{Label: b.Sig})
+				s.sendResponse(id, resp, nil)
+				return
+			}
+		}
+		// Fall back to top-level symbol sig (if present)
 		for _, sym := range doc.symbols {
 			if sym.Name == name && sym.Kind == "fun" {
 				label := sym.Sig
 				if label == "" {
 					label = name + "(...) -> Any"
 				}
-				si := SignatureInformation{Label: label}
-				resp.Signatures = append(resp.Signatures, si)
+				resp.Signatures = append(resp.Signatures, SignatureInformation{Label: label})
 				s.sendResponse(id, resp, nil)
 				return
 			}
 		}
-		// Try global meta
+		// Try global meta (metadata only; no user code execution)
 		if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTFun {
 			if meta, ok := s.ip.FunMeta(v); ok {
 				ps := meta.ParamSpecs()
@@ -930,10 +977,10 @@ found:
 					paramsInfo = append(paramsInfo, ParameterInformation{Label: seg})
 				}
 				label := fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), mindscript.FormatType(meta.ReturnType()))
-				doc := strings.TrimSpace(meta.Doc())
+				docm := strings.TrimSpace(meta.Doc())
 				var docPtr *MarkupContent
-				if doc != "" {
-					docPtr = &MarkupContent{Kind: "markdown", Value: doc}
+				if docm != "" {
+					docPtr = &MarkupContent{Kind: "markdown", Value: docm}
 				}
 				resp.Signatures = append(resp.Signatures, SignatureInformation{
 					Label:         label,

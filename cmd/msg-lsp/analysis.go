@@ -1,206 +1,30 @@
-// cmd/lsp/core.go
+// analysis.go
 //
-// ROLE: Shared infrastructure for the LSP server: transport helpers, server
-//       state, text/position math, diagnostics, token/span utilities, and the
-//       analysis pipeline (lex + parse + symbol extraction).
+// ROLE: Lex/parse/index pipeline, text/position helpers, span utilities, and
+//       diagnostics mapping. Populates per-document caches used by features.
 //
 // What lives here
-//   • Transport helpers for framed stdio (Content-Length) and convenience
-//     send/notify wrappers (used by handlers).
-//   • Server model:
-//        - server: global state (open docs, mutex, interpreter handle).
-//        - docState: per-document caches (raw text, line starts, tokens, AST,
-//          span index, lightweight symbol table).
-//   • Unicode/UTF-16 column math and byte↔position conversions consistent with
-//     the LSP spec (positions are UTF-16 code units).
-//   • Diagnostics plumbing: mapping lexer/parser errors to LSP ranges and
-//     publishing them, including “incomplete” heuristics for on-type feedback.
-//   • Token & span helpers: locate tokens at offsets, compute exact byte spans,
-//     comment/annotation region detection for semantic tokens & folding.
-//   • Analysis pipeline (`analyze`):
-//        1) Lex (interactive), 2) Parse (interactive), 3) Collect top-level
-//           symbols (no code execution), 4) Publish/clear diagnostics.
-//     Results populate docState so feature handlers can be fast and side-effect-free.
+//   • Text & UTF-16 helpers and byte↔position conversion consistent with LSP.
+//   • Token/span helpers (exact spans, token lookup, comment/annotation regions).
+//   • Diagnostics plumbing: map lexer/parser errors to LSP ranges and publish.
+//   • Analysis pipeline: analyze() → lex, parse (with spans), collect bindings
+//     and top-level symbols, and clear/publish diagnostics.
+//   • Lightweight static type synthesis and formatting helpers used by features.
 //
 // What does NOT live here
-//   • No LSP feature handlers themselves (hover, completion, etc.).
-//   • No business rules about how to format responses—handlers own that.
-//   • No interpreter-driven execution of user code. (We only build tokens/AST
-//     and extract symbols; see features.go for the optional, guarded lookup of
-//     global/builtin metadata.)
-//
-// Why this separation
-//   • Centralizes shared mechanics so features stay small and consistent.
-//   • Makes unit testing of text math and analysis independent of UI features.
-//
-// Dependencies
-//   • Relies on internal/mindscript lexer & parser (no VM/interpreter internals).
-//   • Holds an *Interpreter pointer only for feature-level metadata queries;
-//     core analysis itself does not execute user programs.
+//   • No transport framing or send/notify implementations (lives in main.go).
+//   • No LSP feature handlers (hover/definition/etc.) — see features.go.
+//   • No server/document struct definitions — see state.go.
 
-// cmd/lsp/core.go
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"os"
 	"strings"
-	"sync"
 	"unicode/utf8"
 
 	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
 )
-
-////////////////////////////////////////////////////////////////////////////////
-// Transport (stdio framing) + send/notify
-////////////////////////////////////////////////////////////////////////////////
-
-var stdoutSink io.Writer = os.Stdout
-
-func init() {
-	// Silence unsolicited output during `go test` unless opted in.
-	if strings.HasSuffix(os.Args[0], ".test") && os.Getenv("LSP_STDOUT") == "" {
-		stdoutSink = io.Discard
-	}
-}
-
-func readMsg(r *bufio.Reader) ([]byte, error) {
-	var contentLen int
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			break
-		}
-		if i := strings.IndexByte(line, ':'); i >= 0 {
-			key := strings.ToLower(strings.TrimSpace(line[:i]))
-			val := strings.TrimSpace(line[i+1:])
-			if key == "content-length" {
-				_, _ = fmt.Sscanf(val, "%d", &contentLen)
-			}
-		}
-	}
-	if contentLen <= 0 {
-		return nil, io.EOF
-	}
-	buf := make([]byte, contentLen)
-	_, err := io.ReadFull(r, buf)
-	return buf, err
-}
-
-func writeMsg(w io.Writer, v any) error {
-	body, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	var b bytes.Buffer
-	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
-	b.Write(body)
-	_, err = w.Write(b.Bytes())
-	return err
-}
-
-func (s *server) sendResponse(id json.RawMessage, result any, respErr *ResponseError) {
-	if respErr == nil && result == nil {
-		rawNull := json.RawMessage([]byte("null"))
-		_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: rawNull})
-		return
-	}
-	_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: result, Error: respErr})
-}
-
-func (s *server) notify(method string, params any) {
-	_ = writeMsg(stdoutSink, map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-		"params":  params,
-	})
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Server state & document model
-////////////////////////////////////////////////////////////////////////////////
-
-type symbolDef struct {
-	Name  string
-	Kind  string // "let" | "fun" | "type"
-	Range Range  // where it's declared
-	Doc   string // first line, if available
-	Sig   string // pretty signature for fun/oracle
-}
-
-// bindingDef: any assignment to a name (decl/id) anywhere in the file.
-// Docs come uniformly from the VALUE's annotation wrapper if present.
-type bindingDef struct {
-	Name     string
-	Range    Range // span of the defining identifier token
-	DocFull  string
-	DocFirst string
-	Kind     string // "let" | "fun" | "oracle" | "type" | "param" | "" (best-effort)
-	// Enriched info for hover/completion
-	TypeNode []any  // synthesized/static type (vars/params) or declared return (fun/oracle/type)
-	Sig      string // pretty signature for fun/oracle
-}
-
-type docState struct {
-	uri     string
-	text    string
-	lines   []int // line start offsets (byte indices)
-	symbols []symbolDef
-	tokens  []mindscript.Token
-	ast     mindscript.S
-	spans   *mindscript.SpanIndex
-	binds   []bindingDef // all bindings collected uniformly
-}
-
-type server struct {
-	mu   sync.RWMutex
-	docs map[string]*docState
-	ip   *mindscript.Interpreter
-}
-
-func newServer() *server {
-	ip, _ := mindscript.NewInterpreter()
-	return &server{
-		docs: make(map[string]*docState),
-		ip:   ip,
-	}
-}
-
-// snapshotDoc returns a consistent, read-only snapshot of a document.
-func (s *server) snapshotDoc(uri string) *docState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	d := s.docs[uri]
-	if d == nil {
-		return nil
-	}
-	cp := *d // shallow copy
-	if d.lines != nil {
-		cp.lines = append([]int(nil), d.lines...)
-	}
-	if d.tokens != nil {
-		cp.tokens = append([]mindscript.Token(nil), d.tokens...)
-	}
-	if d.symbols != nil {
-		cp.symbols = append([]symbolDef(nil), d.symbols...)
-	}
-	// ast/spans are immutable enough to share (spans is read-only).
-	cp.ast = d.ast
-	cp.spans = d.spans
-	// binds is read-only after analyze
-	if d.binds != nil {
-		cp.binds = append([]bindingDef(nil), d.binds...)
-	}
-	return &cp
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Text & UTF-16 helpers
@@ -236,6 +60,7 @@ func toU16(r rune) int {
 	return 2
 }
 
+// posToOffset converts an LSP Position (UTF-16 code units) to a byte offset.
 func posToOffset(lines []int, p Position, text string) int {
 	if p.Line < 0 {
 		return 0
@@ -260,6 +85,7 @@ func posToOffset(lines []int, p Position, text string) int {
 	return i
 }
 
+// offsetToPos converts a byte offset to an LSP Position (UTF-16 code units).
 func offsetToPos(lines []int, off int, text string) Position {
 	if off < 0 {
 		off = 0
@@ -333,12 +159,6 @@ func u16Len(s string) int {
 		}
 	}
 	return n
-}
-
-// hasValidSpan reports whether the lexer provided concrete byte offsets.
-// Used for ANNOTATION tokens which must have StartByte/EndByte or be ignored.
-func hasValidSpan(t mindscript.Token, textLen int) bool {
-	return t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= textLen
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -441,6 +261,12 @@ func tokenName(t mindscript.Token) string {
 	return t.Lexeme
 }
 
+// hasValidSpan reports whether the lexer provided concrete byte offsets.
+// Used for ANNOTATION tokens which must have StartByte/EndByte or be ignored.
+func hasValidSpan(t mindscript.Token, textLen int) bool {
+	return t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= textLen
+}
+
 // Prefer exact lexer byte spans; fallback to line-local search.
 func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
 	// NEW: exact byte spans from the lexer if present.
@@ -539,45 +365,9 @@ func findSymbol(doc *docState, name string) (symbolDef, bool) {
 	return symbolDef{}, false
 }
 
-// -------- Annotation & binding helpers (no special-casing) --------
-
-// annotText returns (baseNode, mergedAnnotationText, ok) without mutating the node.
-func annotText(n []any) ([]any, string, bool) {
-	cur := n
-	var parts []string
-	for len(cur) >= 3 {
-		if tag, _ := cur[0].(string); tag != "annot" {
-			break
-		}
-		if child, ok := cur[1].([]any); ok && len(child) >= 2 && child[0] == "str" {
-			if s, _ := child[1].(string); s != "" {
-				parts = append(parts, s)
-			}
-		}
-		base, _ := cur[2].([]any)
-		cur = base
-	}
-	if len(parts) == 0 {
-		return n, "", false
-	}
-	return cur, strings.Join(parts, "\n"), true
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return strings.TrimSpace(s[:i])
-	}
-	return strings.TrimSpace(s)
-}
-
-func indexOfToken(toks []mindscript.Token, tk mindscript.Token) int {
-	for i, t := range toks {
-		if t == tk {
-			return i
-		}
-	}
-	return -1
-}
+////////////////////////////////////////////////////////////////////////////////
+// Word scanning & comments
+////////////////////////////////////////////////////////////////////////////////
 
 // wordAt: prefer token-based match; fallback to ASCII scan if needed.
 func wordAt(doc *docState, pos Position) (string, Range) {
@@ -586,7 +376,7 @@ func wordAt(doc *docState, pos Position) (string, Range) {
 		return "", Range{}
 	}
 	for _, t := range doc.tokens {
-		// FIX: only IDs are symbol names; TYPE is a keyword.
+		// Only IDs are symbol names; TYPE is a keyword.
 		if t.Type != mindscript.ID {
 			continue
 		}
@@ -615,49 +405,6 @@ func wordAt(doc *docState, pos Position) (string, Range) {
 	return "", Range{}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Shared keyword/type helpers (used by hover/completion/semTokens)
-////////////////////////////////////////////////////////////////////////////////
-
-func isKeywordButNotType(tt mindscript.TokenType) bool {
-	switch tt {
-	case mindscript.AND, mindscript.OR, mindscript.NOT,
-		mindscript.LET, mindscript.DO, mindscript.END, mindscript.RETURN, mindscript.BREAK, mindscript.CONTINUE,
-		mindscript.IF, mindscript.THEN, mindscript.ELIF, mindscript.ELSE,
-		mindscript.FUNCTION, mindscript.ORACLE,
-		mindscript.FOR, mindscript.IN, mindscript.FROM, mindscript.WHILE,
-		// FIX: 'type' keyword should be colored as a keyword, not a type identifier.
-		mindscript.TYPECONS, mindscript.TYPE, mindscript.ENUM,
-		mindscript.NULL:
-		return true
-	default:
-		return false
-	}
-}
-
-var builtinTypeDocs = map[string]string{
-	"Any":  "Top type; any value.",
-	"Null": "Null value (absence).",
-	"Bool": "Boolean type (true/false).",
-	"Int":  "64-bit signed integer.",
-	"Num":  "64-bit IEEE-754 float.",
-	"Str":  "Unicode string.",
-	"Type": "Type descriptor value.",
-}
-
-// semantic tokens type legend index (handlers will read this)
-var semTypes = map[string]int{
-	"keyword":  0,
-	"function": 1,
-	"type":     2,
-	"variable": 3,
-	"property": 4,
-	"string":   5,
-	"number":   6,
-	"comment":  7,
-	"bracket":  8,
-}
-
 func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
 
 // comment/annotation spans used by semantic tokens & folding.
@@ -683,54 +430,51 @@ func commentSpans(doc *docState) [][2]int {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Definition heuristics & symbol formatting
+// Shared keyword/type helpers (used by features)
 ////////////////////////////////////////////////////////////////////////////////
 
-// defRangeByTokens: heuristic: let <name> … OR <name> = … (same or next line)
-func defRangeByTokens(doc *docState, name string) (Range, bool) {
-	toks := doc.tokens
-	for i := 0; i < len(toks); i++ {
-		t := toks[i]
-		if t.Type != mindscript.ID || tokenName(t) != name {
-			continue
-		}
-		// let <name> …
-		if i >= 1 && toks[i-1].Type == mindscript.LET && toks[i-1].Line == t.Line {
-			s, e := tokenSpan(doc, t)
-			return makeRange(doc.lines, s, e, doc.text), true
-		}
-		if i >= 2 && toks[i-2].Type == mindscript.LET && toks[i-2].Line == t.Line {
-			s, e := tokenSpan(doc, t)
-			return makeRange(doc.lines, s, e, doc.text), true
-		}
-		// <name> = … (same line)
-		found := false
-		line := t.Line
-		for j := i + 1; j < len(toks) && toks[j].Line == line; j++ {
-			if toks[j].Type == mindscript.ASSIGN {
-				found = true
-				break
-			}
-		}
-		// spill to next line: <name> \n =
-		if !found {
-			for j := i + 1; j < len(toks); j++ {
-				if toks[j].Line > line+1 {
-					break
-				}
-				if toks[j].Type == mindscript.ASSIGN {
-					found = true
-					break
-				}
-			}
-		}
-		if found {
-			s, e := tokenSpan(doc, t)
-			return makeRange(doc.lines, s, e, doc.text), true
-		}
+func isKeywordButNotType(tt mindscript.TokenType) bool {
+	switch tt {
+	case mindscript.AND, mindscript.OR, mindscript.NOT,
+		mindscript.LET, mindscript.DO, mindscript.END, mindscript.RETURN, mindscript.BREAK, mindscript.CONTINUE,
+		mindscript.IF, mindscript.THEN, mindscript.ELIF, mindscript.ELSE,
+		mindscript.FUNCTION, mindscript.ORACLE,
+		mindscript.FOR, mindscript.IN, mindscript.FROM, mindscript.WHILE,
+		// 'type' keyword should be colored as a keyword, not a type identifier.
+		mindscript.TYPECONS, mindscript.TYPE, mindscript.ENUM,
+		mindscript.NULL:
+		return true
+	default:
+		return false
 	}
-	return Range{}, false
 }
+
+var builtinTypeDocs = map[string]string{
+	"Any":  "Top type; any value.",
+	"Null": "Null value (absence).",
+	"Bool": "Boolean type (true/false).",
+	"Int":  "64-bit signed integer.",
+	"Num":  "64-bit IEEE-754 float.",
+	"Str":  "Unicode string.",
+	"Type": "Type descriptor value.",
+}
+
+// semantic tokens legend index (handlers will read this)
+var semTypes = map[string]int{
+	"keyword":  0,
+	"function": 1,
+	"type":     2,
+	"variable": 3,
+	"property": 4,
+	"string":   5,
+	"number":   6,
+	"comment":  7,
+	"bracket":  8,
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Definition heuristics & symbol formatting
+////////////////////////////////////////////////////////////////////////////////
 
 // formatFunSig builds a pretty signature from a ("fun", ...) AST node.
 func formatFunSig(name string, fun []any) string {
@@ -772,7 +516,7 @@ func formatFunSig(name string, fun []any) string {
 // analyze lexes, parses, and refreshes the per-doc caches used by features.
 // It fills: doc.tokens, doc.ast (when parse succeeds), and doc.symbols (top-level defs).
 func (s *server) analyze(doc *docState) {
-	// 1) Lex (interactive is fine; the tests use valid input)
+	// 1) Lex (interactive)
 	lx := mindscript.NewLexerInteractive(doc.text)
 	toks, err := lx.Scan()
 	if err != nil {
@@ -794,8 +538,6 @@ func (s *server) analyze(doc *docState) {
 					ptoks = ptoks[:n-1]
 				}
 				doc.tokens = ptoks
-			} else {
-				// If even the prefix fails, leave tokens as-is (keep previous coloring).
 			}
 		}
 		doc.symbols = nil
@@ -834,12 +576,14 @@ func (s *server) analyze(doc *docState) {
 	s.clearDiagnostics(doc.uri)
 }
 
-// ---------- Lightweight static type synthesis (no execution) ----------
+////////////////////////////////////////////////////////////////////////////////
+// Lightweight static type synthesis (no execution)
+////////////////////////////////////////////////////////////////////////////////
+
 // We represent types as the same AST nodes used in function signatures:
 //   ("id","Int"), ("array", T), ("map", ("pair", ("str","k"), T), ...), ("unop","?", T)
 // and pretty-print with mindscript.FormatType.
 
-// typeID builds a leaf type like Int/Num/Str/Any.
 func typeID(name string) []any { return []any{"id", name} }
 
 // formatTypeNode -> human string (falls back to "Any" on nil/unknown)
@@ -897,7 +641,7 @@ func findLocalFunRetType(doc *docState, name string) ([]any, bool) {
 		rhs, _ := n[2].([]any)
 		if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
 			if nm, _ := lhs[1].(string); nm == name {
-				base, _, _ := annotText(rhs)
+				base, _ := unwrapAnnotNode(rhs), true
 				if len(base) >= 3 && (base[0] == "fun" || base[0] == "oracle") {
 					// fun/oracle layout: ("fun", params, ret, body) / ("oracle", params, outType, source)
 					if tnode, ok := base[2].([]any); ok {
@@ -912,47 +656,6 @@ func findLocalFunRetType(doc *docState, name string) ([]any, bool) {
 		}
 	}
 	return nil, false
-}
-
-// rhsForBinding locates the RHS node for a binding by matching the LHS span to b.Range.
-func rhsForBinding(doc *docState, b bindingDef) ([]any, bool) {
-	if doc == nil || doc.ast == nil || doc.spans == nil {
-		return nil, false
-	}
-	// Convert binding range start/end to byte offsets
-	start := posToOffset(doc.lines, b.Range.Start, doc.text)
-	end := posToOffset(doc.lines, b.Range.End, doc.text)
-
-	var found []any
-	var walk func(node []any, path mindscript.NodePath)
-	walk = func(node []any, path mindscript.NodePath) {
-		if found != nil {
-			return
-		}
-		if len(node) >= 3 && node[0] == "assign" {
-			lhs, _ := node[1].([]any)
-			rhs, _ := node[2].([]any)
-			_ = lhs
-			// span for the LHS child
-			lhsPath := append(append(mindscript.NodePath{}, path...), 0)
-			if sp, ok := doc.spans.Get(lhsPath); ok {
-				if sp.StartByte == start && sp.EndByte == end {
-					found = rhs
-					return
-				}
-			}
-		}
-		for i := 1; i < len(node); i++ {
-			if ch, ok := node[i].([]any); ok {
-				walk(ch, append(path, i-1))
-			}
-		}
-	}
-	walk(doc.ast, mindscript.NodePath{})
-	if found == nil {
-		return nil, false
-	}
-	return found, true
 }
 
 // inferExprType synthesizes a best-effort type for a value expression.
@@ -1143,7 +846,38 @@ func inferExprType(doc *docState, n []any) []any {
 	return typeID("Any")
 }
 
-// ---------- Uniform binding collection (no top-level specialness) ----------
+////////////////////////////////////////////////////////////////////////////////
+// Uniform binding collection (no top-level specialness)
+////////////////////////////////////////////////////////////////////////////////
+
+// annotText returns (baseNode, mergedAnnotationText, ok) without mutating the node.
+func annotText(n []any) ([]any, string, bool) {
+	cur := n
+	var parts []string
+	for len(cur) >= 3 {
+		if tag, _ := cur[0].(string); tag != "annot" {
+			break
+		}
+		if child, ok := cur[1].([]any); ok && len(child) >= 2 && child[0] == "str" {
+			if s, _ := child[1].(string); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		base, _ := cur[2].([]any)
+		cur = base
+	}
+	if len(parts) == 0 {
+		return n, "", false
+	}
+	return cur, strings.Join(parts, "\n"), true
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
 
 // collectBindings walks the AST and records every binding of the form:
 //
@@ -1291,7 +1025,7 @@ func collectBindings(doc *docState) []bindingDef {
 							}
 						}
 						if name != "" {
-							// Path to id child (0-based NodePath indices):
+							// Path to id child:
 							//   fun := ("fun", params, ret, body)
 							//   params is child 0 in NodePath
 							//   pair is (i-1) within params
@@ -1369,16 +1103,13 @@ func nearestBinding(doc *docState, name string, off int) (bindingDef, bool) {
 
 // collectTopLevelSymbols walks the AST (root-level only) and extracts symbols:
 //   - let/assign of a simple decl: ("assign", ("decl", name), rhs)
-//   - marks kind "fun" when rhs tag == "fun"; otherwise "let".
-//
-// Ranges are the byte range of the defining identifier token.
+//   - marks kind "fun" when rhs tag == "fun"; "type" when rhs tag == "type"
 func collectTopLevelSymbols(doc *docState) []symbolDef {
 	var out []symbolDef
 	root := doc.ast
 	if len(root) == 0 {
 		return out
 	}
-
 	tag, _ := root[0].(string)
 	if tag == "block" {
 		for i := 1; i < len(root); i++ {
@@ -1394,8 +1125,7 @@ func collectTopLevelSymbols(doc *docState) []symbolDef {
 	return out
 }
 
-// addTopLevelAssign adds a symbol for ("assign", ("decl", name), rhs).
-// Kind is "fun" if rhs tag == "fun"; otherwise "let".
+// addTopLevelAssign adds a symbol for ("assign", ("decl"| "id", name), rhs).
 func addTopLevelAssign(node []any, doc *docState, out *[]symbolDef) {
 	if len(node) < 3 {
 		return

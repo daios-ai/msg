@@ -1,32 +1,109 @@
-// cmd/lsp/main.go
+// main.go
 //
-// ROLE: Executable entrypoint and JSON-RPC dispatch loop.
+// ROLE: Executable entrypoint and JSON-RPC dispatch loop, plus transport
+//       helpers (framed stdio) and small server send/notify wrappers.
 //
 // What lives here
 //   • Process startup and server construction.
 //   • Framed JSON-RPC read loop from stdin and write to stdout.
 //   • Method routing: decode → switch on req.Method → delegate to server
-//     handlers in features.go / core.go.
+//     handlers in features.go / analysis.go.
 //   • Minimal lifecycle handling (initialize/shutdown/exit).
+//   • Transport helpers: Content-Length framing, sendResponse/notify.
 //
 // What does NOT live here
-//   • No language features, no text analysis, no diagnostics computation,
-//     no document state. Keep this file small so it’s easy to test/replace
-//     the transport without touching feature logic.
-//
-// Why this separation
-//   • Clear boundary between transport concerns and language intelligence.
-//   • Enables reuse of the server with different frontends/transports.
+//   • No language features (hover/definition/etc.) — see features.go.
+//   • No analysis or text math — see analysis.go.
+//   • No server/doc structs — see state.go.
 
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
+
+////////////////////////////////////////////////////////////////////////////////
+// Transport (stdio framing) + send/notify
+////////////////////////////////////////////////////////////////////////////////
+
+var stdoutSink io.Writer = os.Stdout
+
+func init() {
+	// Silence unsolicited output during `go test` unless opted in.
+	if strings.HasSuffix(os.Args[0], ".test") && os.Getenv("LSP_STDOUT") == "" {
+		stdoutSink = io.Discard
+	}
+}
+
+// readMsg reads a single JSON-RPC message body using LSP's Content-Length framing.
+func readMsg(r *bufio.Reader) ([]byte, error) {
+	var contentLen int
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		if i := strings.IndexByte(line, ':'); i >= 0 {
+			key := strings.ToLower(strings.TrimSpace(line[:i]))
+			val := strings.TrimSpace(line[i+1:])
+			if key == "content-length" {
+				_, _ = fmt.Sscanf(val, "%d", &contentLen)
+			}
+		}
+	}
+	if contentLen <= 0 {
+		return nil, io.EOF
+	}
+	buf := make([]byte, contentLen)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
+
+// writeMsg writes a JSON-RPC payload with Content-Length framing.
+func writeMsg(w io.Writer, v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
+	b.Write(body)
+	_, err = w.Write(b.Bytes())
+	return err
+}
+
+// sendResponse sends a JSON-RPC response (result or error).
+func (s *server) sendResponse(id json.RawMessage, result any, respErr *ResponseError) {
+	if respErr == nil && result == nil {
+		rawNull := json.RawMessage([]byte("null"))
+		_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: rawNull})
+		return
+	}
+	_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: result, Error: respErr})
+}
+
+// notify sends a JSON-RPC notification (no id).
+func (s *server) notify(method string, params any) {
+	_ = writeMsg(stdoutSink, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	})
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Entry point & dispatcher
+////////////////////////////////////////////////////////////////////////////////
 
 func main() {
 	s := newServer()

@@ -166,6 +166,26 @@ func (s *server) onDidChange(raw json.RawMessage) {
 // Hover
 ////////////////////////////////////////////////////////////////////////////////
 
+// tokenAtOffset returns the token index and span whose lexeme covers [off].
+func tokenAtOffset(doc *docState, off int) (idx int, t mindscript.Token, start, end int, ok bool) {
+	for i, tk := range doc.tokens {
+		s, e := tokenSpan(doc, tk)
+		if off >= s && off < e {
+			return i, tk, s, e, true
+		}
+	}
+	return -1, mindscript.Token{}, 0, 0, false
+}
+
+func findSymbol(doc *docState, name string) (symbolDef, bool) {
+	for _, s := range doc.symbols {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return symbolDef{}, false
+}
+
 func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 	var params struct {
 		TextDocument TextDocumentIdentifier `json:"textDocument"`
@@ -1003,6 +1023,8 @@ found:
 ////////////////////////////////////////////////////////////////////////////////
 // Folding ranges
 ////////////////////////////////////////////////////////////////////////////////
+
+func overlaps(a, b [2]int) bool { return a[0] < b[1] && b[0] < a[1] }
 
 func (s *server) onFoldingRange(id json.RawMessage, paramsRaw json.RawMessage) {
 	var params struct {

@@ -1,12 +1,13 @@
 // cmd/msg-lsp/lub.go
 //
-// Package-local LUB/GLB for MindScript S-expr types.
+// Package-local LUB/GLB/Subtyping for MindScript S-expr types.
 //
 // What this file does
 // -------------------
-// Implements a **single-pass, static** type **Least Upper Bound (LUB)** and a
-// minimal **Greatest Lower Bound (GLB)** (only needed for function-parameter
-// contravariance) over MindScript’s S-expr type nodes.
+// Implements a **single-pass, static** type **Least Upper Bound (LUB)**,
+// a minimal **Greatest Lower Bound (GLB)** (only needed for function-parameter
+// contravariance), and a **structural subtyping predicate** over MindScript’s
+// S-expr type nodes.
 //
 // Public surface for analysis.go
 // ------------------------------
@@ -22,6 +23,15 @@
 //         arrays, type-maps (union of keys; required if either; per-field GLB
 //         with Any fallback), enums (set intersection), and nullability rules.
 //         Returns ok=false when no meaningful meet exists.
+//
+//   • func IsSubtypeStatic(a, b []any) bool
+//       – **Structural** subtyping check used by the analyzer for conformance
+//         tests (e.g., return-site checks and call-site argument checks).
+//         Obeys the spec: Int <: Num; arrays covariant; maps require all
+//         required fields and check optionals if present; arrows are
+//         contravariant in parameters and covariant in returns; enums are
+//         subset-checked; nullable is handled uniformly; non-builtin IDs are
+//         opaque atoms (identical-id only).
 //
 // Data structures visible to analysis.go
 // --------------------------------------
@@ -48,6 +58,12 @@ func LUB(a, b []any) []any { return lubImpl(a, b) }
 
 // GLB computes a minimal greatest lower bound. ok=false means no GLB exists.
 func GLB(a, b []any) ([]any, bool) { return glbImpl(a, b) }
+
+// IsSubtypeStatic reports whether a <: b under the analyzer's static,
+// structural rules (uniform nullability, arrays covariant, maps with
+// required/optional semantics, arrows contra/co, enums by set-inclusion,
+// opaque aliases compare by atom identity).
+func IsSubtypeStatic(a, b []any) bool { return isSubtypeImpl(a, b) }
 
 //// END_OF_PUBLIC
 
@@ -222,6 +238,109 @@ func arrowParts(t []any) (param, ret []any) {
 }
 
 func eq(a, b []any) bool { return reflect.DeepEqual(a, b) }
+
+// --- Subtyping (structural; analyzer-side) ----------------------------------
+
+func isSubtypeImpl(a, b []any) bool {
+	// Any is top
+	if isAny(b) {
+		return true
+	}
+	// Exact equality
+	if eq(a, b) {
+		return true
+	}
+
+	// Uniform nullable handling
+	ab, aq, anull := peelNullable(a)
+	bb, bq, bnull := peelNullable(b)
+
+	// Null <: T? (and only then)
+	if anull {
+		return bnull || bq
+	}
+	// T? ⊄ U unless U is also nullable
+	if aq && !bq {
+		return false
+	}
+	// T? <: U? iff T <: U
+	if aq && bq {
+		return isSubtypeImpl(ab, bb)
+	}
+	// T <: U? iff T <: U
+	if !aq && bq {
+		return isSubtypeImpl(ab, bb)
+	}
+	// From here both are non-nullable base types ab, bb
+
+	// Primitives (Int <: Num)
+	if isPrim(ab) && isPrim(bb) {
+		return primSubtype(ab, bb)
+	}
+
+	// Arrays covariant
+	if isArray(ab) && isArray(bb) {
+		return isSubtypeImpl(arrElem(ab), arrElem(bb))
+	}
+
+	// Maps (open-world): required keys must exist and subtype; optional keys
+	// must subtype only if present on the left.
+	if isMap(ab) && isMap(bb) {
+		ma, mb := mapFields(ab), mapFields(bb)
+		for k, fb := range mb {
+			fa, ok := ma[k]
+			if fb.required {
+				if !ok || !isSubtypeImpl(fa.typ, fb.typ) {
+					return false
+				}
+			} else {
+				if ok && !isSubtypeImpl(fa.typ, fb.typ) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	// Enums: subset (same literal kind)
+	if isEnum(ab) && isEnum(bb) {
+		ka, kb := enumKind(ab), enumKind(bb)
+		if ka == "" || ka != kb {
+			return false
+		}
+		A, B := enumMembers(ab), enumMembers(bb)
+		for _, x := range A {
+			found := false
+			for _, y := range B {
+				if reflect.DeepEqual(x, y) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	// Enum <: base primitive (e.g., Enum["r","g"] <: Str)
+	if isEnum(ab) && isPrim(bb) && eq(enumBasePrim(enumKind(ab)), bb) {
+		return true
+	}
+
+	// Arrows: contravariant in params, covariant in return
+	if isArrow(ab) && isArrow(bb) {
+		ap, ar := arrowParts(ab)
+		bp, br := arrowParts(bb)
+		return isSubtypeImpl(bp, ap) && isSubtypeImpl(ar, br)
+	}
+
+	// Opaque non-builtin aliases: identical id only
+	if len(ab) >= 2 && ab[0] == "id" && !isPrim(ab) {
+		return reflect.DeepEqual(ab, bb)
+	}
+	return false
+}
 
 // --- GLB (minimal; for function params) --------------------------------------
 

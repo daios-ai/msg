@@ -13,6 +13,7 @@
 //   • Analysis pipeline: analyze() → lex, parse (with spans), collect bindings
 //     and top-level symbols, and clear/publish diagnostics.
 //   • Lightweight static type synthesis and formatting helpers used by features.
+//   • **Structural subtyping conformance checks** via IsSubtypeStatic (see lub.go).
 //
 // What does NOT live here
 //   • No transport framing or send/notify implementations (lives in main.go).
@@ -757,6 +758,11 @@ func (s *server) analyze(doc *docState) {
 
 // //////////////////////////////////////////////////////////////////////////////
 // Lightweight static type algebra (reused by fold)
+//   - typeID, formatTypeNode helpers
+//   - LUB / GLB (defined in lub.go)
+//   - **IsSubtypeStatic(a, b []any) bool** (defined in lub.go):
+//     Structural subtyping used for conformance in return and call checks.
+//
 // //////////////////////////////////////////////////////////////////////////////
 func typeID(name string) []any { return []any{"id", name} }
 func formatTypeNode(t []any) string {
@@ -807,8 +813,20 @@ func findLocalFunMeta(doc *docState, name string) (bool, [][]any, []any, bool) {
 									}
 								}
 							}
+							// MindScript: no true zero-arity — synthesize one Null param
+							if len(pts) == 0 {
+								pts = [][]any{typeID("Null")}
+							}
 							if rt, ok := base[2].([]any); ok {
-								foundIsOracle, foundParams, foundRet, found = (base[0] == "oracle"), pts, rt, true
+								// Record oracle return as nullable at DEFINITION time.
+								if base[0] == "oracle" {
+									foundIsOracle = true
+									foundRet = []any{"unop", "?", rt}
+								} else {
+									foundIsOracle = false
+									foundRet = rt
+								}
+								foundParams, found = pts, true
 							}
 						}
 					}
@@ -1351,9 +1369,6 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 		// Support BOTH shapes:
 		//   ("call", calleeExpr, ("array", arg1, arg2, ...))
 		//   ("call", calleeExpr, arg1, arg2, ...)
-		if len(n) < 3 {
-			return foldOut{T: typeID("Any")}
-		}
 		// Callee name (only simple id needed for tests)
 		calleeIsID := false
 		calleeName := ""
@@ -1366,35 +1381,41 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 		// Fold args and collect their types + ranges (accept both shapes)
 		var argTs [][]any
 		var argRanges []Range
-		if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
-			// ("call", callee, ("array", arg1, arg2, ...))
-			for i := 1; i < len(an); i++ {
-				if a, ok := an[i].([]any); ok {
-					argTs = append(argTs, fold(a, append(path, 1, i-1), c).T)
-					if r, ok := rangeFromPath(c.doc, append(path, 1, i-1)); ok {
-						argRanges = append(argRanges, r)
-					} else {
-						argRanges = append(argRanges, Range{})
+		// MindScript: no true zero-arity — missing arg list implies a single Null argument
+		if len(n) == 2 {
+			argTs = [][]any{typeID("Null")}
+			argRanges = []Range{rangeOrDefault(c.doc, path)}
+		} else if len(n) > 2 {
+			if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
+				// ("call", callee, ("array", arg1, arg2, ...))
+				for i := 1; i < len(an); i++ {
+					if a, ok := an[i].([]any); ok {
+						argTs = append(argTs, fold(a, append(path, 1, i-1), c).T)
+						if r, ok := rangeFromPath(c.doc, append(path, 1, i-1)); ok {
+							argRanges = append(argRanges, r)
+						} else {
+							argRanges = append(argRanges, Range{})
+						}
 					}
 				}
-			}
-		} else {
-			// ("call", callee, arg1, arg2, ...)
-			for i := 2; i < len(n); i++ {
-				if a, ok := n[i].([]any); ok {
-					argTs = append(argTs, fold(a, append(path, i-1), c).T)
-					if r, ok := rangeFromPath(c.doc, append(path, i-1)); ok {
-						argRanges = append(argRanges, r)
-					} else {
-						argRanges = append(argRanges, Range{})
+			} else {
+				// ("call", callee, arg1, arg2, ...)
+				for i := 2; i < len(n); i++ {
+					if a, ok := n[i].([]any); ok {
+						argTs = append(argTs, fold(a, append(path, i-1), c).T)
+						if r, ok := rangeFromPath(c.doc, append(path, i-1)); ok {
+							argRanges = append(argRanges, r)
+						} else {
+							argRanges = append(argRanges, Range{})
+						}
 					}
 				}
 			}
 		}
 		// Default: unknown callee → just return Any
-		isOracle, paramTs, retT, ok := false, [][]any{}, typeID("Any"), false
+		paramTs, retT, ok := [][]any{}, typeID("Any"), false
 		if calleeIsID {
-			isOracle, paramTs, retT, ok = findLocalFunMeta(c.doc, calleeName)
+			_, paramTs, retT, ok = findLocalFunMeta(c.doc, calleeName)
 		}
 		if ok {
 			// Arity checks (overflow only; partial application allowed)
@@ -1409,45 +1430,38 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 					})
 				}
 			}
-			// Per-argument type checks (best-effort)
+			// Per-argument type checks (use structural subtyping).
 			nCheck := len(argTs)
 			if len(paramTs) < nCheck {
 				nCheck = len(paramTs)
 			}
 			for i := 0; i < nCheck; i++ {
-				gotS := formatTypeNode(argTs[i])
-				wantS := formatTypeNode(paramTs[i])
-				// Special-case Enum membership when argument is a literal.
-				// Recover the literal node from whichever arg shape we saw.
+				mismatch := !IsSubtypeStatic(argTs[i], paramTs[i])
+
+				// Special-case Enum membership when argument is a literal:
+				// This preserves the crisp "not a member" diagnostic flavor.
 				var argNode []any
-				if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
-					if i+1 < len(an) {
-						argNode, _ = an[i+1].([]any)
+				if len(n) > 2 {
+					if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
+						if i+1 < len(an) {
+							argNode, _ = an[i+1].([]any)
+						}
+					} else if 2+i < len(n) {
+						argNode, _ = n[2+i].([]any)
 					}
-				} else if 2+i < len(n) {
-					argNode, _ = n[2+i].([]any)
 				}
 				isEnum, isMember := enumHasMember(paramTs[i], unwrapAnnotNode(argNode), c.doc)
-				mismatch := false
-				switch {
-				case isEnum && !isMember:
+				if isEnum && !isMember {
 					mismatch = true
-				case wantS == "Num" && gotS == "Int":
-					mismatch = false
-				default:
-					mismatch = gotS != wantS && wantS != "Any"
 				}
+
 				if mismatch && i < len(argRanges) {
 					emit(Diagnostic{
 						Range:    argRanges[i],
 						Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript",
-						Message: fmt.Sprintf("Argument %d: got %s, want %s.", i+1, gotS, wantS),
+						Message: fmt.Sprintf("Argument %d: got %s, want %s.", i+1, formatTypeNode(argTs[i]), formatTypeNode(paramTs[i])),
 					})
 				}
-			}
-			// Oracle returns are nullable at call sites
-			if isOracle && len(retT) > 0 {
-				retT = []any{"unop", "?", retT}
 			}
 			// Under-application: return residual arrow of remaining params → retT
 			if len(argTs) < len(paramTs) {
@@ -1636,13 +1650,8 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 			} else {
 				actual = typeID("Null")
 			}
-			wantS := formatTypeNode(c.curFunRet)
-			gotS := formatTypeNode(actual)
-			ok := false
-			if wantS == gotS || (wantS == "Num" && gotS == "Int") || (strings.HasSuffix(wantS, "?") && gotS == "Null") {
-				ok = true
-			}
-			if !ok {
+			// Structural subtyping conformance (no string-equality hacks).
+			if !IsSubtypeStatic(actual, c.curFunRet) {
 				// Always emit, even if a precise span is missing.
 				rng := rangeOrDefault(c.doc, path)
 				emit(Diagnostic{
@@ -1650,7 +1659,7 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 					Severity: 1,
 					Code:     "MS-RET-TYPE-MISMATCH",
 					Source:   "mindscript",
-					Message:  fmt.Sprintf("Return type %s does not match %s.", gotS, wantS),
+					Message:  fmt.Sprintf("Return type %s does not match %s.", formatTypeNode(actual), formatTypeNode(c.curFunRet)),
 				})
 			}
 		}

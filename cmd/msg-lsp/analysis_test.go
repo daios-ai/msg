@@ -559,9 +559,10 @@ func Test_Analysis_Block_Last_Value(t *testing.T) {
 
 	t.Run("block_last_expression_type_is_used_for_binding", func(t *testing.T) {
 		src := `
-let x =
+let x = do
   1
   "s"
+end
 `
 		res := runPure(t, uri, src)
 

@@ -463,3 +463,517 @@ x & 3
 		mustHaveDiag(t, res, "MS-BITWISE-NONINT")
 	})
 }
+
+// --- Typed map field access (using type aliases on params) -------------------
+
+func Test_Analysis_Typed_Map_Field_Access(t *testing.T) {
+	const uri = "mem://typed-map.ms"
+
+	t.Run("typed_param_known_field_ok", func(t *testing.T) {
+		src := `
+let Person = type { name!: Str, age: Int? }
+let get = fun(p: Person) -> Str do p.name end
+`
+		res := runPure(t, uri, src)
+		// No warning about missing key on a known field of a typed map.
+		mustNotHaveDiag(t, res, "MS-MAP-MISSING-KEY")
+	})
+
+	t.Run("typed_param_missing_field_warns", func(t *testing.T) {
+		src := `
+let Person = type { name!: Str }
+let get = fun(p: Person) -> Any do p.age end
+`
+		res := runPure(t, uri, src)
+		// Current analyzer issues the generic value-map warning even for typed maps.
+		mustHaveDiag(t, res, "MS-MAP-MISSING-KEY")
+	})
+}
+
+// --- Nullable receivers (property/index usage on T?) -------------------------
+
+func Test_Analysis_Nullable_Receivers(t *testing.T) {
+	const uri = "mem://nullable-recv.ms"
+
+	t.Run("property_on_nullable_warns", func(t *testing.T) {
+		t.Skip("nullable receiver checks not implemented yet")
+		src := `
+let mk = oracle() -> { name: Str }
+let v = mk()
+v.name
+`
+		_ = runPure(t, uri, src)
+	})
+
+	t.Run("index_on_nullable_warns", func(t *testing.T) {
+		t.Skip("nullable receiver checks not implemented yet")
+		src := `
+let mk = oracle() -> [Int]
+let xs = mk()
+xs[0]
+`
+		_ = runPure(t, uri, src)
+	})
+}
+
+// --- If-expression LUB (branch typing) --------------------------------------
+
+func Test_Analysis_If_LUB(t *testing.T) {
+	const uri = "mem://iflub.ms"
+
+	t.Run("int_vs_num_result_used_in_numeric_context", func(t *testing.T) {
+		src := `
+let y =
+  if true then 1 else 2.0 end
+y + 1.5
+`
+		// Today: fold() returns Any for if; still should not *error*.
+		res := runPure(t, uri, src)
+		// No type-specific diagnostic should fire here.
+		mustNotHaveDiag(t, res, "MS-ARG-TYPE-MISMATCH")
+		mustNotHaveDiag(t, res, "MS-COMPARISON-TYPE-MISMATCH")
+	})
+}
+
+// --- Enums inside typed contexts (impossible equality) ----------------------
+
+func Test_Analysis_Enum_Eq_In_Typed_Context(t *testing.T) {
+	const uri = "mem://enum-ctx.ms"
+
+	t.Run("compare_with_non_member_literal_in_fun_body", func(t *testing.T) {
+		t.Skip("enum equality non-member check in expressions not implemented yet")
+		src := `
+let Color = type Enum["red","green","blue"]
+let isYellow = fun(c: Color) -> Bool do c == "yellow" end
+`
+		_ = runPure(t, uri, src)
+	})
+}
+
+// --- Array destructuring defaults & nullability ------------------------------
+
+func Test_Analysis_Array_Destructuring_Nullability(t *testing.T) {
+	const uri = "mem://darr-null.ms"
+
+	t.Run("missing_second_element_binds_null_then_used_unsafely", func(t *testing.T) {
+		t.Skip("array destructuring null defaults + unsafe use not implemented yet")
+		src := `
+let [a, b] = [1]
+b + 1
+`
+		_ = runPure(t, uri, src)
+	})
+}
+
+// --- Block result typing (last expression) ----------------------------------
+
+func Test_Analysis_Block_Last_Value(t *testing.T) {
+	const uri = "mem://block-last.ms"
+
+	t.Run("block_last_expression_type", func(t *testing.T) {
+		t.Skip("block last-value typing not implemented (fold returns Any)")
+		src := `
+let x =
+  1
+  "s"
+x + 1
+`
+		_ = runPure(t, uri, src)
+	})
+}
+
+// --- Currying surface (no false positives; future: function type on partial) -
+
+func Test_Analysis_Currying_Sanity(t *testing.T) {
+	const uri = "mem://curry.ms"
+
+	t.Run("partial_then_apply_no_spurious_errors", func(t *testing.T) {
+		src := `
+let add = fun(a: Int, b: Int) -> Int do a + b end
+let g = add(1)
+g(2)
+`
+		res := runPure(t, uri, src)
+		// Current analyzer can't type 'g', but it also shouldn't mis-diagnose.
+		mustNotHaveDiag(t, res, "MS-ARG-OVERFLOW")
+		mustNotHaveDiag(t, res, "MS-ARG-TYPE-MISMATCH")
+	})
+}
+
+// --- Division typing corner: Int/Int -> Int, else Num ------------------------
+
+func Test_Analysis_Division_Typing(t *testing.T) {
+	const uri = "mem://div-typing.ms"
+
+	t.Run("int_div_int_is_int_no_error", func(t *testing.T) {
+		src := `1 / 2`
+		res := runPure(t, uri, src)
+		// No diagnostics expected from this simple expression.
+		if len(res.Diags) != 0 {
+			t.Fatalf("unexpected diagnostics: %+v", res.Diags)
+		}
+	})
+
+	t.Run("int_div_num_is_num_no_error", func(t *testing.T) {
+		src := `1 / 2.0`
+		res := runPure(t, uri, src)
+		if len(res.Diags) != 0 {
+			t.Fatalf("unexpected diagnostics: %+v", res.Diags)
+		}
+	})
+}
+
+// --- Value-map requiredness marker is ignored (printer parity) ---------------
+
+func Test_Analysis_Value_Map_Requiredness_Ignored(t *testing.T) {
+	const uri = "mem://valmap-req.ms"
+
+	t.Run("value_map_pair_bang_ignored_no_error", func(t *testing.T) {
+		src := `
+let p = { name!: "Ada" }  # runtime value; '!' should be ignored by analyzer
+p.name
+`
+		res := runPure(t, uri, src)
+		// Access should not error or warn merely due to '!' in a *value* map.
+		mustNotHaveDiag(t, res, "MS-MAP-MISSING-KEY")
+	})
+}
+
+// --- Type alias property format interop (ensures we parse/format types) -----
+
+func Test_Analysis_Type_Alias_Property_Interop(t *testing.T) {
+	const uri = "mem://type-alias-interop.ms"
+
+	t.Run("prop_access_uses_param_type_alias_fields", func(t *testing.T) {
+		src := `
+let Point = type { x: Num, y: Num }
+let fx = fun(p: Point) -> Num do p.x + p.y end
+`
+		res := runPure(t, uri, src)
+		// Sanity: no key-missing / type-mismatch diagnostics expected.
+		mustNotHaveDiag(t, res, "MS-MAP-MISSING-KEY")
+		mustNotHaveDiag(t, res, "MS-ARG-TYPE-MISMATCH")
+	})
+}
+
+// --- Shift-count range check placeholder (kept minimal) ----------------------
+
+func Test_Analysis_Shift_Count_Range_New(t *testing.T) {
+	const uri = "mem://shift-range.ms"
+
+	t.Run("shift_count_64_out_of_range_const", func(t *testing.T) {
+		t.Skip("shift count range check not implemented yet")
+		src := `1 << 64`
+		_ = runPure(t, uri, src)
+	})
+}
+
+// Additional tiny & orthogonal tests for uncovered areas.
+
+func Test_Analysis_LUB_Typing(t *testing.T) {
+	const uri = "mem://lub.ms"
+
+	t.Run("array_element_lub_empty_any", func(t *testing.T) {
+		src := `let xs = []`
+		res := runPure(t, uri, src)
+
+		found := false
+		for _, b := range res.Bindings {
+			if b.Name == "xs" {
+				if mindscript.FormatType(b.TypeNode) != "[Any]" {
+					t.Fatalf("want [Any], got %q", mindscript.FormatType(b.TypeNode))
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("binding xs not found")
+		}
+	})
+
+	t.Run("array_element_lub_homogeneous_int", func(t *testing.T) {
+		src := `let xs = [1, 2, 3]`
+		res := runPure(t, uri, src)
+
+		found := false
+		for _, b := range res.Bindings {
+			if b.Name == "xs" {
+				if mindscript.FormatType(b.TypeNode) != "[Int]" {
+					t.Fatalf("want [Int], got %q", mindscript.FormatType(b.TypeNode))
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("binding xs not found")
+		}
+	})
+
+	t.Run("array_element_lub_heterogeneous_int_num_num", func(t *testing.T) {
+		src := `let xs = [1, 2.0]`
+		res := runPure(t, uri, src)
+
+		// Still warns for heterogeneity, but the element type should LUB to Num.
+		mustHaveDiag(t, res, "MS-ARRAY-HETEROGENEOUS")
+		found := false
+		for _, b := range res.Bindings {
+			if b.Name == "xs" {
+				if mindscript.FormatType(b.TypeNode) != "[Num]" {
+					t.Fatalf("want [Num], got %q", mindscript.FormatType(b.TypeNode))
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("binding xs not found")
+		}
+	})
+
+	t.Run("if_expression_lub_int_vs_num_becomes_num", func(t *testing.T) {
+		src := `
+let y =
+  if true then 1 else 2.0 end
+`
+		res := runPure(t, uri, src)
+
+		found := false
+		for _, b := range res.Bindings {
+			if b.Name == "y" {
+				if mindscript.FormatType(b.TypeNode) != "Num" {
+					t.Fatalf("want Num, got %q", mindscript.FormatType(b.TypeNode))
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("binding y not found")
+		}
+	})
+
+	t.Run("binop_lub_int_plus_num_becomes_num", func(t *testing.T) {
+		src := `let z = 1 + 2.0`
+		res := runPure(t, uri, src)
+
+		found := false
+		for _, b := range res.Bindings {
+			if b.Name == "z" {
+				if mindscript.FormatType(b.TypeNode) != "Num" {
+					t.Fatalf("want Num, got %q", mindscript.FormatType(b.TypeNode))
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("binding z not found")
+		}
+	})
+}
+
+func Test_Analysis_ValueMap_Literal_Field_Present(t *testing.T) {
+	const uri = "mem://valmap-present.ms"
+
+	t.Run("literal_map_known_key_has_no_missing_key_warning", func(t *testing.T) {
+		src := `
+{ name: "Ada", age: 36 }.name
+`
+		res := runPure(t, uri, src)
+		// Accessing a key that is visibly present in the same literal should not warn.
+		mustNotHaveDiag(t, res, "MS-MAP-MISSING-KEY")
+	})
+}
+
+func Test_Analysis_Currying_CurrentBehavior(t *testing.T) {
+	const uri = "mem://curry-behavior.ms"
+
+	t.Run("partial_application_returns_declared_ret_type_current_impl", func(t *testing.T) {
+		// NOTE: Current fold() returns the declared return type even for partial application.
+		// This test locks in that behavior to avoid regressions while true currying types are unimplemented.
+		src := `
+let add = fun(a: Int, b: Int) -> Int do a + b end
+let g = add(1)
+`
+		res := runPure(t, uri, src)
+
+		// No spurious call diagnostics.
+		mustNotHaveDiag(t, res, "MS-ARG-OVERFLOW")
+		mustNotHaveDiag(t, res, "MS-ARG-TYPE-MISMATCH")
+
+		// Binding 'g' currently typed as the callee's declared return type (Int).
+		found := false
+		for _, b := range res.Bindings {
+			if b.Name == "g" {
+				if mindscript.FormatType(b.TypeNode) != "Int" {
+					t.Fatalf("current behavior: want Int, got %q", mindscript.FormatType(b.TypeNode))
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("binding g not found")
+		}
+	})
+}
+
+func Test_Analysis_Annotations_Local_And_Nested_Short(t *testing.T) {
+	// tiny helpers
+	getBind := func(res *pureResult, name, kind string) (pureBinding, bool) {
+		for _, b := range res.Bindings {
+			if b.Name == name && b.Kind == kind {
+				return b, true
+			}
+		}
+		return pureBinding{}, false
+	}
+	requireDoc := func(t *testing.T, b pureBinding, must ...string) {
+		t.Helper()
+		for _, m := range must {
+			if !strings.Contains(b.DocFull, m) {
+				t.Fatalf("expected doc for %q to contain %q, got %q", b.Name, m, b.DocFull)
+			}
+		}
+	}
+
+	t.Run("local_let_inside_fun_has_doc", func(t *testing.T) {
+		const uri = "mem://annot-local-let.ms"
+		src := `
+let f = fun() -> Int do
+  let x =
+  # local: the answer
+  42
+  0
+end
+`
+		res := runPure(t, uri, src)
+		b, ok := getBind(res, "x", "let")
+		if !ok {
+			t.Fatalf("binding 'x' not found")
+		}
+		requireDoc(t, b, "local: the answer")
+	})
+
+	t.Run("local_oracle_inside_fun_has_doc_and_nullable_type", func(t *testing.T) {
+		const uri = "mem://annot-local-oracle.ms"
+		src := `
+let f = fun() -> Int do
+  let o =
+  # oracle: local next
+  oracle() -> Int
+  0
+end
+`
+		res := runPure(t, uri, src)
+		b, ok := getBind(res, "o", "oracle")
+		if !ok {
+			t.Fatalf("binding 'o' not found")
+		}
+		requireDoc(t, b, "oracle: local next")
+		if got := mindscript.FormatType(b.TypeNode); got != "Int?" {
+			t.Fatalf("expected oracle type Int?, got %q", got)
+		}
+	})
+
+	t.Run("destructuring_inside_fun_propagates_doc_to_each_binding", func(t *testing.T) {
+		const uri = "mem://annot-dobj-local.ms"
+		src := `
+let g = fun() -> Any do
+  let { name: n, age: a } =
+  # user: payload doc
+  { name: "Ada" }
+  n
+end
+`
+		res := runPure(t, uri, src)
+		n, okN := getBind(res, "n", "let")
+		a, okA := getBind(res, "a", "let")
+		if !okN || !okA {
+			t.Fatalf("expected destructured bindings n and a, got n=%v a=%v", okN, okA)
+		}
+		requireDoc(t, n, "user: payload doc")
+		requireDoc(t, a, "user: payload doc")
+	})
+
+	t.Run("annotations_inside_module_body_are_captured", func(t *testing.T) {
+		const uri = "mem://annot-module.ms"
+		src := `
+let M = module "m" do
+  let x =
+  # module: inner value
+  1
+end
+`
+		res := runPure(t, uri, src)
+		b, ok := getBind(res, "x", "let")
+		if !ok {
+			t.Fatalf("binding 'x' not found")
+		}
+		requireDoc(t, b, "module: inner value")
+	})
+
+	t.Run("annotations_inside_loop_body_are_captured", func(t *testing.T) {
+		const uri = "mem://annot-loop.ms"
+		src := `
+for i in [1] do
+  let y =
+  # loop: body value
+  2
+end
+`
+		res := runPure(t, uri, src)
+		b, ok := getBind(res, "y", "let")
+		if !ok {
+			t.Fatalf("binding 'y' not found")
+		}
+		requireDoc(t, b, "loop: body value")
+	})
+
+	t.Run("shadowing_keeps_docs_per_binding", func(t *testing.T) {
+		const uri = "mem://annot-shadow.ms"
+		src := `
+let x =
+# top: outer x
+0
+
+do
+  let x =
+  # inner: shadow x
+  1
+  x
+end
+`
+		res := runPure(t, uri, src)
+		outer, haveOuter := getBind(res, "x", "let") // first occurrence (top-level) will be found by getBind
+		if !haveOuter || !strings.Contains(outer.DocFull, "top: outer x") {
+			t.Fatalf("expected outer x doc, got %v %q", haveOuter, outer.DocFull)
+		}
+		// find *another* x with the inner doc
+		foundInner := false
+		for _, b := range res.Bindings {
+			if b.Name == "x" && b.Kind == "let" && strings.Contains(b.DocFull, "inner: shadow x") {
+				foundInner = true
+				break
+			}
+		}
+		if !foundInner {
+			t.Fatalf("expected inner x doc not found")
+		}
+	})
+
+	t.Run("stacked_annotations_merge_in_order", func(t *testing.T) {
+		const uri = "mem://annot-merge.ms"
+		src := `
+let z =
+# line one
+# line two
+"ok"
+`
+		res := runPure(t, uri, src)
+		b, ok := getBind(res, "z", "let")
+		if !ok {
+			t.Fatalf("binding 'z' not found")
+		}
+		requireDoc(t, b, "line one", "line two")
+		if !strings.Contains(b.DocFull, "line one\nline two") {
+			t.Fatalf("expected merged doc to preserve newline order, got %q", b.DocFull)
+		}
+	})
+}

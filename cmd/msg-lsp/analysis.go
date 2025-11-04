@@ -316,23 +316,8 @@ func mapFieldType(t []any, key string) ([]any, bool) {
 	return nil, false
 }
 
-// LUB: least common supertype used by infer + analyzer. Mirrors previous
-// numeric/any rules used by numericSuper/commonSuper.
-func LUB(a, b []any) []any {
-	as, bs := formatTypeNode(a), formatTypeNode(b)
-	if as == bs {
-		return a
-	}
-	// numeric widening
-	if (as == "Int" && bs == "Num") || (as == "Num" && bs == "Int") {
-		return typeID("Num")
-	}
-	// Unknowns → Any
-	if as == "Any" || bs == "Any" || as == "" || bs == "" {
-		return typeID("Any")
-	}
-	return typeID("Any")
-}
+// (Deprecated) LUB2 kept for compatibility; real LUB lives in lub.go and is used below.
+// func LUB2(a, b []any) []any { return typeID("Any") }
 
 // isNullable reports whether the static type node has the nullable modifier T?.
 func isNullable(t []any) bool {
@@ -512,6 +497,8 @@ type pureBinding struct {
 	Kind      string
 	TypeNode  []any
 	Sig       string
+	DocFull   string
+	DocFirst  string
 	StartByte int
 	EndByte   int
 }
@@ -521,6 +508,7 @@ type pureSymbol struct {
 	Name      string
 	Kind      string
 	Sig       string
+	Doc       string
 	StartByte int
 	EndByte   int
 }
@@ -616,6 +604,8 @@ func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
 			Kind:      b.Kind,
 			TypeNode:  b.TypeNode,
 			Sig:       b.Sig,
+			DocFull:   b.DocFull,
+			DocFirst:  b.DocFirst,
 			StartByte: start,
 			EndByte:   end,
 		})
@@ -629,6 +619,7 @@ func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
 			Name:      s.Name,
 			Kind:      s.Kind,
 			Sig:       s.Sig,
+			Doc:       s.Doc,
 			StartByte: start,
 			EndByte:   end,
 		})
@@ -686,8 +677,8 @@ func (s *server) analyze(doc *docState) {
 		doc.binds = append(doc.binds, bindingDef{
 			Name:     b.Name,
 			Range:    makeRange(doc.lines, b.StartByte, b.EndByte, doc.text),
-			DocFull:  "",
-			DocFirst: "",
+			DocFull:  b.DocFull,
+			DocFirst: b.DocFirst,
 			Kind:     b.Kind,
 			TypeNode: b.TypeNode,
 			Sig:      b.Sig,
@@ -699,7 +690,7 @@ func (s *server) analyze(doc *docState) {
 			Name:  ssy.Name,
 			Kind:  ssy.Kind,
 			Range: makeRange(doc.lines, ssy.StartByte, ssy.EndByte, doc.text),
-			Doc:   "",
+			Doc:   ssy.Doc,
 			Sig:   ssy.Sig,
 		})
 	}
@@ -1177,8 +1168,15 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 						emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-UNKNOWN-NAME", Source: "mindscript", Message: fmt.Sprintf("Unknown name: %s", nm)})
 					}
 				}
+				// 1) Try already-published bindings (doc.binds)
 				if tn, ok := findAnyBindingType(c.doc, nm); ok {
 					return foldOut{T: tn}
+				}
+				// 2) Fallback: look in current-pass bindings (c.binds), newest first
+				for i := len(c.binds) - 1; i >= 0; i-- {
+					if c.binds[i].Name == nm && len(c.binds[i].TypeNode) > 0 {
+						return foldOut{T: c.binds[i].TypeNode}
+					}
 				}
 			}
 		}
@@ -1228,6 +1226,14 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 	case "get":
 		if len(n) >= 3 {
 			objT := fold(n[1].([]any), append(path, 0), c).T
+			// NEW: resolve type alias if receiver is an id
+			if len(objT) >= 2 && objT[0] == "id" {
+				if nm, _ := objT[1].(string); nm != "" {
+					if ta, ok := resolveTypeAliasAST(c.doc, nm); ok {
+						objT = ta
+					}
+				}
+			}
 			key := ""
 			if ks, ok := n[2].([]any); ok && len(ks) >= 2 && ks[0] == "str" {
 				key, _ = ks[1].(string)
@@ -1237,7 +1243,10 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 					return foldOut{T: tv}
 				}
 				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript", Message: fmt.Sprintf("Key '%s' may be missing.", key)})
+					emit(Diagnostic{
+						Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
+						Message: fmt.Sprintf("Key '%s' may be missing.", key),
+					})
 				}
 			}
 		}
@@ -1653,20 +1662,44 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 			if len(base) > 0 && (base[0] == "fun" || base[0] == "oracle") {
 				sig = formatFunSig(na.Name, base)
 			}
+			// Choose the base type for this binding (respecting dobj open-world policy),
+			// then LUB with any previous known type for the same symbol to widen across reassignments.
+			chosenType := func() []any {
+				if isDobj {
+					// Open-world: field may be missing → nullable Any.
+					return []any{"unop", "?", typeID("Any")}
+				}
+				return tnode
+			}()
+			// Find previous type for this name (prefer current-pass binds, then existing doc.binds).
+			prevType := []any(nil)
+			for i := len(c.binds) - 1; i >= 0; i-- {
+				if c.binds[i].Name == na.Name && len(c.binds[i].TypeNode) > 0 {
+					prevType = c.binds[i].TypeNode
+					break
+				}
+			}
+			if prevType == nil {
+				for i := len(c.doc.binds) - 1; i >= 0; i-- {
+					if c.doc.binds[i].Name == na.Name && len(c.doc.binds[i].TypeNode) > 0 {
+						prevType = c.doc.binds[i].TypeNode
+						break
+					}
+				}
+			}
+			mergedType := chosenType
+			if prevType != nil {
+				mergedType = LUB(prevType, chosenType)
+			}
+
 			b := bindingDef{
 				Name:     na.Name,
 				Range:    rangeFromID(c.doc, na.Path, na.Name),
 				DocFull:  txt,
 				DocFirst: firstLine(txt),
 				Kind:     kind,
-				TypeNode: func() []any {
-					if isDobj {
-						// Open-world: field may be missing → nullable.
-						return []any{"unop", "?", typeID("Any")}
-					}
-					return tnode
-				}(),
-				Sig: sig,
+				TypeNode: mergedType,
+				Sig:      sig,
 			}
 			c.binds = append(c.binds, b)
 			c.doc.binds = append(c.doc.binds, b)

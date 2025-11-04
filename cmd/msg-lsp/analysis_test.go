@@ -247,7 +247,7 @@ p.name
 	if len(res.Tokens) == 0 {
 		t.Fatalf("expected some tokens, got none")
 	}
-	if res.AST == nil || len(res.AST) == 0 || res.Spans == nil {
+	if len(res.AST) == 0 || res.Spans == nil {
 		t.Fatalf("expected AST and spans to be present")
 	}
 	// Ensure we can find an ID token "p" and it has a valid byte span

@@ -44,6 +44,125 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////////////
+// Feature-local helpers moved from analysis.go (UI-only utilities)
+////////////////////////////////////////////////////////////////////////////////
+
+// hasValidSpan reports whether the lexer provided concrete byte offsets.
+// Used for ANNOTATION tokens which must have StartByte/EndByte or be ignored.
+func hasValidSpan(t mindscript.Token, textLen int) bool {
+	return t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= textLen
+}
+
+// comment/annotation spans used by semantic tokens & folding.
+func commentSpans(doc *docState) [][2]int {
+	spans := [][2]int{}
+	if doc == nil {
+		return spans
+	}
+	// Source of truth: lexer ANNOTATION tokens only, and only when they carry a valid span.
+	for _, tk := range doc.tokens {
+		if tk.Type != mindscript.ANNOTATION {
+			continue
+		}
+		if !hasValidSpan(tk, len(doc.text)) {
+			continue
+		}
+		s, e := tk.StartByte, tk.EndByte
+		if e > s {
+			spans = append(spans, [2]int{s, e})
+		}
+	}
+	return spans
+}
+
+// wordAt: prefer token-based match; fallback to ASCII scan if needed.
+func wordAt(doc *docState, pos Position) (string, Range) {
+	off := posToOffset(doc.lines, pos, doc.text)
+	if off < 0 || off > len(doc.text) {
+		return "", Range{}
+	}
+	for _, t := range doc.tokens {
+		// Only IDs are symbol names; TYPE is a keyword.
+		if t.Type != mindscript.ID {
+			continue
+		}
+		start, end := tokenSpan(doc, t)
+		if off >= start && off < end {
+			name := tokenName(t)
+			return name, makeRange(doc.lines, start, end, doc.text)
+		}
+	}
+	// fallback: ASCII-ish word scan
+	isIdent := func(b byte) bool {
+		return b == '_' ||
+			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9')
+	}
+	i, j := off, off
+	for i > 0 && isIdent(doc.text[i-1]) {
+		i--
+	}
+	for j < len(doc.text) && isIdent(doc.text[j]) {
+		j++
+	}
+	if i < j {
+		return strings.TrimSpace(doc.text[i:j]), makeRange(doc.lines, i, j, doc.text)
+	}
+	return "", Range{}
+}
+
+func isKeywordButNotType(tt mindscript.TokenType) bool {
+	switch tt {
+	case mindscript.AND, mindscript.OR, mindscript.NOT,
+		mindscript.LET, mindscript.DO, mindscript.END, mindscript.RETURN, mindscript.BREAK, mindscript.CONTINUE,
+		mindscript.IF, mindscript.THEN, mindscript.ELIF, mindscript.ELSE,
+		mindscript.FUNCTION, mindscript.ORACLE,
+		mindscript.FOR, mindscript.IN, mindscript.FROM, mindscript.WHILE,
+		mindscript.TYPECONS, mindscript.TYPE, mindscript.ENUM,
+		mindscript.NULL:
+		return true
+	default:
+		return false
+	}
+}
+
+var builtinTypeDocs = map[string]string{
+	"Any":  "Top type; any value.",
+	"Null": "Null value (absence).",
+	"Bool": "Boolean type (true/false).",
+	"Int":  "64-bit signed integer.",
+	"Num":  "64-bit IEEE-754 float.",
+	"Str":  "Unicode string.",
+	"Type": "Type descriptor value.",
+}
+
+// semantic tokens legend index (handlers will read this)
+var semTypes = map[string]int{
+	"keyword":  0,
+	"function": 1,
+	"type":     2,
+	"variable": 3,
+	"property": 4,
+	"string":   5,
+	"number":   6,
+	"comment":  7,
+	"bracket":  8,
+}
+
+// UTF-16 code-unit length of a string slice (for semantic tokens).
+func u16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r < 0x10000 {
+			n++
+		} else {
+			n += 2
+		}
+	}
+	return n
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Initialize & text sync
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -411,10 +530,8 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 			kind = 6 // Variable (parameter)
 		}
 		detail := b.Kind
-		if b.Kind == "fun" || b.Kind == "oracle" {
-			if b.Sig != "" {
-				detail = b.Sig
-			}
+		if (b.Kind == "fun" || b.Kind == "oracle") && b.Sig != "" {
+			detail = b.Sig
 		} else {
 			ty := formatTypeNode(b.TypeNode)
 			if ty != "" && ty != "Any" {

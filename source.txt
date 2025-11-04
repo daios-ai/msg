@@ -9,7 +9,7 @@
 //
 // What lives here
 //   • Text & UTF-16 helpers and byte↔position conversion consistent with LSP.
-//   • Token/span helpers (exact spans, token lookup, comment/annotation regions).
+//   • Token/span helpers (exact spans, token lookup).
 //   • Diagnostics plumbing: map lexer/parser errors to LSP ranges and publish.
 //   • Analysis pipeline: analyze() → lex, parse (with spans), collect bindings
 //     and top-level symbols, and clear/publish diagnostics.
@@ -153,19 +153,6 @@ func byteColToOffset(lines []int, line0, byteCol int, text string) int {
 	return off
 }
 
-// UTF-16 code-unit length of a string slice (for semantic tokens).
-func u16Len(s string) int {
-	n := 0
-	for _, r := range s {
-		if r < 0x10000 {
-			n++
-		} else {
-			n += 2
-		}
-	}
-	return n
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Diagnostics helpers
 ////////////////////////////////////////////////////////////////////////////////
@@ -188,76 +175,19 @@ func tokenName(t mindscript.Token) string {
 	return t.Lexeme
 }
 
-// hasValidSpan reports whether the lexer provided concrete byte offsets.
-// Used for ANNOTATION tokens which must have StartByte/EndByte or be ignored.
-func hasValidSpan(t mindscript.Token, textLen int) bool {
-	return t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= textLen
-}
-
-// Prefer exact lexer byte spans; fallback to line-local search.
+// Prefer exact lexer byte spans (the lexer guarantees StartByte/EndByte).
 func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
-	// NEW: exact byte spans from the lexer if present.
-	if t.StartByte >= 0 && t.EndByte >= t.StartByte && t.EndByte <= len(doc.text) {
-		return t.StartByte, t.EndByte
+	start, end = t.StartByte, t.EndByte
+	if start < 0 {
+		start = 0
 	}
-
-	if t.Line < 1 || t.Line > len(doc.lines) {
-		return 0, 0
+	if end < start {
+		end = start
 	}
-	lineStart := doc.lines[t.Line-1]
-	lineEnd := len(doc.text)
-	if t.Line < len(doc.lines) {
-		lineEnd = doc.lines[t.Line]
+	if end > len(doc.text) {
+		end = len(doc.text)
 	}
-	line := doc.text[lineStart:lineEnd]
-
-	cand := t.Col - 1
-	if cand < 0 {
-		cand = 0
-	}
-	if cand > len(line) {
-		cand = len(line)
-	}
-	try := func(at int) (int, int, bool) {
-		if at < 0 {
-			at = 0
-		}
-		if at+len(t.Lexeme) > len(line) {
-			return 0, 0, false
-		}
-		if line[at:at+len(t.Lexeme)] == t.Lexeme {
-			s := lineStart + at
-			return s, s + len(t.Lexeme), true
-		}
-		return 0, 0, false
-	}
-	if s, e, ok := try(cand); ok {
-		return s, e
-	}
-	if s, e, ok := try(cand - 1); ok {
-		return s, e
-	}
-	const window = 8
-	from := cand - window
-	if from < 0 {
-		from = 0
-	}
-	if idx := strings.Index(line[from:], t.Lexeme); idx >= 0 {
-		s := lineStart + from + idx
-		return s, s + len(t.Lexeme)
-	}
-	s := lineStart + t.Col - 1
-	e := s + len(t.Lexeme)
-	if s < 0 {
-		s = 0
-	}
-	if e > len(doc.text) {
-		e = len(doc.text)
-	}
-	if e < s {
-		e = s
-	}
-	return s, e
+	return start, end
 }
 
 // Use SpanIndex to build a Range from a NodePath.
@@ -368,111 +298,6 @@ func isNullable(t []any) bool {
 		}
 	}
 	return false
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Word scanning & comments
-////////////////////////////////////////////////////////////////////////////////
-
-// wordAt: prefer token-based match; fallback to ASCII scan if needed.
-func wordAt(doc *docState, pos Position) (string, Range) {
-	off := posToOffset(doc.lines, pos, doc.text)
-	if off < 0 || off > len(doc.text) {
-		return "", Range{}
-	}
-	for _, t := range doc.tokens {
-		// Only IDs are symbol names; TYPE is a keyword.
-		if t.Type != mindscript.ID {
-			continue
-		}
-		start, end := tokenSpan(doc, t)
-		if off >= start && off < end {
-			name := tokenName(t)
-			return name, makeRange(doc.lines, start, end, doc.text)
-		}
-	}
-	// fallback: ASCII-ish word scan
-	isIdent := func(b byte) bool {
-		return b == '_' ||
-			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
-			(b >= '0' && b <= '9')
-	}
-	i, j := off, off
-	for i > 0 && isIdent(doc.text[i-1]) {
-		i--
-	}
-	for j < len(doc.text) && isIdent(doc.text[j]) {
-		j++
-	}
-	if i < j {
-		return strings.TrimSpace(doc.text[i:j]), makeRange(doc.lines, i, j, doc.text)
-	}
-	return "", Range{}
-}
-
-// comment/annotation spans used by semantic tokens & folding.
-func commentSpans(doc *docState) [][2]int {
-	spans := [][2]int{}
-	if doc == nil {
-		return spans
-	}
-	// Source of truth: lexer ANNOTATION tokens only, and only when they carry a valid span.
-	for _, tk := range doc.tokens {
-		if tk.Type != mindscript.ANNOTATION {
-			continue
-		}
-		if !hasValidSpan(tk, len(doc.text)) {
-			continue
-		}
-		s, e := tk.StartByte, tk.EndByte
-		if e > s {
-			spans = append(spans, [2]int{s, e})
-		}
-	}
-	return spans
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Shared keyword/type helpers (used by features)
-////////////////////////////////////////////////////////////////////////////////
-
-func isKeywordButNotType(tt mindscript.TokenType) bool {
-	switch tt {
-	case mindscript.AND, mindscript.OR, mindscript.NOT,
-		mindscript.LET, mindscript.DO, mindscript.END, mindscript.RETURN, mindscript.BREAK, mindscript.CONTINUE,
-		mindscript.IF, mindscript.THEN, mindscript.ELIF, mindscript.ELSE,
-		mindscript.FUNCTION, mindscript.ORACLE,
-		mindscript.FOR, mindscript.IN, mindscript.FROM, mindscript.WHILE,
-		// 'type' keyword should be colored as a keyword, not a type identifier.
-		mindscript.TYPECONS, mindscript.TYPE, mindscript.ENUM,
-		mindscript.NULL:
-		return true
-	default:
-		return false
-	}
-}
-
-var builtinTypeDocs = map[string]string{
-	"Any":  "Top type; any value.",
-	"Null": "Null value (absence).",
-	"Bool": "Boolean type (true/false).",
-	"Int":  "64-bit signed integer.",
-	"Num":  "64-bit IEEE-754 float.",
-	"Str":  "Unicode string.",
-	"Type": "Type descriptor value.",
-}
-
-// semantic tokens legend index (handlers will read this)
-var semTypes = map[string]int{
-	"keyword":  0,
-	"function": 1,
-	"type":     2,
-	"variable": 3,
-	"property": 4,
-	"string":   5,
-	"number":   6,
-	"comment":  7,
-	"bracket":  8,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -789,7 +614,7 @@ func findLocalFunMeta(doc *docState, name string) (bool, [][]any, []any, bool) {
 
 	var walk func(node []any)
 	walk = func(node []any) {
-		if node == nil || len(node) == 0 {
+		if len(node) == 0 {
 			return
 		}
 		tag, _ := node[0].(string)
@@ -900,38 +725,6 @@ func enumHasMember(t []any, lit []any, doc *docState) (bool, bool) {
 	return true, false
 }
 
-// findLocalFunRetType retained to improve call typing.
-func findLocalFunRetType(doc *docState, name string) ([]any, bool) {
-	if doc == nil || doc.ast == nil || len(doc.ast) == 0 {
-		return nil, false
-	}
-	root := doc.ast
-	if root[0] != "block" {
-		return nil, false
-	}
-	for i := 1; i < len(root); i++ {
-		n, ok := root[i].([]any)
-		if !ok || len(n) < 3 || n[0] != "assign" {
-			continue
-		}
-		lhs, _ := n[1].([]any)
-		rhs, _ := n[2].([]any)
-		if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
-			if nm, _ := lhs[1].(string); nm == name {
-				base := unwrapAnnotNode(rhs)
-				if len(base) >= 3 && (base[0] == "fun" || base[0] == "oracle") {
-					if tnode, ok := base[2].([]any); ok {
-						if base[0] == "oracle" {
-							return []any{"unop", "?", tnode}, true
-						}
-						return tnode, true
-					}
-				}
-			}
-		}
-	}
-	return nil, false
-}
 func findAnyBindingType(doc *docState, name string) ([]any, bool) {
 	for _, b := range doc.binds {
 		if b.Name == name && len(b.TypeNode) > 0 {
@@ -1861,8 +1654,6 @@ func unifiedAnalyze(doc *docState) (binds []bindingDef, syms []symbolDef, diags 
 	return c.binds, c.syms, c.diags
 }
 
-// Ensure "return" diagnostics always emit even without precise spans:
-// Modify the "return" case to use rangeOrDefault.
 func init() {
 	_ = rangeOrDefault // keep the helper referenced for go vet / linters
 }
@@ -2735,7 +2526,7 @@ p.name
 	if len(res.Tokens) == 0 {
 		t.Fatalf("expected some tokens, got none")
 	}
-	if res.AST == nil || len(res.AST) == 0 || res.Spans == nil {
+	if len(res.AST) == 0 || res.Spans == nil {
 		t.Fatalf("expected AST and spans to be present")
 	}
 	// Ensure we can find an ID token "p" and it has a valid byte span
@@ -3047,9 +2838,10 @@ func Test_Analysis_Block_Last_Value(t *testing.T) {
 
 	t.Run("block_last_expression_type_is_used_for_binding", func(t *testing.T) {
 		src := `
-let x =
+let x = do
   1
   "s"
+end
 `
 		res := runPure(t, uri, src)
 

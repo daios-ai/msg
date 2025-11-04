@@ -316,6 +316,43 @@ func mapFieldType(t []any, key string) ([]any, bool) {
 	return nil, false
 }
 
+// mapFieldTypeReq extracts the field (type, required?) from a ("map", ...) type node by key.
+func mapFieldTypeReq(t []any, key string) (field []any, required bool, ok bool) {
+	if len(t) == 0 || t[0] != "map" {
+		return nil, false, false
+	}
+	for i := 1; i < len(t); i++ {
+		if pr, okp := t[i].([]any); okp && len(pr) >= 3 && (pr[0] == "pair" || pr[0] == "pair!") {
+			if k, okk := pr[1].([]any); okk && len(k) >= 2 && k[0] == "str" {
+				if nm, _ := k[1].(string); nm == key {
+					if tv, okt := pr[2].([]any); okt {
+						return tv, pr[0] == "pair!", true
+					}
+				}
+			}
+		}
+	}
+	return nil, false, false
+}
+
+// resolveTypeAliasMap tries to resolve an alias ID type into its underlying ("map", ...) type.
+// Returns (mapType, ok). Does not unfold through non-map aliases (keeps aliases opaque otherwise).
+func resolveTypeAliasMap(doc *docState, t []any) ([]any, bool) {
+	if len(t) >= 2 && t[0] == "id" {
+		if name, _ := t[1].(string); name != "" {
+			if mt, ok := resolveTypeAliasAST(doc, name); ok && len(mt) > 0 && mt[0] == "map" {
+				return mt, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// sameType reports textual equality via FormatType (kept minimal for array homogeneity warnings).
+func sameType(a, b []any) bool {
+	return formatTypeNode(a) == formatTypeNode(b)
+}
+
 // (Deprecated) LUB2 kept for compatibility; real LUB lives in lub.go and is used below.
 // func LUB2(a, b []any) []any { return typeID("Any") }
 
@@ -822,14 +859,7 @@ func resolveTypeAliasAST(doc *docState, name string) ([]any, bool) {
 // enumHasMember reports whether t is Enum[...] and lit is one of its members.
 // Returns (isEnumType, isMember).
 func enumHasMember(t []any, lit []any, doc *docState) (bool, bool) {
-	// If t is an alias id, resolve.
-	if len(t) >= 2 && t[0] == "id" {
-		if nm, _ := t[1].(string); nm != "" {
-			if ta, ok := resolveTypeAliasAST(doc, nm); ok {
-				t = ta
-			}
-		}
-	}
+	// No alias unfolding: opaque non-builtin ids remain atoms.
 	if len(t) == 0 || t[0] != "enum" {
 		return false, false
 	}
@@ -1145,13 +1175,11 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 		c.push()
 		c.atTop = len(path) == 0
 		defer c.pop()
-		// fold children, last value is block value (MindScript block is expression container)
-		var lastT []any
+		// Block is an expression: the value is the LAST child's type (or Any if none).
+		var lastT []any = typeID("Any")
 		for i := 1; i < len(n); i++ {
 			if ch, ok := n[i].([]any); ok {
-				fold(ch, append(path, i-1), c)
-				// blocks don't produce a value here; keep Any
-				lastT = typeID("Any")
+				lastT = fold(ch, append(path, i-1), c).T
 			}
 		}
 		return foldOut{T: lastT}
@@ -1168,15 +1196,24 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 						emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-UNKNOWN-NAME", Source: "mindscript", Message: fmt.Sprintf("Unknown name: %s", nm)})
 					}
 				}
-				// 1) Try already-published bindings (doc.binds)
-				if tn, ok := findAnyBindingType(c.doc, nm); ok {
-					return foldOut{T: tn}
+				// If this identifier refers to a function/oracle, surface its ARROW type
+				// for expression typing (arrays, partial application, etc.).
+				if _, pts, ret, ok := findLocalFunMeta(c.doc, nm); ok {
+					arrow := ret
+					for i := len(pts) - 1; i >= 0; i-- {
+						arrow = []any{"arrow", pts[i], arrow}
+					}
+					return foldOut{T: arrow}
 				}
-				// 2) Fallback: look in current-pass bindings (c.binds), newest first
+				// Prefer current-pass bindings first (most precise during single-pass fold)
 				for i := len(c.binds) - 1; i >= 0; i-- {
 					if c.binds[i].Name == nm && len(c.binds[i].TypeNode) > 0 {
 						return foldOut{T: c.binds[i].TypeNode}
 					}
+				}
+				// Then fall back to already-published bindings (from previous analyses)
+				if tn, ok := findAnyBindingType(c.doc, nm); ok {
+					return foldOut{T: tn}
 				}
 			}
 		}
@@ -1186,18 +1223,22 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 		if len(n) == 1 {
 			return foldOut{T: []any{"array", typeID("Any")}}
 		}
-		elem := typeID("Any")
-		first := []any(nil)
+		var elem []any
+		var first []any
 		mixed := false
 		for i := 1; i < len(n); i++ {
 			if ch, ok := n[i].([]any); ok {
 				ti := fold(ch, append(path, i-1), c).T
 				if first == nil {
 					first = ti
-				} else if formatTypeNode(first) != formatTypeNode(ti) {
-					mixed = true
+					// seed element type with the first element (avoid collapsing to Any)
+					elem = ti
+				} else {
+					if !sameType(first, ti) {
+						mixed = true
+					}
+					elem = LUB(elem, ti)
 				}
-				elem = LUB(elem, ti)
 			}
 		}
 		if mixed && formatTypeNode(elem) != formatTypeNode(first) {
@@ -1225,29 +1266,67 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 
 	case "get":
 		if len(n) >= 3 {
-			objT := fold(n[1].([]any), append(path, 0), c).T
-			// NEW: resolve type alias if receiver is an id
-			if len(objT) >= 2 && objT[0] == "id" {
-				if nm, _ := objT[1].(string); nm != "" {
-					if ta, ok := resolveTypeAliasAST(c.doc, nm); ok {
-						objT = ta
-					}
-				}
-			}
+			recvNode, _ := n[1].([]any)
+			objT := fold(recvNode, append(path, 0), c).T
 			key := ""
 			if ks, ok := n[2].([]any); ok && len(ks) >= 2 && ks[0] == "str" {
 				key, _ = ks[1].(string)
 			}
-			if key != "" && len(objT) > 0 && objT[0] == "map" {
-				if tv, ok := mapFieldType(objT, key); ok {
+			if key == "" {
+				return foldOut{T: typeID("Any")}
+			}
+			// Determine if receiver is a *typed parameter*; only then trust type-map requiredness.
+			isTypedParam := false
+			var paramMapT []any
+			idn := recvNode // recvNode is already []any; no type assertion needed
+			if len(idn) >= 2 && idn[0] == "id" {
+				if nm, _ := idn[1].(string); nm != "" {
+					for i := len(c.binds) - 1; i >= 0; i-- {
+						b := c.binds[i]
+						if b.Name == nm && b.Kind == "param" && len(b.TypeNode) > 0 && b.TypeNode[0] == "map" {
+							isTypedParam = true
+							paramMapT = b.TypeNode
+							break
+						}
+						// Accept alias-typed params that resolve to a map.
+						if b.Name == nm && b.Kind == "param" && len(b.TypeNode) > 0 && b.TypeNode[0] == "id" {
+							if mt, ok := resolveTypeAliasMap(c.doc, b.TypeNode); ok {
+								isTypedParam = true
+								paramMapT = mt
+								break
+							}
+						}
+					}
+				}
+			}
+			if isTypedParam {
+				if tv, _, ok := mapFieldTypeReq(paramMapT, key); ok {
+					// Required fields are guaranteed present; optional fields have their annotated type.
 					return foldOut{T: tv}
 				}
+				// Unknown key on a *typed* param: open-world, but warn because field is not declared.
 				if rng, ok := rangeFromPath(c.doc, path); ok {
 					emit(Diagnostic{
 						Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
 						Message: fmt.Sprintf("Key '%s' may be missing.", key),
 					})
 				}
+				return foldOut{T: typeID("Any")}
+			}
+			// Value-map / unknown object:
+			// If static receiver type is a map *and the key exists*, return its type with NO warning.
+			// Otherwise, warn that the key may be missing.
+			if len(objT) > 0 && objT[0] == "map" {
+				if tv, ok := mapFieldType(objT, key); ok {
+					// Known-present key in the *static* value-map type: no warning.
+					return foldOut{T: tv}
+				}
+			}
+			if rng, ok := rangeFromPath(c.doc, path); ok {
+				emit(Diagnostic{
+					Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
+					Message: fmt.Sprintf("Key '%s' may be missing.", key),
+				})
 			}
 		}
 		return foldOut{T: typeID("Any")}
@@ -1366,12 +1445,19 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 					})
 				}
 			}
-			// Result type (oracle is always nullable)
+			// Oracle returns are nullable at call sites
 			if isOracle && len(retT) > 0 {
 				retT = []any{"unop", "?", retT}
 			}
-			// If under-applied, we still return the declared return type for tests
-			// (currying surface not required by the current failing cases).
+			// Under-application: return residual arrow of remaining params → retT
+			if len(argTs) < len(paramTs) {
+				res := retT
+				for i := len(paramTs) - 1; i >= len(argTs); i-- {
+					res = []any{"arrow", paramTs[i], res}
+				}
+				return foldOut{T: res}
+			}
+			// Exact or over-application: return declared (possibly nullable) return type.
 			return foldOut{T: retT}
 		}
 		// Unknown callee — fall back to Any
@@ -1488,6 +1574,16 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 			t = typeID("Any")
 		}
 		return foldOut{T: t}
+
+	case "while", "for":
+		// Loops: result is LUB(body, Null) conservatively (zero-iteration)
+		var acc []any
+		for i := 1; i < len(n); i++ {
+			if ch, ok := n[i].([]any); ok {
+				acc = LUB(acc, fold(ch, append(path, i-1), c).T)
+			}
+		}
+		return foldOut{T: LUB(acc, typeID("Null"))}
 
 	case "fun", "oracle":
 		// enter scope; bind params; remember return type

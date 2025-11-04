@@ -1201,7 +1201,7 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 				if _, pts, ret, ok := findLocalFunMeta(c.doc, nm); ok {
 					arrow := ret
 					for i := len(pts) - 1; i >= 0; i-- {
-						arrow = []any{"arrow", pts[i], arrow}
+						arrow = []any{"binop", "->", pts[i], arrow}
 					}
 					return foldOut{T: arrow}
 				}
@@ -1453,7 +1453,7 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 			if len(argTs) < len(paramTs) {
 				res := retT
 				for i := len(paramTs) - 1; i >= len(argTs); i-- {
-					res = []any{"arrow", paramTs[i], res}
+					res = []any{"binop", "->", paramTs[i], res}
 				}
 				return foldOut{T: res}
 			}

@@ -1202,7 +1202,7 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 				if _, pts, ret, ok := findLocalFunMeta(c.doc, nm); ok {
 					arrow := ret
 					for i := len(pts) - 1; i >= 0; i-- {
-						arrow = []any{"arrow", pts[i], arrow}
+						arrow = []any{"binop", "->", pts[i], arrow}
 					}
 					return foldOut{T: arrow}
 				}
@@ -1454,7 +1454,7 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 			if len(argTs) < len(paramTs) {
 				res := retT
 				for i := len(paramTs) - 1; i >= len(argTs); i-- {
-					res = []any{"arrow", paramTs[i], res}
+					res = []any{"binop", "->", paramTs[i], res}
 				}
 				return foldOut{T: res}
 			}
@@ -2073,13 +2073,13 @@ func enumBasePrim(kind string) []any {
 	}
 }
 
-func isArrow(t []any) bool { return len(t) >= 3 && t[0] == "arrow" }
+func isArrow(t []any) bool { return len(t) >= 4 && t[0] == "binop" && t[1] == "->" }
 func arrowParts(t []any) (param, ret []any) {
 	if !isArrow(t) {
 		return typeID("Any"), typeID("Any")
 	}
-	p, _ := t[1].([]any)
-	r, _ := t[2].([]any)
+	p, _ := t[2].([]any)
+	r, _ := t[3].([]any)
 	return p, r
 }
 
@@ -2344,7 +2344,7 @@ func lubImpl(a, b []any) []any {
 		if !ok {
 			return addNullable(typeID("Any"), nullable)
 		}
-		return addNullable([]any{"arrow", gp, lubImpl(ar1, ar2)}, nullable)
+		return addNullable([]any{"binop", "->", gp, lubImpl(ar1, ar2)}, nullable)
 	}
 
 	// Opaque alias atoms: same id → itself; else Any
@@ -3205,8 +3205,8 @@ let a = [f, g]  # element type should be (Int) -> Num
 			if b.Name == "a" {
 				ft := mindscript.FormatType(b.TypeNode)
 				// Expect something like "[(Int) -> Num]" or equivalent pretty form.
-				if !strings.Contains(ft, "(Int) -> Num") {
-					t.Fatalf("want array of (Int) -> Num, got %q", ft)
+				if !strings.Contains(ft, "[Int -> Num]") {
+					t.Fatalf("want array of [Int -> Num], got %q", ft)
 				}
 				found = true
 			}

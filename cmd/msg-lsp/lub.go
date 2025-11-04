@@ -211,13 +211,13 @@ func enumBasePrim(kind string) []any {
 	}
 }
 
-func isArrow(t []any) bool { return len(t) >= 3 && t[0] == "arrow" }
+func isArrow(t []any) bool { return len(t) >= 4 && t[0] == "binop" && t[1] == "->" }
 func arrowParts(t []any) (param, ret []any) {
 	if !isArrow(t) {
 		return typeID("Any"), typeID("Any")
 	}
-	p, _ := t[1].([]any)
-	r, _ := t[2].([]any)
+	p, _ := t[2].([]any)
+	r, _ := t[3].([]any)
 	return p, r
 }
 
@@ -482,7 +482,7 @@ func lubImpl(a, b []any) []any {
 		if !ok {
 			return addNullable(typeID("Any"), nullable)
 		}
-		return addNullable([]any{"arrow", gp, lubImpl(ar1, ar2)}, nullable)
+		return addNullable([]any{"binop", "->", gp, lubImpl(ar1, ar2)}, nullable)
 	}
 
 	// Opaque alias atoms: same id → itself; else Any

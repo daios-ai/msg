@@ -845,8 +845,8 @@ let a = [f, g]  # element type should be (Int) -> Num
 			if b.Name == "a" {
 				ft := mindscript.FormatType(b.TypeNode)
 				// Expect something like "[(Int) -> Num]" or equivalent pretty form.
-				if !strings.Contains(ft, "(Int) -> Num") {
-					t.Fatalf("want array of (Int) -> Num, got %q", ft)
+				if !strings.Contains(ft, "[Int -> Num]") {
+					t.Fatalf("want array of [Int -> Num], got %q", ft)
 				}
 				found = true
 			}

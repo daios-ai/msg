@@ -216,7 +216,7 @@ func Test_LUB_Enums(t *testing.T) {
 }
 
 func Test_LUB_Arrows(t *testing.T) {
-	arrow := func(p, r []any) []any { return []any{"arrow", p, r} }
+	arrow := func(p, r []any) []any { return []any{"binop", "->", p, r} }
 	n := func(x []any) []any { return []any{"unop", "?", x} }
 
 	t.Run("param_GLB_success_return_LUB", func(t *testing.T) {
@@ -444,7 +444,7 @@ func Test_GLB_Arrays_NoMeet(t *testing.T) {
 }
 
 func Test_LUB_Arrow_NullabilityOnWholeArrow(t *testing.T) {
-	arrow := func(p, r []any) []any { return []any{"arrow", p, r} }
+	arrow := func(p, r []any) []any { return []any{"binop", "->", p, r} }
 	wrap := func(x []any) []any { return []any{"unop", "?", x} }
 
 	// Null ⊔ (Int -> Str) = (Int -> Str)?
@@ -569,7 +569,7 @@ func Test_GLB_OpaqueAliases(t *testing.T) {
 }
 
 func Test_LUB_Arrows_ReturnLUB_Widen(t *testing.T) {
-	arrow := func(p, r []any) []any { return []any{"arrow", p, r} }
+	arrow := func(p, r []any) []any { return []any{"binop", "->", p, r} }
 	t.Run("same_param_returns_widen", func(t *testing.T) {
 		a := arrow([]any{"id", "Int"}, []any{"id", "Int"})
 		b := arrow([]any{"id", "Int"}, []any{"id", "Num"})
@@ -592,7 +592,7 @@ func Test_LUB_Arrows_ReturnLUB_Widen(t *testing.T) {
 }
 
 func Test_LUB_Arrows_ParamNullableGLB(t *testing.T) {
-	arrow := func(p, r []any) []any { return []any{"arrow", p, r} }
+	arrow := func(p, r []any) []any { return []any{"binop", "->", p, r} }
 	n := func(x []any) []any { return []any{"unop", "?", x} }
 
 	t.Run("Int? vs Int → param GLB is Int (non-nullable)", func(t *testing.T) {
@@ -607,7 +607,7 @@ func Test_LUB_Arrows_ParamNullableGLB(t *testing.T) {
 }
 
 func Test_LUB_Arrows_vs_NonArrow_WidensToAny(t *testing.T) {
-	arrow := func(p, r []any) []any { return []any{"arrow", p, r} }
+	arrow := func(p, r []any) []any { return []any{"binop", "->", p, r} }
 	t.Run("arrow_vs_map", func(t *testing.T) {
 		mapEmpty := []any{"map"}
 		got := LUB(arrow([]any{"id", "Int"}, []any{"id", "Str"}), mapEmpty)

@@ -45,8 +45,9 @@ type bindingDef struct {
 	DocFirst string
 	Kind     string // "let" | "fun" | "oracle" | "type" | "param" | "" (best-effort)
 	// Enriched info for hover/completion
-	TypeNode []any  // synthesized/static type (vars/params) or declared return (fun/oracle/type)
-	Sig      string // pretty signature for fun/oracle
+	TypeNode   []any  // synthesized/static type (vars/params) or declared return (fun/oracle/type)
+	Sig        string // pretty signature for fun/oracle
+	IsTopLevel bool
 }
 
 // docState: per-document caches (populated by analysis).

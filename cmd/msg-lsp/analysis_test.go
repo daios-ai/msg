@@ -68,9 +68,7 @@ func mustHaveDiagOneOf(t *testing.T, res *pureResult, codes ...string) {
 		}
 	}
 	var want []string
-	for _, c := range codes {
-		want = append(want, c)
-	}
+	want = append(want, codes...)
 	t.Fatalf("expected one of %v, got codes=%v", want, got)
 }
 

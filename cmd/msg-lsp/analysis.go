@@ -1,24 +1,67 @@
 // analysis.go
 //
-// ROLE: Lex/parse/index pipeline, text/position helpers, span utilities, and
-//       diagnostics mapping. Populates per-document caches used by features.
+// High-level purpose
+// ------------------
+// Single-file analysis for the MindScript LSP. This turns source text into:
+//   • Tokens (for highlighting and layout lints),
+//   • An S-expr AST with span info,
+//   • Bindings (the single source of truth for names, types, and docs),
+//   • Diagnostics (precise span + code + message).
+// It also provides byte↔UTF-16 helpers for LSP ranges and a single-pass, static
+// fold that synthesizes types, checks subtyping, and emits diagnostics.
 //
-// NOTE: A generic AST walker and small visitor structs are used to keep logic
-//       compact. Long, duplicated traversals have been replaced with visitors.
+// What you get (result shape)
+// ---------------------------
+// analyzeFilePure returns a *pureResult:
+//   • URI, Text, Tokens
+//   • AST, Spans
+//   • Bindings: []pureBinding, each with
+//       - Name: identifier
+//       - Kind: one of {"fun","oracle","type","param","variable"}
+//       - TypeNode: compact S-expr type (e.g., ["array", ["id","Int"]])
+//       - Sig: human string for fun/oracle (e.g., "add(a: Int, b: Int) -> Int")
+//       - DocFull / DocFirst: concatenated annotation text and its first line
+//       - StartByte / EndByte: definition byte span (precise, LSP-agnostic)
+//       - IsTopLevel: true iff defined at file scope
+//     Bindings are the single source of truth. Top-level “symbols” shown in the
+//     UI are derived from Bindings where IsTopLevel == true.
+//   • Diags: []pureDiag with (StartByte, EndByte, Severity, Code, Message)
 //
-// What lives here
-//   • Text & UTF-16 helpers and byte↔position conversion consistent with LSP.
-//   • Token/span helpers (exact spans, token lookup).
-//   • Diagnostics plumbing: map lexer/parser errors to LSP ranges and publish.
-//   • Analysis pipeline: analyze() → lex, parse (with spans), collect bindings
-//     and top-level symbols, and clear/publish diagnostics.
-//   • Lightweight static type synthesis and formatting helpers used by features.
-//   • **Structural subtyping conformance checks** via IsSubtypeStatic (see lub.go).
+// How types are synthesized (single pass; static; uniform)
+// --------------------------------------------------------
+// • The fold walks the AST once. It never executes code.
+// • All types are uniform S-exprs. Nullable is a normal constructor: ["unop","?",T].
+// • LUB/GLB/Subtyping live in lub.go and are shape-aware:
+//     - Int <: Num <: Any. Arrays covariant. Maps fieldwise.
+//     - Enums by set semantics; widen to base primitive when needed.
+//     - Arrows: GLB(param) -> LUB(ret). If param GLB fails, widen to Any.
+//     - Opaque aliases (non-builtin ids) compare by identical atom only.
+// • Open-world value maps: only observed fields are recorded; extra may exist.
+//   Typed map parameters (in function signatures) impose required/optional keys;
+//   inside bodies, parameters are trusted to match their declared types.
+// • Oracles: their declared return type is made nullable at definition time.
+// • Currying: under-application yields a residual arrow; over-application flags
+//   overflow; exact application yields the declared (possibly nullable) return.
 //
-// What does NOT live here
-//   • No transport framing or send/notify implementations (lives in main.go).
-//   • No LSP feature handlers (hover/definition/etc.) — see features.go.
-//   • No server/document struct definitions — see state.go.
+// Diagnostics (examples)
+// ----------------------
+// • Names/targets: MS-UNKNOWN-NAME, MS-INVALID-ASSIGN-TARGET
+// • Calls: MS-ARG-OVERFLOW, MS-ARG-TYPE-MISMATCH (incl. enum non-member)
+// • Returns: MS-RET-TYPE-MISMATCH (structural check, not string compare)
+// • Flow/types: MS-MAYBE-NULL-UNSAFE, MS-MAP-MISSING-KEY, MS-ARRAY-HETEROGENEOUS
+// • Ops: MS-BITWISE-NONINT, MS-COMPARISON-TYPE-MISMATCH, MS-DIV-BY-ZERO-CONST
+//
+// Organization
+// ------------
+// • Public shims: analyzeFilePure (pure), (*server).analyze (publishes diags).
+// • A `//// END_OF_PUBLIC` separator marks the public/private boundary.
+// • Helpers + single-pass fold live below; LUB/GLB/subtyping in lub.go.
+//
+// Notes
+// -----
+// • Single pass over AST with tokens/spans available.
+// • No body-based inference for function signatures.
+// • Bindings carry Kind and IsTopLevel; symbols are derived from bindings.
 
 package main
 
@@ -29,6 +72,70 @@ import (
 
 	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
 )
+
+////////////////////////////////////////////////////////////////////////////////
+// Pure analyzer types (byte-span, no LSP deps) — lives here to avoid new files
+////////////////////////////////////////////////////////////////////////////////
+
+// fileSnapshot lets the pure analyzer read file text by URI (multi-file ready).
+type fileSnapshot interface {
+	Get(uri string) (text string, ok bool)
+}
+
+// pureDiag is a diagnostic with byte offsets (LSP-agnostic).
+type pureDiag struct {
+	StartByte int
+	EndByte   int
+	Severity  int // 1=error, 2=warning, 3=hint, 4=info
+	Code      string
+	Message   string
+}
+
+// pureBinding mirrors binding data with byte spans.
+type pureBinding struct {
+	Name       string
+	Kind       string
+	TypeNode   []any
+	Sig        string
+	DocFull    string
+	DocFirst   string
+	StartByte  int
+	EndByte    int
+	IsTopLevel bool
+}
+
+// pureResult is the full output of analyzing a single file.
+type pureResult struct {
+	URI      string
+	Text     string
+	Tokens   []mindscript.Token
+	AST      mindscript.S
+	Spans    *mindscript.SpanIndex
+	Bindings []pureBinding
+	Diags    []pureDiag
+}
+
+/////////////////////////////
+// PUBLIC SHIMS (thin API) //
+/////////////////////////////
+
+// analyzeFilePure is a pure function: reads source via snapshot, lexes/parses,
+// collects bindings, runs static checks, and returns byte-span results.
+func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
+	return analyzeFilePureImpl(sn, uri)
+}
+
+// analyze lexes, parses, and refreshes the per-doc caches used by features.
+// It fills: doc.tokens, doc.ast (when parse succeeds), and doc.symbols (top-level defs).
+func (s *server) analyze(doc *docState) {
+	analyzeImpl(s, doc)
+}
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+// Implementation (private)
+////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////
 // Text & UTF-16 helpers
@@ -284,9 +391,6 @@ func sameType(a, b []any) bool {
 	return formatTypeNode(a) == formatTypeNode(b)
 }
 
-// (Deprecated) LUB2 kept for compatibility; real LUB lives in lub.go and is used below.
-// func LUB2(a, b []any) []any { return typeID("Any") }
-
 // isNullable reports whether the static type node has the nullable modifier T?.
 func isNullable(t []any) bool {
 	if len(t) >= 3 {
@@ -336,71 +440,8 @@ func formatFunSig(name string, fun []any) string {
 	return fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), ret)
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Pure analyzer types (byte-span, no LSP deps) — lives here to avoid new files
-////////////////////////////////////////////////////////////////////////////////
-
-// fileSnapshot lets the pure analyzer read file text by URI (multi-file ready).
-type fileSnapshot interface {
-	Get(uri string) (text string, ok bool)
-}
-
-// pureDiag is a diagnostic with byte offsets (LSP-agnostic).
-type pureDiag struct {
-	StartByte int
-	EndByte   int
-	Severity  int // 1=error, 2=warning, 3=hint, 4=info
-	Code      string
-	Message   string
-}
-
-// pureBinding mirrors binding data with byte spans.
-type pureBinding struct {
-	Name      string
-	Kind      string
-	TypeNode  []any
-	Sig       string
-	DocFull   string
-	DocFirst  string
-	StartByte int
-	EndByte   int
-}
-
-// pureSymbol mirrors top-level symbol data with byte spans.
-type pureSymbol struct {
-	Name      string
-	Kind      string
-	Sig       string
-	Doc       string
-	StartByte int
-	EndByte   int
-}
-
-// pureResult is the full output of analyzing a single file.
-type pureResult struct {
-	URI      string
-	Text     string
-	Tokens   []mindscript.Token
-	AST      mindscript.S
-	Spans    *mindscript.SpanIndex
-	Bindings []pureBinding
-	Symbols  []pureSymbol
-	Diags    []pureDiag
-}
-
-// serverSnapshot is a minimal adapter over server to satisfy fileSnapshot.
-type serverSnapshot struct{ s *server }
-
-func (ss serverSnapshot) Get(uri string) (string, bool) {
-	if d := ss.s.snapshotDoc(uri); d != nil {
-		return d.text, true
-	}
-	return "", false
-}
-
-// analyzeFilePure is a pure function: reads source via snapshot, lexes/parses,
-// collects bindings/symbols, runs static checks, and returns byte-span results.
-func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
+// analyzeFilePureImpl (private) — the implementation behind the public shim.
+func analyzeFilePureImpl(sn fileSnapshot, uri string) *pureResult {
 	txt, _ := sn.Get(uri)
 
 	// 1) Lex (interactive) — keep the salvage behavior for coloring on partial errors.
@@ -453,8 +494,8 @@ func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
 	lines := lineOffsets(txt)
 	tmp := &docState{uri: uri, text: txt, lines: lines, tokens: toks, ast: ast, spans: spans}
 
-	// Run unified AST analysis (bindings + symbols + diags) and token lints once.
-	binds, syms, diags := unifiedAnalyze(tmp)
+	// Run unified AST analysis (bindings + diags) and token lints once.
+	binds, diags := unifiedAnalyze(tmp)
 	tokDiags := tokenLints(tmp)
 
 	// Bindings → pureBinding with byte spans
@@ -463,28 +504,15 @@ func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
 		start := posToOffset(lines, b.Range.Start, txt)
 		end := posToOffset(lines, b.Range.End, txt)
 		pBinds = append(pBinds, pureBinding{
-			Name:      b.Name,
-			Kind:      b.Kind,
-			TypeNode:  b.TypeNode,
-			Sig:       b.Sig,
-			DocFull:   b.DocFull,
-			DocFirst:  b.DocFirst,
-			StartByte: start,
-			EndByte:   end,
-		})
-	}
-	// Symbols → pureSymbol with byte spans
-	var pSyms []pureSymbol
-	for _, s := range syms {
-		start := posToOffset(lines, s.Range.Start, txt)
-		end := posToOffset(lines, s.Range.End, txt)
-		pSyms = append(pSyms, pureSymbol{
-			Name:      s.Name,
-			Kind:      s.Kind,
-			Sig:       s.Sig,
-			Doc:       s.Doc,
-			StartByte: start,
-			EndByte:   end,
+			Name:       b.Name,
+			Kind:       b.Kind,
+			TypeNode:   b.TypeNode,
+			Sig:        b.Sig,
+			DocFull:    b.DocFull,
+			DocFirst:   b.DocFirst,
+			StartByte:  start,
+			EndByte:    end,
+			IsTopLevel: b.IsTopLevel,
 		})
 	}
 	// Diagnostics (token lints + AST checks) → pureDiag with byte spans
@@ -508,7 +536,6 @@ func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
 		AST:      ast,
 		Spans:    spans,
 		Bindings: pBinds,
-		Symbols:  pSyms,
 		Diags:    pDiags,
 	}
 }
@@ -517,12 +544,20 @@ func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
 // Analysis (lex + parse + symbol extraction) — publishes diagnostics via notify
 ////////////////////////////////////////////////////////////////////////////////
 
-// analyze lexes, parses, and refreshes the per-doc caches used by features.
-// It fills: doc.tokens, doc.ast (when parse succeeds), and doc.symbols (top-level defs).
-func (s *server) analyze(doc *docState) {
+// serverSnapshot is a minimal adapter over server to satisfy fileSnapshot.
+type serverSnapshot struct{ s *server }
+
+func (ss serverSnapshot) Get(uri string) (string, bool) {
+	if d := ss.s.snapshotDoc(uri); d != nil {
+		return d.text, true
+	}
+	return "", false
+}
+
+func analyzeImpl(s *server, doc *docState) {
 	// Use the pure function; the snapshot is the server’s current state.
 	sn := serverSnapshot{s: s}
-	res := analyzeFilePure(sn, doc.uri)
+	res := analyzeFilePureImpl(sn, doc.uri)
 
 	// Update caches
 	doc.text = res.Text
@@ -534,27 +569,33 @@ func (s *server) analyze(doc *docState) {
 	}
 
 	// Uniform: collect all bindings + docs (already computed in pure result).
-	// Rehydrate bindings/symbols with LSP ranges
+	// Rehydrate bindings with LSP ranges
 	doc.binds = doc.binds[:0]
 	for _, b := range res.Bindings {
 		doc.binds = append(doc.binds, bindingDef{
-			Name:     b.Name,
-			Range:    makeRange(doc.lines, b.StartByte, b.EndByte, doc.text),
-			DocFull:  b.DocFull,
-			DocFirst: b.DocFirst,
-			Kind:     b.Kind,
-			TypeNode: b.TypeNode,
-			Sig:      b.Sig,
+			Name:       b.Name,
+			Range:      makeRange(doc.lines, b.StartByte, b.EndByte, doc.text),
+			DocFull:    b.DocFull,
+			DocFirst:   b.DocFirst,
+			Kind:       b.Kind,
+			TypeNode:   b.TypeNode,
+			Sig:        b.Sig,
+			IsTopLevel: b.IsTopLevel,
 		})
 	}
+
+	// Derive lightweight top-level symbols from bindings (single source of truth).
 	doc.symbols = doc.symbols[:0]
-	for _, ssy := range res.Symbols {
+	for _, b := range doc.binds {
+		if !b.IsTopLevel {
+			continue
+		}
 		doc.symbols = append(doc.symbols, symbolDef{
-			Name:  ssy.Name,
-			Kind:  ssy.Kind,
-			Range: makeRange(doc.lines, ssy.StartByte, ssy.EndByte, doc.text),
-			Doc:   ssy.Doc,
-			Sig:   ssy.Sig,
+			Name:  b.Name,
+			Kind:  b.Kind,
+			Range: b.Range,
+			Doc:   b.DocFirst,
+			Sig:   b.Sig,
 		})
 	}
 
@@ -929,7 +970,7 @@ func tokenLints(doc *docState) []Diagnostic {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Catamorphic fold (one pass): types + diagnostics + bindings/symbols
+// Catamorphic fold (one pass): types + diagnostics + bindings
 ////////////////////////////////////////////////////////////////////////////////
 
 type foldOut struct {
@@ -942,7 +983,6 @@ type anCtx struct {
 	atTop     bool
 	curFunRet []any
 	binds     []bindingDef
-	syms      []symbolDef
 	diags     []Diagnostic
 }
 
@@ -1530,7 +1570,7 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 		collectPat(lhs, lhsPath)
 
 		base, txt, _ := annotText(rhs)
-		kind := "let"
+		kind := "variable"
 		var tnode []any
 		sig := ""
 		if len(base) > 0 {
@@ -1602,30 +1642,14 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 			c.binds = append(c.binds, b)
 			c.doc.binds = append(c.doc.binds, b)
 			c.bind(na.Name)
-			if c.atTop {
-				if lhst, _ := lhs[0].(string); lhst == "decl" || lhst == "id" {
-					k := "let"
-					s := ""
-					docFirst := firstLine(txt)
-					if len(base) > 0 {
-						if rtag, _ := base[0].(string); rtag == "fun" || rtag == "oracle" {
-							k = "fun"
-							s = formatFunSig(na.Name, base)
-						} else if rtag == "type" {
-							k = "type"
-						}
-					}
-					if s0, e0, ok := findDefIDRange(c.doc.tokens, na.Name); ok {
-						c.syms = append(c.syms, symbolDef{
-							Name:  na.Name,
-							Kind:  k,
-							Range: makeRange(c.doc.lines, s0, e0, c.doc.text),
-							Doc:   docFirst,
-							Sig:   s,
-						})
-					}
-				}
+
+			// mark top-level on the just-appended binding(s)
+			lhst, _ := lhs[0].(string)
+			if c.atTop && (lhst == "decl" || lhst == "id") {
+				c.binds[len(c.binds)-1].IsTopLevel = true
+				c.doc.binds[len(c.doc.binds)-1].IsTopLevel = true
 			}
+
 			sig = ""
 		}
 		return foldOut{T: typeID("Any")}
@@ -1639,9 +1663,9 @@ func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
 	return foldOut{T: typeID("Any")}
 }
 
-func unifiedAnalyze(doc *docState) (binds []bindingDef, syms []symbolDef, diags []Diagnostic) {
+func unifiedAnalyze(doc *docState) (binds []bindingDef, diags []Diagnostic) {
 	if doc == nil || doc.ast == nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	c := &anCtx{doc: doc}
 	// seed scope with already-known bindings
@@ -1650,7 +1674,7 @@ func unifiedAnalyze(doc *docState) (binds []bindingDef, syms []symbolDef, diags 
 		c.bind(b.Name)
 	}
 	_ = fold(doc.ast, mindscript.NodePath{}, c)
-	return c.binds, c.syms, c.diags
+	return c.binds, c.diags
 }
 
 func init() {

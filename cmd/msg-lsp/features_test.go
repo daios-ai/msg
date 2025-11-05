@@ -1,0 +1,1190 @@
+// features_test.go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+)
+
+func decodeResp(t *testing.T, buf *bytes.Buffer) Response {
+	t.Helper()
+	raw := buf.Bytes()
+	if len(raw) == 0 {
+		t.Fatalf("no response written")
+	}
+	var body []byte
+	// Try to find "\r\n\r\n" framing split, then unmarshal the body.
+	if i := strings.Index(string(raw), "\r\n\r\n"); i >= 0 {
+		body = raw[i+4:]
+	} else {
+		body = raw
+	}
+	var resp Response
+	if err := json.Unmarshal(body, &resp); err != nil {
+		// Fallback: try whole payload again, just in case
+		if err2 := json.Unmarshal(raw, &resp); err2 != nil {
+			t.Fatalf("unmarshal response: %v / %v\npayload:\n%s", err, err2, string(raw))
+		}
+	}
+	buf.Reset()
+	return resp
+}
+
+func Test_Features_Initialize_Capabilities(t *testing.T) {
+	s := newServer()
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`1`)
+	s.onInitialize(id, nil)
+	resp := decodeResp(t, &out)
+
+	var initRes InitializeResult
+	if err := json.Unmarshal(resp.Result, &initRes); err != nil {
+		t.Fatalf("decode init result: %v", err)
+	}
+
+	c := initRes.Capabilities
+	if !c.TextDocumentSync.OpenClose || c.TextDocumentSync.Change != 2 {
+		t.Fatalf("text sync not as spec: %+v", c.TextDocumentSync)
+	}
+	if !c.HoverProvider || !c.DefinitionProvider || c.CompletionProvider == nil || c.SignatureHelpProvider == nil {
+		t.Fatalf("core features not advertised")
+	}
+	if !c.DocumentSymbolProvider {
+		t.Fatalf("document symbols not advertised")
+	}
+	if c.SemanticTokensProvider == nil || !c.SemanticTokensProvider.Full || !c.SemanticTokensProvider.Range {
+		t.Fatalf("semantic tokens not advertised correctly")
+	}
+	if !c.FoldingRangeProvider {
+		t.Fatalf("folding range not advertised")
+	}
+	// Spec requires formatting to be advertised.
+	if !c.DocumentFormattingProvider {
+		t.Fatalf("formatting must be advertised per spec")
+	}
+}
+
+func Test_Features_Robustness_StaleOrMissingDoc(t *testing.T) {
+	s := newServer()
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	const uri = "file:///missing.ms"
+
+	t.Run("Hover_nilDoc_returnsNull", func(t *testing.T) {
+		id := json.RawMessage(`2`)
+		params := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 0},
+		}
+		pb, _ := json.Marshal(params)
+		s.onHover(id, pb)
+		resp := decodeResp(t, &out)
+		if string(resp.Result) != "null" {
+			t.Fatalf("expected null hover, got %s", string(resp.Result))
+		}
+	})
+
+	t.Run("Completion_nilDoc_returnsEmpty", func(t *testing.T) {
+		id := json.RawMessage(`4`)
+		params := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 0},
+		}
+		pb, _ := json.Marshal(params)
+		s.onCompletion(id, pb)
+		resp := decodeResp(t, &out)
+		var items []CompletionItem
+		if err := json.Unmarshal(resp.Result, &items); err != nil {
+			t.Fatalf("decode completion: %v", err)
+		}
+		if len(items) != 0 {
+			t.Fatalf("expected empty completion, got %d", len(items))
+		}
+	})
+}
+
+func Test_Features_TextSync_OpenAndChange_Basic(t *testing.T) {
+	s := newServer()
+
+	// didOpen
+	openParams := map[string]any{
+		"textDocument": map[string]any{
+			"uri":        "file:///a.ms",
+			"languageId": "mindscript",
+			"version":    1,
+			"text":       "x",
+		},
+	}
+	b, _ := json.Marshal(openParams)
+	s.onDidOpen(b)
+
+	// didChange full replace wins
+	changeParams := map[string]any{
+		"textDocument": map[string]any{
+			"uri": "file:///a.ms",
+		},
+		"contentChanges": []any{
+			map[string]any{"text": "y"}, // full
+			map[string]any{"range": map[string]any{"start": map[string]int{"line": 0, "character": 0}, "end": map[string]int{"line": 0, "character": 1}}, "text": "z"},
+		},
+	}
+	cb, _ := json.Marshal(changeParams)
+	s.onDidChange(cb)
+	d := s.snapshotDoc("file:///a.ms")
+	if d == nil || d.text != "y" {
+		t.Fatalf("didChange full replace not applied; got %q", func() string {
+			if d == nil {
+				return ""
+			}
+			return d.text
+		}())
+	}
+
+	// incremental apply
+	changeParams2 := map[string]any{
+		"textDocument": map[string]any{"uri": "file:///a.ms"},
+		"contentChanges": []any{
+			map[string]any{
+				"range": map[string]any{"start": map[string]int{"line": 0, "character": 0}, "end": map[string]int{"line": 0, "character": 1}},
+				"text":  "X",
+			},
+		},
+	}
+	cb2, _ := json.Marshal(changeParams2)
+	s.onDidChange(cb2)
+	d2 := s.snapshotDoc("file:///a.ms")
+	if d2 == nil || d2.text != "X" {
+		t.Fatalf("didChange incremental not applied; got %q", func() string {
+			if d2 == nil {
+				return ""
+			}
+			return d2.text
+		}())
+	}
+}
+
+func Test_Features_LanguageCore_SpecBehavior(t *testing.T) {
+	s := newServer()
+	const uri = "file:///spec.ms"
+
+	// "x f(f, g) {k:1}\nlet\nobj.prop\nInt\n"
+	docText := "x f(f, g) {k:1}\nlet\nobj.prop\nInt\n"
+	doc := &docState{
+		uri:   uri,
+		text:  docText,
+		lines: lineOffsets(docText),
+		symbols: []symbolDef{
+			{Name: "F", Kind: "fun", Range: Range{Start: Position{0, 2}, End: Position{0, 3}}, Sig: "F(a: Int) -> Int"},
+			{Name: "T", Kind: "type", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+			{Name: "X", Kind: "let", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+		},
+		binds: []bindingDef{
+			{Name: "x", Kind: "variable", TypeNode: []any{"id", "Int"}, Range: Range{Start: Position{0, 0}, End: Position{0, 1}}, DocFull: "x var"},
+			{Name: "f", Kind: "fun", Sig: "f(a: Int, b: Str) -> Int", Range: Range{Start: Position{0, 2}, End: Position{0, 3}}},
+			{Name: "T", Kind: "type", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+		},
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 0, EndByte: 1},
+			{Type: mindscript.ID, Lexeme: "f", StartByte: 2, EndByte: 3},
+			{Type: mindscript.CLROUND, Lexeme: "(", StartByte: 3, EndByte: 4},
+			{Type: mindscript.ID, Lexeme: "f", StartByte: 4, EndByte: 5},
+			{Type: mindscript.COMMA, Lexeme: ",", StartByte: 5, EndByte: 6},
+			{Type: mindscript.ID, Lexeme: "g", StartByte: 7, EndByte: 8},
+			{Type: mindscript.RROUND, Lexeme: ")", StartByte: 8, EndByte: 9},
+			{Type: mindscript.LCURLY, Lexeme: "{", StartByte: 10, EndByte: 11},
+			{Type: mindscript.ID, Lexeme: "k", StartByte: 11, EndByte: 12},
+			{Type: mindscript.COLON, Lexeme: ":", StartByte: 12, EndByte: 13},
+			{Type: mindscript.INTEGER, Lexeme: "1", StartByte: 13, EndByte: 14, Literal: int64(1)},
+			{Type: mindscript.RCURLY, Lexeme: "}", StartByte: 14, EndByte: 15},
+			{Type: mindscript.LET, Lexeme: "let", StartByte: 16, EndByte: 19},
+			{Type: mindscript.ID, Lexeme: "obj", StartByte: 20, EndByte: 23},
+			{Type: mindscript.PERIOD, Lexeme: ".", StartByte: 23, EndByte: 24},
+			{Type: mindscript.ID, Lexeme: "prop", StartByte: 24, EndByte: 28},
+			{Type: mindscript.ID, Lexeme: "Int", StartByte: 29, EndByte: 32},
+		},
+	}
+	// Add multi-line annotation span for folding & masking.
+	annot := mindscript.Token{Type: mindscript.ANNOTATION, Lexeme: "@doc", StartByte: 33, EndByte: 45}
+	doc.text += "@doc block\nmore\n"
+	doc.lines = lineOffsets(doc.text)
+	doc.tokens = append(doc.tokens, annot)
+
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	t.Run("Hover_keyword", func(t *testing.T) {
+		id := json.RawMessage(`11`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 1, "character": 0},
+		}
+		pb, _ := json.Marshal(p)
+		s.onHover(id, pb)
+		resp := decodeResp(t, &out)
+		var hv Hover
+		if err := json.Unmarshal(resp.Result, &hv); err != nil {
+			t.Fatalf("decode hover: %v", err)
+		}
+		if hv.Contents.Kind != "markdown" || hv.Contents.Value == "" || !strings.HasPrefix(hv.Contents.Value, "**keyword**") {
+			t.Fatalf("expected keyword hover, got %q", hv.Contents.Value)
+		}
+	})
+
+	t.Run("Hover_variable_with_type", func(t *testing.T) {
+		id := json.RawMessage(`12`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 0},
+		}
+		pb, _ := json.Marshal(p)
+		s.onHover(id, pb)
+		resp := decodeResp(t, &out)
+		var hv Hover
+		if err := json.Unmarshal(resp.Result, &hv); err != nil {
+			t.Fatalf("decode hover: %v", err)
+		}
+		want := "**variable** `x: Int`"
+		if !strings.HasPrefix(hv.Contents.Value, want) {
+			t.Fatalf("want %q, got %q", want, hv.Contents.Value)
+		}
+	})
+
+	t.Run("Definition_bare_symbol", func(t *testing.T) {
+		id := json.RawMessage(`13`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 2},
+		}
+		pb, _ := json.Marshal(p)
+		s.onDefinition(id, pb)
+		resp := decodeResp(t, &out)
+		var loc Location
+		if err := json.Unmarshal(resp.Result, &loc); err != nil {
+			t.Fatalf("decode def: %v", err)
+		}
+		if loc.URI != uri {
+			t.Fatalf("wrong uri: %s", loc.URI)
+		}
+	})
+
+	t.Run("Definition_property_returns_null", func(t *testing.T) {
+		id := json.RawMessage(`14`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 2, "character": 5},
+		}
+		pb, _ := json.Marshal(p)
+		s.onDefinition(id, pb)
+		resp := decodeResp(t, &out)
+		if string(resp.Result) != "null" {
+			t.Fatalf("expected null for property def, got %s", string(resp.Result))
+		}
+	})
+
+	t.Run("Completion_includes_bindings_keywords_and_details", func(t *testing.T) {
+		id := json.RawMessage(`16`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 0},
+		}
+		pb, _ := json.Marshal(p)
+		s.onCompletion(id, pb)
+		resp := decodeResp(t, &out)
+		var items []CompletionItem
+		if err := json.Unmarshal(resp.Result, &items); err != nil {
+			t.Fatalf("decode completion: %v", err)
+		}
+		seen := map[string]CompletionItem{}
+		for _, it := range items {
+			seen[it.Label] = it
+		}
+		if _, ok := seen["f"]; !ok {
+			t.Fatalf("expected 'f' in completion")
+		}
+		if _, ok := seen["T"]; !ok {
+			t.Fatalf("expected 'T' in completion")
+		}
+		if _, ok := seen["x"]; !ok {
+			t.Fatalf("expected 'x' in completion")
+		}
+		if _, ok := seen["fun"]; !ok {
+			t.Fatalf("expected 'fun' keyword in completion")
+		}
+		if d := seen["f"].Detail; d == "" || d[0] != 'f' {
+			t.Fatalf("function detail should show Sig, got %q", d)
+		}
+		if d := seen["x"].Detail; d == "" || !strings.HasSuffix(d, "Int") {
+			t.Fatalf("variable detail should include non-Any type, got %q", d)
+		}
+	})
+
+	t.Run("SignatureHelp_basic_and_active_param", func(t *testing.T) {
+		id := json.RawMessage(`17`)
+		// cursor inside "f(f, g)" right after comma → activeParameter = 1
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 6},
+		}
+		pb, _ := json.Marshal(p)
+		s.onSignatureHelp(id, pb)
+		resp := decodeResp(t, &out)
+		var sh SignatureHelp
+		if err := json.Unmarshal(resp.Result, &sh); err != nil {
+			t.Fatalf("decode signature help: %v", err)
+		}
+		if len(sh.Signatures) == 0 {
+			t.Fatalf("expected at least one signature")
+		}
+		if sh.ActiveParameter != 1 {
+			t.Fatalf("expected active param 1, got %d", sh.ActiveParameter)
+		}
+	})
+
+	t.Run("SignatureHelp_outside_call_empty", func(t *testing.T) {
+		id := json.RawMessage(`17.1`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 1, "character": 1},
+		}
+		pb, _ := json.Marshal(p)
+		s.onSignatureHelp(id, pb)
+		resp := decodeResp(t, &out)
+		var sh SignatureHelp
+		if err := json.Unmarshal(resp.Result, &sh); err != nil {
+			t.Fatalf("decode signature help: %v", err)
+		}
+		if len(sh.Signatures) != 0 {
+			t.Fatalf("expected empty signature help")
+		}
+	})
+
+	t.Run("DocumentSymbols_top_level_only", func(t *testing.T) {
+		id := json.RawMessage(`18`)
+		p := map[string]any{"textDocument": map[string]any{"uri": uri}}
+		pb, _ := json.Marshal(p)
+		s.onDocumentSymbols(id, pb)
+		resp := decodeResp(t, &out)
+		var syms []DocumentSymbol
+		if err := json.Unmarshal(resp.Result, &syms); err != nil {
+			t.Fatalf("decode doc symbols: %v", err)
+		}
+		if len(syms) != 3 {
+			t.Fatalf("want 3 top-level symbols, got %d", len(syms))
+		}
+	})
+
+	t.Run("SemanticTokens_no_tokens_inside_annotation_range", func(t *testing.T) {
+		id := json.RawMessage(`19.1`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"range":        map[string]any{"start": map[string]int{"line": 4, "character": 0}, "end": map[string]int{"line": 5, "character": 0}},
+		}
+		pb, _ := json.Marshal(p)
+		s.onSemanticTokensRange(id, pb)
+		resp := decodeResp(t, &out)
+		var toks SemanticTokens
+		if err := json.Unmarshal(resp.Result, &toks); err != nil {
+			t.Fatalf("decode tokens: %v", err)
+		}
+		if len(toks.Data) != 0 {
+			t.Fatalf("expected no tokens inside annotation span, got %d", len(toks.Data))
+		}
+	})
+
+	t.Run("Folding_multi_line_annotation", func(t *testing.T) {
+		id := json.RawMessage(`20`)
+		p := map[string]any{"textDocument": map[string]any{"uri": uri}}
+		pb, _ := json.Marshal(p)
+		s.onFoldingRange(id, pb)
+		resp := decodeResp(t, &out)
+		var fr []FoldingRange
+		if err := json.Unmarshal(resp.Result, &fr); err != nil {
+			t.Fatalf("decode folding ranges: %v", err)
+		}
+		if len(fr) == 0 {
+			t.Fatalf("expected at least one folding range (annotation)")
+		}
+	})
+}
+
+func Test_Features_Hover_String_Annotation_Null(t *testing.T) {
+	s := newServer()
+	const uri = "file:///shadow.ms"
+
+	text := "let\nx\n{\"a\":1}\n\"str\"\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text + "@doc\nline\n",
+		lines: lineOffsets(text + "@doc\nline\n"),
+		binds: []bindingDef{
+			{Name: "x", Kind: "variable", TypeNode: []any{"id", "Num"}, Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+			{Name: "x", Kind: "variable", TypeNode: []any{"id", "Int"}, Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+		},
+		tokens: []mindscript.Token{
+			{Type: mindscript.LET, Lexeme: "let", StartByte: 0, EndByte: 3},
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 4, EndByte: 5},
+			{Type: mindscript.LCURLY, StartByte: 6, EndByte: 7},
+			{Type: mindscript.STRING, Lexeme: "\"a\"", StartByte: 7, EndByte: 10},
+			{Type: mindscript.COLON, StartByte: 10, EndByte: 11},
+			{Type: mindscript.INTEGER, Lexeme: "1", StartByte: 11, EndByte: 12},
+			{Type: mindscript.RCURLY, StartByte: 12, EndByte: 13},
+			{Type: mindscript.STRING, Lexeme: "\"str\"", StartByte: 14, EndByte: 19},
+			{Type: mindscript.ANNOTATION, Lexeme: "@doc", StartByte: 20, EndByte: 26},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	t.Run("Hover_inside_string_returns_null", func(t *testing.T) {
+		id := json.RawMessage(`31`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 3, "character": 1},
+		}
+		pb, _ := json.Marshal(p)
+		s.onHover(id, pb)
+		resp := decodeResp(t, &out)
+		if string(resp.Result) != "null" {
+			t.Fatalf("expected null hover inside string")
+		}
+	})
+
+	t.Run("Hover_inside_annotation_returns_null", func(t *testing.T) {
+		id := json.RawMessage(`32`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 4, "character": 1},
+		}
+		pb, _ := json.Marshal(p)
+		s.onHover(id, pb)
+		resp := decodeResp(t, &out)
+		if string(resp.Result) != "null" {
+			t.Fatalf("expected null hover inside annotation")
+		}
+	})
+}
+
+func Test_Features_Completion_SuppressedInStringAndAnnotation(t *testing.T) {
+	s := newServer()
+	const uri = "file:///compl.ms"
+
+	text := "\"s\"\n@a\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		tokens: []mindscript.Token{
+			{Type: mindscript.STRING, Lexeme: "\"s\"", StartByte: 0, EndByte: 3},
+			{Type: mindscript.ANNOTATION, Lexeme: "@a", StartByte: 4, EndByte: 6},
+		},
+		binds: []bindingDef{{Name: "f", Kind: "fun", Sig: "f() -> Any"}},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	t.Run("in_string", func(t *testing.T) {
+		id := json.RawMessage(`40`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 1},
+		}
+		pb, _ := json.Marshal(p)
+		s.onCompletion(id, pb)
+		resp := decodeResp(t, &out)
+		var items []CompletionItem
+		if err := json.Unmarshal(resp.Result, &items); err != nil {
+			t.Fatalf("decode completion: %v", err)
+		}
+		if len(items) != 0 {
+			t.Fatalf("expected empty completion in string")
+		}
+	})
+
+	t.Run("in_annotation", func(t *testing.T) {
+		id := json.RawMessage(`41`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 1, "character": 1},
+		}
+		pb, _ := json.Marshal(p)
+		s.onCompletion(id, pb)
+		resp := decodeResp(t, &out)
+		var items []CompletionItem
+		if err := json.Unmarshal(resp.Result, &items); err != nil {
+			t.Fatalf("decode completion: %v", err)
+		}
+		if len(items) != 0 {
+			t.Fatalf("expected empty completion in annotation")
+		}
+	})
+}
+
+func Test_Features_SemanticTokens_BracketPass_Basic(t *testing.T) {
+	s := newServer()
+	const uri = "file:///brackets.ms"
+	text := "then\ndo\nelse\nend\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		tokens: []mindscript.Token{
+			{Type: mindscript.THEN, Lexeme: "then", StartByte: 0, EndByte: 4},
+			{Type: mindscript.DO, Lexeme: "do", StartByte: 5, EndByte: 7},
+			{Type: mindscript.ELSE, Lexeme: "else", StartByte: 8, EndByte: 12},
+			{Type: mindscript.END, Lexeme: "end", StartByte: 13, EndByte: 16},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`50`)
+	params := map[string]any{"textDocument": map[string]any{"uri": uri}}
+	pb, _ := json.Marshal(params)
+	s.onSemanticTokensFull(id, pb)
+	resp := decodeResp(t, &out)
+	var tok SemanticTokens
+	if err := json.Unmarshal(resp.Result, &tok); err != nil {
+		t.Fatalf("decode sem tokens: %v", err)
+	}
+	if len(tok.Data) == 0 {
+		t.Fatalf("expected bracket tokens")
+	}
+}
+
+func Test_Features_SignatureHelp_EdgeCases(t *testing.T) {
+	s := newServer()
+	const uri = "file:///sig.ms"
+	text := "f(a,(b,c))\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		binds: []bindingDef{
+			{Name: "f", Kind: "fun", Sig: "f(a: Any, b: Any) -> Any", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+		},
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "f", StartByte: 0, EndByte: 1},
+			{Type: mindscript.CLROUND, Lexeme: "(", StartByte: 1, EndByte: 2},
+			{Type: mindscript.ID, Lexeme: "a", StartByte: 2, EndByte: 3},
+			{Type: mindscript.COMMA, Lexeme: ",", StartByte: 3, EndByte: 4},
+			{Type: mindscript.CLROUND, Lexeme: "(", StartByte: 4, EndByte: 5},
+			{Type: mindscript.ID, Lexeme: "b", StartByte: 5, EndByte: 6},
+			{Type: mindscript.COMMA, Lexeme: ",", StartByte: 6, EndByte: 7},
+			{Type: mindscript.ID, Lexeme: "c", StartByte: 7, EndByte: 8},
+			{Type: mindscript.RROUND, Lexeme: ")", StartByte: 8, EndByte: 9},
+			{Type: mindscript.RROUND, Lexeme: ")", StartByte: 9, EndByte: 10},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	t.Run("inside_nested_args_counts_commas_at_top_level", func(t *testing.T) {
+		id := json.RawMessage(`60`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 7}, // after inner comma
+		}
+		pb, _ := json.Marshal(p)
+		s.onSignatureHelp(id, pb)
+		resp := decodeResp(t, &out)
+		var sh SignatureHelp
+		if err := json.Unmarshal(resp.Result, &sh); err != nil {
+			t.Fatalf("decode signature help: %v", err)
+		}
+		if sh.ActiveParameter != 1 {
+			t.Fatalf("expected activeParameter=1, got %d", sh.ActiveParameter)
+		}
+	})
+
+	t.Run("after_matching_paren_empty", func(t *testing.T) {
+		id := json.RawMessage(`61`)
+		p := map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 10}, // after ')'
+		}
+		pb, _ := json.Marshal(p)
+		s.onSignatureHelp(id, pb)
+		resp := decodeResp(t, &out)
+		var sh SignatureHelp
+		if err := json.Unmarshal(resp.Result, &sh); err != nil {
+			t.Fatalf("decode signature help: %v", err)
+		}
+		if len(sh.Signatures) != 0 {
+			t.Fatalf("expected empty signature help after ')'")
+		}
+	})
+}
+
+func Test_Features_SignatureHelp_MinimalFallback_WhenUnknown(t *testing.T) {
+	s := newServer()
+	const uri = "file:///sig2.ms"
+	text := "h(1)\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "h", StartByte: 0, EndByte: 1},
+			{Type: mindscript.CLROUND, Lexeme: "(", StartByte: 1, EndByte: 2},
+			{Type: mindscript.INTEGER, Lexeme: "1", StartByte: 2, EndByte: 3},
+			{Type: mindscript.RROUND, Lexeme: ")", StartByte: 3, EndByte: 4},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`62`)
+	pb, _ := json.Marshal(map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     map[string]any{"line": 0, "character": 2},
+	})
+	s.onSignatureHelp(id, pb)
+	resp := decodeResp(t, &out)
+	var sh SignatureHelp
+	if err := json.Unmarshal(resp.Result, &sh); err != nil {
+		t.Fatalf("decode signature help: %v", err)
+	}
+	if len(sh.Signatures) == 0 || sh.Signatures[0].Label == "" {
+		t.Fatalf("expected minimal signature label for unknown function")
+	}
+}
+
+func Test_Features_References_ShadowingAware(t *testing.T) {
+	s := newServer()
+	const uri = "file:///refs.ms"
+	text := "x\nx\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		binds: []bindingDef{
+			{Name: "x", Kind: "variable", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+			{Name: "x", Kind: "variable", Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+		},
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 0, EndByte: 1},
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 2, EndByte: 3},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`63`)
+	pb, _ := json.Marshal(map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     map[string]any{"line": 1, "character": 0},
+		"context":      map[string]any{"includeDeclaration": true},
+	})
+	s.onReferences(id, pb)
+	resp := decodeResp(t, &out)
+	var locs []Location
+	if err := json.Unmarshal(resp.Result, &locs); err != nil {
+		t.Fatalf("decode refs: %v", err)
+	}
+	if len(locs) == 0 {
+		t.Fatalf("expected at least one reference")
+	}
+	for _, l := range locs {
+		if l.Range.Start.Line == 0 {
+			t.Fatalf("should not include first binding when querying second")
+		}
+	}
+}
+
+func Test_Features_UTF16_PositionMath(t *testing.T) {
+	text := "a🙂b\n"
+	lines := lineOffsets(text)
+	posB := offsetToPos(lines, 5, text) // at 'b'
+	if posB.Line != 0 || posB.Character != 3 {
+		t.Fatalf("UTF-16 char pos wrong; want line=0,ch=3; got %+v", posB)
+	}
+}
+
+func Test_Features_Rename_and_PrepareRename(t *testing.T) {
+	s := newServer()
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	// Initialize → must advertise rename with prepareProvider=true
+	id := json.RawMessage(`70`)
+	s.onInitialize(id, nil)
+	resp := decodeResp(t, &out)
+
+	var initRes InitializeResult
+	if err := json.Unmarshal(resp.Result, &initRes); err != nil {
+		t.Fatalf("decode init result: %v", err)
+	}
+
+	// We expect the server to advertise rename support with prepareProvider=true.
+	type renameCaps struct {
+		RenameProvider any `json:"renameProvider"`
+	}
+	var caps map[string]any
+	b, _ := json.Marshal(initRes.Capabilities)
+	_ = json.Unmarshal(b, &caps)
+	rc, ok := caps["renameProvider"]
+	if !ok {
+		t.Fatalf("renameProvider not advertised")
+	}
+	j, _ := json.Marshal(rc)
+	if !strings.Contains(string(j), `"prepareProvider":true`) {
+		t.Fatalf("renameProvider.prepareProvider must be true; got %s", string(j))
+	}
+}
+
+func Test_Features_DocumentFormatting(t *testing.T) {
+	// Capability advertised + (behavioral) whole-document standardization shape.
+	s := newServer()
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`71`)
+	s.onInitialize(id, nil)
+	resp := decodeResp(t, &out)
+
+	var initRes InitializeResult
+	if err := json.Unmarshal(resp.Result, &initRes); err != nil {
+		t.Fatalf("decode init result: %v", err)
+	}
+	if !initRes.Capabilities.DocumentFormattingProvider {
+		t.Fatalf("formatting must be advertised")
+	}
+
+	// Behavioral expectation of the pretty-printer used by formatting:
+	src := "fun(x) do\nx\nend"
+	std, err := mindscript.Standardize(src)
+	if err != nil {
+		t.Fatalf("Standardize failed: %v", err)
+	}
+	// Exactly one trailing newline.
+	if !strings.HasSuffix(std, "\n") || strings.HasSuffix(std, "\n\n") {
+		t.Fatalf("standardize must end with exactly one newline; got %q", std)
+	}
+}
+
+func Test_Features_GoToTypeDefinition(t *testing.T) {
+	// Single-file, user-defined type reference should jump to its decl.
+	s := newServer()
+	const uri = "file:///typedef.ms"
+
+	// Fake doc: `type T = Int\nlet x: T = 1\n` (tokens place a usage 'T' on line 2)
+	text := "type T = Int\nx\nT\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		binds: []bindingDef{
+			// Decl: type T at line 0, col 5..6
+			{Name: "T", Kind: "type", Range: Range{Start: Position{0, 5}, End: Position{0, 6}}},
+			// Usage: pretend x has TypeNode "T" so handler can resolve; we place a binding
+			{Name: "x", Kind: "variable", TypeNode: []any{"id", "T"}, Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+		},
+		// Tokens include the identifier `T` on line 2 for cursor targeting.
+		tokens: []mindscript.Token{
+			{Type: mindscript.TYPE, Lexeme: "type", StartByte: 0, EndByte: 4},
+			{Type: mindscript.ID, Lexeme: "T", StartByte: 5, EndByte: 6},
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 14, EndByte: 15},
+			{Type: mindscript.ID, Lexeme: "T", StartByte: 16, EndByte: 17},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	// Cursor on the usage `T` (line 2, char 0).
+	id := json.RawMessage(`72.5`)
+	params := map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     map[string]any{"line": 2, "character": 0},
+	}
+	pb, _ := json.Marshal(params)
+	s.onTypeDefinition(id, pb)
+	resp := decodeResp(t, &out)
+
+	var loc Location
+	if err := json.Unmarshal(resp.Result, &loc); err != nil {
+		t.Fatalf("decode typedef location: %v", err)
+	}
+	if loc.URI != uri || loc.Range.Start.Line != 0 || loc.Range.Start.Character != 5 {
+		t.Fatalf("expected jump to type decl at (0,5); got %+v", loc)
+	}
+}
+
+func Test_Features_Completion_SnippetAndPrefixFilter(t *testing.T) {
+	s := newServer()
+	const uri = "file:///compl2.ms"
+
+	text := "f\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		binds: []bindingDef{
+			{Name: "foo", Kind: "fun", Sig: "foo(a: Int) -> Int"},
+			{Name: "bar", Kind: "variable", TypeNode: []any{"id", "Int"}},
+		},
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "f", StartByte: 0, EndByte: 1},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`72`)
+	params := map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     map[string]any{"line": 0, "character": 1}, // after "f"
+	}
+	pb, _ := json.Marshal(params)
+	s.onCompletion(id, pb)
+	resp := decodeResp(t, &out)
+
+	var items []CompletionItem
+	if err := json.Unmarshal(resp.Result, &items); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	// Expect prefix filtering: "bar" must not be present when prefix is "f"
+	for _, it := range items {
+		if it.Label == "bar" {
+			t.Fatalf("prefix filter: unexpected 'bar' for prefix 'f'")
+		}
+	}
+
+	// Expect function snippet insertion for "foo"
+	var got *CompletionItem
+	for i := range items {
+		if items[i].Label == "foo" {
+			got = &items[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("expected 'foo' in completion")
+	}
+	if got.InsertTextFormat != 2 || got.InsertText == "" || !strings.HasPrefix(got.InsertText, "foo(") {
+		t.Fatalf("function completion must use snippet 'foo($0)'; got %+v", *got)
+	}
+}
+
+func Test_Features_Diagnostics_Publishing(t *testing.T) {
+	s := newServer()
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	const uri = "file:///diags.ms"
+	openParams := map[string]any{
+		"textDocument": map[string]any{
+			"uri":        uri,
+			"languageId": "mindscript",
+			"version":    1,
+			"text":       "", // analyzer may produce zero diags; we still want a publish
+		},
+	}
+	b, _ := json.Marshal(openParams)
+	s.onDidOpen(b)
+
+	// Look for a publishDiagnostics notification in the output stream.
+	payload := out.Bytes()
+	if !strings.Contains(string(payload), `"method":"textDocument/publishDiagnostics"`) {
+		t.Fatalf("expected publishDiagnostics notification on didOpen")
+	}
+	// Quick shape check: params.uri must be our URI
+	type notif struct {
+		JSONRPC string         `json:"jsonrpc"`
+		Method  string         `json:"method"`
+		Params  map[string]any `json:"params"`
+	}
+	var last notif
+	parts := bytes.Split(payload, []byte("\r\n\r\n"))
+	for _, p := range parts {
+		var n notif
+		if json.Unmarshal(p, &n) == nil && n.Method == "textDocument/publishDiagnostics" {
+			last = n
+		}
+	}
+	if last.Params == nil || last.Params["uri"] != uri {
+		t.Fatalf("publishDiagnostics.params.uri mismatch; got %#v", last.Params)
+	}
+	// Diagnostics array should be present (empty is fine).
+	if _, ok := last.Params["diagnostics"]; !ok {
+		t.Fatalf("publishDiagnostics must include diagnostics array")
+	}
+}
+
+func Test_Features_References_NoOriginBinding_Empty(t *testing.T) {
+	s := newServer()
+	const uri = "file:///refs-nobind.ms"
+
+	// Doc has an identifier "y" but no binding for "y".
+	text := "y\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		// No binds for "y" on purpose.
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "y", StartByte: 0, EndByte: 1},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`80`)
+	pb, _ := json.Marshal(map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     map[string]any{"line": 0, "character": 0},
+		"context":      map[string]any{"includeDeclaration": true},
+	})
+	s.onReferences(id, pb)
+	resp := decodeResp(t, &out)
+
+	var locs []Location
+	if err := json.Unmarshal(resp.Result, &locs); err != nil {
+		t.Fatalf("decode refs: %v", err)
+	}
+	if len(locs) != 0 {
+		t.Fatalf("spec: no origin binding → expect [], got %d locations", len(locs))
+	}
+}
+
+func Test_Features_Definition_NoFallbackToTopLevel(t *testing.T) {
+	s := newServer()
+	const uri = "file:///def-nofallback.ms"
+
+	// Symbol table contains top-level "Z"; query cursor is on an unrelated "Z"
+	// occurrence that has no binding. Spec: must return null (no fallback).
+	text := "Z\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		symbols: []symbolDef{
+			{Name: "Z", Kind: "fun", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}, Sig: "Z() -> Any"},
+		},
+		// No binds — simulate an unresolved usage.
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "Z", StartByte: 0, EndByte: 1},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`81`)
+	pb, _ := json.Marshal(map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     map[string]any{"line": 0, "character": 0},
+	})
+	s.onDefinition(id, pb)
+	resp := decodeResp(t, &out)
+
+	if string(resp.Result) != "null" {
+		t.Fatalf("spec: no nearest binding → definition must be null; got %s", string(resp.Result))
+	}
+}
+
+func Test_Features_DocumentFormatting_FullEditApplied(t *testing.T) {
+	s := newServer()
+	const uri = "file:///format.ms"
+
+	// Unformatted snippet (no trailing newline).
+	src := "fun(x) do\nx\nend"
+	doc := &docState{
+		uri:   uri,
+		text:  src,
+		lines: lineOffsets(src),
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	expect, err := mindscript.Standardize(src)
+	if err != nil {
+		t.Fatalf("Standardize: %v", err)
+	}
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	id := json.RawMessage(`82`)
+	params := map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"options":      map[string]any{}, // formatting options unused
+	}
+	pb, _ := json.Marshal(params)
+	s.onDocumentFormatting(id, pb)
+	resp := decodeResp(t, &out)
+
+	// Decode a generic array of edits: [{range:{...}, newText:"..."}]
+	var edits []map[string]any
+	if err := json.Unmarshal(resp.Result, &edits); err != nil {
+		t.Fatalf("decode edits: %v", err)
+	}
+	if len(edits) == 0 {
+		t.Fatalf("spec: formatting must return a full-document edit; got 0 edits")
+	}
+	nt, _ := edits[0]["newText"].(string)
+	if nt != expect {
+		t.Fatalf("formatting newText mismatch\nwant:\n%q\ngot:\n%q", expect, nt)
+	}
+}
+
+func Test_Features_RenameFlow_Minimal(t *testing.T) {
+	s := newServer()
+	const uri = "file:///rename.ms"
+
+	// Two occurrences of x; one binding entry is enough for the handlers.
+	text := "x\nx\n"
+	doc := &docState{
+		uri:   uri,
+		text:  text,
+		lines: lineOffsets(text),
+		binds: []bindingDef{
+			{Name: "x", Kind: "variable", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+		},
+		tokens: []mindscript.Token{
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 0, EndByte: 1},
+			{Type: mindscript.ID, Lexeme: "x", StartByte: 2, EndByte: 3},
+		},
+	}
+	s.mu.Lock()
+	s.docs[uri] = doc
+	s.mu.Unlock()
+
+	var out bytes.Buffer
+	old := stdoutSink
+	stdoutSink = &out
+	defer func() { stdoutSink = old }()
+
+	t.Run("prepareRename_returns_range_and_placeholder", func(t *testing.T) {
+		id := json.RawMessage(`83`)
+		pb, _ := json.Marshal(map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 0},
+		})
+		s.onPrepareRename(id, pb)
+		resp := decodeResp(t, &out)
+
+		if string(resp.Result) == "null" {
+			t.Fatalf("spec: prepareRename must return range+placeholder, got null")
+		}
+		var res map[string]any
+		_ = json.Unmarshal(resp.Result, &res)
+		if _, ok := res["range"]; !ok {
+			t.Fatalf("prepareRename: missing range")
+		}
+		if ph, ok := res["placeholder"].(string); !ok || ph != "x" {
+			t.Fatalf("prepareRename: placeholder must be 'x', got %v", res["placeholder"])
+		}
+	})
+
+	t.Run("rename_returns_nonempty_workspace_edit", func(t *testing.T) {
+		id := json.RawMessage(`84`)
+		pb, _ := json.Marshal(map[string]any{
+			"textDocument": map[string]any{"uri": uri},
+			"position":     map[string]any{"line": 0, "character": 0},
+			"newName":      "y",
+		})
+		s.onRename(id, pb)
+		resp := decodeResp(t, &out)
+
+		var edit map[string]any
+		if err := json.Unmarshal(resp.Result, &edit); err != nil {
+			t.Fatalf("decode rename edit: %v", err)
+		}
+		dc, ok := edit["documentChanges"].([]any)
+		if !ok || len(dc) == 0 {
+			t.Fatalf("spec: rename must return non-empty documentChanges")
+		}
+	})
+}
+
+// Optional scaffold for the "arrays/maps fold only when ≥ 3 lines" rule.
+// This requires AST+SpanIndex to be wired for literals; keep as a TODO so it
+// doesn't bloat or flake until spans are easily constructible here.
+func Test_Features_Folding_ArraysAndMaps_MinLines(t *testing.T) {
+	t.Skip("TODO: add when constructing mindscript.S AST + SpanIndex for literals is convenient in tests")
+}

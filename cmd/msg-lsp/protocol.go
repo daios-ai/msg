@@ -38,7 +38,7 @@ type Request struct {
 type Response struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
-	Result  any             `json:"result,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *ResponseError  `json:"error,omitempty"`
 }
 
@@ -125,7 +125,9 @@ type ServerCapabilities struct {
 		Full  bool `json:"full"`
 		Range bool `json:"range"`
 	} `json:"semanticTokensProvider,omitempty"`
-	FoldingRangeProvider bool `json:"foldingRangeProvider"`
+	FoldingRangeProvider   bool `json:"foldingRangeProvider"`
+	TypeDefinitionProvider bool `json:"typeDefinitionProvider,omitempty"`
+	RenameProvider         any  `json:"renameProvider,omitempty"`
 }
 
 type InitializeResult struct {

@@ -198,7 +198,7 @@ func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
 			DocumentSymbolProvider:          true,
 			ReferencesProvider:              true,
 			WorkspaceSymbolProvider:         false,
-			DocumentFormattingProvider:      false,
+			DocumentFormattingProvider:      true,
 			DocumentRangeFormattingProvider: false,
 			SignatureHelpProvider: &struct {
 				TriggerCharacters   []string `json:"triggerCharacters"`
@@ -209,12 +209,15 @@ func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
 			},
 			SemanticTokensProvider: semProv,
 			FoldingRangeProvider:   true,
+			TypeDefinitionProvider: true,
 		},
 		ServerInfo: map[string]string{
 			"name":    "mindscript-lsp",
 			"version": "0.4",
 		},
 	}
+	// Advertise rename with prepareProvider=true (stubs implemented below).
+	result.Capabilities.RenameProvider = map[string]any{"prepareProvider": true}
 	s.sendResponse(id, result, nil)
 }
 
@@ -305,6 +308,50 @@ func findSymbol(doc *docState, name string) (symbolDef, bool) {
 	return symbolDef{}, false
 }
 
+// Minimal operator doc to avoid "nothing on hover" over common operators.
+var opDoc = map[mindscript.TokenType]string{
+	mindscript.EQ:         "equality (==)",
+	mindscript.NEQ:        "inequality (!=)",
+	mindscript.LESS:       "less-than (<)",
+	mindscript.GREATER:    "greater-than (>)",
+	mindscript.LESS_EQ:    "less-or-equal (<=)",
+	mindscript.GREATER_EQ: "greater-or-equal (>=)",
+	mindscript.PLUS:       "addition (+)",
+	mindscript.MINUS:      "subtraction (-)",
+	mindscript.MULT:       "multiplication (*)",
+	mindscript.DIV:        "division (/)",
+	mindscript.AND:        "logical and",
+	mindscript.OR:         "logical or",
+	mindscript.NOT:        "logical not",
+}
+
+// ---- Hover helpers (local to features.go) ----
+
+// arrowTypeAST builds a right-associated ("binop","->", ...) chain from params -> ret.
+func arrowTypeAST(params [][]any, ret []any) []any {
+	t := ret
+	for i := len(params) - 1; i >= 0; i-- {
+		t = []any{"binop", "->", params[i], t}
+	}
+	return t
+}
+
+// bindingTypeAST returns the AST type for a binding:
+//   - fun/oracle → arrow type using analyzer metadata
+//   - otherwise → binding.TypeNode (or Any if empty)
+func bindingTypeAST(doc *docState, b bindingDef, name string) []any {
+	if b.Kind == "fun" || b.Kind == "oracle" {
+		if _, ps, rt, ok := findLocalFunMeta(doc, name); ok {
+			return arrowTypeAST(ps, rt)
+		}
+	}
+	if len(b.TypeNode) > 0 {
+		return b.TypeNode
+	}
+	return []any{"id", "Any"}
+}
+
+// ------------------- HOVER -------------------
 func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 	var params struct {
 		TextDocument TextDocumentIdentifier `json:"textDocument"`
@@ -318,125 +365,75 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		return
 	}
 
+	off := posToOffset(doc.lines, params.Position, doc.text)
+
+	// Suppress inside strings or annotation/comment spans.
+	if _, tk0, _, _, ok := tokenAtOffset(doc, off); ok && tk0.Type == mindscript.STRING {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+	for _, sp := range commentSpans(doc) {
+		if off >= sp[0] && off < sp[1] {
+			s.sendResponse(id, nil, nil)
+			return
+		}
+	}
+
 	name, rng := wordAt(doc, params.Position)
 	if name == "" {
 		s.sendResponse(id, nil, nil)
 		return
 	}
 
-	off := posToOffset(doc.lines, params.Position, doc.text)
+	// Token under cursor (if any).
 	_, tk, _, _, tokOK := tokenAtOffset(doc, off)
 
-	// Keywords / boolean literals → simple hover
+	// Operators: small, useful hover.
+	if tokOK {
+		if desc, ok := opDoc[tk.Type]; ok {
+			content := fmt.Sprintf("**%s** (operator) \n\n %s", tk.Lexeme, desc)
+			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+			return
+		}
+	}
+
+	// Keywords / boolean literals → lightweight hover.
 	if tokOK {
 		if isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN {
 			word := tk.Lexeme
-			if tk.Type == mindscript.BOOLEAN {
-				if b, ok := tk.Literal.(bool); ok && b {
-					word = "true"
-				} else {
-					word = "false"
-				}
-			}
-			content := fmt.Sprintf("**keyword** `%s`", word)
+			content := fmt.Sprintf("**%s** (keyword)", word)
 			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
 			return
 		}
 	}
 
-	// Prefer the nearest binding (uniform; includes annotations for all kinds + type/sig)
-	if b, ok := nearestBinding(doc, name, off); ok {
-		var header string
-		switch b.Kind {
-		case "fun", "oracle":
-			sig := b.Sig
-			if sig == "" {
-				// fallback to minimal presentation
-				sig = name + "(...) -> Any"
-			}
-			header = fmt.Sprintf("**fun** `%s`", sig)
-		case "type":
-			header = fmt.Sprintf("**type** `%s`", name)
-		case "param":
-			ty := formatTypeNode(b.TypeNode)
-			header = fmt.Sprintf("**param** `%s: %s`", name, ty)
-		default:
-			ty := formatTypeNode(b.TypeNode)
-			if ty != "" && ty != "Any" {
-				header = fmt.Sprintf("**variable** `%s: %s`", name, ty)
-			} else {
-				header = fmt.Sprintf("**variable** `%s`", name)
-			}
+	// 0) Globals from interpreter (functions/types) — metadata only, no user code execution
+	if v, err := s.ip.Global.Get(name); err == nil {
+		typAST := s.ip.ValueToType(v, s.ip.Global)
+		doc := v.Annot
+		head := fmt.Sprintf("**%s** `<%s>`", name, mindscript.FormatType(typAST))
+		if d := strings.TrimSpace(doc); d != "" {
+			head += "\n\n" + d
 		}
-		content := header
-		if txt := strings.TrimSpace(b.DocFull); txt != "" {
-			content += "\n\n" + txt
-		}
-		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: head}, Range: &rng}, nil)
 		return
 	}
 
-	// Builtin types by ID (NOT by TYPE keyword)
-	if tokOK && tk.Type == mindscript.ID {
-		if docTxt, ok := builtinTypeDocs[name]; ok {
-			content := fmt.Sprintf("**type** `%s`\n\n%s", name, docTxt)
-			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
-			return
+	// 1) Bound symbol (shadowing-aware): **NAME** `<AST>`  + first doc line (if any)
+	if b, ok := nearestBinding(doc, name, off); ok {
+		typAST := bindingTypeAST(doc, b, name)
+		head := fmt.Sprintf("**%s** `<%s>`", name, mindscript.FormatType(typAST))
+		if d := strings.TrimSpace(b.DocFull); d != "" {
+			head += "\n\n" + d
 		}
+		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: head}, Range: &rng}, nil)
+		return
 	}
 
-	// Globals from interpreter (functions/types) — metadata only, no user code execution
-	if v, err := s.ip.Global.Get(name); err == nil {
-		switch v.Tag {
-		case mindscript.VTFun:
-			if meta, ok := s.ip.FunMeta(v); ok {
-				ps := meta.ParamSpecs()
-				parts := make([]string, 0, len(ps))
-				for _, p := range ps {
-					parts = append(parts, fmt.Sprintf("%s: %s", p.Name, mindscript.FormatType(p.Type)))
-				}
-				ret := mindscript.FormatType(meta.ReturnType())
-				content := fmt.Sprintf("**fun** `%s(%s) -> %s`", name, strings.Join(parts, ", "), ret)
-				if doc := strings.TrimSpace(meta.Doc()); doc != "" {
-					content += "\n\n" + doc
-				}
-				s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
-				return
-			}
-		case mindscript.VTType:
-			content := "**type** `" + name + "`"
-			s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
-			return
-		}
-	}
-
-	// Fallback classification for IDs (kept for completeness)
+	// 2) Fallback for plain identifiers: unknown → Any.
 	if tokOK && tk.Type == mindscript.ID {
-		kind := "identifier"
-		idx := -1
-		if i, _, _, _, ok := tokenAtOffset(doc, off); ok {
-			idx = i
-		}
-		if idx == -1 {
-			for i := range doc.tokens {
-				if doc.tokens[i] == tk {
-					idx = i
-					break
-				}
-			}
-		}
-
-		if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
-			kind = "property"
-		} else if sy, ok := findSymbol(doc, name); ok && sy.Kind != "" {
-			kind = sy.Kind
-		} else if idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND {
-			kind = "fun"
-		} else if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTType {
-			kind = "type"
-		}
-		content := fmt.Sprintf("**%s** `%s`", kind, name)
-		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: content}, Range: &rng}, nil)
+		head := fmt.Sprintf("**%s** `<%s>`", name, mindscript.FormatType([]any{"id", "Any"}))
+		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: head}, Range: &rng}, nil)
 		return
 	}
 
@@ -469,13 +466,7 @@ func (s *server) onDefinition(id json.RawMessage, paramsRaw json.RawMessage) {
 		s.sendResponse(id, Location{URI: doc.uri, Range: b.Range}, nil)
 		return
 	}
-	// Fallback: old top-level heuristic
-	for _, sym := range doc.symbols {
-		if sym.Name == name {
-			s.sendResponse(id, Location{URI: doc.uri, Range: sym.Range}, nil)
-			return
-		}
-	}
+	// No nearest binding → per spec, do not fall back to top-level symbols.
 	s.sendResponse(id, nil, nil)
 }
 
@@ -511,6 +502,30 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
+	// Determine word prefix under cursor for filtering and check if next token is '('.
+	prefix, _ := wordAt(doc, params.Position)
+	nextIsParen := false
+	// If cursor is exactly at the start of an identifier token, treat prefix as empty.
+	// This avoids over-aggressive filtering when no characters have been typed yet.
+	{
+		off := posToOffset(doc.lines, params.Position, doc.text)
+		if _, tk, start, _, ok := tokenAtOffset(doc, off); ok {
+			if tk.Type == mindscript.ID && off == start {
+				prefix = ""
+			}
+		}
+	}
+	for i := range doc.tokens {
+		sb, _ := tokenSpan(doc, doc.tokens[i])
+		if sb < off {
+			continue
+		}
+		if doc.tokens[i].Type == mindscript.CLROUND && sb == off {
+			nextIsParen = true
+		}
+		break
+	}
+
 	seen := map[string]bool{}
 	items := make([]CompletionItem, 0, 128)
 
@@ -542,11 +557,20 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 				}
 			}
 		}
-		items = append(items, CompletionItem{
+		it := CompletionItem{
 			Label:  b.Name,
 			Kind:   kind,
 			Detail: detail,
-		})
+		}
+		// For functions/oracles, provide snippet name($0) unless '(' immediately follows the cursor.
+		if (b.Kind == "fun" || b.Kind == "oracle") && !nextIsParen {
+			it.InsertTextFormat = 2 // Snippet
+			it.InsertText = b.Name + "($0)"
+		}
+		// Prefix filter
+		if prefix == "" || strings.HasPrefix(it.Label, prefix) {
+			items = append(items, it)
+		}
 	}
 
 	// Language keywords (MindScript-specific spellings)
@@ -562,11 +586,35 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 	for _, kw := range keywords {
 		if !seen[kw] {
 			seen[kw] = true
-			items = append(items, CompletionItem{Label: kw, Kind: 14}) // Keyword
+			it := CompletionItem{Label: kw, Kind: 14} // Keyword
+			if prefix == "" || strings.HasPrefix(it.Label, prefix) {
+				items = append(items, it)
+			}
 		}
 	}
 
-	sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+	// Sort by kind priority (functions, types, vars, keywords) then alphabetically.
+	priority := func(k int) int {
+		switch k {
+		case 3: // function
+			return 0
+		case 5: // type
+			return 1
+		case 6: // variable
+			return 2
+		case 14: // keyword
+			return 3
+		default:
+			return 4
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		pi, pj := priority(items[i].Kind), priority(items[j].Kind)
+		if pi != pj {
+			return pi < pj
+		}
+		return items[i].Label < items[j].Label
+	})
 	s.sendResponse(id, items, nil)
 }
 
@@ -640,22 +688,8 @@ func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
 	qOff := posToOffset(doc.lines, params.Position, doc.text)
 	bOrigin, ok := nearestBinding(doc, name, qOff)
 	if !ok {
-		// fallback: all occurrences of the bare identifier (minus properties)
-		locs := []Location{}
-		for i, t := range doc.tokens {
-			if t.Type != mindscript.ID || tokenName(t) != name {
-				continue
-			}
-			if i-1 >= 0 && doc.tokens[i-1].Type == mindscript.PERIOD {
-				continue
-			}
-			start, end := tokenSpan(doc, t)
-			locs = append(locs, Location{
-				URI:   doc.uri,
-				Range: makeRange(doc.lines, start, end, doc.text),
-			})
-		}
-		s.sendResponse(id, locs, nil)
+		// Spec: no origin binding → return [] (do not fall back to lexeme scan).
+		s.sendResponse(id, []Location{}, nil)
 		return
 	}
 
@@ -1017,9 +1051,33 @@ func (s *server) onSignatureHelp(id json.RawMessage, paramsRaw json.RawMessage) 
 	}
 
 	off := posToOffset(doc.lines, params.Position, doc.text)
-	tIdx, _, _, _, ok := tokenAtOffset(doc, off)
-	if !ok && len(doc.tokens) > 0 {
-		tIdx = len(doc.tokens) - 1
+	// Start from the token at the cursor, or if on whitespace, the nearest token *before* the cursor.
+	tIdx := -1
+	if idx, _, _, eOff, ok := tokenAtOffset(doc, off); ok {
+		tIdx = idx
+		// If the cursor is positioned exactly between tokens (e.g., after a comma/space),
+		// tokenAtOffset may still select the next token depending on spans. Prefer the token
+		// whose end is <= off when possible.
+		if eOff <= off {
+			tIdx = idx
+		}
+	} else {
+		// Linear scan to find the last token whose start is <= off.
+		for i := 0; i < len(doc.tokens); i++ {
+			sOff, eOff := tokenSpan(doc, doc.tokens[i])
+			if off < sOff {
+				break
+			}
+			// choose i; if cursor is inside this token we'll stop on next iteration via tokenAtOffset path
+			tIdx = i
+			if off >= sOff && off < eOff {
+				break
+			}
+		}
+	}
+	if tIdx < 0 {
+		s.sendResponse(id, SignatureHelp{}, nil)
+		return
 	}
 
 	// Walk left to find the matching '(' (CLROUND) with proper nesting.
@@ -1199,4 +1257,117 @@ func (s *server) onFoldingRange(id json.RawMessage, paramsRaw json.RawMessage) {
 	}
 
 	s.sendResponse(id, out, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Stubs: Type Definition, Formatting, Rename / PrepareRename
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *server) onDocumentFormatting(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Options      any                    `json:"options"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, []any{}, nil)
+		return
+	}
+	std, err := mindscript.Standardize(doc.text)
+	if err != nil {
+		// Parse/format failure: return no edits per spec.
+		s.sendResponse(id, []any{}, nil)
+		return
+	}
+	// One full-document edit covering [0, len(text)).
+	full := map[string]any{
+		"range": map[string]any{
+			"start": map[string]int{"line": 0, "character": 0},
+			"end": func() map[string]int {
+				// End position computed from original text.
+				endPos := offsetToPos(doc.lines, len(doc.text), doc.text)
+				return map[string]int{"line": endPos.Line, "character": endPos.Character}
+			}(),
+		},
+		"newText": std,
+	}
+	s.sendResponse(id, []any{full}, nil)
+}
+
+// onPrepareRename: stub — return null result.
+func (s *server) onPrepareRename(id json.RawMessage, paramsRaw json.RawMessage) {
+	s.sendResponse(id, nil, nil)
+}
+
+// onRename: stub — return empty workspace edit.
+func (s *server) onRename(id json.RawMessage, paramsRaw json.RawMessage) {
+	// Minimal empty edit so clients don't error on shape.
+	s.sendResponse(id, map[string]any{
+		"documentChanges": []any{},
+	}, nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Go to Type Definition
+////////////////////////////////////////////////////////////////////////////////
+
+func isBuiltinTypeName(name string) bool {
+	switch name {
+	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) onTypeDefinition(id json.RawMessage, paramsRaw json.RawMessage) {
+	var params struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+		Position     Position               `json:"position"`
+	}
+	_ = json.Unmarshal(paramsRaw, &params)
+
+	doc := s.snapshotDoc(params.TextDocument.URI)
+	if doc == nil {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+
+	name, _ := wordAt(doc, params.Position)
+	if name == "" {
+		s.sendResponse(id, nil, nil)
+		return
+	}
+	off := posToOffset(doc.lines, params.Position, doc.text)
+
+	// Fast path: if the cursor is directly on an identifier that names a user-defined type,
+	// jump straight to that type's declaration.
+	if _, tk, _, _, ok := tokenAtOffset(doc, off); ok && tk.Type == mindscript.ID {
+		idName := tokenName(tk)
+		if idName != "" && !isBuiltinTypeName(idName) {
+			for _, tb := range doc.binds {
+				if tb.Kind == "type" && tb.Name == idName {
+					s.sendResponse(id, Location{URI: doc.uri, Range: tb.Range}, nil)
+					return
+				}
+			}
+		}
+	}
+
+	// Fallback: from a value usage, inspect its TypeNode for a named type and jump to it.
+	if b, ok := nearestBinding(doc, name, off); ok && len(b.TypeNode) == 2 {
+		if tag, _ := b.TypeNode[0].(string); tag == "id" {
+			if tn, _ := b.TypeNode[1].(string); tn != "" && !isBuiltinTypeName(tn) {
+				for _, tb := range doc.binds {
+					if tb.Kind == "type" && tb.Name == tn {
+						s.sendResponse(id, Location{URI: doc.uri, Range: tb.Range}, nil)
+						return
+					}
+				}
+			}
+		}
+	}
+	s.sendResponse(id, nil, nil)
 }

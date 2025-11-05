@@ -311,12 +311,24 @@ func rangeFromPath(doc *docState, p mindscript.NodePath) (Range, bool) {
 // rangeOrDefault tries span index first, then falls back to an empty range.
 // This ensures diagnostics are still emitted even when a precise span is missing.
 func rangeOrDefault(doc *docState, p mindscript.NodePath) Range {
+	// 1) Exact node span?
 	if r, ok := rangeFromPath(doc, p); ok {
 		return r
 	}
-	// Fall back to a zero-length range at the start of the document.
-	// (Tests check presence of codes; exact ranges are less critical.)
-	return makeRange(doc.lines, 0, 0, doc.text)
+	// 2) Walk up ancestors to find the nearest enclosing span and anchor a caret at its start.
+	if doc.spans != nil {
+		anc := append(mindscript.NodePath(nil), p...)
+		for len(anc) > 0 {
+			if sp, ok := doc.spans.Get(anc); ok {
+				start := offsetToPos(doc.lines, sp.StartByte, doc.text)
+				return Range{Start: start, End: start}
+			}
+			anc = anc[:len(anc)-1]
+		}
+	}
+	// 3) Last resort: caret at end of document (anything but 0,0).
+	end := offsetToPos(doc.lines, len(doc.text), doc.text)
+	return Range{Start: end, End: end}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -467,8 +479,19 @@ func analyzeFilePureImpl(sn fileSnapshot, uri string) *pureResult {
 				toks = ptoks
 			}
 		}
-		// surface the lex error as a single diag; byte positions are best-effort (0..0)
-		ds = append(ds, pureDiag{StartByte: 0, EndByte: 0, Severity: 1, Code: "LEX", Message: err.Error()})
+		// surface the lex error at its caret
+		pos := 0
+		if e, ok := err.(*mindscript.Error); ok {
+			lines := lineOffsets(txt)
+			pos = byteColToOffset(lines, e.Line-1, e.Col-1, txt)
+		}
+		ds = append(ds, pureDiag{
+			StartByte: pos,
+			EndByte:   pos,
+			Severity:  1,
+			Code:      "LEX",
+			Message:   err.Error(),
+		})
 		return &pureResult{URI: uri, Text: txt, Tokens: toks, Diags: ds}
 	}
 	if n := len(toks); n > 0 && toks[n-1].Type == mindscript.EOF {
@@ -482,12 +505,18 @@ func analyzeFilePureImpl(sn fileSnapshot, uri string) *pureResult {
 			// Incomplete: return tokens but no diagnostics (non-nagging while typing)
 			return &pureResult{URI: uri, Text: txt, Tokens: toks}
 		}
+		pos := 0
+		if e, ok := perr.(*mindscript.Error); ok {
+			lines := lineOffsets(txt)
+			pos = byteColToOffset(lines, e.Line-1, e.Col-1, txt)
+		}
 		return &pureResult{
 			URI:    uri,
 			Text:   txt,
 			Tokens: toks,
-			Diags:  []pureDiag{{StartByte: 0, EndByte: 0, Severity: 1, Code: "PARSE", Message: perr.Error()}},
+			Diags:  []pureDiag{{StartByte: pos, EndByte: pos, Severity: 1, Code: "PARSE", Message: perr.Error()}},
 		}
+
 	}
 
 	// 3) Reuse existing collectors and static checks by constructing a temp docState

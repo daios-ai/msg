@@ -84,12 +84,16 @@ func writeMsg(w io.Writer, v any) error {
 
 // sendResponse sends a JSON-RPC response (result or error).
 func (s *server) sendResponse(id json.RawMessage, result any, respErr *ResponseError) {
+	// Always serialize result as raw JSON so decoders can test for literal null, etc.
+	var rm json.RawMessage
 	if respErr == nil && result == nil {
-		rawNull := json.RawMessage([]byte("null"))
-		_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: rawNull})
-		return
+		rm = json.RawMessage([]byte("null"))
+	} else if result != nil {
+		if b, err := json.Marshal(result); err == nil {
+			rm = json.RawMessage(b)
+		}
 	}
-	_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: result, Error: respErr})
+	_ = writeMsg(stdoutSink, Response{JSONRPC: "2.0", ID: id, Result: rm, Error: respErr})
 }
 
 // notify sends a JSON-RPC notification (no id).
@@ -157,6 +161,14 @@ func main() {
 			s.onSignatureHelp(req.ID, req.Params)
 		case "textDocument/foldingRange":
 			s.onFoldingRange(req.ID, req.Params)
+		case "textDocument/typeDefinition":
+			s.onTypeDefinition(req.ID, req.Params)
+		case "textDocument/formatting":
+			s.onDocumentFormatting(req.ID, req.Params)
+		case "textDocument/prepareRename":
+			s.onPrepareRename(req.ID, req.Params)
+		case "textDocument/rename":
+			s.onRename(req.ID, req.Params)
 
 		// Semantic tokens
 		case "textDocument/semanticTokens/full":

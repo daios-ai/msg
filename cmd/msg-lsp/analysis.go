@@ -1,1711 +1,1622 @@
-// analysis.go
+// cmd/msg-lsp/analysis.go
 //
-// High-level purpose
-// ------------------
-// Single-file analysis for the MindScript LSP. This turns source text into:
-//   • Tokens (for highlighting and layout lints),
-//   • An S-expr AST with span info,
-//   • Bindings (the single source of truth for names, types, and docs),
-//   • Diagnostics (precise span + code + message).
-// It also provides byte↔UTF-16 helpers for LSP ranges and a single-pass, static
-// fold that synthesizes types, checks subtyping, and emits diagnostics.
+// New MindScript static analyzer.
 //
-// What you get (result shape)
-// ---------------------------
-// analyzeFilePure returns a *pureResult:
-//   • URI, Text, Tokens
-//   • AST, Spans
-//   • Bindings: []pureBinding, each with
-//       - Name: identifier
-//       - Kind: one of {"fun","oracle","type","param","variable"}
-//       - TypeNode: compact S-expr type (e.g., ["array", ["id","Int"]])
-//       - Sig: human string for fun/oracle (e.g., "add(a: Int, b: Int) -> Int")
-//       - DocFull / DocFirst: concatenated annotation text and its first line
-//       - StartByte / EndByte: definition byte span (precise, LSP-agnostic)
-//       - IsTopLevel: true iff defined at file scope
-//     Bindings are the single source of truth. Top-level “symbols” shown in the
-//     UI are derived from Bindings where IsTopLevel == true.
-//   • Diags: []pureDiag with (StartByte, EndByte, Severity, Code, Message)
-//
-// How types are synthesized (single pass; static; uniform)
-// --------------------------------------------------------
-// • The fold walks the AST once. It never executes code.
-// • All types are uniform S-exprs. Nullable is a normal constructor: ["unop","?",T].
-// • LUB/GLB/Subtyping live in lub.go and are shape-aware:
-//     - Int <: Num <: Any. Arrays covariant. Maps fieldwise.
-//     - Enums by set semantics; widen to base primitive when needed.
-//     - Arrows: GLB(param) -> LUB(ret). If param GLB fails, widen to Any.
-//     - Opaque aliases (non-builtin ids) compare by identical atom only.
-// • Open-world value maps: only observed fields are recorded; extra may exist.
-//   Typed map parameters (in function signatures) impose required/optional keys;
-//   inside bodies, parameters are trusted to match their declared types.
-// • Oracles: their declared return type is made nullable at definition time.
-// • Currying: under-application yields a residual arrow; over-application flags
-//   overflow; exact application yields the declared (possibly nullable) return.
-//
-// Diagnostics (examples)
-// ----------------------
-// • Names/targets: MS-UNKNOWN-NAME, MS-INVALID-ASSIGN-TARGET
-// • Calls: MS-ARG-OVERFLOW, MS-ARG-TYPE-MISMATCH (incl. enum non-member)
-// • Returns: MS-RET-TYPE-MISMATCH (structural check, not string compare)
-// • Flow/types: MS-MAYBE-NULL-UNSAFE, MS-MAP-MISSING-KEY, MS-ARRAY-HETEROGENEOUS
-// • Ops: MS-BITWISE-NONINT, MS-COMPARISON-TYPE-MISMATCH, MS-DIV-BY-ZERO-CONST
-//
-// Organization
-// ------------
-// • Public shims: analyzeFilePure (pure), (*server).analyze (publishes diags).
-// • A `//// END_OF_PUBLIC` separator marks the public/private boundary.
-// • Helpers + single-pass fold live below; LUB/GLB/subtyping in lub.go.
-//
-// Notes
-// -----
-// • Single pass over AST with tokens/spans available.
-// • No body-based inference for function signatures.
-// • Bindings carry Kind and IsTopLevel; symbols are derived from bindings.
+// Key constraints:
+//   - Pure static, single-pass, abstract interpreter.
+//   - Uses ONLY mindscript APIs visible in interpreter.go and types.go.
+//   - Uses real *mindscript.Env* for all scopes.
+//   - Analysis domain:
+//       • VTType  (as in runtime) for type aliases / schema values.
+//       • VTSymbol (analysis-only) summarizing inferred type/docs for values.
+//   - No Scope / Symbol / NameRef graph like the old implementation.
+//   - Dispatcher-style fold() with per-tag handlers, kept modular & extensible.
+//   - Never Eval/Apply user code; all reasoning goes through Interpreter helpers.
 
 package main
 
 import (
-	"fmt"
-	"strings"
-	"unicode/utf8"
-
 	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-// Pure analyzer types (byte-span, no LSP deps) — lives here to avoid new files
+// Core analysis result types
 ////////////////////////////////////////////////////////////////////////////////
 
-// fileSnapshot lets the pure analyzer read file text by URI (multi-file ready).
-type fileSnapshot interface {
-	Get(uri string) (text string, ok bool)
-}
-
-// pureDiag is a diagnostic with byte offsets (LSP-agnostic).
-type pureDiag struct {
+// Diag is a single diagnostic attached to a byte range in the current file.
+type Diag struct {
 	StartByte int
 	EndByte   int
-	Severity  int // 1=error, 2=warning, 3=hint, 4=info
 	Code      string
 	Message   string
+	// Severity, related info, quick-fixes, etc. can be added later.
 }
 
-// pureBinding mirrors binding data with byte spans.
-type pureBinding struct {
-	Name       string
-	Kind       string
-	TypeNode   []any
-	Sig        string
-	DocFull    string
-	DocFirst   string
-	StartByte  int
-	EndByte    int
-	IsTopLevel bool
+// FileIndex is the per-file analysis product.
+type FileIndex struct {
+	URI  string
+	Text string
+
+	// Parsed artifacts.
+	AST   mindscript.S
+	Spans *mindscript.SpanIndex // from parser/spans; used only for ranges.
+
+	// RootEnv is the file’s root analysis environment:
+	//   RootEnv -> ambient/prelude (ip.Global/Base/Core)
+	RootEnv *mindscript.Env
+
+	// NodeTypes holds synthesized expression types for tooling.
+	// Keying strategy (e.g. by span or stable node-id) is left for later.
+	NodeTypes map[interface{}]mindscript.S
+
+	// Diagnostics collected during analysis.
+	Diags []Diag
 }
 
-// pureResult is the full output of analyzing a single file.
-type pureResult struct {
-	URI      string
-	Text     string
-	Tokens   []mindscript.Token
-	AST      mindscript.S
-	Spans    *mindscript.SpanIndex
-	Bindings []pureBinding
-	Diags    []pureDiag
+// addDiag appends a diagnostic.
+func (idx *FileIndex) addDiag(d Diag) {
+	idx.Diags = append(idx.Diags, d)
 }
 
-/////////////////////////////
-// PUBLIC SHIMS (thin API) //
-/////////////////////////////
-
-// analyzeFilePure is a pure function: reads source via snapshot, lexes/parses,
-// collects bindings, runs static checks, and returns byte-span results.
-func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
-	return analyzeFilePureImpl(sn, uri)
-}
-
-// analyze lexes, parses, and refreshes the per-doc caches used by features.
-// It fills: doc.tokens, doc.ast (when parse succeeds), and doc.symbols (top-level defs).
-func (s *server) analyze(doc *docState) {
-	analyzeImpl(s, doc)
-}
-
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-// Implementation (private)
-////////////////////////////////////////////////////////////////////////////////
-
-////////////////////////////////////////////////////////////////////////////////
-// Text & UTF-16 helpers
-////////////////////////////////////////////////////////////////////////////////
-
-// CRLF-aware: treat "\r\n" as a single newline; store offsets at the byte *after* '\n'.
-func lineOffsets(text string) []int {
-	offs := []int{0}
-	for i := 0; i < len(text); {
-		if text[i] == '\r' {
-			// skip lone \r (shouldn't happen often)
-			i++
-			continue
-		}
-		if text[i] == '\n' {
-			offs = append(offs, i+1)
-			i++
-			continue
-		}
-		_, sz := utf8.DecodeRuneInString(text[i:])
-		if sz <= 0 {
-			sz = 1
-		}
-		i += sz
+// rememberType records the type for an expression node.
+func (idx *FileIndex) rememberType(key interface{}, t mindscript.S) {
+	if idx.NodeTypes == nil {
+		idx.NodeTypes = make(map[interface{}]mindscript.S)
 	}
-	return offs
-}
-
-func toU16(r rune) int {
-	if r < 0x10000 {
-		return 1
-	}
-	return 2
-}
-
-// posToOffset converts an LSP Position (UTF-16 code units) to a byte offset.
-func posToOffset(lines []int, p Position, text string) int {
-	if p.Line < 0 {
-		return 0
-	}
-	if p.Line >= len(lines) {
-		return len(text)
-	}
-	i := lines[p.Line]
-	need := p.Character // in UTF-16 units
-	for i < len(text) && need > 0 {
-		r, sz := utf8.DecodeRuneInString(text[i:])
-		if r == '\r' { // ignore CR in column math
-			i += sz
-			continue
-		}
-		if r == '\n' {
-			break
-		}
-		need -= toU16(r)
-		i += sz
-	}
-	return i
-}
-
-// offsetToPos converts a byte offset to an LSP Position (UTF-16 code units).
-func offsetToPos(lines []int, off int, text string) Position {
-	if off < 0 {
-		off = 0
-	}
-	if off > len(text) {
-		off = len(text)
-	}
-	i, j := 0, len(lines)
-	for i+1 < j {
-		m := (i + j) / 2
-		if lines[m] <= off {
-			i = m
-		} else {
-			j = m
-		}
-	}
-	u16 := 0
-	for k := lines[i]; k < off && k < len(text); {
-		r, sz := utf8.DecodeRuneInString(text[k:])
-		if r == '\r' { // ignore CR
-			k += sz
-			continue
-		}
-		if r == '\n' {
-			break
-		}
-		u16 += toU16(r)
-		k += sz
-	}
-	return Position{Line: i, Character: u16}
-}
-
-func makeRange(lines []int, start, end int, text string) Range {
-	return Range{
-		Start: offsetToPos(lines, start, text),
-		End:   offsetToPos(lines, end, text),
-	}
-}
-
-// Engine gives us byte columns (not UTF-16). Clamp within the line.
-func byteColToOffset(lines []int, line0, byteCol int, text string) int {
-	if line0 < 0 {
-		line0 = 0
-	}
-	if line0 >= len(lines) {
-		return len(text)
-	}
-	start := lines[line0]
-	end := len(text)
-	if line0+1 < len(lines) {
-		end = lines[line0+1]
-	}
-	off := start + byteCol
-	if off < start {
-		off = start
-	}
-	if off > end {
-		off = end
-	}
-	return off
+	idx.NodeTypes[key] = t
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Diagnostics helpers
+// Analyzer: shared interpreter + entrypoint
 ////////////////////////////////////////////////////////////////////////////////
 
-func (s *server) clearDiagnostics(uri string) {
-	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
-		URI:         uri,
-		Diagnostics: []Diagnostic{},
-	})
+type Analyzer struct {
+	IP *mindscript.Interpreter
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Token & span helpers
-////////////////////////////////////////////////////////////////////////////////
-
-func tokenName(t mindscript.Token) string {
-	if s, ok := t.Literal.(string); ok {
-		return s
+// ensureIP lazily constructs an Interpreter for ambient types/prelude.
+func (a *Analyzer) ensureIP() *mindscript.Interpreter {
+	if a == nil {
+		return nil
 	}
-	return t.Lexeme
-}
-
-// Prefer exact lexer byte spans (the lexer guarantees StartByte/EndByte).
-func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
-	start, end = t.StartByte, t.EndByte
-	if start < 0 {
-		start = 0
+	if a.IP != nil {
+		return a.IP
 	}
-	if end < start {
-		end = start
-	}
-	if end > len(doc.text) {
-		end = len(doc.text)
-	}
-	return start, end
-}
-
-// Use SpanIndex to build a Range from a NodePath.
-func rangeFromPath(doc *docState, p mindscript.NodePath) (Range, bool) {
-	if doc.spans == nil {
-		return Range{}, false
-	}
-	sp, ok := doc.spans.Get(p)
-	if !ok {
-		return Range{}, false
-	}
-	return makeRange(doc.lines, sp.StartByte, sp.EndByte, doc.text), true
-}
-
-// rangeOrDefault tries span index first, then falls back to an empty range.
-// This ensures diagnostics are still emitted even when a precise span is missing.
-func rangeOrDefault(doc *docState, p mindscript.NodePath) Range {
-	// 1) Exact node span?
-	if r, ok := rangeFromPath(doc, p); ok {
-		return r
-	}
-	// 2) Walk up ancestors to find the nearest enclosing span and anchor a caret at its start.
-	if doc.spans != nil {
-		anc := append(mindscript.NodePath(nil), p...)
-		for len(anc) > 0 {
-			if sp, ok := doc.spans.Get(anc); ok {
-				start := offsetToPos(doc.lines, sp.StartByte, doc.text)
-				return Range{Start: start, End: start}
-			}
-			anc = anc[:len(anc)-1]
-		}
-	}
-	// 3) Last resort: caret at end of document (anything but 0,0).
-	end := offsetToPos(doc.lines, len(doc.text), doc.text)
-	return Range{Start: end, End: end}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// AST Walker & Visitors (centralized traversal)
-////////////////////////////////////////////////////////////////////////////////
-
-// rangeFromID provides a best-effort identifier range: it first tries the path
-// via SpanIndex; when unavailable, falls back to token scanning by name.
-func rangeFromID(doc *docState, path mindscript.NodePath, name string) Range {
-	if r, ok := rangeFromPath(doc, path); ok {
-		return r
-	}
-	if s, e, ok := findDefIDRange(doc.tokens, name); ok {
-		return makeRange(doc.lines, s, e, doc.text)
-	}
-	return Range{}
-}
-
-// mapFieldType extracts the field type from a ("map", ...) type node by key.
-func mapFieldType(t []any, key string) ([]any, bool) {
-	if len(t) == 0 || t[0] != "map" {
-		return nil, false
-	}
-	for i := 1; i < len(t); i++ {
-		if pr, ok := t[i].([]any); ok && len(pr) >= 3 && (pr[0] == "pair" || pr[0] == "pair!") {
-			if k, ok := pr[1].([]any); ok && len(k) >= 2 && k[0] == "str" {
-				if nm, _ := k[1].(string); nm == key {
-					if tv, ok := pr[2].([]any); ok {
-						return tv, true
-					}
-				}
-			}
-		}
-	}
-	return nil, false
-}
-
-// mapFieldTypeReq extracts the field (type, required?) from a ("map", ...) type node by key.
-func mapFieldTypeReq(t []any, key string) (field []any, required bool, ok bool) {
-	if len(t) == 0 || t[0] != "map" {
-		return nil, false, false
-	}
-	for i := 1; i < len(t); i++ {
-		if pr, okp := t[i].([]any); okp && len(pr) >= 3 && (pr[0] == "pair" || pr[0] == "pair!") {
-			if k, okk := pr[1].([]any); okk && len(k) >= 2 && k[0] == "str" {
-				if nm, _ := k[1].(string); nm == key {
-					if tv, okt := pr[2].([]any); okt {
-						return tv, pr[0] == "pair!", true
-					}
-				}
-			}
-		}
-	}
-	return nil, false, false
-}
-
-// resolveTypeAliasMap tries to resolve an alias ID type into its underlying ("map", ...) type.
-// Returns (mapType, ok). Does not unfold through non-map aliases (keeps aliases opaque otherwise).
-func resolveTypeAliasMap(doc *docState, t []any) ([]any, bool) {
-	if len(t) >= 2 && t[0] == "id" {
-		if name, _ := t[1].(string); name != "" {
-			if mt, ok := resolveTypeAliasAST(doc, name); ok && len(mt) > 0 && mt[0] == "map" {
-				return mt, true
-			}
-		}
-	}
-	return nil, false
-}
-
-// sameType reports textual equality via FormatType (kept minimal for array homogeneity warnings).
-func sameType(a, b []any) bool {
-	return formatTypeNode(a) == formatTypeNode(b)
-}
-
-// isNullable reports whether the static type node has the nullable modifier T?.
-func isNullable(t []any) bool {
-	if len(t) >= 3 {
-		if op, _ := t[0].(string); op == "unop" {
-			if q, _ := t[1].(string); q == "?" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Definition heuristics & symbol formatting
-////////////////////////////////////////////////////////////////////////////////
-
-// formatFunSig builds a pretty signature from a ("fun", ...) AST node.
-func formatFunSig(name string, fun []any) string {
-	if len(fun) < 3 {
-		return name + "() -> Any"
-	}
-	ps, _ := fun[1].([]any)
-	var parts []string
-	if len(ps) > 0 && ps[0] == "array" {
-		for i := 1; i < len(ps); i++ {
-			p, _ := ps[i].([]any) // ("pair"| "pair!", ("id", name), typeS)
-			if len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
-				idNode, _ := p[1].([]any)
-				nameStr := "_"
-				if len(idNode) >= 2 && idNode[0] == "id" {
-					if s, ok := idNode[1].(string); ok {
-						nameStr = s
-					}
-				}
-				if tS, ok := p[2].([]any); ok {
-					parts = append(parts, fmt.Sprintf("%s: %s", nameStr, mindscript.FormatType(tS)))
-				} else {
-					parts = append(parts, nameStr+": Any")
-				}
-			}
-		}
-	}
-	ret := "Any"
-	if rt, ok := fun[2].([]any); ok {
-		ret = mindscript.FormatType(rt)
-	}
-	return fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), ret)
-}
-
-// analyzeFilePureImpl (private) — the implementation behind the public shim.
-func analyzeFilePureImpl(sn fileSnapshot, uri string) *pureResult {
-	txt, _ := sn.Get(uri)
-
-	// 1) Lex (interactive) — keep the salvage behavior for coloring on partial errors.
-	lx := mindscript.NewLexerInteractive(txt)
-	toks, err := lx.Scan()
+	ip, err := mindscript.NewInterpreter()
 	if err != nil {
-		var ds []pureDiag
-		if e, ok := err.(*mindscript.Error); ok && e.Kind == mindscript.DiagLex {
-			// salvage tokens up to error position
-			lines := lineOffsets(txt)
-			off := byteColToOffset(lines, e.Line-1, e.Col-1, txt)
-			if off < 0 {
-				off = 0
-			}
-			if off > len(txt) {
-				off = len(txt)
-			}
-			px := mindscript.NewLexerInteractive(txt[:off])
-			if ptoks, pErr := px.Scan(); pErr == nil {
-				if n := len(ptoks); n > 0 && ptoks[n-1].Type == mindscript.EOF {
-					ptoks = ptoks[:len(ptoks)-1]
-				}
-				toks = ptoks
-			}
-		}
-		// surface the lex error at its caret
-		pos := 0
-		if e, ok := err.(*mindscript.Error); ok {
-			lines := lineOffsets(txt)
-			pos = byteColToOffset(lines, e.Line-1, e.Col-1, txt)
-		}
-		ds = append(ds, pureDiag{
-			StartByte: pos,
-			EndByte:   pos,
-			Severity:  1,
-			Code:      "LEX",
+		// Hard failure to build ambient; analyzer should degrade gracefully.
+		return nil
+	}
+	a.IP = ip
+	return ip
+}
+
+// Analyze is the main entry:
+//   - parse with spans
+//   - build file RootEnv (child of ambient/prelude)
+//   - single-pass fold over AST using dispatcher
+func (a *Analyzer) Analyze(uri, text string) *FileIndex {
+	idx := &FileIndex{
+		URI:  uri,
+		Text: text,
+	}
+
+	ip := a.ensureIP()
+
+	ast, spans, err := mindscript.ParseSExprWithSpans(text)
+	if err != nil {
+		// Map parse error into a single diagnostic; span mapping TBD.
+		idx.addDiag(Diag{
+			StartByte: 0,
+			EndByte:   0,
+			Code:      "MS-PARSE",
 			Message:   err.Error(),
 		})
-		return &pureResult{URI: uri, Text: txt, Tokens: toks, Diags: ds}
+		return idx
 	}
-	if n := len(toks); n > 0 && toks[n-1].Type == mindscript.EOF {
-		toks = toks[:len(toks)-1]
+	idx.AST = ast
+	idx.Spans = spans
+
+	// Build RootEnv for this file: a real Env that chains into ambient.
+	var root *mindscript.Env
+	if ip != nil && ip.Global != nil {
+		root = mindscript.NewEnv(ip.Global)
+	} else {
+		root = mindscript.NewEnv(nil)
 	}
+	idx.RootEnv = root
 
-	// 2) Parse (interactive) with spans
-	ast, spans, perr := mindscript.ParseSExprInteractiveWithSpans(txt)
-	if perr != nil {
-		if e, ok := perr.(*mindscript.Error); ok && e.Kind == mindscript.DiagIncomplete {
-			// Incomplete: return tokens but no diagnostics (non-nagging while typing)
-			return &pureResult{URI: uri, Text: txt, Tokens: toks}
-		}
-		pos := 0
-		if e, ok := perr.(*mindscript.Error); ok {
-			lines := lineOffsets(txt)
-			pos = byteColToOffset(lines, e.Line-1, e.Col-1, txt)
-		}
-		return &pureResult{
-			URI:    uri,
-			Text:   txt,
-			Tokens: toks,
-			Diags:  []pureDiag{{StartByte: pos, EndByte: pos, Severity: 1, Code: "PARSE", Message: perr.Error()}},
-		}
-
+	// Single-pass abstract interpretation.
+	fc := &foldCtx{
+		idx:      idx,
+		ip:       ip,
+		env:      root,
+		topLevel: true,
 	}
+	fc.fold(idx.AST)
 
-	// 3) Reuse existing collectors and static checks by constructing a temp docState
-	lines := lineOffsets(txt)
-	tmp := &docState{uri: uri, text: txt, lines: lines, tokens: toks, ast: ast, spans: spans}
-
-	// Run unified AST analysis (bindings + diags) and token lints once.
-	binds, diags := unifiedAnalyze(tmp)
-	tokDiags := tokenLints(tmp)
-
-	// Bindings → pureBinding with byte spans
-	var pBinds []pureBinding
-	for _, b := range binds {
-		start := posToOffset(lines, b.Range.Start, txt)
-		end := posToOffset(lines, b.Range.End, txt)
-		pBinds = append(pBinds, pureBinding{
-			Name:       b.Name,
-			Kind:       b.Kind,
-			TypeNode:   b.TypeNode,
-			Sig:        b.Sig,
-			DocFull:    b.DocFull,
-			DocFirst:   b.DocFirst,
-			StartByte:  start,
-			EndByte:    end,
-			IsTopLevel: b.IsTopLevel,
-		})
-	}
-	// Diagnostics (token lints + AST checks) → pureDiag with byte spans
-	var pDiags []pureDiag
-	for _, d := range append(tokDiags, diags...) {
-		start := posToOffset(lines, d.Range.Start, txt)
-		end := posToOffset(lines, d.Range.End, txt)
-		pDiags = append(pDiags, pureDiag{
-			StartByte: start,
-			EndByte:   end,
-			Severity:  d.Severity,
-			Code:      d.Code,
-			Message:   d.Message,
-		})
-	}
-
-	return &pureResult{
-		URI:      uri,
-		Text:     txt,
-		Tokens:   toks,
-		AST:      ast,
-		Spans:    spans,
-		Bindings: pBinds,
-		Diags:    pDiags,
-	}
+	return idx
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Analysis (lex + parse + symbol extraction) — publishes diagnostics via notify
+// Analysis value domain
 ////////////////////////////////////////////////////////////////////////////////
 
-// serverSnapshot is a minimal adapter over server to satisfy fileSnapshot.
-type serverSnapshot struct{ s *server }
-
-func (ss serverSnapshot) Get(uri string) (string, bool) {
-	if d := ss.s.snapshotDoc(uri); d != nil {
-		return d.text, true
-	}
-	return "", false
+// VTSymbol is an analysis-only summary value, stored in Env table.
+type VTSymbol struct {
+	Type mindscript.S
+	Doc  string
+	// Flags like IsTopLevel / IsAmbient / etc. can be added later.
 }
 
-func analyzeImpl(s *server, doc *docState) {
-	// Use the pure function; the snapshot is the server’s current state.
-	sn := serverSnapshot{s: s}
-	res := analyzeFilePureImpl(sn, doc.uri)
-
-	// Update caches
-	doc.text = res.Text
-	doc.lines = lineOffsets(doc.text)
-	doc.tokens = res.Tokens
-	doc.ast = res.AST
-	if res.Spans != nil {
-		doc.spans = res.Spans
+// newSymbolVal wraps a VTSymbol into a runtime Value for Env storage.
+func newSymbolVal(sym VTSymbol) mindscript.Value {
+	return mindscript.Value{
+		Tag:   mindscript.VTHandle, // analysis-only payload
+		Data:  sym,
+		Annot: sym.Doc,
 	}
-
-	// Uniform: collect all bindings + docs (already computed in pure result).
-	// Rehydrate bindings with LSP ranges
-	doc.binds = doc.binds[:0]
-	for _, b := range res.Bindings {
-		doc.binds = append(doc.binds, bindingDef{
-			Name:       b.Name,
-			Range:      makeRange(doc.lines, b.StartByte, b.EndByte, doc.text),
-			DocFull:    b.DocFull,
-			DocFirst:   b.DocFirst,
-			Kind:       b.Kind,
-			TypeNode:   b.TypeNode,
-			Sig:        b.Sig,
-			IsTopLevel: b.IsTopLevel,
-		})
-	}
-
-	// Derive lightweight top-level symbols from bindings (single source of truth).
-	doc.symbols = doc.symbols[:0]
-	for _, b := range doc.binds {
-		if !b.IsTopLevel {
-			continue
-		}
-		doc.symbols = append(doc.symbols, symbolDef{
-			Name:  b.Name,
-			Kind:  b.Kind,
-			Range: b.Range,
-			Doc:   b.DocFirst,
-			Sig:   b.Sig,
-		})
-	}
-
-	// Publish diagnostics (convert byte spans to LSP ranges)
-	if len(res.Diags) > 0 {
-		out := make([]Diagnostic, 0, len(res.Diags))
-		for _, d := range res.Diags {
-			out = append(out, Diagnostic{
-				Range:    makeRange(doc.lines, d.StartByte, d.EndByte, doc.text),
-				Severity: d.Severity,
-				Code:     d.Code,
-				Source:   "mindscript",
-				Message:  d.Message,
-			})
-		}
-		s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
-			URI:         doc.uri,
-			Diagnostics: out,
-		})
-		return
-	}
-
-	// 4) Success: clear any previous diagnostics.
-	s.clearDiagnostics(doc.uri)
 }
 
-// //////////////////////////////////////////////////////////////////////////////
-// Lightweight static type algebra (reused by fold)
-//   - typeID, formatTypeNode helpers
-//   - LUB / GLB (defined in lub.go)
-//   - **IsSubtypeStatic(a, b []any) bool** (defined in lub.go):
-//     Structural subtyping used for conformance in return and call checks.
+// asSymbol tries to view a Value as VTSymbol; returns (sym, ok).
+func asSymbol(v mindscript.Value) (VTSymbol, bool) {
+	if v.Data == nil {
+		return VTSymbol{}, false
+	}
+	sym, ok := v.Data.(VTSymbol)
+	return sym, ok
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// foldCtx, block modes & flow
+////////////////////////////////////////////////////////////////////////////////
+
+// foldCtx carries analysis state during folding.
+type foldCtx struct {
+	idx *FileIndex
+	ip  *mindscript.Interpreter
+	env *mindscript.Env
+
+	// topLevel reports whether we're in the file's outermost block.
+	topLevel bool
+}
+
+// blockMode controls how a block handles control-flow from its children.
+type blockMode int
+
+const (
+	blockPlain    blockMode = iota
+	blockTopLevel           // file root
+	blockFunBody            // catches returns for a function/oracle
+	blockLoopBody           // catches break/continue for a loop
+)
+
+// flow summarizes the abstract result of an expression / construct.
+// All semantic information is carried via Values:
 //
-// //////////////////////////////////////////////////////////////////////////////
-func typeID(name string) []any { return []any{"id", name} }
-func formatTypeNode(t []any) string {
-	if len(t) == 0 {
-		return "Any"
-	}
-	return mindscript.FormatType(t)
+//   - VTSymbol (VTHandle+VTSymbol) for inferred expression values.
+//   - VTType   for type aliases / schema values.
+//   - Ambient/runtime values are allowed; typeOf() collapses them.
+type flow struct {
+	// Val is the value along the normal fallthrough path.
+	// For expressions this is usually a VTSymbol; for ("type") it is VTType.
+	Val mindscript.Value
+
+	// Control-flow payloads; guarded by Has* flags so null-return is representable.
+	Ret, Brk, Cont mindscript.Value
+	HasRet         bool
+	HasBrk         bool
+	HasCont        bool
+
+	// Terminated means control does not fall through past this construct.
+	Terminated bool
 }
 
-// findLocalFunMeta finds a top-level binding `name = fun|oracle(...) -> R`
-// and returns (isOracle, paramTypes, returnType, ok).
-func findLocalFunMeta(doc *docState, name string) (bool, [][]any, []any, bool) {
-	// More robust: search the entire AST (not just top-level) for the most
-	// recent assignment to the given name that binds a fun/oracle.
-	if doc == nil || doc.ast == nil || len(doc.ast) == 0 {
-		return false, nil, nil, false
+// newFlow wraps a static type into a fallthrough VTSymbol.
+func newFlow(t mindscript.S) flow {
+	if t == nil {
+		t = mindscript.S{"id", "Any"}
 	}
-
-	var foundIsOracle bool
-	var foundParams [][]any
-	var foundRet []any
-	var found bool
-
-	var walk func(node []any)
-	walk = func(node []any) {
-		if len(node) == 0 {
-			return
-		}
-		tag, _ := node[0].(string)
-		// Look for assignments to the target name anywhere.
-		if tag == "assign" && len(node) >= 3 {
-			if lhs, _ := node[1].([]any); len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
-				if nm, _ := lhs[1].(string); nm == name {
-					if rhs, _ := node[2].([]any); rhs != nil {
-						base := unwrapAnnotNode(rhs)
-						if len(base) >= 3 && (base[0] == "fun" || base[0] == "oracle") {
-							var pts [][]any
-							if ps, ok := base[1].([]any); ok && len(ps) > 0 && ps[0] == "array" {
-								for j := 1; j < len(ps); j++ {
-									if p, _ := ps[j].([]any); len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
-										if tnode, ok := p[2].([]any); ok {
-											pts = append(pts, tnode)
-										} else {
-											pts = append(pts, typeID("Any"))
-										}
-									} else {
-										pts = append(pts, typeID("Any"))
-									}
-								}
-							}
-							// MindScript: no true zero-arity — synthesize one Null param
-							if len(pts) == 0 {
-								pts = [][]any{typeID("Null")}
-							}
-							if rt, ok := base[2].([]any); ok {
-								// Record oracle return as nullable at DEFINITION time.
-								if base[0] == "oracle" {
-									foundIsOracle = true
-									foundRet = []any{"unop", "?", rt}
-								} else {
-									foundIsOracle = false
-									foundRet = rt
-								}
-								foundParams, found = pts, true
-							}
-						}
-					}
-				}
-			}
-		}
-		// Recurse into children.
-		for i := 1; i < len(node); i++ {
-			if ch, ok := node[i].([]any); ok {
-				walk(ch)
-			}
-		}
-	}
-	walk(doc.ast)
-	return foundIsOracle, foundParams, foundRet, found
+	return flow{Val: newSymbolVal(VTSymbol{Type: t})}
 }
 
-// resolveTypeAliasAST returns the type AST for a top-level 'type' binding.
-func resolveTypeAliasAST(doc *docState, name string) ([]any, bool) {
-	if doc == nil || doc.ast == nil || len(doc.ast) == 0 {
-		return nil, false
+// newFlowFromType is an alias for newFlow when starting from an S-type.
+func newFlowFromType(t mindscript.S) flow {
+	return newFlow(t)
+}
+
+// typeOf returns the static type S of v as seen by the analyzer.
+func typeOf(ip *mindscript.Interpreter, env *mindscript.Env, v mindscript.Value) mindscript.S {
+	if sym, ok := asSymbol(v); ok {
+		return sym.Type
 	}
-	root := doc.ast
-	if root[0] != "block" {
-		return nil, false
+	if v.Tag == mindscript.VTType {
+		// Value is a schema/type; its expression type is `Type`.
+		return mindscript.S{"id", "Type"}
 	}
-	for i := 1; i < len(root); i++ {
-		n, _ := root[i].([]any)
-		if len(n) < 3 || n[0] != "assign" {
+	if ip != nil {
+		return ip.ValueToType(v, env)
+	}
+	return mindscript.S{"id", "Any"}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Dispatcher-style fold
+////////////////////////////////////////////////////////////////////////////////
+
+func (c *foldCtx) fold(n mindscript.S) flow {
+	if len(n) == 0 {
+		return newFlow(nil)
+	}
+	tag, _ := n[0].(string)
+
+	switch tag {
+	case "return":
+		return c.foldReturn(n)
+	case "break":
+		return c.foldBreak(n)
+	case "continue":
+		return c.foldContinue(n)
+
+	case "annot":
+		return c.foldAnnot(n)
+
+	case "str", "int", "num", "bool", "null":
+		return c.foldLiteral(n)
+
+	case "id":
+		return c.foldId(n)
+
+	case "array":
+		return c.foldArray(n)
+
+	case "map":
+		return c.foldMap(n)
+
+	case "get":
+		return c.foldGet(n)
+
+	case "idx":
+		return c.foldIdx(n)
+
+	case "call":
+		return c.foldCall(n)
+
+	case "binop":
+		return c.foldBinop(n)
+
+	case "unop":
+		return c.foldUnop(n)
+
+	case "type":
+		return c.foldTypeExpr(n)
+
+	case "assign":
+		return c.foldAssign(n)
+
+	case "decl":
+		return c.foldDecl(n)
+
+	case "block":
+		return c.foldBlock(n)
+
+	case "if":
+		return c.foldIf(n)
+
+	case "while":
+		return c.foldWhile(n)
+
+	case "for":
+		return c.foldFor(n)
+
+	case "fun", "oracle":
+		return c.foldFunLike(n)
+
+	case "module":
+		return c.foldModule(n)
+	}
+
+	// Default: visit children for side-effects/types (to be filled in later if needed).
+	return newFlow(nil)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Per-tag handlers (current subset)
+////////////////////////////////////////////////////////////////////////////////
+
+// ("return") or ("return", expr)
+func (c *foldCtx) foldReturn(n mindscript.S) flow {
+	t := mindscript.S{"id", "Null"}
+	if len(n) >= 2 {
+		if expr, ok := n[1].(mindscript.S); ok {
+			ef := c.fold(expr)
+			tv := typeOf(c.ip, c.env, ef.Val)
+			if tv != nil {
+				t = tv
+			}
+		}
+	}
+	return flow{
+		Val:        newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}}),
+		Terminated: true,
+		Ret:        newSymbolVal(VTSymbol{Type: t}),
+		HasRet:     true,
+	}
+}
+
+// ("break")
+func (c *foldCtx) foldBreak(n mindscript.S) flow {
+	_ = n
+	v := newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+	return flow{
+		Val:        v,
+		Terminated: true,
+		Brk:        v,
+		HasBrk:     true,
+	}
+}
+
+// ("continue")
+func (c *foldCtx) foldContinue(n mindscript.S) flow {
+	_ = n
+	v := newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+	return flow{
+		Val:        v,
+		Terminated: true,
+		Cont:       v,
+		HasCont:    true,
+	}
+}
+
+// ("annot", ("str", doc), expr)
+// Parser has already normalized/merged related comments into this node.
+func (c *foldCtx) foldAnnot(n mindscript.S) flow {
+	if len(n) < 3 {
+		return newFlow(nil)
+	}
+
+	docNode, _ := n[1].(mindscript.S)
+	expr, _ := n[2].(mindscript.S)
+
+	doc := ""
+	if len(docNode) >= 2 {
+		if tag, _ := docNode[0].(string); tag == "str" {
+			if s, ok := docNode[1].(string); ok {
+				doc = s
+			}
+		}
+	}
+
+	inner := c.fold(expr)
+
+	if doc != "" {
+		v := inner.Val
+		if sym, ok := asSymbol(v); ok {
+			sym.Doc = doc
+			v = newSymbolVal(sym)
+		}
+		v.Annot = doc
+		inner.Val = v
+	}
+
+	return inner
+}
+
+func (c *foldCtx) foldLiteral(n mindscript.S) flow {
+	if len(n) == 0 {
+		return newFlow(nil)
+	}
+	switch n[0].(string) {
+	case "int":
+		return newFlowFromType(mindscript.S{"id", "Int"})
+	case "num":
+		return newFlowFromType(mindscript.S{"id", "Num"})
+	case "str":
+		return newFlowFromType(mindscript.S{"id", "Str"})
+	case "bool":
+		return newFlowFromType(mindscript.S{"id", "Bool"})
+	case "null":
+		return newFlowFromType(mindscript.S{"id", "Null"})
+	default:
+		return newFlow(nil)
+	}
+}
+
+func (c *foldCtx) foldId(n mindscript.S) flow {
+	if len(n) < 2 {
+		return newFlow(nil)
+	}
+	name, _ := n[1].(string)
+	if name == "" || c.env == nil {
+		return newFlow(nil)
+	}
+
+	v, err := c.env.Get(name)
+	if err != nil {
+		// Unknown name: report and treat as Any so analysis can continue.
+		c.idx.addDiag(Diag{
+			StartByte: 0, // TODO: use Spans to target the id.
+			EndByte:   0,
+			Code:      "MS-UNKNOWN-NAME",
+			Message:   "unknown name: " + name,
+		})
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
+	// VTSymbol: analysis symbol.
+	if _, ok := asSymbol(v); ok {
+		return flow{Val: v}
+	}
+
+	// VTType: using a type value as an expression → keep VTType (typeOf=Type).
+	if v.Tag == mindscript.VTType {
+		return flow{Val: v}
+	}
+
+	// Ambient/runtime values: approximate via ValueToType when possible.
+	if c.ip != nil {
+		return newFlowFromType(c.ip.ValueToType(v, c.env))
+	}
+
+	return newFlowFromType(mindscript.S{"id", "Any"})
+}
+
+func (c *foldCtx) foldArray(n mindscript.S) flow {
+	// [] → [Any]
+	if len(n) == 1 {
+		return newFlowFromType(mindscript.S{"array", mindscript.S{"id", "Any"}})
+	}
+
+	ip := c.ip
+	elemT := mindscript.S{"id", "Any"}
+	first := true
+
+	for i := 1; i < len(n); i++ {
+		sub, ok := n[i].(mindscript.S)
+		if !ok {
 			continue
 		}
-		lhs, _ := n[1].([]any)
-		rhs, _ := n[2].([]any)
-		if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
-			if nm, _ := lhs[1].(string); nm == name {
-				base := unwrapAnnotNode(rhs)
-				if len(base) >= 2 && base[0] == "type" {
-					if t, ok := base[1].([]any); ok {
-						return t, true
-					}
-				}
-			}
+		sf := c.fold(sub)
+		t := typeOf(ip, c.env, sf.Val)
+		if t == nil {
+			t = mindscript.S{"id", "Any"}
+		}
+		if ip == nil {
+			elemT = mindscript.S{"id", "Any"}
+			continue
+		}
+		if first {
+			elemT = t
+			first = false
+		} else {
+			elemT = ip.UnifyTypes(elemT, t, c.env)
 		}
 	}
-	return nil, false
+
+	if first {
+		elemT = mindscript.S{"id", "Any"}
+	}
+
+	return newFlowFromType(mindscript.S{"array", elemT})
 }
 
-// enumHasMember reports whether t is Enum[...] and lit is one of its members.
-// Returns (isEnumType, isMember).
-func enumHasMember(t []any, lit []any, doc *docState) (bool, bool) {
-	// No alias unfolding: opaque non-builtin ids remain atoms.
-	if len(t) == 0 || t[0] != "enum" {
-		return false, false
+func (c *foldCtx) foldMap(n mindscript.S) flow {
+	// ("map", ("pair" | "pair!", ("str", key), valueExpr)...)
+	if len(n) == 1 {
+		return newFlowFromType(mindscript.S{"map"})
 	}
-	// Literal only handled for strings/ints/nums/bools here (enough for tests).
-	isEq := func(a, b []any) bool {
-		if len(a) < 2 || len(b) < 2 {
-			return false
+
+	out := mindscript.S{"map"}
+
+	for i := 1; i < len(n); i++ {
+		p, ok := n[i].(mindscript.S)
+		if !ok || len(p) < 3 {
+			continue
 		}
-		if a[0] != b[0] {
-			return false
+
+		tag, _ := p[0].(string)
+		if tag != "pair" && tag != "pair!" {
+			continue
 		}
-		return fmt.Sprintf("%v", a[1]) == fmt.Sprintf("%v", b[1])
+
+		keyNode, _ := p[1].(mindscript.S)
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			continue
+		}
+		key, _ := keyNode[1].(string)
+		if key == "" {
+			continue
+		}
+
+		valNode, _ := p[2].(mindscript.S)
+		valFlow := c.fold(valNode)
+		valType := typeOf(c.ip, c.env, valFlow.Val)
+		if valType == nil {
+			valType = mindscript.S{"id", "Any"}
+		}
+
+		out = append(out, mindscript.S{tag, mindscript.S{"str", key}, valType})
+	}
+
+	return newFlowFromType(out)
+}
+
+// mapFieldType returns the field type for key in a structural ("map", ...) type.
+func mapFieldType(t mindscript.S, key string) (mindscript.S, bool) {
+	if len(t) == 0 {
+		return nil, false
+	}
+	if tag, _ := t[0].(string); tag != "map" {
+		return nil, false
 	}
 	for i := 1; i < len(t); i++ {
-		if m, ok := t[i].([]any); ok && isEq(m, lit) {
-			return true, true
+		p, ok := t[i].(mindscript.S)
+		if !ok || len(p) < 3 {
+			continue
 		}
-	}
-	return true, false
-}
-
-func findAnyBindingType(doc *docState, name string) ([]any, bool) {
-	for _, b := range doc.binds {
-		if b.Name == name && len(b.TypeNode) > 0 {
-			return b.TypeNode, true
+		if ptag, _ := p[0].(string); ptag != "pair" && ptag != "pair!" {
+			continue
 		}
+		k, ok := p[1].(mindscript.S)
+		if !ok || len(k) < 2 || k[0].(string) != "str" {
+			continue
+		}
+		name, _ := k[1].(string)
+		if name != key {
+			continue
+		}
+		ft, _ := p[2].(mindscript.S)
+		if ft == nil {
+			ft = mindscript.S{"id", "Any"}
+		}
+		return ft, true
 	}
 	return nil, false
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Uniform binding collection (no top-level specialness)
-////////////////////////////////////////////////////////////////////////////////
-
-// annotText returns (baseNode, mergedAnnotationText, ok) without mutating the node.
-func annotText(n []any) ([]any, string, bool) {
-	cur := n
-	var parts []string
-	for len(cur) >= 3 {
-		if tag, _ := cur[0].(string); tag != "annot" {
-			break
+// arrayElemType returns the element type from a structural ("array", T) type.
+func arrayElemType(t mindscript.S) (mindscript.S, bool) {
+	if len(t) == 0 {
+		return nil, false
+	}
+	if tag, _ := t[0].(string); tag != "array" {
+		return nil, false
+	}
+	if len(t) == 2 {
+		if et, ok := t[1].(mindscript.S); ok {
+			return et, true
 		}
-		if child, ok := cur[1].([]any); ok && len(child) >= 2 && child[0] == "str" {
-			if s, ok := child[1].(string); ok {
-				parts = append(parts, s)
+	}
+	return mindscript.S{"id", "Any"}, true
+}
+
+func (c *foldCtx) foldGet(n mindscript.S) flow {
+	// ("get", recvExpr, ("str", key))
+	if len(n) < 3 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
+	recvNode, _ := n[1].(mindscript.S)
+	keyNode, _ := n[2].(mindscript.S)
+
+	recvFlow := c.fold(recvNode)
+	recvT := typeOf(c.ip, c.env, recvFlow.Val)
+	if recvT == nil {
+		recvT = mindscript.S{"id", "Any"}
+	}
+
+	if c.ip != nil {
+		recvT = c.ip.ResolveType(recvT, c.env)
+	}
+
+	// Only handle literal string keys here.
+	if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+	key, _ := keyNode[1].(string)
+
+	if ft, ok := mapFieldType(recvT, key); ok {
+		return newFlowFromType(ft)
+	}
+
+	// Known map/module type without that key → warning + Any.
+	if len(recvT) > 0 {
+		if tag, _ := recvT[0].(string); tag == "map" {
+			c.idx.addDiag(Diag{
+				StartByte: 0,
+				EndByte:   0,
+				Code:      "MS-MAP-MISSING-KEY",
+				Message:   "missing key '" + key + "' on map/module",
+			})
+		}
+	}
+
+	return newFlowFromType(mindscript.S{"id", "Any"})
+}
+
+func (c *foldCtx) foldIdx(n mindscript.S) flow {
+	// ("idx", recvExpr, indexExpr)
+	if len(n) < 3 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
+	recvNode, _ := n[1].(mindscript.S)
+	idxNode, _ := n[2].(mindscript.S)
+
+	recvFlow := c.fold(recvNode)
+	idxFlow := c.fold(idxNode)
+
+	recvT := typeOf(c.ip, c.env, recvFlow.Val)
+	if recvT == nil {
+		recvT = mindscript.S{"id", "Any"}
+	}
+	idxT := typeOf(c.ip, c.env, idxFlow.Val)
+	if idxT == nil {
+		idxT = mindscript.S{"id", "Any"}
+	}
+
+	ip := c.ip
+	if ip != nil {
+		recvT = ip.ResolveType(recvT, c.env)
+		idxT = ip.ResolveType(idxT, c.env)
+	}
+
+	isId := func(t mindscript.S, name string) bool {
+		return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+	}
+
+	// Array indexing: arr[int] → Elem, non-int → MS-ARG-TYPE-MISMATCH.
+	if elemT, ok := arrayElemType(recvT); ok {
+		okInt := isId(idxT, "Int")
+		if !okInt && ip != nil {
+			okInt = ip.IsSubtype(idxT, mindscript.S{"id", "Int"}, c.env)
+		}
+		if !okInt {
+			c.idx.addDiag(Diag{
+				StartByte: 0,
+				EndByte:   0,
+				Code:      "MS-ARG-TYPE-MISMATCH",
+				Message:   "array index must be Int",
+			})
+			return newFlowFromType(mindscript.S{"id", "Any"})
+		}
+		return newFlowFromType(elemT)
+	}
+
+	// Map indexing:
+	// - string literal key → same as get (field or MS-MAP-MISSING-KEY).
+	// - dynamic key → unknown field → Any.
+	if len(recvT) > 0 {
+		if tag, _ := recvT[0].(string); tag == "map" {
+			if len(idxNode) >= 2 && idxNode[0].(string) == "str" {
+				key, _ := idxNode[1].(string)
+				if ft, ok := mapFieldType(recvT, key); ok {
+					return newFlowFromType(ft)
+				}
+				c.idx.addDiag(Diag{
+					StartByte: 0,
+					EndByte:   0,
+					Code:      "MS-MAP-MISSING-KEY",
+					Message:   "missing key '" + key + "' on map/module",
+				})
+				return newFlowFromType(mindscript.S{"id", "Any"})
 			}
+			return newFlowFromType(mindscript.S{"id", "Any"})
 		}
-		base, _ := cur[2].([]any)
-		cur = base
 	}
-	if len(parts) == 0 {
-		return n, "", false
-	}
-	return cur, strings.Join(parts, "\n"), true
+
+	// Unknown receiver type.
+	return newFlowFromType(mindscript.S{"id", "Any"})
 }
 
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return strings.TrimSpace(s[:i])
+func (c *foldCtx) foldCall(n mindscript.S) flow {
+	if len(n) < 2 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
 	}
-	return strings.TrimSpace(s)
-}
 
-// nearestBinding finds the binding with matching name whose definition appears
-// at or before byte offset 'off', preferring the closest one. If none precede,
-// it returns the earliest matching binding as a fallback.
-func nearestBinding(doc *docState, name string, off int) (bindingDef, bool) {
-	var best bindingDef
-	bestOK := false
-	bestStart := -1
-	for _, b := range doc.binds {
-		if b.Name != name {
-			continue
-		}
-		// Definition start in bytes
-		defOff := posToOffset(doc.lines, b.Range.Start, doc.text)
-		if defOff <= off && defOff >= bestStart {
-			best = b
-			bestOK = true
-			bestStart = defOff
-		}
+	// Fold callee.
+	calleeNode, _ := n[1].(mindscript.S)
+	cf := c.fold(calleeNode)
+	calleeT := typeOf(c.ip, c.env, cf.Val)
+	if calleeT == nil {
+		calleeT = mindscript.S{"id", "Any"}
 	}
-	if bestOK {
-		return best, true
-	}
-	// Fallback: earliest with that name
-	earliest := -1
-	for _, b := range doc.binds {
-		if b.Name != name {
-			continue
-		}
-		defOff := posToOffset(doc.lines, b.Range.Start, doc.text)
-		if earliest == -1 || defOff < earliest {
-			earliest = defOff
-			best = b
-			bestOK = true
-		}
-	}
-	return best, bestOK
-}
 
-// collectTopLevelSymbols walks the AST (root-level only) and extracts symbols:
-//   - let/assign of a simple decl: ("assign", ("decl", name), rhs)
-//   - marks kind "fun" when rhs tag == "fun"; "type" when rhs tag == "type"
-func findDefIDRange(toks []mindscript.Token, name string) (int, int, bool) {
-	for i := 0; i < len(toks); i++ {
-		tk := toks[i]
-		if tk.Type != mindscript.ID {
-			continue
-		}
-		if tokenName(tk) != name {
-			continue
-		}
-		// def `x = ...`
-		if i+1 < len(toks) && toks[i+1].Type == mindscript.ASSIGN {
-			return tk.StartByte, tk.EndByte, true
-		}
-		// def `let x ...`
-		if i-1 >= 0 && toks[i-1].Type == mindscript.LET {
-			return tk.StartByte, tk.EndByte, true
+	// Fold args for side-effects and types.
+	argTypes := make([]mindscript.S, 0, len(n)-2)
+	for i := 2; i < len(n); i++ {
+		if arg, ok := n[i].(mindscript.S); ok {
+			af := c.fold(arg)
+			t := typeOf(c.ip, c.env, af.Val)
+			if t == nil {
+				t = mindscript.S{"id", "Any"}
+			}
+			argTypes = append(argTypes, t)
 		}
 	}
-	// Fallback: first occurrence (still better than nothing)
-	for i := 0; i < len(toks); i++ {
-		tk := toks[i]
-		if tk.Type == mindscript.ID && tokenName(tk) == name {
-			return tk.StartByte, tk.EndByte, true
-		}
-	}
-	return 0, 0, false
-}
 
-func unwrapAnnotNode(n []any) []any {
-	for {
-		if len(n) >= 3 {
-			if tag, _ := n[0].(string); tag == "annot" {
-				if inner, _ := n[2].([]any); inner != nil {
-					n = inner
+	ip := c.ip
+	if ip == nil {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
+	resT := calleeT
+	overflowReported := false
+
+	for _, at := range argTypes {
+		// Expect an arrow: ("binop","->", P, R)
+		if len(resT) >= 4 {
+			if tag, _ := resT[0].(string); tag == "binop" {
+				if op, _ := resT[1].(string); op == "->" {
+					pt, _ := resT[2].(mindscript.S)
+					next, _ := resT[3].(mindscript.S)
+
+					if !ip.IsSubtype(at, pt, c.env) {
+						c.idx.addDiag(Diag{
+							StartByte: 0,
+							EndByte:   0,
+							Code:      "MS-ARG-TYPE-MISMATCH",
+							Message:   "argument type mismatch",
+						})
+					}
+
+					resT = next
 					continue
 				}
 			}
 		}
-		return n
+
+		// Not an arrow anymore: extra args ⇒ overflow.
+		if !overflowReported {
+			c.idx.addDiag(Diag{
+				StartByte: 0,
+				EndByte:   0,
+				Code:      "MS-ARG-OVERFLOW",
+				Message:   "too many arguments",
+			})
+			overflowReported = true
+		}
+		resT = mindscript.S{"id", "Any"}
+		break
+	}
+
+	return newFlowFromType(resT)
+}
+
+func (c *foldCtx) foldBinop(n mindscript.S) flow {
+	if len(n) < 4 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
+	op, _ := n[1].(string)
+	lhs, _ := n[2].(mindscript.S)
+	rhs, _ := n[3].(mindscript.S)
+
+	lf := c.fold(lhs)
+	rf := c.fold(rhs)
+
+	lt := typeOf(c.ip, c.env, lf.Val)
+	rt := typeOf(c.ip, c.env, rf.Val)
+	if lt == nil {
+		lt = mindscript.S{"id", "Any"}
+	}
+	if rt == nil {
+		rt = mindscript.S{"id", "Any"}
+	}
+
+	// Constant div/mod by zero based on raw RHS literal.
+	if op == "/" || op == "%" {
+		if len(rhs) >= 2 {
+			if tag, _ := rhs[0].(string); tag == "int" {
+				if v, ok := rhs[1].(int64); ok && v == 0 {
+					c.idx.addDiag(Diag{
+						StartByte: 0,
+						EndByte:   0,
+						Code:      "MS-DIV-BY-ZERO-CONST",
+						Message:   "division or modulo by constant zero",
+					})
+				}
+			}
+		}
+	}
+
+	ip := c.ip
+	if ip == nil {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
+	isId := func(t mindscript.S, name string) bool {
+		return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+	}
+
+	switch op {
+	case "+", "-", "*", "%", "/":
+		// Arithmetic result typing.
+		if isId(lt, "Int") && isId(rt, "Int") {
+			// Int / Int is Int per spec.
+			return newFlowFromType(mindscript.S{"id", "Int"})
+		}
+		if (isId(lt, "Int") && isId(rt, "Num")) ||
+			(isId(lt, "Num") && isId(rt, "Int")) ||
+			(isId(lt, "Num") && isId(rt, "Num")) {
+			return newFlowFromType(mindscript.S{"id", "Num"})
+		}
+		return newFlowFromType(mindscript.S{"id", "Any"})
+
+	case "&", "|", "^", "<<", ">>":
+		if !(isId(lt, "Int") && isId(rt, "Int")) {
+			c.idx.addDiag(Diag{
+				StartByte: 0,
+				EndByte:   0,
+				Code:      "MS-BITWISE-NONINT",
+				Message:   "bitwise operators require Int operands",
+			})
+			return newFlowFromType(mindscript.S{"id", "Any"})
+		}
+		return newFlowFromType(mindscript.S{"id", "Int"})
+	}
+
+	return newFlowFromType(mindscript.S{"id", "Any"})
+}
+
+func (c *foldCtx) foldUnop(n mindscript.S) flow {
+	if len(n) < 3 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+	op, _ := n[1].(string)
+	expr, _ := n[2].(mindscript.S)
+	tf := c.fold(expr)
+	t := typeOf(c.ip, c.env, tf.Val)
+	if t == nil {
+		t = mindscript.S{"id", "Any"}
+	}
+
+	switch op {
+	case "-":
+		// Keep it simple; detailed arithmetic lives in binop.
+		return newFlowFromType(t)
+	case "!":
+		return newFlowFromType(mindscript.S{"id", "Bool"})
+	default:
+		return newFlowFromType(mindscript.S{"id", "Any"})
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Token-only lints (unchanged)
-////////////////////////////////////////////////////////////////////////////////
+func (c *foldCtx) foldTypeExpr(n mindscript.S) flow {
+	// ("type", typeAst)
+	if len(n) < 2 {
+		return newFlowFromType(mindscript.S{"id", "Type"})
+	}
+	typeAst, _ := n[1].(mindscript.S)
 
-// ---------- Layout-sensitive token lints (kept as a tiny helper) ----------
-func tokenLints(doc *docState) []Diagnostic {
-	if doc == nil {
-		return nil
+	// Construct a VTType value for this schema in the current env.
+	// This relies on the mindscript runtime's type-construction helper.
+	tv := mindscript.TypeValIn(typeAst, c.env)
+
+	return flow{Val: tv}
+}
+
+// ("decl", name)
+// Expression semantics: let x
+// - Side effect: bind x = null in current env.
+// - Value: null.
+func (c *foldCtx) foldDecl(n mindscript.S) flow {
+	if len(n) < 2 || c.env == nil {
+		return newFlowFromType(mindscript.S{"id", "Null"})
 	}
-	out := []Diagnostic{}
-	for i := 0; i+1 < len(doc.tokens); i++ {
-		t := doc.tokens[i]
-		n := doc.tokens[i+1]
-		// LROUND vs CLROUND
-		if n.Type == mindscript.LROUND {
-			if t.Type == mindscript.ID || t.Type == mindscript.RROUND || t.Type == mindscript.RSQUARE ||
-				t.Type == mindscript.STRING || t.Type == mindscript.INTEGER || t.Type == mindscript.NUMBER ||
-				t.Type == mindscript.FUNCTION || t.Type == mindscript.ORACLE {
-				s0, e0 := tokenSpan(doc, n)
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 3,
-					Code:     "MS-LROUND-INSTEAD-OF-CLROUND",
-					Source:   "mindscript",
-					Message:  "Remove space before '(' (use compact '(' with no space).",
-				})
+
+	name, _ := n[1].(string)
+	if name == "" {
+		return newFlowFromType(mindscript.S{"id", "Null"})
+	}
+
+	c.env.Define(name, newSymbolVal(VTSymbol{
+		Type: mindscript.S{"id", "Null"},
+	}))
+	return newFlowFromType(mindscript.S{"id", "Null"})
+}
+
+// ("assign", lhs, rhs?)
+func (c *foldCtx) foldAssign(n mindscript.S) flow {
+	if len(n) < 2 {
+		return newFlow(nil)
+	}
+
+	lhs, _ := n[1].(mindscript.S)
+
+	invalidTarget := func(msg string, t mindscript.S) flow {
+		if msg == "" {
+			msg = "invalid assignment target"
+		}
+		c.idx.addDiag(Diag{
+			StartByte: 0, // TODO: use spans
+			EndByte:   0,
+			Code:      "MS-INVALID-ASSIGN-TARGET",
+			Message:   msg,
+		})
+		if t == nil {
+			t = mindscript.S{"id", "Any"}
+		}
+		return newFlowFromType(t)
+	}
+
+	// Incomplete assignment: ("assign", lhs)
+	if len(n) == 2 {
+		// Parser shouldn't really give us this in valid code; just ignore.
+		return newFlow(nil)
+	}
+
+	// We have an RHS.
+	rhs, _ := n[2].(mindscript.S)
+	rhsFlow := c.fold(rhs)
+	rhsVal := rhsFlow.Val
+	if (rhsVal == mindscript.Value{}) {
+		rhsVal = newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Any"}})
+	}
+	ip := c.ip
+
+	// 1) Declaration + init:
+	// ("assign", ("decl", name), rhs)
+	// let name = rhs
+	if len(lhs) >= 2 && lhs[0].(string) == "decl" {
+		name, _ := lhs[1].(string)
+		if name != "" && c.env != nil {
+			c.env.Define(name, rhsVal)
+		}
+		// Expression value is rhs.
+		return flow{Val: rhsVal}
+	}
+
+	// 2) Simple assignment:
+	// ("assign", ("id", name), rhs)
+	if len(lhs) >= 2 && lhs[0].(string) == "id" {
+		name, _ := lhs[1].(string)
+		if name == "" || c.env == nil {
+			return flow{Val: rhsVal}
+		}
+
+		// Must already exist.
+		v, err := c.env.Get(name)
+		if err != nil {
+			c.idx.addDiag(Diag{
+				StartByte: 0,
+				EndByte:   0,
+				Code:      "MS-UNKNOWN-NAME",
+				Message:   "unknown name: " + name,
+			})
+			// Don't implicitly define; expression still has value rhs.
+			return flow{Val: rhsVal}
+		}
+
+		// If it’s already an analysis symbol: merge/update the summary.
+		if sym, ok := asSymbol(v); ok {
+			newT := typeOf(ip, c.env, rhsVal)
+			if newT == nil {
+				newT = mindscript.S{"id", "Any"}
+			}
+
+			// IMPORTANT: Assignments overwrite the previous value's type.
+			// NEVER use UnifyTypes here. LUB is ONLY for merging control-flow
+			// joins (if/else arms, loop exits, return/break/continue),
+			// not sequential assignments.
+			sym.Type = newT
+
+			if err := c.env.Set(name, newSymbolVal(sym)); err != nil {
+				return invalidTarget(err.Error(), newT)
+			}
+			return flow{Val: newSymbolVal(sym)}
+		}
+
+		// Ambient/runtime or VTType: try to Set directly.
+		if err := c.env.Set(name, rhsVal); err != nil {
+			return invalidTarget(err.Error(), typeOf(ip, c.env, rhsVal))
+		}
+		return flow{Val: rhsVal}
+	}
+
+	// Destructuring support: darr / dobj (possibly nested).
+	// We treat any pattern containing ("decl", ...) as let-style;
+	// otherwise it's assignment-style (ids must already exist).
+	var hasDecl func(p mindscript.S) bool
+	hasDecl = func(p mindscript.S) bool {
+		if len(p) == 0 {
+			return false
+		}
+		if tag, _ := p[0].(string); tag == "decl" {
+			return true
+		}
+		for i := 1; i < len(p); i++ {
+			if sub, ok := p[i].(mindscript.S); ok && hasDecl(sub) {
+				return true
 			}
 		}
-		// LSQUARE vs CLSQUARE
-		if n.Type == mindscript.LSQUARE {
-			if t.Type == mindscript.ID || t.Type == mindscript.RROUND || t.Type == mindscript.RSQUARE ||
-				t.Type == mindscript.STRING || t.Type == mindscript.INTEGER || t.Type == mindscript.NUMBER {
-				s0, e0 := tokenSpan(doc, n)
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 3,
-					Code:     "MS-LSQUARE-INSTEAD-OF-CLSQUARE",
-					Source:   "mindscript",
-					Message:  "Remove space before '[' (use compact '[' with no space) for indexing.",
-				})
-			}
+		return false
+	}
+
+	// bind recursively applies pattern p to type t.
+	// doc is only used for object-pattern missing-key Null bindings.
+	var bind func(p mindscript.S, t mindscript.S, decl bool, doc string)
+
+	bind = func(p mindscript.S, t mindscript.S, decl bool, doc string) {
+		if t == nil {
+			t = mindscript.S{"id", "Any"}
 		}
-		// DOT GAP
-		if t.Type == mindscript.PERIOD {
-			j := i + 1
-			sawAnnot := false
-			for j < len(doc.tokens) && doc.tokens[j].Type == mindscript.ANNOTATION {
-				sawAnnot = true
-				j++
+		if len(p) == 0 {
+			return
+		}
+		tag, _ := p[0].(string)
+
+		switch tag {
+		case "decl":
+			// ("decl", name) or ("decl", subpattern)
+			if len(p) < 2 {
+				return
 			}
-			if sawAnnot && j < len(doc.tokens) {
-				s0, e0 := tokenSpan(doc, t)
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 3,
-					Code:     "MS-DOT-GAP",
-					Source:   "mindscript",
-					Message:  "Remove the gap/comment between '.' and the property name.",
+			if name, ok := p[1].(string); ok && name != "" {
+				c.env.Define(name, newSymbolVal(VTSymbol{Type: t, Doc: doc}))
+				return
+			}
+			if sub, ok := p[1].(mindscript.S); ok {
+				bind(sub, t, true, doc)
+			}
+
+		case "id":
+			if len(p) < 2 {
+				return
+			}
+			name, _ := p[1].(string)
+			if name == "" {
+				return
+			}
+			if decl {
+				c.env.Define(name, newSymbolVal(VTSymbol{Type: t, Doc: doc}))
+				return
+			}
+			// assignment-style: must already exist
+			v, err := c.env.Get(name)
+			if err != nil {
+				c.idx.addDiag(Diag{
+					StartByte: 0, EndByte: 0,
+					Code:    "MS-UNKNOWN-NAME",
+					Message: "unknown name: " + name,
+				})
+				return
+			}
+			sym, ok := asSymbol(v)
+			if !ok {
+				sym = VTSymbol{}
+			}
+			sym.Type = t
+			if doc != "" {
+				sym.Doc = doc
+			}
+			if err := c.env.Set(name, newSymbolVal(sym)); err != nil {
+				c.idx.addDiag(Diag{
+					StartByte: 0, EndByte: 0,
+					Code:    "MS-INVALID-ASSIGN-TARGET",
+					Message: err.Error(),
 				})
 			}
+
+		case "darr":
+			// Array destructuring.
+			elemT, ok := arrayElemType(t)
+			if !ok || elemT == nil {
+				elemT = mindscript.S{"id", "Any"}
+			}
+			// Too-short RHS only when RHS is a literal array we can see.
+			pats := len(p) - 1
+			if pats > 0 && len(rhs) > 0 {
+				if rtag, _ := rhs[0].(string); rtag == "array" {
+					if len(rhs)-1 < pats {
+						c.idx.addDiag(Diag{
+							StartByte: 0, EndByte: 0,
+							Code:    "MS-INVALID-ASSIGN-TARGET",
+							Message: "array destructuring RHS has too few elements",
+						})
+					}
+				}
+			}
+			for i := 1; i < len(p); i++ {
+				if sub, ok := p[i].(mindscript.S); ok {
+					bind(sub, elemT, decl, "")
+				}
+			}
+
+		case "dobj":
+			// Object destructuring.
+			for i := 1; i < len(p); i++ {
+				pair, ok := p[i].(mindscript.S)
+				if !ok || len(pair) < 3 {
+					continue
+				}
+				keyNode, _ := pair[1].(mindscript.S)
+				if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+					continue
+				}
+				key, _ := keyNode[1].(string)
+				sub, _ := pair[2].(mindscript.S)
+
+				ft, found := mapFieldType(t, key)
+				if !found && decl {
+					// Missing key in let-pattern: bind as Null with doc.
+					bind(
+						sub,
+						mindscript.S{"id", "Null"},
+						true,
+						"object pattern: missing key '"+key+"'",
+					)
+				} else {
+					if ft == nil {
+						ft = mindscript.S{"id", "Any"}
+					}
+					bind(sub, ft, decl, "")
+				}
+			}
+		default:
+			// get/idx/etc inside patterns: leave as side-effect-only.
+			return
 		}
 	}
-	for i := 0; i+1 < len(doc.tokens); i++ {
-		if doc.tokens[i].Type == mindscript.ANNOTATION && doc.tokens[i+1].Type == mindscript.END {
-			if doc.tokens[i].Line == doc.tokens[i+1].Line {
-				s0, e0 := tokenSpan(doc, doc.tokens[i+1])
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 4,
-					Code:     "MS-FORMAT-POST-FORCES-NEWLINE",
-					Source:   "mindscript",
-					Message:  "Move 'end' to the next line after a trailing comment.",
-				})
-			}
+
+	if len(lhs) > 0 {
+		if tag, _ := lhs[0].(string); tag == "darr" || tag == "dobj" {
+			bind(lhs, typeOf(ip, c.env, rhsVal), hasDecl(lhs), "")
+			// Value of destructuring expression is the RHS value.
+			return flow{Val: rhsVal}
 		}
+	}
+
+	// 3) Valid non-id targets: get / idx / destructuring.
+	if len(lhs) > 0 {
+		if tag, _ := lhs[0].(string); tag == "get" || tag == "idx" || tag == "darr" || tag == "dobj" {
+			// For get/idx: side-effect only; expression value is rhs.
+			// (darr/dobj handled above.)
+			return flow{Val: rhsVal}
+		}
+	}
+
+	// 4) Everything else is invalid as an assignment target.
+	return invalidTarget("", typeOf(ip, c.env, rhsVal))
+}
+
+// ("block", ...)
+func (c *foldCtx) foldBlock(n mindscript.S) flow {
+	mode := blockPlain
+	if c.topLevel {
+		mode = blockTopLevel
+	}
+	return c.foldBlockWithMode(n, mode)
+}
+
+// foldBlockWithMode handles top-level, plain blocks, function bodies, and loop bodies.
+// For normal fallthrough, the result value is the value of the *last* expression
+// on a non-terminated path. Earlier statements are just steps.
+func (c *foldCtx) foldBlockWithMode(n mindscript.S, mode blockMode) flow {
+	if len(n) == 0 {
+		return newFlowFromType(mindscript.S{"id", "Null"})
+	}
+
+	// Environment:
+	// - Top-level: reuse RootEnv so lets are visible.
+	// - Others: new child env for lexical scope.
+	env := c.env
+	if mode != blockTopLevel {
+		env = mindscript.NewEnv(env)
+	}
+	child := *c
+	child.env = env
+	child.topLevel = false
+	ip := c.ip
+
+	var out flow
+	var haveVal bool
+
+	unifyVals := func(a, b mindscript.Value) mindscript.Value {
+		if (a == mindscript.Value{}) {
+			return b
+		}
+		if (b == mindscript.Value{}) {
+			return a
+		}
+		ta := typeOf(ip, env, a)
+		tb := typeOf(ip, env, b)
+		if ip == nil {
+			return newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Any"}})
+		}
+		u := ip.UnifyTypes(ta, tb, env)
+		return newSymbolVal(VTSymbol{Type: u})
+	}
+
+	var funRet mindscript.Value
+	var loopBrk mindscript.Value
+	var loopCont mindscript.Value
+
+	for i := 1; i < len(n); i++ {
+		sub, ok := n[i].(mindscript.S)
+		if !ok {
+			continue
+		}
+
+		sf := child.fold(sub)
+
+		// Merge control-flow signals.
+		if sf.HasRet {
+			if mode == blockFunBody {
+				funRet = unifyVals(funRet, sf.Ret)
+			} else {
+				out.Ret = unifyVals(out.Ret, sf.Ret)
+				out.HasRet = true
+			}
+			out.Terminated = true
+		}
+
+		if sf.HasBrk {
+			if mode == blockLoopBody {
+				loopBrk = unifyVals(loopBrk, sf.Brk)
+			} else {
+				out.Brk = unifyVals(out.Brk, sf.Brk)
+				out.HasBrk = true
+			}
+			out.Terminated = true
+		}
+
+		if sf.HasCont {
+			if mode == blockLoopBody {
+				loopCont = unifyVals(loopCont, sf.Cont)
+			} else {
+				out.Cont = unifyVals(out.Cont, sf.Cont)
+				out.HasCont = true
+			}
+			out.Terminated = true
+		}
+
+		// Last non-terminating expression wins for fallthrough value.
+		if !sf.Terminated && (sf.Val != mindscript.Value{}) {
+			out.Val = sf.Val
+			haveVal = true
+		}
+
+		// After termination, later statements are unreachable.
+		if sf.Terminated {
+			break
+		}
+	}
+
+	switch mode {
+	case blockFunBody:
+		if (funRet != mindscript.Value{}) {
+			out.Ret = funRet
+			out.HasRet = true
+		}
+	case blockLoopBody:
+		if (loopBrk != mindscript.Value{}) {
+			out.Brk = loopBrk
+			out.HasBrk = true
+		}
+		if (loopCont != mindscript.Value{}) {
+			out.Cont = loopCont
+			out.HasCont = true
+		}
+	}
+
+	if !haveVal {
+		out.Val = newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
 	}
 	return out
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Catamorphic fold (one pass): types + diagnostics + bindings
-////////////////////////////////////////////////////////////////////////////////
-
-type foldOut struct {
-	T  []any
-	Ds []Diagnostic
-}
-type anCtx struct {
-	doc       *docState
-	scope     []map[string]bool
-	atTop     bool
-	curFunRet []any
-	binds     []bindingDef
-	diags     []Diagnostic
-}
-
-func (c *anCtx) push() { c.scope = append(c.scope, map[string]bool{}) }
-func (c *anCtx) pop()  { c.scope = c.scope[:len(c.scope)-1] }
-func (c *anCtx) bind(name string) {
-	if name != "" {
-		c.scope[len(c.scope)-1][name] = true
+func (c *foldCtx) foldIf(n mindscript.S) flow {
+	// ("if", ("pair", cond, thenBlock)..., elseBlock?)
+	if len(n) < 2 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
 	}
-}
-func (c *anCtx) defined(name string) bool {
-	for i := len(c.scope) - 1; i >= 0; i-- {
-		if c.scope[i][name] {
-			return true
+
+	ip := c.ip
+	env := c.env
+
+	unifyVals := func(a, b mindscript.Value) mindscript.Value {
+		if (a == mindscript.Value{}) {
+			return b
+		}
+		if (b == mindscript.Value{}) {
+			return a
+		}
+		ta := typeOf(ip, env, a)
+		tb := typeOf(ip, env, b)
+		if ip == nil {
+			return newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Any"}})
+		}
+		u := ip.UnifyTypes(ta, tb, env)
+		return newSymbolVal(VTSymbol{Type: u})
+	}
+
+	var out flow
+	var armsVal mindscript.Value
+	hasElse := false
+
+	for i := 1; i < len(n); i++ {
+		arm, ok := n[i].(mindscript.S)
+		if !ok || len(arm) == 0 {
+			continue
+		}
+		tag, _ := arm[0].(string)
+
+		if tag == "pair" && len(arm) >= 3 {
+			cond, _ := arm[1].(mindscript.S)
+			thenBlock, _ := arm[2].(mindscript.S)
+			_ = c.fold(cond)
+			tf := c.foldBlockWithMode(thenBlock, blockPlain)
+
+			if tf.HasRet {
+				out.Ret = unifyVals(out.Ret, tf.Ret)
+				out.HasRet = true
+			}
+			if tf.HasBrk {
+				out.Brk = unifyVals(out.Brk, tf.Brk)
+				out.HasBrk = true
+			}
+			if tf.HasCont {
+				out.Cont = unifyVals(out.Cont, tf.Cont)
+				out.HasCont = true
+			}
+			if !tf.Terminated && (tf.Val != mindscript.Value{}) {
+				armsVal = unifyVals(armsVal, tf.Val)
+			}
+			continue
+		}
+
+		// Trailing bare block is else arm.
+		if tag == "block" && i == len(n)-1 {
+			hasElse = true
+			ef := c.foldBlockWithMode(arm, blockPlain)
+
+			if ef.HasRet {
+				out.Ret = unifyVals(out.Ret, ef.Ret)
+				out.HasRet = true
+			}
+			if ef.HasBrk {
+				out.Brk = unifyVals(out.Brk, ef.Brk)
+				out.HasBrk = true
+			}
+			if ef.HasCont {
+				out.Cont = unifyVals(out.Cont, ef.Cont)
+				out.HasCont = true
+			}
+			if !ef.Terminated && (ef.Val != mindscript.Value{}) {
+				armsVal = unifyVals(armsVal, ef.Val)
+			}
 		}
 	}
-	return false
+
+	// No explicit else ⇒ implicit null arm.
+	if !hasElse {
+		nullV := newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+		armsVal = unifyVals(armsVal, nullV)
+	}
+	if (armsVal == mindscript.Value{}) {
+		armsVal = newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+	}
+
+	out.Val = armsVal
+	return out
 }
 
-func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
-	if len(n) == 0 {
-		return foldOut{T: typeID("Any")}
+func (c *foldCtx) foldWhile(n mindscript.S) flow {
+	// ("while", cond, bodyBlock)
+	if len(n) < 3 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
 	}
+	cond, _ := n[1].(mindscript.S)
+	body, _ := n[2].(mindscript.S)
+	_ = c.fold(cond)
+
+	bf := c.foldBlockWithMode(body, blockLoopBody)
+
+	ip := c.ip
+	env := c.env
+
+	unifyVals := func(a, b mindscript.Value) mindscript.Value {
+		if (a == mindscript.Value{}) {
+			return b
+		}
+		if (b == mindscript.Value{}) {
+			return a
+		}
+		ta := typeOf(ip, env, a)
+		tb := typeOf(ip, env, b)
+		if ip == nil {
+			return newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Any"}})
+		}
+		u := ip.UnifyTypes(ta, tb, env)
+		return newSymbolVal(VTSymbol{Type: u})
+	}
+
+	var tv mindscript.Value
+	if (bf.Val != mindscript.Value{}) {
+		tv = unifyVals(tv, bf.Val)
+	}
+	if bf.HasBrk {
+		tv = unifyVals(tv, bf.Brk)
+	}
+	// while-expression type always includes Null (loop may not run).
+	tv = unifyVals(tv, newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}}))
+	if (tv == mindscript.Value{}) {
+		tv = newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+	}
+
+	return flow{
+		Val:    tv,
+		Ret:    bf.Ret, // returns bubble out; break/continue are consumed
+		HasRet: bf.HasRet,
+	}
+}
+
+func (c *foldCtx) foldFor(n mindscript.S) flow {
+	// ("for", target, iter, bodyBlock)
+	if len(n) < 4 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+	// Note: current skeleton ignores target element typing; iter folded for side-effects only.
+	iter, _ := n[2].(mindscript.S)
+	body, _ := n[3].(mindscript.S)
+	_ = c.fold(iter)
+
+	bf := c.foldBlockWithMode(body, blockLoopBody)
+
+	ip := c.ip
+	env := c.env
+
+	unifyVals := func(a, b mindscript.Value) mindscript.Value {
+		if (a == mindscript.Value{}) {
+			return b
+		}
+		if (b == mindscript.Value{}) {
+			return a
+		}
+		ta := typeOf(ip, env, a)
+		tb := typeOf(ip, env, b)
+		if ip == nil {
+			return newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Any"}})
+		}
+		u := ip.UnifyTypes(ta, tb, env)
+		return newSymbolVal(VTSymbol{Type: u})
+	}
+
+	var tv mindscript.Value
+	if (bf.Val != mindscript.Value{}) {
+		tv = unifyVals(tv, bf.Val)
+	}
+	if bf.HasBrk {
+		tv = unifyVals(tv, bf.Brk)
+	}
+	tv = unifyVals(tv, newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}}))
+	if (tv == mindscript.Value{}) {
+		tv = newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+	}
+
+	return flow{
+		Val:    tv,
+		Ret:    bf.Ret,
+		HasRet: bf.HasRet,
+	}
+}
+
+func (c *foldCtx) foldFunLike(n mindscript.S) flow {
+	if len(n) < 3 {
+		return newFlowFromType(mindscript.S{"id", "Any"})
+	}
+
 	tag, _ := n[0].(string)
+	isOracle := tag == "oracle"
 
-	emit := func(d Diagnostic) { c.diags = append(c.diags, d) }
-
-	switch tag {
-	case "str":
-		return foldOut{T: typeID("Str")}
-	case "int":
-		return foldOut{T: typeID("Int")}
-	case "num":
-		return foldOut{T: typeID("Num")}
-	case "bool":
-		return foldOut{T: typeID("Bool")}
-	case "null":
-		return foldOut{T: typeID("Null")}
-
-	case "block":
-		c.push()
-		c.atTop = len(path) == 0
-		defer c.pop()
-		// Block is an expression: the value is the LAST child's type (or Any if none).
-		var lastT []any = typeID("Any")
-		for i := 1; i < len(n); i++ {
-			if ch, ok := n[i].([]any); ok {
-				lastT = fold(ch, append(path, i-1), c).T
-			}
-		}
-		return foldOut{T: lastT}
-
-	case "id":
-		if len(n) >= 2 {
-			nm, _ := n[1].(string)
-			switch nm {
-			case "Int", "Num", "Str", "Bool", "Null", "Any", "Type":
-				return foldOut{T: typeID("Any")}
-			default:
-				if !c.defined(nm) {
-					if rng, ok := rangeFromPath(c.doc, path); ok {
-						emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-UNKNOWN-NAME", Source: "mindscript", Message: fmt.Sprintf("Unknown name: %s", nm)})
-					}
-				}
-				// If this identifier refers to a function/oracle, surface its ARROW type
-				// for expression typing (arrays, partial application, etc.).
-				if _, pts, ret, ok := findLocalFunMeta(c.doc, nm); ok {
-					arrow := ret
-					for i := len(pts) - 1; i >= 0; i-- {
-						arrow = []any{"binop", "->", pts[i], arrow}
-					}
-					return foldOut{T: arrow}
-				}
-				// Prefer current-pass bindings first (most precise during single-pass fold)
-				for i := len(c.binds) - 1; i >= 0; i-- {
-					if c.binds[i].Name == nm && len(c.binds[i].TypeNode) > 0 {
-						return foldOut{T: c.binds[i].TypeNode}
-					}
-				}
-				// Then fall back to already-published bindings (from previous analyses)
-				if tn, ok := findAnyBindingType(c.doc, nm); ok {
-					return foldOut{T: tn}
-				}
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "array":
-		if len(n) == 1 {
-			return foldOut{T: []any{"array", typeID("Any")}}
-		}
-		var elem []any
-		var first []any
-		mixed := false
-		for i := 1; i < len(n); i++ {
-			if ch, ok := n[i].([]any); ok {
-				ti := fold(ch, append(path, i-1), c).T
-				if first == nil {
-					first = ti
-					// seed element type with the first element (avoid collapsing to Any)
-					elem = ti
-				} else {
-					if !sameType(first, ti) {
-						mixed = true
-					}
-					elem = LUB(elem, ti)
-				}
-			}
-		}
-		if mixed && formatTypeNode(elem) != formatTypeNode(first) {
-			if rng, ok := rangeFromPath(c.doc, path); ok {
-				emit(Diagnostic{Range: rng, Severity: 2, Code: "MS-ARRAY-HETEROGENEOUS", Source: "mindscript", Message: "Array has heterogeneous element types; elements widen to a common supertype."})
-			}
-		}
-		return foldOut{T: []any{"array", elem}}
-
-	case "map":
-		out := []any{"map"}
-		for i := 1; i < len(n); i++ {
-			if p, ok := n[i].([]any); ok && len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
-				keyNode, _ := p[1].([]any)
-				valNode, _ := p[2].([]any)
-				ks := ""
-				if len(keyNode) >= 2 && keyNode[0] == "str" {
-					ks, _ = keyNode[1].(string)
-				}
-				vt := fold(valNode, append(path, i-1, 1), c).T
-				out = append(out, []any{"pair", []any{"str", ks}, vt})
-			}
-		}
-		return foldOut{T: out}
-
-	case "get":
-		if len(n) >= 3 {
-			recvNode, _ := n[1].([]any)
-			objT := fold(recvNode, append(path, 0), c).T
-			key := ""
-			if ks, ok := n[2].([]any); ok && len(ks) >= 2 && ks[0] == "str" {
-				key, _ = ks[1].(string)
-			}
-			if key == "" {
-				return foldOut{T: typeID("Any")}
-			}
-			// Determine if receiver is a *typed parameter*; only then trust type-map requiredness.
-			isTypedParam := false
-			var paramMapT []any
-			idn := recvNode // recvNode is already []any; no type assertion needed
-			if len(idn) >= 2 && idn[0] == "id" {
-				if nm, _ := idn[1].(string); nm != "" {
-					for i := len(c.binds) - 1; i >= 0; i-- {
-						b := c.binds[i]
-						if b.Name == nm && b.Kind == "param" && len(b.TypeNode) > 0 && b.TypeNode[0] == "map" {
-							isTypedParam = true
-							paramMapT = b.TypeNode
-							break
-						}
-						// Accept alias-typed params that resolve to a map.
-						if b.Name == nm && b.Kind == "param" && len(b.TypeNode) > 0 && b.TypeNode[0] == "id" {
-							if mt, ok := resolveTypeAliasMap(c.doc, b.TypeNode); ok {
-								isTypedParam = true
-								paramMapT = mt
-								break
-							}
-						}
-					}
-				}
-			}
-			if isTypedParam {
-				if tv, _, ok := mapFieldTypeReq(paramMapT, key); ok {
-					// Required fields are guaranteed present; optional fields have their annotated type.
-					return foldOut{T: tv}
-				}
-				// Unknown key on a *typed* param: open-world, but warn because field is not declared.
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{
-						Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
-						Message: fmt.Sprintf("Key '%s' may be missing.", key),
-					})
-				}
-				return foldOut{T: typeID("Any")}
-			}
-			// Value-map / unknown object:
-			// If static receiver type is a map *and the key exists*, return its type with NO warning.
-			// Otherwise, warn that the key may be missing.
-			if len(objT) > 0 && objT[0] == "map" {
-				if tv, ok := mapFieldType(objT, key); ok {
-					// Known-present key in the *static* value-map type: no warning.
-					return foldOut{T: tv}
-				}
-			}
-			if rng, ok := rangeFromPath(c.doc, path); ok {
-				emit(Diagnostic{
-					Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
-					Message: fmt.Sprintf("Key '%s' may be missing.", key),
-				})
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "idx":
-		if len(n) >= 3 {
-			objT := fold(n[1].([]any), append(path, 0), c).T
-			idxT := fold(n[2].([]any), append(path, 1), c).T
-			// Index expr lives at child #1 in fold-path space → use append(path, 1)
-			if rng, ok := rangeFromPath(c.doc, append(path, 1)); ok && formatTypeNode(idxT) != "Int" {
-				emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript", Message: "Index must be Int."})
-			}
-			if len(objT) >= 2 && objT[0] == "array" {
-				if t, ok := objT[1].([]any); ok {
-					return foldOut{T: t}
-				}
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "call":
-		// Support BOTH shapes:
-		//   ("call", calleeExpr, ("array", arg1, arg2, ...))
-		//   ("call", calleeExpr, arg1, arg2, ...)
-		// Callee name (only simple id needed for tests)
-		calleeIsID := false
-		calleeName := ""
-		if idn, _ := n[1].([]any); len(idn) >= 2 && idn[0] == "id" {
-			if s, _ := idn[1].(string); s != "" {
-				calleeIsID = true
-				calleeName = s
-			}
-		}
-		// Fold args and collect their types + ranges (accept both shapes)
-		var argTs [][]any
-		var argRanges []Range
-		// MindScript: no true zero-arity — missing arg list implies a single Null argument
-		if len(n) == 2 {
-			argTs = [][]any{typeID("Null")}
-			argRanges = []Range{rangeOrDefault(c.doc, path)}
-		} else if len(n) > 2 {
-			if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
-				// ("call", callee, ("array", arg1, arg2, ...))
-				for i := 1; i < len(an); i++ {
-					if a, ok := an[i].([]any); ok {
-						argTs = append(argTs, fold(a, append(path, 1, i-1), c).T)
-						if r, ok := rangeFromPath(c.doc, append(path, 1, i-1)); ok {
-							argRanges = append(argRanges, r)
-						} else {
-							argRanges = append(argRanges, Range{})
-						}
-					}
-				}
-			} else {
-				// ("call", callee, arg1, arg2, ...)
-				for i := 2; i < len(n); i++ {
-					if a, ok := n[i].([]any); ok {
-						argTs = append(argTs, fold(a, append(path, i-1), c).T)
-						if r, ok := rangeFromPath(c.doc, append(path, i-1)); ok {
-							argRanges = append(argRanges, r)
-						} else {
-							argRanges = append(argRanges, Range{})
-						}
-					}
-				}
-			}
-		}
-		// Default: unknown callee → just return Any
-		paramTs, retT, ok := [][]any{}, typeID("Any"), false
-		if calleeIsID {
-			_, paramTs, retT, ok = findLocalFunMeta(c.doc, calleeName)
-		}
-		if ok {
-			// Arity checks (overflow only; partial application allowed)
-			if len(argTs) > len(paramTs) {
-				// Mark the first overflow argument
-				overIdx := len(paramTs)
-				if overIdx < len(argRanges) {
-					emit(Diagnostic{
-						Range:    argRanges[overIdx],
-						Severity: 1, Code: "MS-ARG-OVERFLOW", Source: "mindscript",
-						Message: "Too many arguments for function.",
-					})
-				}
-			}
-			// Per-argument type checks (use structural subtyping).
-			nCheck := len(argTs)
-			if len(paramTs) < nCheck {
-				nCheck = len(paramTs)
-			}
-			for i := 0; i < nCheck; i++ {
-				mismatch := !IsSubtypeStatic(argTs[i], paramTs[i])
-
-				// Special-case Enum membership when argument is a literal:
-				// This preserves the crisp "not a member" diagnostic flavor.
-				var argNode []any
-				if len(n) > 2 {
-					if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
-						if i+1 < len(an) {
-							argNode, _ = an[i+1].([]any)
-						}
-					} else if 2+i < len(n) {
-						argNode, _ = n[2+i].([]any)
-					}
-				}
-				isEnum, isMember := enumHasMember(paramTs[i], unwrapAnnotNode(argNode), c.doc)
-				if isEnum && !isMember {
-					mismatch = true
-				}
-
-				if mismatch && i < len(argRanges) {
-					emit(Diagnostic{
-						Range:    argRanges[i],
-						Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript",
-						Message: fmt.Sprintf("Argument %d: got %s, want %s.", i+1, formatTypeNode(argTs[i]), formatTypeNode(paramTs[i])),
-					})
-				}
-			}
-			// Under-application: return residual arrow of remaining params → retT
-			if len(argTs) < len(paramTs) {
-				res := retT
-				for i := len(paramTs) - 1; i >= len(argTs); i-- {
-					res = []any{"binop", "->", paramTs[i], res}
-				}
-				return foldOut{T: res}
-			}
-			// Exact or over-application: return declared (possibly nullable) return type.
-			return foldOut{T: retT}
-		}
-		// Unknown callee — fall back to Any
-		return foldOut{T: typeID("Any")}
-
-	case "binop":
-		op, _ := n[1].(string)
-		lt := fold(n[2].([]any), append(path, 1), c).T
-		rt := fold(n[3].([]any), append(path, 2), c).T
-		// % 0 constant
-		if op == "%" {
-			// RHS is child index 2 in fold-path space (n[3] in raw),
-			// so use append(path, 2) for spans (not 3).
-			m := unwrapAnnotNode(n[3].([]any))
-			if len(m) >= 2 && m[0] == "int" {
-				if v0, ok := m[1].(int64); ok && v0 == 0 {
-					rng := rangeOrDefault(c.doc, append(path, 2))
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-DIV-BY-ZERO-CONST", Source: "mindscript", Message: "Modulo by zero."})
-				}
-			}
-		}
-		// bitwise require Int
-		if op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" {
-			if formatTypeNode(lt) != "Int" || formatTypeNode(rt) != "Int" {
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-BITWISE-NONINT", Source: "mindscript", Message: "Bitwise operators require Int operands."})
-				}
-			}
-			return foldOut{T: typeID("Int")}
-		}
-		// boolean ops
-		if op == "and" || op == "or" {
-			if formatTypeNode(lt) != "Bool" || formatTypeNode(rt) != "Bool" {
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript", Message: "Boolean operators require Bool operands."})
-				}
-			}
-			return foldOut{T: typeID("Bool")}
-		}
-		// nullable arithmetic/bitwise: guard usage of T? in numeric ops
-		if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-			if isNullable(lt) || isNullable(rt) {
-				rng := rangeOrDefault(c.doc, path)
-				emit(Diagnostic{
-					Range:    rng,
-					Severity: 2,
-					Code:     "MS-MAYBE-NULL-UNSAFE",
-					Source:   "mindscript",
-					Message:  "Value may be null; guard with a null check.",
-				})
-			}
-		}
-		switch op {
-		case "+", "-", "*", "%":
-			return foldOut{T: LUB(lt, rt)}
-		case "/":
-			as, bs := formatTypeNode(lt), formatTypeNode(rt)
-			if as == "Int" && bs == "Int" {
-				return foldOut{T: typeID("Int")}
-			}
-			if as == "Num" || bs == "Num" {
-				return foldOut{T: typeID("Num")}
-			}
-			return foldOut{T: typeID("Any")}
-		case "==", "!=":
-			return foldOut{T: typeID("Bool")}
-		case "<", "<=", ">", ">=":
-			okNum := (formatTypeNode(lt) == "Num" || formatTypeNode(lt) == "Int") &&
-				(formatTypeNode(rt) == "Num" || formatTypeNode(rt) == "Int")
-			okStr := formatTypeNode(lt) == "Str" && formatTypeNode(rt) == "Str"
-			if !(okNum || okStr) {
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-COMPARISON-TYPE-MISMATCH", Source: "mindscript", Message: "Comparison requires Num↔Num or Str↔Str."})
-				}
-			}
-			return foldOut{T: typeID("Bool")}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "unop":
-		if len(n) >= 3 {
-			op, _ := n[1].(string)
-			r := fold(n[2].([]any), append(path, 1), c).T
-			switch op {
-			case "-":
-				rs := formatTypeNode(r)
-				if rs == "Int" || rs == "Num" {
-					return foldOut{T: r}
-				}
-			case "not":
-				return foldOut{T: typeID("Bool")}
-			case "?":
-				return foldOut{T: []any{"unop", "?", r}}
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "if":
-		// ("if", ("pair", cond, then), ..., else?)
-		var t []any
-		for i := 1; i < len(n); i++ {
-			arm, _ := n[i].([]any)
-			if len(arm) == 0 {
+	// Params: ("array", ("pair", ("id", name), typeS?)...)
+	paramsNode, _ := n[1].(mindscript.S)
+	var paramNames []string
+	var paramTypes []mindscript.S
+	if len(paramsNode) >= 1 && paramsNode[0] == "array" {
+		for i := 1; i < len(paramsNode); i++ {
+			p, ok := paramsNode[i].(mindscript.S)
+			if !ok || len(p) < 2 {
 				continue
 			}
-			if arm[0] == "pair" && len(arm) >= 3 {
-				thenBlk, _ := arm[2].([]any)
-				t = LUB(t, fold(thenBlk, append(path, i-1, 1), c).T)
-			} else {
-				t = LUB(t, fold(arm, append(path, i-1), c).T)
+			nameNode, _ := p[1].(mindscript.S)
+			if len(nameNode) < 2 || nameNode[0].(string) != "id" {
+				continue
 			}
-		}
-		if len(t) == 0 {
-			t = typeID("Any")
-		}
-		return foldOut{T: t}
-
-	case "while", "for":
-		// Loops: result is LUB(body, Null) conservatively (zero-iteration)
-		var acc []any
-		for i := 1; i < len(n); i++ {
-			if ch, ok := n[i].([]any); ok {
-				acc = LUB(acc, fold(ch, append(path, i-1), c).T)
+			name, _ := nameNode[1].(string)
+			if name == "" {
+				continue
 			}
-		}
-		return foldOut{T: LUB(acc, typeID("Null"))}
-
-	case "fun", "oracle":
-		// enter scope; bind params; remember return type
-		c.push()
-		defer c.pop()
-		if (tag == "fun" || tag == "oracle") && len(n) >= 2 {
-			if ps, _ := n[1].([]any); len(ps) > 0 && ps[0] == "array" {
-				for i := 1; i < len(ps); i++ {
-					if p, _ := ps[i].([]any); len(p) >= 2 {
-						if idNode, _ := p[1].([]any); len(idNode) >= 2 && idNode[0] == "id" {
-							if nm, _ := idNode[1].(string); nm != "" {
-								c.bind(nm)
-								idPath := append(append(append(mindscript.NodePath{}, path...), 0), i-1)
-								idPath = append(idPath, 0)
-								var tNode []any
-								if len(p) >= 3 {
-									tNode, _ = p[2].([]any)
-								}
-								b := bindingDef{Name: nm, Range: rangeFromID(c.doc, idPath, nm), Kind: "param", TypeNode: tNode}
-								c.binds = append(c.binds, b)
-								c.doc.binds = append(c.doc.binds, b)
-							}
-						}
-					}
+			pt := mindscript.S{"id", "Any"}
+			if len(p) >= 3 {
+				if ts, ok := p[2].(mindscript.S); ok {
+					pt = ts
 				}
 			}
-		}
-		// body
-		if tag == "fun" && len(n) >= 4 {
-			// set current return type
-			prev := c.curFunRet
-			if rt, ok := n[2].([]any); ok {
-				c.curFunRet = rt
+			if c.ip != nil {
+				pt = c.ip.ResolveType(pt, c.env)
 			}
-			defer func() { c.curFunRet = prev }()
-			fold(n[3].([]any), append(path, 2), c)
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "type":
-		return foldOut{T: typeID("Any")}
-
-	case "return":
-		if len(c.curFunRet) > 0 {
-			var actual []any
-			if len(n) >= 2 {
-				if rn, ok := n[1].([]any); ok {
-					actual = fold(rn, append(path, 0), c).T
-				}
-			} else {
-				actual = typeID("Null")
-			}
-			// Structural subtyping conformance (no string-equality hacks).
-			if !IsSubtypeStatic(actual, c.curFunRet) {
-				// Always emit, even if a precise span is missing.
-				rng := rangeOrDefault(c.doc, path)
-				emit(Diagnostic{
-					Range:    rng,
-					Severity: 1,
-					Code:     "MS-RET-TYPE-MISMATCH",
-					Source:   "mindscript",
-					Message:  fmt.Sprintf("Return type %s does not match %s.", formatTypeNode(actual), formatTypeNode(c.curFunRet)),
-				})
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "assign":
-		// Fallthrough above changed: ensure return-type mismatches always emit,
-		// even if a precise span can't be found.
-		if len(c.curFunRet) > 0 && len(n) > 0 && n[0] == "return" {
-			// (No-op; handled in "return" case. This comment clarifies intent.)
-		}
-
-		// Restore the removed block with default-range emission:
-		if false {
-			_ = rangeOrDefault // keep helper referenced in this scope (no-op)
-		}
-
-		if len(n) < 3 {
-			return foldOut{T: typeID("Any")}
-		}
-		lhs, _ := n[1].([]any)
-		rhs, _ := n[2].([]any)
-		// target validation
-		if len(lhs) > 0 {
-			switch lhs[0] {
-			case "decl", "id", "get", "idx", "darr", "dobj":
-			default:
-				if rng, ok := rangeFromPath(c.doc, append(path, 1)); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-INVALID-ASSIGN-TARGET", Source: "mindscript", Message: "Invalid assignment target."})
-				}
-			}
-		}
-
-		// If this is a "return" handled above, emit with default range:
-		if len(n) > 0 && n[0] == "return" && len(c.curFunRet) > 0 {
-			rng := rangeOrDefault(c.doc, path)
-			_ = rng // (the actual mismatch logic runs in the "return" branch)
-		}
-
-		// collect names in patterns
-		type nameAt struct {
-			Name string
-			Path mindscript.NodePath
-		}
-		var names []nameAt
-		var collectPat func(pat []any, base mindscript.NodePath)
-		collectPat = func(pat []any, base mindscript.NodePath) {
-			if len(pat) == 0 {
-				return
-			}
-			switch pat[0] {
-			case "decl", "id":
-				if len(pat) >= 2 {
-					if n, _ := pat[1].(string); n != "" {
-						names = append(names, nameAt{n, append(mindscript.NodePath{}, base...)})
-					}
-				}
-			case "darr":
-				for i := 1; i < len(pat); i++ {
-					if ch, ok := pat[i].([]any); ok {
-						collectPat(ch, append(append(mindscript.NodePath{}, base...), i-1))
-					}
-				}
-			case "dobj":
-				for i := 1; i < len(pat); i++ {
-					if pair, ok := pat[i].([]any); ok && len(pair) >= 3 && (pair[0] == "pair" || pair[0] == "pair!") {
-						if sub, ok := pair[2].([]any); ok {
-							collectPat(sub, append(append(mindscript.NodePath{}, base...), i-1, 1))
-						}
-					}
-				}
-			}
-		}
-		lhsPath := append(append(mindscript.NodePath{}, path...), 1)
-		collectPat(lhs, lhsPath)
-
-		base, txt, _ := annotText(rhs)
-		kind := "variable"
-		var tnode []any
-		sig := ""
-		if len(base) > 0 {
-			switch base[0] {
-			case "fun":
-				kind = "fun"
-				if rt, ok := base[2].([]any); ok {
-					tnode = rt
-				}
-			case "oracle":
-				kind = "oracle"
-				if rt, ok := base[2].([]any); ok {
-					tnode = []any{"unop", "?", rt}
-				}
-			case "type":
-				kind = "type"
-			}
-		}
-		// fold RHS once for type if needed
-		rhsT := fold(base, append(path, 1), c).T
-		if len(tnode) == 0 {
-			tnode = rhsT
-		}
-		// If the pattern is an object destructure, default unknown entries to nullable.
-		isDobj := len(lhs) > 0 && lhs[0] == "dobj"
-		for _, na := range names {
-			if len(base) > 0 && (base[0] == "fun" || base[0] == "oracle") {
-				sig = formatFunSig(na.Name, base)
-			}
-			// Choose the base type for this binding (respecting dobj open-world policy),
-			// then LUB with any previous known type for the same symbol to widen across reassignments.
-			chosenType := func() []any {
-				if isDobj {
-					// Open-world: field may be missing → nullable Any.
-					return []any{"unop", "?", typeID("Any")}
-				}
-				return tnode
-			}()
-			// Find previous type for this name (prefer current-pass binds, then existing doc.binds).
-			prevType := []any(nil)
-			for i := len(c.binds) - 1; i >= 0; i-- {
-				if c.binds[i].Name == na.Name && len(c.binds[i].TypeNode) > 0 {
-					prevType = c.binds[i].TypeNode
-					break
-				}
-			}
-			if prevType == nil {
-				for i := len(c.doc.binds) - 1; i >= 0; i-- {
-					if c.doc.binds[i].Name == na.Name && len(c.doc.binds[i].TypeNode) > 0 {
-						prevType = c.doc.binds[i].TypeNode
-						break
-					}
-				}
-			}
-			mergedType := chosenType
-			if prevType != nil {
-				mergedType = LUB(prevType, chosenType)
-			}
-
-			b := bindingDef{
-				Name:     na.Name,
-				Range:    rangeFromID(c.doc, na.Path, na.Name),
-				DocFull:  txt,
-				DocFirst: firstLine(txt),
-				Kind:     kind,
-				TypeNode: mergedType,
-				Sig:      sig,
-			}
-			c.binds = append(c.binds, b)
-			c.doc.binds = append(c.doc.binds, b)
-			c.bind(na.Name)
-
-			// mark top-level on the just-appended binding(s)
-			lhst, _ := lhs[0].(string)
-			if c.atTop && (lhst == "decl" || lhst == "id") {
-				c.binds[len(c.binds)-1].IsTopLevel = true
-				c.doc.binds[len(c.doc.binds)-1].IsTopLevel = true
-			}
-
-			sig = ""
-		}
-		return foldOut{T: typeID("Any")}
-	}
-	// default: fold children to harvest diagnostics but return Any
-	for i := 1; i < len(n); i++ {
-		if ch, ok := n[i].([]any); ok {
-			fold(ch, append(path, i-1), c)
+			paramNames = append(paramNames, name)
+			paramTypes = append(paramTypes, pt)
 		}
 	}
-	return foldOut{T: typeID("Any")}
+
+	// Declared return type (default Any).
+	retT := mindscript.S{"id", "Any"}
+	if rt, ok := n[2].(mindscript.S); ok {
+		retT = rt
+	}
+	if c.ip != nil {
+		retT = c.ip.ResolveType(retT, c.env)
+	}
+
+	// Oracle effective return: nullable unless already nullable or Any.
+	effRet := retT
+	if isOracle {
+		isNullable := len(retT) >= 3 && retT[0] == "unop" && retT[1] == "?"
+		isAny := len(retT) >= 2 && retT[0] == "id" && retT[1] == "Any"
+		if !isNullable && !isAny {
+			effRet = mindscript.S{"unop", "?", retT}
+		}
+	}
+
+	// Build arrow type (right-assoc), with 0-arg sugar: Null -> R.
+	funType := effRet
+	if len(paramTypes) == 0 {
+		funType = mindscript.S{
+			"binop", "->",
+			mindscript.S{"id", "Null"},
+			effRet,
+		}
+	} else {
+		for i := len(paramTypes) - 1; i >= 0; i-- {
+			funType = mindscript.S{"binop", "->", paramTypes[i], funType}
+		}
+	}
+
+	// For plain fun (with a real body block), check returns against effRet.
+	if !isOracle && len(n) >= 4 {
+		if body, ok := n[3].(mindscript.S); ok && len(body) > 0 && body[0] == "block" {
+			funEnv := mindscript.NewEnv(c.env)
+			for i := range paramNames {
+				funEnv.Define(paramNames[i], newSymbolVal(VTSymbol{Type: paramTypes[i]}))
+			}
+			child := *c
+			child.env = funEnv
+			child.topLevel = false
+			bf := child.foldBlockWithMode(body, blockFunBody)
+
+			if c.ip != nil {
+				var observed mindscript.S
+				if bf.HasRet {
+					observed = typeOf(c.ip, funEnv, bf.Ret)
+				}
+				if !bf.Terminated && (bf.Val != mindscript.Value{}) {
+					tv := typeOf(c.ip, funEnv, bf.Val)
+					if observed == nil {
+						observed = tv
+					} else {
+						observed = c.ip.UnifyTypes(observed, tv, funEnv)
+					}
+				}
+				if observed != nil && !c.ip.IsSubtype(observed, effRet, funEnv) {
+					c.idx.addDiag(Diag{
+						StartByte: 0, // TODO: attach to function span
+						EndByte:   0,
+						Code:      "MS-RET-TYPE-MISMATCH",
+						Message:   "return type does not match function declaration",
+					})
+				}
+			}
+		}
+	}
+
+	return newFlowFromType(funType)
 }
 
-func unifiedAnalyze(doc *docState) (binds []bindingDef, diags []Diagnostic) {
-	if doc == nil || doc.ast == nil {
-		return nil, nil
-	}
-	c := &anCtx{doc: doc}
-	// seed scope with already-known bindings
-	c.push()
-	for _, b := range doc.binds {
-		c.bind(b.Name)
-	}
-	_ = fold(doc.ast, mindscript.NodePath{}, c)
-	return c.binds, c.diags
-}
-
-func init() {
-	_ = rangeOrDefault // keep the helper referenced for go vet / linters
+func (c *foldCtx) foldModule(n mindscript.S) flow {
+	// TODO: module env, collect exports into map type, bind as VTSymbol.
+	_ = n
+	return newFlow(nil)
 }

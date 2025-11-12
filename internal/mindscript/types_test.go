@@ -608,22 +608,28 @@ func Test_Types_ValueToType_Module_Inference(t *testing.T) {
 	mod := &Module{Map: mo, Env: NewEnv(ip.Global)}
 	v := Value{Tag: VTModule, Data: mod}
 
-	// ValueToType should infer an open-world map schema with optional fields
+	// ValueToType for a VTModule should:
+	// - Treat the module as a map (AsMapValue),
+	// - Mark observed exports as required fields (pair!),
+	// - Remain open-world (extra fields still allowed by the type system).
 	typ := ip.ValueToType(v, ip.Global)
 	if len(typ) == 0 || typ[0].(string) != "map" {
 		t.Fatalf("expected ValueToType(VTModule) to yield a 'map' type, got: %#v", typ)
 	}
 
 	fields := mapTypeFields(typ)
+
 	fx, ok := fields["x"]
-	if !ok || !isId(fx.typ, "Str") || fx.required {
-		t.Fatalf("expected field x: Str (optional), got: %#v", fx)
+	if !ok || !isId(fx.typ, "Str") || !fx.required {
+		t.Fatalf("expected field x: Str (required), got: %#v", fx)
 	}
+
 	fn, ok := fields["n"]
-	if !ok || !isId(fn.typ, "Int") || fn.required {
-		t.Fatalf("expected field n: Int (optional), got: %#v", fn)
+	if !ok || !isId(fn.typ, "Int") || !fn.required {
+		t.Fatalf("expected field n: Int (required), got: %#v", fn)
 	}
 }
+
 func Test_Types_IsType_Map_FieldAnnotations_Single(t *testing.T) {
 	ip, _ := NewInterpreter()
 

@@ -136,7 +136,7 @@ func Test_Features_TextSync_OpenAndChange_Basic(t *testing.T) {
 		},
 		"contentChanges": []any{
 			map[string]any{"text": "y"}, // full
-			map[string]any{"range": map[string]any{"start": map[string]int{"line": 0, "character": 0}, "end": map[string]int{"line": 0, "character": 1}}, "text": "z"},
+			map[string]any{"range": map[string]int{"start": 0, "end": 1}, "text": "z"},
 		},
 	}
 	cb, _ := json.Marshal(changeParams)
@@ -184,15 +184,13 @@ func Test_Features_LanguageCore_SpecBehavior(t *testing.T) {
 		uri:   uri,
 		text:  docText,
 		lines: lineOffsets(docText),
-		symbols: []symbolDef{
-			{Name: "F", Kind: "fun", Range: Range{Start: Position{0, 2}, End: Position{0, 3}}, Sig: "F(a: Int) -> Int"},
-			{Name: "T", Kind: "type", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
-			{Name: "X", Kind: "let", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
-		},
 		binds: []bindingDef{
-			{Name: "x", Kind: "variable", TypeNode: []any{"id", "Int"}, Range: Range{Start: Position{0, 0}, End: Position{0, 1}}, DocFull: "x var"},
-			{Name: "f", Kind: "fun", Sig: "f(a: Int, b: Str) -> Int", Range: Range{Start: Position{0, 2}, End: Position{0, 3}}},
-			{Name: "T", Kind: "type", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+			// x at byte 0..1, Int, top-level with docs
+			{Name: "x", StartByte: 0, EndByte: 1, HasRange: true, IsTopLevel: true, TypeNode: []any{"id", "Int"}, DocFull: "x var", DocFirst: "x var"},
+			// f at byte 2..3, top-level function with signature
+			{Name: "f", StartByte: 2, EndByte: 3, HasRange: true, IsTopLevel: true, Sig: "f(a: Int, b: Str) -> Int"},
+			// T: just another top-level symbol to appear in symbols/completion
+			{Name: "T", StartByte: 0, EndByte: 1, HasRange: true, IsTopLevel: true},
 		},
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "x", StartByte: 0, EndByte: 1},
@@ -242,8 +240,8 @@ func Test_Features_LanguageCore_SpecBehavior(t *testing.T) {
 		if err := json.Unmarshal(resp.Result, &hv); err != nil {
 			t.Fatalf("decode hover: %v", err)
 		}
-		if hv.Contents.Kind != "markdown" || hv.Contents.Value == "" || !strings.HasPrefix(hv.Contents.Value, "**keyword**") {
-			t.Fatalf("expected keyword hover, got %q", hv.Contents.Value)
+		if hv.Contents.Kind != "markdown" || !strings.HasPrefix(hv.Contents.Value, "**let** (keyword)") {
+			t.Fatalf("expected keyword hover '**let** (keyword)', got %q", hv.Contents.Value)
 		}
 	})
 
@@ -260,9 +258,15 @@ func Test_Features_LanguageCore_SpecBehavior(t *testing.T) {
 		if err := json.Unmarshal(resp.Result, &hv); err != nil {
 			t.Fatalf("decode hover: %v", err)
 		}
-		want := "**variable** `x: Int`"
-		if !strings.HasPrefix(hv.Contents.Value, want) {
-			t.Fatalf("want %q, got %q", want, hv.Contents.Value)
+		// Hover reports symbol name + type + docs from bindings.
+		if hv.Contents.Kind != "markdown" {
+			t.Fatalf("expected markdown hover, got kind=%q", hv.Contents.Kind)
+		}
+		if !strings.HasPrefix(hv.Contents.Value, "**x** `<Int>`") {
+			t.Fatalf("hover must start with '**x** `<Int>`', got %q", hv.Contents.Value)
+		}
+		if !strings.Contains(hv.Contents.Value, "x var") {
+			t.Fatalf("hover should include binding docs; got %q", hv.Contents.Value)
 		}
 	})
 
@@ -434,8 +438,9 @@ func Test_Features_Hover_String_Annotation_Null(t *testing.T) {
 		text:  text + "@doc\nline\n",
 		lines: lineOffsets(text + "@doc\nline\n"),
 		binds: []bindingDef{
-			{Name: "x", Kind: "variable", TypeNode: []any{"id", "Num"}, Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
-			{Name: "x", Kind: "variable", TypeNode: []any{"id", "Int"}, Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+			// Two bindings for x at the same position to test nearestBinding shadowing.
+			{Name: "x", StartByte: 4, EndByte: 5, HasRange: true, TypeNode: []any{"id", "Num"}},
+			{Name: "x", StartByte: 4, EndByte: 5, HasRange: true, TypeNode: []any{"id", "Int"}},
 		},
 		tokens: []mindscript.Token{
 			{Type: mindscript.LET, Lexeme: "let", StartByte: 0, EndByte: 3},
@@ -500,7 +505,9 @@ func Test_Features_Completion_SuppressedInStringAndAnnotation(t *testing.T) {
 			{Type: mindscript.STRING, Lexeme: "\"s\"", StartByte: 0, EndByte: 3},
 			{Type: mindscript.ANNOTATION, Lexeme: "@a", StartByte: 4, EndByte: 6},
 		},
-		binds: []bindingDef{{Name: "f", Kind: "fun", Sig: "f() -> Any"}},
+		binds: []bindingDef{
+			{Name: "f", Sig: "f() -> Any"},
+		},
 	}
 	s.mu.Lock()
 	s.docs[uri] = doc
@@ -595,7 +602,7 @@ func Test_Features_SignatureHelp_EdgeCases(t *testing.T) {
 		text:  text,
 		lines: lineOffsets(text),
 		binds: []bindingDef{
-			{Name: "f", Kind: "fun", Sig: "f(a: Any, b: Any) -> Any", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+			{Name: "f", StartByte: 0, EndByte: 1, HasRange: true, Sig: "f(a: Any, b: Any) -> Any"},
 		},
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "f", StartByte: 0, EndByte: 1},
@@ -705,8 +712,8 @@ func Test_Features_References_ShadowingAware(t *testing.T) {
 		text:  text,
 		lines: lineOffsets(text),
 		binds: []bindingDef{
-			{Name: "x", Kind: "variable", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
-			{Name: "x", Kind: "variable", Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+			{Name: "x", StartByte: 0, EndByte: 1, HasRange: true},
+			{Name: "x", StartByte: 2, EndByte: 3, HasRange: true},
 		},
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "x", StartByte: 0, EndByte: 1},
@@ -824,19 +831,18 @@ func Test_Features_GoToTypeDefinition(t *testing.T) {
 	s := newServer()
 	const uri = "file:///typedef.ms"
 
-	// Fake doc: `type T = Int\nlet x: T = 1\n` (tokens place a usage 'T' on line 2)
+	// Fake doc: `type T = Int\nlet x: T = 1\n` with a usage `T` on line 2.
 	text := "type T = Int\nx\nT\n"
 	doc := &docState{
 		uri:   uri,
 		text:  text,
 		lines: lineOffsets(text),
 		binds: []bindingDef{
-			// Decl: type T at line 0, col 5..6
-			{Name: "T", Kind: "type", Range: Range{Start: Position{0, 5}, End: Position{0, 6}}},
-			// Usage: pretend x has TypeNode "T" so handler can resolve; we place a binding
-			{Name: "x", Kind: "variable", TypeNode: []any{"id", "T"}, Range: Range{Start: Position{1, 0}, End: Position{1, 1}}},
+			// Decl: type T at byte 5..6
+			{Name: "T", StartByte: 5, EndByte: 6, HasRange: true},
+			// Usage site: x has TypeNode id T so handler can resolve.
+			{Name: "x", StartByte: 14, EndByte: 15, HasRange: true, TypeNode: []any{"id", "T"}},
 		},
-		// Tokens include the identifier `T` on line 2 for cursor targeting.
 		tokens: []mindscript.Token{
 			{Type: mindscript.TYPE, Lexeme: "type", StartByte: 0, EndByte: 4},
 			{Type: mindscript.ID, Lexeme: "T", StartByte: 5, EndByte: 6},
@@ -882,8 +888,8 @@ func Test_Features_Completion_SnippetAndPrefixFilter(t *testing.T) {
 		text:  text,
 		lines: lineOffsets(text),
 		binds: []bindingDef{
-			{Name: "foo", Kind: "fun", Sig: "foo(a: Int) -> Int"},
-			{Name: "bar", Kind: "variable", TypeNode: []any{"id", "Int"}},
+			{Name: "foo", Sig: "foo(a: Int) -> Int"},
+			{Name: "bar", TypeNode: []any{"id", "Int"}},
 		},
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "f", StartByte: 0, EndByte: 1},
@@ -918,7 +924,7 @@ func Test_Features_Completion_SnippetAndPrefixFilter(t *testing.T) {
 		}
 	}
 
-	// Expect function snippet insertion for "foo"
+	// Expect "foo" completion with detail reflecting its signature metadata.
 	var got *CompletionItem
 	for i := range items {
 		if items[i].Label == "foo" {
@@ -929,8 +935,8 @@ func Test_Features_Completion_SnippetAndPrefixFilter(t *testing.T) {
 	if got == nil {
 		t.Fatalf("expected 'foo' in completion")
 	}
-	if got.InsertTextFormat != 2 || got.InsertText == "" || !strings.HasPrefix(got.InsertText, "foo(") {
-		t.Fatalf("function completion must use snippet 'foo($0)'; got %+v", *got)
+	if got.Detail == "" || !strings.HasPrefix(got.Detail, "foo(") {
+		t.Fatalf("completion detail for 'foo' should reflect its signature; got %+v", *got)
 	}
 }
 
@@ -991,10 +997,10 @@ func Test_Features_References_NoOriginBinding_Empty(t *testing.T) {
 		uri:   uri,
 		text:  text,
 		lines: lineOffsets(text),
-		// No binds for "y" on purpose.
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "y", StartByte: 0, EndByte: 1},
 		},
+		// No binds for "y" on purpose.
 	}
 	s.mu.Lock()
 	s.docs[uri] = doc
@@ -1027,20 +1033,16 @@ func Test_Features_Definition_NoFallbackToTopLevel(t *testing.T) {
 	s := newServer()
 	const uri = "file:///def-nofallback.ms"
 
-	// Symbol table contains top-level "Z"; query cursor is on an unrelated "Z"
-	// occurrence that has no binding. Spec: must return null (no fallback).
+	// Doc has a usage "Z" but no binding for "Z".
 	text := "Z\n"
 	doc := &docState{
 		uri:   uri,
 		text:  text,
 		lines: lineOffsets(text),
-		symbols: []symbolDef{
-			{Name: "Z", Kind: "fun", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}, Sig: "Z() -> Any"},
-		},
-		// No binds — simulate an unresolved usage.
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "Z", StartByte: 0, EndByte: 1},
 		},
+		// No binds — simulate an unresolved usage; no fallback to top-level.
 	}
 	s.mu.Lock()
 	s.docs[uri] = doc
@@ -1116,14 +1118,14 @@ func Test_Features_RenameFlow_Minimal(t *testing.T) {
 	s := newServer()
 	const uri = "file:///rename.ms"
 
-	// Two occurrences of x; one binding entry is enough for the handlers.
+	// Two occurrences of x; one binding entry is enough for handlers.
 	text := "x\nx\n"
 	doc := &docState{
 		uri:   uri,
 		text:  text,
 		lines: lineOffsets(text),
 		binds: []bindingDef{
-			{Name: "x", Kind: "variable", Range: Range{Start: Position{0, 0}, End: Position{0, 1}}},
+			{Name: "x", StartByte: 0, EndByte: 1, HasRange: true},
 		},
 		tokens: []mindscript.Token{
 			{Type: mindscript.ID, Lexeme: "x", StartByte: 0, EndByte: 1},
@@ -1183,8 +1185,6 @@ func Test_Features_RenameFlow_Minimal(t *testing.T) {
 }
 
 // Optional scaffold for the "arrays/maps fold only when ≥ 3 lines" rule.
-// This requires AST+SpanIndex to be wired for literals; keep as a TODO so it
-// doesn't bloat or flake until spans are easily constructible here.
 func Test_Features_Folding_ArraysAndMaps_MinLines(t *testing.T) {
 	t.Skip("TODO: add when constructing mindscript.S AST + SpanIndex for literals is convenient in tests")
 }

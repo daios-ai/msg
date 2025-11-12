@@ -10,15 +10,14 @@
 //        - language features: hover, definition, references, completion,
 //          document symbols, semantic tokens (full/range), signature help,
 //          folding ranges.
-//   • Heuristics that read docState (tokens, AST, spans, symbols) and format
+//   • Heuristics that read docState (tokens, AST, spans, binds) and format
 //     LSP-shaped responses. Where useful, consults server.ip to surface
 //     metadata about built-ins (e.g., function signatures) — without executing
-//     user code. The optional listBindings() call that executed user code has
-//     been removed to respect “don’t run user code in LSP.”
+//     user code.
 //
 // What does NOT live here
 //   • No transport framing or JSON-RPC loop (see main.go).
-//   • No core text/position math or analysis pipeline (see core.go).
+//   • No core text/position math or analysis pipeline (see analysis.go).
 //   • No interpreter internals or VM usage; feature logic relies on lexer/parser
 //     output and cached spans. Interpreter access is read-only for metadata.
 //
@@ -29,7 +28,7 @@
 // Dependencies
 //   • Consumes helpers/types from core.go and protocol.go.
 //   • May read from s.ip.Global to describe built-ins; otherwise operates purely
-//     on statically computed tokens/AST/symbols.
+//     on statically computed tokens/AST/binds.
 
 package main
 
@@ -44,7 +43,7 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-// Feature-local helpers moved from analysis.go (UI-only utilities)
+// Feature-local helpers
 ////////////////////////////////////////////////////////////////////////////////
 
 // hasValidSpan reports whether the lexer provided concrete byte offsets.
@@ -167,7 +166,7 @@ func u16Len(s string) int {
 ////////////////////////////////////////////////////////////////////////////////
 
 func (s *server) onInitialize(id json.RawMessage, _ json.RawMessage) {
-	// Keep the token legend order in sync with semTypes in core.go
+	// Keep the token legend order in sync with semTypes.
 	legendTypes := []string{
 		"keyword", "function", "type", "variable", "property",
 		"string", "number", "comment", "bracket",
@@ -299,15 +298,6 @@ func tokenAtOffset(doc *docState, off int) (idx int, t mindscript.Token, start, 
 	return -1, mindscript.Token{}, 0, 0, false
 }
 
-func findSymbol(doc *docState, name string) (symbolDef, bool) {
-	for _, s := range doc.symbols {
-		if s.Name == name {
-			return s, true
-		}
-	}
-	return symbolDef{}, false
-}
-
 // Minimal operator doc to avoid "nothing on hover" over common operators.
 var opDoc = map[mindscript.TokenType]string{
 	mindscript.EQ:         "equality (==)",
@@ -325,33 +315,15 @@ var opDoc = map[mindscript.TokenType]string{
 	mindscript.NOT:        "logical not",
 }
 
-// ---- Hover helpers (local to features.go) ----
-
-// arrowTypeAST builds a right-associated ("binop","->", ...) chain from params -> ret.
-func arrowTypeAST(params [][]any, ret []any) []any {
-	t := ret
-	for i := len(params) - 1; i >= 0; i-- {
-		t = []any{"binop", "->", params[i], t}
-	}
-	return t
-}
-
-// bindingTypeAST returns the AST type for a binding:
-//   - fun/oracle → arrow type using analyzer metadata
-//   - otherwise → binding.TypeNode (or Any if empty)
-func bindingTypeAST(doc *docState, b bindingDef, name string) []any {
-	if b.Kind == "fun" || b.Kind == "oracle" {
-		if _, ps, rt, ok := findLocalFunMeta(doc, name); ok {
-			return arrowTypeAST(ps, rt)
-		}
-	}
+// Hover helper: pick a type node or Any if missing.
+func bindingTypeAST(b bindingDef) []any {
 	if len(b.TypeNode) > 0 {
 		return b.TypeNode
 	}
 	return []any{"id", "Any"}
 }
 
-// ------------------- HOVER -------------------
+// HOVER
 func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 	var params struct {
 		TextDocument TextDocumentIdentifier `json:"textDocument"`
@@ -407,21 +379,9 @@ func (s *server) onHover(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// 0) Globals from interpreter (functions/types) — metadata only, no user code execution
-	if v, err := s.ip.Global.Get(name); err == nil {
-		typAST := s.ip.ValueToType(v, s.ip.Global)
-		doc := v.Annot
-		head := fmt.Sprintf("**%s** `<%s>`", name, mindscript.FormatType(typAST))
-		if d := strings.TrimSpace(doc); d != "" {
-			head += "\n\n" + d
-		}
-		s.sendResponse(id, Hover{Contents: MarkupContent{Kind: "markdown", Value: head}, Range: &rng}, nil)
-		return
-	}
-
-	// 1) Bound symbol (shadowing-aware): **NAME** `<AST>`  + first doc line (if any)
+	// 1) Bound symbol (shadowing-aware): **NAME** `<type>` + docs.
 	if b, ok := nearestBinding(doc, name, off); ok {
-		typAST := bindingTypeAST(doc, b, name)
+		typAST := bindingTypeAST(b)
 		head := fmt.Sprintf("**%s** `<%s>`", name, mindscript.FormatType(typAST))
 		if d := strings.TrimSpace(b.DocFull); d != "" {
 			head += "\n\n" + d
@@ -463,10 +423,11 @@ func (s *server) onDefinition(id json.RawMessage, paramsRaw json.RawMessage) {
 	}
 	off := posToOffset(doc.lines, params.Position, doc.text)
 	if b, ok := nearestBinding(doc, name, off); ok {
-		s.sendResponse(id, Location{URI: doc.uri, Range: b.Range}, nil)
+		rng := makeRange(doc.lines, b.StartByte, b.EndByte, doc.text)
+		s.sendResponse(id, Location{URI: doc.uri, Range: rng}, nil)
 		return
 	}
-	// No nearest binding → per spec, do not fall back to top-level symbols.
+	// No nearest binding → per spec, do not fall back to top-level-only guesses.
 	s.sendResponse(id, nil, nil)
 }
 
@@ -502,11 +463,9 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 		}
 	}
 
-	// Determine word prefix under cursor for filtering and check if next token is '('.
+	// Determine word prefix under cursor for filtering.
 	prefix, _ := wordAt(doc, params.Position)
-	nextIsParen := false
 	// If cursor is exactly at the start of an identifier token, treat prefix as empty.
-	// This avoids over-aggressive filtering when no characters have been typed yet.
 	{
 		off := posToOffset(doc.lines, params.Position, doc.text)
 		if _, tk, start, _, ok := tokenAtOffset(doc, off); ok {
@@ -515,65 +474,33 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 			}
 		}
 	}
-	for i := range doc.tokens {
-		sb, _ := tokenSpan(doc, doc.tokens[i])
-		if sb < off {
-			continue
-		}
-		if doc.tokens[i].Type == mindscript.CLROUND && sb == off {
-			nextIsParen = true
-		}
-		break
-	}
 
 	seen := map[string]bool{}
 	items := make([]CompletionItem, 0, 128)
 
-	// Uniform: suggest from all bindings we know in this file (with kind/signature or type)
+	// Suggest from all bindings we know in this file (ambient + locals).
+	// No stored "kind"; infer for UI details only from Sig/TypeNode.
 	for _, b := range doc.binds {
-		if seen[b.Name] {
+		if b.Name == "" || seen[b.Name] {
 			continue
 		}
 		seen[b.Name] = true
-		kind := 6 // Variable
-		switch b.Kind {
-		case "fun", "oracle":
-			kind = 3 // Function
-		case "type":
-			kind = 5 // Class-ish
-		case "param":
-			kind = 6 // Variable (parameter)
-		}
-		detail := b.Kind
-		if (b.Kind == "fun" || b.Kind == "oracle") && b.Sig != "" {
-			detail = b.Sig
-		} else {
-			ty := formatTypeNode(b.TypeNode)
-			if ty != "" && ty != "Any" {
-				if detail != "" {
-					detail = detail + " · " + ty
-				} else {
-					detail = ty
-				}
-			}
-		}
+
+		kind := 6 // LSP: Variable (generic symbol)
+		detail := formatTypeNode(b.TypeNode)
+
 		it := CompletionItem{
 			Label:  b.Name,
 			Kind:   kind,
 			Detail: detail,
 		}
-		// For functions/oracles, provide snippet name($0) unless '(' immediately follows the cursor.
-		if (b.Kind == "fun" || b.Kind == "oracle") && !nextIsParen {
-			it.InsertTextFormat = 2 // Snippet
-			it.InsertText = b.Name + "($0)"
-		}
-		// Prefix filter
+
 		if prefix == "" || strings.HasPrefix(it.Label, prefix) {
 			items = append(items, it)
 		}
 	}
 
-	// Language keywords (MindScript-specific spellings)
+	// Language keywords.
 	keywords := []string{
 		"and", "or", "not",
 		"let", "do", "end", "return", "break", "continue",
@@ -584,23 +511,24 @@ func (s *server) onCompletion(id json.RawMessage, paramsRaw json.RawMessage) {
 		"null", "true", "false",
 	}
 	for _, kw := range keywords {
-		if !seen[kw] {
-			seen[kw] = true
-			it := CompletionItem{Label: kw, Kind: 14} // Keyword
-			if prefix == "" || strings.HasPrefix(it.Label, prefix) {
-				items = append(items, it)
-			}
+		if seen[kw] {
+			continue
+		}
+		seen[kw] = true
+		it := CompletionItem{Label: kw, Kind: 14} // Keyword
+		if prefix == "" || strings.HasPrefix(it.Label, prefix) {
+			items = append(items, it)
 		}
 	}
 
-	// Sort by kind priority (functions, types, vars, keywords) then alphabetically.
+	// Sort by simple priority then alphabetically.
 	priority := func(k int) int {
 		switch k {
-		case 3: // function
+		case 3: // function (unused currently)
 			return 0
-		case 5: // type
+		case 5: // type (unused currently)
 			return 1
-		case 6: // variable
+		case 6: // variable / symbol
 			return 2
 		case 14: // keyword
 			return 3
@@ -634,27 +562,29 @@ func (s *server) onDocumentSymbols(id json.RawMessage, paramsRaw json.RawMessage
 		return
 	}
 
-	out := make([]DocumentSymbol, 0, len(doc.symbols))
-	for _, sym := range doc.symbols {
-		kind := 13 // Variable
-		switch sym.Kind {
-		case "fun":
-			kind = 12 // Function
-		case "type":
-			kind = 5 // Class-ish
+	out := make([]DocumentSymbol, 0, len(doc.binds))
+	for _, b := range doc.binds {
+		// Only real file-local top-levels with ranges become document symbols.
+		if !b.IsTopLevel || !b.HasRange {
+			continue
 		}
-		detail := sym.Kind
-		if sym.Kind == "fun" && sym.Sig != "" {
-			detail = sym.Sig
+		rng := makeRange(doc.lines, b.StartByte, b.EndByte, doc.text)
+		kind := 13 // SymbolKindVariable (generic)
+		detail := ""
+		if b.Sig != "" {
+			detail = b.Sig
+		} else if b.DocFirst != "" {
+			detail = b.DocFirst
 		}
 		out = append(out, DocumentSymbol{
-			Name:           sym.Name,
+			Name:           b.Name,
 			Detail:         detail,
 			Kind:           kind,
-			Range:          sym.Range,
-			SelectionRange: sym.Range,
+			Range:          rng,
+			SelectionRange: rng,
 		})
 	}
+
 	s.sendResponse(id, out, nil)
 }
 
@@ -687,13 +617,14 @@ func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
 	// Resolve the specific binding at the query position.
 	qOff := posToOffset(doc.lines, params.Position, doc.text)
 	bOrigin, ok := nearestBinding(doc, name, qOff)
-	if !ok {
-		// Spec: no origin binding → return [] (do not fall back to lexeme scan).
+	if !ok || !bOrigin.HasRange {
+		// No origin binding with a real location → no references.
 		s.sendResponse(id, []Location{}, nil)
 		return
 	}
 
-	// Shadowing-aware: include only occurrences that resolve to the same nearest binding.
+	// Shadowing-aware: include only occurrences that resolve to the same binding
+	// (matched by defining byte span).
 	locs := []Location{}
 	for i, t := range doc.tokens {
 		if t.Type != mindscript.ID || tokenName(t) != name {
@@ -704,9 +635,8 @@ func (s *server) onReferences(id json.RawMessage, paramsRaw json.RawMessage) {
 			continue
 		}
 		sOff, eOff := tokenSpan(doc, t)
-		// Use the start of the token as its "position"
-		if bTok, ok := nearestBinding(doc, name, sOff); ok {
-			if bTok.Range == bOrigin.Range {
+		if bTok, ok := nearestBinding(doc, name, sOff); ok && bTok.HasRange {
+			if bTok.StartByte == bOrigin.StartByte && bTok.EndByte == bOrigin.EndByte {
 				locs = append(locs, Location{
 					URI:   doc.uri,
 					Range: makeRange(doc.lines, sOff, eOff, doc.text),
@@ -781,7 +711,7 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 	entries := []semEntry{}
 
 	// Emit code tokens, skipping anything inside comment spans.
-	// Track brace depth to classify map-literal keys (`id`/`"str"`) as properties.
+	// Track brace depth to classify map-literal keys as properties.
 	braceDepth := 0
 
 	for i := 0; i < len(doc.tokens); i++ {
@@ -827,7 +757,6 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 		case isKeywordButNotType(tk.Type) || tk.Type == mindscript.BOOLEAN:
 			// Let the bracket pass own do/then/elif/else/end so we don't duplicate tokens.
 			if isKeywordOpen(tk) || isKeywordClose(tk) || isKeywordCloseReopen(tk) {
-				// maintain depth for braces only (not relevant here), then skip emission
 				if tk.Type == mindscript.LCURLY {
 					braceDepth++
 				} else if tk.Type == mindscript.RCURLY && braceDepth > 0 {
@@ -852,21 +781,19 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 
 		case tk.Type == mindscript.ID:
 			name := tokenName(tk)
-			idx := i // avoid O(n) indexOfToken
+			idx := i
 			if idx >= 1 && doc.tokens[idx-1].Type == mindscript.PERIOD {
 				typIdx = semTypes["property"]
 			} else if braceDepth > 0 && i+1 < len(doc.tokens) && doc.tokens[i+1].Type == mindscript.COLON {
 				// `{ key: ... }`
 				typIdx = semTypes["property"]
 			} else {
-				kind := ""
-				if sy, ok := findSymbol(doc, name); ok {
-					kind = sy.Kind
-				}
-				if kind == "fun" || (idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND) {
+				// Without stored Kind, classify IDs using only:
+				//   • local syntax: `name(` → function-ish
+				//   • builtin metadata: VTType → type-ish
+				// Everything else is a variable.
+				if idx+1 < len(doc.tokens) && doc.tokens[idx+1].Type == mindscript.CLROUND {
 					typIdx = semTypes["function"]
-				} else if kind == "type" {
-					typIdx = semTypes["type"]
 				} else if v, err := s.ip.Global.Get(name); err == nil && v.Tag == mindscript.VTType {
 					typIdx = semTypes["type"]
 				} else {
@@ -962,14 +889,13 @@ func (s *server) semanticTokensData(doc *docState, selStart, selEnd int) []uint3
 
 		typIdx := semTypes["bracket"]
 		// Use the *closing* level for close/close-reopen so matching pairs share the same color.
-		// Example: after 'then' we push (depth=1). On 'end', we want the same b* as 'then' → level-1.
 		lvl := level
 		if isKeywordClose(tk) || isKeywordCloseReopen(tk) {
 			if lvl > 0 {
 				lvl--
 			}
 		}
-		modBit := uint32(1 << lvl) // maps to b0..b5 in package.json
+		modBit := uint32(1 << lvl) // maps to b0..b5
 
 		emit := func(segStart, segEnd int) {
 			st := offsetToPos(doc.lines, segStart, doc.text)
@@ -1055,20 +981,15 @@ func (s *server) onSignatureHelp(id json.RawMessage, paramsRaw json.RawMessage) 
 	tIdx := -1
 	if idx, _, _, eOff, ok := tokenAtOffset(doc, off); ok {
 		tIdx = idx
-		// If the cursor is positioned exactly between tokens (e.g., after a comma/space),
-		// tokenAtOffset may still select the next token depending on spans. Prefer the token
-		// whose end is <= off when possible.
 		if eOff <= off {
 			tIdx = idx
 		}
 	} else {
-		// Linear scan to find the last token whose start is <= off.
 		for i := 0; i < len(doc.tokens); i++ {
 			sOff, eOff := tokenSpan(doc, doc.tokens[i])
 			if off < sOff {
 				break
 			}
-			// choose i; if cursor is inside this token we'll stop on next iteration via tokenAtOffset path
 			tIdx = i
 			if off >= sOff && off < eOff {
 				break
@@ -1121,7 +1042,7 @@ found:
 			depth++
 		case mindscript.RROUND:
 			if depth == 0 {
-				i = len(doc.tokens) // break two loops
+				i = len(doc.tokens)
 				break
 			}
 			depth--
@@ -1139,23 +1060,11 @@ found:
 		ActiveParameter: paramIdx,
 	}
 
-	// Prefer a local binding signature if available
+	// Prefer a local binding signature if available (Sig is stored).
 	if name != "" {
 		for _, b := range doc.binds {
-			if b.Name == name && (b.Kind == "fun" || b.Kind == "oracle") && b.Sig != "" {
+			if b.Name == name && b.Sig != "" {
 				resp.Signatures = append(resp.Signatures, SignatureInformation{Label: b.Sig})
-				s.sendResponse(id, resp, nil)
-				return
-			}
-		}
-		// Fall back to top-level symbol sig (if present)
-		for _, sym := range doc.symbols {
-			if sym.Name == name && sym.Kind == "fun" {
-				label := sym.Sig
-				if label == "" {
-					label = name + "(...) -> Any"
-				}
-				resp.Signatures = append(resp.Signatures, SignatureInformation{Label: label})
 				s.sendResponse(id, resp, nil)
 				return
 			}
@@ -1342,29 +1251,30 @@ func (s *server) onTypeDefinition(id json.RawMessage, paramsRaw json.RawMessage)
 	}
 	off := posToOffset(doc.lines, params.Position, doc.text)
 
-	// Fast path: if the cursor is directly on an identifier that names a user-defined type,
-	// jump straight to that type's declaration.
+	// Minimal behavior:
+	//   - If on an identifier, jump to its defining binding (like definition), when it exists.
+	//   - If the nearest binding's TypeNode is an alias ["id", T], jump to T's binding.
+
+	// Direct: if on an identifier, try its own binding.
 	if _, tk, _, _, ok := tokenAtOffset(doc, off); ok && tk.Type == mindscript.ID {
 		idName := tokenName(tk)
 		if idName != "" && !isBuiltinTypeName(idName) {
-			for _, tb := range doc.binds {
-				if tb.Kind == "type" && tb.Name == idName {
-					s.sendResponse(id, Location{URI: doc.uri, Range: tb.Range}, nil)
-					return
-				}
+			if b, ok := nearestBinding(doc, idName, off); ok && b.HasRange {
+				rng := makeRange(doc.lines, b.StartByte, b.EndByte, doc.text)
+				s.sendResponse(id, Location{URI: doc.uri, Range: rng}, nil)
+				return
 			}
 		}
 	}
 
-	// Fallback: from a value usage, inspect its TypeNode for a named type and jump to it.
+	// Fallback: from a value usage, inspect its TypeNode for a named type alias and jump to that.
 	if b, ok := nearestBinding(doc, name, off); ok && len(b.TypeNode) == 2 {
 		if tag, _ := b.TypeNode[0].(string); tag == "id" {
 			if tn, _ := b.TypeNode[1].(string); tn != "" && !isBuiltinTypeName(tn) {
-				for _, tb := range doc.binds {
-					if tb.Kind == "type" && tb.Name == tn {
-						s.sendResponse(id, Location{URI: doc.uri, Range: tb.Range}, nil)
-						return
-					}
+				if tb, ok2 := nearestBinding(doc, tn, 1<<30); ok2 && tb.HasRange {
+					rng := makeRange(doc.lines, tb.StartByte, tb.EndByte, doc.text)
+					s.sendResponse(id, Location{URI: doc.uri, Range: rng}, nil)
+					return
 				}
 			}
 		}

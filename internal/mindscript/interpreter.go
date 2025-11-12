@@ -405,6 +405,10 @@ func (e *Env) Get(name string) (Value, error) {
 	return Value{}, fmt.Errorf("undefined variable: %s", name)
 }
 
+func (e *Env) GetTable() map[string]Value { return e.table }
+
+func (e *Env) GetParent() *Env { return e.parent }
+
 // ParamSpec documents a function parameter (name + declared type). Used by
 // native registration and function introspection.
 type ParamSpec struct {

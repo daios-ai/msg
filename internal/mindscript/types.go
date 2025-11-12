@@ -391,9 +391,10 @@ func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
 			defer func() { delete(seenMap, mo) }()
 
 			out := S{"map"}
-			// Open-world: infer observed fields as optional ("pair").
+			// Open-world: all observed fields are definitely present on this value,
+			// so record them as required ("pair!"). Extra fields remain allowed.
 			for k, vv := range mo.Entries {
-				out = append(out, S{"pair", S{"str", k}, infer(vv)})
+				out = append(out, S{"pair!", S{"str", k}, infer(vv)})
 			}
 			return out
 

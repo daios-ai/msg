@@ -1,2683 +1,3727 @@
-=== BEGIN FILE: cmd/msg-lsp/analysis.go ===
-// analysis.go
+=== BEGIN FILE: internal/mindscript/types.go ===
+// types.go: runtime type & schema system for MindScript.
 //
-// High-level purpose
-// ------------------
-// Single-file analysis for the MindScript LSP. This turns source text into:
-//   • Tokens (for highlighting and layout lints),
-//   • An S-expr AST with span info,
-//   • Bindings (the single source of truth for names, types, and docs),
-//   • Diagnostics (precise span + code + message).
-// It also provides byte↔UTF-16 helpers for LSP ranges and a single-pass, static
-// fold that synthesizes types, checks subtyping, and emits diagnostics.
+// IMPLEMENTATION-ONLY FILE
+// ------------------------
+// This file contains the *private implementation* of the type engine used by
+// the public methods on *Interpreter* that live in interpreter.go:
 //
-// What you get (result shape)
-// ---------------------------
-// analyzeFilePure returns a *pureResult:
-//   • URI, Text, Tokens
-//   • AST, Spans
-//   • Bindings: []pureBinding, each with
-//       - Name: identifier
-//       - Kind: one of {"fun","oracle","type","param","variable"}
-//       - TypeNode: compact S-expr type (e.g., ["array", ["id","Int"]])
-//       - Sig: human string for fun/oracle (e.g., "add(a: Int, b: Int) -> Int")
-//       - DocFull / DocFirst: concatenated annotation text and its first line
-//       - StartByte / EndByte: definition byte span (precise, LSP-agnostic)
-//       - IsTopLevel: true iff defined at file scope
-//     Bindings are the single source of truth. Top-level “symbols” shown in the
-//     UI are derived from Bindings where IsTopLevel == true.
-//   • Diags: []pureDiag with (StartByte, EndByte, Severity, Code, Message)
+//   ResolveType, IsType, IsSubtype, UnifyTypes, ValueToType.
 //
-// How types are synthesized (single pass; static; uniform)
-// --------------------------------------------------------
-// • The fold walks the AST once. It never executes code.
-// • All types are uniform S-exprs. Nullable is a normal constructor: ["unop","?",T].
-// • LUB/GLB/Subtyping live in lub.go and are shape-aware:
-//     - Int <: Num <: Any. Arrays covariant. Maps fieldwise.
-//     - Enums by set semantics; widen to base primitive when needed.
-//     - Arrows: GLB(param) -> LUB(ret). If param GLB fails, widen to Any.
-//     - Opaque aliases (non-builtin ids) compare by identical atom only.
-// • Open-world value maps: only observed fields are recorded; extra may exist.
-//   Typed map parameters (in function signatures) impose required/optional keys;
-//   inside bodies, parameters are trusted to match their declared types.
-// • Oracles: their declared return type is made nullable at definition time.
-// • Currying: under-application yields a residual arrow; over-application flags
-//   overflow; exact application yields the declared (possibly nullable) return.
+// Those exported methods are thin wrappers that delegate to the lower-case
+// functions defined here: resolveType, isType, isSubtype, unifyTypes,
+// valueToTypeS (plus helpers like litToValue/equalS).
 //
-// Diagnostics (examples)
-// ----------------------
-// • Names/targets: MS-UNKNOWN-NAME, MS-INVALID-ASSIGN-TARGET
-// • Calls: MS-ARG-OVERFLOW, MS-ARG-TYPE-MISMATCH (incl. enum non-member)
-// • Returns: MS-RET-TYPE-MISMATCH (structural check, not string compare)
-// • Flow/types: MS-MAYBE-NULL-UNSAFE, MS-MAP-MISSING-KEY, MS-ARRAY-HETEROGENEOUS
-// • Ops: MS-BITWISE-NONINT, MS-COMPARISON-TYPE-MISMATCH, MS-DIV-BY-ZERO-CONST
+// Goals / design (practical, JSON-friendly, duck-typed):
 //
-// Organization
-// ------------
-// • Public shims: analyzeFilePure (pure), (*server).analyze (publishes diags).
-// • A `//// END_OF_PUBLIC` separator marks the public/private boundary.
-// • Helpers + single-pass fold live below; LUB/GLB/subtyping in lub.go.
+// OVERVIEW
+// --------
+// This file implements MindScript’s *runtime* type system. Types are represented
+// as S-expressions (the same light-weight shape the parser produces) and remain
+// entirely structural. The system is designed for practical, JSON-friendly
+// validation and inference:
 //
-// Notes
-// -----
-// • Single pass over AST with tokens/spans available.
-// • No body-based inference for function signatures.
-// • Bindings carry Kind and IsTopLevel; symbols are derived from bindings.
+//   - `Value → Type` inference (`ValueToType`) infers loose shapes, e.g.
+//     {name:"Raffa"} → {"map", {"pair", {"str","name"}, {"id","Str"}}}
+//     Arrays unify element types conservatively; objects are “open-world”.
+//   - `IsType(v, T)` checks whether a runtime `Value` conforms to `T`.
+//   - `IsSubtype(A, B)` is a *structural* subtyping relation.
+//   - Arrays are covariant in element type.
+//   - Objects require that all *required* fields of `B` exist, with compatible
+//     types, and *requiredness cannot be relaxed*.
+//   - Extra fields on values are allowed (open-world).
+//   - Functions use parameter contravariance and return covariance.
+//   - `Int <: Num`, and `T?` means nullable.
+//   - `UnifyTypes(A, B)` computes a least common supertype (LUB) used by
+//     inference (e.g., arrays with mixed contents).
+//   - **Modules:** Runtime values tagged `VTModule` are treated as **maps** for
+//     type-checking and inference purposes (they normalize via `AsMapValue`).
+//
+// CANONICALIZATION (alias nodes)
+// ------------------------------
+// A key improvement in this implementation is *alias canonicalization*.
+//
+//  • Any non-builtin type reference (local or module-qualified) is resolved to a
+//    stable, pointer-identified alias node:   ("alias", *TypeValue)
+//
+//  • Builtin type names remain as ("id", "Int"|"Num"|"Str"|"Bool"|"Null"|"Any"|"Type").
+//
+//  • Structural nodes ("array", "map", "unop ?","binop ->", "enum") are resolved
+//    recursively while keeping alias nodes *opaque* — we *do not* inline-expand
+//    aliases during ResolveType. This produces a canonical, name-agnostic
+//    representation so that `M.T` and a local `T = M.T` unify by *pointer
+//    identity* of the exported `*TypeValue`.
+//
+// EQUIRECURSIVE COMPARISON
+// ------------------------
+// Both `isType` and `isSubtype` are implemented coinductively with cycle
+// breaking using memo tables keyed on:
+//   • value-pointer × type-node-pointer (for isType), and
+//   • (left-node, right-node) identity (for isSubtype),
+// augmented so that ("alias", *TypeValue) keys by the *TypeValue pointer*.
+// This makes recursive types and module-qualified aliases compare correctly.
+//
+// DEPENDENCIES (other files)
+// --------------------------
+// • parser.go
+//   - `type S = []any`  (S-expression node type)
+//
+// • interpreter.go
+//   - Runtime value model: `Value`, tags (VTNull/VTBool/VTInt/...),
+//     constructors (`Null`, `Bool`, `Int`, `Num`, `Str`, `Arr`)
+//   - `MapObject` (map entries + key annotations), `Fun`, `TypeValue`
+//   - Environments: `Env` with `Get/Set/Define`
+//   - `type Interpreter` (receiver for public API methods)
+//
+// • vm.go (indirect): no direct calls here, but shares `Value` semantics.
+//
+// PUBLIC VS PRIVATE
+// -----------------
+// PUBLIC  : Nothing.
+//
+// PRIVATE : All concrete algorithms and helpers: resolveType, isType,
+//           isSubtype, unifyTypes, valueToTypeS, literal conversion,
+//           structural S-equality, and field extraction.
 
-package main
+package mindscript
+
+import (
+	"unsafe"
+)
+
+//// END_OF_PUBLIC
+
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+// -----------------------------
+// Helpers
+// -----------------------------
+
+// stripAnnot unwraps annotation wrappers inside type ASTs:
+//
+//	("annot", ("str", doc), T)  =>  T
+//
+// It repeats until the outer node is not "annot".
+func stripAnnot(t S) S {
+	for len(t) >= 3 {
+		tag, ok := t[0].(string)
+		if !ok || tag != "annot" {
+			break
+		}
+		t = t[2].(S)
+	}
+	return t
+}
+
+func isBuiltinTypeName(name string) bool {
+	switch name {
+	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type", "Handle":
+		return true
+	default:
+		return false
+	}
+}
+
+func isId(t S, name string) bool {
+	return len(t) >= 2 && t[0].(string) == "id" && t[1].(string) == name
+}
+
+// ("map", ("pair"| "pair!", ("str",k), T)...)
+type objField struct {
+	required bool
+	typ      S
+}
+
+func mapTypeFields(t S) map[string]objField {
+	fs := map[string]objField{}
+	for i := 1; i < len(t); i++ {
+		p := t[i].(S)
+		if len(p) < 3 {
+			continue
+		}
+		ptag := p[0].(string)           // "pair" or "pair!"
+		keyNode := stripAnnot(p[1].(S)) // allow annotated keys
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			continue
+		}
+		k := keyNode[1].(string)
+		required := ptag == "pair!"
+		fs[k] = objField{required: required, typ: stripAnnot(p[2].(S))}
+	}
+	return fs
+}
+
+// Structural equality for S-exprs with special cases:
+//   - "map" and "enum" stay order-insensitive as before.
+//   - NEW: ("alias", *TypeValue) compares by pointer identity.
+func equalLiteralS(a, b S) bool {
+
+	// Compares two primitive S nodes or scalars used inside S.
+	equalPrimitiveS := func(x, y any) bool {
+		switch xv := x.(type) {
+		case []any: // covers S too
+			yv, ok := y.([]any)
+			if !ok {
+				return false
+			}
+			return equalLiteralS(xv, yv)
+		case string:
+			ys, ok := y.(string)
+			return ok && xv == ys
+		case int64:
+			yi, ok := y.(int64)
+			return ok && xv == yi
+		case float64:
+			yf, ok := y.(float64)
+			return ok && xv == yf
+		case bool:
+			yb, ok := y.(bool)
+			return ok && xv == yb
+		default:
+			return x == y
+		}
+	}
+
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+
+	ta, ok := a[0].(string)
+	if !ok {
+		return false
+	}
+	tb, ok := b[0].(string)
+	if !ok || ta != tb {
+		return false
+	}
+
+	if ta == "alias" {
+		if len(a) < 2 || len(b) < 2 {
+			return false
+		}
+		atv, ok1 := a[1].(*TypeValue)
+		btv, ok2 := b[1].(*TypeValue)
+		return ok1 && ok2 && atv == btv
+	}
+
+	// Order-insensitive equality for maps.
+	if ta == "map" {
+		fa := mapTypeFields(a)
+		fb := mapTypeFields(b)
+		if len(fa) != len(fb) {
+			return false
+		}
+		for k, va := range fa {
+			vb, ok := fb[k]
+			if !ok || va.required != vb.required || !equalLiteralS(va.typ, vb.typ) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Order-insensitive equality for enums.
+	if ta == "enum" {
+		if len(a) != len(b) { // quick length check
+			return false
+		}
+	outer:
+		for i := 1; i < len(a); i++ {
+			for j := 1; j < len(b); j++ {
+				if equalLiteralS(a[i].(S), b[j].(S)) {
+					continue outer
+				}
+			}
+			return false
+		}
+		return true
+	}
+
+	for i := 1; i < len(a); i++ {
+		if !equalPrimitiveS(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// --- Handle type helpers ---
+
+// handleType builds the canonical type S for a given handle kind.
+func handleType(kind string) S {
+	return S{"get", S{"id", "Handle"}, S{"str", kind}}
+}
+
+// isHandleKindNode reports whether t is of the form: ("get", ("id","Handle"), ("str", kind)).
+func isHandleKindNode(t S) (kind string, ok bool) {
+	if len(t) < 3 || t[0].(string) != "get" {
+		return "", false
+	}
+	base, _ := t[1].(S)
+	key, _ := t[2].(S)
+	if len(base) >= 2 && base[0].(string) == "id" && base[1].(string) == "Handle" &&
+		len(key) >= 2 && key[0].(string) == "str" {
+		return key[1].(string), true
+	}
+	return "", false
+}
+
+// Convert a literal S-expr (incl. arrays/maps) to a runtime Value.
+// Allowed forms: null/bool/int/num/str/array/map with literal children.
+// Map pairs may be "pair" or "pair!" and keys must be ("str", <k>).
+func (ip *Interpreter) litToValue(lit S) (Value, bool) {
+	if len(lit) == 0 {
+		return Null, false
+	}
+	switch lit[0].(string) {
+	case "null":
+		return Null, true
+	case "bool":
+		return Bool(lit[1].(bool)), true
+	case "int":
+		return Int(lit[1].(int64)), true
+	case "num":
+		return Num(lit[1].(float64)), true
+	case "str":
+		return Str(lit[1].(string)), true
+	case "array":
+		out := make([]Value, 0, len(lit)-1)
+		for i := 1; i < len(lit); i++ {
+			v, ok := ip.litToValue(lit[i].(S))
+			if !ok {
+				return Null, false
+			}
+			out = append(out, v)
+		}
+		return Arr(out), true
+	case "map":
+		m := make(map[string]Value, len(lit)-1)
+		for i := 1; i < len(lit); i++ {
+			p := lit[i].(S)
+			if len(p) < 3 {
+				return Null, false
+			}
+			keyNode := p[1].(S)
+			if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+				return Null, false
+			}
+			k := keyNode[1].(string)
+			v, ok := ip.litToValue(p[2].(S))
+			if !ok {
+				return Null, false
+			}
+			m[k] = v
+		}
+		return Map(m), true
+	default:
+		return Null, false
+	}
+}
+
+// -----------------------------
+// Value → Type inference (typeOf-like behavior)
+// -----------------------------
+
+// valueToTypeS infers a structural type for v. This wrapper seeds cycle guards.
+func (ip *Interpreter) valueToTypeS(v Value, env *Env) S {
+	// Cycle guards for arrays and maps so self-references don't produce
+	// infinitely deep or self-nested element/object types. Any back-edge
+	// collapses to Any (conservative, JSON-friendly).
+	seenArr := map[*ArrayObject]bool{}
+	seenMap := map[*MapObject]bool{}
+
+	var infer func(Value) S
+	infer = func(v Value) S {
+		switch v.Tag {
+		case VTNull:
+			return S{"id", "Null"}
+		case VTBool:
+			return S{"id", "Bool"}
+		case VTInt:
+			return S{"id", "Int"}
+		case VTNum:
+			return S{"id", "Num"}
+		case VTStr:
+			return S{"id", "Str"}
+
+		case VTArray:
+			ao := v.Data.(*ArrayObject)
+
+			// If we're already walking this array, it's a cycle → Any.
+			if seenArr[ao] {
+				return S{"id", "Any"}
+			}
+			seenArr[ao] = true
+			defer func() { delete(seenArr, ao) }()
+
+			xs := ao.Elems
+			if len(xs) == 0 {
+				return S{"array", S{"id", "Any"}}
+			}
+
+			// If any element is exactly this array → element type Any.
+			for _, e := range xs {
+				if e.Tag == VTArray && e.Data.(*ArrayObject) == ao {
+					return S{"array", S{"id", "Any"}}
+				}
+			}
+
+			elem := infer(xs[0])
+			for i := 1; i < len(xs); i++ {
+				elem = ip.unifyTypes(elem, infer(xs[i]), env)
+				if isId(elem, "Any") {
+					// Can't get more specific; bail early.
+					break
+				}
+			}
+			return S{"array", elem}
+
+		case VTMap:
+			mo := v.Data.(*MapObject)
+
+			// Cycle guard for maps.
+			if seenMap[mo] {
+				return S{"id", "Any"}
+			}
+			seenMap[mo] = true
+			defer func() { delete(seenMap, mo) }()
+
+			out := S{"map"}
+			// Open-world: infer observed fields as optional ("pair").
+			for k, vv := range mo.Entries {
+				out = append(out, S{"pair", S{"str", k}, infer(vv)})
+			}
+			return out
+
+		case VTModule:
+			// Treat modules structurally as maps.
+			return infer(AsMapValue(v))
+
+		case VTFun:
+			f := v.Data.(*Fun)
+			// Resolve each piece in the function's own env to avoid <type>
+			rt := ip.resolveType(f.ReturnType, f.Env)
+			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+				pt := ip.resolveType(f.ParamTypes[i], f.Env)
+				rt = S{"binop", "->", pt, rt}
+			}
+			return rt
+
+		case VTHandle:
+			h := v.Data.(*Handle)
+			if h == nil || h.Kind == "" {
+				return S{"id", "Any"}
+			}
+			return handleType(h.Kind)
+
+		case VTType:
+			return S{"id", "Type"}
+
+		default:
+			return S{"id", "Any"}
+		}
+	}
+
+	return infer(v)
+}
+
+// -----------------------------
+// Alias-based canonical resolution
+// -----------------------------
+
+// --- replace the old resolveModuleTypeAlias with these helpers ---
+
+// peelGetChain collects rightward keys from nested ("get", base, "str") nodes.
+// It returns (baseNode, keysRightToLeft).
+func peelGetChain(t S) (S, []string) {
+	t = stripAnnot(t)
+	keys := []string{}
+	node := t
+	for len(node) >= 3 && node[0].(string) == "get" {
+		keyNode, _ := node[2].(S)
+		if len(keyNode) < 2 || keyNode[0].(string) != "str" {
+			return t, nil
+		}
+		keys = append(keys, keyNode[1].(string))
+		base, _ := node[1].(S)
+		node = base
+	}
+	return node, keys
+}
+
+// resolveTypePath walks a ("get", ...) chain against runtime values, switching
+// the lookup view when encountering a Type (use its Env) and stepping through
+// modules by reading their exported map. On success returns the terminal *TypeValue.
+func (ip *Interpreter) resolveTypePath(env *Env, t S) (*TypeValue, bool) {
+	base, keysRL := peelGetChain(t)
+	if len(keysRL) == 0 {
+		return nil, false
+	}
+
+	// Resolve the base to a runtime Value in the given env.
+	var cur Value
+	switch {
+	case len(base) >= 2 && base[0].(string) == "id":
+		v, err := env.Get(base[1].(string))
+		if err != nil {
+			return nil, false
+		}
+		cur = v
+
+	case len(base) >= 3 && base[0].(string) == "get":
+		// Recurse: resolve the inner path first.
+		tv, ok := ip.resolveTypePath(env, base)
+		if !ok {
+			return nil, false
+		}
+		// The base resolved to a Type; switch view to its Env to continue.
+		cur = TypeValIn(tv.Ast, tv.Env)
+
+	default:
+		return nil, false
+	}
+
+	// Walk keys left→right (we collected right→left).
+	for i := len(keysRL) - 1; i >= 0; i-- {
+		switch cur.Tag {
+		case VTModule:
+			mod := cur.Data.(*Module)
+			v, ok := mod.get(keysRL[i])
+			if !ok {
+				return nil, false
+			}
+			cur = v
+
+		case VTType:
+			// Switch lookup view to the type's own environment.
+			tv := cur.Data.(*TypeValue)
+			if tv.Env == nil {
+				return nil, false
+			}
+			v, err := tv.Env.Get(keysRL[i])
+			if err != nil {
+				return nil, false
+			}
+			cur = v
+
+		default:
+			return nil, false
+		}
+	}
+
+	if cur.Tag != VTType {
+		return nil, false
+	}
+	return cur.Data.(*TypeValue), true
+}
+
+// resolveType canonicalizes a type S-expression in env:
+//   - Builtins stay as ("id", "...").
+//   - Any non-builtin type identifier or qualified get resolves to a stable,
+//     *pointer-identified* alias node: ("alias", *TypeValue).
+//   - Structure nodes ("array", "map", "unop ?","binop ->", "enum") are
+//     recursively resolved while *keeping* alias nodes opaque (no inline
+//     expansion). This gives us a canonical, name-agnostic graph suitable for
+//     equirecursive comparison across modules.
+//
+// NOTE: By avoiding inline expansion and using ("alias", *TypeValue), two
+// references to the same exported type (e.g., M.T and a local T = M.T) become
+// literally the same anchor, regardless of spelling.
+func (ip *Interpreter) resolveType(t S, env *Env) S {
+	t = stripAnnot(t)
+	if len(t) == 0 {
+		return t
+	}
+
+	// Helper: build alias if a local name resolves to a VTType.
+	// Self-cycle guard: let T = type T  must not aliasify; keep ("id","T").
+	aliasOf := func(e *Env, name string) (S, bool) {
+		if e == nil || isBuiltinTypeName(name) {
+			return nil, false
+		}
+		v, err := e.Get(name)
+		if err != nil || v.Tag != VTType {
+			return nil, false
+		}
+		tv := v.Data.(*TypeValue)
+		root := stripAnnot(tv.Ast)
+		if len(root) >= 2 && root[0].(string) == "id" && root[1].(string) == name {
+			return nil, false
+		}
+		return S{"alias", tv}, true
+	}
+
+	switch t[0].(string) {
+	case "id":
+		if a, ok := aliasOf(env, t[1].(string)); ok {
+			return a
+		}
+		return t // builtin or unknown stays as-is
+
+	case "get":
+		// Robust qualified resolution: walk through modules and types (env switch on type).
+		if tv, ok := ip.resolveTypePath(env, t); ok {
+			return S{"alias", tv}
+		}
+		return t
+
+	case "unop":
+		if len(t) >= 3 && t[1].(string) == "?" {
+			return S{"unop", "?", ip.resolveType(t[2].(S), env)}
+		}
+		return t
+
+	case "array":
+		if len(t) == 2 {
+			return S{"array", ip.resolveType(t[1].(S), env)}
+		}
+		out := S{"array"}
+		for i := 1; i < len(t); i++ {
+			out = append(out, ip.resolveType(t[i].(S), env))
+		}
+		return out
+
+	case "map":
+		out := S{"map"}
+		for i := 1; i < len(t); i++ {
+			p := t[i].(S) // ("pair"|"pair!", ("str",k), T)
+			tag := p[0].(string)
+			key := p[1].(S)
+			out = append(out, S{tag, key, ip.resolveType(p[2].(S), env)})
+		}
+		return out
+
+	case "enum":
+		// Enum literals stay literal; we don't resolve inside.
+		return t
+
+	case "binop":
+		if len(t) >= 4 && t[1].(string) == "->" {
+			return S{"binop", "->", ip.resolveType(t[2].(S), env), ip.resolveType(t[3].(S), env)}
+		}
+		return t
+
+	default:
+		return t
+	}
+}
+
+// -----------------------------
+// Runtime type checking
+// -----------------------------
+
+// isType checks whether runtime value v conforms to type t under env.
+// We canonicalize t once (resolveType), then check structurally.
+// It fully supports nested function types and alias nodes.
+func (ip *Interpreter) isType(v Value, t S, env *Env) bool {
+	t = stripAnnot(ip.resolveType(t, env))
+
+	// Coinductive memo: (valuePtr, nodeKey(t))
+	// nodeKey mirrors isSubtype: aliases key by *TypeValue, others by &t[0].
+	seen := make(map[[2]unsafe.Pointer]struct{})
+
+	nodeKey := func(t S) unsafe.Pointer {
+		if len(t) >= 2 && t[0].(string) == "alias" {
+			if tv, ok := t[1].(*TypeValue); ok {
+				return unsafe.Pointer(tv)
+			}
+		}
+		return unsafe.Pointer(&t[0])
+	}
+
+	// Build value pointer key for arrays/maps/funs for memoization.
+	valKey := func(v Value) unsafe.Pointer {
+		switch v.Tag {
+		case VTMap:
+			return unsafe.Pointer(v.Data.(*MapObject))
+		case VTArray:
+			return unsafe.Pointer(v.Data.(*ArrayObject))
+		case VTFun:
+			return unsafe.Pointer(v.Data.(*Fun))
+		default:
+			return nil
+		}
+	}
+
+	var check func(Value, S) bool
+	check = func(v Value, t S) bool {
+		t = stripAnnot(t)
+		if len(t) == 0 {
+			return false
+		}
+
+		// Recognize Handle."kind" at any depth (e.g., under nullable T?).
+		if kind, ok := isHandleKindNode(t); ok {
+			if v.Tag != VTHandle {
+				return false
+			}
+			h := v.Data.(*Handle)
+			return h != nil && h.Kind == kind
+		}
+
+		// Modules behave structurally as maps.
+		v = AsMapValue(v)
+
+		vp := valKey(v)
+		nk := nodeKey(t)
+		// For structured values (vp != nil), memoize all nodes.
+		// For scalars (vp == nil), memoize only alias nodes to break unfold cycles.
+		if vp != nil || (len(t) >= 2 && t[0].(string) == "alias") {
+			k := [2]unsafe.Pointer{vp, nk}
+			if _, ok := seen[k]; ok {
+				return true
+			}
+			seen[k] = struct{}{}
+		}
+
+		switch t[0].(string) {
+		case "id":
+			switch t[1].(string) {
+			case "Any":
+				return true
+			case "Null":
+				return v.Tag == VTNull
+			case "Bool":
+				return v.Tag == VTBool
+			case "Int":
+				return v.Tag == VTInt
+			case "Num":
+				return v.Tag == VTInt || v.Tag == VTNum
+			case "Str":
+				return v.Tag == VTStr
+			case "Type":
+				return v.Tag == VTType
+			default:
+				// Non-builtin unresolved id: reject (canonical resolver leaves only builtins or aliases)
+				return false
+			}
+
+		case "alias":
+			// Unfold against the alias's own env; the unified memo above
+			// prevents both structured and scalar infinite unfolding.
+			tv := t[1].(*TypeValue)
+			return check(v, ip.resolveType(tv.Ast, tv.Env))
+
+		case "unop": // nullable
+			if t[1].(string) != "?" {
+				return false
+			}
+			if v.Tag == VTNull {
+				return true
+			}
+			return check(v, t[2].(S))
+
+		case "array":
+			if v.Tag != VTArray {
+				return false
+			}
+			elemT := S{"id", "Any"}
+			if len(t) == 2 {
+				elemT = t[1].(S)
+			}
+			for _, e := range v.Data.(*ArrayObject).Elems {
+				if !check(e, elemT) {
+					return false
+				}
+			}
+			return true
+
+		case "map":
+			if v.Tag != VTMap {
+				return false
+			}
+			fs := mapTypeFields(t)
+			m := v.Data.(*MapObject).Entries
+			for name, f := range fs {
+				val, ok := m[name]
+				if !ok {
+					if f.required {
+						return false
+					}
+					continue
+				}
+				if !check(val, f.typ) {
+					return false
+				}
+			}
+			return true
+
+		case "enum":
+			for i := 1; i < len(t); i++ {
+				if lit, ok := ip.litToValue(t[i].(S)); ok && ip.deepEqual(lit, v) {
+					return true
+				}
+			}
+			return false
+
+		case "binop": // function type expected
+			if t[1].(string) != "->" || v.Tag != VTFun {
+				return false
+			}
+			// Build the function value's fully-resolved signature in its own env.
+			f := v.Data.(*Fun)
+			rt := stripAnnot(ip.resolveType(f.ReturnType, f.Env))
+			for i := len(f.ParamTypes) - 1; i >= 0; i-- {
+				pt := stripAnnot(ip.resolveType(f.ParamTypes[i], f.Env))
+				rt = S{"binop", "->", pt, rt}
+			}
+			// CRITICAL: Compare under the *expected-type's* env (the env passed into isType),
+			// so module-qualified names/aliases from the expected side resolve properly.
+			// 'rt' already contains alias nodes for the value side and does not require this env.
+			return ip.isSubtype(rt, t, env)
+		}
+
+		return false
+	}
+
+	return check(v, t)
+}
+
+// -----------------------------
+// Structural subtyping  t1 <: t2
+// -----------------------------
+
+// isSubtype checks a <: b structurally. Both sides are first canonicalized by
+// resolveType(t, env). It supports equirecursive types via a coinductive memo
+// keyed by the underlying node identity; for ("alias", *TypeValue) it keys on
+// the *TypeValue pointer*, so module-qualified names unify with local aliases.
+func (ip *Interpreter) isSubtype(a, b S, env *Env) bool {
+	a = stripAnnot(ip.resolveType(a, env))
+	b = stripAnnot(ip.resolveType(b, env))
+
+	// Produce a stable pointer identity for memo keys:
+	//  • for ("alias", *TypeValue) use the tv pointer,
+	//  • otherwise use &node[0] (address of tag cell).
+	nodeKey := func(t S) unsafe.Pointer {
+		if len(t) >= 2 && t[0].(string) == "alias" {
+			if tv, ok := t[1].(*TypeValue); ok {
+				return unsafe.Pointer(tv)
+			}
+		}
+		return unsafe.Pointer(&t[0])
+	}
+
+	seen := make(map[[2]unsafe.Pointer]struct{})
+
+	var sub func(S, S) bool
+	sub = func(x, y S) bool {
+		x = stripAnnot(x)
+		y = stripAnnot(y)
+		if len(x) == 0 || len(y) == 0 {
+			return false
+		}
+
+		k := [2]unsafe.Pointer{nodeKey(x), nodeKey(y)}
+		if _, ok := seen[k]; ok {
+			return true
+		}
+		seen[k] = struct{}{}
+
+		// Fast equality
+		if equalLiteralS(x, y) {
+			return true
+		}
+
+		// Top
+		if isId(y, "Any") {
+			return true
+		}
+
+		// Nullable helpers
+		isOpt := func(t S) bool { return len(t) >= 3 && t[0].(string) == "unop" && t[1].(string) == "?" }
+		unwrap := func(t S) S { return t[2].(S) }
+
+		// Handle kinds: nominal equality only
+		if ak, okA := isHandleKindNode(x); okA {
+			if bk, okB := isHandleKindNode(y); okB {
+				return ak == bk
+			}
+			// So x <: y is false when y isn't the same Handle."kind".
+		}
+
+		if isOpt(y) {
+			if sub(x, unwrap(y)) {
+				return true
+			}
+			if isId(x, "Null") {
+				return true
+			}
+		}
+		// Int <: Num
+		if isId(x, "Int") && isId(y, "Num") {
+			return true
+		}
+		// A? <: B? iff A <: B
+		if isOpt(x) && isOpt(y) {
+			return sub(unwrap(x), unwrap(y))
+		}
+		// Identical primitive ids
+		if len(x) >= 2 && x[0].(string) == "id" && len(y) >= 2 && y[0].(string) == "id" {
+			return x[1].(string) == y[1].(string)
+		}
+
+		// Alias unfolding (lazily)
+		if len(x) >= 2 && x[0].(string) == "alias" {
+			tv := x[1].(*TypeValue)
+			return sub(ip.resolveType(tv.Ast, tv.Env), y)
+		}
+		if len(y) >= 2 && y[0].(string) == "alias" {
+			tv := y[1].(*TypeValue)
+			return sub(x, ip.resolveType(tv.Ast, tv.Env))
+		}
+
+		switch x[0].(string) {
+		case "array":
+			if y[0].(string) != "array" {
+				return false
+			}
+			xe := S{"id", "Any"}
+			ye := S{"id", "Any"}
+			if len(x) == 2 {
+				xe = x[1].(S)
+			}
+			if len(y) == 2 {
+				ye = y[1].(S)
+			}
+			return sub(xe, ye) // covariance
+
+		case "map":
+			if y[0].(string) != "map" {
+				return false
+			}
+			reqY := mapTypeFields(y)
+			haveX := mapTypeFields(x)
+			for name, fy := range reqY {
+				fx, ok := haveX[name]
+				if !ok {
+					if fy.required {
+						return false
+					}
+					continue
+				}
+				if fy.required && !fx.required {
+					return false
+				}
+				if !sub(fx.typ, fy.typ) {
+					return false
+				}
+			}
+			return true
+
+		case "enum":
+			// Enum⊆Enum by literal inclusion
+			if y[0].(string) == "enum" {
+				for i := 1; i < len(x); i++ {
+					found := false
+					for j := 1; j < len(y); j++ {
+						if equalLiteralS(x[i].(S), y[j].(S)) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						return false
+					}
+				}
+				return true
+			}
+			// Enum <: T if each member fits T
+			for i := 1; i < len(x); i++ {
+				lv, ok := ip.litToValue(x[i].(S))
+				if !ok || !ip.isType(lv, y, nil) {
+					return false
+				}
+			}
+			return true
+
+		case "binop":
+			if x[1].(string) != "->" || y[0].(string) != "binop" || y[1].(string) != "->" {
+				return false
+			}
+			xp, xr := x[2].(S), x[3].(S)
+			yp, yr := y[2].(S), y[3].(S)
+			// Param contravariance, return covariance
+			return sub(yp, xp) && sub(xr, yr)
+		}
+
+		return false
+	}
+
+	return sub(a, b)
+}
+
+// -----------------------------
+// Unification (least common supertype)
+// -----------------------------
+
+func (ip *Interpreter) unifyTypes(t1 S, t2 S, env *Env) S {
+	// Canonicalize both sides first (alias-aware)
+	t1 = stripAnnot(ip.resolveType(t1, env))
+	t2 = stripAnnot(ip.resolveType(t2, env))
+
+	// Helper: expand a single alias once (for LUB we can unfold to compare)
+	expandAlias := func(t S) S {
+		if len(t) >= 2 && t[0].(string) == "alias" {
+			tv := t[1].(*TypeValue)
+			return stripAnnot(ip.resolveType(tv.Ast, tv.Env))
+		}
+		return t
+	}
+
+	// Any absorbs
+	if isId(t1, "Any") {
+		return t1
+	}
+	if isId(t2, "Any") {
+		return t2
+	}
+
+	// ---- Null / Nullable ----
+	if isId(t1, "Null") && isId(t2, "Null") {
+		return t1
+	}
+	if isId(t1, "Null") && len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?" {
+		return t2
+	}
+	if isId(t2, "Null") && len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?" {
+		return t1
+	}
+	if isId(t1, "Null") {
+		return S{"unop", "?", t2}
+	}
+	if isId(t2, "Null") {
+		return S{"unop", "?", t1}
+	}
+
+	// Nullable normalization
+	isOpt1 := len(t1) >= 3 && t1[0].(string) == "unop" && t1[1].(string) == "?"
+	isOpt2 := len(t2) >= 3 && t2[0].(string) == "unop" && t2[1].(string) == "?"
+	if isOpt1 && isOpt2 {
+		u := ip.unifyTypes(t1[2].(S), t2[2].(S), env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+	if isOpt1 {
+		u := ip.unifyTypes(t1[2].(S), t2, env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+	if isOpt2 {
+		u := ip.unifyTypes(t1, t2[2].(S), env)
+		if isId(u, "Any") {
+			return u
+		}
+		return S{"unop", "?", u}
+	}
+
+	// If either side is an alias, unfold once for comparison.
+	if len(t1) >= 2 && t1[0].(string) == "alias" {
+		t1 = expandAlias(t1)
+	}
+	if len(t2) >= 2 && t2[0].(string) == "alias" {
+		t2 = expandAlias(t2)
+	}
+
+	// ---- Handle kinds (nominal) ----
+	if k1, ok1 := isHandleKindNode(t1); ok1 {
+		if k2, ok2 := isHandleKindNode(t2); ok2 {
+			if k1 == k2 {
+				return t1
+			}
+			return S{"id", "Any"}
+		}
+	}
+
+	// ---- Primitives (incl. Int ⊔ Num = Num) ----
+	if len(t1) >= 2 && len(t2) >= 2 && t1[0].(string) == "id" && t2[0].(string) == "id" {
+		n1 := t1[1].(string)
+		n2 := t2[1].(string)
+		if n1 == n2 {
+			return t1
+		}
+		if (n1 == "Int" && n2 == "Num") || (n1 == "Num" && n2 == "Int") {
+			return S{"id", "Num"}
+		}
+		return S{"id", "Any"}
+	}
+
+	// ---- Arrays ----
+	if t1[0].(string) == "array" && t2[0].(string) == "array" {
+		e1 := S{"id", "Any"}
+		e2 := S{"id", "Any"}
+		if len(t1) == 2 {
+			e1 = t1[1].(S)
+		}
+		if len(t2) == 2 {
+			e2 = t2[1].(S)
+		}
+		elem := ip.unifyTypes(e1, e2, env)
+		return S{"array", elem}
+	}
+	if t1[0].(string) == "array" || t2[0].(string) == "array" {
+		return S{"id", "Any"}
+	}
+
+	// ---- Maps: fieldwise unify; required OR ----
+	if t1[0].(string) == "map" && t2[0].(string) == "map" {
+		f1 := mapTypeFields(t1)
+		f2 := mapTypeFields(t2)
+		keys := map[string]struct{}{}
+		for k := range f1 {
+			keys[k] = struct{}{}
+		}
+		for k := range f2 {
+			keys[k] = struct{}{}
+		}
+		out := S{"map"}
+		for k := range keys {
+			s1, ok1 := f1[k]
+			s2, ok2 := f2[k]
+			switch {
+			case ok1 && ok2:
+				ut := ip.unifyTypes(s1.typ, s2.typ, env)
+				req := s1.required && s2.required
+				tag := "pair"
+				if req {
+					tag = "pair!"
+				}
+				out = append(out, S{tag, S{"str", k}, ut})
+			case ok1 && !ok2:
+				out = append(out, S{"pair", S{"str", k}, s1.typ})
+			case !ok1 && ok2:
+				out = append(out, S{"pair", S{"str", k}, s2.typ})
+			}
+		}
+		return out
+	}
+	if t1[0].(string) == "map" || t2[0].(string) == "map" {
+		return S{"id", "Any"}
+	}
+
+	// ---- Enums ----
+	if t1[0].(string) == "enum" && t2[0].(string) == "enum" {
+		union := S{"enum"}
+		seen := func(x S) bool {
+			for i := 1; i < len(union); i++ {
+				if equalLiteralS(union[i].(S), x) {
+					return true
+				}
+			}
+			return false
+		}
+		for i := 1; i < len(t1); i++ {
+			x := t1[i].(S)
+			if !seen(x) {
+				union = append(union, x)
+			}
+		}
+		for i := 1; i < len(t2); i++ {
+			x := t2[i].(S)
+			if !seen(x) {
+				union = append(union, x)
+			}
+		}
+		return union
+	}
+	// enum ⊔ Type → Type if all members fit; else Any
+	if t1[0].(string) == "enum" {
+		all := true
+		for i := 1; i < len(t1); i++ {
+			lv, ok := ip.litToValue(t1[i].(S))
+			if !ok || !ip.isType(lv, t2, env) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return t2
+		}
+		return S{"id", "Any"}
+	}
+	if t2[0].(string) == "enum" {
+		all := true
+		for i := 1; i < len(t2); i++ {
+			lv, ok := ip.litToValue(t2[i].(S))
+			if !ok || !ip.isType(lv, t1, env) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return t1
+		}
+		return S{"id", "Any"}
+	}
+
+	// ---- Functions: pointwise ----
+	if t1[0].(string) == "binop" && t2[0].(string) == "binop" && t1[1].(string) == "->" && t2[1].(string) == "->" {
+		// f1 = A1 -> B1, f2 = A2 -> B2
+		a1, b1 := t1[2].(S), t1[3].(S)
+		a2, b2 := t2[2].(S), t2[3].(S)
+
+		// Param GLB (contravariant):
+		// if A1 <: A2 → A1; else if A2 <: A1 → A2; else no GLB → give up to Any
+		var param S
+		if ip.isSubtype(a1, a2, env) {
+			param = a1
+		} else if ip.isSubtype(a2, a1, env) {
+			param = a2
+		} else {
+			return S{"id", "Any"}
+		}
+
+		// Return LUB (covariant):
+		ret := ip.unifyTypes(b1, b2, env)
+		return S{"binop", "->", param, ret}
+	}
+	if t1[0].(string) == "binop" || t2[0].(string) == "binop" {
+		return S{"id", "Any"}
+	}
+
+	return S{"id", "Any"}
+}
+
+// validateTypeShape checks that an S-expression is a *type-shaped* AST.
+// It is purely syntactic: it does not resolve identifiers or paths.
+// Returns "" if OK; otherwise a short human-friendly error message.
+//
+// Allowed forms (with arity):
+//
+//	("id", name)
+//	("get", base=id|get, ("str", key))
+//	("unop","?", T)
+//	("binop","->", A, B)
+//	("array", T)
+//	("map", ("pair"| "pair!", ("str", key), T)*)
+//	("enum", <JSON-literal>...)
+//	("annot", ("str", doc), T)   // stripped and T validated
+//
+// Disallowed:
+//
+//	raw literals as types (e.g., ("int", 1)), ("fun", ...), ("type", ...),
+//	("module", ...), raw ("alias", *TypeValue) (internal canonical form),
+//	malformed arities, non-string map keys, duplicate keys within one map type.
+//
+// validateTypeShape checks that an S-expression is a syntactically valid *type*
+// shape (purely structural; no name resolution). It returns "" if OK, else a
+// short human-readable error message. Aliases/self-references are allowed
+// because ("id", ...) and ("get", ...) are accepted without resolution.
+//
+// Allowed nodes:
+//
+//	("id", name)
+//	("get", base, ("str", key))        // base must be id|get
+//	("unop", "?", T)                   // nullable
+//	("binop", "->", A, B)              // function type
+//	("array", T)                       // exactly one elem type
+//	("map", ("pair"| "pair!", ("str",k), T)...)  // no duplicate keys
+//	("enum", <anything>)               // JSON-literal check is done elsewhere
+//	("annot", ("str", doc), T)         // allowed wrapper anywhere
+//
+// Disallowed: literal value nodes ("int"/"num"/"str"/... as types), "fun",
+// "module", raw internal "alias" nodes, wrong arities, non-string keys, etc.
+func validateTypeShape(t S) string {
+	// Local helper to strip "annot" wrappers *and* validate their doc fields.
+	strip := func(n S) (S, string) {
+		for len(n) >= 3 {
+			tag, ok := n[0].(string)
+			if !ok || tag != "annot" {
+				break
+			}
+			// validate ("annot", ("str", doc), subj)
+			doc, ok := n[1].(S)
+			if !ok || len(doc) < 2 || doc[0].(string) != "str" {
+				return nil, "annotation must have a string doc"
+			}
+			subj, _ := n[2].(S)
+			n = subj
+		}
+		return n, ""
+	}
+
+	var walk func(S) string
+	walk = func(n S) string {
+		if len(n) == 0 {
+			return "invalid type: empty"
+		}
+		// peel/validate annot wrappers
+		var msg string
+		if n, msg = strip(n); msg != "" {
+			return msg
+		}
+		if len(n) == 0 {
+			return "invalid type: empty"
+		}
+
+		tag, ok := n[0].(string)
+		if !ok {
+			return "invalid type: corrupt node tag"
+		}
+
+		switch tag {
+		case "id":
+			if len(n) != 2 {
+				return "id type must have exactly one name"
+			}
+			if _, ok := n[1].(string); !ok {
+				return "id name must be a string"
+			}
+			return ""
+
+		case "get":
+			if len(n) != 3 {
+				return `qualified type must be ("get", base, ("str", key))`
+			}
+			base, okb := n[1].(S)
+			if !okb || len(base) == 0 {
+				return "qualified type has invalid base"
+			}
+			if btag, _ := base[0].(string); btag != "id" && btag != "get" && btag != "annot" {
+				return "qualified type base must be id or get"
+			}
+			// walk the base (allows nested get/annot/id)
+			if err := walk(base); err != "" {
+				return err
+			}
+			key, okk := n[2].(S)
+			if !okk || len(key) < 2 || key[0].(string) != "str" {
+				return "qualified type key must be a string literal"
+			}
+			return ""
+
+		case "unop":
+			if len(n) != 3 || n[1] != "?" {
+				return `nullable type must be ("unop", "?", T)`
+			}
+			sub, _ := n[2].(S)
+			return walk(sub)
+
+		case "binop":
+			if len(n) != 4 || n[1] != "->" {
+				return `function type must be ("binop", "->", A, B)`
+			}
+			if err := walk(n[2].(S)); err != "" {
+				return err
+			}
+			return walk(n[3].(S))
+
+		case "array":
+			if len(n) != 2 {
+				return "array type must have exactly one element type"
+			}
+			return walk(n[1].(S))
+
+		case "map":
+			seen := map[string]struct{}{}
+			for i := 1; i < len(n); i++ {
+				p, okp := n[i].(S)
+				if !okp || len(p) < 3 {
+					return `map field must be ("pair"|"pair!", ("str", key), T)`
+				}
+				// Forbid annot-wrapping the entire pair node.
+				ptag, ok := p[0].(string)
+				if !ok || (ptag != "pair" && ptag != "pair!") {
+					return `map field must start with "pair" or "pair!"`
+				}
+
+				// Allow annotations on the KEY: ("annot", ("str",doc), ("str", key))
+				key, okk := p[1].(S)
+				if !okk {
+					return "map field key must be a string literal"
+				}
+				key = stripAnnot(key)
+				if len(key) < 2 || key[0].(string) != "str" {
+					return "map field key must be a string literal"
+				}
+				k := key[1].(string)
+				if _, dup := seen[k]; dup {
+					return "duplicate field '" + k + "' in map type"
+				}
+				seen[k] = struct{}{}
+				// Value type may itself be annotated; walk handles that.
+				if err := walk(p[2].(S)); err != "" {
+					return err
+				}
+			}
+			return ""
+
+		case "enum":
+			// Members must be JSON literals (null/bool/int/num/str/array/map of literals).
+			for i := 1; i < len(n); i++ {
+				member, ok := n[i].(S)
+				if !ok || !isJSONLiteralNode(member) {
+					return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
+				}
+			}
+			return ""
+
+		case "annot":
+			// Should have been stripped; treat as error to avoid silent loops.
+			return "internal error: unexpected annot after strip"
+
+		// Explicitly disallow internal/user-nonsensical nodes in type shapes.
+		case "int", "num", "str", "bool", "null", "fun", "module", "type", "alias":
+			return "invalid type: unexpected node " + tag
+
+		default:
+			return "invalid type: unexpected node " + tag
+		}
+	}
+
+	return walk(t)
+}
+
+// -----------------------------
+// Enum literal-only validation
+// -----------------------------
+
+// isJSONLiteralNode reports whether n is one of the literal forms that
+// litToValue accepts: null/bool/int/num/str/array/map (with literal children).
+func isJSONLiteralNode(n S) bool {
+	if len(n) == 0 {
+		return false
+	}
+	switch n[0].(string) {
+	case "null", "bool", "int", "num", "str":
+		return true
+	case "array":
+		for i := 1; i < len(n); i++ {
+			child, ok := n[i].(S)
+			if !ok || !isJSONLiteralNode(child) {
+				return false
+			}
+		}
+		return true
+	case "map":
+		for i := 1; i < len(n); i++ {
+			p, ok := n[i].(S)
+			if !ok || len(p) < 3 {
+				return false
+			}
+			// p = ("pair" | "pair!", ("str", key), valueLit)
+			tag := p[0].(string)
+			if tag != "pair" && tag != "pair!" {
+				return false
+			}
+			key, ok := p[1].(S)
+			if !ok || len(key) < 2 || key[0].(string) != "str" {
+				return false
+			}
+			val, ok := p[2].(S)
+			if !ok || !isJSONLiteralNode(val) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// validateEnumsJSONOnly walks a type AST and ensures any ("enum", ...)
+// contains only JSON-style literals. It returns an empty string if OK,
+// otherwise a short human message.
+func validateEnumsJSONOnly(t S) string {
+	if len(t) == 0 {
+		return ""
+	}
+	switch t[0].(string) {
+	case "annot":
+		if len(t) >= 3 {
+			if sub, ok := t[2].(S); ok {
+				return validateEnumsJSONOnly(sub)
+			}
+		}
+		return ""
+	case "enum":
+		for i := 1; i < len(t); i++ {
+			member, ok := t[i].(S)
+			if !ok || !isJSONLiteralNode(member) {
+				return "Enum members must be JSON literals (null/bool/int/num/str/array/map of literals)"
+			}
+		}
+		return ""
+	case "unop", "binop", "array", "map", "get", "id", "alias", "type", "module":
+		for i := 1; i < len(t); i++ {
+			if sub, ok := t[i].(S); ok {
+				if msg := validateEnumsJSONOnly(sub); msg != "" {
+					return msg
+				}
+			}
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+=== END FILE: internal/mindscript/types.go ===
+
+=== BEGIN FILE: internal/mindscript/interpreter.go ===
+// interpreter.go — SINGLE PUBLIC API SURFACE for the MindScript interpreter.
+//
+// OVERVIEW
+// ========
+// This file exposes the **entire public surface** of the MindScript runtime. It
+// deliberately contains **only exported types and thin methods**. All behavior
+// is specified here in enough detail that a consumer can use the interpreter
+// without reading any private implementation.
+//
+// What you get in this file:
+//   • The **runtime value model** (`Value`, `ValueTag`, constructors like `Int/Str/Arr`).
+//   • **Ordered maps** with per-key annotations (`MapObject`) and helpers.
+//   • **Functions / closures** (`Fun`) as first-class values.
+//   • **Environments** (`Env`) with lexical scoping.
+//   • The **Interpreter** type with the canonical entry points:
+//        - parsing+evaluation of source/AST (ephemeral vs persistent),
+//        - function application (`Apply`, `Call0`),
+//        - function introspection (`FunMeta`),
+//        - native registration (`RegisterNative`),
+//        - type helpers (`ResolveType`, `IsType`, `IsSubtype`, `UnifyTypes`, `ValueToType`).
+//   • Hard errors bubble as a single `*Error` (see errors.go). Entry points
+//     format them with caret snippets; internals do **not** format.
+//
+// What this file does **not** include:
+//   • Any algorithmic implementation, bytecode generation, or the VM. Those live
+//     in private files and are intentionally hidden behind narrow private
+//     interfaces that are wired up during `NewInterpreter()`.
+//
+// EXECUTION & SCOPING SEMANTICS
+// -----------------------------
+// MindScript code evaluates in **environments** (`*Env`) that form a lexical
+// chain via `parent`. The Interpreter exposes two well-known frames:
+//   • `Core`: built-ins and registered natives (read-only to user code).
+//   • `Global`: user-visible program state (REPL/module globals).
+//
+// Entry points differ only in *which* environment they target:
+//   • Ephemeral (sandboxed) runs: `EvalSource` and `Eval` create a **fresh child
+//     of Global**; names bound during evaluation land in that throwaway child,
+//     so `Global` remains unchanged unless the program **explicitly** mutates it.
+//   • Persistent (REPL-style) runs: `EvalPersistentSource` and `EvalPersistent`
+//     evaluate **in Global** itself, so `let`/assignment update the persistent
+//     state.
+//   • Advanced embedding: `EvalAST(ast, env)` evaluates exactly in the provided
+//     environment, letting hosts control scoping explicitly.
+//
+// ERROR MODEL
+// -----------
+// MindScript distinguishes:
+//   1) **Soft errors** for operational conditions (file-not-found, no space,
+//      etc.). These surface as annotated-null **Values** (not Go errors).
+//   2) **Hard errors** for contractual failures (lex/parse mistakes, wrong
+//      arity/type contracts, runtime invariants). These bubble as a single
+//      `*Error` with (Kind, Msg, Line, Col, Src). Internals NEVER pretty print.
+//      Public entry points attach the correct SourceRef and format them.
+//
+// All `Eval*` methods return `(Value, error)`. On hard failure they return a Go
+// `error` whose message is a caret-formatted snippet produced **only here** at
+// the API surface via `FormatError` (see errors.go). Internals pass `*Error` up
+// unformatted.
+//
+// VALUES & MAPS
+// -------------
+// `Value` is a tagged sum covering: null, bool, int64, float64, string, arrays,
+// ordered maps, functions, type values, modules, and opaque handles. `MapObject`
+// preserves **insertion order** (`Keys`). Its `Entries` is a string→Value map;
+// order-sensitive operations must consult `Keys`. The helper `AsMapValue`
+// exposes a module’s map view.
+//
+// FUNCTIONS & NATIVES
+// -------------------
+// `Fun` carries parameter names/types, a body (as an S-expression), its closure
+// environment, and an optional `NativeName` when the function is implemented in
+// the host. Natives are registered via `RegisterNative(name, params, ret, impl)`
+// and are **type-checked both on call and on return** using the MindScript type
+// engine (see Type Helpers below). `Apply` performs call/currying semantics and
+// enforces parameter types. `FunMeta` exposes arity, parameter specs, return
+// type, docs, and closure environment for tooling.
+//
+// TYPES (STRUCTURAL)
+// ------------------
+// Types are S-expressions (`type S = []any`, defined in parser.go). The public
+// helpers delegate to the private type engine:
+//   • `ResolveType(t, env)` — resolve identifiers within a type expression.
+//   • `IsType(v, t, env)`   — runtime value check against a type.
+//   • `IsSubtype(a, b, env)`— structural subtyping.
+//   • `UnifyTypes(t1, t2, env)` — least common supertype (LUB).
+//   • `ValueToType(v, env)` — pragmatic structural type inference.
+// The precise structural rules (nullable, arrays, maps with required/optional,
+// functions contravariant/covariant, enums, `Int <: Num`, etc.) are defined in
+// `types.go` and fully respected by this API.
+//
+// PROCESSES & CONCURRENCY (MINIMAL, LUA-STYLE)
+// --------------------------------------------
+// The simplest safe model is **isolates**: each `Interpreter` instance is an
+// independent “process” with its own `Global`, module cache, stacks, and
+// ephemeral state. The `Core` environment is shared **read-only** across
+// isolates (user code cannot mutate Core; see sealing notes below).
+//
+// You can spawn concurrent work by **cloning** an interpreter and running code
+// in a new goroutine. This file exposes:
+//   • `(*Interpreter) Clone()` — snapshot the current interpreter into a new
+//     isolate (shares a read-only Core; copies native registry; new Global).
+//   • Host-level spawns: `SpawnSource` / `SpawnAST` returning a `ProcessHandle`.
+//   • A helper `HandleVal` to wrap/unwrap process handles as `Value` (VTHandle),
+//     so `spawn`/`join` natives can be implemented in `interpreter_ops.go`.
+//
+// Concurrency contract:
+//   • Instantiate and register natives **before** spawning concurrent processes.
+//     (Clones copy the native registry; mutating a Go `map` concurrently is not
+//     allowed. Core is treated as immutable after init.)
+//   • Each `Interpreter` instance is not re-entrant; run at most one evaluation
+//     at a time per instance. For parallel work, use `Clone()`.
+//   • `Global`/module caches are **not** shared between clones.
+//
+// DEPENDENCIES (OTHER FILES)
+// --------------------------
+//   • lexer.go / parser.go: tokenization and Pratt parser that produce S-expr ASTs.
+//     (Public alias `type S = []any` is defined in parser.go.)
+//   • spans.go: sidecar source spans used for caret-style runtime errors.
+//   • vm.go: bytecode `Chunk`, opcodes, and VM execution (internal).
+//   • interpreter_exec.go (private): parsing, JIT, VM dispatch, calls/currying.
+//   • interpreter_ops.go  (private): built-ins, assignment, iteration, emitter.
+//   • types.go: structural type system (used via public wrappers here).
+//   • errors.go: unified diagnostic (`*Error`) and pretty-printing at API surface.
+//   • oracles.go, modules.go: optional features used internally (opaque here).
+//
+// DESIGN INTENT
+// -------------
+// The API is intentionally **narrow and predictable**. You can:
+//   • Choose source or AST inputs.
+//   • Choose ephemeral (child) or persistent (Global) scope.
+//   • Register natives with explicit param/return types.
+//   • Call functions and introspect them.
+//   • Ask type questions and perform type inference.
+//   • Clone interpreters and spawn concurrent processes safely.
+//
+// Everything else—parsing details, bytecode shapes, opcodes, cache strategies,
+// optimization passes—remains private and may evolve without breaking this API.
+
+package mindscript
 
 import (
 	"fmt"
-	"strings"
-	"unicode/utf8"
-
-	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+	"strconv"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-// Pure analyzer types (byte-span, no LSP deps) — lives here to avoid new files
+//                              PUBLIC TYPES & CTORS
 ////////////////////////////////////////////////////////////////////////////////
 
-// fileSnapshot lets the pure analyzer read file text by URI (multi-file ready).
-type fileSnapshot interface {
-	Get(uri string) (text string, ok bool)
+// ValueTag enumerates all runtime kinds a Value may hold.
+// The tag determines which field of Value.Data is valid (see Value docs).
+type ValueTag int
+
+const (
+	VTNull   ValueTag = iota // null (no payload)
+	VTBool                   // bool
+	VTInt                    // int64
+	VTNum                    // float64
+	VTStr                    // string
+	VTArray                  // *ArrayObject
+	VTMap                    // *MapObject (ordered map)
+	VTFun                    // *Fun (closure; native or user-defined)
+	VTType                   // *TypeValue (type AST + definition env)
+	VTModule                 // module handle (opaque; maps to a MapObject view)
+	VTHandle                 // opaque host handle (integration-specific)
+)
+
+// Value is the universal runtime carrier used by the interpreter.
+//
+// Fields:
+//   - Tag   — discriminant indicating which case is active.
+//   - Data  — Go value appropriate for Tag (see ValueTag; e.g., int64 for VTInt).
+//   - Annot — optional annotation used by the runtime to propagate user-facing
+//     documentation or error context. Annotations never affect equality.
+//
+// Invariants:
+//   - When Tag==VTNull, Data is nil.
+//   - When Tag==VTMap, Data is *MapObject preserving insertion order.
+//   - Modules (VTModule) can be viewed as maps via AsMapValue.
+type Value struct {
+	Tag   ValueTag
+	Data  interface{}
+	Annot string
 }
 
-// pureDiag is a diagnostic with byte offsets (LSP-agnostic).
-type pureDiag struct {
-	StartByte int
-	EndByte   int
-	Severity  int // 1=error, 2=warning, 3=hint, 4=info
-	Code      string
-	Message   string
+// ArrayObject gives arrays reference semantics (like MapObject), so mutations
+// (push/pop/shift/unshift/index-assign) are observed by all aliases.
+type ArrayObject struct {
+	Elems []Value
 }
 
-// pureBinding mirrors binding data with byte spans.
-type pureBinding struct {
-	Name       string
-	Kind       string
-	TypeNode   []any
-	Sig        string
-	DocFull    string
-	DocFirst   string
-	StartByte  int
-	EndByte    int
-	IsTopLevel bool
+// Handle is the single opaque/userdata-like carrier (Lua-style).
+// Hosts can box arbitrary data behind a "kind" discriminator.
+type Handle struct {
+	Kind string
+	Data any
 }
 
-// pureResult is the full output of analyzing a single file.
-type pureResult struct {
-	URI      string
-	Text     string
-	Tokens   []mindscript.Token
-	AST      mindscript.S
-	Spans    *mindscript.SpanIndex
-	Bindings []pureBinding
-	Diags    []pureDiag
+// HandleVal boxes host data into an opaque runtime Value.
+func HandleVal(kind string, data any) Value {
+	return Value{Tag: VTHandle, Data: &Handle{Kind: kind, Data: data}}
 }
 
-/////////////////////////////
-// PUBLIC SHIMS (thin API) //
-/////////////////////////////
-
-// analyzeFilePure is a pure function: reads source via snapshot, lexes/parses,
-// collects bindings, runs static checks, and returns byte-span results.
-func analyzeFilePure(sn fileSnapshot, uri string) *pureResult {
-	return analyzeFilePureImpl(sn, uri)
+// String renders a human-friendly debug representation (annotations are omitted).
+func (v Value) String() string {
+	switch v.Tag {
+	case VTNull:
+		return "null"
+	case VTBool:
+		return fmt.Sprintf("%v", v.Data.(bool))
+	case VTInt:
+		return strconv.FormatInt(v.Data.(int64), 10)
+	case VTNum:
+		return strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
+	case VTStr:
+		return fmt.Sprintf("%q", v.Data.(string))
+	case VTArray:
+		return fmt.Sprintf("<array len=%d>", len(v.Data.(*ArrayObject).Elems))
+	case VTMap:
+		return "<map>"
+	case VTFun:
+		return "<fun>"
+	case VTType:
+		return "<type>"
+	case VTModule:
+		return "<module>"
+	case VTHandle:
+		return "<handle>"
+	default:
+		return "<unknown>"
+	}
 }
 
-// analyze lexes, parses, and refreshes the per-doc caches used by features.
-// It fills: doc.tokens, doc.ast (when parse succeeds), and doc.symbols (top-level defs).
-func (s *server) analyze(doc *docState) {
-	analyzeImpl(s, doc)
+// Null is the singleton null Value (no annotation, no payload).
+var Null = Value{Tag: VTNull}
+
+// Primitive constructors for convenience. They do not attach annotations.
+func Bool(b bool) Value    { return Value{Tag: VTBool, Data: b} }
+func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
+func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
+func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
+func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: &ArrayObject{Elems: xs}} }
+
+// MapObject is an ordered map preserving insertion order.
+//
+// Fields:
+//   - Entries — the key/value storage (by string key).
+//   - Keys    — insertion order (unique keys); use this to iterate predictably.
+//
+// Semantics:
+//   - Insert order is the iteration order.
+//   - Setting a value for a new key appends that key to Keys.
+//   - Removing keys (if implemented in hosts) must also update Keys.
+//
+// Values of map type are represented as Value{Tag: VTMap, Data: *MapObject}.
+type MapObject struct {
+	Entries map[string]Value
+	Keys    []string
+}
+
+// Map constructs a VTMap from a plain Go map. Note: Literal maps constructed
+// from source preserve exact key order via internal built-ins; hosts building
+// maps programmatically can use Map for convenience (order equals Go map
+// iteration order if Keys is not supplied, so this helper synthesizes Keys
+// from the initial map contents).
+func Map(m map[string]Value) Value {
+	mo := &MapObject{
+		Entries: m,
+	}
+	mo.Keys = make([]string, 0, len(m))
+	for k := range m {
+		mo.Keys = append(mo.Keys, k)
+	}
+	return Value{Tag: VTMap, Data: mo}
+}
+
+// TypeValue carries a type expression AST (S) and the lexical Env where it was
+// defined. Resolution uses the stored Env when available.
+type TypeValue struct {
+	Ast S
+	Env *Env
+}
+
+// TypeValIn builds a VTType and pins its resolution environment explicitly.
+// Use this when exporting user-defined types from specific scopes.
+func TypeValIn(expr S, env *Env) Value {
+	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
+}
+
+// Fun represents a function/closure. Functions are first-class Values (VTFun).
+//
+// Fields (stable API; implementation specifics like bytecode are private):
+//   - Params      — parameter names in order.
+//   - ParamTypes  — declared parameter types (S-expression per param).
+//   - ReturnType  — declared return type (S). Oracles are made nullable internally.
+//   - Body        — function body as an S-expression (opaque to callers).
+//   - Env         — closure environment captured at definition time.
+//   - NativeName  — non-empty iff implemented by a registered native.
+//   - Examples    — optional example values for tooling; ignored by runtime.
+//   - IsOracle    — marks oracle functions (different return-type semantics).
+//   - HiddenNull  — internal arity placeholder for zero-arg construction (not API).
+//   - Src         — optional source metadata for enriched runtime errors.
+//
+// Note: `Chunk` is an internal JIT product stored here for caching; callers
+// should treat it as opaque and never rely on it.
+type Fun struct {
+	Params     []string
+	Body       S
+	Env        *Env
+	ParamTypes []S
+	ReturnType S
+	HiddenNull bool
+
+	Chunk      *Chunk // JIT result (from vm.go) — internal use only
+	NativeName string // non-empty for registered natives
+
+	IsOracle bool  // oracle marker
+	Examples Value // VTArray of [input, output] pairs, or Null when none
+
+	Src *SourceRef // source metadata (optional)
+
+	// Original declaration signature (names/types): tools/oracles can
+	// reference it even after currying changes Params.
+	Sig *SigMeta
+}
+
+// SigMeta is an immutable, engine-internal carrier of the original signature.
+// It replaces the old $__sig_names / $__sig_types closure bindings for oracles.
+type SigMeta struct {
+	Names []string // original parameter names, in order
+	Types []S      // original declared parameter types, in order
+}
+
+// FunVal wraps *Fun into a Value (Tag=VTFun).
+func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
+
+// Env is a lexical environment frame with a parent link. Lookups walk parent-ward.
+// Use Define to bind in the current frame, Set to update an existing visible
+// binding (nearest frame), and Get to retrieve.
+type Env struct {
+	parent           *Env
+	table            map[string]Value
+	sealParentWrites bool
+}
+
+// ---- Builtin type names/constructors (value-namespace guards) ----
+var builtinTypeAtoms = map[string]struct{}{
+	"Any": {}, "Null": {}, "Bool": {}, "Int": {}, "Num": {}, "Str": {}, "Handle": {}, "Type": {}, "Enum": {},
+}
+
+func isBuiltinTypeAtom(name string) bool { _, ok := builtinTypeAtoms[name]; return ok }
+
+// SealParentWrites prevents Set from climbing into parent frames.
+// Lookups (Get) still traverse parents as usual.
+func (e *Env) SealParentWrites() { e.sealParentWrites = true }
+
+// NewEnv creates a new lexical frame with the given parent (which may be nil).
+func NewEnv(parent *Env) *Env { return &Env{parent: parent, table: make(map[string]Value)} }
+
+// Define binds name to v in the current frame, shadowing any outer binding.
+func (e *Env) Define(name string, v Value) {
+	e.table[name] = v
+}
+
+// Set updates the nearest existing binding of name to v. If no binding exists
+// in any visible frame, Set returns an error (it does not implicitly define).
+func (e *Env) Set(name string, v Value) error {
+	// Disallow assignment to language-level builtins (even if not present in envs).
+	if isBuiltinTypeAtom(name) {
+		return fmt.Errorf("cannot assign to type atom/constructor: %s", name)
+	}
+	if _, ok := e.table[name]; ok {
+		e.table[name] = v
+		return nil
+	}
+	// If this frame is sealed, do not climb; emit a friendlier message
+	// when the name exists in an ancestor (e.g., Core builtins).
+	if e.sealParentWrites {
+		for p := e.parent; p != nil; p = p.parent {
+			if _, ok := p.table[name]; ok {
+				return fmt.Errorf("cannot assign to builtin: %s", name)
+			}
+		}
+		return fmt.Errorf("undefined variable: %s", name)
+	}
+	if e.parent != nil {
+		return e.parent.Set(name, v)
+	}
+	return fmt.Errorf("undefined variable: %s", name)
+}
+
+// Get retrieves the nearest visible binding for name or returns an error.
+func (e *Env) Get(name string) (Value, error) {
+	if v, ok := e.table[name]; ok {
+		return v, nil
+	}
+	if e.parent != nil {
+		return e.parent.Get(name)
+	}
+	// If the miss is a type atom/ctor, explain how to obtain a runtime Type.
+	if isBuiltinTypeAtom(name) {
+		return Value{}, fmt.Errorf("'%s' is a type expression, not a value. Use 'type %s' to obtain a runtime Type, or use it in a type annotation", name, name)
+	}
+	return Value{}, fmt.Errorf("undefined variable: %s", name)
+}
+
+func (e *Env) GetTable() map[string]Value { return e.table }
+
+func (e *Env) GetParent() *Env { return e.parent }
+
+// ParamSpec documents a function parameter (name + declared type). Used by
+// native registration and function introspection.
+type ParamSpec struct {
+	Name string
+	Type S
+}
+
+// Callable exposes metadata about a function Value (for tooling, docs, REPLs).
+// The returned values reflect the function’s declared signature and closure env.
+type Callable interface {
+	Arity() int
+	ParamSpecs() []ParamSpec
+	ReturnType() S
+	Doc() string
+	ClosureEnv() *Env
+}
+
+// CallCtx is passed to native functions, providing access to bound arguments
+// (by parameter name) and the effect scope (where side effects should land).
+type CallCtx interface {
+	Arg(name string) Value
+	Env() *Env
+}
+
+// NativeImpl is the implementation signature for registered host/native functions.
+// Implementations must return a Value conforming to the declared return type;
+// the interpreter enforces parameter and return types on every call.
+type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
+
+////////////////////////////////////////////////////////////////////////////////
+//                          PROCESSES (MINIMAL CONCURRENCY)
+////////////////////////////////////////////////////////////////////////////////
+
+// ProcessHandle is a tiny, host-visible handle for a spawned evaluation.
+// Join blocks until the process completes and returns the same (Value, error)
+// shape as Eval* entry points (errors already pretty-printed).
+type ProcessHandle struct {
+	ch chan processResult
+}
+
+type processResult struct {
+	v   Value
+	err error
+}
+
+// Join waits for the spawned evaluation to finish and returns its result.
+func (h *ProcessHandle) Join() (Value, error) {
+	if h == nil || h.ch == nil {
+		return Null, fmt.Errorf("invalid process handle")
+	}
+	r := <-h.ch
+	return r.v, r.err
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                               PUBLIC INTERPRETER
+////////////////////////////////////////////////////////////////////////////////
+
+// Interpreter is the entry point for evaluating MindScript programs.
+//
+// Public fields:
+//   - Core   — built-in environment; parent of Global. Populated by NewInterpreter.
+//   - Global — persistent program environment (REPL/module state).
+//
+// Construction:
+//   - Use NewInterpreter() to obtain a ready-to-use instance. Core natives are
+//     installed automatically; Global is an empty child of Core.
+//
+// Behavior summary:
+//   - EvalSource/Eval run in a **fresh child of Global** (ephemeral).
+//   - EvalPersistentSource/EvalPersistent run **in Global** (persistent).
+//   - EvalAST runs in the environment you pass.
+//   - Apply/Call0 invoke function Values with type-checking & currying.
+//   - FunMeta returns a Callable to inspect signatures/docs.
+//   - (New) Clone returns an isolated interpreter suitable for concurrent runs.
+//   - (New) SpawnSource/SpawnAST run code in a fresh isolate on a goroutine.
+//
+// Hard-error discipline:
+//   - Internals bubble `*Error` up **unformatted**.
+//   - Public entry points attach the correct `SourceRef` and return a Go error
+//     whose message is a pretty, caret-labeled snippet via `FormatError`.
+type Interpreter struct {
+	// Publicly visible environments:
+	Global *Env // user-visible namespace (per-interpreter)
+	Base   *Env // per-namespace runtime/prelude layer (overwritable)
+	Core   *Env // engine-critical intrinsics (read-only)
+
+	// Immutable, pre-seeded Base template used for fast namespace snapshots.
+	baseTemplate *Env
+
+	// Private internals (opaque to callers):
+	modules   map[string]*moduleRec // private module system (defined elsewhere)
+	native    map[string]NativeImpl // registered natives
+	loadStack []string              // import guard
+
+	currentSrc *SourceRef
+
+	// Private facades implemented in private files:
+	_exec execCore
+}
+
+// Private contracts the internals satisfy (wired by NewInterpreter).
+// These are intentionally unexported and may evolve.
+type execCore interface {
+	// Parse + evaluate source into the given env (fresh or persistent).
+	evalSource(src string, env *Env) (Value, error)
+	// Evaluate AST in the given env.
+	evalAST(ast S, env *Env) (Value, error)
+	// Calls & metadata
+	applyArgsScoped(fn Value, args []Value, callSite *Env) Value
+	funMeta(fn Value) (Callable, bool)
+}
+
+// NewInterpreter constructs an engine with core natives and a seeded Base,
+// failing fast if the standard prelude cannot be loaded. After construction:
+//   - Core is populated with built-ins and any subsequently registered natives.
+//   - Global is empty and inherits from Core.
+//   - Global is sealed from mutating Core (user code cannot overwrite builtins).
+//   - The interpreter is ready for Eval*/Apply/FunMeta/etc.
+func NewInterpreter() (*Interpreter, error) {
+	ip := &Interpreter{}
+	ip.Core = NewEnv(nil)
+	ip.modules = map[string]*moduleRec{}
+	ip.native = map[string]NativeImpl{}
+
+	// Wire private implementations (defined in private files).
+	ip._exec = newExec(ip)
+
+	// Install core built-ins.
+	initCore(ip)
+
+	// Build a pre-seeded, immutable Base template once, then snapshot per namespace.
+	if err := ip.buildBaseTemplate(); err != nil {
+		return nil, err
+	}
+	ip.Base = ip.newBaseFromTemplate()
+	// Global is the user frame. It may climb into Base to overwrite runtime/prelude.
+	ip.Global = NewEnv(ip.Base)
+
+	return ip, nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                         PUBLIC METHODS (THIN DELEGATIONS)
+////////////////////////////////////////////////////////////////////////////////
+
+// ensureErrorHasSource attaches sr to e if e is a *Error and Src is nil.
+// Returns the possibly-updated error.
+func ensureErrorHasSource(err error, sr *SourceRef) error {
+	if err == nil || sr == nil {
+		return err
+	}
+	if e, ok := err.(*Error); ok && e.Src == nil {
+		e.Src = sr
+	}
+	return err
+}
+
+// formatAtAPI pretty-prints a hard error to a Go error (string message).
+// If err is not a *Error, it is passed through unchanged.
+func formatAtAPI(err error) error {
+	if err == nil {
+		return nil
+	}
+	if e, ok := err.(*Error); ok {
+		return fmt.Errorf("%s", FormatError(e))
+	}
+	return err
+}
+
+// EvalSource parses and evaluates source **in a fresh child of Global**.
+// Effects (lets/assignments) land in that ephemeral child; Global is unchanged
+// unless the program explicitly mutates it.
+//
+// Returns the resulting Value; on hard failure returns a Go error with a
+// caret-formatted snippet (LEXICAL/PARSE/RUNTIME) produced at the API surface.
+func (ip *Interpreter) EvalSource(src string) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// Eval evaluates a pre-parsed AST **in a fresh child of Global**.
+// See EvalSource for scoping and error semantics.
+//
+// Implementation detail:
+//
+//	We format the AST back to source to construct a SourceRef with spans
+//	(via ParseSExprWithSpans) so hard errors can be shown with carets.
+func (ip *Interpreter) Eval(root S) (Value, error) {
+	src := FormatSExpr(root)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// EvalPersistentSource parses and evaluates source **in Global** (REPL-style).
+// Effects directly mutate Global. Returns Value; on hard failure returns a
+// caret-formatted Go error produced at the API surface.
+func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// EvalPersistent evaluates a pre-parsed AST **in Global** (REPL-style).
+// Effects directly mutate Global. Returns Value; on hard failure returns a
+// caret-formatted Go error produced at the API surface.
+func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
+	src := FormatSExpr(root)
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
+	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
+	if err != nil {
+		err = ensureErrorHasSource(err, sr)
+		return Null, formatAtAPI(err)
+	}
+	return val, nil
+}
+
+// EvalAST evaluates an AST in the provided environment exactly as given.
+// Hosts use this to control scoping (e.g., per-request envs, sandboxes).
+// Returns Value; on hard failure returns a caret-formatted Go error if the
+// bubbled *Error already carries a SourceRef; otherwise the error is passed
+// through unchanged (callers without source can still inspect *Error fields).
+func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
+	val, err := ip._exec.evalAST(ast, env)
+	if err != nil {
+		// If the error already has a SourceRef, pretty print; else pass through.
+		if _, ok := err.(*Error); ok {
+			return Null, formatAtAPI(err)
+		}
+		return Null, err
+	}
+	return val, nil
+}
+
+// Apply applies a function Value to the provided argument Values.
+//
+// Semantics:
+//   - Performs arity/type checking against the function’s declared ParamTypes.
+//   - Supports currying: if fewer args than parameters are provided, returns a
+//     partially-applied function Value; if more are provided, they are applied
+//     in sequence to the results.
+//   - Side effects from natives occur in the call-site/program scope.
+//
+// Panics inside the engine are caught by Eval* callers; Apply itself follows
+// the runtime’s internal error discipline. Use via evaluated programs or in
+// hosts that handle runtime errors accordingly.
+func (ip *Interpreter) Apply(fn Value, args []Value) Value {
+	return ip._exec.applyArgsScoped(fn, args, nil)
+}
+
+// Call0 invokes a function with zero arguments (equivalent to Apply(fn, nil)).
+func (ip *Interpreter) Call0(fn Value) Value { return ip._exec.applyArgsScoped(fn, nil, nil) }
+
+// FunMeta exposes a function Value as a Callable for introspection (arity,
+// parameter specs with declared types, return type, documentation string taken
+// from Value.Annot, and the closure environment). Returns (nil, false) if the
+// Value is not a function.
+func (ip *Interpreter) FunMeta(fn Value) (Callable, bool) {
+	return ip._exec.funMeta(fn)
+}
+
+// ResolveType expands a type expression by resolving identifiers bound to
+// user-defined types in the provided environment. See types.go for semantics.
+func (ip *Interpreter) ResolveType(t S, env *Env) S { return ip.resolveType(t, env) }
+
+// IsType reports whether runtime value v conforms to type t.
+// Structural rules are defined in types.go (Int<:Num, nullable, arrays/maps,
+// function subtyping, enums, open-world objects, etc.).
+func (ip *Interpreter) IsType(v Value, t S, env *Env) bool { return ip.isType(v, t, env) }
+
+// IsSubtype reports whether type a is a structural subtype of type b.
+func (ip *Interpreter) IsSubtype(a, b S, env *Env) bool { return ip.isSubtype(a, b, env) }
+
+// UnifyTypes computes a least common supertype (LUB) of t1 and t2.
+func (ip *Interpreter) UnifyTypes(t1 S, t2 S, env *Env) S { return ip.unifyTypes(t1, t2, env) }
+
+// ValueToType infers a pragmatic structural type for v (JSON-friendly).
+// Arrays unify element types; maps become open-world with observed fields.
+func (ip *Interpreter) ValueToType(v Value, env *Env) S { return ip.valueToTypeS(v, env) }
+
+// RegisterNative installs a host/native function into Core and exposes it as a
+// first-class function Value available by `name` to programs.
+//
+// Contract:
+//   - `params` declares parameter names and types (enforced on call).
+//   - `ret` declares the return type (enforced on return).
+//   - `impl` is invoked with (ip, CallCtx) at runtime.
+//   - The created function is placed in Core under `name`.
+//
+// Notes:
+//   - Natives participate in currying and type-checking like user functions.
+//   - The doc string for introspection is taken from the Value’s Annot (callers
+//     may annotate after registration if desired).
+//
+// Concurrency:
+//   - Register natives **before** using Clone/Spawn for concurrent work.
+//     Clones copy the native registry; mutating maps concurrently is not supported.
+//
+// 2) Public API (unchanged): also install into Core under the public name.
+func (ip *Interpreter) RegisterNative(
+	name string, params []ParamSpec, ret S, impl NativeImpl,
+) {
+	// For Core natives, use the same key for lookup and public name.
+	funVal := ip.newNativeFun(name, params, ret, impl)
+	if ip.Core == nil {
+		ip.Core = NewEnv(nil)
+	}
+	ip.Core.Define(name, funVal)
+}
+
+// AsMapValue returns a VTMap view for VTMap/VTModule (sharing the same MapObject),
+// else returns the input unchanged. This is useful when callers want uniform map
+// handling for modules and plain maps.
+func AsMapValue(v Value) Value {
+	if v.Tag == VTModule {
+		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
+	}
+	return v
+}
+
+// Clone creates an isolated Interpreter that shares no mutable runtime state
+// with the original. It shares the read-only Core, reuses the prebuilt
+// baseTemplate, creates a fresh Base + Global, and copies the native registry
+// (name -> implementation) without mutating Core.
+//
+// Notes:
+//   - Core is shared and treated as immutable after init (no writes here).
+//   - Base is recreated from the immutable template; Global is a fresh child.
+//   - Module cache and loader state are fresh per-clone.
+//   - The exec facade is rebound to the clone.
+func (ip *Interpreter) Clone() *Interpreter {
+	// New interpreter shell
+	cl := &Interpreter{}
+
+	// Share read-only Core; do not mutate it here.
+	cl.Core = ip.Core
+
+	// Fresh per-clone state
+	cl.modules = map[string]*moduleRec{}
+	cl.native = make(map[string]NativeImpl, len(ip.native))
+	cl._exec = newExec(cl)
+
+	// Reuse immutable template to create a fresh Base, then make a fresh Global.
+	cl.baseTemplate = ip.baseTemplate
+	cl.Base = cl.newBaseFromTemplate()
+	cl.Global = NewEnv(cl.Base)
+
+	// Copy native registry implementations for this clone (no Core writes).
+	for name, impl := range ip.native {
+		cl.native[name] = impl
+	}
+
+	// Fresh loader/source tracking
+	cl.loadStack = nil
+	cl.currentSrc = nil
+
+	return cl
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                      ISOLATES: CLONE & HOST-LEVEL SPAWN
+////////////////////////////////////////////////////////////////////////////////
+
+// SpawnSource clones the interpreter and evaluates `src` persistently (in the
+// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
+// yields the same (Value, error) contract as EvalPersistentSource.
+func (ip *Interpreter) SpawnSource(src string) *ProcessHandle {
+	child := ip.Clone()
+	h := &ProcessHandle{ch: make(chan processResult, 1)}
+	go func() {
+		v, err := child.EvalPersistentSource(src)
+		h.ch <- processResult{v: v, err: err}
+	}()
+	return h
+}
+
+// SpawnAST clones the interpreter and evaluates `ast` persistently (in the
+// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
+// yields the same (Value, error) contract as EvalPersistent.
+func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
+	child := ip.Clone()
+	h := &ProcessHandle{ch: make(chan processResult, 1)}
+	go func() {
+		v, err := child.EvalPersistent(ast)
+		h.ch <- processResult{v: v, err: err}
+	}()
+	return h
 }
 
 //// END_OF_PUBLIC
 
 ////////////////////////////////////////////////////////////////////////////////
-// Implementation (private)
+//                    BASE TEMPLATE + SNAPSHOT HELPERS (PRIVATE)
 ////////////////////////////////////////////////////////////////////////////////
 
-////////////////////////////////////////////////////////////////////////////////
-// Text & UTF-16 helpers
-////////////////////////////////////////////////////////////////////////////////
+// Build a pre-seeded, sealed Base template parented to Core. Treat as immutable.
+// RETURNS ERROR if the runtime/prelude fails to load.
+func (ip *Interpreter) buildBaseTemplate() error {
+	tmpl := NewEnv(ip.Core)
+	tmpl.SealParentWrites()
 
-// CRLF-aware: treat "\r\n" as a single newline; store offsets at the byte *after* '\n'.
-func lineOffsets(text string) []int {
-	offs := []int{0}
-	for i := 0; i < len(text); {
-		if text[i] == '\r' {
-			// skip lone \r (shouldn't happen often)
-			i++
-			continue
-		}
-		if text[i] == '\n' {
-			offs = append(offs, i+1)
-			i++
-			continue
-		}
-		_, sz := utf8.DecodeRuneInString(text[i:])
-		if sz <= 0 {
-			sz = 1
-		}
-		i += sz
+	ip.baseTemplate = tmpl
+
+	ip.SeedRuntimeInto(tmpl)
+	if err := ip.SeedRuntimeInto(tmpl); err != nil {
+		return err
 	}
-	return offs
+	ip.baseTemplate = tmpl
+	return nil
 }
 
-func toU16(r rune) int {
-	if r < 0x10000 {
-		return 1
+// Create a fresh Base(ns) by cloning the template and rebinding closures/types.
+func (ip *Interpreter) newBaseFromTemplate() *Env {
+	// Base template must be constructed during NewInterpreter(). Do not
+	// silently build it here (that would swallow prelude errors).
+	if ip.baseTemplate == nil {
+		panic("base template not initialized (constructor should have failed)")
 	}
-	return 2
+	return cloneEnvRebinding(ip.baseTemplate, ip.Core)
 }
 
-// posToOffset converts an LSP Position (UTF-16 code units) to a byte offset.
-func posToOffset(lines []int, p Position, text string) int {
-	if p.Line < 0 {
-		return 0
+// cloneEnvRebinding clones src into a new Env with newParent, rebinding
+// closures and type envs that *directly* referenced src -> to the new Env.
+// We do not rebuild entire env chains anymore; functions/types now capture
+// the real parent env (Base/module), so a simple pointer equality rebind
+// is sufficient and avoids deep recursion/stack growth.
+func cloneEnvRebinding(src *Env, newParent *Env) *Env {
+	dst := NewEnv(newParent)
+	dst.sealParentWrites = src.sealParentWrites
+	dst.table = make(map[string]Value, len(src.table))
+	for k, v := range src.table {
+		dst.table[k] = rebindValue(v, src, dst)
 	}
-	if p.Line >= len(lines) {
-		return len(text)
-	}
-	i := lines[p.Line]
-	need := p.Character // in UTF-16 units
-	for i < len(text) && need > 0 {
-		r, sz := utf8.DecodeRuneInString(text[i:])
-		if r == '\r' { // ignore CR in column math
-			i += sz
-			continue
-		}
-		if r == '\n' {
-			break
-		}
-		need -= toU16(r)
-		i += sz
-	}
-	return i
+	return dst
 }
 
-// offsetToPos converts a byte offset to an LSP Position (UTF-16 code units).
-func offsetToPos(lines []int, off int, text string) Position {
-	if off < 0 {
-		off = 0
-	}
-	if off > len(text) {
-		off = len(text)
-	}
-	i, j := 0, len(lines)
-	for i+1 < j {
-		m := (i + j) / 2
-		if lines[m] <= off {
-			i = m
-		} else {
-			j = m
+// rebindValue: if a function/type closes over 'from', re-pin to 'to'.
+// For arrays/maps we deep-copy the container shape and rebind contained values
+// (to avoid aliasing across namespaces). Primitives pass through unchanged.
+func rebindValue(v Value, from, to *Env) Value {
+	switch v.Tag {
+	case VTFun:
+		f := *v.Data.(*Fun) // copy
+		if f.Env == from {
+			f.Env = to
 		}
-	}
-	u16 := 0
-	for k := lines[i]; k < off && k < len(text); {
-		r, sz := utf8.DecodeRuneInString(text[k:])
-		if r == '\r' { // ignore CR
-			k += sz
-			continue
+		nv := FunVal(&f)
+		nv.Annot = v.Annot
+		return nv
+	case VTType:
+		tv := *v.Data.(*TypeValue) // copy
+		// Pin envs that were defined in the template (or env-less) to 'to'.
+		if tv.Env == nil || tv.Env == from {
+			tv.Env = to
 		}
-		if r == '\n' {
-			break
+		return Value{Tag: VTType, Data: &tv, Annot: v.Annot}
+	case VTArray:
+		src := v.Data.(*ArrayObject).Elems
+		out := make([]Value, len(src))
+		for i := range src {
+			out[i] = rebindValue(src[i], from, to)
 		}
-		u16 += toU16(r)
-		k += sz
-	}
-	return Position{Line: i, Character: u16}
-}
-
-func makeRange(lines []int, start, end int, text string) Range {
-	return Range{
-		Start: offsetToPos(lines, start, text),
-		End:   offsetToPos(lines, end, text),
+		return Arr(out)
+	case VTMap:
+		sm := v.Data.(*MapObject)
+		nm := &MapObject{
+			Entries: make(map[string]Value, len(sm.Entries)),
+			Keys:    append([]string(nil), sm.Keys...),
+		}
+		for k, vv := range sm.Entries {
+			nm.Entries[k] = rebindValue(vv, from, to)
+		}
+		nv := Value{Tag: VTMap, Data: nm, Annot: v.Annot}
+		return nv
+	default:
+		return v
 	}
 }
 
-// Engine gives us byte columns (not UTF-16). Clamp within the line.
-func byteColToOffset(lines []int, line0, byteCol int, text string) int {
-	if line0 < 0 {
-		line0 = 0
+//  1. Single internal constructor (no Core side effects).
+//     Returns a VTFun wired to ip.native[uniq]. Caller decides where to place it.
+func (ip *Interpreter) newNativeFun(
+	uniq string, params []ParamSpec, ret S, impl NativeImpl,
+) Value {
+	if ip.native == nil {
+		ip.native = map[string]NativeImpl{}
 	}
-	if line0 >= len(lines) {
-		return len(text)
+	ip.native[uniq] = impl
+
+	names := make([]string, len(params))
+	types := make([]S, len(params))
+	for i, p := range params {
+		names[i], types[i] = p.Name, p.Type
 	}
-	start := lines[line0]
-	end := len(text)
-	if line0+1 < len(lines) {
-		end = lines[line0+1]
+	hidden := false
+	if len(names) == 0 {
+		names = []string{"_"}
+		types = []S{S{"id", "Null"}}
+		hidden = true
 	}
-	off := start + byteCol
-	if off < start {
-		off = start
+
+	f := &Fun{
+		Params:     names,
+		ParamTypes: types,
+		ReturnType: ret,
+		Body:       S{"native", uniq}, // sentinel for debugging
+		Env:        nil,               // let execFunBodyScoped use call-site scope when provided
+		NativeName: uniq,
+		HiddenNull: hidden,
+		Sig:        &SigMeta{Names: append([]string{}, names...), Types: append([]S{}, types...)},
 	}
-	if off > end {
-		off = end
+	return FunVal(f)
+}
+=== END FILE: internal/mindscript/interpreter.go ===
+
+=== BEGIN FILE: cmd/msg-lsp/analysis_test.go ===
+// analysis_test.go
+package main
+
+import (
+	"strings"
+	"testing"
+
+	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+)
+
+// -----------------------------------------------------------------------------
+// Harness
+// -----------------------------------------------------------------------------
+
+// runIndex runs the pure analyzer over a single in-memory file.
+func runIndex(t *testing.T, uri, src string) *FileIndex {
+	t.Helper()
+	a := &Analyzer{} // For now, no ambient IP; ambient tests can inject if needed.
+	res := a.Analyze(uri, src)
+	if res == nil {
+		t.Fatalf("Analyze returned nil")
 	}
-	return off
+	return res
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Diagnostics helpers
-////////////////////////////////////////////////////////////////////////////////
-
-func (s *server) clearDiagnostics(uri string) {
-	s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
-		URI:         uri,
-		Diagnostics: []Diagnostic{},
-	})
+// runIndexWithIP runs analyze with a specific interpreter (for ambient tests).
+func runIndexWithIP(t *testing.T, uri, src string, ip *mindscript.Interpreter) *FileIndex {
+	t.Helper()
+	a := &Analyzer{IP: ip}
+	res := a.Analyze(uri, src)
+	if res == nil {
+		t.Fatalf("Analyze returned nil")
+	}
+	return res
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Token & span helpers
-////////////////////////////////////////////////////////////////////////////////
-
-func tokenName(t mindscript.Token) string {
-	if s, ok := t.Literal.(string); ok {
-		return s
-	}
-	return t.Lexeme
-}
-
-// Prefer exact lexer byte spans (the lexer guarantees StartByte/EndByte).
-func tokenSpan(doc *docState, t mindscript.Token) (start, end int) {
-	start, end = t.StartByte, t.EndByte
-	if start < 0 {
-		start = 0
-	}
-	if end < start {
-		end = start
-	}
-	if end > len(doc.text) {
-		end = len(doc.text)
-	}
-	return start, end
-}
-
-// Use SpanIndex to build a Range from a NodePath.
-func rangeFromPath(doc *docState, p mindscript.NodePath) (Range, bool) {
-	if doc.spans == nil {
-		return Range{}, false
-	}
-	sp, ok := doc.spans.Get(p)
-	if !ok {
-		return Range{}, false
-	}
-	return makeRange(doc.lines, sp.StartByte, sp.EndByte, doc.text), true
-}
-
-// rangeOrDefault tries span index first, then falls back to an empty range.
-// This ensures diagnostics are still emitted even when a precise span is missing.
-func rangeOrDefault(doc *docState, p mindscript.NodePath) Range {
-	// 1) Exact node span?
-	if r, ok := rangeFromPath(doc, p); ok {
-		return r
-	}
-	// 2) Walk up ancestors to find the nearest enclosing span and anchor a caret at its start.
-	if doc.spans != nil {
-		anc := append(mindscript.NodePath(nil), p...)
-		for len(anc) > 0 {
-			if sp, ok := doc.spans.Get(anc); ok {
-				start := offsetToPos(doc.lines, sp.StartByte, doc.text)
-				return Range{Start: start, End: start}
-			}
-			anc = anc[:len(anc)-1]
-		}
-	}
-	// 3) Last resort: caret at end of document (anything but 0,0).
-	end := offsetToPos(doc.lines, len(doc.text), doc.text)
-	return Range{Start: end, End: end}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// AST Walker & Visitors (centralized traversal)
-////////////////////////////////////////////////////////////////////////////////
-
-// rangeFromID provides a best-effort identifier range: it first tries the path
-// via SpanIndex; when unavailable, falls back to token scanning by name.
-func rangeFromID(doc *docState, path mindscript.NodePath, name string) Range {
-	if r, ok := rangeFromPath(doc, path); ok {
-		return r
-	}
-	if s, e, ok := findDefIDRange(doc.tokens, name); ok {
-		return makeRange(doc.lines, s, e, doc.text)
-	}
-	return Range{}
-}
-
-// mapFieldType extracts the field type from a ("map", ...) type node by key.
-func mapFieldType(t []any, key string) ([]any, bool) {
-	if len(t) == 0 || t[0] != "map" {
-		return nil, false
-	}
-	for i := 1; i < len(t); i++ {
-		if pr, ok := t[i].([]any); ok && len(pr) >= 3 && (pr[0] == "pair" || pr[0] == "pair!") {
-			if k, ok := pr[1].([]any); ok && len(k) >= 2 && k[0] == "str" {
-				if nm, _ := k[1].(string); nm == key {
-					if tv, ok := pr[2].([]any); ok {
-						return tv, true
-					}
-				}
-			}
-		}
-	}
-	return nil, false
-}
-
-// mapFieldTypeReq extracts the field (type, required?) from a ("map", ...) type node by key.
-func mapFieldTypeReq(t []any, key string) (field []any, required bool, ok bool) {
-	if len(t) == 0 || t[0] != "map" {
-		return nil, false, false
-	}
-	for i := 1; i < len(t); i++ {
-		if pr, okp := t[i].([]any); okp && len(pr) >= 3 && (pr[0] == "pair" || pr[0] == "pair!") {
-			if k, okk := pr[1].([]any); okk && len(k) >= 2 && k[0] == "str" {
-				if nm, _ := k[1].(string); nm == key {
-					if tv, okt := pr[2].([]any); okt {
-						return tv, pr[0] == "pair!", true
-					}
-				}
-			}
-		}
-	}
-	return nil, false, false
-}
-
-// resolveTypeAliasMap tries to resolve an alias ID type into its underlying ("map", ...) type.
-// Returns (mapType, ok). Does not unfold through non-map aliases (keeps aliases opaque otherwise).
-func resolveTypeAliasMap(doc *docState, t []any) ([]any, bool) {
-	if len(t) >= 2 && t[0] == "id" {
-		if name, _ := t[1].(string); name != "" {
-			if mt, ok := resolveTypeAliasAST(doc, name); ok && len(mt) > 0 && mt[0] == "map" {
-				return mt, true
-			}
-		}
-	}
-	return nil, false
-}
-
-// sameType reports textual equality via FormatType (kept minimal for array homogeneity warnings).
-func sameType(a, b []any) bool {
-	return formatTypeNode(a) == formatTypeNode(b)
-}
-
-// isNullable reports whether the static type node has the nullable modifier T?.
-func isNullable(t []any) bool {
-	if len(t) >= 3 {
-		if op, _ := t[0].(string); op == "unop" {
-			if q, _ := t[1].(string); q == "?" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Definition heuristics & symbol formatting
-////////////////////////////////////////////////////////////////////////////////
-
-// formatFunSig builds a pretty signature from a ("fun", ...) AST node.
-func formatFunSig(name string, fun []any) string {
-	if len(fun) < 3 {
-		return name + "() -> Any"
-	}
-	ps, _ := fun[1].([]any)
-	var parts []string
-	if len(ps) > 0 && ps[0] == "array" {
-		for i := 1; i < len(ps); i++ {
-			p, _ := ps[i].([]any) // ("pair"| "pair!", ("id", name), typeS)
-			if len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
-				idNode, _ := p[1].([]any)
-				nameStr := "_"
-				if len(idNode) >= 2 && idNode[0] == "id" {
-					if s, ok := idNode[1].(string); ok {
-						nameStr = s
-					}
-				}
-				if tS, ok := p[2].([]any); ok {
-					parts = append(parts, fmt.Sprintf("%s: %s", nameStr, mindscript.FormatType(tS)))
-				} else {
-					parts = append(parts, nameStr+": Any")
-				}
-			}
-		}
-	}
-	ret := "Any"
-	if rt, ok := fun[2].([]any); ok {
-		ret = mindscript.FormatType(rt)
-	}
-	return fmt.Sprintf("%s(%s) -> %s", name, strings.Join(parts, ", "), ret)
-}
-
-// analyzeFilePureImpl (private) — the implementation behind the public shim.
-func analyzeFilePureImpl(sn fileSnapshot, uri string) *pureResult {
-	txt, _ := sn.Get(uri)
-
-	// 1) Lex (interactive) — keep the salvage behavior for coloring on partial errors.
-	lx := mindscript.NewLexerInteractive(txt)
-	toks, err := lx.Scan()
-	if err != nil {
-		var ds []pureDiag
-		if e, ok := err.(*mindscript.Error); ok && e.Kind == mindscript.DiagLex {
-			// salvage tokens up to error position
-			lines := lineOffsets(txt)
-			off := byteColToOffset(lines, e.Line-1, e.Col-1, txt)
-			if off < 0 {
-				off = 0
-			}
-			if off > len(txt) {
-				off = len(txt)
-			}
-			px := mindscript.NewLexerInteractive(txt[:off])
-			if ptoks, pErr := px.Scan(); pErr == nil {
-				if n := len(ptoks); n > 0 && ptoks[n-1].Type == mindscript.EOF {
-					ptoks = ptoks[:len(ptoks)-1]
-				}
-				toks = ptoks
-			}
-		}
-		// surface the lex error at its caret
-		pos := 0
-		if e, ok := err.(*mindscript.Error); ok {
-			lines := lineOffsets(txt)
-			pos = byteColToOffset(lines, e.Line-1, e.Col-1, txt)
-		}
-		ds = append(ds, pureDiag{
-			StartByte: pos,
-			EndByte:   pos,
-			Severity:  1,
-			Code:      "LEX",
-			Message:   err.Error(),
-		})
-		return &pureResult{URI: uri, Text: txt, Tokens: toks, Diags: ds}
-	}
-	if n := len(toks); n > 0 && toks[n-1].Type == mindscript.EOF {
-		toks = toks[:len(toks)-1]
-	}
-
-	// 2) Parse (interactive) with spans
-	ast, spans, perr := mindscript.ParseSExprInteractiveWithSpans(txt)
-	if perr != nil {
-		if e, ok := perr.(*mindscript.Error); ok && e.Kind == mindscript.DiagIncomplete {
-			// Incomplete: return tokens but no diagnostics (non-nagging while typing)
-			return &pureResult{URI: uri, Text: txt, Tokens: toks}
-		}
-		pos := 0
-		if e, ok := perr.(*mindscript.Error); ok {
-			lines := lineOffsets(txt)
-			pos = byteColToOffset(lines, e.Line-1, e.Col-1, txt)
-		}
-		return &pureResult{
-			URI:    uri,
-			Text:   txt,
-			Tokens: toks,
-			Diags:  []pureDiag{{StartByte: pos, EndByte: pos, Severity: 1, Code: "PARSE", Message: perr.Error()}},
-		}
-
-	}
-
-	// 3) Reuse existing collectors and static checks by constructing a temp docState
-	lines := lineOffsets(txt)
-	tmp := &docState{uri: uri, text: txt, lines: lines, tokens: toks, ast: ast, spans: spans}
-
-	// Run unified AST analysis (bindings + diags) and token lints once.
-	binds, diags := unifiedAnalyze(tmp)
-	tokDiags := tokenLints(tmp)
-
-	// Bindings → pureBinding with byte spans
-	var pBinds []pureBinding
-	for _, b := range binds {
-		start := posToOffset(lines, b.Range.Start, txt)
-		end := posToOffset(lines, b.Range.End, txt)
-		pBinds = append(pBinds, pureBinding{
-			Name:       b.Name,
-			Kind:       b.Kind,
-			TypeNode:   b.TypeNode,
-			Sig:        b.Sig,
-			DocFull:    b.DocFull,
-			DocFirst:   b.DocFirst,
-			StartByte:  start,
-			EndByte:    end,
-			IsTopLevel: b.IsTopLevel,
-		})
-	}
-	// Diagnostics (token lints + AST checks) → pureDiag with byte spans
-	var pDiags []pureDiag
-	for _, d := range append(tokDiags, diags...) {
-		start := posToOffset(lines, d.Range.Start, txt)
-		end := posToOffset(lines, d.Range.End, txt)
-		pDiags = append(pDiags, pureDiag{
-			StartByte: start,
-			EndByte:   end,
-			Severity:  d.Severity,
-			Code:      d.Code,
-			Message:   d.Message,
-		})
-	}
-
-	return &pureResult{
-		URI:      uri,
-		Text:     txt,
-		Tokens:   toks,
-		AST:      ast,
-		Spans:    spans,
-		Bindings: pBinds,
-		Diags:    pDiags,
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Analysis (lex + parse + symbol extraction) — publishes diagnostics via notify
-////////////////////////////////////////////////////////////////////////////////
-
-// serverSnapshot is a minimal adapter over server to satisfy fileSnapshot.
-type serverSnapshot struct{ s *server }
-
-func (ss serverSnapshot) Get(uri string) (string, bool) {
-	if d := ss.s.snapshotDoc(uri); d != nil {
-		return d.text, true
-	}
-	return "", false
-}
-
-func analyzeImpl(s *server, doc *docState) {
-	// Use the pure function; the snapshot is the server’s current state.
-	sn := serverSnapshot{s: s}
-	res := analyzeFilePureImpl(sn, doc.uri)
-
-	// Update caches
-	doc.text = res.Text
-	doc.lines = lineOffsets(doc.text)
-	doc.tokens = res.Tokens
-	doc.ast = res.AST
-	if res.Spans != nil {
-		doc.spans = res.Spans
-	}
-
-	// Uniform: collect all bindings + docs (already computed in pure result).
-	// Rehydrate bindings with LSP ranges
-	doc.binds = doc.binds[:0]
-	for _, b := range res.Bindings {
-		doc.binds = append(doc.binds, bindingDef{
-			Name:       b.Name,
-			Range:      makeRange(doc.lines, b.StartByte, b.EndByte, doc.text),
-			DocFull:    b.DocFull,
-			DocFirst:   b.DocFirst,
-			Kind:       b.Kind,
-			TypeNode:   b.TypeNode,
-			Sig:        b.Sig,
-			IsTopLevel: b.IsTopLevel,
-		})
-	}
-
-	// Derive lightweight top-level symbols from bindings (single source of truth).
-	doc.symbols = doc.symbols[:0]
-	for _, b := range doc.binds {
-		if !b.IsTopLevel {
-			continue
-		}
-		doc.symbols = append(doc.symbols, symbolDef{
-			Name:  b.Name,
-			Kind:  b.Kind,
-			Range: b.Range,
-			Doc:   b.DocFirst,
-			Sig:   b.Sig,
-		})
-	}
-
-	// Publish diagnostics (convert byte spans to LSP ranges)
-	if len(res.Diags) > 0 {
-		out := make([]Diagnostic, 0, len(res.Diags))
-		for _, d := range res.Diags {
-			out = append(out, Diagnostic{
-				Range:    makeRange(doc.lines, d.StartByte, d.EndByte, doc.text),
-				Severity: d.Severity,
-				Code:     d.Code,
-				Source:   "mindscript",
-				Message:  d.Message,
-			})
-		}
-		s.notify("textDocument/publishDiagnostics", PublishDiagnosticsParams{
-			URI:         doc.uri,
-			Diagnostics: out,
-		})
-		return
-	}
-
-	// 4) Success: clear any previous diagnostics.
-	s.clearDiagnostics(doc.uri)
-}
-
-// //////////////////////////////////////////////////////////////////////////////
-// Lightweight static type algebra (reused by fold)
-//   - typeID, formatTypeNode helpers
-//   - LUB / GLB (defined in lub.go)
-//   - **IsSubtypeStatic(a, b []any) bool** (defined in lub.go):
-//     Structural subtyping used for conformance in return and call checks.
-//
-// //////////////////////////////////////////////////////////////////////////////
-func typeID(name string) []any { return []any{"id", name} }
-func formatTypeNode(t []any) string {
-	if len(t) == 0 {
-		return "Any"
-	}
-	return mindscript.FormatType(t)
-}
-
-// findLocalFunMeta finds a top-level binding `name = fun|oracle(...) -> R`
-// and returns (isOracle, paramTypes, returnType, ok).
-func findLocalFunMeta(doc *docState, name string) (bool, [][]any, []any, bool) {
-	// More robust: search the entire AST (not just top-level) for the most
-	// recent assignment to the given name that binds a fun/oracle.
-	if doc == nil || doc.ast == nil || len(doc.ast) == 0 {
-		return false, nil, nil, false
-	}
-
-	var foundIsOracle bool
-	var foundParams [][]any
-	var foundRet []any
-	var found bool
-
-	var walk func(node []any)
-	walk = func(node []any) {
-		if len(node) == 0 {
-			return
-		}
-		tag, _ := node[0].(string)
-		// Look for assignments to the target name anywhere.
-		if tag == "assign" && len(node) >= 3 {
-			if lhs, _ := node[1].([]any); len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
-				if nm, _ := lhs[1].(string); nm == name {
-					if rhs, _ := node[2].([]any); rhs != nil {
-						base := unwrapAnnotNode(rhs)
-						if len(base) >= 3 && (base[0] == "fun" || base[0] == "oracle") {
-							var pts [][]any
-							if ps, ok := base[1].([]any); ok && len(ps) > 0 && ps[0] == "array" {
-								for j := 1; j < len(ps); j++ {
-									if p, _ := ps[j].([]any); len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
-										if tnode, ok := p[2].([]any); ok {
-											pts = append(pts, tnode)
-										} else {
-											pts = append(pts, typeID("Any"))
-										}
-									} else {
-										pts = append(pts, typeID("Any"))
-									}
-								}
-							}
-							// MindScript: no true zero-arity — synthesize one Null param
-							if len(pts) == 0 {
-								pts = [][]any{typeID("Null")}
-							}
-							if rt, ok := base[2].([]any); ok {
-								// Record oracle return as nullable at DEFINITION time.
-								if base[0] == "oracle" {
-									foundIsOracle = true
-									foundRet = []any{"unop", "?", rt}
-								} else {
-									foundIsOracle = false
-									foundRet = rt
-								}
-								foundParams, found = pts, true
-							}
-						}
-					}
-				}
-			}
-		}
-		// Recurse into children.
-		for i := 1; i < len(node); i++ {
-			if ch, ok := node[i].([]any); ok {
-				walk(ch)
-			}
-		}
-	}
-	walk(doc.ast)
-	return foundIsOracle, foundParams, foundRet, found
-}
-
-// resolveTypeAliasAST returns the type AST for a top-level 'type' binding.
-func resolveTypeAliasAST(doc *docState, name string) ([]any, bool) {
-	if doc == nil || doc.ast == nil || len(doc.ast) == 0 {
-		return nil, false
-	}
-	root := doc.ast
-	if root[0] != "block" {
-		return nil, false
-	}
-	for i := 1; i < len(root); i++ {
-		n, _ := root[i].([]any)
-		if len(n) < 3 || n[0] != "assign" {
-			continue
-		}
-		lhs, _ := n[1].([]any)
-		rhs, _ := n[2].([]any)
-		if len(lhs) >= 2 && (lhs[0] == "decl" || lhs[0] == "id") {
-			if nm, _ := lhs[1].(string); nm == name {
-				base := unwrapAnnotNode(rhs)
-				if len(base) >= 2 && base[0] == "type" {
-					if t, ok := base[1].([]any); ok {
-						return t, true
-					}
-				}
-			}
-		}
-	}
-	return nil, false
-}
-
-// enumHasMember reports whether t is Enum[...] and lit is one of its members.
-// Returns (isEnumType, isMember).
-func enumHasMember(t []any, lit []any, doc *docState) (bool, bool) {
-	// No alias unfolding: opaque non-builtin ids remain atoms.
-	if len(t) == 0 || t[0] != "enum" {
-		return false, false
-	}
-	// Literal only handled for strings/ints/nums/bools here (enough for tests).
-	isEq := func(a, b []any) bool {
-		if len(a) < 2 || len(b) < 2 {
-			return false
-		}
-		if a[0] != b[0] {
-			return false
-		}
-		return fmt.Sprintf("%v", a[1]) == fmt.Sprintf("%v", b[1])
-	}
-	for i := 1; i < len(t); i++ {
-		if m, ok := t[i].([]any); ok && isEq(m, lit) {
-			return true, true
-		}
-	}
-	return true, false
-}
-
-func findAnyBindingType(doc *docState, name string) ([]any, bool) {
-	for _, b := range doc.binds {
-		if b.Name == name && len(b.TypeNode) > 0 {
-			return b.TypeNode, true
-		}
-	}
-	return nil, false
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Uniform binding collection (no top-level specialness)
-////////////////////////////////////////////////////////////////////////////////
-
-// annotText returns (baseNode, mergedAnnotationText, ok) without mutating the node.
-func annotText(n []any) ([]any, string, bool) {
-	cur := n
-	var parts []string
-	for len(cur) >= 3 {
-		if tag, _ := cur[0].(string); tag != "annot" {
-			break
-		}
-		if child, ok := cur[1].([]any); ok && len(child) >= 2 && child[0] == "str" {
-			if s, ok := child[1].(string); ok {
-				parts = append(parts, s)
-			}
-		}
-		base, _ := cur[2].([]any)
-		cur = base
-	}
-	if len(parts) == 0 {
-		return n, "", false
-	}
-	return cur, strings.Join(parts, "\n"), true
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return strings.TrimSpace(s[:i])
-	}
-	return strings.TrimSpace(s)
-}
-
-// nearestBinding finds the binding with matching name whose definition appears
-// at or before byte offset 'off', preferring the closest one. If none precede,
-// it returns the earliest matching binding as a fallback.
-func nearestBinding(doc *docState, name string, off int) (bindingDef, bool) {
-	var best bindingDef
-	bestOK := false
-	bestStart := -1
-	for _, b := range doc.binds {
-		if b.Name != name {
-			continue
-		}
-		// Definition start in bytes
-		defOff := posToOffset(doc.lines, b.Range.Start, doc.text)
-		if defOff <= off && defOff >= bestStart {
-			best = b
-			bestOK = true
-			bestStart = defOff
-		}
-	}
-	if bestOK {
-		return best, true
-	}
-	// Fallback: earliest with that name
-	earliest := -1
-	for _, b := range doc.binds {
-		if b.Name != name {
-			continue
-		}
-		defOff := posToOffset(doc.lines, b.Range.Start, doc.text)
-		if earliest == -1 || defOff < earliest {
-			earliest = defOff
-			best = b
-			bestOK = true
-		}
-	}
-	return best, bestOK
-}
-
-// collectTopLevelSymbols walks the AST (root-level only) and extracts symbols:
-//   - let/assign of a simple decl: ("assign", ("decl", name), rhs)
-//   - marks kind "fun" when rhs tag == "fun"; "type" when rhs tag == "type"
-func findDefIDRange(toks []mindscript.Token, name string) (int, int, bool) {
-	for i := 0; i < len(toks); i++ {
-		tk := toks[i]
-		if tk.Type != mindscript.ID {
-			continue
-		}
-		if tokenName(tk) != name {
-			continue
-		}
-		// def `x = ...`
-		if i+1 < len(toks) && toks[i+1].Type == mindscript.ASSIGN {
-			return tk.StartByte, tk.EndByte, true
-		}
-		// def `let x ...`
-		if i-1 >= 0 && toks[i-1].Type == mindscript.LET {
-			return tk.StartByte, tk.EndByte, true
-		}
-	}
-	// Fallback: first occurrence (still better than nothing)
-	for i := 0; i < len(toks); i++ {
-		tk := toks[i]
-		if tk.Type == mindscript.ID && tokenName(tk) == name {
-			return tk.StartByte, tk.EndByte, true
-		}
-	}
-	return 0, 0, false
-}
-
-func unwrapAnnotNode(n []any) []any {
-	for {
-		if len(n) >= 3 {
-			if tag, _ := n[0].(string); tag == "annot" {
-				if inner, _ := n[2].([]any); inner != nil {
-					n = inner
-					continue
-				}
-			}
-		}
-		return n
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Token-only lints (unchanged)
-////////////////////////////////////////////////////////////////////////////////
-
-// ---------- Layout-sensitive token lints (kept as a tiny helper) ----------
-func tokenLints(doc *docState) []Diagnostic {
-	if doc == nil {
-		return nil
-	}
-	out := []Diagnostic{}
-	for i := 0; i+1 < len(doc.tokens); i++ {
-		t := doc.tokens[i]
-		n := doc.tokens[i+1]
-		// LROUND vs CLROUND
-		if n.Type == mindscript.LROUND {
-			if t.Type == mindscript.ID || t.Type == mindscript.RROUND || t.Type == mindscript.RSQUARE ||
-				t.Type == mindscript.STRING || t.Type == mindscript.INTEGER || t.Type == mindscript.NUMBER ||
-				t.Type == mindscript.FUNCTION || t.Type == mindscript.ORACLE {
-				s0, e0 := tokenSpan(doc, n)
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 3,
-					Code:     "MS-LROUND-INSTEAD-OF-CLROUND",
-					Source:   "mindscript",
-					Message:  "Remove space before '(' (use compact '(' with no space).",
-				})
-			}
-		}
-		// LSQUARE vs CLSQUARE
-		if n.Type == mindscript.LSQUARE {
-			if t.Type == mindscript.ID || t.Type == mindscript.RROUND || t.Type == mindscript.RSQUARE ||
-				t.Type == mindscript.STRING || t.Type == mindscript.INTEGER || t.Type == mindscript.NUMBER {
-				s0, e0 := tokenSpan(doc, n)
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 3,
-					Code:     "MS-LSQUARE-INSTEAD-OF-CLSQUARE",
-					Source:   "mindscript",
-					Message:  "Remove space before '[' (use compact '[' with no space) for indexing.",
-				})
-			}
-		}
-		// DOT GAP
-		if t.Type == mindscript.PERIOD {
-			j := i + 1
-			sawAnnot := false
-			for j < len(doc.tokens) && doc.tokens[j].Type == mindscript.ANNOTATION {
-				sawAnnot = true
-				j++
-			}
-			if sawAnnot && j < len(doc.tokens) {
-				s0, e0 := tokenSpan(doc, t)
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 3,
-					Code:     "MS-DOT-GAP",
-					Source:   "mindscript",
-					Message:  "Remove the gap/comment between '.' and the property name.",
-				})
-			}
-		}
-	}
-	for i := 0; i+1 < len(doc.tokens); i++ {
-		if doc.tokens[i].Type == mindscript.ANNOTATION && doc.tokens[i+1].Type == mindscript.END {
-			if doc.tokens[i].Line == doc.tokens[i+1].Line {
-				s0, e0 := tokenSpan(doc, doc.tokens[i+1])
-				out = append(out, Diagnostic{
-					Range:    makeRange(doc.lines, s0, e0, doc.text),
-					Severity: 4,
-					Code:     "MS-FORMAT-POST-FORCES-NEWLINE",
-					Source:   "mindscript",
-					Message:  "Move 'end' to the next line after a trailing comment.",
-				})
-			}
-		}
-	}
-	return out
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Catamorphic fold (one pass): types + diagnostics + bindings
-////////////////////////////////////////////////////////////////////////////////
-
-type foldOut struct {
-	T  []any
-	Ds []Diagnostic
-}
-type anCtx struct {
-	doc       *docState
-	scope     []map[string]bool
-	atTop     bool
-	curFunRet []any
-	binds     []bindingDef
-	diags     []Diagnostic
-}
-
-func (c *anCtx) push() { c.scope = append(c.scope, map[string]bool{}) }
-func (c *anCtx) pop()  { c.scope = c.scope[:len(c.scope)-1] }
-func (c *anCtx) bind(name string) {
-	if name != "" {
-		c.scope[len(c.scope)-1][name] = true
-	}
-}
-func (c *anCtx) defined(name string) bool {
-	for i := len(c.scope) - 1; i >= 0; i-- {
-		if c.scope[i][name] {
+func hasDiag(idx *FileIndex, code string) bool {
+	for _, d := range idx.Diags {
+		if d.Code == code {
 			return true
 		}
 	}
 	return false
 }
 
-func fold(n []any, path mindscript.NodePath, c *anCtx) foldOut {
-	if len(n) == 0 {
-		return foldOut{T: typeID("Any")}
-	}
-	tag, _ := n[0].(string)
-
-	emit := func(d Diagnostic) { c.diags = append(c.diags, d) }
-
-	switch tag {
-	case "str":
-		return foldOut{T: typeID("Str")}
-	case "int":
-		return foldOut{T: typeID("Int")}
-	case "num":
-		return foldOut{T: typeID("Num")}
-	case "bool":
-		return foldOut{T: typeID("Bool")}
-	case "null":
-		return foldOut{T: typeID("Null")}
-
-	case "block":
-		c.push()
-		c.atTop = len(path) == 0
-		defer c.pop()
-		// Block is an expression: the value is the LAST child's type (or Any if none).
-		var lastT []any = typeID("Any")
-		for i := 1; i < len(n); i++ {
-			if ch, ok := n[i].([]any); ok {
-				lastT = fold(ch, append(path, i-1), c).T
-			}
-		}
-		return foldOut{T: lastT}
-
-	case "id":
-		if len(n) >= 2 {
-			nm, _ := n[1].(string)
-			switch nm {
-			case "Int", "Num", "Str", "Bool", "Null", "Any", "Type":
-				return foldOut{T: typeID("Any")}
-			default:
-				if !c.defined(nm) {
-					if rng, ok := rangeFromPath(c.doc, path); ok {
-						emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-UNKNOWN-NAME", Source: "mindscript", Message: fmt.Sprintf("Unknown name: %s", nm)})
-					}
-				}
-				// If this identifier refers to a function/oracle, surface its ARROW type
-				// for expression typing (arrays, partial application, etc.).
-				if _, pts, ret, ok := findLocalFunMeta(c.doc, nm); ok {
-					arrow := ret
-					for i := len(pts) - 1; i >= 0; i-- {
-						arrow = []any{"binop", "->", pts[i], arrow}
-					}
-					return foldOut{T: arrow}
-				}
-				// Prefer current-pass bindings first (most precise during single-pass fold)
-				for i := len(c.binds) - 1; i >= 0; i-- {
-					if c.binds[i].Name == nm && len(c.binds[i].TypeNode) > 0 {
-						return foldOut{T: c.binds[i].TypeNode}
-					}
-				}
-				// Then fall back to already-published bindings (from previous analyses)
-				if tn, ok := findAnyBindingType(c.doc, nm); ok {
-					return foldOut{T: tn}
-				}
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "array":
-		if len(n) == 1 {
-			return foldOut{T: []any{"array", typeID("Any")}}
-		}
-		var elem []any
-		var first []any
-		mixed := false
-		for i := 1; i < len(n); i++ {
-			if ch, ok := n[i].([]any); ok {
-				ti := fold(ch, append(path, i-1), c).T
-				if first == nil {
-					first = ti
-					// seed element type with the first element (avoid collapsing to Any)
-					elem = ti
-				} else {
-					if !sameType(first, ti) {
-						mixed = true
-					}
-					elem = LUB(elem, ti)
-				}
-			}
-		}
-		if mixed && formatTypeNode(elem) != formatTypeNode(first) {
-			if rng, ok := rangeFromPath(c.doc, path); ok {
-				emit(Diagnostic{Range: rng, Severity: 2, Code: "MS-ARRAY-HETEROGENEOUS", Source: "mindscript", Message: "Array has heterogeneous element types; elements widen to a common supertype."})
-			}
-		}
-		return foldOut{T: []any{"array", elem}}
-
-	case "map":
-		out := []any{"map"}
-		for i := 1; i < len(n); i++ {
-			if p, ok := n[i].([]any); ok && len(p) >= 3 && (p[0] == "pair" || p[0] == "pair!") {
-				keyNode, _ := p[1].([]any)
-				valNode, _ := p[2].([]any)
-				ks := ""
-				if len(keyNode) >= 2 && keyNode[0] == "str" {
-					ks, _ = keyNode[1].(string)
-				}
-				vt := fold(valNode, append(path, i-1, 1), c).T
-				out = append(out, []any{"pair", []any{"str", ks}, vt})
-			}
-		}
-		return foldOut{T: out}
-
-	case "get":
-		if len(n) >= 3 {
-			recvNode, _ := n[1].([]any)
-			objT := fold(recvNode, append(path, 0), c).T
-			key := ""
-			if ks, ok := n[2].([]any); ok && len(ks) >= 2 && ks[0] == "str" {
-				key, _ = ks[1].(string)
-			}
-			if key == "" {
-				return foldOut{T: typeID("Any")}
-			}
-			// Determine if receiver is a *typed parameter*; only then trust type-map requiredness.
-			isTypedParam := false
-			var paramMapT []any
-			idn := recvNode // recvNode is already []any; no type assertion needed
-			if len(idn) >= 2 && idn[0] == "id" {
-				if nm, _ := idn[1].(string); nm != "" {
-					for i := len(c.binds) - 1; i >= 0; i-- {
-						b := c.binds[i]
-						if b.Name == nm && b.Kind == "param" && len(b.TypeNode) > 0 && b.TypeNode[0] == "map" {
-							isTypedParam = true
-							paramMapT = b.TypeNode
-							break
-						}
-						// Accept alias-typed params that resolve to a map.
-						if b.Name == nm && b.Kind == "param" && len(b.TypeNode) > 0 && b.TypeNode[0] == "id" {
-							if mt, ok := resolveTypeAliasMap(c.doc, b.TypeNode); ok {
-								isTypedParam = true
-								paramMapT = mt
-								break
-							}
-						}
-					}
-				}
-			}
-			if isTypedParam {
-				if tv, _, ok := mapFieldTypeReq(paramMapT, key); ok {
-					// Required fields are guaranteed present; optional fields have their annotated type.
-					return foldOut{T: tv}
-				}
-				// Unknown key on a *typed* param: open-world, but warn because field is not declared.
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{
-						Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
-						Message: fmt.Sprintf("Key '%s' may be missing.", key),
-					})
-				}
-				return foldOut{T: typeID("Any")}
-			}
-			// Value-map / unknown object:
-			// If static receiver type is a map *and the key exists*, return its type with NO warning.
-			// Otherwise, warn that the key may be missing.
-			if len(objT) > 0 && objT[0] == "map" {
-				if tv, ok := mapFieldType(objT, key); ok {
-					// Known-present key in the *static* value-map type: no warning.
-					return foldOut{T: tv}
-				}
-			}
-			if rng, ok := rangeFromPath(c.doc, path); ok {
-				emit(Diagnostic{
-					Range: rng, Severity: 2, Code: "MS-MAP-MISSING-KEY", Source: "mindscript",
-					Message: fmt.Sprintf("Key '%s' may be missing.", key),
-				})
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "idx":
-		if len(n) >= 3 {
-			objT := fold(n[1].([]any), append(path, 0), c).T
-			idxT := fold(n[2].([]any), append(path, 1), c).T
-			// Index expr lives at child #1 in fold-path space → use append(path, 1)
-			if rng, ok := rangeFromPath(c.doc, append(path, 1)); ok && formatTypeNode(idxT) != "Int" {
-				emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript", Message: "Index must be Int."})
-			}
-			if len(objT) >= 2 && objT[0] == "array" {
-				if t, ok := objT[1].([]any); ok {
-					return foldOut{T: t}
-				}
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "call":
-		// Support BOTH shapes:
-		//   ("call", calleeExpr, ("array", arg1, arg2, ...))
-		//   ("call", calleeExpr, arg1, arg2, ...)
-		// Callee name (only simple id needed for tests)
-		calleeIsID := false
-		calleeName := ""
-		if idn, _ := n[1].([]any); len(idn) >= 2 && idn[0] == "id" {
-			if s, _ := idn[1].(string); s != "" {
-				calleeIsID = true
-				calleeName = s
-			}
-		}
-		// Fold args and collect their types + ranges (accept both shapes)
-		var argTs [][]any
-		var argRanges []Range
-		// MindScript: no true zero-arity — missing arg list implies a single Null argument
-		if len(n) == 2 {
-			argTs = [][]any{typeID("Null")}
-			argRanges = []Range{rangeOrDefault(c.doc, path)}
-		} else if len(n) > 2 {
-			if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
-				// ("call", callee, ("array", arg1, arg2, ...))
-				for i := 1; i < len(an); i++ {
-					if a, ok := an[i].([]any); ok {
-						argTs = append(argTs, fold(a, append(path, 1, i-1), c).T)
-						if r, ok := rangeFromPath(c.doc, append(path, 1, i-1)); ok {
-							argRanges = append(argRanges, r)
-						} else {
-							argRanges = append(argRanges, Range{})
-						}
-					}
-				}
-			} else {
-				// ("call", callee, arg1, arg2, ...)
-				for i := 2; i < len(n); i++ {
-					if a, ok := n[i].([]any); ok {
-						argTs = append(argTs, fold(a, append(path, i-1), c).T)
-						if r, ok := rangeFromPath(c.doc, append(path, i-1)); ok {
-							argRanges = append(argRanges, r)
-						} else {
-							argRanges = append(argRanges, Range{})
-						}
-					}
-				}
-			}
-		}
-		// Default: unknown callee → just return Any
-		paramTs, retT, ok := [][]any{}, typeID("Any"), false
-		if calleeIsID {
-			_, paramTs, retT, ok = findLocalFunMeta(c.doc, calleeName)
-		}
-		if ok {
-			// Arity checks (overflow only; partial application allowed)
-			if len(argTs) > len(paramTs) {
-				// Mark the first overflow argument
-				overIdx := len(paramTs)
-				if overIdx < len(argRanges) {
-					emit(Diagnostic{
-						Range:    argRanges[overIdx],
-						Severity: 1, Code: "MS-ARG-OVERFLOW", Source: "mindscript",
-						Message: "Too many arguments for function.",
-					})
-				}
-			}
-			// Per-argument type checks (use structural subtyping).
-			nCheck := len(argTs)
-			if len(paramTs) < nCheck {
-				nCheck = len(paramTs)
-			}
-			for i := 0; i < nCheck; i++ {
-				mismatch := !IsSubtypeStatic(argTs[i], paramTs[i])
-
-				// Special-case Enum membership when argument is a literal:
-				// This preserves the crisp "not a member" diagnostic flavor.
-				var argNode []any
-				if len(n) > 2 {
-					if an, ok := n[2].([]any); ok && len(an) > 0 && an[0] == "array" {
-						if i+1 < len(an) {
-							argNode, _ = an[i+1].([]any)
-						}
-					} else if 2+i < len(n) {
-						argNode, _ = n[2+i].([]any)
-					}
-				}
-				isEnum, isMember := enumHasMember(paramTs[i], unwrapAnnotNode(argNode), c.doc)
-				if isEnum && !isMember {
-					mismatch = true
-				}
-
-				if mismatch && i < len(argRanges) {
-					emit(Diagnostic{
-						Range:    argRanges[i],
-						Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript",
-						Message: fmt.Sprintf("Argument %d: got %s, want %s.", i+1, formatTypeNode(argTs[i]), formatTypeNode(paramTs[i])),
-					})
-				}
-			}
-			// Under-application: return residual arrow of remaining params → retT
-			if len(argTs) < len(paramTs) {
-				res := retT
-				for i := len(paramTs) - 1; i >= len(argTs); i-- {
-					res = []any{"binop", "->", paramTs[i], res}
-				}
-				return foldOut{T: res}
-			}
-			// Exact or over-application: return declared (possibly nullable) return type.
-			return foldOut{T: retT}
-		}
-		// Unknown callee — fall back to Any
-		return foldOut{T: typeID("Any")}
-
-	case "binop":
-		op, _ := n[1].(string)
-		lt := fold(n[2].([]any), append(path, 1), c).T
-		rt := fold(n[3].([]any), append(path, 2), c).T
-		// % 0 constant
-		if op == "%" {
-			// RHS is child index 2 in fold-path space (n[3] in raw),
-			// so use append(path, 2) for spans (not 3).
-			m := unwrapAnnotNode(n[3].([]any))
-			if len(m) >= 2 && m[0] == "int" {
-				if v0, ok := m[1].(int64); ok && v0 == 0 {
-					rng := rangeOrDefault(c.doc, append(path, 2))
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-DIV-BY-ZERO-CONST", Source: "mindscript", Message: "Modulo by zero."})
-				}
-			}
-		}
-		// bitwise require Int
-		if op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" {
-			if formatTypeNode(lt) != "Int" || formatTypeNode(rt) != "Int" {
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-BITWISE-NONINT", Source: "mindscript", Message: "Bitwise operators require Int operands."})
-				}
-			}
-			return foldOut{T: typeID("Int")}
-		}
-		// boolean ops
-		if op == "and" || op == "or" {
-			if formatTypeNode(lt) != "Bool" || formatTypeNode(rt) != "Bool" {
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-ARG-TYPE-MISMATCH", Source: "mindscript", Message: "Boolean operators require Bool operands."})
-				}
-			}
-			return foldOut{T: typeID("Bool")}
-		}
-		// nullable arithmetic/bitwise: guard usage of T? in numeric ops
-		if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-			if isNullable(lt) || isNullable(rt) {
-				rng := rangeOrDefault(c.doc, path)
-				emit(Diagnostic{
-					Range:    rng,
-					Severity: 2,
-					Code:     "MS-MAYBE-NULL-UNSAFE",
-					Source:   "mindscript",
-					Message:  "Value may be null; guard with a null check.",
-				})
-			}
-		}
-		switch op {
-		case "+", "-", "*", "%":
-			return foldOut{T: LUB(lt, rt)}
-		case "/":
-			as, bs := formatTypeNode(lt), formatTypeNode(rt)
-			if as == "Int" && bs == "Int" {
-				return foldOut{T: typeID("Int")}
-			}
-			if as == "Num" || bs == "Num" {
-				return foldOut{T: typeID("Num")}
-			}
-			return foldOut{T: typeID("Any")}
-		case "==", "!=":
-			return foldOut{T: typeID("Bool")}
-		case "<", "<=", ">", ">=":
-			okNum := (formatTypeNode(lt) == "Num" || formatTypeNode(lt) == "Int") &&
-				(formatTypeNode(rt) == "Num" || formatTypeNode(rt) == "Int")
-			okStr := formatTypeNode(lt) == "Str" && formatTypeNode(rt) == "Str"
-			if !(okNum || okStr) {
-				if rng, ok := rangeFromPath(c.doc, path); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-COMPARISON-TYPE-MISMATCH", Source: "mindscript", Message: "Comparison requires Num↔Num or Str↔Str."})
-				}
-			}
-			return foldOut{T: typeID("Bool")}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "unop":
-		if len(n) >= 3 {
-			op, _ := n[1].(string)
-			r := fold(n[2].([]any), append(path, 1), c).T
-			switch op {
-			case "-":
-				rs := formatTypeNode(r)
-				if rs == "Int" || rs == "Num" {
-					return foldOut{T: r}
-				}
-			case "not":
-				return foldOut{T: typeID("Bool")}
-			case "?":
-				return foldOut{T: []any{"unop", "?", r}}
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "if":
-		// ("if", ("pair", cond, then), ..., else?)
-		var t []any
-		for i := 1; i < len(n); i++ {
-			arm, _ := n[i].([]any)
-			if len(arm) == 0 {
-				continue
-			}
-			if arm[0] == "pair" && len(arm) >= 3 {
-				thenBlk, _ := arm[2].([]any)
-				t = LUB(t, fold(thenBlk, append(path, i-1, 1), c).T)
-			} else {
-				t = LUB(t, fold(arm, append(path, i-1), c).T)
-			}
-		}
-		if len(t) == 0 {
-			t = typeID("Any")
-		}
-		return foldOut{T: t}
-
-	case "while", "for":
-		// Loops: result is LUB(body, Null) conservatively (zero-iteration)
-		var acc []any
-		for i := 1; i < len(n); i++ {
-			if ch, ok := n[i].([]any); ok {
-				acc = LUB(acc, fold(ch, append(path, i-1), c).T)
-			}
-		}
-		return foldOut{T: LUB(acc, typeID("Null"))}
-
-	case "fun", "oracle":
-		// enter scope; bind params; remember return type
-		c.push()
-		defer c.pop()
-		if (tag == "fun" || tag == "oracle") && len(n) >= 2 {
-			if ps, _ := n[1].([]any); len(ps) > 0 && ps[0] == "array" {
-				for i := 1; i < len(ps); i++ {
-					if p, _ := ps[i].([]any); len(p) >= 2 {
-						if idNode, _ := p[1].([]any); len(idNode) >= 2 && idNode[0] == "id" {
-							if nm, _ := idNode[1].(string); nm != "" {
-								c.bind(nm)
-								idPath := append(append(append(mindscript.NodePath{}, path...), 0), i-1)
-								idPath = append(idPath, 0)
-								var tNode []any
-								if len(p) >= 3 {
-									tNode, _ = p[2].([]any)
-								}
-								b := bindingDef{Name: nm, Range: rangeFromID(c.doc, idPath, nm), Kind: "param", TypeNode: tNode}
-								c.binds = append(c.binds, b)
-								c.doc.binds = append(c.doc.binds, b)
-							}
-						}
-					}
-				}
-			}
-		}
-		// body
-		if tag == "fun" && len(n) >= 4 {
-			// set current return type
-			prev := c.curFunRet
-			if rt, ok := n[2].([]any); ok {
-				c.curFunRet = rt
-			}
-			defer func() { c.curFunRet = prev }()
-			fold(n[3].([]any), append(path, 2), c)
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "type":
-		return foldOut{T: typeID("Any")}
-
-	case "return":
-		if len(c.curFunRet) > 0 {
-			var actual []any
-			if len(n) >= 2 {
-				if rn, ok := n[1].([]any); ok {
-					actual = fold(rn, append(path, 0), c).T
-				}
-			} else {
-				actual = typeID("Null")
-			}
-			// Structural subtyping conformance (no string-equality hacks).
-			if !IsSubtypeStatic(actual, c.curFunRet) {
-				// Always emit, even if a precise span is missing.
-				rng := rangeOrDefault(c.doc, path)
-				emit(Diagnostic{
-					Range:    rng,
-					Severity: 1,
-					Code:     "MS-RET-TYPE-MISMATCH",
-					Source:   "mindscript",
-					Message:  fmt.Sprintf("Return type %s does not match %s.", formatTypeNode(actual), formatTypeNode(c.curFunRet)),
-				})
-			}
-		}
-		return foldOut{T: typeID("Any")}
-
-	case "assign":
-		// Fallthrough above changed: ensure return-type mismatches always emit,
-		// even if a precise span can't be found.
-		if len(c.curFunRet) > 0 && len(n) > 0 && n[0] == "return" {
-			// (No-op; handled in "return" case. This comment clarifies intent.)
-		}
-
-		// Restore the removed block with default-range emission:
-		if false {
-			_ = rangeOrDefault // keep helper referenced in this scope (no-op)
-		}
-
-		if len(n) < 3 {
-			return foldOut{T: typeID("Any")}
-		}
-		lhs, _ := n[1].([]any)
-		rhs, _ := n[2].([]any)
-		// target validation
-		if len(lhs) > 0 {
-			switch lhs[0] {
-			case "decl", "id", "get", "idx", "darr", "dobj":
-			default:
-				if rng, ok := rangeFromPath(c.doc, append(path, 1)); ok {
-					emit(Diagnostic{Range: rng, Severity: 1, Code: "MS-INVALID-ASSIGN-TARGET", Source: "mindscript", Message: "Invalid assignment target."})
-				}
-			}
-		}
-
-		// If this is a "return" handled above, emit with default range:
-		if len(n) > 0 && n[0] == "return" && len(c.curFunRet) > 0 {
-			rng := rangeOrDefault(c.doc, path)
-			_ = rng // (the actual mismatch logic runs in the "return" branch)
-		}
-
-		// collect names in patterns
-		type nameAt struct {
-			Name string
-			Path mindscript.NodePath
-		}
-		var names []nameAt
-		var collectPat func(pat []any, base mindscript.NodePath)
-		collectPat = func(pat []any, base mindscript.NodePath) {
-			if len(pat) == 0 {
-				return
-			}
-			switch pat[0] {
-			case "decl", "id":
-				if len(pat) >= 2 {
-					if n, _ := pat[1].(string); n != "" {
-						names = append(names, nameAt{n, append(mindscript.NodePath{}, base...)})
-					}
-				}
-			case "darr":
-				for i := 1; i < len(pat); i++ {
-					if ch, ok := pat[i].([]any); ok {
-						collectPat(ch, append(append(mindscript.NodePath{}, base...), i-1))
-					}
-				}
-			case "dobj":
-				for i := 1; i < len(pat); i++ {
-					if pair, ok := pat[i].([]any); ok && len(pair) >= 3 && (pair[0] == "pair" || pair[0] == "pair!") {
-						if sub, ok := pair[2].([]any); ok {
-							collectPat(sub, append(append(mindscript.NodePath{}, base...), i-1, 1))
-						}
-					}
-				}
-			}
-		}
-		lhsPath := append(append(mindscript.NodePath{}, path...), 1)
-		collectPat(lhs, lhsPath)
-
-		base, txt, _ := annotText(rhs)
-		kind := "variable"
-		var tnode []any
-		sig := ""
-		if len(base) > 0 {
-			switch base[0] {
-			case "fun":
-				kind = "fun"
-				if rt, ok := base[2].([]any); ok {
-					tnode = rt
-				}
-			case "oracle":
-				kind = "oracle"
-				if rt, ok := base[2].([]any); ok {
-					tnode = []any{"unop", "?", rt}
-				}
-			case "type":
-				kind = "type"
-			}
-		}
-		// fold RHS once for type if needed
-		rhsT := fold(base, append(path, 1), c).T
-		if len(tnode) == 0 {
-			tnode = rhsT
-		}
-		// If the pattern is an object destructure, default unknown entries to nullable.
-		isDobj := len(lhs) > 0 && lhs[0] == "dobj"
-		for _, na := range names {
-			if len(base) > 0 && (base[0] == "fun" || base[0] == "oracle") {
-				sig = formatFunSig(na.Name, base)
-			}
-			// Choose the base type for this binding (respecting dobj open-world policy),
-			// then LUB with any previous known type for the same symbol to widen across reassignments.
-			chosenType := func() []any {
-				if isDobj {
-					// Open-world: field may be missing → nullable Any.
-					return []any{"unop", "?", typeID("Any")}
-				}
-				return tnode
-			}()
-			// Find previous type for this name (prefer current-pass binds, then existing doc.binds).
-			prevType := []any(nil)
-			for i := len(c.binds) - 1; i >= 0; i-- {
-				if c.binds[i].Name == na.Name && len(c.binds[i].TypeNode) > 0 {
-					prevType = c.binds[i].TypeNode
-					break
-				}
-			}
-			if prevType == nil {
-				for i := len(c.doc.binds) - 1; i >= 0; i-- {
-					if c.doc.binds[i].Name == na.Name && len(c.doc.binds[i].TypeNode) > 0 {
-						prevType = c.doc.binds[i].TypeNode
-						break
-					}
-				}
-			}
-			mergedType := chosenType
-			if prevType != nil {
-				mergedType = LUB(prevType, chosenType)
-			}
-
-			b := bindingDef{
-				Name:     na.Name,
-				Range:    rangeFromID(c.doc, na.Path, na.Name),
-				DocFull:  txt,
-				DocFirst: firstLine(txt),
-				Kind:     kind,
-				TypeNode: mergedType,
-				Sig:      sig,
-			}
-			c.binds = append(c.binds, b)
-			c.doc.binds = append(c.doc.binds, b)
-			c.bind(na.Name)
-
-			// mark top-level on the just-appended binding(s)
-			lhst, _ := lhs[0].(string)
-			if c.atTop && (lhst == "decl" || lhst == "id") {
-				c.binds[len(c.binds)-1].IsTopLevel = true
-				c.doc.binds[len(c.doc.binds)-1].IsTopLevel = true
-			}
-
-			sig = ""
-		}
-		return foldOut{T: typeID("Any")}
-	}
-	// default: fold children to harvest diagnostics but return Any
-	for i := 1; i < len(n); i++ {
-		if ch, ok := n[i].([]any); ok {
-			fold(ch, append(path, i-1), c)
+func getDiag(idx *FileIndex, code string) (Diag, bool) {
+	for _, d := range idx.Diags {
+		if d.Code == code {
+			return d, true
 		}
 	}
-	return foldOut{T: typeID("Any")}
+	return Diag{}, false
 }
 
-func unifiedAnalyze(doc *docState) (binds []bindingDef, diags []Diagnostic) {
-	if doc == nil || doc.ast == nil {
-		return nil, nil
+func mustHaveDiag(t *testing.T, idx *FileIndex, code string) Diag {
+	t.Helper()
+	if d, ok := getDiag(idx, code); ok {
+		return d
 	}
-	c := &anCtx{doc: doc}
-	// seed scope with already-known bindings
-	c.push()
-	for _, b := range doc.binds {
-		c.bind(b.Name)
+	var got []string
+	for _, d := range idx.Diags {
+		got = append(got, d.Code)
 	}
-	_ = fold(doc.ast, mindscript.NodePath{}, c)
-	return c.binds, c.diags
+	t.Fatalf("expected diag %q not found; got=%v", code, got)
+	return Diag{}
 }
 
-func init() {
-	_ = rangeOrDefault // keep the helper referenced for go vet / linters
-}
-=== END FILE: cmd/msg-lsp/analysis.go ===
-
-=== BEGIN FILE: cmd/msg-lsp/lub.go ===
-// cmd/msg-lsp/lub.go
-//
-// Package-local LUB/GLB/Subtyping for MindScript S-expr types.
-//
-// What this file does
-// -------------------
-// Implements a **single-pass, static** type **Least Upper Bound (LUB)**,
-// a minimal **Greatest Lower Bound (GLB)** (only needed for function-parameter
-// contravariance), and a **structural subtyping predicate** over MindScript’s
-// S-expr type nodes.
-//
-// Public surface for analysis.go
-// ------------------------------
-//   • func LUB(a, b []any) []any
-//       – Spec-faithful LUB over type nodes, including nullability sugar,
-//         arrays (covariant), maps (field-wise on intersection; required iff
-//         required in both), enums (set union / widen), and arrows
-//         (GLB on params, LUB on returns). Opaque non-builtin IDs are treated
-//         as atoms: same-ID ⇒ itself, otherwise widen to Any.
-//
-//   • func GLB(a, b []any) ([]any, bool)
-//       – Minimal GLB used by LUB for function parameters. Handles primitives,
-//         arrays, type-maps (union of keys; required if either; per-field GLB
-//         with Any fallback), enums (set intersection), and nullability rules.
-//         Returns ok=false when no meaningful meet exists.
-//
-//   • func IsSubtypeStatic(a, b []any) bool
-//       – **Structural** subtyping check used by the analyzer for conformance
-//         tests (e.g., return-site checks and call-site argument checks).
-//         Obeys the spec: Int <: Num; arrays covariant; maps require all
-//         required fields and check optionals if present; arrows are
-//         contravariant in parameters and covariant in returns; enums are
-//         subset-checked; nullable is handled uniformly; non-builtin IDs are
-//         opaque atoms (identical-id only).
-//
-// Data structures visible to analysis.go
-// --------------------------------------
-// None beyond the S-expr `[]any` nodes it already uses.
-//
-// Notes
-// -----
-// • This file does **not** unfold user aliases; only built-ins (`Any, Null,
-//   Bool, Int, Num, Str, Type`) are special. Keep results compact (no shape
-//   invention beyond the spec rules).
-// • The public functions are thin shims; implementation details live below
-//   the `//// END_OF_PUBLIC` marker.
-
-package main
-
-import "reflect"
-
-// -----------------------------
-// Public shims (stable surface)
-// -----------------------------
-
-// LUB computes the least upper bound of two MindScript type S-exprs.
-func LUB(a, b []any) []any { return lubImpl(a, b) }
-
-// GLB computes a minimal greatest lower bound. ok=false means no GLB exists.
-func GLB(a, b []any) ([]any, bool) { return glbImpl(a, b) }
-
-// IsSubtypeStatic reports whether a <: b under the analyzer's static,
-// structural rules (uniform nullability, arrays covariant, maps with
-// required/optional semantics, arrows contra/co, enums by set-inclusion,
-// opaque aliases compare by atom identity).
-func IsSubtypeStatic(a, b []any) bool { return isSubtypeImpl(a, b) }
-
-//// END_OF_PUBLIC
-
-// -----------------------------
-// Implementation (private)
-// -----------------------------
-
-// --- tiny predicates ---------------------------------------------------------
-
-func isID(t []any, name string) bool { return len(t) >= 2 && t[0] == "id" && t[1] == name }
-func isAny(t []any) bool             { return isID(t, "Any") }
-func isNull(t []any) bool            { return isID(t, "Null") }
-
-func isPrim(t []any) bool {
-	if len(t) < 2 || t[0] != "id" {
-		return false
+func mustHaveDiagOneOf(t *testing.T, idx *FileIndex, codes ...string) {
+	t.Helper()
+	got := map[string]bool{}
+	for _, d := range idx.Diags {
+		got[d.Code] = true
 	}
-	switch t[1] {
-	case "Any", "Null", "Bool", "Int", "Num", "Str", "Type":
-		return true
-	default:
-		return false
+	for _, c := range codes {
+		if got[c] {
+			return
+		}
+	}
+	var want []string
+	want = append(want, codes...)
+	t.Fatalf("expected one of %v, got codes=%v", want, got)
+}
+
+func mustNotHaveDiag(t *testing.T, idx *FileIndex, code string) {
+	t.Helper()
+	if hasDiag(idx, code) {
+		var got []string
+		for _, d := range idx.Diags {
+			got = append(got, d.Code)
+		}
+		t.Fatalf("unexpected diag %q present; got=%v", code, got)
 	}
 }
 
-func primLUB(a, b []any) []any {
-	// equal handled by caller; Any handled by caller.
-	if (isID(a, "Int") && isID(b, "Num")) || (isID(a, "Num") && isID(b, "Int")) {
-		return typeID("Num")
-	}
-	// unrelated primitives widen to Any
-	return typeID("Any")
-}
-
-func primSubtype(a, b []any) bool {
-	if reflect.DeepEqual(a, b) {
-		return true
-	}
-	if isID(a, "Int") && isID(b, "Num") {
-		return true
-	}
-	if isAny(b) {
-		return true
-	}
-	return false
-}
-
-func peelNullable(t []any) (base []any, nullable bool, wasNull bool) {
-	if len(t) >= 3 && t[0] == "unop" && t[1] == "?" {
-		if inner, ok := t[2].([]any); ok {
-			return inner, true, false
-		}
-	}
-	if isNull(t) {
-		return nil, true, true
-	}
-	return t, false, false
-}
-func addNullable(t []any, q bool) []any {
-	if q {
-		return []any{"unop", "?", t}
-	}
-	return t
-}
-
-func isArray(t []any) bool { return len(t) >= 2 && t[0] == "array" }
-func arrElem(t []any) []any {
-	if len(t) >= 2 {
-		if e, ok := t[1].([]any); ok {
-			return e
-		}
-	}
-	return typeID("Any")
-}
-
-type fieldInfo struct {
-	typ      []any
-	required bool
-}
-
-func isMap(t []any) bool { return len(t) >= 1 && t[0] == "map" }
-func mapFields(t []any) map[string]fieldInfo {
-	m := map[string]fieldInfo{}
-	if !isMap(t) {
-		return m
-	}
-	for i := 1; i < len(t); i++ {
-		pr, ok := t[i].([]any)
-		if !ok || len(pr) < 3 {
-			continue
-		}
-		tag, _ := pr[0].(string)
-		if tag != "pair" && tag != "pair!" {
-			continue
-		}
-		k, _ := pr[1].([]any)
-		if len(k) < 2 || k[0] != "str" {
-			continue
-		}
-		key, _ := k[1].(string)
-		tv, _ := pr[2].([]any)
-		m[key] = fieldInfo{typ: tv, required: tag == "pair!"}
-	}
-	return m
-}
-func makeMapFrom(fields map[string]fieldInfo) []any {
-	out := []any{"map"}
-	for k, fi := range fields {
-		tag := "pair"
-		if fi.required {
-			tag = "pair!"
-		}
-		out = append(out, []any{tag, []any{"str", k}, fi.typ})
-	}
-	return out
-}
-
-func isEnum(t []any) bool { return len(t) >= 1 && t[0] == "enum" }
-func enumKind(t []any) string {
-	if !isEnum(t) || len(t) < 2 {
-		return ""
-	}
-	for i := 1; i < len(t); i++ {
-		if m, ok := t[i].([]any); ok && len(m) >= 2 {
-			if k, _ := m[0].(string); k == "str" || k == "int" || k == "num" || k == "bool" {
-				return k
-			}
-		}
-	}
-	return ""
-}
-func enumMembers(t []any) []any {
-	if !isEnum(t) {
+// findSymbol finds an analysis symbol with a given name by reading from RootEnv.
+// Only bindings stored as VTSymbol (via newSymbolVal) are returned; ambient
+// runtime values (non-VTSymbol) are ignored.
+func findSymbol(idx *FileIndex, name string) *VTSymbol {
+	if idx == nil || idx.RootEnv == nil {
 		return nil
 	}
-	out := make([]any, 0, len(t)-1)
-	for i := 1; i < len(t); i++ {
-		if m, ok := t[i].([]any); ok && len(m) >= 2 {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-func enumOf(_kind string, members []any) []any {
-	out := []any{"enum"}
-	out = append(out, members...)
-	return out
-}
-func enumBasePrim(kind string) []any {
-	switch kind {
-	case "str":
-		return typeID("Str")
-	case "int":
-		return typeID("Int")
-	case "num":
-		return typeID("Num")
-	case "bool":
-		return typeID("Bool")
-	default:
-		return typeID("Any")
-	}
-}
 
-func isArrow(t []any) bool { return len(t) >= 4 && t[0] == "binop" && t[1] == "->" }
-func arrowParts(t []any) (param, ret []any) {
-	if !isArrow(t) {
-		return typeID("Any"), typeID("Any")
-	}
-	p, _ := t[2].([]any)
-	r, _ := t[3].([]any)
-	return p, r
-}
-
-func eq(a, b []any) bool { return reflect.DeepEqual(a, b) }
-
-// --- Subtyping (structural; analyzer-side) ----------------------------------
-
-func isSubtypeImpl(a, b []any) bool {
-	// Any is top
-	if isAny(b) {
-		return true
-	}
-	// Exact equality
-	if eq(a, b) {
-		return true
-	}
-
-	// Uniform nullable handling
-	ab, aq, anull := peelNullable(a)
-	bb, bq, bnull := peelNullable(b)
-
-	// Null <: T? (and only then)
-	if anull {
-		return bnull || bq
-	}
-	// T? ⊄ U unless U is also nullable
-	if aq && !bq {
-		return false
-	}
-	// T? <: U? iff T <: U
-	if aq && bq {
-		return isSubtypeImpl(ab, bb)
-	}
-	// T <: U? iff T <: U
-	if !aq && bq {
-		return isSubtypeImpl(ab, bb)
-	}
-	// From here both are non-nullable base types ab, bb
-
-	// Primitives (Int <: Num)
-	if isPrim(ab) && isPrim(bb) {
-		return primSubtype(ab, bb)
-	}
-
-	// Arrays covariant
-	if isArray(ab) && isArray(bb) {
-		return isSubtypeImpl(arrElem(ab), arrElem(bb))
-	}
-
-	// Maps (open-world): required keys must exist and subtype; optional keys
-	// must subtype only if present on the left.
-	if isMap(ab) && isMap(bb) {
-		ma, mb := mapFields(ab), mapFields(bb)
-		for k, fb := range mb {
-			fa, ok := ma[k]
-			if fb.required {
-				if !ok || !isSubtypeImpl(fa.typ, fb.typ) {
-					return false
-				}
-			} else {
-				if ok && !isSubtypeImpl(fa.typ, fb.typ) {
-					return false
-				}
-			}
-		}
-		return true
-	}
-
-	// Enums: subset (same literal kind)
-	if isEnum(ab) && isEnum(bb) {
-		ka, kb := enumKind(ab), enumKind(bb)
-		if ka == "" || ka != kb {
-			return false
-		}
-		A, B := enumMembers(ab), enumMembers(bb)
-		for _, x := range A {
-			found := false
-			for _, y := range B {
-				if reflect.DeepEqual(x, y) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	}
-	// Enum <: base primitive (e.g., Enum["r","g"] <: Str)
-	if isEnum(ab) && isPrim(bb) && eq(enumBasePrim(enumKind(ab)), bb) {
-		return true
-	}
-
-	// Arrows: contravariant in params, covariant in return
-	if isArrow(ab) && isArrow(bb) {
-		ap, ar := arrowParts(ab)
-		bp, br := arrowParts(bb)
-		return isSubtypeImpl(bp, ap) && isSubtypeImpl(ar, br)
-	}
-
-	// Opaque non-builtin aliases: identical id only
-	if len(ab) >= 2 && ab[0] == "id" && !isPrim(ab) {
-		return reflect.DeepEqual(ab, bb)
-	}
-	return false
-}
-
-// --- GLB (minimal; for function params) --------------------------------------
-
-func glbImpl(a, b []any) ([]any, bool) {
-	ab, aq, anull := peelNullable(a)
-	bb, bq, bnull := peelNullable(b)
-
-	// Null rules
-	if anull && bnull {
-		return typeID("Null"), true
-	}
-	// both nullable: GLB(inner)?
-	if aq && bq {
-		if g, ok := glbImpl(ab, bb); ok {
-			return addNullable(g, true), true
-		}
-		return nil, false
-	}
-	// mixed nullable vs non-nullable: inner GLB must exist
-	if aq != bq || anull || bnull {
-		if g, ok := glbImpl(ab, bb); ok {
-			return g, true
-		}
-		return nil, false
-	}
-
-	if eq(ab, bb) {
-		return ab, true
-	}
-	// Any identity
-	if isAny(ab) {
-		return bb, true
-	}
-	if isAny(bb) {
-		return ab, true
-	}
-
-	// Primitives
-	if isPrim(ab) && isPrim(bb) {
-		if (isID(ab, "Int") && isID(bb, "Num")) || (isID(ab, "Num") && isID(bb, "Int")) {
-			return typeID("Int"), true
-		}
-		if primSubtype(ab, bb) {
-			return ab, true
-		}
-		if primSubtype(bb, ab) {
-			return bb, true
-		}
-		return nil, false
-	}
-
-	// Arrays
-	if isArray(ab) && isArray(bb) {
-		ge, ok := glbImpl(arrElem(ab), arrElem(bb))
-		if !ok {
-			return nil, false
-		}
-		return []any{"array", ge}, true
-	}
-
-	// Type maps (contravariant): union of keys; field GLB (fallback Any); required if either
-	if isMap(ab) && isMap(bb) {
-		ma, mb := mapFields(ab), mapFields(bb)
-		keys := map[string]struct{}{}
-		for k := range ma {
-			keys[k] = struct{}{}
-		}
-		for k := range mb {
-			keys[k] = struct{}{}
-		}
-		out := map[string]fieldInfo{}
-		for k := range keys {
-			fa, oka := ma[k]
-			fb, okb := mb[k]
-			var ta, tb []any
-			req := false
-			if oka {
-				ta = fa.typ
-				req = req || fa.required
-			}
-			if okb {
-				tb = fb.typ
-				req = req || fb.required
-			}
-			g, ok := glbImpl(ta, tb)
-			if !ok {
-				g = typeID("Any")
-			}
-			out[k] = fieldInfo{typ: g, required: req}
-		}
-		return makeMapFrom(out), true
-	}
-
-	// Enums (same kind): intersection (if empty → no GLB)
-	if isEnum(ab) && isEnum(bb) {
-		ka, kb := enumKind(ab), enumKind(bb)
-		if ka != "" && ka == kb {
-			ma, mb := enumMembers(ab), enumMembers(bb)
-			inter := []any{}
-			for _, x := range ma {
-				found := false
-				for _, y := range mb {
-					if reflect.DeepEqual(x, y) {
-						found = true
-						break
-					}
-				}
-				if found {
-					inter = append(inter, x)
-				}
-			}
-			if len(inter) == 0 {
-				return nil, false
-			}
-			return enumOf(ka, inter), true
-		}
-		return nil, false
-	}
-
-	// Enums with primitive of same base: GLB is the enum (subset of primitive)
-	if isEnum(ab) && isPrim(bb) {
-		k := enumKind(ab)
-		switch {
-		case k == "str" && isID(bb, "Str"),
-			k == "int" && isID(bb, "Int"),
-			k == "num" && isID(bb, "Num"),
-			k == "bool" && isID(bb, "Bool"):
-			return ab, true
-		}
-	}
-	if isEnum(bb) && isPrim(ab) {
-		k := enumKind(bb)
-		switch {
-		case k == "str" && isID(ab, "Str"),
-			k == "int" && isID(ab, "Int"),
-			k == "num" && isID(ab, "Num"),
-			k == "bool" && isID(ab, "Bool"):
-			return bb, true
-		}
-	}
-
-	// Opaque alias: same id → itself; else no GLB
-	if len(ab) >= 2 && ab[0] == "id" && !isPrim(ab) && reflect.DeepEqual(ab, bb) {
-		return ab, true
-	}
-
-	// Arrow GLB not defined (contravariant meet of arrows rarely needed here)
-	return nil, false
-}
-
-// --- LUB (spec-faithful) -----------------------------------------------------
-
-func lubImpl(a, b []any) []any {
-	ab, aq, anull := peelNullable(a)
-	bb, bq, bnull := peelNullable(b)
-
-	// Null ⊔ Null = Null
-	if anull && bnull {
-		return typeID("Null")
-	}
-	nullable := aq || bq || anull || bnull
-
-	// base shortcuts
-	if ab == nil {
-		if bb == nil {
-			return typeID("Null")
-		}
-		return addNullable(bb, nullable)
-	}
-	if bb == nil {
-		return addNullable(ab, nullable)
-	}
-
-	if eq(ab, bb) {
-		return addNullable(ab, nullable)
-	}
-	if isAny(ab) || isAny(bb) {
-		return addNullable(typeID("Any"), nullable)
-	}
-
-	// Primitives
-	if isPrim(ab) && isPrim(bb) {
-		return addNullable(primLUB(ab, bb), nullable)
-	}
-
-	// Arrays (covariant)
-	if isArray(ab) && isArray(bb) {
-		le := lubImpl(arrElem(ab), arrElem(bb))
-		return addNullable([]any{"array", le}, nullable)
-	}
-
-	// Maps: intersection of keys; field LUB; required iff both required
-	if isMap(ab) && isMap(bb) {
-		ma, mb := mapFields(ab), mapFields(bb)
-		out := map[string]fieldInfo{}
-		for k, fa := range ma {
-			if fb, ok := mb[k]; ok {
-				req := fa.required && fb.required
-				out[k] = fieldInfo{typ: lubImpl(fa.typ, fb.typ), required: req}
-			}
-		}
-		return addNullable(makeMapFrom(out), nullable)
-	}
-
-	// Enums (same kind → union; different kinds → Any)
-	if isEnum(ab) && isEnum(bb) {
-		ka, kb := enumKind(ab), enumKind(bb)
-		if ka != "" && ka == kb {
-			ua := enumMembers(ab)
-			ub := enumMembers(bb)
-			union := []any{}
-			add := func(x any) {
-				for _, u := range union {
-					if reflect.DeepEqual(u, x) {
-						return
-					}
-				}
-				union = append(union, x)
-			}
-			for _, x := range ua {
-				add(x)
-			}
-			for _, x := range ub {
-				add(x)
-			}
-			return addNullable(enumOf(ka, union), nullable)
-		}
-		return addNullable(typeID("Any"), nullable)
-	}
-
-	// Enums with primitive of same base: widen to the primitive
-	if isEnum(ab) && isPrim(bb) {
-		k := enumKind(ab)
-		switch {
-		case k == "str" && isID(bb, "Str"),
-			k == "int" && isID(bb, "Int"),
-			k == "num" && isID(bb, "Num"),
-			k == "bool" && isID(bb, "Bool"):
-			return addNullable(bb, nullable)
-		}
-	}
-	if isEnum(bb) && isPrim(ab) {
-		k := enumKind(bb)
-		switch {
-		case k == "str" && isID(ab, "Str"),
-			k == "int" && isID(ab, "Int"),
-			k == "num" && isID(ab, "Num"),
-			k == "bool" && isID(ab, "Bool"):
-			return addNullable(ab, nullable)
-		}
-	}
-
-	// Arrows: param GLB (if exists), return LUB
-	if isArrow(ab) && isArrow(bb) {
-		ap1, ar1 := arrowParts(ab)
-		ap2, ar2 := arrowParts(bb)
-		gp, ok := glbImpl(ap1, ap2)
-		if !ok {
-			return addNullable(typeID("Any"), nullable)
-		}
-		return addNullable([]any{"binop", "->", gp, lubImpl(ar1, ar2)}, nullable)
-	}
-
-	// Opaque alias atoms: same id → itself; else Any
-	if len(ab) >= 2 && ab[0] == "id" && !isPrim(ab) && reflect.DeepEqual(ab, bb) {
-		return addNullable(ab, nullable)
-	}
-
-	// Fallback: different shapes → Any
-	return addNullable(typeID("Any"), nullable)
-}
-=== END FILE: cmd/msg-lsp/lub.go ===
-
-=== BEGIN FILE: cmd/msg-lsp/protocol.go ===
-// cmd/lsp/protocol.go
-//
-// ROLE: Pure wire schema for JSON-RPC 2.0 and the Language Server Protocol (LSP).
-//
-// What lives here
-//   • Go structs that mirror the on-the-wire request/response envelopes and
-//     LSP payload types (positions, ranges, diagnostics, hovers, completion,
-//     semantic tokens, folding, signature help, etc.).
-//
-// What does NOT live here
-//   • No business logic, no transport framing, no feature handlers, no
-//     server state. This file must remain DTOs only so the rest of the
-//     codebase can import it without pulling any behavior.
-//
-// Why this separation
-//   • Keeps (de)serialization types stable and dependency-free.
-//   • Makes it easy to audit protocol changes and keep handlers decoupled.
-//
-// Dependencies: none (stdlib only).
-
-package main
-
-import "encoding/json"
-
-////////////////////////////////////////////////////////////////////////////////
-// LSP protocol types (wire structs)
-////////////////////////////////////////////////////////////////////////////////
-
-// ----- JSON-RPC envelope -----
-
-type Request struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
-type Response struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *ResponseError  `json:"error,omitempty"`
-}
-
-type ResponseError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// ----- LSP core value types -----
-
-type Position struct {
-	Line      int `json:"line"`
-	Character int `json:"character"` // UTF-16 code units
-}
-
-type Range struct {
-	Start Position `json:"start"`
-	End   Position `json:"end"`
-}
-
-type Location struct {
-	URI   string `json:"uri"`
-	Range Range  `json:"range"`
-}
-
-// ----- Text document -----
-
-type TextDocumentIdentifier struct {
-	URI string `json:"uri"`
-}
-
-type TextDocumentItem struct {
-	URI        string `json:"uri"`
-	LanguageID string `json:"languageId"`
-	Version    int    `json:"version"`
-	Text       string `json:"text"`
-}
-
-type TextDocumentContentChangeEvent struct {
-	Range       *Range `json:"range,omitempty"`
-	RangeLength int    `json:"rangeLength,omitempty"`
-	Text        string `json:"text"`
-}
-
-// ----- Initialize / capabilities -----
-
-type InitializeParams struct {
-	Capabilities any    `json:"capabilities"`
-	RootURI      string `json:"rootUri,omitempty"`
-}
-
-type TextDocumentSyncOptions struct {
-	OpenClose bool `json:"openClose"`
-	// 1 = Full, 2 = Incremental
-	Change            int  `json:"change"`
-	WillSave          bool `json:"willSave"`
-	WillSaveWaitUntil bool `json:"willSaveWaitUntil"`
-	Save              *struct {
-		IncludeText bool `json:"includeText"`
-	} `json:"save,omitempty"`
-}
-
-type ServerCapabilities struct {
-	TextDocumentSync   TextDocumentSyncOptions `json:"textDocumentSync"`
-	HoverProvider      bool                    `json:"hoverProvider"`
-	DefinitionProvider bool                    `json:"definitionProvider"`
-	CompletionProvider *struct {
-		TriggerCharacters []string `json:"triggerCharacters"`
-	} `json:"completionProvider,omitempty"`
-	DocumentSymbolProvider          bool `json:"documentSymbolProvider"`
-	ReferencesProvider              bool `json:"referencesProvider"`
-	WorkspaceSymbolProvider         bool `json:"workspaceSymbolProvider"`
-	DocumentFormattingProvider      bool `json:"documentFormattingProvider"`
-	DocumentRangeFormattingProvider bool `json:"documentRangeFormattingProvider"`
-	SignatureHelpProvider           *struct {
-		TriggerCharacters   []string `json:"triggerCharacters"`
-		RetriggerCharacters []string `json:"retriggerCharacters"`
-	} `json:"signatureHelpProvider,omitempty"`
-	SemanticTokensProvider *struct {
-		Legend struct {
-			TokenTypes     []string `json:"tokenTypes"`
-			TokenModifiers []string `json:"tokenModifiers"`
-		} `json:"legend"`
-		Full  bool `json:"full"`
-		Range bool `json:"range"`
-	} `json:"semanticTokensProvider,omitempty"`
-	FoldingRangeProvider   bool `json:"foldingRangeProvider"`
-	TypeDefinitionProvider bool `json:"typeDefinitionProvider,omitempty"`
-	RenameProvider         any  `json:"renameProvider,omitempty"`
-}
-
-type InitializeResult struct {
-	Capabilities ServerCapabilities `json:"capabilities"`
-	ServerInfo   map[string]string  `json:"serverInfo,omitempty"`
-}
-
-// ----- Diagnostics -----
-
-type Diagnostic struct {
-	Range    Range  `json:"range"`
-	Severity int    `json:"severity,omitempty"` // 1 = Error
-	Code     string `json:"code,omitempty"`
-	Source   string `json:"source,omitempty"`
-	Message  string `json:"message"`
-}
-
-type PublishDiagnosticsParams struct {
-	URI         string       `json:"uri"`
-	Diagnostics []Diagnostic `json:"diagnostics"`
-}
-
-// ----- Hover -----
-
-type Hover struct {
-	Contents MarkupContent `json:"contents"`
-	Range    *Range        `json:"range,omitempty"`
-}
-
-type MarkupContent struct {
-	Kind  string `json:"kind"`  // "plaintext" or "markdown"
-	Value string `json:"value"` // content
-}
-
-// ----- Completion -----
-
-type CompletionItem struct {
-	Label            string `json:"label"`
-	Kind             int    `json:"kind,omitempty"`
-	Detail           string `json:"detail,omitempty"`
-	InsertText       string `json:"insertText,omitempty"`
-	InsertTextFormat int    `json:"insertTextFormat,omitempty"`
-}
-
-// ----- Document symbols -----
-
-type DocumentSymbol struct {
-	Name           string           `json:"name"`
-	Detail         string           `json:"detail,omitempty"`
-	Kind           int              `json:"kind"`
-	Range          Range            `json:"range"`
-	SelectionRange Range            `json:"selectionRange"`
-	Children       []DocumentSymbol `json:"children,omitempty"`
-}
-
-// ----- Semantic tokens -----
-
-type SemanticTokensParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-}
-
-type SemanticTokensRangeParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Range        Range                  `json:"range"`
-}
-
-type SemanticTokens struct {
-	Data []uint32 `json:"data"`
-}
-
-// ----- Folding ranges -----
-
-type FoldingRange struct {
-	StartLine      int     `json:"startLine"`
-	StartCharacter *int    `json:"startCharacter,omitempty"`
-	EndLine        int     `json:"endLine"`
-	EndCharacter   *int    `json:"endCharacter,omitempty"`
-	Kind           *string `json:"kind,omitempty"` // "region", "comment"
-}
-
-// ----- Signature help -----
-
-type SignatureHelpParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     Position               `json:"position"`
-}
-
-type SignatureHelp struct {
-	Signatures      []SignatureInformation `json:"signatures"`
-	ActiveSignature int                    `json:"activeSignature"`
-	ActiveParameter int                    `json:"activeParameter"`
-}
-
-type SignatureInformation struct {
-	Label         string                 `json:"label"`
-	Documentation *MarkupContent         `json:"documentation,omitempty"`
-	Parameters    []ParameterInformation `json:"parameters,omitempty"`
-}
-
-type ParameterInformation struct {
-	Label         string         `json:"label"`
-	Documentation *MarkupContent `json:"documentation,omitempty"`
-}
-=== END FILE: cmd/msg-lsp/protocol.go ===
-
-=== BEGIN FILE: cmd/msg-lsp/state.go ===
-// state.go
-//
-// ROLE: Server/document data structures and minimal lifecycle helpers.
-//       This file defines the shared model (server, documents, symbol/binding
-//       records) and provides a constructor plus a read-only snapshot method.
-//
-// What lives here
-//   • server/doc structs, mutexes, interpreter handle.
-//   • Lightweight records used across features (symbolDef, bindingDef).
-//   • newServer() to construct the server.
-//   • (*server).snapshotDoc() to take a safe, read-only copy of a document.
-//
-// What does NOT live here
-//   • No transport/framing (readMsg/writeMsg), no send/notify helpers.
-//   • No analysis logic (lex/parse, spans, diagnostics).
-//   • No LSP feature handlers (hover/definition/etc.).
-//
-// Why this separation
-//   • Keeps state/model stable and import-light.
-//   • Analysis and features can depend on this without dragging in transport.
-
-package main
-
-import (
-	"sync"
-
-	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
-)
-
-// symbolDef: top-level symbols shown in document symbols (and used by features).
-type symbolDef struct {
-	Name  string
-	Kind  string // "let" | "fun" | "type"
-	Range Range  // where it's declared
-	Doc   string // first line, if available
-	Sig   string // pretty signature for fun/oracle
-}
-
-// bindingDef: any assignment to a name (decl/id) anywhere in the file.
-// Docs come uniformly from the VALUE's annotation wrapper if present.
-type bindingDef struct {
-	Name     string
-	Range    Range // span of the defining identifier token
-	DocFull  string
-	DocFirst string
-	Kind     string // "let" | "fun" | "oracle" | "type" | "param" | "" (best-effort)
-	// Enriched info for hover/completion
-	TypeNode   []any  // synthesized/static type (vars/params) or declared return (fun/oracle/type)
-	Sig        string // pretty signature for fun/oracle
-	IsTopLevel bool
-}
-
-// docState: per-document caches (populated by analysis).
-type docState struct {
-	uri     string
-	text    string
-	lines   []int // line start offsets (byte indices)
-	symbols []symbolDef
-	tokens  []mindscript.Token
-	ast     mindscript.S
-	spans   *mindscript.SpanIndex
-	binds   []bindingDef // all bindings collected uniformly
-}
-
-// server: global state for the LSP server.
-type server struct {
-	mu   sync.RWMutex
-	docs map[string]*docState
-	ip   *mindscript.Interpreter
-}
-
-// newServer constructs a server with an interpreter handle for metadata queries.
-// (Core analysis never executes user programs; the interpreter is used only to
-// read builtin/global metadata when formatting certain answers.)
-func newServer() *server {
-	ip, _ := mindscript.NewInterpreter()
-	return &server{
-		docs: make(map[string]*docState),
-		ip:   ip,
-	}
-}
-
-// snapshotDoc returns a consistent, read-only snapshot of a document.
-// Slices are shallow-copied so readers can't race on mutation.
-func (s *server) snapshotDoc(uri string) *docState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	d := s.docs[uri]
-	if d == nil {
+	v, err := idx.RootEnv.Get(name)
+	if err != nil {
+		// Name not found (or lookup error) → no analysis symbol.
 		return nil
 	}
-	cp := *d // shallow copy of struct
 
-	// Copy slices so callers can't mutate underlying arrays.
-	if d.lines != nil {
-		cp.lines = append([]int(nil), d.lines...)
-	}
-	if d.tokens != nil {
-		cp.tokens = append([]mindscript.Token(nil), d.tokens...)
-	}
-	if d.symbols != nil {
-		cp.symbols = append([]symbolDef(nil), d.symbols...)
-	}
-	if d.binds != nil {
-		cp.binds = append([]bindingDef(nil), d.binds...)
+	if sym, ok := asSymbol(v); ok {
+		return &sym
 	}
 
-	// AST and SpanIndex are treated as immutable by readers.
-	cp.ast = d.ast
-	cp.spans = d.spans
-
-	return &cp
+	// Non-VTSymbol binding → treat as ambient/builtin, not an analysis symbol.
+	return nil
 }
-=== END FILE: cmd/msg-lsp/state.go ===
+
+// -----------------------------------------------------------------------------
+// 1) Layout-sensitive token lints
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_LayoutHints(t *testing.T) {
+	const uri = "mem://layout.ms"
+
+	t.Run("space_before_paren_call_and_fun_params", func(t *testing.T) {
+		src := `
+let f = fun (x: Int) -> Int do x end
+f (1)
+`
+		idx := runIndex(t, uri, src)
+		// Parser might reject; if it parses, we expect the lint.
+		mustHaveDiagOneOf(t, idx, "MS-LROUND-INSTEAD-OF-CLROUND", "MS-PARSE")
+	})
+
+	t.Run("space_before_square_index", func(t *testing.T) {
+		src := `
+let arr = [1,2,3]
+arr [0]
+`
+		idx := runIndex(t, uri, src)
+		mustHaveDiag(t, idx, "MS-LSQUARE-INSTEAD-OF-CLSQUARE")
+	})
+
+	t.Run("dot_gap_across_annotation", func(t *testing.T) {
+		src := `
+let p = { name: "Ada" }
+p
+# note
+. name
+`
+		idx := runIndex(t, uri, src)
+		mustHaveDiagOneOf(t, idx, "MS-DOT-GAP", "MS-PARSE")
+	})
+
+	t.Run("post_forces_newline_end_same_line_hint", func(t *testing.T) {
+		// As per spec: this may be lexically impossible today; keep skipped.
+		t.Skip("MS-FORMAT-POST-FORCES-NEWLINE depends on lexer behavior; not observable yet")
+	})
+}
+
+// -----------------------------------------------------------------------------
+// 2) Names & assignment targets
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Unknown_Name(t *testing.T) {
+	const uri = "mem://names.ms"
+	const src = "y = x\n" // x never declared
+
+	idx := runIndex(t, uri, src)
+	if !hasDiag(idx, "MS-UNKNOWN-NAME") {
+		var got []string
+		for _, d := range idx.Diags {
+			got = append(got, d.Code)
+		}
+		t.Fatalf("expected MS-UNKNOWN-NAME, got=%v", got)
+	}
+}
+
+func Test_Analysis_Invalid_Assign_Target(t *testing.T) {
+	const uri = "mem://invalid-assign.ms"
+	const src = "(1 + 2) = 3\n"
+	idx := runIndex(t, uri, src)
+
+	got := map[string]bool{}
+	for _, d := range idx.Diags {
+		got[d.Code] = true
+	}
+	if !(got["MS-INVALID-ASSIGN-TARGET"] || got["MS-PARSE"]) {
+		t.Fatalf("expected MS-INVALID-ASSIGN-TARGET or MS-PARSE, got=%v", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 3) Arrays & operators
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Mod_By_Zero_Const(t *testing.T) {
+	const uri = "mem://ops-mod.ms"
+	src := `3 % 0`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-DIV-BY-ZERO-CONST")
+}
+
+func Test_Analysis_Bitwise_On_NonInt(t *testing.T) {
+	const uri = "mem://ops-bit.ms"
+	src := `1.0 & 3`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-BITWISE-NONINT")
+}
+
+// -----------------------------------------------------------------------------
+// 4) Bindings, functions, and oracle types
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Fun_Binding_Arrow_Type(t *testing.T) {
+	const uri = "mem://binds-fun.ms"
+	src := `
+let add = fun(a: Int, b: Int) -> Int do a + b end
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "add")
+	if s == nil {
+		t.Fatalf("binding for fun 'add' not found")
+	}
+	ty := mindscript.FormatType(s.Type)
+	if !strings.Contains(ty, "Int") || !strings.Contains(ty, "->") {
+		t.Fatalf("expected arrow type ending in Int, got %q", ty)
+	}
+}
+
+func Test_Analysis_Oracle_Return_Exposed_As_Nullable(t *testing.T) {
+	const uri = "mem://binds-oracle.ms"
+	src := `
+let next = oracle(seed: Int) -> Int
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "next")
+	if s == nil {
+		t.Fatalf("binding for oracle 'next' not found")
+	}
+	ty := mindscript.FormatType(s.Type)
+	if !strings.Contains(ty, "Int?") {
+		t.Fatalf("expected oracle return to be nullable Int?, got %q", ty)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 5) AST & spans sanity
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_AST_And_Spans_Sanity(t *testing.T) {
+	const uri = "mem://spans.ms"
+	src := `
+let p = { name: "Ada", age: 36 }
+p.name
+`
+	idx := runIndex(t, uri, src)
+
+	if idx.AST == nil || len(idx.AST) == 0 || idx.Spans == nil {
+		t.Fatalf("expected AST and spans to be present")
+	}
+	// Further SpanIndex assertions can be added once APIs are finalized.
+}
+
+// -----------------------------------------------------------------------------
+// 6) Calls, currying & arity
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Call_Arg_Overflow(t *testing.T) {
+	const uri = "mem://arity-overflow.ms"
+	src := `
+let f = fun(a: Int, b: Int) -> Int do a + b end
+f(1,2,3)
+`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-ARG-OVERFLOW")
+}
+
+func Test_Analysis_Call_Arg_Type_Mismatch(t *testing.T) {
+	const uri = "mem://arity-mismatch.ms"
+	src := `
+let f = fun(a: Int, b: Int) -> Int do a + b end
+f("a", 2)
+`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+}
+
+func Test_Analysis_Currying_Residual_Arrow(t *testing.T) {
+	const uri = "mem://curry.ms"
+	src := `
+let add = fun(a: Int, b: Int) -> Int do a + b end
+let g = add(1)
+`
+	idx := runIndex(t, uri, src)
+
+	mustNotHaveDiag(t, idx, "MS-ARG-OVERFLOW")
+	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+
+	s := findSymbol(idx, "g")
+	if s == nil {
+		t.Fatalf("binding g not found")
+	}
+	ft := mindscript.FormatType(s.Type)
+	if !strings.Contains(ft, "-> Int") {
+		t.Fatalf("want residual arrow ending in Int, got %q", ft)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 7) Return type checks
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Return_Type_Mismatch_Bare(t *testing.T) {
+	const uri = "mem://ret-bare.ms"
+	src := `
+let k = fun() -> Int do
+  return
+end
+`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-RET-TYPE-MISMATCH")
+}
+
+func Test_Analysis_Return_Type_Mismatch_Value(t *testing.T) {
+	const uri = "mem://ret-val.ms"
+	src := `
+let k = fun() -> Int do
+  return "x"
+end
+`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-RET-TYPE-MISMATCH")
+}
+
+// -----------------------------------------------------------------------------
+// 8) Indexing & properties
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Index_Must_Be_Int(t *testing.T) {
+	const uri = "mem://idx-int.ms"
+	src := `
+let xs = [1,2,3]
+xs["0"]
+`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+}
+
+func Test_Analysis_Map_Missing_Key_Warning_On_Value_Map(t *testing.T) {
+	const uri = "mem://map-missing.ms"
+	src := `
+let p = { name: "Ada" }
+p.age
+`
+	idx := runIndex(t, uri, src)
+	mustHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
+}
+
+func Test_Analysis_ValueMap_Known_Key_No_Warning(t *testing.T) {
+	const uri = "mem://valmap-present.ms"
+	src := `
+let p = { name: "Ada", age: 36 }
+p.name
+`
+	idx := runIndex(t, uri, src)
+	mustNotHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
+}
+
+// -----------------------------------------------------------------------------
+// 9) Block result typing (last expression)
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Block_Last_Expression_Binding_Type(t *testing.T) {
+	const uri = "mem://block-last.ms"
+	src := `
+let x = do
+  1
+  "s"
+end
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "x")
+	if s == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "Str" {
+		t.Fatalf("want Str, got %q", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 10) Division typing
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Division_Typing(t *testing.T) {
+	const uri = "mem://div-typing.ms"
+
+	t.Run("int_div_int_is_int_no_error", func(t *testing.T) {
+		src := `1 / 2`
+		idx := runIndex(t, uri, src)
+		if len(idx.Diags) != 0 {
+			t.Fatalf("unexpected diagnostics: %+v", idx.Diags)
+		}
+	})
+
+	t.Run("int_div_num_is_num_no_error", func(ttesting *testing.T) {
+		src := `1 / 2.0`
+		idx := runIndex(ttesting, uri, src)
+		if len(idx.Diags) != 0 {
+			ttesting.Fatalf("unexpected diagnostics: %+v", idx.Diags)
+		}
+	})
+}
+
+// -----------------------------------------------------------------------------
+// 11) Array + if-expression LUB sanity
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Array_LUB_Empty_Is_Any(t *testing.T) {
+	const uri = "mem://arr-empty.ms"
+	src := `let xs = []`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "xs")
+	if s == nil {
+		t.Fatalf("binding xs not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "[Any]" {
+		t.Fatalf("want [Any], got %q", got)
+	}
+}
+
+func Test_Analysis_Array_LUB_Homogeneous_Int(t *testing.T) {
+	const uri = "mem://arr-int.ms"
+	src := `let xs = [1, 2, 3]`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "xs")
+	if s == nil {
+		t.Fatalf("binding xs not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "[Int]" {
+		t.Fatalf("want [Int], got %q", got)
+	}
+}
+
+func Test_Analysis_If_LUB_Int_Vs_Num_Becomes_Num(t *testing.T) {
+	const uri = "mem://if-lub.ms"
+	src := `
+let y =
+  if true then 1 else 2.0 end
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "y")
+	if s == nil {
+		t.Fatalf("binding y not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "Num" {
+		t.Fatalf("want Num, got %q", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 12) Expression typing — tiny, focused tests
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Literals_Primitives(t *testing.T) {
+	const uri = "mem://lit-prim.ms"
+
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"int", `let x = 1`, "Int"},
+		{"num", `let x = 1.5`, "Num"},
+		{"str", `let x = "hi"`, "Str"},
+		{"bool", `let x = true`, "Bool"},
+		{"null", `let x = null`, "Null"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			idx := runIndex(t, uri, tc.src)
+			s := findSymbol(idx, "x")
+			if s == nil {
+				t.Fatalf("binding x not found")
+			}
+			if got := mindscript.FormatType(s.Type); got != tc.want {
+				t.Fatalf("want %s, got %q", tc.want, got)
+			}
+			if len(idx.Diags) != 0 {
+				t.Fatalf("unexpected diags: %+v", idx.Diags)
+			}
+		})
+	}
+}
+
+func Test_Analysis_Literals_Unknown_Name(t *testing.T) {
+	const uri = "mem://lit-unknown.ms"
+	src := `let x = y`
+	idx := runIndex(t, uri, src)
+
+	mustHaveDiag(t, idx, "MS-UNKNOWN-NAME")
+
+	s := findSymbol(idx, "x")
+	if s == nil {
+		t.Fatalf("binding x not found")
+	}
+	// Unknown RHS widens to Any.
+	if got := mindscript.FormatType(s.Type); got != "Any" {
+		t.Fatalf("want Any for x, got %q", got)
+	}
+}
+
+func Test_Analysis_Array_LUB_Mixed_NumNullable(t *testing.T) {
+	const uri = "mem://arr-mixed.ms"
+	src := `let xs = [1, 2.0, null]`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "xs")
+	if s == nil {
+		t.Fatalf("binding xs not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "[Num?]" {
+		t.Fatalf("want [Num?], got %q", got)
+	}
+}
+
+func Test_Analysis_Maps_Value_Shape(t *testing.T) {
+	const uri = "mem://map-shape.ms"
+	src := `let m = {a: 1, b: "x"}`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "m")
+	if s == nil {
+		t.Fatalf("binding m not found")
+	}
+	want := `{a: Int, b: Str}`
+	if got := mindscript.FormatType(s.Type); got != want {
+		t.Fatalf("want %s, got %q", want, got)
+	}
+}
+
+func Test_Analysis_Property_Get_Known_And_Unknown(t *testing.T) {
+	const uri = "mem://get-known-unknown.ms"
+	src := `
+let m = {a: 1}
+let x = m.a
+let y = m.b
+`
+	idx := runIndex(t, uri, src)
+
+	mustHaveDiag(t, idx, "MS-MAP-MISSING-KEY") // for m.b
+
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want Int for x, got %q", got)
+	}
+
+	y := findSymbol(idx, "y")
+	if y == nil {
+		t.Fatalf("binding y not found")
+	}
+	if got := mindscript.FormatType(y.Type); got != "Any" {
+		t.Fatalf("want Any for y, got %q", got)
+	}
+}
+
+func Test_Analysis_Index_Array_ElementType(t *testing.T) {
+	const uri = "mem://idx-array.ms"
+	src := `
+let xs = [1]
+let x = xs[0]
+`
+	idx := runIndex(t, uri, src)
+
+	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+
+	s := findSymbol(idx, "x")
+	if s == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "Int" {
+		t.Fatalf("want Int, got %q", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 13) If-expressions & loops — LUB and nullability
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_If_LUB_Branches(t *testing.T) {
+	const uri = "mem://if-basic.ms"
+
+	t.Run("int_int", func(t *testing.T) {
+		src := `let x = if true then 1 else 2 end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "x")
+		if s == nil {
+			t.Fatalf("binding x not found")
+		}
+		if got := mindscript.FormatType(s.Type); got != "Int" {
+			t.Fatalf("want Int, got %q", got)
+		}
+	})
+
+	t.Run("int_str_any", func(t *testing.T) {
+		src := `let x = if true then 1 else "no" end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "x")
+		if s == nil {
+			t.Fatalf("binding x not found")
+		}
+		if got := mindscript.FormatType(s.Type); got != "Any" {
+			t.Fatalf("want Any, got %q", got)
+		}
+	})
+
+	t.Run("missing_else_makes_nullable", func(t *testing.T) {
+		src := `let x = if true then 1 end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "x")
+		if s == nil {
+			t.Fatalf("binding x not found")
+		}
+		if got := mindscript.FormatType(s.Type); got != "Int?" {
+			t.Fatalf("want Int?, got %q", got)
+		}
+	})
+
+	t.Run("else_null_makes_nullable", func(t *testing.T) {
+		src := `let x = if true then 1 else null end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "x")
+		if s == nil {
+			t.Fatalf("binding x not found")
+		}
+		if got := mindscript.FormatType(s.Type); got != "Int?" {
+			t.Fatalf("want Int?, got %q", got)
+		}
+	})
+}
+
+func Test_Analysis_Loop_Result_Nullable(t *testing.T) {
+	const uri = "mem://loop-nullable.ms"
+	src := `
+let x = while false do
+  1
+end
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "x")
+	if s == nil {
+		t.Fatalf("binding x not found")
+	}
+	// Spec: loop may not run → body ⊔ Null ⇒ Int?
+	if got := mindscript.FormatType(s.Type); got != "Int?" {
+		t.Fatalf("want Int?, got %q", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 14) Functions & oracles — arrow shapes & nullability
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Fun_And_Oracle_Arrow_Shapes(t *testing.T) {
+	const uri = "mem://fun-oracle-arrows.ms"
+
+	t.Run("plain_fun_arrow", func(t *testing.T) {
+		src := `let f = fun(x: Int) -> Str do "ok" end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "f")
+		if s == nil {
+			t.Fatalf("binding f not found")
+		}
+		if got := mindscript.FormatType(s.Type); got != "Int -> Str" {
+			t.Fatalf("want Int -> Str, got %q", got)
+		}
+	})
+
+	t.Run("oracle_return_made_nullable", func(t *testing.T) {
+		src := `let f = oracle(x: Int) -> Str`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "f")
+		if s == nil {
+			t.Fatalf("binding f not found")
+		}
+		// Spec: Int -> Str?
+		if got := mindscript.FormatType(s.Type); got != "Int -> Str?" {
+			t.Fatalf("want Int -> Str?, got %q", got)
+		}
+	})
+
+	t.Run("oracle_already_nullable_stable", func(t *testing.T) {
+		src := `let f = oracle(x: Int) -> Str?`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "f")
+		if s == nil {
+			t.Fatalf("binding f not found")
+		}
+		// Spec: still Int -> Str? (no ??)
+		if got := mindscript.FormatType(s.Type); got != "Int -> Str?" {
+			t.Fatalf("want Int -> Str?, got %q", got)
+		}
+	})
+
+	t.Run("zero_arg_fun_is_null_param", func(t *testing.T) {
+		src := `let f = fun() -> Str do "hi" end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "f")
+		if s == nil {
+			t.Fatalf("binding f not found")
+		}
+		// Spec: Null -> Str (0-arg sugar)
+		if got := mindscript.FormatType(s.Type); got != "Null -> Str" {
+			t.Fatalf("want Null -> Str, got %q", got)
+		}
+	})
+
+	t.Run("untyped_fun_any_to_any", func(t *testing.T) {
+		src := `let f = fun(x) do x end`
+		idx := runIndex(t, uri, src)
+		s := findSymbol(idx, "f")
+		if s == nil {
+			t.Fatalf("binding f not found")
+		}
+		if got := mindscript.FormatType(s.Type); got != "Any -> Any" {
+			t.Fatalf("want Any -> Any, got %q", got)
+		}
+	})
+}
+
+func Test_Analysis_Return_Type_Mismatch_Enum(t *testing.T) {
+	const uri = "mem://ret-enum.ms"
+	src := `let f = fun() -> Enum[1, 2] do 3 end`
+	idx := runIndex(t, uri, src)
+
+	mustHaveDiag(t, idx, "MS-RET-TYPE-MISMATCH")
+}
+
+// -----------------------------------------------------------------------------
+// 15) Calls & currying — extra cases
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Call_Enum_Arg_Mismatch(t *testing.T) {
+	const uri = "mem://call-enum.ms"
+	src := `
+let f = fun(x: Enum["a", "b"]) -> Str do x end
+f("d")
+`
+	idx := runIndex(t, uri, src)
+	// Prefer enum-specific, but accept generic mismatch until implemented.
+	mustHaveDiagOneOf(t, idx, "MS-ENUM-VALUE-NOT-MEMBER", "MS-ARG-TYPE-MISMATCH")
+}
+
+func Test_Analysis_Currying_Residual_Arrow_Shape(t *testing.T) {
+	const uri = "mem://curry-residual.ms"
+	src := `
+let f = fun(a: Int, b: Str) -> Bool do true end
+let g = f(1)
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "g")
+	if s == nil {
+		t.Fatalf("binding g not found")
+	}
+	// Expect residual Str -> Bool.
+	if got := mindscript.FormatType(s.Type); got != "Str -> Bool" {
+		t.Fatalf("want Str -> Bool, got %q", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 16) Typed maps & alias-ish behavior
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Type_Alias_And_Map_Use(t *testing.T) {
+	const uri = "mem://type-alias.ms"
+	src := `
+let Point = type {x!: Int, y!: Int}
+let f = fun(p: Point) -> Point do p end
+let p = {x: 1, y: 2}
+let q = f(p)
+`
+	idx := runIndex(t, uri, src)
+
+	// We do NOT require p to be inferred as type Point.
+	// We only care that using Point as a schema in the function
+	// signature does not produce spurious type errors.
+	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+	mustNotHaveDiag(t, idx, "MS-RET-TYPE-MISMATCH")
+
+	// q should have some sensible, non-empty type (map or alias),
+	// but we don't pin the exact pretty-printed shape here.
+	q := findSymbol(idx, "q")
+	if q == nil {
+		t.Fatalf("binding q not found")
+	}
+	if got := mindscript.FormatType(q.Type); got == "" {
+		t.Fatalf("expected some type for q, got empty")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 17) Ambient functions (requires real interpreter)
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Ambient_Len_Success_And_Mismatch(t *testing.T) {
+	ip, err := mindscript.NewInterpreter()
+	if err != nil {
+		t.Fatalf("NewInterpreter: %v", err)
+	}
+
+	t.Run("len_on_array_ok", func(t *testing.T) {
+		const uri = "mem://ambient-len-ok.ms"
+		src := `
+let xs = [1,2,3]
+let n = len(xs)
+`
+		idx := runIndexWithIP(t, uri, src, ip)
+
+		// Call is well-typed: len takes Any, so array is fine.
+		mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+
+		n := findSymbol(idx, "n")
+		if n == nil {
+			t.Fatalf("binding n not found")
+		}
+		// len returns Int? (null signals failure), so statically Int?.
+		if got := mindscript.FormatType(n.Type); got != "Int?" {
+			t.Fatalf("want Int?, got %q", got)
+		}
+	})
+
+	t.Run("len_on_non_array_still_typed", func(t *testing.T) {
+		const uri = "mem://ambient-len-bad.ms"
+		src := `
+let n = len(1)
+`
+		idx := runIndexWithIP(t, uri, src, ip)
+
+		// len accepts Any, so no static mismatch.
+		mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+
+		n := findSymbol(idx, "n")
+		if n == nil {
+			t.Fatalf("binding n not found")
+		}
+		// Statically still Int? (runtime may yield null).
+		if got := mindscript.FormatType(n.Type); got != "Int?" {
+			t.Fatalf("want Int?, got %q", got)
+		}
+	})
+}
+
+// -----------------------------------------------------------------------------
+// 18) Modules
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Modules_Export_And_Field(t *testing.T) {
+	const uri = "mem://modules-export.ms"
+	src := `
+module "M" do
+  let x = 1
+end
+
+let y = M.x
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "y")
+	if s == nil {
+		t.Fatalf("binding y not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "Int" {
+		t.Fatalf("want y: Int, got %q", got)
+	}
+	mustNotHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
+}
+
+func Test_Analysis_Modules_Missing_Field_Diag(t *testing.T) {
+	const uri = "mem://modules-missing-field.ms"
+	src := `
+module "M" do
+  let x = 1
+end
+
+let y = M.y
+`
+	idx := runIndex(t, uri, src)
+
+	mustHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
+
+	s := findSymbol(idx, "y")
+	if s == nil {
+		t.Fatalf("binding y not found")
+	}
+	// We only assert it widens; concrete shape is analyzer-defined.
+	if got := mindscript.FormatType(s.Type); got == "" {
+		t.Fatalf("expected some type for y, got empty")
+	}
+}
+
+func Test_Analysis_Modules_As_Value_Field_Access(t *testing.T) {
+	const uri = "mem://modules-as-value.ms"
+	src := `
+module "M" do
+  let x = 1
+end
+
+let m = M
+let z = m.x
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "z")
+	if s == nil {
+		t.Fatalf("binding z not found")
+	}
+	if got := mindscript.FormatType(s.Type); got != "Int" {
+		t.Fatalf("want z: Int via module-as-map, got %q", got)
+	}
+}
+
+func Test_Analysis_Modules_Binding_Only(t *testing.T) {
+	const uri = "mem://modules-binding-only.ms"
+	src := `
+module "M" do
+  let x = 1
+end
+
+let m = M
+`
+	idx := runIndex(t, uri, src)
+
+	s := findSymbol(idx, "m")
+	if s == nil {
+		t.Fatalf("binding m not found")
+	}
+	// We don't over-constrain the exact printed type, only that it's non-empty.
+	if got := mindscript.FormatType(s.Type); got == "" {
+		t.Fatalf("expected some type for m, got empty")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 19) Lexical environments & shadowing
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Shadowing_Inner_Shadows_Outer(t *testing.T) {
+	const uri = "mem://shadow-inner.ms"
+	src := `
+let x = 1
+let y
+do
+  let x = "s"
+  y = x
+end
+`
+	idx := runIndex(t, uri, src)
+
+	// Outer x should remain Int.
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want outer x: Int, got %q", got)
+	}
+
+	// y starts as null, then is assigned from inner x: "s".
+	// Single-pass LUB: Null ⊔ Str = Str?
+	y := findSymbol(idx, "y")
+	if y == nil {
+		t.Fatalf("binding y not found")
+	}
+	if got := mindscript.FormatType(y.Type); got != "Str?" {
+		t.Fatalf("want y: Str? (Null then inner Str), got %q", got)
+	}
+}
+
+func Test_Analysis_Shadowing_Innermost_Wins(t *testing.T) {
+	const uri = "mem://shadow-innermost.ms"
+	src := `
+let x = 1
+let z
+do
+  let x = true
+  z = x
+end
+`
+	idx := runIndex(t, uri, src)
+
+	// Outer x should remain Int.
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want outer x: Int, got %q", got)
+	}
+
+	// z starts as null, then is assigned from inner x: true.
+	// LUB(Null, Bool) = Bool?
+	z := findSymbol(idx, "z")
+	if z == nil {
+		t.Fatalf("binding z not found")
+	}
+	if got := mindscript.FormatType(z.Type); got != "Bool?" {
+		t.Fatalf("want z: Bool? (Null then inner Bool), got %q", got)
+	}
+}
+
+func Test_Analysis_Shadowing_Outer_Survives_Block(t *testing.T) {
+	const uri = "mem://shadow-outer.ms"
+	src := `
+let x = 1
+do
+  let x = "s"
+end
+let y = x
+`
+	idx := runIndex(t, uri, src)
+
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want outer x: Int, got %q", got)
+	}
+
+	y := findSymbol(idx, "y")
+	if y == nil {
+		t.Fatalf("binding y not found")
+	}
+	if got := mindscript.FormatType(y.Type); got != "Int" {
+		t.Fatalf("want y: Int (from outer x), got %q", got)
+	}
+}
+
+func Test_Analysis_Shadowing_Ambient_Builtin_With_Local(t *testing.T) {
+	const uri = "mem://shadow-ambient.ms"
+	src := `
+let len = fun(s: Str) -> Int do 1 end
+let n = len("hi")
+`
+
+	// Use a real interpreter to populate ambient, per spec.
+	ip, err := mindscript.NewInterpreter()
+	if err != nil {
+		t.Fatalf("NewInterpreter: %v", err)
+	}
+	idx := runIndexWithIP(t, uri, src, ip)
+
+	n := findSymbol(idx, "n")
+	if n == nil {
+		t.Fatalf("binding n not found")
+	}
+	if got := mindscript.FormatType(n.Type); got != "Int" {
+		t.Fatalf("want n: Int, got %q", got)
+	}
+	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+}
+
+// -----------------------------------------------------------------------------
+// 20) Annotations (docs)
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Annotations_Leading_On_Let(t *testing.T) {
+	const uri = "mem://annot-leading.ms"
+	src := `
+# x is the answer
+let x = 1
+`
+	idx := runIndex(t, uri, src)
+
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want x: Int, got %q", got)
+	}
+	if x.Doc != "x is the answer" {
+		t.Fatalf("want doc %q, got %q", "x is the answer", x.Doc)
+	}
+}
+
+func Test_Analysis_Annotations_On_RHS_Expression(t *testing.T) {
+	const uri = "mem://annot-rhs.ms"
+	src := `
+let x =
+  # important number
+  1
+`
+	idx := runIndex(t, uri, src)
+
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want x: Int, got %q", got)
+	}
+	if x.Doc != "important number" {
+		t.Fatalf("want doc %q, got %q", "important number", x.Doc)
+	}
+}
+
+func Test_Analysis_Annotations_Multiline_Chain(t *testing.T) {
+	const uri = "mem://annot-multiline.ms"
+	src := `
+let x =
+  # line one
+  # line two
+  1
+`
+	idx := runIndex(t, uri, src)
+
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Int" {
+		t.Fatalf("want x: Int, got %q", got)
+	}
+	wantDoc := "line one\nline two"
+	if x.Doc != wantDoc {
+		t.Fatalf("want doc %q, got %q", wantDoc, x.Doc)
+	}
+}
+
+func Test_Analysis_Annotations_NonSemantic_For_Types(t *testing.T) {
+	const uri = "mem://annot-nonsemantic.ms"
+	src := `
+# not a type
+let x = "hi"
+`
+	idx := runIndex(t, uri, src)
+
+	x := findSymbol(idx, "x")
+	if x == nil {
+		t.Fatalf("binding x not found")
+	}
+	if got := mindscript.FormatType(x.Type); got != "Str" {
+		t.Fatalf("want x: Str, got %q", got)
+	}
+}
+
+func Test_Analysis_Annotations_Propagate_Through_Alias_Assign(t *testing.T) {
+	const uri = "mem://annot-propagate.ms"
+	src := `
+# outer doc
+let x = 1
+let y = x
+`
+	idx := runIndex(t, uri, src)
+
+	y := findSymbol(idx, "y")
+	if y == nil {
+		t.Fatalf("binding y not found")
+	}
+	if got := mindscript.FormatType(y.Type); got != "Int" {
+		t.Fatalf("want y: Int, got %q", got)
+	}
+	if y.Doc != "outer doc" {
+		t.Fatalf("want propagated doc %q on y, got %q", "outer doc", y.Doc)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 21) Destructuring
+// -----------------------------------------------------------------------------
+
+func Test_Analysis_Destructuring_Array_Exact(t *testing.T) {
+	const uri = "mem://destr-arr-exact.ms"
+	src := `
+let [a, b] = [1, 2]
+`
+	idx := runIndex(t, uri, src)
+
+	a := findSymbol(idx, "a")
+	b := findSymbol(idx, "b")
+	if a == nil || b == nil {
+		t.Fatalf("expected bindings a and b")
+	}
+	if got := mindscript.FormatType(a.Type); got != "Int" {
+		t.Fatalf("want a: Int, got %q", got)
+	}
+	if got := mindscript.FormatType(b.Type); got != "Int" {
+		t.Fatalf("want b: Int, got %q", got)
+	}
+}
+
+func Test_Analysis_Destructuring_Array_Extra_RHS_Elems(t *testing.T) {
+	const uri = "mem://destr-arr-extra.ms"
+	src := `
+let [a, b] = [1, 2, 3]
+`
+	idx := runIndex(t, uri, src)
+
+	a := findSymbol(idx, "a")
+	b := findSymbol(idx, "b")
+	if a == nil || b == nil {
+		t.Fatalf("expected bindings a and b")
+	}
+	if got := mindscript.FormatType(a.Type); got != "Int" {
+		t.Fatalf("want a: Int, got %q", got)
+	}
+	if got := mindscript.FormatType(b.Type); got != "Int" {
+		t.Fatalf("want b: Int, got %q", got)
+	}
+}
+
+func Test_Analysis_Destructuring_Array_Too_Short_RHS_Diagnostic(t *testing.T) {
+	const uri = "mem://destr-arr-short.ms"
+	src := `
+let [a, b, c] = [1, 2]
+`
+	idx := runIndex(t, uri, src)
+
+	// Spec: do not silently invent c = null; report a diagnostic.
+	mustHaveDiag(t, idx, "MS-INVALID-ASSIGN-TARGET")
+}
+
+func Test_Analysis_Destructuring_Object_Exact(t *testing.T) {
+	const uri = "mem://destr-obj-exact.ms"
+	src := `
+let p = {x: 1, y: 2}
+let {x: a, y: b} = p
+`
+	idx := runIndex(t, uri, src)
+
+	a := findSymbol(idx, "a")
+	b := findSymbol(idx, "b")
+	if a == nil || b == nil {
+		t.Fatalf("expected bindings a and b")
+	}
+	if got := mindscript.FormatType(a.Type); got != "Int" {
+		t.Fatalf("want a: Int, got %q", got)
+	}
+	if got := mindscript.FormatType(b.Type); got != "Int" {
+		t.Fatalf("want b: Int, got %q", got)
+	}
+	mustNotHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
+}
+
+func Test_Analysis_Destructuring_Object_Missing_Key_Becomes_Null_With_Doc(t *testing.T) {
+	const uri = "mem://destr-obj-missing.ms"
+	src := `
+let p = {x: 1}
+let {x: a, y: b} = p
+`
+	idx := runIndex(t, uri, src)
+
+	a := findSymbol(idx, "a")
+	b := findSymbol(idx, "b")
+	if a == nil || b == nil {
+		t.Fatalf("expected bindings a and b")
+	}
+	if got := mindscript.FormatType(a.Type); got != "Int" {
+		t.Fatalf("want a: Int, got %q", got)
+	}
+	if got := mindscript.FormatType(b.Type); got != "Null" {
+		t.Fatalf("want b: Null (missing key), got %q", got)
+	}
+	if b.Doc != "object pattern: missing key 'y'" {
+		t.Fatalf("want doc %q on b, got %q", "object pattern: missing key 'y'", b.Doc)
+	}
+}
+
+func Test_Analysis_Destructuring_Object_Unknown_RHS_Name(t *testing.T) {
+	const uri = "mem://destr-obj-unknown-rhs.ms"
+	src := `
+let {x: a} = something
+`
+	idx := runIndex(t, uri, src)
+
+	mustHaveDiag(t, idx, "MS-UNKNOWN-NAME")
+}
+=== END FILE: cmd/msg-lsp/analysis_test.go ===
 

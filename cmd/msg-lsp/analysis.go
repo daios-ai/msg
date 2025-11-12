@@ -1,17 +1,47 @@
 // cmd/msg-lsp/analysis.go
 //
-// New MindScript static analyzer.
+// MindScript Static Analyzer — structure & contract
+// -------------------------------------------------
 //
-// Key constraints:
-//   - Pure static, single-pass, abstract interpreter.
-//   - Uses ONLY mindscript APIs visible in interpreter.go and types.go.
-//   - Uses real *mindscript.Env* for all scopes.
-//   - Analysis domain:
-//       • VTType  (as in runtime) for type aliases / schema values.
-//       • VTSymbol (analysis-only) summarizing inferred type/docs for values.
-//   - No Scope / Symbol / NameRef graph like the old implementation.
-//   - Dispatcher-style fold() with per-tag handlers, kept modular & extensible.
-//   - Never Eval/Apply user code; all reasoning goes through Interpreter helpers.
+// What this file is:
+//   • A *pure*, single-pass, abstract interpreter for MindScript used by the LSP.
+//   • It shares the same lexer/parser, S-expr AST, Env, and type engine as the
+//     runtime interpreter (see internal/mindscript/interpreter.go & types.go).
+//   • It never executes user code; it only *walks* the AST and synthesizes
+//     static types, symbol summaries, and diagnostics.
+//
+// What the LSP gets from here:
+//   • Analyzer: an object with a single entry point, Analyze(uri, text) -> *FileIndex.
+//   • FileIndex: per-file product with AST, spans, diagnostics, and the root Env
+//     holding per-file bindings as VTSymbols (analysis-only summaries).
+//   • Diag: simple diagnostics structure (code/message and byte spans).
+//   • Values VTType & VTSymbol: Values are stored in Env; VTTypes define type aliases;
+//     VTSymbols are analysis-only payloads (type & annotation/doc info).
+//
+// How it works (high level):
+//   1) Parse the source with spans.
+//   2) Build a real *mindscript.Env* for the file that chains to ambient
+//      prelude (ip.Global/Base/Core).
+//   3) Fold the AST once using a small dispatcher (foldX per node tag).
+//      Each fold returns a 'flow' record summarizing fallthrough value types
+//      and control-flow (return/break/continue) payloads.
+//   4) Types are represented as MindScript's S-expressions and reasoned about
+//      via Interpreter helpers: ResolveType / IsSubtype / UnifyTypes / ValueToType.
+//
+// Encapsulation in this file:
+//   • Public-facing shims (types & functions the LSP/tests use) live in the
+//     first code section below.
+//   • The actual implementation (folding logic and helpers) lives at the end.
+//   • “Public” vs “Private” here is a code-organization choice, not Go export.
+//
+// Guarantees / non-goals:
+//   • We don't Eval/Apply user code, run natives/oracles, or perform I/O.
+//   • We use the runtime's Env and type engine as the single source of truth.
+//   • Diagnostics are conservative and keep analysis progressing on errors.
+//
+// -----------------------------------------------------------------------------
+// Section 1: Public-facing shims (used by the LSP/tests)
+// -----------------------------------------------------------------------------
 
 package main
 
@@ -20,7 +50,7 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-// Core analysis result types
+// Diagnostics & per-file result
 ////////////////////////////////////////////////////////////////////////////////
 
 // Diag is a single diagnostic attached to a byte range in the current file.
@@ -30,6 +60,40 @@ type Diag struct {
 	Code      string
 	Message   string
 	// Severity, related info, quick-fixes, etc. can be added later.
+}
+
+// --- Token index (positional sidecar) ----------------------------------------
+type TokenKind int
+
+const (
+	TokIdentifier TokenKind = iota
+	TokKeyword
+	TokLiteral
+	TokOperator
+	TokPunct
+)
+
+type TokenEntry struct {
+	Start  int
+	End    int
+	Kind   TokenKind
+	Text   string
+	Sym    *VTSymbol
+	IsDecl bool
+}
+
+type TokenIndex struct {
+	Entries []TokenEntry
+}
+
+func (ti *TokenIndex) add(e TokenEntry) {
+	// Minimal: append; callers may sort later if needed.
+	ti.Entries = append(ti.Entries, e)
+}
+
+// emitIdent records an identifier token.
+func (idx *FileIndex) emitIdent(start, end int, text string, sym *VTSymbol, isDecl bool) {
+	idx.Tokens.add(TokenEntry{Start: start, End: end, Kind: TokIdentifier, Text: text, Sym: sym, IsDecl: isDecl})
 }
 
 // FileIndex is the per-file analysis product.
@@ -44,6 +108,9 @@ type FileIndex struct {
 	// RootEnv is the file’s root analysis environment:
 	//   RootEnv -> ambient/prelude (ip.Global/Base/Core)
 	RootEnv *mindscript.Env
+
+	// Token index for def–use/semantic tokens.
+	Tokens TokenIndex
 
 	// NodeTypes holds synthesized expression types for tooling.
 	// Keying strategy (e.g. by span or stable node-id) is left for later.
@@ -67,11 +134,50 @@ func (idx *FileIndex) rememberType(key interface{}, t mindscript.S) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Analyzer: shared interpreter + entrypoint
+// Analysis symbol summary (stored in Env)
+////////////////////////////////////////////////////////////////////////////////
+
+// VTSymbol is an analysis-only summary value, stored in Env table.
+type VTSymbol struct {
+	Type mindscript.S
+	Doc  string
+	// Flags like IsTopLevel / IsAmbient / etc. can be added later.
+}
+
+// newSymbolVal wraps a VTSymbol into a runtime Value for Env storage.
+func newSymbolVal(sym VTSymbol) mindscript.Value {
+	ps := new(VTSymbol)
+	*ps = sym
+	return mindscript.Value{
+		Tag:   mindscript.VTHandle, // analysis-only payload
+		Data:  ps,                  // store by POINTER to keep identity
+		Annot: sym.Doc,
+	}
+}
+
+// asSymbol tries to view a Value as *VTSymbol; returns (symPtr, ok).
+func asSymbol(v mindscript.Value) (*VTSymbol, bool) {
+	if v.Data == nil {
+		return nil, false
+	}
+	sym, ok := v.Data.(*VTSymbol)
+	return sym, ok
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Analyzer entrypoint for the LSP
 ////////////////////////////////////////////////////////////////////////////////
 
 type Analyzer struct {
 	IP *mindscript.Interpreter
+}
+
+// small utility: append child index for NodePath (child k == S[k+1])
+func appendPath(base mindscript.NodePath, child int) mindscript.NodePath {
+	out := make(mindscript.NodePath, 0, len(base)+1)
+	out = append(out, base...)
+	out = append(out, child)
+	return out
 }
 
 // ensureIP lazily constructs an Interpreter for ambient types/prelude.
@@ -133,39 +239,16 @@ func (a *Analyzer) Analyze(uri, text string) *FileIndex {
 		env:      root,
 		topLevel: true,
 	}
-	fc.fold(idx.AST)
+	fc.fold(idx.AST) // root has empty NodePath
 
 	return idx
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Analysis value domain
-////////////////////////////////////////////////////////////////////////////////
+//// END_OF_PUBLIC
 
-// VTSymbol is an analysis-only summary value, stored in Env table.
-type VTSymbol struct {
-	Type mindscript.S
-	Doc  string
-	// Flags like IsTopLevel / IsAmbient / etc. can be added later.
-}
-
-// newSymbolVal wraps a VTSymbol into a runtime Value for Env storage.
-func newSymbolVal(sym VTSymbol) mindscript.Value {
-	return mindscript.Value{
-		Tag:   mindscript.VTHandle, // analysis-only payload
-		Data:  sym,
-		Annot: sym.Doc,
-	}
-}
-
-// asSymbol tries to view a Value as VTSymbol; returns (sym, ok).
-func asSymbol(v mindscript.Value) (VTSymbol, bool) {
-	if v.Data == nil {
-		return VTSymbol{}, false
-	}
-	sym, ok := v.Data.(VTSymbol)
-	return sym, ok
-}
+// -----------------------------------------------------------------------------
+// Section 2: Private implementation (folding logic & helpers)
+// -----------------------------------------------------------------------------
 
 ////////////////////////////////////////////////////////////////////////////////
 // foldCtx, block modes & flow
@@ -179,6 +262,9 @@ type foldCtx struct {
 
 	// topLevel reports whether we're in the file's outermost block.
 	topLevel bool
+
+	// path is the current node's NodePath in the AST (for spans).
+	path mindscript.NodePath
 }
 
 // blockMode controls how a block handles control-flow from its children.
@@ -320,6 +406,43 @@ func (c *foldCtx) fold(n mindscript.S) flow {
 	return newFlow(nil)
 }
 
+// --- Span helpers -------------------------------------------------------------
+
+// spanFor returns the span for the current node path.
+func (c *foldCtx) spanFor() (int, int, bool) {
+	if sp, ok := c.idx.Spans.Get(c.path); ok {
+		return sp.StartByte, sp.EndByte, true
+	}
+	return 0, 0, false
+}
+
+// spanForChildSlot returns the span for child at S[slot] (slot>=1).
+func (c *foldCtx) spanForChildSlot(slot int) (int, int, bool) {
+	if slot < 1 {
+		return 0, 0, false
+	}
+	cp := appendPath(c.path, slot-1)
+	if sp, ok := c.idx.Spans.Get(cp); ok {
+		return sp.StartByte, sp.EndByte, true
+	}
+	return 0, 0, false
+}
+
+// childCtx returns a copy of c positioned at child S[slot] (slot>=1).
+func (c *foldCtx) childCtx(slot int) *foldCtx {
+	cc := *c
+	if slot >= 1 {
+		cc.path = appendPath(c.path, slot-1)
+	}
+	return &cc
+}
+
+// recordIdent emits an identifier token at the current node path.
+func (c *foldCtx) recordIdent(name string, sym *VTSymbol, isDecl bool) {
+	start, end, _ := c.spanFor()
+	c.idx.emitIdent(start, end, name, sym, isDecl)
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Per-tag handlers (current subset)
 ////////////////////////////////////////////////////////////////////////////////
@@ -329,7 +452,7 @@ func (c *foldCtx) foldReturn(n mindscript.S) flow {
 	t := mindscript.S{"id", "Null"}
 	if len(n) >= 2 {
 		if expr, ok := n[1].(mindscript.S); ok {
-			ef := c.fold(expr)
+			ef := c.childCtx(1).fold(expr)
 			tv := typeOf(c.ip, c.env, ef.Val)
 			if tv != nil {
 				t = tv
@@ -387,13 +510,13 @@ func (c *foldCtx) foldAnnot(n mindscript.S) flow {
 		}
 	}
 
-	inner := c.fold(expr)
+	inner := c.childCtx(2).fold(expr)
 
 	if doc != "" {
 		v := inner.Val
 		if sym, ok := asSymbol(v); ok {
 			sym.Doc = doc
-			v = newSymbolVal(sym)
+			v = newSymbolVal(*sym)
 		}
 		v.Annot = doc
 		inner.Val = v
@@ -434,9 +557,11 @@ func (c *foldCtx) foldId(n mindscript.S) flow {
 	v, err := c.env.Get(name)
 	if err != nil {
 		// Unknown name: report and treat as Any so analysis can continue.
+		// Still emit an identifier token (no symbol).
+		c.recordIdent(name, nil, false)
 		c.idx.addDiag(Diag{
-			StartByte: 0, // TODO: use Spans to target the id.
-			EndByte:   0,
+			StartByte: func() int { s, _, _ := c.spanFor(); return s }(),
+			EndByte:   func() int { _, e, _ := c.spanFor(); return e }(),
 			Code:      "MS-UNKNOWN-NAME",
 			Message:   "unknown name: " + name,
 		})
@@ -444,20 +569,24 @@ func (c *foldCtx) foldId(n mindscript.S) flow {
 	}
 
 	// VTSymbol: analysis symbol.
-	if _, ok := asSymbol(v); ok {
+	if sym, ok := asSymbol(v); ok {
+		c.recordIdent(name, sym, false)
 		return flow{Val: v}
 	}
 
 	// VTType: using a type value as an expression → keep VTType (typeOf=Type).
 	if v.Tag == mindscript.VTType {
+		c.recordIdent(name, nil, false)
 		return flow{Val: v}
 	}
 
 	// Ambient/runtime values: approximate via ValueToType when possible.
 	if c.ip != nil {
+		c.recordIdent(name, nil, false)
 		return newFlowFromType(c.ip.ValueToType(v, c.env))
 	}
 
+	c.recordIdent(name, nil, false)
 	return newFlowFromType(mindscript.S{"id", "Any"})
 }
 
@@ -476,7 +605,7 @@ func (c *foldCtx) foldArray(n mindscript.S) flow {
 		if !ok {
 			continue
 		}
-		sf := c.fold(sub)
+		sf := c.childCtx(i).fold(sub)
 		t := typeOf(ip, c.env, sf.Val)
 		if t == nil {
 			t = mindscript.S{"id", "Any"}
@@ -529,13 +658,15 @@ func (c *foldCtx) foldMap(n mindscript.S) flow {
 		}
 
 		valNode, _ := p[2].(mindscript.S)
-		valFlow := c.fold(valNode)
+		valFlow := c.childCtx(i).fold(valNode)
 		valType := typeOf(c.ip, c.env, valFlow.Val)
 		if valType == nil {
 			valType = mindscript.S{"id", "Any"}
 		}
 
-		out = append(out, mindscript.S{tag, mindscript.S{"str", key}, valType})
+		// IMPORTANT: Treat observed keys as required in the inferred type shape.
+		// This makes typeOf(x, X) == isSubtype(typeOf(x), X) for map types.
+		out = append(out, mindscript.S{"pair!", mindscript.S{"str", key}, valType})
 	}
 
 	return newFlowFromType(out)
@@ -599,7 +730,7 @@ func (c *foldCtx) foldGet(n mindscript.S) flow {
 	recvNode, _ := n[1].(mindscript.S)
 	keyNode, _ := n[2].(mindscript.S)
 
-	recvFlow := c.fold(recvNode)
+	recvFlow := c.childCtx(1).fold(recvNode)
 	recvT := typeOf(c.ip, c.env, recvFlow.Val)
 	if recvT == nil {
 		recvT = mindscript.S{"id", "Any"}
@@ -622,9 +753,10 @@ func (c *foldCtx) foldGet(n mindscript.S) flow {
 	// Known map/module type without that key → warning + Any.
 	if len(recvT) > 0 {
 		if tag, _ := recvT[0].(string); tag == "map" {
+			s, e, _ := c.spanForChildSlot(2)
 			c.idx.addDiag(Diag{
-				StartByte: 0,
-				EndByte:   0,
+				StartByte: s,
+				EndByte:   e,
 				Code:      "MS-MAP-MISSING-KEY",
 				Message:   "missing key '" + key + "' on map/module",
 			})
@@ -643,8 +775,8 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 	recvNode, _ := n[1].(mindscript.S)
 	idxNode, _ := n[2].(mindscript.S)
 
-	recvFlow := c.fold(recvNode)
-	idxFlow := c.fold(idxNode)
+	recvFlow := c.childCtx(1).fold(recvNode)
+	idxFlow := c.childCtx(2).fold(idxNode)
 
 	recvT := typeOf(c.ip, c.env, recvFlow.Val)
 	if recvT == nil {
@@ -672,9 +804,10 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 			okInt = ip.IsSubtype(idxT, mindscript.S{"id", "Int"}, c.env)
 		}
 		if !okInt {
+			s, e, _ := c.spanForChildSlot(2)
 			c.idx.addDiag(Diag{
-				StartByte: 0,
-				EndByte:   0,
+				StartByte: s,
+				EndByte:   e,
 				Code:      "MS-ARG-TYPE-MISMATCH",
 				Message:   "array index must be Int",
 			})
@@ -693,9 +826,10 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 				if ft, ok := mapFieldType(recvT, key); ok {
 					return newFlowFromType(ft)
 				}
+				s, e, _ := c.spanForChildSlot(2)
 				c.idx.addDiag(Diag{
-					StartByte: 0,
-					EndByte:   0,
+					StartByte: s,
+					EndByte:   e,
 					Code:      "MS-MAP-MISSING-KEY",
 					Message:   "missing key '" + key + "' on map/module",
 				})
@@ -716,22 +850,26 @@ func (c *foldCtx) foldCall(n mindscript.S) flow {
 
 	// Fold callee.
 	calleeNode, _ := n[1].(mindscript.S)
-	cf := c.fold(calleeNode)
+	cf := c.childCtx(1).fold(calleeNode)
 	calleeT := typeOf(c.ip, c.env, cf.Val)
 	if calleeT == nil {
 		calleeT = mindscript.S{"id", "Any"}
 	}
 
-	// Fold args for side-effects and types.
+	// Fold args (types + spans).
 	argTypes := make([]mindscript.S, 0, len(n)-2)
+	argSpans := make([][2]int, 0, len(n)-2) // [start,end]
 	for i := 2; i < len(n); i++ {
 		if arg, ok := n[i].(mindscript.S); ok {
-			af := c.fold(arg)
+			cc := c.childCtx(i)
+			af := cc.fold(arg)
 			t := typeOf(c.ip, c.env, af.Val)
 			if t == nil {
 				t = mindscript.S{"id", "Any"}
 			}
 			argTypes = append(argTypes, t)
+			s, e, _ := c.spanForChildSlot(i)
+			argSpans = append(argSpans, [2]int{s, e})
 		}
 	}
 
@@ -740,8 +878,24 @@ func (c *foldCtx) foldCall(n mindscript.S) flow {
 		return newFlowFromType(mindscript.S{"id", "Any"})
 	}
 
+	// Small helpers to read spans without mutating the slice.
+	spanCursor := 0
+	nextSpan := func() (s, e int) {
+		if spanCursor < len(argSpans) {
+			s, e = argSpans[spanCursor][0], argSpans[spanCursor][1]
+			spanCursor++
+			return
+		}
+		return 0, 0
+	}
+	peekSpan := func() (s, e int) {
+		if spanCursor < len(argSpans) {
+			return argSpans[spanCursor][0], argSpans[spanCursor][1]
+		}
+		return 0, 0
+	}
+
 	resT := calleeT
-	overflowReported := false
 
 	for _, at := range argTypes {
 		// Expect an arrow: ("binop","->", P, R)
@@ -751,10 +905,12 @@ func (c *foldCtx) foldCall(n mindscript.S) flow {
 					pt, _ := resT[2].(mindscript.S)
 					next, _ := resT[3].(mindscript.S)
 
+					// Use the CURRENT arg's span (consume it once per arg).
+					s, e := nextSpan()
 					if !ip.IsSubtype(at, pt, c.env) {
 						c.idx.addDiag(Diag{
-							StartByte: 0,
-							EndByte:   0,
+							StartByte: s,
+							EndByte:   e,
 							Code:      "MS-ARG-TYPE-MISMATCH",
 							Message:   "argument type mismatch",
 						})
@@ -766,17 +922,14 @@ func (c *foldCtx) foldCall(n mindscript.S) flow {
 			}
 		}
 
-		// Not an arrow anymore: extra args ⇒ overflow.
-		if !overflowReported {
-			c.idx.addDiag(Diag{
-				StartByte: 0,
-				EndByte:   0,
-				Code:      "MS-ARG-OVERFLOW",
-				Message:   "too many arguments",
-			})
-			overflowReported = true
-		}
-		resT = mindscript.S{"id", "Any"}
+		// Not an arrow anymore → this arg is the FIRST extra one.
+		s, e := peekSpan() // do NOT consume; this is the first extra arg
+		c.idx.addDiag(Diag{
+			StartByte: s,
+			EndByte:   e,
+			Code:      "MS-ARG-OVERFLOW",
+			Message:   "too many arguments",
+		})
 		break
 	}
 
@@ -792,8 +945,8 @@ func (c *foldCtx) foldBinop(n mindscript.S) flow {
 	lhs, _ := n[2].(mindscript.S)
 	rhs, _ := n[3].(mindscript.S)
 
-	lf := c.fold(lhs)
-	rf := c.fold(rhs)
+	lf := c.childCtx(2).fold(lhs)
+	rf := c.childCtx(3).fold(rhs)
 
 	lt := typeOf(c.ip, c.env, lf.Val)
 	rt := typeOf(c.ip, c.env, rf.Val)
@@ -809,9 +962,10 @@ func (c *foldCtx) foldBinop(n mindscript.S) flow {
 		if len(rhs) >= 2 {
 			if tag, _ := rhs[0].(string); tag == "int" {
 				if v, ok := rhs[1].(int64); ok && v == 0 {
+					s, e, _ := c.spanForChildSlot(3)
 					c.idx.addDiag(Diag{
-						StartByte: 0,
-						EndByte:   0,
+						StartByte: s,
+						EndByte:   e,
 						Code:      "MS-DIV-BY-ZERO-CONST",
 						Message:   "division or modulo by constant zero",
 					})
@@ -865,7 +1019,7 @@ func (c *foldCtx) foldUnop(n mindscript.S) flow {
 	}
 	op, _ := n[1].(string)
 	expr, _ := n[2].(mindscript.S)
-	tf := c.fold(expr)
+	tf := c.childCtx(2).fold(expr)
 	t := typeOf(c.ip, c.env, tf.Val)
 	if t == nil {
 		t = mindscript.S{"id", "Any"}
@@ -910,9 +1064,11 @@ func (c *foldCtx) foldDecl(n mindscript.S) flow {
 		return newFlowFromType(mindscript.S{"id", "Null"})
 	}
 
-	c.env.Define(name, newSymbolVal(VTSymbol{
-		Type: mindscript.S{"id", "Null"},
-	}))
+	v := newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Null"}})
+	c.env.Define(name, v)
+	if sym, ok := asSymbol(v); ok {
+		c.recordIdent(name, sym, true)
+	}
 	return newFlowFromType(mindscript.S{"id", "Null"})
 }
 
@@ -928,9 +1084,10 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 		if msg == "" {
 			msg = "invalid assignment target"
 		}
+		s, e, _ := c.spanFor()
 		c.idx.addDiag(Diag{
-			StartByte: 0, // TODO: use spans
-			EndByte:   0,
+			StartByte: s,
+			EndByte:   e,
 			Code:      "MS-INVALID-ASSIGN-TARGET",
 			Message:   msg,
 		})
@@ -948,7 +1105,7 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 
 	// We have an RHS.
 	rhs, _ := n[2].(mindscript.S)
-	rhsFlow := c.fold(rhs)
+	rhsFlow := c.childCtx(2).fold(rhs)
 	rhsVal := rhsFlow.Val
 	if (rhsVal == mindscript.Value{}) {
 		rhsVal = newSymbolVal(VTSymbol{Type: mindscript.S{"id", "Any"}})
@@ -962,6 +1119,12 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 		name, _ := lhs[1].(string)
 		if name != "" && c.env != nil {
 			c.env.Define(name, rhsVal)
+			if sym, ok := asSymbol(rhsVal); ok {
+				// decl node is child slot 1 of assign
+				c.childCtx(1).recordIdent(name, sym, true)
+			} else {
+				c.childCtx(1).recordIdent(name, nil, true)
+			}
 		}
 		// Expression value is rhs.
 		return flow{Val: rhsVal}
@@ -978,9 +1141,11 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 		// Must already exist.
 		v, err := c.env.Get(name)
 		if err != nil {
+			c.childCtx(1).recordIdent(name, nil, false)
+			s, e, _ := c.spanForChildSlot(1)
 			c.idx.addDiag(Diag{
-				StartByte: 0,
-				EndByte:   0,
+				StartByte: s,
+				EndByte:   e,
 				Code:      "MS-UNKNOWN-NAME",
 				Message:   "unknown name: " + name,
 			})
@@ -1000,17 +1165,18 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 			// joins (if/else arms, loop exits, return/break/continue),
 			// not sequential assignments.
 			sym.Type = newT
-
-			if err := c.env.Set(name, newSymbolVal(sym)); err != nil {
+			if err := c.env.Set(name, v); err != nil {
 				return invalidTarget(err.Error(), newT)
 			}
-			return flow{Val: newSymbolVal(sym)}
+			c.childCtx(1).recordIdent(name, sym, false)
+			return flow{Val: v}
 		}
 
 		// Ambient/runtime or VTType: try to Set directly.
 		if err := c.env.Set(name, rhsVal); err != nil {
 			return invalidTarget(err.Error(), typeOf(ip, c.env, rhsVal))
 		}
+		c.childCtx(1).recordIdent(name, nil, false)
 		return flow{Val: rhsVal}
 	}
 
@@ -1035,9 +1201,9 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 
 	// bind recursively applies pattern p to type t.
 	// doc is only used for object-pattern missing-key Null bindings.
-	var bind func(p mindscript.S, t mindscript.S, decl bool, doc string)
+	var bind func(pat mindscript.S, pth mindscript.NodePath, t mindscript.S, decl bool, doc string)
 
-	bind = func(p mindscript.S, t mindscript.S, decl bool, doc string) {
+	bind = func(p mindscript.S, pth mindscript.NodePath, t mindscript.S, decl bool, doc string) {
 		if t == nil {
 			t = mindscript.S{"id", "Any"}
 		}
@@ -1053,11 +1219,24 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 				return
 			}
 			if name, ok := p[1].(string); ok && name != "" {
-				c.env.Define(name, newSymbolVal(VTSymbol{Type: t, Doc: doc}))
+				v := newSymbolVal(VTSymbol{Type: t, Doc: doc})
+				c.env.Define(name, v)
+				if sym, ok := asSymbol(v); ok {
+					// decl node span
+					start, end := 0, 0
+					if sp, ok := c.idx.Spans.Get(pth); ok {
+						start, end = sp.StartByte, sp.EndByte
+					}
+					c.idx.emitIdent(start, end, name, sym, true)
+				} else {
+					if sp, ok := c.idx.Spans.Get(pth); ok {
+						c.idx.emitIdent(sp.StartByte, sp.EndByte, name, nil, true)
+					}
+				}
 				return
 			}
 			if sub, ok := p[1].(mindscript.S); ok {
-				bind(sub, t, true, doc)
+				bind(sub, appendPath(pth, 0), t, true, doc)
 			}
 
 		case "id":
@@ -1069,28 +1248,49 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 				return
 			}
 			if decl {
-				c.env.Define(name, newSymbolVal(VTSymbol{Type: t, Doc: doc}))
+				v := newSymbolVal(VTSymbol{Type: t, Doc: doc})
+				c.env.Define(name, v)
+				if sym, ok := asSymbol(v); ok {
+					if sp, ok := c.idx.Spans.Get(pth); ok {
+						c.idx.emitIdent(sp.StartByte, sp.EndByte, name, sym, true)
+					}
+				} else {
+					if sp, ok := c.idx.Spans.Get(pth); ok {
+						c.idx.emitIdent(sp.StartByte, sp.EndByte, name, nil, true)
+					}
+				}
 				return
 			}
 			// assignment-style: must already exist
 			v, err := c.env.Get(name)
 			if err != nil {
+				s, e := 0, 0
+				if sp, ok := c.idx.Spans.Get(pth); ok {
+					s, e = sp.StartByte, sp.EndByte
+				}
 				c.idx.addDiag(Diag{
-					StartByte: 0, EndByte: 0,
+					StartByte: s, EndByte: e,
 					Code:    "MS-UNKNOWN-NAME",
 					Message: "unknown name: " + name,
 				})
 				return
 			}
-			sym, ok := asSymbol(v)
-			if !ok {
-				sym = VTSymbol{}
-			}
-			sym.Type = t
-			if doc != "" {
-				sym.Doc = doc
-			}
-			if err := c.env.Set(name, newSymbolVal(sym)); err != nil {
+			if sym, ok := asSymbol(v); ok {
+				sym.Type = t
+				if doc != "" {
+					sym.Doc = doc
+				}
+				if err := c.env.Set(name, v); err != nil {
+					c.idx.addDiag(Diag{
+						StartByte: 0, EndByte: 0,
+						Code:    "MS-INVALID-ASSIGN-TARGET",
+						Message: err.Error(),
+					})
+				}
+				if sp, ok := c.idx.Spans.Get(pth); ok {
+					c.idx.emitIdent(sp.StartByte, sp.EndByte, name, sym, false)
+				}
+			} else if err := c.env.Set(name, newSymbolVal(VTSymbol{Type: t, Doc: doc})); err != nil {
 				c.idx.addDiag(Diag{
 					StartByte: 0, EndByte: 0,
 					Code:    "MS-INVALID-ASSIGN-TARGET",
@@ -1119,7 +1319,7 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 			}
 			for i := 1; i < len(p); i++ {
 				if sub, ok := p[i].(mindscript.S); ok {
-					bind(sub, elemT, decl, "")
+					bind(sub, appendPath(pth, i-1), elemT, decl, "")
 				}
 			}
 
@@ -1140,8 +1340,8 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 				ft, found := mapFieldType(t, key)
 				if !found && decl {
 					// Missing key in let-pattern: bind as Null with doc.
-					bind(
-						sub,
+					bind(sub,
+						appendPath(appendPath(pth, i-1), 1),
 						mindscript.S{"id", "Null"},
 						true,
 						"object pattern: missing key '"+key+"'",
@@ -1150,7 +1350,7 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 					if ft == nil {
 						ft = mindscript.S{"id", "Any"}
 					}
-					bind(sub, ft, decl, "")
+					bind(sub, appendPath(appendPath(pth, i-1), 1), ft, decl, "")
 				}
 			}
 		default:
@@ -1161,7 +1361,7 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 
 	if len(lhs) > 0 {
 		if tag, _ := lhs[0].(string); tag == "darr" || tag == "dobj" {
-			bind(lhs, typeOf(ip, c.env, rhsVal), hasDecl(lhs), "")
+			bind(lhs, appendPath(c.path, 0), typeOf(ip, c.env, rhsVal), hasDecl(lhs), "")
 			// Value of destructuring expression is the RHS value.
 			return flow{Val: rhsVal}
 		}
@@ -1207,6 +1407,7 @@ func (c *foldCtx) foldBlockWithMode(n mindscript.S, mode blockMode) flow {
 	child := *c
 	child.env = env
 	child.topLevel = false
+	// child's path stays at the same node for block; we'll set per-statement below
 	ip := c.ip
 
 	var out flow
@@ -1238,7 +1439,9 @@ func (c *foldCtx) foldBlockWithMode(n mindscript.S, mode blockMode) flow {
 			continue
 		}
 
-		sf := child.fold(sub)
+		cc := child
+		cc.path = appendPath(c.path, i-1)
+		sf := cc.fold(sub)
 
 		// Merge control-flow signals.
 		if sf.HasRet {
@@ -1345,8 +1548,8 @@ func (c *foldCtx) foldIf(n mindscript.S) flow {
 		if tag == "pair" && len(arm) >= 3 {
 			cond, _ := arm[1].(mindscript.S)
 			thenBlock, _ := arm[2].(mindscript.S)
-			_ = c.fold(cond)
-			tf := c.foldBlockWithMode(thenBlock, blockPlain)
+			_ = c.childCtx(i).childCtx(1).fold(cond)
+			tf := c.childCtx(i).childCtx(2).foldBlockWithMode(thenBlock, blockPlain)
 
 			if tf.HasRet {
 				out.Ret = unifyVals(out.Ret, tf.Ret)
@@ -1369,7 +1572,7 @@ func (c *foldCtx) foldIf(n mindscript.S) flow {
 		// Trailing bare block is else arm.
 		if tag == "block" && i == len(n)-1 {
 			hasElse = true
-			ef := c.foldBlockWithMode(arm, blockPlain)
+			ef := c.childCtx(i).foldBlockWithMode(arm, blockPlain)
 
 			if ef.HasRet {
 				out.Ret = unifyVals(out.Ret, ef.Ret)
@@ -1409,9 +1612,9 @@ func (c *foldCtx) foldWhile(n mindscript.S) flow {
 	}
 	cond, _ := n[1].(mindscript.S)
 	body, _ := n[2].(mindscript.S)
-	_ = c.fold(cond)
+	_ = c.childCtx(1).fold(cond)
 
-	bf := c.foldBlockWithMode(body, blockLoopBody)
+	bf := c.childCtx(2).foldBlockWithMode(body, blockLoopBody)
 
 	ip := c.ip
 	env := c.env
@@ -1460,9 +1663,9 @@ func (c *foldCtx) foldFor(n mindscript.S) flow {
 	// Note: current skeleton ignores target element typing; iter folded for side-effects only.
 	iter, _ := n[2].(mindscript.S)
 	body, _ := n[3].(mindscript.S)
-	_ = c.fold(iter)
+	_ = c.childCtx(2).fold(iter)
 
-	bf := c.foldBlockWithMode(body, blockLoopBody)
+	bf := c.childCtx(3).foldBlockWithMode(body, blockLoopBody)
 
 	ip := c.ip
 	env := c.env
@@ -1512,8 +1715,11 @@ func (c *foldCtx) foldFunLike(n mindscript.S) flow {
 
 	// Params: ("array", ("pair", ("id", name), typeS?)...)
 	paramsNode, _ := n[1].(mindscript.S)
+	paramsPath := appendPath(c.path, 0)
+
 	var paramNames []string
 	var paramTypes []mindscript.S
+	var paramIDPaths []mindscript.NodePath
 	if len(paramsNode) >= 1 && paramsNode[0] == "array" {
 		for i := 1; i < len(paramsNode); i++ {
 			p, ok := paramsNode[i].(mindscript.S)
@@ -1537,6 +1743,10 @@ func (c *foldCtx) foldFunLike(n mindscript.S) flow {
 			if c.ip != nil {
 				pt = c.ip.ResolveType(pt, c.env)
 			}
+			// capture the ("id",name) node path inside the params array
+			idPath := appendPath(appendPath(paramsPath, i-1), 0)
+			paramIDPaths = append(paramIDPaths, idPath)
+
 			paramNames = append(paramNames, name)
 			paramTypes = append(paramTypes, pt)
 		}
@@ -1579,12 +1789,20 @@ func (c *foldCtx) foldFunLike(n mindscript.S) flow {
 	if !isOracle && len(n) >= 4 {
 		if body, ok := n[3].(mindscript.S); ok && len(body) > 0 && body[0] == "block" {
 			funEnv := mindscript.NewEnv(c.env)
+			// define params and emit decl tokens with the SAME symbol pointers
 			for i := range paramNames {
-				funEnv.Define(paramNames[i], newSymbolVal(VTSymbol{Type: paramTypes[i]}))
+				val := newSymbolVal(VTSymbol{Type: paramTypes[i]})
+				funEnv.Define(paramNames[i], val)
+				if sp, ok := c.idx.Spans.Get(paramIDPaths[i]); ok {
+					if sym, ok := asSymbol(val); ok {
+						c.idx.emitIdent(sp.StartByte, sp.EndByte, paramNames[i], sym, true)
+					}
+				}
 			}
 			child := *c
 			child.env = funEnv
 			child.topLevel = false
+			child.path = appendPath(c.path, 2)
 			bf := child.foldBlockWithMode(body, blockFunBody)
 
 			if c.ip != nil {
@@ -1607,6 +1825,18 @@ func (c *foldCtx) foldFunLike(n mindscript.S) flow {
 						Code:      "MS-RET-TYPE-MISMATCH",
 						Message:   "return type does not match function declaration",
 					})
+				}
+			}
+		}
+	} else if isOracle {
+		// Even for oracle, we should declare params in the current env for tokenization.
+		oracleEnv := mindscript.NewEnv(c.env)
+		for i := range paramNames {
+			val := newSymbolVal(VTSymbol{Type: paramTypes[i]})
+			oracleEnv.Define(paramNames[i], val)
+			if sp, ok := c.idx.Spans.Get(paramIDPaths[i]); ok {
+				if sym, ok := asSymbol(val); ok {
+					c.idx.emitIdent(sp.StartByte, sp.EndByte, paramNames[i], sym, true)
 				}
 			}
 		}

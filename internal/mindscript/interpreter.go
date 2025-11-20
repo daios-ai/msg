@@ -164,6 +164,7 @@ const (
 	VTType                   // *TypeValue (type AST + definition env)
 	VTModule                 // module handle (opaque; maps to a MapObject view)
 	VTHandle                 // opaque host handle (integration-specific)
+	VTSymbol                 // reserved ONLY for static analysis, not runtime
 )
 
 // Value is the universal runtime carrier used by the interpreter.

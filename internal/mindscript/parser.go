@@ -92,17 +92,13 @@
 // ----------------------------------
 // **This file now centralizes AST construction and span emission.**
 //
-//   - Every AST node is constructed through `mk*` helpers that *atomically*
-//     append exactly one span for that node.
-//   - Spans are appended in strict **post-order** of the final AST (children
-//     first, then parent), left-to-right among siblings.
-//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule:
-//     child's span first, then the wrapper's span.
+//   - Every AST node is constructed through IR first (no spans during parse).
+//   - After parsing, we materialize the AST and emit spans in strict **post-order**
+//     (children first, then parent), left-to-right among siblings.
+//   - Wrapper nodes we create (e.g. "annot" from PRE/POST) obey the same rule.
 //   - Nodes that are synthesized with no concrete tokens (e.g. default type
-//     `Any`) still receive a placeholder `Span{}` via `mk*` (using tok=-1).
+//     `Any`) still receive a placeholder `Span{}` (tok=-1).
 //   - The root block’s span is appended last.
-//
-// The helpers in this file enforce the invariant mechanically at every construct.
 //
 // Dependencies
 // ------------
@@ -124,6 +120,73 @@ type S = []any
 
 func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
 
+// IR (Intermediate Representation) — built during parsing without emitting spans.
+
+// ---------------- IR TYPES ---------------------------------------------------
+type NodeID int
+
+type IRNode struct {
+	Tag         string
+	Kids        []NodeID
+	Value       any
+	TokStart    int  // inclusive token index, -1 if synthetic
+	TokEnd      int  // inclusive token index, -1 if synthetic
+	ZeroAtStart bool // if true, materializer emits zero-length span at TokStart (binding-site annot child)
+}
+
+type IRArena struct {
+	Nodes []IRNode
+	Root  NodeID
+}
+
+// materializePostOrder converts IR into the public AST (S-expr) and a slice of
+// spans in strict post-order (children first, then parent).
+func materializePostOrder(toks []Token, ir IRArena) (S, []Span) {
+	spans := make([]Span, 0, len(ir.Nodes))
+
+	var build func(NodeID) S
+	build = func(id NodeID) S {
+		n := ir.Nodes[id]
+
+		// Build children first (post-order span emission later).
+		childNodes := make([]S, len(n.Kids))
+		for i, k := range n.Kids {
+			childNodes[i] = build(k)
+		}
+
+		// Convert []S -> []any for L(...).
+		parts := make([]any, 0, len(childNodes)+1)
+		if n.Value != nil {
+			parts = append(parts, n.Value)
+		}
+		for _, c := range childNodes {
+			parts = append(parts, c)
+		}
+
+		node := L(n.Tag, parts...)
+
+		// Append this node’s span (post-order).
+		span := Span{}
+		if n.TokStart >= 0 && n.TokEnd >= n.TokStart &&
+			n.TokStart < len(toks) && n.TokEnd < len(toks) {
+			if n.ZeroAtStart {
+				// Synthetic binding-site annot child: zero-length at value start.
+				start := toks[n.TokStart].StartByte
+				span.StartByte = start
+				span.EndByte = start
+			} else {
+				span.StartByte = toks[n.TokStart].StartByte
+				span.EndByte = toks[n.TokEnd].EndByte
+			}
+		}
+		spans = append(spans, span)
+		return node
+	}
+
+	ast := build(ir.Root)
+	return ast, spans
+}
+
 // ParseSExpr parses a complete MindScript source string and returns its AST.
 func ParseSExpr(src string) (S, error) {
 	lex := NewLexer(src)
@@ -132,7 +195,13 @@ func ParseSExpr(src string) (S, error) {
 		return nil, err
 	}
 	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	return p.program()
+	root, err := p.programIR()
+	if err != nil {
+		return nil, err
+	}
+	p.ir.Root = root
+	ast, _ := materializePostOrder(p.toks, p.ir)
+	return ast, nil
 }
 
 // ParseSExprWithSpans parses like ParseSExpr and also returns a *SpanIndex,
@@ -144,11 +213,13 @@ func ParseSExprWithSpans(src string) (S, *SpanIndex, error) {
 		return nil, nil, err
 	}
 	p := &parser{toks: toks, src: src, lastSpanStartTok: -1, lastSpanEndTok: -1}
-	ast, perr := p.program()
+	root, perr := p.programIR()
 	if perr != nil {
 		return nil, nil, perr
 	}
-	idx := BuildSpanIndexPostOrder(ast, p.post)
+	p.ir.Root = root
+	ast, spans := materializePostOrder(p.toks, p.ir)
+	idx := BuildSpanIndexPostOrder(ast, spans)
 	return ast, idx, nil
 }
 
@@ -166,11 +237,13 @@ func ParseSExprInteractiveWithSpans(src string) (S, *SpanIndex, error) {
 		interactive:      true,
 		lastSpanStartTok: -1, lastSpanEndTok: -1,
 	}
-	ast, perr := p.program()
+	root, perr := p.programIR()
 	if perr != nil {
 		return nil, nil, perr
 	}
-	idx := BuildSpanIndexPostOrder(ast, p.post)
+	p.ir.Root = root
+	ast, spans := materializePostOrder(p.toks, p.ir)
+	idx := BuildSpanIndexPostOrder(ast, spans)
 	return ast, idx, nil
 }
 
@@ -184,11 +257,12 @@ type parser struct {
 	toks        []Token
 	i           int
 	interactive bool
-
-	post             []Span // strictly post-order: one span per node, appended after children
+	// (no span emission during parse)
 	lastSpanStartTok int
 	lastSpanEndTok   int
 	src              string
+	// IR arena (nodes + eventual root)
+	ir IRArena
 }
 
 // New small shared helpers (each used ≥3 times):
@@ -199,12 +273,13 @@ type parser struct {
 //
 // All helpers reuse existing machinery: takeReqGap, collectGap, need, attachAnnotFrom, bracketed, etc.
 
-// ─────────────────────── centralized annotation carrier ──────────────────────
+// ─────────────────────── centralized annotation carrier ─────────────────────
 type annSrc struct {
-	txt      string
-	startTok int // inclusive token index of the first contributing annotation token
-	endTok   int // inclusive token index of the last contributing annotation token
-	ok       bool
+	txt            string
+	startTok       int // inclusive token index of the first contributing annotation token
+	endTok         int // inclusive token index of the last contributing annotation token
+	ok             bool
+	pinToBaseStart bool // when true, emit zero-length annot child pinned to base value start (binding sites)
 }
 
 func annNone() annSrc { return annSrc{} }
@@ -240,7 +315,10 @@ func mergeAnn(a, b annSrc) annSrc {
 	if end < 0 || (b.endTok >= 0 && b.endTok > end) {
 		end = b.endTok
 	}
-	return annSrc{txt: txt, startTok: start, endTok: end, ok: txt != ""}
+	return annSrc{
+		txt: txt, startTok: start, endTok: end, ok: txt != "",
+		pinToBaseStart: a.pinToBaseStart || b.pinToBaseStart,
+	}
 }
 
 // ─────────────────────────── token basics & helpers ─────────────────────────
@@ -430,46 +508,53 @@ func isRightAssoc(tt TokenType) bool {
 	return tt == ASSIGN || tt == ARROW || tt == POW
 }
 
-// ───────────────────────────── span emission (core) ─────────────────────────
-//
-// Centralized helpers. **All** node construction goes through these, which
-// also append exactly one span for the node (post-order).
-//
-// Rules:
-//   - For leaves tied to a concrete token, pass tok≥0 (start=end=tok).
-//   - For synthetic leaves (e.g. default "Any"), pass tok=-1 to emit Span{}.
-//   - For parents, pass the token range [startTok, endTok] that covers the node.
-//   - Helpers also update (lastSpanStartTok,lastSpanEndTok) to the node’s range,
-//     so callers can compose larger parent ranges deterministically.
+// ───────────────────────────── IR node builders ─────────────────────────
 
-func (p *parser) appendNodeSpanByTok(startTok, endTok int) {
-	if startTok >= 0 && endTok >= startTok &&
-		startTok < len(p.toks) && endTok < len(p.toks) {
-		p.post = append(p.post, Span{
-			StartByte: p.toks[startTok].StartByte,
-			EndByte:   p.toks[endTok].EndByte,
-		})
-	} else {
-		p.post = append(p.post, Span{})
+func (p *parser) mkLeafIR(tag string, tok int, parts ...any) NodeID {
+	id := NodeID(len(p.ir.Nodes))
+	var val any
+	if len(parts) > 0 {
+		val = parts[0]
 	}
-	p.lastSpanStartTok = startTok
-	p.lastSpanEndTok = endTok
+	p.ir.Nodes = append(p.ir.Nodes, IRNode{
+		Tag: tag, Kids: nil, Value: val,
+		TokStart: tok, TokEnd: tok,
+	})
+	// Do not let synthetic tokens clobber anchors used for diagnostics.
+	if tok >= 0 {
+		p.lastSpanStartTok, p.lastSpanEndTok = tok, tok
+	}
+	return id
 }
 
-// mkLeaf builds a leaf node whose span is a single token (tok). If tok<0,
-// a placeholder empty span is appended (keeps post-order cardinality intact).
-func (p *parser) mkLeaf(tag string, tok int, parts ...any) S {
-	n := L(tag, parts...)
-	p.appendNodeSpanByTok(tok, tok)
-	return n
+func (p *parser) mkIR(tag string, startTok, endTok int, kids ...NodeID) NodeID {
+	id := NodeID(len(p.ir.Nodes))
+	cp := make([]NodeID, len(kids))
+	copy(cp, kids)
+	p.ir.Nodes = append(p.ir.Nodes, IRNode{
+		Tag: tag, Kids: cp,
+		TokStart: startTok, TokEnd: endTok,
+	})
+	// Preserve last real-token anchor; ignore synthetic (-1).
+	if startTok >= 0 && endTok >= 0 {
+		p.lastSpanStartTok, p.lastSpanEndTok = startTok, endTok
+	}
+	return id
 }
 
-// mk builds a parent node after its children were already constructed.
-// It appends exactly one span for the parent covering [startTok,endTok].
-func (p *parser) mk(tag string, startTok, endTok int, parts ...any) S {
-	n := L(tag, parts...)
-	p.appendNodeSpanByTok(startTok, endTok)
-	return n
+func (p *parser) mkIRVal(tag string, startTok, endTok int, value any, kids ...NodeID) NodeID {
+	id := NodeID(len(p.ir.Nodes))
+	cp := make([]NodeID, len(kids))
+	copy(cp, kids)
+	p.ir.Nodes = append(p.ir.Nodes, IRNode{
+		Tag: tag, Kids: cp, Value: value,
+		TokStart: startTok, TokEnd: endTok,
+	})
+	// Preserve last real-token anchor; ignore synthetic (-1).
+	if startTok >= 0 && endTok >= 0 {
+		p.lastSpanStartTok, p.lastSpanEndTok = startTok, endTok
+	}
+	return id
 }
 
 // ───────────────────────── NOOP / annotation utils ─────────────────────
@@ -498,7 +583,7 @@ func (p *parser) onlyGapsToEOF() bool {
 // opener already consumed. Parse exactly one expr between opener/closer,
 // attach PRE (after opener) and trailing gaps (before closer), then need(closer).
 // Returns the inner expression and the closer's token index.
-func (p *parser) parseSingleBetween(closer TokenType, expect string) (S, int, error) {
+func (p *parser) parseSingleBetween(closer TokenType, expect string) (NodeID, int, error) {
 	openTok := p.toks[p.i-1]
 	needMsg := "expected expression after '('"
 	if closer == RSQUARE {
@@ -506,11 +591,11 @@ func (p *parser) parseSingleBetween(closer TokenType, expect string) (S, int, er
 	}
 	pre, err := p.takeReqGap(openTok, needMsg)
 	if err != nil {
-		return nil, 0, err
+		return 0, 0, err
 	}
 	inner, err := p.expr(0)
 	if err != nil {
-		return nil, 0, err
+		return 0, 0, err
 	}
 	if pre.ok {
 		inner = p.attachAnnotFrom(pre, inner)
@@ -519,17 +604,17 @@ func (p *parser) parseSingleBetween(closer TokenType, expect string) (S, int, er
 		inner = p.attachAnnotFrom(tail, inner)
 	}
 	if _, err := p.need(closer, expect); err != nil {
-		return nil, 0, err
+		return 0, 0, err
 	}
 	return inner, p.i - 1, nil
 }
 
 // Common "gap before do" handling for fun/oracle/module/loops.
-func (p *parser) parseDoBlockWithLeadingGap() (S, error) {
+func (p *parser) parseDoBlockWithLeadingGap() (NodeID, error) {
 	pre := p.collectGap()
 	b, err := p.parseBlock(true)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if pre.ok {
 		b = p.attachAnnotFrom(pre, b)
@@ -539,14 +624,14 @@ func (p *parser) parseDoBlockWithLeadingGap() (S, error) {
 
 // Require an expression after a just-consumed anchor token, with configurable BP,
 // attaching PRE to that expression.
-func (p *parser) parseExprAfterBP(anchor Token, msg string, bp int) (S, error) {
+func (p *parser) parseExprAfterBP(anchor Token, msg string, bp int) (NodeID, error) {
 	pre, err := p.takeReqGap(anchor, msg)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	e, err := p.expr(bp)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if pre.ok {
 		e = p.attachAnnotFrom(pre, e)
@@ -555,14 +640,24 @@ func (p *parser) parseExprAfterBP(anchor Token, msg string, bp int) (S, error) {
 }
 
 // POST-after-comma attaches to VALUE inside ("pair", key, value)
-func (p *parser) onCommaPostAttachToValue(last S, comma Token) S {
-	if len(last) >= 3 {
-		v := last[2].(S)
-		v = p.attachSameLineAnnots(v, comma.Line)
-		last[2] = v
-		return last
+func (p *parser) onCommaPostAttachToValue(last NodeID, comma Token) NodeID {
+	n := p.ir.Nodes[last]
+	switch n.Tag {
+	case "pair", "pair!":
+		// Re-attach POST to the value child, not the pair wrapper.
+		if len(n.Kids) < 2 {
+			// Defensive: malformed pair; fall back to prior behavior.
+			return p.attachSameLineAnnots(last, comma.Line)
+		}
+		key := n.Kids[0]
+		val := n.Kids[1]
+		val = p.attachSameLineAnnots(val, comma.Line)
+		// Rebuild the pair node with the updated value; preserve original span.
+		return p.mkIR(n.Tag, n.TokStart, n.TokEnd, key, val)
+	default:
+		// Arrays or other lists: attach to the element itself.
+		return p.attachSameLineAnnots(last, comma.Line)
 	}
-	return p.attachSameLineAnnots(last, comma.Line)
 }
 
 func (p *parser) nextTokenIsOnSameLine(as Token) bool {
@@ -598,7 +693,7 @@ func (p *parser) collectGap() annSrc {
 }
 
 // Attach one or more *single-line* ANNOTATION tokens that start on refLine.
-func (p *parser) attachSameLineAnnots(n S, refLine int) S {
+func (p *parser) attachSameLineAnnots(n NodeID, refLine int) NodeID {
 	if p.atEnd() || p.peek().Type != ANNOTATION {
 		return n
 	}
@@ -618,50 +713,51 @@ func (p *parser) attachSameLineAnnots(n S, refLine int) S {
 	return p.attachAnnotFrom(acc, n)
 }
 
-// Attach annotation so:
-//   - the child ("str", txt) uses the annotation token's span (src.tokIdx), and
-//   - the wrapper ("annot", ...) inherits the *wrapped value's* span — not the child.
-//
-// This preserves strict post-order: base was already appended; we append the child
-// next, and finally the wrapper using the base's span snapshot (not "lastSpan*",
-// which now points at the child).
-func (p *parser) attachAnnotFrom(src annSrc, val S) S {
+// IR-safe annotation attach: build ("annot", ("str", txt), base) in IR.
+//   - Normally, child "str" spans = [src.startTok, src.endTok] (fallback to base span).
+//   - For binding-site normalization, when src.pinToBaseStart==true, emit a synthetic
+//     zero-length child pinned at the base value's TokStart (ZeroAtStart=true).
+//   - Wrapper inherits base span.
+func (p *parser) attachAnnotFrom(src annSrc, val NodeID) NodeID {
 	if !src.ok || src.txt == "" {
 		return val
 	}
 
 	base := val
 	have := ""
-	if b, h, ok := unwrapAnnot(val); ok {
+	if b, h, ok := p.unwrapAnnotIR(val); ok {
 		base, have = b, h
 	}
+	bn := p.ir.Nodes[base]
+	txt := joinNonEmpty(src.txt, have)
 
-	// Snapshot the base's span *before* emitting the child, because appending
-	// the child will update lastSpan* to the child's span.
-	baseStartTok, baseEndTok := p.lastSpanStartTok, p.lastSpanEndTok
-	// Build the child "str" using the annotation tokens' combined range.
-	// If only one annotation token is present, startTok==endTok.
-	childText := joinNonEmpty(src.txt, have)
-	startTok := src.startTok
-	endTok := src.endTok
-	if startTok < 0 {
-		startTok = baseStartTok // fallback, though callers should supply annotation tokens
+	var str NodeID
+	if src.pinToBaseStart {
+		// Synthetic zero-length at value start.
+		startTok := bn.TokStart
+		if startTok < 0 {
+			// Fallback: keep synthetic with no location.
+			str = p.mkLeafIR("str", -1, txt)
+		} else {
+			str = p.mkLeafIR("str", startTok, txt)
+			p.ir.Nodes[str].TokEnd = startTok
+			p.ir.Nodes[str].ZeroAtStart = true
+		}
+	} else {
+		// Normal case: use annotation tokens' combined range (fallback to base).
+		startTok := src.startTok
+		endTok := src.endTok
+		if startTok < 0 {
+			startTok = bn.TokStart
+		}
+		if endTok < 0 {
+			endTok = bn.TokEnd
+		}
+		str = p.mkLeafIR("str", startTok, txt)
+		p.ir.Nodes[str].TokEnd = endTok
 	}
-	if endTok < 0 {
-		endTok = baseEndTok
-	}
-	// 1) Append child span.
-	child := p.mk("str", startTok, endTok, childText)
 
-	// 2) Reorder spans to match post-order of the *final* AST subtree:
-	// We just appended: [..., base, child]. The post-order under ("annot", child, base)
-	// must be: child, base, wrapper. Swap the last two so it becomes [..., child, base].
-	if n := len(p.post); n >= 2 {
-		p.post[n-2], p.post[n-1] = p.post[n-1], p.post[n-2]
-		// Do not touch lastSpanStartTok/EndTok; wrapper uses the base snapshot we captured.
-	}
-	// Wrapper inherits the *base's* span snapshot.
-	return p.mk("annot", baseStartTok, baseEndTok, child, base)
+	return p.mkIR("annot", bn.TokStart, bn.TokEnd, str, base)
 }
 
 // ───────────────────── centralized A+B+C+D normalization ─────────────────────
@@ -672,90 +768,92 @@ func (p *parser) attachAnnotFrom(src annSrc, val S) S {
 //
 // Central ABCD normalization for VALUE sites (assign RHS, params value, map value, etc.).
 // A and B are source-carrying; C (existing on right) is folded in; D is adjacent after right.
-func (p *parser) normalizeABCD(a annSrc, b annSrc, right S) S {
-	baseRight, cTxt, _ := unwrapAnnot(right) // C: text only (no reliable tokens)
+// The resulting annotation child is *synthetic* and must be pinned as zero-length at the
+// start of the VALUE span.
+func (p *parser) normalizeABCD(a annSrc, b annSrc, right NodeID) NodeID {
+	baseRight, cTxt, _ := p.unwrapAnnotIR(right) // C
 	c := annSrc{txt: cTxt, startTok: -1, endTok: -1, ok: cTxt != ""}
-	d := p.collectAnnotsSrc() // D: includes source tokens (startTok/endTok set)
+	d := p.collectAnnotsSrc() // D
 	merged := mergeAnn(mergeAnn(a, b), mergeAnn(c, d))
+	merged.pinToBaseStart = true // <<— request zero-length child at value start
 	return p.attachAnnotFrom(merged, baseRight)
 }
 
 // ───────────────────────── program / blocks ────────────────────────────
 
-func (p *parser) program() (S, error) {
-	var items []any
+func (p *parser) programIR() (NodeID, error) {
+	var kids []NodeID
 	for !p.atEnd() {
 		e, err := p.expr(0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
-		items = append(items, e)
+		kids = append(kids, e)
 	}
 	if len(p.toks) <= 1 {
-		return p.mk("block", -1, -1 /*empty*/), nil
+		return p.mkIR("block", -1, -1 /*empty*/), nil
 	}
-	return p.mk("block", 0, len(p.toks)-2, items...), nil
+	return p.mkIR("block", 0, len(p.toks)-2, kids...), nil
 }
 
 // blockUntil parses statements until a stop token is seen.
-// Span append happens once for the "block" node, after its children.
-func (p *parser) blockUntil(stops ...TokenType) (S, error) {
+func (p *parser) blockUntil(stops ...TokenType) (NodeID, error) {
 	stop := map[TokenType]bool{}
 	for _, s := range stops {
 		stop[s] = true
 	}
-	var items []any
+	var items []NodeID
 	startTok := p.i
 	consumedAny := false
 
 	for !p.atEnd() && !stop[p.peek().Type] {
 		e, err := p.expr(0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		items = append(items, e)
 		consumedAny = true
 	}
 	if consumedAny {
-		return p.mk("block", startTok, p.i-1, items...), nil
+		return p.mkIR("block", startTok, p.i-1, items...), nil
 	}
-	return p.mk("block", -1, -1 /*empty*/), nil
+	return p.mkIR("block", -1, -1 /*empty*/), nil
 }
 
-func (p *parser) parseBlock(requireDo bool) (S, error) {
+func (p *parser) parseBlock(requireDo bool) (NodeID, error) {
 	if requireDo {
 		if _, err := p.need(DO, "expected 'do'"); err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
 	b, err := p.blockUntil(END)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
+		return 0, err
 	}
 	return b, nil
 }
 
 // ───────────────────────────── tiny node helpers ───────────────────────────
 
-func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
+func (p *parser) tryLiteralOrId(t Token, start int) (NodeID, bool) {
 	switch t.Type {
 	case ID, TYPE:
-		return p.mkLeaf("id", start, tokText(t)), true
+		return p.mkLeafIR("id", start, tokText(t)), true
 	case INTEGER:
-		return p.mkLeaf("int", start, t.Literal), true
+		return p.mkLeafIR("int", start, t.Literal), true
 	case NUMBER:
-		return p.mkLeaf("num", start, t.Literal), true
+		return p.mkLeafIR("num", start, t.Literal), true
 	case STRING:
-		return p.mkLeaf("str", start, t.Literal), true
+		return p.mkLeafIR("str", start, t.Literal), true
 	case BOOLEAN:
-		return p.mkLeaf("bool", start, t.Literal), true
+		return p.mkLeafIR("bool", start, t.Literal), true
 	case NULL:
-		return p.mkLeaf("null", start), true
+		return p.mkLeafIR("null", start), true
 	}
-	return nil, false
+	return 0, false
 }
 
 // ---- tiny shared helpers for delimited lists ----
@@ -766,7 +864,7 @@ func (p *parser) tryLiteralOrId(t Token, start int) (S, bool) {
 //
 // It never crosses non-gap tokens. If a non-gap appears before the closer,
 // it delegates to need(close, expectMsg) to produce the right diagnostic.
-func (p *parser) drainTrailingGapsUntil(close TokenType, expectMsg string, out *[]any) error {
+func (p *parser) drainTrailingGapsUntil(close TokenType, expectMsg string, out *[]NodeID) error {
 	for {
 		if p.atEnd() {
 			// Let need(...) decide whether this is parse vs incomplete, with correct anchoring.
@@ -780,13 +878,13 @@ func (p *parser) drainTrailingGapsUntil(close TokenType, expectMsg string, out *
 			return nil
 
 		case NOOP:
-			*out = append(*out, p.mkLeaf("noop", p.i))
+			*out = append(*out, p.mkLeafIR("noop", p.i))
 			p.i++
 
 		case ANNOTATION:
 			// Merge adjacent annotations and wrap a noop, preserving the annotation's source span.
 			src := p.collectAnnotsSrc()
-			*out = append(*out, p.attachAnnotFrom(src, p.mkLeaf("noop", -1)))
+			*out = append(*out, p.attachAnnotFrom(src, p.mkLeafIR("noop", -1)))
 
 		default:
 			// Unexpected token before closer → canonical error.
@@ -800,12 +898,12 @@ func (p *parser) drainTrailingGapsUntil(close TokenType, expectMsg string, out *
 
 // ───────────────────────────── prefix / postfix / infix ────────────────────
 
-func (p *parser) expr(minBP int) (S, error) {
+func (p *parser) expr(minBP int) (NodeID, error) {
 	tokIndexOfThis := p.i
 	t := p.peek()
 	p.i++
 
-	var left S
+	var left NodeID
 	leftAnnA := annNone()
 	leftStartTok := tokIndexOfThis
 
@@ -815,7 +913,7 @@ func (p *parser) expr(minBP int) (S, error) {
 	} else {
 		switch t.Type {
 		case NOOP:
-			left = p.mkLeaf("noop", tokIndexOfThis)
+			left = p.mkLeafIR("noop", tokIndexOfThis)
 
 		case ENUM:
 			// Accept gap (annotations/newlines) between 'Enum' and '[' safely.
@@ -823,17 +921,13 @@ func (p *parser) expr(minBP int) (S, error) {
 			enumPre := p.collectGap()
 			if p.peek().Type == LSQUARE || p.peek().Type == CLSQUARE {
 				p.i++ // consume '[' or CLSQUARE
-				// Reuse full array machinery (gaps, PRE/POST, dangling PRE).
 				arr, err := p.arrayLiteralAfterOpen()
 				if err != nil {
-					return nil, err
+					return 0, err
 				}
 				// Retag: ("array", e1, e2, ...) -> ("enum", e1, e2, ...)
-				items := make([]any, 0, len(arr)-1)
-				for i := 1; i < len(arr); i++ {
-					items = append(items, arr[i])
-				}
-				n := p.mk("enum", tokIndexOfThis, p.i-1, items...)
+				an := p.ir.Nodes[arr]
+				n := p.mkIR("enum", tokIndexOfThis, p.i-1, an.Kids...)
 				if enumPre.ok {
 					n = p.attachAnnotFrom(enumPre, n)
 				}
@@ -841,34 +935,24 @@ func (p *parser) expr(minBP int) (S, error) {
 			} else {
 				// Not an Enum-literal; restore so gap remains for the next construct.
 				p.i = saveI
-				left = p.mkLeaf("id", tokIndexOfThis, tokText(t))
+				left = p.mkLeafIR("id", tokIndexOfThis, tokText(t))
 			}
 
-		case MINUS, NOT:
+		case MINUS, NOT, BITNOT:
 			r, err := p.parseExprAfterBP(t, "expected expression after unary operator", 80)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			endTok := p.lastSpanEndTok
 			if endTok < 0 {
 				endTok = tokIndexOfThis
 			}
-			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
-		case BITNOT:
-			r, err := p.parseExprAfterBP(t, "expected expression after unary operator", 80)
-			if err != nil {
-				return nil, err
-			}
-			endTok := p.lastSpanEndTok
-			if endTok < 0 {
-				endTok = tokIndexOfThis
-			}
-			left = p.mk("unop", tokIndexOfThis, endTok, t.Lexeme, r)
+			left = p.mkIRVal("unop", tokIndexOfThis, endTok, t.Lexeme, r)
 
 		case LROUND, CLROUND:
 			inner, _, err := p.parseSingleBetween(RROUND, "expected ')'")
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = inner
 			leftStartTok = tokIndexOfThis
@@ -876,7 +960,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		case LSQUARE, CLSQUARE:
 			a, err := p.arrayLiteralAfterOpen()
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = a
 			leftStartTok = tokIndexOfThis
@@ -884,7 +968,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		case LCURLY:
 			mp, err := p.mapLiteralAfterOpen(tokIndexOfThis)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = mp
 			leftStartTok = tokIndexOfThis
@@ -892,7 +976,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		case FUNCTION:
 			fn, err := p.funExpr(tokIndexOfThis)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = fn
 			leftStartTok = tokIndexOfThis
@@ -900,7 +984,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		case ORACLE:
 			orc, err := p.oracleExpr(tokIndexOfThis)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = orc
 			leftStartTok = tokIndexOfThis
@@ -908,35 +992,36 @@ func (p *parser) expr(minBP int) (S, error) {
 		case MODULE:
 			name, err := p.parseExprAfterBP(t, "expected module name expression", 0)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			body, err := p.parseDoBlockWithLeadingGap()
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
-			left = p.mk("module", tokIndexOfThis, p.i-1, name, body)
+			left = p.mkIR("module", tokIndexOfThis, p.i-1, name, body)
 			leftStartTok = tokIndexOfThis
 
 		case RETURN, BREAK, CONTINUE:
 			n, err := p.parseControl(t, tokIndexOfThis)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = n
 			leftStartTok = tokIndexOfThis
 
 		case IF:
-			thenIf, err := p.ifExpr()
+			ifnode, err := p.ifExpr()
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
-			left = p.mk("if", tokIndexOfThis, p.i-1, thenIf[1:]...)
+			in := p.ir.Nodes[ifnode]
+			left = p.mkIR("if", tokIndexOfThis, p.i-1, in.Kids...)
 			leftStartTok = tokIndexOfThis
 
 		case DO:
 			body, err := p.parseBlock(false)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = body
 			leftStartTok = tokIndexOfThis
@@ -944,7 +1029,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		case FOR:
 			f, err := p.forExpr(tokIndexOfThis)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = f
 			leftStartTok = tokIndexOfThis
@@ -952,7 +1037,7 @@ func (p *parser) expr(minBP int) (S, error) {
 		case WHILE:
 			w, err := p.whileExpr(tokIndexOfThis)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = w
 			leftStartTok = tokIndexOfThis
@@ -960,15 +1045,14 @@ func (p *parser) expr(minBP int) (S, error) {
 		case LET:
 			pat, a, err := p.declPattern()
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			left = pat
 			leftAnnA = a
 			leftStartTok = tokIndexOfThis
 
 			// If destructuring, require an '=' (after any annotations).
-			base, _, _ := unwrapAnnot(pat)
-			if tag, _ := base[0].(string); tag == "darr" || tag == "dobj" {
+			if p.isTag(pat, "darr") || p.isTag(pat, "dobj") {
 				// Skip GAPs (ANNOTATION/NOOP) without letting them satisfy the requirement.
 				j := p.i
 				for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
@@ -981,21 +1065,21 @@ func (p *parser) expr(minBP int) (S, error) {
 					if p.interactive {
 						kind = DiagIncomplete
 					}
-					return nil, &Error{Kind: kind, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+					return 0, &Error{Kind: kind, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 				}
 				// Not EOF: require ASSIGN next; if not, hard parse error at that token.
 				if p.toks[j].Type != ASSIGN {
 					line, col := p.posAtByte(p.toks[j].StartByte)
-					return nil, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
+					return 0, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
 				}
 			}
 
 		case TYPECONS:
 			x, err := p.parseExprAfterBP(t, "expected type expression after 'type'", 1)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
-			left = p.mk("type", tokIndexOfThis, p.lastSpanEndTok, x)
+			left = p.mkIR("type", tokIndexOfThis, p.lastSpanEndTok, x)
 			leftStartTok = tokIndexOfThis
 
 		case ANNOTATION:
@@ -1008,7 +1092,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			// Floating annotation: if the very next token is a NOOP, consume exactly one
 			// NOOP and return annot(noop) immediately.
 			if p.match(NOOP) {
-				return p.attachAnnotFrom(src, p.mkLeaf("noop", p.i-1)), nil
+				return p.attachAnnotFrom(src, p.mkLeafIR("noop", p.i-1)), nil
 			}
 
 			// Standalone comment: after skipping NOOPs, if the next token cannot start a value,
@@ -1027,22 +1111,22 @@ func (p *parser) expr(minBP int) (S, error) {
 					// Interactive + only gaps to EOF ⇒ ask for more input instead of annot(noop).
 					if p.interactive && p.onlyGapsToEOF() {
 						line, col := p.posAtByte(t.StartByte)
-						return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
+						return 0, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
 					}
-					return p.attachAnnotFrom(src, p.mkLeaf("noop", -1)), nil
+					return p.attachAnnotFrom(src, p.mkLeafIR("noop", -1)), nil
 				case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
-					return p.attachAnnotFrom(src, p.mkLeaf("noop", -1)), nil
+					return p.attachAnnotFrom(src, p.mkLeafIR("noop", -1)), nil
 				}
 			}
 
 			// Interactive: only gaps after the annotation → incomplete
 			if p.interactive && p.onlyGapsToEOF() {
 				line, col := p.posAtByte(t.StartByte)
-				return nil, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
+				return 0, &Error{Kind: DiagIncomplete, Msg: "expected expression after annotation", Line: line, Col: col}
 			}
 			// Non-interactive EOF → treat as annot(noop)
 			if p.atEnd() && !p.interactive {
-				left = p.attachAnnotFrom(src, p.mkLeaf("noop", -1))
+				left = p.attachAnnotFrom(src, p.mkLeafIR("noop", -1))
 				leftStartTok = tokIndexOfThis
 				break
 			}
@@ -1050,7 +1134,7 @@ func (p *parser) expr(minBP int) (S, error) {
 			// Normal case: parse the annotated operand
 			operand, err := p.expr(0)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			endTok := p.lastSpanEndTok
 			if endTok < 0 {
@@ -1058,25 +1142,22 @@ func (p *parser) expr(minBP int) (S, error) {
 			}
 
 			// If operand is an assignment, fold PRE onto the RHS value
-			if len(operand) >= 3 {
-				if tag, _ := operand[0].(string); tag == "assign" {
-					lhs, _ := operand[1].(S)
-					rhs, _ := operand[2].(S)
-					rhs = p.attachAnnotFrom(src, rhs)
-					left = p.mk("assign", -1, -1, lhs, rhs)
-					return left, nil
-				}
+			if p.isTag(operand, "assign") {
+				lhs := p.child(operand, 0)
+				rhs := p.child(operand, 1)
+				src.pinToBaseStart = true
+				rhs = p.attachAnnotFrom(src, rhs)
+				return p.mkIR("assign", -1, -1, lhs, rhs), nil
 			}
 
 			// If operand is a control form, PRE attaches to the control's VALUE
-			if len(operand) >= 2 {
-				if tag, _ := operand[0].(string); tag == "return" || tag == "break" || tag == "continue" {
-					val := operand[1].(S)
-					val = p.attachAnnotFrom(src, val)
-					left = p.mk(tag, tokIndexOfThis, endTok, val)
-					leftStartTok = tokIndexOfThis
-					return left, nil
-				}
+			if p.isTag(operand, "return") || p.isTag(operand, "break") || p.isTag(operand, "continue") {
+				val := p.child(operand, 0)
+				val = p.attachAnnotFrom(src, val)
+				tag := p.ir.Nodes[operand].Tag
+				left = p.mkIR(tag, tokIndexOfThis, endTok, val)
+				leftStartTok = tokIndexOfThis
+				return left, nil
 			}
 
 			// Normal (non-assignment, non-control) case: wrap operand with PRE
@@ -1086,10 +1167,10 @@ func (p *parser) expr(minBP int) (S, error) {
 		default:
 			if t.Type == EOF && p.interactive {
 				line, col := p.posAfterLastSpan()
-				return nil, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
+				return 0, &Error{Kind: DiagIncomplete, Msg: "unexpected end of input", Line: line, Col: col}
 			}
 			line, col := p.posAtByte(t.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
+			return 0, &Error{Kind: DiagParse, Msg: fmt.Sprintf("unexpected token '%s'", t.Lexeme), Line: line, Col: col}
 		}
 	}
 
@@ -1097,7 +1178,7 @@ func (p *parser) expr(minBP int) (S, error) {
 	for {
 		n, ok, err := p.parseOnePostfix(left, leftStartTok)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		if !ok {
 			break
@@ -1119,15 +1200,15 @@ func (p *parser) expr(minBP int) (S, error) {
 			nextBP = bp
 		}
 
-		if op.Type == ASSIGN && !assignable(left) {
+		if op.Type == ASSIGN && !p.assignableIR(left) {
 			line, col := p.posAtByte(op.StartByte)
-			return nil, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
+			return 0, &Error{Kind: DiagParse, Msg: "invalid assignment target", Line: line, Col: col}
 		}
 
 		// Allow GAP between operator and RHS, but don't let it satisfy the need.
 		preOp, err := p.takeReqGap(op, "expected expression after operator")
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		var b annSrc
@@ -1138,17 +1219,17 @@ func (p *parser) expr(minBP int) (S, error) {
 
 		rightParsed, err := p.expr(nextBP)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		endTok := p.lastSpanEndTok
 
 		if op.Type == ASSIGN {
 			// A (from prior 'let' pattern if any) + B + (C on right) + D
 			normRight := p.normalizeABCD(leftAnnA, b, rightParsed)
-			left = p.mk("assign", leftStartTok, endTok, left, normRight)
+			left = p.mkIR("assign", leftStartTok, endTok, left, normRight)
 			leftAnnA = annNone()
 		} else {
-			left = p.mk("binop", leftStartTok, endTok, op.Lexeme, left, rightParsed)
+			left = p.mkIRVal("binop", leftStartTok, endTok, op.Lexeme, left, rightParsed)
 		}
 	}
 
@@ -1169,10 +1250,9 @@ func (p *parser) expr(minBP int) (S, error) {
 // ───────────────────────── unified postfix dispatcher ──────────────────────
 //
 // Handles: QUESTION (optional), CLROUND (call), CLSQUARE (index), PERIOD (dot).
-// **Span order** is enforced: children were already appended during their parse.
-// We append exactly one span for the new wrapper node (unop '?', call, idx, get).
+// **Span order** is enforced on IR materialization.
 
-func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
+func (p *parser) parseOnePostfix(left NodeID, leftStartTok int) (NodeID, bool, error) {
 	// Enforce GAPLESS *before* '.' : if we are sitting on GAPs and the next
 	// non-gap token is PERIOD, that is an error (or incomplete at EOF).
 	if !p.atEnd() && (p.peek().Type == ANNOTATION || p.peek().Type == NOOP) {
@@ -1184,48 +1264,56 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		if j < len(p.toks) && p.toks[j].Type == PERIOD {
 			// There *is* a dot after a gap → forbidden.
 			line, col := p.posAtByte(firstGap.StartByte)
-			return nil, false, &Error{Kind: DiagParse, Msg: "no gap allowed before '.'", Line: line, Col: col}
+			return 0, false, &Error{Kind: DiagParse, Msg: "no gap allowed before '.'", Line: line, Col: col}
 		}
 		// Not a dot next; postfix chain stops here.
-		return nil, false, nil
+		return 0, false, nil
 	}
 
 	switch p.peek().Type {
 	case QUESTION:
 		qtok := p.i
 		p.i++
-		n := p.mk("unop", leftStartTok, qtok, "?", left)
+		n := p.mkIRVal("unop", leftStartTok, qtok, "?", left)
 		return n, true, nil
 
 	case CLROUND:
 		p.i++
 		if p.match(RROUND) {
-			n := p.mk("call", leftStartTok, p.i-1, left)
+			n := p.mkIR("call", leftStartTok, p.i-1, left)
 			return n, true, nil
 		}
-		args, _, closeTok, err := p.bracketed(RROUND, "expected ')'", func(pending annSrc) (S, int, error) {
-			a, err := p.expr(0)
-			if err != nil {
-				return nil, 0, err
-			}
-			if pending.ok {
-				a = p.attachAnnotFrom(pending, a)
-			}
-			return a, 0, nil
-		}, nil)
+		// Parse argument list
+		args, _, closeTok, err := p.bracketed(
+			RROUND, "expected ')'",
+			func(pending annSrc) (NodeID, int, error) {
+				a, err := p.expr(0)
+				if err != nil {
+					return 0, 0, err
+				}
+				if pending.ok {
+					a = p.attachAnnotFrom(pending, a)
+				}
+				return a, 0, nil
+			},
+			func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
+		)
 		if err != nil {
-			return nil, false, err
+			return 0, false, err
 		}
-		n := p.mk("call", leftStartTok, closeTok, append([]any{left}, args...)...)
+		kids := make([]NodeID, 0, 1+len(args))
+		kids = append(kids, left)
+		kids = append(kids, args...)
+		n := p.mkIR("call", leftStartTok, closeTok, kids...)
 		return n, true, nil
 
 	case CLSQUARE:
 		p.i++
 		idx, closeTok, perr := p.parseSingleBetween(RSQUARE, "expected ']'")
 		if perr != nil {
-			return nil, false, perr
+			return 0, false, perr
 		}
-		n := p.mk("idx", leftStartTok, closeTok, left, idx)
+		n := p.mkIR("idx", leftStartTok, closeTok, left, idx)
 		return n, true, nil
 
 	case PERIOD:
@@ -1233,56 +1321,48 @@ func (p *parser) parseOnePostfix(left S, leftStartTok int) (S, bool, error) {
 		dotTok := p.toks[p.i-1]
 		// GAPLESS after '.': forbid ANNOTATION/NOOP immediately after dot.
 		if err := p.needNoGap(dotTok, "expected property name, integer, or '(expr)' immediately after '.' (no gap allowed)"); err != nil {
-			return nil, false, err
+			return 0, false, err
 		}
 		if p.match(LROUND) || p.match(CLROUND) {
 			ex, closeTok, perr := p.parseSingleBetween(RROUND, "expected ')' after computed property")
 			if perr != nil {
-				return nil, false, perr
+				return 0, false, perr
 			}
-			n := p.mk("idx", leftStartTok, closeTok, left, ex)
+			n := p.mkIR("idx", leftStartTok, closeTok, left, ex)
 			return n, true, nil
 		}
 		// .<int> -> idx
 		if p.match(INTEGER) {
 			intTok := p.i - 1
-			intNode := p.mkLeaf("int", intTok, p.prev().Literal)
-			n := p.mk("idx", leftStartTok, intTok, left, intNode)
+			intNode := p.mkLeafIR("int", intTok, p.prev().Literal)
+			n := p.mkIR("idx", leftStartTok, intTok, left, intNode)
 			return n, true, nil
 		}
 		// .id or coerced quoted-name (lexer coerces after PERIOD) -> get
 		if p.match(ID) {
 			propTok := p.i - 1
-			prop := p.mkLeaf("str", propTok, tokText(p.prev()))
-			n := p.mk("get", leftStartTok, propTok, left, prop)
+			prop := p.mkLeafIR("str", propTok, tokText(p.prev()))
+			n := p.mkIR("get", leftStartTok, propTok, left, prop)
 			return n, true, nil
 		}
 		// Fallback diagnostic (not a valid follower)
 		g := p.peek()
 		line, col := p.posAtByte(g.StartByte)
-		return nil, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
+		return 0, false, &Error{Kind: DiagParse, Msg: "expected property name, integer, or '(expr)' after '.'", Line: line, Col: col}
 	}
-	return nil, false, nil
+	return 0, false, nil
 }
 
 // ───────────────────────── collections / lists / maps ─────────────────────
 
 // bracketed parses a comma-separated list between an already-consumed opener
-// and its 'close'. It owns:
-//   - interstitial PRE via ANNOTATION (pending text) and NOOP emission,
-//   - POST right after an element (same line),
-//   - POST after a COMMA (same line) via onCommaPost callback,
-//   - dangling PRE before closer -> annot(noop),
-//   - trailing gaps before closer (NOOP/ANNOTATION).
-//
-// bracketed parses a comma-separated list between an already-consumed opener.
-// It carries interstitial PRE as annSrc and emits annot(noop) with correct spans.
+// and its 'close'. It carries interstitial PRE as annSrc and emits annot(noop) with correct spans.
 func (p *parser) bracketed(
 	close TokenType,
 	expectMsg string,
-	parseElem func(pendingPRE annSrc) (S, int, error),
-	onCommaPost func(last S, comma Token, txt string) S,
-) ([]any, int, int, error) {
+	parseElem func(pendingPRE annSrc) (NodeID, int, error),
+	onCommaPost func(last NodeID, comma Token, txt string) NodeID,
+) ([]NodeID, int, int, error) {
 	openTok := p.i - 1
 
 	// Empty only when the very next token is the closer (no gap skipping).
@@ -1290,14 +1370,14 @@ func (p *parser) bracketed(
 		return nil, openTok, p.i - 1, nil
 	}
 
-	var out []any
+	var out []NodeID
 	pending := annNone()
 
 	for {
 		// Close: emit dangling PRE as annot(noop)
 		if p.peek().Type == close {
 			if pending.ok {
-				out = append(out, p.attachAnnotFrom(pending, p.mkLeaf("noop", -1)))
+				out = append(out, p.attachAnnotFrom(pending, p.mkLeafIR("noop", -1)))
 				pending = annNone()
 			}
 			break
@@ -1310,12 +1390,12 @@ func (p *parser) bracketed(
 			continue
 		case NOOP:
 			if pending.ok {
-				out = append(out, p.attachAnnotFrom(pending, p.mkLeaf("noop", -1)))
+				out = append(out, p.attachAnnotFrom(pending, p.mkLeafIR("noop", -1)))
 				pending = annNone()
 				p.i++ // consume the NOOP we wrapped
 				continue
 			}
-			out = append(out, p.mkLeaf("noop", p.i))
+			out = append(out, p.mkLeafIR("noop", p.i))
 			p.i++
 			continue
 		}
@@ -1325,11 +1405,11 @@ func (p *parser) bracketed(
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		// POST right after element (same line only)
+		// Same-line POST handled by IR attachment here:
 		if end := p.lastSpanEndTok; end >= 0 && end < len(p.toks) {
 			elem = p.attachSameLineAnnots(elem, p.toks[end].Line)
 		}
-		pending = annNone() // Clear pending PRE — responsibility is with parseElem.
+		pending = annNone() // Clear pending PRE
 
 		out = append(out, elem)
 
@@ -1338,7 +1418,7 @@ func (p *parser) bracketed(
 			break
 		}
 		comma := p.prev()
-		last := out[len(out)-1].(S)
+		last := out[len(out)-1]
 		if onCommaPost != nil {
 			last = onCommaPost(last, comma, "")
 		} else {
@@ -1357,16 +1437,16 @@ func (p *parser) bracketed(
 	return out, openTok, p.i - 1, nil
 }
 
-func (p *parser) arrayLiteralAfterOpen() (S, error) {
+func (p *parser) arrayLiteralAfterOpen() (NodeID, error) {
 	if p.match(RSQUARE) {
-		return p.mk("array", p.i-2, p.i-1 /* '[]' */), nil
+		return p.mkIR("array", p.i-2, p.i-1 /* '[]' */), nil
 	}
 	items, openTok, closeTok, err := p.bracketed(
 		RSQUARE, "expected ']'",
-		func(pending annSrc) (S, int, error) {
+		func(pending annSrc) (NodeID, int, error) {
 			e, err := p.expr(0)
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 			if pending.ok {
 				e = p.attachAnnotFrom(pending, e)
@@ -1376,9 +1456,9 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 		nil, // POST-after-comma attaches to element itself
 	)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("array", openTok, closeTok, items...), nil
+	return p.mkIR("array", openTok, closeTok, items...), nil
 }
 
 // params parses (CLROUND ... RROUND) parameter pairs; preserves NOOPs and
@@ -1386,15 +1466,15 @@ func (p *parser) arrayLiteralAfterOpen() (S, error) {
 // between ':' and the type expression (so annotations there still bind to the type).
 // Critically, it NORMALIZES annotations at the binding site by merging pending/A/B/C/D
 // onto the VALUE inside each ("pair", name, value), never onto the pair node itself.
-func (p *parser) params() (S, error) {
+func (p *parser) params() (NodeID, error) {
 	if _, perr := p.need(CLROUND, "expected '(' to start parameters"); perr != nil {
-		return nil, perr
+		return 0, perr
 	}
 	openTok := p.i - 1
 
 	// Immediate close → empty params array
 	if p.match(RROUND) {
-		return p.mk("array", openTok, p.i-1), nil
+		return p.mkIR("array", openTok, p.i-1), nil
 	}
 
 	// Guard: preserve the same diagnostic if a non-element appears before ')'.
@@ -1403,80 +1483,78 @@ func (p *parser) params() (S, error) {
 	default:
 		g := p.peek()
 		line, col := p.posAtByte(g.StartByte)
-		return nil, &Error{Kind: DiagParse, Msg: "expected ')' after parameters", Line: line, Col: col}
+		return 0, &Error{Kind: DiagParse, Msg: "expected ')' after parameters", Line: line, Col: col}
 	}
 
 	entries, _, closeTok, err := p.bracketed(
 		RROUND, "expected ')' after parameters",
-		func(pendingPRE annSrc) (S, int, error) {
+		func(pendingPRE annSrc) (NodeID, int, error) {
 			elemStartTok := p.i
 			idTok, err := p.need(ID, "expected parameter name")
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 			idIdx := p.i - 1
-			nameLeaf := p.mkLeaf("id", idIdx, tokText(idTok))
+			nameLeaf := p.mkLeafIR("id", idIdx, tokText(idTok))
 
-			var val S
+			var val NodeID
 			if p.match(COLON) {
 				b, err := p.takeReqGap(p.prev(), "expected type after ':'")
 				if err != nil {
-					return nil, 0, err
+					return 0, 0, err
 				}
 				tExpr, err := p.expr(0)
 				if err != nil {
-					return nil, 0, err
+					return 0, 0, err
 				}
 				val = p.normalizeABCD(pendingPRE, b, tExpr)
 			} else {
-				base := p.mkLeaf("id", -1, "Any")
+				base := p.mkLeafIR("id", -1, "Any")
 				val = p.attachAnnotFrom(pendingPRE, base)
 			}
 
-			// Pair span starts at pending PRE if present.
-			pairStartTok := elemStartTok
-			if pendingPRE.ok && pendingPRE.startTok < pairStartTok {
-				pairStartTok = pendingPRE.startTok
-			}
-			return p.mk("pair", pairStartTok, p.i-1, nameLeaf, val), 0, nil
+			// Pair span starts at pending PRE if present (span carried by parent array anyway).
+			_ = elemStartTok
+			pair := p.mkIR("pair", -1, -1, nameLeaf, val)
+			return pair, 0, nil
 		},
-		func(last S, comma Token, _ string) S { return p.onCommaPostAttachToValue(last, comma) },
+		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("array", openTok, closeTok, entries...), nil
+	return p.mkIR("array", openTok, closeTok, entries...), nil
 }
 
-func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
+func (p *parser) mapLiteralAfterOpen(openTok int) (NodeID, error) {
 	p.skipNoops()
 	if p.match(RCURLY) {
-		return p.mk("map", openTok, p.i-1), nil
+		return p.mkIR("map", openTok, p.i-1), nil
 	}
 
 	pairs, _, closeTok, err := p.bracketed(
 		RCURLY, "expected '}'",
-		func(pendingPRE annSrc) (S, int, error) {
+		func(pendingPRE annSrc) (NodeID, int, error) {
 			elemStartTok := p.i // current token before reading key/annots
 			k, aKey, err := p.readKeyString()
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 
 			req := p.match(BANG)
 			colonTok, err := p.need(COLON, "expected ':' after key")
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 
 			// B = GAP after ':'; it cannot satisfy the value requirement.
 			b, err := p.takeReqGap(colonTok, "expected value after ':'")
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 			v, err := p.expr(0)
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 
 			// Value normalization (A + B + C + D)
@@ -1495,19 +1573,19 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (S, error) {
 			if req {
 				tag = "pair!"
 			}
-			return p.mk(tag, pairStartTok, p.i-1, k, val), 0, nil
+			return p.mkIR(tag, pairStartTok, p.i-1, k, val), 0, nil
 		},
-		func(last S, comma Token, _ string) S { return p.onCommaPostAttachToValue(last, comma) },
+		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("map", openTok, closeTok, pairs...), nil
+	return p.mkIR("map", openTok, closeTok, pairs...), nil
 }
 
 // ───────────────────────── control / loops / if ───────────────────────────
 
-func (p *parser) parseControl(t Token, startTok int) (S, error) {
+func (p *parser) parseControl(t Token, startTok int) (NodeID, error) {
 	// tag: "return" | "break" | "continue"
 	tag := "return"
 	switch t.Type {
@@ -1519,29 +1597,26 @@ func (p *parser) parseControl(t Token, startTok int) (S, error) {
 
 	// Newline after the control word → no value (Null).
 	if !p.nextTokenIsOnSameLine(t) {
-		// Do NOT consume annotations here; leave them for the next statement.
-		// Returning a bare null ensures `# pre` on the following line can wrap
-		// the next expression instead of being swallowed by this control.
-		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
+		return p.mkIR(tag, startTok, startTok, p.mkLeafIR("null", -1)), nil
 	}
 
 	p.skipNoops()
 	// Same line but next token can't start a value → also Null.
 	switch p.peek().Type {
 	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
-		return p.mk(tag, startTok, startTok, p.mkLeaf("null", -1)), nil
+		return p.mkIR(tag, startTok, startTok, p.mkLeafIR("null", -1)), nil
 	}
 
 	// Parse value and attach any adjacent annotations.
 	x, err := p.expr(0)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	// Attach any adjacent annotations to the control's value (source-aware).
 	if tail := p.collectAnnotsSrc(); tail.ok {
 		x = p.attachAnnotFrom(tail, x)
 	}
-	return p.mk(tag, startTok, p.lastSpanEndTok, x), nil
+	return p.mkIR(tag, startTok, p.lastSpanEndTok, x), nil
 }
 
 // ────────────────────── Minimal annotation normalization helpers ─────────────
@@ -1550,51 +1625,51 @@ func (p *parser) parseControl(t Token, startTok int) (S, error) {
 // sites (ASSIGN, pairs in maps/types/params). Presentation (pre vs post) is a
 // pretty-printer concern.
 
-// unwrapAnnot collects stacked ("annot", ("str", s), base) wrappers:
+// unwrapAnnotIR collects stacked ("annot", ("str", s), base) wrappers:
 // - merges stacked texts with '\n' (no POST marker semantics);
-// - returns (base, mergedText, hadAnnot).
-func unwrapAnnot(n S) (S, string, bool) {
+// - returns (baseID, mergedText, hadAnnot).
+func (p *parser) unwrapAnnotIR(id NodeID) (NodeID, string, bool) {
 	var parts []string
-	cur := n
-	for len(cur) >= 3 {
-		tag, _ := cur[0].(string)
-		if tag != "annot" {
+	cur := id
+	for {
+		n := p.ir.Nodes[cur]
+		if n.Tag != "annot" || len(n.Kids) < 2 {
 			break
 		}
-		if child, ok := cur[1].(S); ok && len(child) >= 2 && child[0] == "str" {
-			if s, _ := child[1].(string); s != "" {
+		str := p.ir.Nodes[n.Kids[0]]
+		if str.Tag == "str" {
+			if s, _ := str.Value.(string); s != "" {
 				parts = append(parts, s)
 			}
 		}
-		base, _ := cur[2].(S)
-		cur = base
+		cur = n.Kids[1]
 	}
 	if len(parts) == 0 {
-		return n, "", false
+		return id, "", false
 	}
 	return cur, joinNonEmpty(parts...), true
 }
 
-func (p *parser) ifExpr() (S, error) {
+func (p *parser) ifExpr() (NodeID, error) {
 	ifTok := p.toks[p.i-1]
 	condStartTok := p.i
 	cond, err := p.parseExprAfterBP(ifTok, "expected condition after 'if'", 0)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	between := p.collectGap()
 	if _, err := p.need(THEN, "expected 'then'"); err != nil {
-		return nil, err
+		return 0, err
 	}
 	thenBlk, err := p.blockUntil(END, ELIF, ELSE)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if between.ok {
 		thenBlk = p.attachAnnotFrom(between, thenBlk)
 	}
-	arm := p.mk("pair", condStartTok, p.lastSpanEndTok, cond, thenBlk)
-	arms := []any{arm}
+	arm := p.mkIR("pair", condStartTok, p.lastSpanEndTok, cond, thenBlk)
+	arms := []NodeID{arm}
 
 	// Repeated elif arms with gap-aware detection and attachment.
 	for {
@@ -1609,15 +1684,15 @@ func (p *parser) ifExpr() (S, error) {
 		condStartTok = p.i
 		c, err := p.parseExprAfterBP(elifTok, "expected condition after 'elif'", 0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		between := p.collectGap()
 		if _, err := p.need(THEN, "expected 'then'"); err != nil {
-			return nil, err
+			return 0, err
 		}
 		b, err := p.blockUntil(END, ELIF, ELSE)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		if lead.ok {
 			b = p.attachAnnotFrom(lead, b)
@@ -1625,11 +1700,11 @@ func (p *parser) ifExpr() (S, error) {
 		if between.ok {
 			b = p.attachAnnotFrom(between, b)
 		}
-		arm := p.mk("pair", condStartTok, p.lastSpanEndTok, c, b)
+		arm := p.mkIR("pair", condStartTok, p.lastSpanEndTok, c, b)
 		arms = append(arms, arm)
 	}
 
-	var elseTail []any
+	var elseTail []NodeID
 	// Optional else with gap-aware attachment.
 	saveI := p.i
 	preElse := p.collectGap()
@@ -1639,28 +1714,28 @@ func (p *parser) ifExpr() (S, error) {
 	} else {
 		b, err := p.blockUntil(END)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		if preElse.ok {
 			b = p.attachAnnotFrom(preElse, b)
 		}
-		elseTail = []any{b}
+		elseTail = []NodeID{b}
 	}
 	if _, err := p.need(END, "expected 'end'"); err != nil {
-		return nil, err
+		return 0, err
 	}
-	return L("if", append(arms, elseTail...)...), nil
+	return p.mkIR("if", -1, -1, append(arms, elseTail...)...), nil
 }
 
-func (p *parser) forExpr(openTok int) (S, error) {
+func (p *parser) forExpr(openTok int) (NodeID, error) {
 	// Ensure gaps right after 'for' are treated uniformly (including NOOPs)
 	preFor, err := p.takeReqGap(p.toks[openTok], "expected for-target after 'for'")
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	tgt, err := p.forTarget()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if preFor.ok {
 		tgt = p.attachAnnotFrom(preFor, tgt)
@@ -1668,40 +1743,40 @@ func (p *parser) forExpr(openTok int) (S, error) {
 	between := p.collectGap()
 	inTok, err := p.need(IN, "expected 'in'")
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	postIn, err := p.takeReqGap(inTok, "expected expression after 'in'")
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	iter, err := p.expr(0)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	// Attach both the pre-'in' gap (between target and 'in') and the post-'in' gap.
 	iter = p.attachAnnotFrom(mergeAnn(between, postIn), iter)
 	body, err := p.parseDoBlockWithLeadingGap()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("for", openTok, p.i-1, tgt, iter, body), nil
+	return p.mkIR("for", openTok, p.i-1, tgt, iter, body), nil
 }
 
-func (p *parser) whileExpr(openTok int) (S, error) {
+func (p *parser) whileExpr(openTok int) (NodeID, error) {
 	cond, err := p.parseExprAfterBP(p.toks[openTok], "expected condition after 'while'", 0)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	body, err := p.parseDoBlockWithLeadingGap()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("while", openTok, p.i-1, cond, body), nil
+	return p.mkIR("while", openTok, p.i-1, cond, body), nil
 }
 
 // ───────────────────────── functions / oracle ─────────────────────────────
 
-func (p *parser) optionalArrowType(incMsg string) (S, error) {
+func (p *parser) optionalArrowType(incMsg string) (NodeID, error) {
 	// Allow a GAP between params ')' and '->'. If '->' is found AFTER the gap,
 	// parse the type and attach the gap's annotations to that type. Otherwise,
 	// restore so the gap can belong to the subsequent join (e.g., 'do').
@@ -1711,22 +1786,22 @@ func (p *parser) optionalArrowType(incMsg string) (S, error) {
 		arrowTok := p.prev()
 		post, err := p.takeReqGap(arrowTok, incMsg) // GAP immediately after '->'
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		r, err := p.expr(0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		r = p.attachAnnotFrom(mergeAnn(lead, post), r)
 		return r, nil // parsed type (one node)
 	}
 	// No arrow: put the parser back so the gap isn't consumed.
 	p.i = saveI
-	return p.mkLeaf("id", -1, "Any"), nil // single synthetic node
+	return p.mkLeafIR("id", -1, "Any"), nil // single synthetic node
 }
 
 // Small shared header for fun/oracle: params + optional arrow type
-type fnHeader struct{ params, arrow S }
+type fnHeader struct{ params, arrow NodeID }
 
 func (p *parser) parseFnHeader(kind string) (fnHeader, error) {
 	ps, err := p.params()
@@ -1737,31 +1812,29 @@ func (p *parser) parseFnHeader(kind string) (fnHeader, error) {
 	if kind == "oracle" {
 		msg = "expected output type after '->'"
 	}
-	// NOTE: optionalArrowType now internally accepts a gap before '->' and
-	// safely restores position if '->' is not present, so no extra work here.
 	ar, err := p.optionalArrowType(msg)
 	return fnHeader{ps, ar}, err
 }
 
-func (p *parser) funExpr(openTok int) (S, error) {
+func (p *parser) funExpr(openTok int) (NodeID, error) {
 	h, err := p.parseFnHeader("fun")
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	body, err := p.parseDoBlockWithLeadingGap()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	node := p.mk("fun", openTok, p.i-1, h.params, h.arrow, body)
+	node := p.mkIR("fun", openTok, p.i-1, h.params, h.arrow, body)
 	return node, nil
 }
 
-func (p *parser) oracleExpr(openTok int) (S, error) {
+func (p *parser) oracleExpr(openTok int) (NodeID, error) {
 	h, err := p.parseFnHeader("oracle")
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	var src any
+	var src NodeID
 	// Collect annotations/newlines before optional 'from'.
 	saveI := p.i
 	preFrom := p.collectGap()
@@ -1770,26 +1843,26 @@ func (p *parser) oracleExpr(openTok int) (S, error) {
 		fromTok := p.prev()
 		postFrom, err := p.takeReqGap(fromTok, "expected expression after 'from'")
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		ex, err := p.expr(0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		ex = p.attachAnnotFrom(mergeAnn(preFrom, postFrom), ex)
 		src = ex
 	} else {
 		// No 'from': restore so the gap belongs to whatever follows the oracle.
 		p.i = saveI
-		src = p.mk("array", -1, -1) // build only when needed
+		src = p.mkIR("array", -1, -1) // build only when needed
 	}
-	body := p.mk("oracle", openTok, p.i-1, h.params, h.arrow, src)
+	body := p.mkIR("oracle", openTok, p.i-1, h.params, h.arrow, src)
 	return body, nil
 }
 
 // ─────────────────────── declaration patterns (let/for) ───────────────────
 
-func (p *parser) declPattern() (S, annSrc, error) {
+func (p *parser) declPattern() (NodeID, annSrc, error) {
 	// Gather stacked PRE immediately before pattern (do not wrap yet).
 	pre := annNone()
 	for !p.atEnd() && p.peek().Type == ANNOTATION {
@@ -1797,7 +1870,7 @@ func (p *parser) declPattern() (S, annSrc, error) {
 	}
 	if p.match(ID) {
 		idIdx := p.i - 1
-		return p.mk("decl", idIdx, idIdx, tokText(p.prev())), pre, nil
+		return p.mkLeafIR("decl", idIdx, tokText(p.prev())), pre, nil
 	}
 	if p.match(LSQUARE, CLSQUARE) {
 		n, err := p.arrayDeclPattern()
@@ -1810,25 +1883,25 @@ func (p *parser) declPattern() (S, annSrc, error) {
 	g := p.peek()
 	if p.interactive && p.onlyGapsToEOF() {
 		line, col := p.posAfterLastSpan()
-		return nil, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
+		return 0, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
 	}
 	line, col := p.posAtByte(g.StartByte)
-	return nil, annNone(), &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
+	return 0, annNone(), &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
 }
 
-func (p *parser) arrayDeclPattern() (S, error) {
+func (p *parser) arrayDeclPattern() (NodeID, error) {
 	openTok := p.i - 1
 	p.skipNoops()
 	if p.match(RSQUARE) {
-		return p.mk("darr", openTok, p.i-1), nil
+		return p.mkIR("darr", openTok, p.i-1), nil
 	}
 
 	parts, _, closeTok, err := p.bracketed(
 		RSQUARE, "expected ']' in array pattern",
-		func(pending annSrc) (S, int, error) {
+		func(pending annSrc) (NodeID, int, error) {
 			pt, a, err := p.declPattern()
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 			// attach element's own PRE + interstitial PRE to the subpattern itself
 			if a.ok {
@@ -1842,38 +1915,38 @@ func (p *parser) arrayDeclPattern() (S, error) {
 		nil, // POST-after-comma attaches to the element itself
 	)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("darr", openTok, closeTok, parts...), nil
+	return p.mkIR("darr", openTok, closeTok, parts...), nil
 }
 
-func (p *parser) objectDeclPattern() (S, error) {
+func (p *parser) objectDeclPattern() (NodeID, error) {
 	openTok := p.i - 1
 	p.skipNoops()
 	if p.match(RCURLY) {
-		return p.mk("dobj", openTok, p.i-1), nil
+		return p.mkIR("dobj", openTok, p.i-1), nil
 	}
 
 	pairs, _, closeTok, err := p.bracketed(
 		RCURLY, "expected '}' in object pattern",
-		func(pendingPRE annSrc) (S, int, error) {
+		func(pendingPRE annSrc) (NodeID, int, error) {
 			startTok := p.i
 			k, aKey, err := p.readKeyString()
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 
 			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 			// B = GAP after ':' (cannot satisfy requirement)
 			b, err := p.takeReqGap(p.toks[p.i-1], "expected pattern after ':'")
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 			pt, aSub, err := p.declPattern()
 			if err != nil {
-				return nil, 0, err
+				return 0, 0, err
 			}
 
 			// subpattern-local PRE attaches to the pattern node itself
@@ -1882,26 +1955,26 @@ func (p *parser) objectDeclPattern() (S, error) {
 			}
 			// Merge pending PRE + A(from key) + B + C + D onto VALUE (the subpattern)
 			val := p.normalizeABCD(mergeAnn(pendingPRE, aKey), b, pt)
-			return p.mk("pair", startTok, p.i-1, k, val), 0, nil
+			return p.mkIR("pair", startTok, p.i-1, k, val), 0, nil
 		},
-		func(last S, comma Token, _ string) S { return p.onCommaPostAttachToValue(last, comma) },
+		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return p.mk("dobj", openTok, closeTok, pairs...), nil
+	return p.mkIR("dobj", openTok, closeTok, pairs...), nil
 }
 
 // readKeyString allows stacked PRE-annotations (handled recursively).
 // Span order: (1) PRE "str" child; (2) "annot" wrapper; (3) final key "str" leaf.
-func (p *parser) readKeyString() (S, annSrc, error) {
+func (p *parser) readKeyString() (NodeID, annSrc, error) {
 	// Stackable PRE immediately before key
 	var pre annSrc
 	for !p.atEnd() && p.peek().Type == ANNOTATION {
 		pre = mergeAnn(pre, p.collectAnnotsSrc())
 	}
 	if p.match(STRING) {
-		return p.mkLeaf("str", p.i-1, p.prev().Literal), pre, nil
+		return p.mkLeafIR("str", p.i-1, p.prev().Literal), pre, nil
 	}
 	t := p.peek()
 	if isWordLike(t.Type) {
@@ -1910,15 +1983,15 @@ func (p *parser) readKeyString() (S, annSrc, error) {
 		if s, ok := t.Literal.(string); ok {
 			name = s
 		}
-		return p.mkLeaf("str", p.i-1, name), pre, nil
+		return p.mkLeafIR("str", p.i-1, name), pre, nil
 	}
 	g := p.peek()
 	if p.interactive && p.onlyGapsToEOF() {
 		line, col := p.posAfterLastSpan()
-		return nil, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
+		return 0, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected key", Line: line, Col: col}
 	}
 	line, col := p.posAtByte(g.StartByte)
-	return nil, annNone(), &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
+	return 0, annNone(), &Error{Kind: DiagParse, Msg: "expected key", Line: line, Col: col}
 }
 
 func isWordLike(tt TokenType) bool {
@@ -1934,12 +2007,12 @@ func isWordLike(tt TokenType) bool {
 
 // ───────────────────────────── for-target helpers ─────────────────────────
 
-func (p *parser) forTarget() (S, error) {
+func (p *parser) forTarget() (NodeID, error) {
 	// 'for let <pattern> in ...'
 	if p.match(LET) {
 		pt, a, err := p.declPattern()
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		// In a for-target, attach the pattern's own PRE to the pattern itself.
 		if a.ok {
@@ -1960,7 +2033,7 @@ func (p *parser) forTarget() (S, error) {
 			return pt, nil
 		}
 		if p.interactive && IsIncomplete(err) {
-			return nil, err
+			return 0, err
 		}
 		p.i = save
 	}
@@ -1969,40 +2042,46 @@ func (p *parser) forTarget() (S, error) {
 	save := p.i
 	e, err := p.expr(90)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	if !assignable(e) {
+	if !p.assignableIR(e) {
 		p.i = save
 		g := p.peek()
 		line, col := p.posAtByte(g.StartByte)
-		return nil, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
+		return 0, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
 	}
-	if e[0].(string) == "id" {
-		// Reuse the existing id span for the decl node range.
-		return p.mk("decl", p.lastSpanStartTok, p.lastSpanEndTok, e[1].(string)), nil
+	// id → decl
+	if p.ir.Nodes[e].Tag == "id" {
+		name := p.ir.Nodes[e].Value.(string)
+		return p.mkLeafIR("decl", -1, name), nil
 	}
 	return e, nil
 }
 
-func assignable(n S) bool {
-	cur := n
-	for len(cur) > 0 {
-		tag, _ := cur[0].(string)
-		if tag == "annot" {
-			if inner, ok := cur[2].(S); ok {
-				cur = inner
-				continue
-			}
+func (p *parser) assignableIR(id NodeID) bool {
+	// unwrap annotations
+	cur := id
+	for {
+		n := p.ir.Nodes[cur]
+		if n.Tag == "annot" && len(n.Kids) >= 2 {
+			cur = n.Kids[1]
+			continue
 		}
 		break
 	}
-	if len(cur) == 0 {
-		return false
-	}
-	switch cur[0] {
+	tag := p.ir.Nodes[cur].Tag
+	switch tag {
 	case "id", "get", "idx", "decl", "darr", "dobj":
 		return true
 	default:
 		return false
 	}
+}
+
+// Small IR utilities
+func (p *parser) isTag(id NodeID, tag string) bool {
+	return p.ir.Nodes[id].Tag == tag
+}
+func (p *parser) child(id NodeID, i int) NodeID {
+	return p.ir.Nodes[id].Kids[i]
 }

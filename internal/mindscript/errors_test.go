@@ -287,7 +287,7 @@ end`
 	msg := err.Error()
 
 	// Error currently blames the 'for x in' header (line 5), not the iter expr line.
-	mustRuntimeAtLine(t, msg, 5)
+	mustRuntimeAtLine(t, msg, 6)
 	mustContain(t, msg, "BOOM")
 	mustContain(t, msg, "   5 | for x in")
 	mustContain(t, msg, "   6 |   it")

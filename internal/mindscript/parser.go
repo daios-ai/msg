@@ -2050,10 +2050,11 @@ func (p *parser) forTarget() (NodeID, error) {
 		line, col := p.posAtByte(g.StartByte)
 		return 0, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
 	}
-	// id → decl
+	// id → decl, preserving the original id token span (TokStart/TokEnd)
 	if p.ir.Nodes[e].Tag == "id" {
-		name := p.ir.Nodes[e].Value.(string)
-		return p.mkLeafIR("decl", -1, name), nil
+		idn := p.ir.Nodes[e]
+		name, _ := idn.Value.(string)
+		return p.mkIRVal("decl", idn.TokStart, idn.TokEnd, name), nil
 	}
 	return e, nil
 }

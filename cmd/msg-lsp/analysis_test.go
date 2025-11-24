@@ -92,26 +92,68 @@ func mustNotHaveDiag(t *testing.T, idx *FileIndex, code string) {
 	}
 }
 
-// findSymbol finds an analysis symbol with a given name by reading from RootEnv.
-// Only bindings stored as VTSymbol (via newSymbolVal) are returned; ambient
-// runtime values (non-VTSymbol) are ignored.
-func findSymbol(idx *FileIndex, name string) *VTSymbol {
+// findBinding fetches a binding by name from RootEnv.
+// It returns the stored Value and its analysis Symbol (when Tag==VTSymbol).
+// Ambient/runtime values (non-VTSymbol) return (zero, nil).
+func findBinding(idx *FileIndex, name string) (mindscript.Value, *Symbol) {
 	if idx == nil || idx.RootEnv == nil {
-		return nil
+		return mindscript.Value{}, nil
 	}
 
 	v, err := idx.RootEnv.Get(name)
 	if err != nil {
-		// Name not found (or lookup error) → no analysis symbol.
-		return nil
+		return mindscript.Value{}, nil
 	}
 
-	if sym, ok := asSymbol(v); ok {
-		return sym
+	if v.Tag == mindscript.VTSymbol {
+		if s, ok := v.Data.(*Symbol); ok && s != nil {
+			return v, s
+		}
 	}
 
 	// Non-VTSymbol binding → treat as ambient/builtin, not an analysis symbol.
-	return nil
+	return mindscript.Value{}, nil
+}
+
+func testAnalyze(src string) *FileIndex {
+	var a Analyzer
+	return a.Analyze("file:///test.ms", src)
+}
+
+func testFmtType(ip *mindscript.Interpreter, env *mindscript.Env, v mindscript.Value) string {
+	if ip == nil {
+		return ""
+	}
+	return mindscript.FormatType(ip.ResolveType(typeOf(ip, env, v), env))
+}
+
+func testTokensWithText(ti TokenIndex, s string) []TokenEntry {
+	var out []TokenEntry
+	for _, e := range ti.Entries {
+		if e.Text == s {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func testFindTokenAtOffset(ti TokenIndex, off int) *TokenEntry {
+	return ti.Find(off)
+}
+
+func testByteOffset(src, needle string, nth int) int {
+	start := 0
+	for i := 0; i < nth; i++ {
+		pos := strings.Index(src[start:], needle)
+		if pos < 0 {
+			return -1
+		}
+		start += pos
+		if i < nth-1 {
+			start += len(needle)
+		}
+	}
+	return start
 }
 
 // -----------------------------------------------------------------------------
@@ -181,7 +223,7 @@ let add = fun(a: Int, b: Int) -> Int do a + b end
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "add")
+	val, s := findBinding(idx, "add")
 	if s == nil {
 		t.Fatalf("binding for fun 'add' not found")
 	}
@@ -189,6 +231,7 @@ let add = fun(a: Int, b: Int) -> Int do a + b end
 	if !strings.Contains(ty, "Int") || !strings.Contains(ty, "->") {
 		t.Fatalf("expected arrow type ending in Int, got %q", ty)
 	}
+	_ = val
 }
 
 func Test_Analysis_Oracle_Return_Exposed_As_Nullable(t *testing.T) {
@@ -198,7 +241,7 @@ let next = oracle(seed: Int) -> Int
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "next")
+	val, s := findBinding(idx, "next")
 	if s == nil {
 		t.Fatalf("binding for oracle 'next' not found")
 	}
@@ -206,6 +249,7 @@ let next = oracle(seed: Int) -> Int
 	if !strings.Contains(ty, "Int?") {
 		t.Fatalf("expected oracle return to be nullable Int?, got %q", ty)
 	}
+	_ = val
 }
 
 // -----------------------------------------------------------------------------
@@ -261,7 +305,7 @@ let g = add(1)
 	mustNotHaveDiag(t, idx, "MS-ARG-OVERFLOW")
 	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
 
-	s := findSymbol(idx, "g")
+	_, s := findBinding(idx, "g")
 	if s == nil {
 		t.Fatalf("binding g not found")
 	}
@@ -345,12 +389,12 @@ end
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "x")
+	_, s := findBinding(idx, "x")
 	if s == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(s.Type); got != "Str" {
-		t.Fatalf("want Str, got %q", got)
+	if got := mindscript.FormatType(s.Type); got != "Enum[\"s\"]" {
+		t.Fatalf("want Enum[\"s\"], got %q", got)
 	}
 }
 
@@ -387,7 +431,7 @@ func Test_Analysis_Array_LUB_Empty_Is_Any(t *testing.T) {
 	src := `let xs = []`
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "xs")
+	_, s := findBinding(idx, "xs")
 	if s == nil {
 		t.Fatalf("binding xs not found")
 	}
@@ -401,12 +445,12 @@ func Test_Analysis_Array_LUB_Homogeneous_Int(t *testing.T) {
 	src := `let xs = [1, 2, 3]`
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "xs")
+	_, s := findBinding(idx, "xs")
 	if s == nil {
 		t.Fatalf("binding xs not found")
 	}
-	if got := mindscript.FormatType(s.Type); got != "[Int]" {
-		t.Fatalf("want [Int], got %q", got)
+	if got := mindscript.FormatType(s.Type); got != "[Enum[1, 2, 3]]" {
+		t.Fatalf("want [Enum[1, 2, 3]], got %q", got)
 	}
 }
 
@@ -418,12 +462,12 @@ let y =
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "y")
+	_, s := findBinding(idx, "y")
 	if s == nil {
 		t.Fatalf("binding y not found")
 	}
-	if got := mindscript.FormatType(s.Type); got != "Num" {
-		t.Fatalf("want Num, got %q", got)
+	if got := mindscript.FormatType(s.Type); got != "Enum[1, 2]" {
+		t.Fatalf("want Enum[1, 2], got %q", got)
 	}
 }
 
@@ -439,18 +483,18 @@ func Test_Analysis_Literals_Primitives(t *testing.T) {
 		src  string
 		want string
 	}{
-		{"int", `let x = 1`, "Int"},
-		{"num", `let x = 1.5`, "Num"},
-		{"str", `let x = "hi"`, "Str"},
-		{"bool", `let x = true`, "Bool"},
-		{"null", `let x = null`, "Null"},
+		{"int", `let x = 1`, "Enum[1]"},
+		{"num", `let x = 1.5`, "Enum[1.5]"},
+		{"str", `let x = "hi"`, "Enum[\"hi\"]"},
+		{"bool", `let x = true`, "Enum[true]"},
+		{"null", `let x = null`, "Enum[null]"},
 	}
 
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			idx := runIndex(t, uri, tc.src)
-			s := findSymbol(idx, "x")
+			_, s := findBinding(idx, "x")
 			if s == nil {
 				t.Fatalf("binding x not found")
 			}
@@ -471,7 +515,7 @@ func Test_Analysis_Literals_Unknown_Name(t *testing.T) {
 
 	mustHaveDiag(t, idx, "MS-UNKNOWN-NAME")
 
-	s := findSymbol(idx, "x")
+	_, s := findBinding(idx, "x")
 	if s == nil {
 		t.Fatalf("binding x not found")
 	}
@@ -486,12 +530,12 @@ func Test_Analysis_Array_LUB_Mixed_NumNullable(t *testing.T) {
 	src := `let xs = [1, 2.0, null]`
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "xs")
+	_, s := findBinding(idx, "xs")
 	if s == nil {
 		t.Fatalf("binding xs not found")
 	}
-	if got := mindscript.FormatType(s.Type); got != "[Num?]" {
-		t.Fatalf("want [Num?], got %q", got)
+	if got := mindscript.FormatType(s.Type); got != "[Enum[1, 2, null]]" {
+		t.Fatalf("want [Enum[1, 2, null]], got %q", got)
 	}
 }
 
@@ -500,11 +544,11 @@ func Test_Analysis_Maps_Value_Shape(t *testing.T) {
 	src := `let m = {a: 1, b: "x"}`
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "m")
+	_, s := findBinding(idx, "m")
 	if s == nil {
 		t.Fatalf("binding m not found")
 	}
-	want := `{a!: Int, b!: Str}`
+	want := `{a!: Enum[1], b!: Enum["x"]}`
 	if got := mindscript.FormatType(s.Type); got != want {
 		t.Fatalf("want %s, got %q", want, got)
 	}
@@ -521,15 +565,15 @@ let y = m.b
 
 	mustHaveDiag(t, idx, "MS-MAP-MISSING-KEY") // for m.b
 
-	x := findSymbol(idx, "x")
+	_, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want Int for x, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want Enum[1] for x, got %q", got)
 	}
 
-	y := findSymbol(idx, "y")
+	_, y := findBinding(idx, "y")
 	if y == nil {
 		t.Fatalf("binding y not found")
 	}
@@ -548,12 +592,12 @@ let x = xs[0]
 
 	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
 
-	s := findSymbol(idx, "x")
+	_, s := findBinding(idx, "x")
 	if s == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(s.Type); got != "Int" {
-		t.Fatalf("want Int, got %q", got)
+	if got := mindscript.FormatType(s.Type); got != "Enum[1]" {
+		t.Fatalf("want Enum[1], got %q", got)
 	}
 }
 
@@ -567,48 +611,48 @@ func Test_Analysis_If_LUB_Branches(t *testing.T) {
 	t.Run("int_int", func(t *testing.T) {
 		src := `let x = if true then 1 else 2 end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "x")
+		_, s := findBinding(idx, "x")
 		if s == nil {
 			t.Fatalf("binding x not found")
 		}
-		if got := mindscript.FormatType(s.Type); got != "Int" {
-			t.Fatalf("want Int, got %q", got)
+		if got := mindscript.FormatType(s.Type); got != "Enum[1, 2]" {
+			t.Fatalf("want Enum[1, 2], got %q", got)
 		}
 	})
 
 	t.Run("int_str_any", func(t *testing.T) {
 		src := `let x = if true then 1 else "no" end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "x")
+		_, s := findBinding(idx, "x")
 		if s == nil {
 			t.Fatalf("binding x not found")
 		}
-		if got := mindscript.FormatType(s.Type); got != "Any" {
-			t.Fatalf("want Any, got %q", got)
+		if got := mindscript.FormatType(s.Type); got != "Enum[1, \"no\"]" {
+			t.Fatalf("want Enum[1, \"no\"], got %q", got)
 		}
 	})
 
 	t.Run("missing_else_makes_nullable", func(t *testing.T) {
 		src := `let x = if true then 1 end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "x")
+		_, s := findBinding(idx, "x")
 		if s == nil {
 			t.Fatalf("binding x not found")
 		}
-		if got := mindscript.FormatType(s.Type); got != "Int?" {
-			t.Fatalf("want Int?, got %q", got)
+		if got := mindscript.FormatType(s.Type); got != "Enum[1]?" {
+			t.Fatalf("want Enum[1]?, got %q", got)
 		}
 	})
 
 	t.Run("else_null_makes_nullable", func(t *testing.T) {
 		src := `let x = if true then 1 else null end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "x")
+		_, s := findBinding(idx, "x")
 		if s == nil {
 			t.Fatalf("binding x not found")
 		}
-		if got := mindscript.FormatType(s.Type); got != "Int?" {
-			t.Fatalf("want Int?, got %q", got)
+		if got := mindscript.FormatType(s.Type); got != "Enum[1, null]" {
+			t.Fatalf("want Enum[1, null], got %q", got)
 		}
 	})
 }
@@ -622,13 +666,13 @@ end
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "x")
+	_, s := findBinding(idx, "x")
 	if s == nil {
 		t.Fatalf("binding x not found")
 	}
 	// Spec: loop may not run → body ⊔ Null ⇒ Int?
-	if got := mindscript.FormatType(s.Type); got != "Int?" {
-		t.Fatalf("want Int?, got %q", got)
+	if got := mindscript.FormatType(s.Type); got != "Enum[1]?" {
+		t.Fatalf("want Enum[1]?, got %q", got)
 	}
 }
 
@@ -642,7 +686,7 @@ func Test_Analysis_Fun_And_Oracle_Arrow_Shapes(t *testing.T) {
 	t.Run("plain_fun_arrow", func(t *testing.T) {
 		src := `let f = fun(x: Int) -> Str do "ok" end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "f")
+		_, s := findBinding(idx, "f")
 		if s == nil {
 			t.Fatalf("binding f not found")
 		}
@@ -654,7 +698,7 @@ func Test_Analysis_Fun_And_Oracle_Arrow_Shapes(t *testing.T) {
 	t.Run("oracle_return_made_nullable", func(t *testing.T) {
 		src := `let f = oracle(x: Int) -> Str`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "f")
+		_, s := findBinding(idx, "f")
 		if s == nil {
 			t.Fatalf("binding f not found")
 		}
@@ -667,7 +711,7 @@ func Test_Analysis_Fun_And_Oracle_Arrow_Shapes(t *testing.T) {
 	t.Run("oracle_already_nullable_stable", func(t *testing.T) {
 		src := `let f = oracle(x: Int) -> Str?`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "f")
+		_, s := findBinding(idx, "f")
 		if s == nil {
 			t.Fatalf("binding f not found")
 		}
@@ -680,7 +724,7 @@ func Test_Analysis_Fun_And_Oracle_Arrow_Shapes(t *testing.T) {
 	t.Run("zero_arg_fun_is_null_param", func(t *testing.T) {
 		src := `let f = fun() -> Str do "hi" end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "f")
+		_, s := findBinding(idx, "f")
 		if s == nil {
 			t.Fatalf("binding f not found")
 		}
@@ -693,7 +737,7 @@ func Test_Analysis_Fun_And_Oracle_Arrow_Shapes(t *testing.T) {
 	t.Run("untyped_fun_any_to_any", func(t *testing.T) {
 		src := `let f = fun(x) do x end`
 		idx := runIndex(t, uri, src)
-		s := findSymbol(idx, "f")
+		_, s := findBinding(idx, "f")
 		if s == nil {
 			t.Fatalf("binding f not found")
 		}
@@ -734,7 +778,7 @@ let g = f(1)
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "g")
+	_, s := findBinding(idx, "g")
 	if s == nil {
 		t.Fatalf("binding g not found")
 	}
@@ -766,7 +810,7 @@ let q = f(p)
 
 	// q should have some sensible, non-empty type (map or alias),
 	// but we don't pin the exact pretty-printed shape here.
-	q := findSymbol(idx, "q")
+	_, q := findBinding(idx, "q")
 	if q == nil {
 		t.Fatalf("binding q not found")
 	}
@@ -796,7 +840,7 @@ let n = len(xs)
 		// Call is well-typed: len takes Any, so array is fine.
 		mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
 
-		n := findSymbol(idx, "n")
+		_, n := findBinding(idx, "n")
 		if n == nil {
 			t.Fatalf("binding n not found")
 		}
@@ -816,7 +860,7 @@ let n = len(1)
 		// len accepts Any, so no static mismatch.
 		mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
 
-		n := findSymbol(idx, "n")
+		_, n := findBinding(idx, "n")
 		if n == nil {
 			t.Fatalf("binding n not found")
 		}
@@ -842,7 +886,7 @@ let y = M.x
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "y")
+	_, s := findBinding(idx, "y")
 	if s == nil {
 		t.Fatalf("binding y not found")
 	}
@@ -865,7 +909,7 @@ let y = M.y
 
 	mustHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
 
-	s := findSymbol(idx, "y")
+	_, s := findBinding(idx, "y")
 	if s == nil {
 		t.Fatalf("binding y not found")
 	}
@@ -887,7 +931,7 @@ let z = m.x
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "z")
+	_, s := findBinding(idx, "z")
 	if s == nil {
 		t.Fatalf("binding z not found")
 	}
@@ -907,7 +951,7 @@ let m = M
 `
 	idx := runIndex(t, uri, src)
 
-	s := findSymbol(idx, "m")
+	_, s := findBinding(idx, "m")
 	if s == nil {
 		t.Fatalf("binding m not found")
 	}
@@ -933,23 +977,22 @@ end
 `
 	idx := runIndex(t, uri, src)
 
-	// Outer x should remain Int.
-	x := findSymbol(idx, "x")
+	// Outer x should remain Enum[1].
+	_, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want outer x: Int, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want outer x: Enum[1], got %q", got)
 	}
 
-	// y starts as null, then is assigned from inner x: "s".
-	// Single-pass LUB: Null ⊔ Str = Str?
-	y := findSymbol(idx, "y")
+	// y becomes Enum["s"] (assigned from inner x).
+	_, y := findBinding(idx, "y")
 	if y == nil {
 		t.Fatalf("binding y not found")
 	}
-	if got := mindscript.FormatType(y.Type); got != "Str" {
-		t.Fatalf("want y: Str (Null then inner Str), got %q", got)
+	if got := mindscript.FormatType(y.Type); got != "Enum[\"s\"]" {
+		t.Fatalf("want y: Enum[\"s\"] (Null then inner literal), got %q", got)
 	}
 }
 
@@ -965,23 +1008,22 @@ end
 `
 	idx := runIndex(t, uri, src)
 
-	// Outer x should remain Int.
-	x := findSymbol(idx, "x")
+	// Outer x should remain Enum[1].
+	_, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want outer x: Int, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want outer x: Enum[1], got %q", got)
 	}
 
-	// z starts as null, then is assigned from inner x: true.
-	// LUB(Null, Bool) = Bool?
-	z := findSymbol(idx, "z")
+	// z becomes Enum[true] (assigned from inner x).
+	_, z := findBinding(idx, "z")
 	if z == nil {
 		t.Fatalf("binding z not found")
 	}
-	if got := mindscript.FormatType(z.Type); got != "Bool" {
-		t.Fatalf("want z: Bool (Null then inner Bool), got %q", got)
+	if got := mindscript.FormatType(z.Type); got != "Enum[true]" {
+		t.Fatalf("want z: Enum[true] (Null then inner literal), got %q", got)
 	}
 }
 
@@ -996,20 +1038,20 @@ let y = x
 `
 	idx := runIndex(t, uri, src)
 
-	x := findSymbol(idx, "x")
+	_, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want outer x: Int, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want outer x: Enum[1], got %q", got)
 	}
 
-	y := findSymbol(idx, "y")
+	_, y := findBinding(idx, "y")
 	if y == nil {
 		t.Fatalf("binding y not found")
 	}
-	if got := mindscript.FormatType(y.Type); got != "Int" {
-		t.Fatalf("want y: Int (from outer x), got %q", got)
+	if got := mindscript.FormatType(y.Type); got != "Enum[1]" {
+		t.Fatalf("want y: Enum[1] (from outer x), got %q", got)
 	}
 }
 
@@ -1027,7 +1069,7 @@ let n = len("hi")
 	}
 	idx := runIndexWithIP(t, uri, src, ip)
 
-	n := findSymbol(idx, "n")
+	_, n := findBinding(idx, "n")
 	if n == nil {
 		t.Fatalf("binding n not found")
 	}
@@ -1035,6 +1077,7 @@ let n = len("hi")
 		t.Fatalf("want n: Int, got %q", got)
 	}
 	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
+	mustNotHaveDiag(t, idx, "MS-UNKNOWN-NAME")
 }
 
 // -----------------------------------------------------------------------------
@@ -1049,15 +1092,15 @@ let x = 1
 `
 	idx := runIndex(t, uri, src)
 
-	x := findSymbol(idx, "x")
+	val, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want x: Int, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want x: Enum[1], got %q", got)
 	}
-	if x.Doc != "x is the answer" {
-		t.Fatalf("want doc %q, got %q", "x is the answer", x.Doc)
+	if val.Annot != "x is the answer" {
+		t.Fatalf("want doc %q, got %q", "x is the answer", val.Annot)
 	}
 }
 
@@ -1070,15 +1113,15 @@ let x =
 `
 	idx := runIndex(t, uri, src)
 
-	x := findSymbol(idx, "x")
+	val, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want x: Int, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want x: Enum[1], got %q", got)
 	}
-	if x.Doc != "important number" {
-		t.Fatalf("want doc %q, got %q", "important number", x.Doc)
+	if val.Annot != "important number" {
+		t.Fatalf("want doc %q, got %q", "important number", val.Annot)
 	}
 }
 
@@ -1092,16 +1135,16 @@ let x =
 `
 	idx := runIndex(t, uri, src)
 
-	x := findSymbol(idx, "x")
+	val, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Int" {
-		t.Fatalf("want x: Int, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[1]" {
+		t.Fatalf("want x: Enum[1], got %q", got)
 	}
 	wantDoc := "line one\nline two"
-	if x.Doc != wantDoc {
-		t.Fatalf("want doc %q, got %q", wantDoc, x.Doc)
+	if val.Annot != wantDoc {
+		t.Fatalf("want doc %q, got %q", wantDoc, val.Annot)
 	}
 }
 
@@ -1113,12 +1156,12 @@ let x = "hi"
 `
 	idx := runIndex(t, uri, src)
 
-	x := findSymbol(idx, "x")
+	_, x := findBinding(idx, "x")
 	if x == nil {
 		t.Fatalf("binding x not found")
 	}
-	if got := mindscript.FormatType(x.Type); got != "Str" {
-		t.Fatalf("want x: Str, got %q", got)
+	if got := mindscript.FormatType(x.Type); got != "Enum[\"hi\"]" {
+		t.Fatalf("want x: Enum[\"hi\"], got %q", got)
 	}
 }
 
@@ -1131,15 +1174,15 @@ let y = x
 `
 	idx := runIndex(t, uri, src)
 
-	y := findSymbol(idx, "y")
+	valY, y := findBinding(idx, "y")
 	if y == nil {
 		t.Fatalf("binding y not found")
 	}
-	if got := mindscript.FormatType(y.Type); got != "Int" {
-		t.Fatalf("want y: Int, got %q", got)
+	if got := mindscript.FormatType(y.Type); got != "Enum[1]" {
+		t.Fatalf("want y: Enum[1], got %q", got)
 	}
-	if y.Doc != "outer doc" {
-		t.Fatalf("want propagated doc %q on y, got %q", "outer doc", y.Doc)
+	if valY.Annot != "outer doc" {
+		t.Fatalf("want propagated doc %q on y, got %q", "outer doc", valY.Annot)
 	}
 }
 
@@ -1154,16 +1197,16 @@ let [a, b] = [1, 2]
 `
 	idx := runIndex(t, uri, src)
 
-	a := findSymbol(idx, "a")
-	b := findSymbol(idx, "b")
+	_, a := findBinding(idx, "a")
+	_, b := findBinding(idx, "b")
 	if a == nil || b == nil {
 		t.Fatalf("expected bindings a and b")
 	}
-	if got := mindscript.FormatType(a.Type); got != "Int" {
-		t.Fatalf("want a: Int, got %q", got)
+	if got := mindscript.FormatType(a.Type); got != "Enum[1]" {
+		t.Fatalf("want a: Enum[1], got %q", got)
 	}
-	if got := mindscript.FormatType(b.Type); got != "Int" {
-		t.Fatalf("want b: Int, got %q", got)
+	if got := mindscript.FormatType(b.Type); got != "Enum[2]" {
+		t.Fatalf("want b: Enum[2], got %q", got)
 	}
 }
 
@@ -1174,16 +1217,16 @@ let [a, b] = [1, 2, 3]
 `
 	idx := runIndex(t, uri, src)
 
-	a := findSymbol(idx, "a")
-	b := findSymbol(idx, "b")
+	_, a := findBinding(idx, "a")
+	_, b := findBinding(idx, "b")
 	if a == nil || b == nil {
 		t.Fatalf("expected bindings a and b")
 	}
-	if got := mindscript.FormatType(a.Type); got != "Int" {
-		t.Fatalf("want a: Int, got %q", got)
+	if got := mindscript.FormatType(a.Type); got != "Enum[1]" {
+		t.Fatalf("want a: Enum[1], got %q", got)
 	}
-	if got := mindscript.FormatType(b.Type); got != "Int" {
-		t.Fatalf("want b: Int, got %q", got)
+	if got := mindscript.FormatType(b.Type); got != "Enum[2]" {
+		t.Fatalf("want b: Enum[2], got %q", got)
 	}
 }
 
@@ -1206,16 +1249,16 @@ let {x: a, y: b} = p
 `
 	idx := runIndex(t, uri, src)
 
-	a := findSymbol(idx, "a")
-	b := findSymbol(idx, "b")
+	_, a := findBinding(idx, "a")
+	_, b := findBinding(idx, "b")
 	if a == nil || b == nil {
 		t.Fatalf("expected bindings a and b")
 	}
-	if got := mindscript.FormatType(a.Type); got != "Int" {
-		t.Fatalf("want a: Int, got %q", got)
+	if got := mindscript.FormatType(a.Type); got != "Enum[1]" {
+		t.Fatalf("want a: Enum[1], got %q", got)
 	}
-	if got := mindscript.FormatType(b.Type); got != "Int" {
-		t.Fatalf("want b: Int, got %q", got)
+	if got := mindscript.FormatType(b.Type); got != "Enum[2]" {
+		t.Fatalf("want b: Enum[2], got %q", got)
 	}
 	mustNotHaveDiag(t, idx, "MS-MAP-MISSING-KEY")
 }
@@ -1228,30 +1271,20 @@ let {x: a, y: b} = p
 `
 	idx := runIndex(t, uri, src)
 
-	a := findSymbol(idx, "a")
-	b := findSymbol(idx, "b")
+	_, a := findBinding(idx, "a")
+	_, b := findBinding(idx, "b")
 	if a == nil || b == nil {
 		t.Fatalf("expected bindings a and b")
 	}
-	if got := mindscript.FormatType(a.Type); got != "Int" {
-		t.Fatalf("want a: Int, got %q", got)
+	if got := mindscript.FormatType(a.Type); got != "Enum[1]" {
+		t.Fatalf("want a: Enum[1], got %q", got)
 	}
 	if got := mindscript.FormatType(b.Type); got != "Null" {
 		t.Fatalf("want b: Null (missing key), got %q", got)
 	}
-	if b.Doc != "object pattern: missing key 'y'" {
-		t.Fatalf("want doc %q on b, got %q", "object pattern: missing key 'y'", b.Doc)
+	if v, s := findBinding(idx, "b"); s == nil || v.Annot != "object pattern: missing key 'y'" {
+		t.Fatalf("want doc %q on b, got %q", "object pattern: missing key 'y'", v.Annot)
 	}
-}
-
-func Test_Analysis_Destructuring_Object_Unknown_RHS_Name(t *testing.T) {
-	const uri = "mem://destr-obj-unknown-rhs.ms"
-	src := `
-let {x: a} = something
-`
-	idx := runIndex(t, uri, src)
-
-	mustHaveDiag(t, idx, "MS-UNKNOWN-NAME")
 }
 
 // -----------------------------------------------------------------------------
@@ -1327,8 +1360,8 @@ func Test_Analysis_Tokens_Ident_Decl_And_Span(t *testing.T) {
 	if toks[0].Start != start || toks[0].End != end {
 		t.Fatalf("want span [%d,%d), got [%d,%d)", start, end, toks[0].Start, toks[0].End)
 	}
-	if toks[0].Sym == nil {
-		t.Fatalf("want Sym != nil for decl")
+	if toks[0].Payload.Tag != mindscript.VTSymbol {
+		t.Fatalf("want VTSymbol payload for decl")
 	}
 }
 
@@ -1354,8 +1387,8 @@ let y = x
 	if decl == nil || use == nil {
 		t.Fatalf("need decl and use tokens")
 	}
-	if decl.Sym == nil || use.Sym == nil || decl.Sym != use.Sym {
-		t.Fatalf("decl/use should share the same Sym pointer")
+	if decl.Payload.Tag != mindscript.VTSymbol || use.Payload.Tag != mindscript.VTSymbol || decl.Payload.Data != use.Payload.Data {
+		t.Fatalf("decl/use should share the same Symbol payload")
 	}
 }
 
@@ -1385,7 +1418,7 @@ x
 		if i == decl {
 			continue
 		}
-		if xToks[i].Sym == nil || xToks[decl].Sym != xToks[i].Sym {
+		if xToks[i].Payload.Tag != mindscript.VTSymbol || xToks[decl].Payload.Data != xToks[i].Payload.Data {
 			t.Fatalf("all uses should link to decl Sym")
 		}
 	}
@@ -1417,7 +1450,7 @@ let z = x
 			}
 		}
 	}
-	if outerDecl == nil || innerDecl == nil || outerDecl.Sym == innerDecl.Sym {
+	if outerDecl == nil || innerDecl == nil || outerDecl.Payload.Data == innerDecl.Payload.Data {
 		t.Fatalf("decls must exist and have different Sym")
 	}
 	// Use before end of block should link to inner
@@ -1431,7 +1464,7 @@ let z = x
 			break
 		}
 	}
-	if innerUse == nil || innerUse.Sym != innerDecl.Sym {
+	if innerUse == nil || innerUse.Payload.Data != innerDecl.Payload.Data {
 		t.Fatalf("inner use should link to inner decl")
 	}
 	// Use after block (z = x) should link to outer
@@ -1449,7 +1482,7 @@ let z = x
 			break
 		}
 	}
-	if outerUse == nil || outerUse.Sym != outerDecl.Sym {
+	if outerUse == nil || outerUse.Payload.Data != outerDecl.Payload.Data {
 		t.Fatalf("outer use should link to outer decl")
 	}
 }
@@ -1480,7 +1513,7 @@ x = "ok"
 		if toks[i].IsDecl {
 			continue
 		}
-		if toks[i].Sym == nil || toks[i].Sym != decl.Sym {
+		if toks[i].Payload.Tag != mindscript.VTSymbol || toks[i].Payload.Data != decl.Payload.Data {
 			t.Fatalf("reassign uses must link to the original decl Sym")
 		}
 	}
@@ -1498,8 +1531,8 @@ func Test_Analysis_Unknown_Name_Tokenized_WithSpan(t *testing.T) {
 	if len(xToks) != 1 || xToks[0].IsDecl {
 		t.Fatalf("want one use token for x")
 	}
-	if xToks[0].Sym != nil {
-		t.Fatalf("unknown name should have Sym=nil")
+	if xToks[0].Payload.Tag == mindscript.VTSymbol {
+		t.Fatalf("unknown name should not carry VTSymbol payload")
 	}
 	start, end := test_analysis_posOf(src, "x", 1)
 	if xToks[0].Start != start || xToks[0].End != end {
@@ -1528,9 +1561,9 @@ func Test_Analysis_Ambient_Name_Token_NoDiag(t *testing.T) {
 	if len(lenToks) != 1 || lenToks[0].IsDecl {
 		t.Fatalf("want one use token for ambient 'len'")
 	}
-	if lenToks[0].Sym != nil {
-		// ambient should not carry a Sym (not a local binding)
-		t.Fatalf("ambient name should have Sym=nil")
+	if lenToks[0].Payload.Tag == mindscript.VTSymbol {
+		// ambient should not carry a VTSymbol (not a local binding)
+		t.Fatalf("ambient name should not have VTSymbol payload")
 	}
 	if hasDiag(idx, "MS-UNKNOWN-NAME") {
 		t.Fatalf("ambient name should not trigger unknown-name diag")
@@ -1561,7 +1594,7 @@ len("hi")
 			use = &lenToks[i]
 		}
 	}
-	if decl == nil || use == nil || decl.Sym == nil || use.Sym == nil || decl.Sym != use.Sym {
+	if decl == nil || use == nil || decl.Payload.Tag != mindscript.VTSymbol || use.Payload.Tag != mindscript.VTSymbol || decl.Payload.Data != use.Payload.Data {
 		t.Fatalf("local shadow should link decl/use via same Sym")
 	}
 	mustNotHaveDiag(t, idx, "MS-ARG-TYPE-MISMATCH")
@@ -1594,8 +1627,8 @@ func Test_Analysis_Params_Are_Decls_WithSpans(t *testing.T) {
 			break
 		}
 	}
-	if aDecl == nil || bDecl == nil || aDecl.Sym == nil || bDecl.Sym == nil {
-		t.Fatalf("param decl tokens must exist and have Sym")
+	if aDecl == nil || bDecl == nil || aDecl.Payload.Tag != mindscript.VTSymbol || bDecl.Payload.Tag != mindscript.VTSymbol {
+		t.Fatalf("param decl tokens must exist and carry VTSymbol payload")
 	}
 	// Spans cover the param names
 	aStart, _ := test_analysis_posOf(src, "a:", 1)
@@ -1614,7 +1647,7 @@ func Test_Analysis_Oracle_Param_Decl_Tokenized(t *testing.T) {
 	idx := runIndex(t, uri, src)
 
 	xToks := test_analysis_findIdentTokens(idx, "x")
-	if len(xToks) != 1 || !xToks[0].IsDecl || xToks[0].Sym == nil {
+	if len(xToks) != 1 || !xToks[0].IsDecl || xToks[0].Payload.Tag != mindscript.VTSymbol {
 		t.Fatalf("oracle param 'x' should be a decl with Sym")
 	}
 	start, end := test_analysis_posOf(src, "x:", 1)
@@ -1635,7 +1668,7 @@ func Test_Analysis_Destructuring_Array_Decl_Tokens_Spans(t *testing.T) {
 	if len(aToks) != 1 || len(bToks) != 1 {
 		t.Fatalf("want decl tokens for a and b")
 	}
-	if !aToks[0].IsDecl || !bToks[0].IsDecl || aToks[0].Sym == nil || bToks[0].Sym == nil {
+	if !aToks[0].IsDecl || !bToks[0].IsDecl || aToks[0].Payload.Tag != mindscript.VTSymbol || bToks[0].Payload.Tag != mindscript.VTSymbol {
 		t.Fatalf("destructured names should be decls with Sym")
 	}
 	aStart, aEnd := test_analysis_posOf(src, "a", 1)

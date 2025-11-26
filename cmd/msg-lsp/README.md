@@ -81,7 +81,7 @@ Below is a Go-ish package layout that matches your current code and MindScript p
 
 * `jsonrpc`/`protocol` are **transport-only** (no MindScript import).
 * `server` knows only about `Feature` interfaces and `docstore`. It does **not** import MindScript.
-* `engine` is the **only** package that imports `github.com/DAIOS-AI/msg` (lexer/parser/printer/spans/interpreter). If the engine changes, upper layers don’t.
+* `engine` is the **only** package that imports `github.com/daios-ai/msg` (lexer/parser/printer/spans/interpreter). If the engine changes, upper layers don’t.
 * `analysis` depends on `engine` and `docstore` and returns a **stable, LSP-friendly result**:
 
   ```go
@@ -138,7 +138,7 @@ cmd/mindscript-lsp
    ├─ internal/features
    │  └─ internal/analysis
    │     ├─ internal/engine
-   │     │  └─ github.com/DAIOS-AI/msg  (mindscript: lexer, parser, spans, printer, interpreter)
+   │     │  └─ github.com/daios-ai/msg  (mindscript: lexer, parser, spans, printer, interpreter)
    │     └─ internal/docstore
    ├─ internal/config
    └─ internal/logging
@@ -162,7 +162,7 @@ Or, as edges (acyclic):
 **MindScript internals** remain self-contained:
 
 ```
-github.com/DAIOS-AI/msg (MindScript)
+github.com/daios-ai/msg (MindScript)
 ├─ lexer.go
 ├─ parser.go
 ├─ spans.go

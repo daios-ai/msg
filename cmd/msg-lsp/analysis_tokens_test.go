@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+	mindscript "github.com/daios-ai/msg/internal/mindscript"
 )
 
 //

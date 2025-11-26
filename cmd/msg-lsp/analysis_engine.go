@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"strings"
 
-	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+	mindscript "github.com/daios-ai/msg/internal/mindscript"
 )
 
 //// END_OF_PUBLIC

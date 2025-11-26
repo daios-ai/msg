@@ -12,8 +12,8 @@ INSTALL_DIR="${HOME}/.mindscript"
 # Online source (works if repo is public)
 # - "latest" uses GitHub's latest/download endpoint (no latest.txt needed)
 VERSION="${VERSION:-latest}"
-BASE_URL_LATEST="https://github.com/DAIOS-AI/msg/releases/latest/download"
-BASE_URL_TAGGED="https://github.com/DAIOS-AI/msg/releases/download"
+BASE_URL_LATEST="https://github.com/daios-ai/msg/releases/latest/download"
+BASE_URL_TAGGED="https://github.com/daios-ai/msg/releases/download"
 
 # -----------------------------
 # Args: --local [dir]

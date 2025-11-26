@@ -25,7 +25,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	mindscript "github.com/DAIOS-AI/msg/internal/mindscript"
+	mindscript "github.com/daios-ai/msg/internal/mindscript"
 )
 
 // bindingDef: single source of truth for names.

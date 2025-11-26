@@ -1,4 +1,4 @@
-module github.com/DAIOS-AI/msg
+module github.com/daios-ai/msg
 
 go 1.24
 

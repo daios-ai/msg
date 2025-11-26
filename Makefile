@@ -143,8 +143,7 @@ endif
 test-go:
 	@echo "Running Go tests..."
 	@mkdir -p bin
-	MSGPATH=$(PWD) go test -v ./internal/mindscript
-	MSGPATH=$(PWD) go test -v ./cmd/msg-lsp
+	MSGPATH=$(PWD) go test -v ./mindscript
 
 test-ms:
 	@echo "Running MindScript stdlib tests with staged binary..."
@@ -157,9 +156,6 @@ ifeq ($(UNAME_S),Linux)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
 	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
 	 -o $(BIN_DIR)/msg     ./cmd/msg
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
-	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
 	@# If we didn't successfully vendor libffi before build, fall back to post-build discovery (old, proven path)
 	@if ! ls "$(VENDOR_LIB_DIR)"/libffi.so* >/dev/null 2>&1; then \
 	  set -e; \
@@ -176,9 +172,6 @@ else ifeq ($(UNAME_S),Darwin)
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
 	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
 	 -o $(BIN_DIR)/msg     ./cmd/msg
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
-	 -o $(BIN_DIR)/msg-lsp ./cmd/msg-lsp
 	@# On macOS we pre-vendored and set the dylib id; binaries now reference @loader_path/../lib/<BASE>
 endif
 	@test -d lib      && cp -R lib      $(ROOT)/ || true

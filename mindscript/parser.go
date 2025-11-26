@@ -1191,15 +1191,15 @@ func (p *parser) parseOnePostfix(left NodeID, leftStartTok int) (NodeID, bool, e
 		// Parse argument list
 		args, _, closeTok, err := p.bracketed(
 			RROUND, "expected ')'",
-			func(pending annSrc) (NodeID, int, error) {
+			func(pending annSrc) (NodeID, error) {
 				a, err := p.expr(0)
 				if err != nil {
-					return 0, 0, err
+					return 0, err
 				}
 				if pending.ok {
 					a = p.attachAnnotFrom(pending, a)
 				}
-				return a, 0, nil
+				return a, nil
 			},
 			func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 		)
@@ -1265,7 +1265,7 @@ func (p *parser) parseOnePostfix(left NodeID, leftStartTok int) (NodeID, bool, e
 func (p *parser) bracketed(
 	close TokenType,
 	expectMsg string,
-	parseElem func(pendingPRE annSrc) (NodeID, int, error),
+	parseElem func(pendingPRE annSrc) (NodeID, error),
 	onCommaPost func(last NodeID, comma Token, txt string) NodeID,
 ) ([]NodeID, int, int, error) {
 	openTok := p.i - 1
@@ -1306,7 +1306,7 @@ func (p *parser) bracketed(
 		}
 
 		// Element with current pending PRE (caller applies it appropriately)
-		elem, _, err := parseElem(pending)
+		elem, err := parseElem(pending)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -1348,15 +1348,15 @@ func (p *parser) arrayLiteralAfterOpen() (NodeID, error) {
 	}
 	items, openTok, closeTok, err := p.bracketed(
 		RSQUARE, "expected ']'",
-		func(pending annSrc) (NodeID, int, error) {
+		func(pending annSrc) (NodeID, error) {
 			e, err := p.expr(0)
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 			if pending.ok {
 				e = p.attachAnnotFrom(pending, e)
 			}
-			return e, 0, nil
+			return e, nil
 		},
 		nil, // POST-after-comma attaches to element itself
 	)
@@ -1393,11 +1393,10 @@ func (p *parser) params() (NodeID, error) {
 
 	entries, _, closeTok, err := p.bracketed(
 		RROUND, "expected ')' after parameters",
-		func(pendingPRE annSrc) (NodeID, int, error) {
-			elemStartTok := p.i
+		func(pendingPRE annSrc) (NodeID, error) {
 			idTok, err := p.need(ID, "expected parameter name")
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 			idIdx := p.i - 1
 			nameLeaf := p.mkLeafIR("id", idIdx, tokText(idTok))
@@ -1406,11 +1405,11 @@ func (p *parser) params() (NodeID, error) {
 			if p.match(COLON) {
 				b, err := p.takeReqGap(p.prev(), "expected type after ':'")
 				if err != nil {
-					return 0, 0, err
+					return 0, err
 				}
 				tExpr, err := p.expr(0)
 				if err != nil {
-					return 0, 0, err
+					return 0, err
 				}
 				ann := mergeAnn(pendingPRE, b)
 				if ann.ok {
@@ -1422,10 +1421,8 @@ func (p *parser) params() (NodeID, error) {
 				val = p.attachAnnotFrom(pendingPRE, base)
 			}
 
-			// Pair span starts at pending PRE if present (span carried by parent array anyway).
-			_ = elemStartTok
 			pair := p.mkIR("pair", -1, -1, nameLeaf, val)
-			return pair, 0, nil
+			return pair, nil
 		},
 		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)
@@ -1443,27 +1440,27 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (NodeID, error) {
 
 	pairs, _, closeTok, err := p.bracketed(
 		RCURLY, "expected '}'",
-		func(pendingPRE annSrc) (NodeID, int, error) {
+		func(pendingPRE annSrc) (NodeID, error) {
 			elemStartTok := p.i // current token before reading key/annots
 			k, aKey, err := p.readKeyString()
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 
 			req := p.match(BANG)
 			colonTok, err := p.need(COLON, "expected ':' after key")
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 
 			// B = GAP after ':'; it cannot satisfy the value requirement.
 			b, err := p.takeReqGap(colonTok, "expected value after ':'")
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 			v, err := p.expr(0)
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 
 			val := v
@@ -1485,7 +1482,7 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (NodeID, error) {
 			if req {
 				tag = "pair!"
 			}
-			return p.mkIR(tag, pairStartTok, p.i-1, k, val), 0, nil
+			return p.mkIR(tag, pairStartTok, p.i-1, k, val), nil
 		},
 		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)
@@ -1782,10 +1779,10 @@ func (p *parser) arrayDeclPattern() (NodeID, error) {
 
 	parts, _, closeTok, err := p.bracketed(
 		RSQUARE, "expected ']' in array pattern",
-		func(pending annSrc) (NodeID, int, error) {
+		func(pending annSrc) (NodeID, error) {
 			pt, a, err := p.declPattern()
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 			// attach element's own PRE + interstitial PRE to the subpattern itself
 			if a.ok {
@@ -1794,7 +1791,7 @@ func (p *parser) arrayDeclPattern() (NodeID, error) {
 			if pending.ok {
 				pt = p.attachAnnotFrom(pending, pt)
 			}
-			return pt, 0, nil
+			return pt, nil
 		},
 		nil, // POST-after-comma attaches to the element itself
 	)
@@ -1813,24 +1810,24 @@ func (p *parser) objectDeclPattern() (NodeID, error) {
 
 	pairs, _, closeTok, err := p.bracketed(
 		RCURLY, "expected '}' in object pattern",
-		func(pendingPRE annSrc) (NodeID, int, error) {
+		func(pendingPRE annSrc) (NodeID, error) {
 			startTok := p.i
 			k, aKey, err := p.readKeyString()
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 
 			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 			// B = GAP after ':' (cannot satisfy requirement)
 			b, err := p.takeReqGap(p.toks[p.i-1], "expected pattern after ':'")
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 			pt, aSub, err := p.declPattern()
 			if err != nil {
-				return 0, 0, err
+				return 0, err
 			}
 
 			// subpattern-local PRE attaches to the pattern node itself
@@ -1841,7 +1838,7 @@ func (p *parser) objectDeclPattern() (NodeID, error) {
 			if ann.ok {
 				pt = p.attachAnnotFrom(ann, pt)
 			}
-			return p.mkIR("pair", startTok, p.i-1, k, pt), 0, nil
+			return p.mkIR("pair", startTok, p.i-1, k, pt), nil
 		},
 		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)

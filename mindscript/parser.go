@@ -126,12 +126,11 @@ func L(tag string, parts ...any) S { return append([]any{tag}, parts...) }
 type NodeID int
 
 type IRNode struct {
-	Tag         string
-	Kids        []NodeID
-	Value       any
-	TokStart    int  // inclusive token index, -1 if synthetic
-	TokEnd      int  // inclusive token index, -1 if synthetic
-	ZeroAtStart bool // if true, materializer emits zero-length span at TokStart (binding-site annot child)
+	Tag      string
+	Kids     []NodeID
+	Value    any
+	TokStart int // inclusive token index, -1 if synthetic
+	TokEnd   int // inclusive token index, -1 if synthetic
 }
 
 type IRArena struct {
@@ -169,15 +168,8 @@ func materializePostOrder(toks []Token, ir IRArena) (S, []Span) {
 		span := Span{}
 		if n.TokStart >= 0 && n.TokEnd >= n.TokStart &&
 			n.TokStart < len(toks) && n.TokEnd < len(toks) {
-			if n.ZeroAtStart {
-				// Synthetic binding-site annot child: zero-length at value start.
-				start := toks[n.TokStart].StartByte
-				span.StartByte = start
-				span.EndByte = start
-			} else {
-				span.StartByte = toks[n.TokStart].StartByte
-				span.EndByte = toks[n.TokEnd].EndByte
-			}
+			span.StartByte = toks[n.TokStart].StartByte
+			span.EndByte = toks[n.TokEnd].EndByte
 		}
 		spans = append(spans, span)
 		return node
@@ -275,11 +267,10 @@ type parser struct {
 
 // ─────────────────────── centralized annotation carrier ─────────────────────
 type annSrc struct {
-	txt            string
-	startTok       int // inclusive token index of the first contributing annotation token
-	endTok         int // inclusive token index of the last contributing annotation token
-	ok             bool
-	pinToBaseStart bool // when true, emit zero-length annot child pinned to base value start (binding sites)
+	txt      string
+	startTok int // inclusive token index of the first contributing annotation token
+	endTok   int // inclusive token index of the last contributing annotation token
+	ok       bool
 }
 
 func annNone() annSrc { return annSrc{} }
@@ -317,7 +308,6 @@ func mergeAnn(a, b annSrc) annSrc {
 	}
 	return annSrc{
 		txt: txt, startTok: start, endTok: end, ok: txt != "",
-		pinToBaseStart: a.pinToBaseStart || b.pinToBaseStart,
 	}
 }
 
@@ -360,22 +350,6 @@ func (p *parser) need(t TokenType, msg string) (Token, error) {
 	}
 	line, col := p.posAtByte(g.StartByte)
 	return Token{}, &Error{Kind: DiagParse, Msg: msg, Line: line, Col: col}
-}
-
-// joinNonEmpty concatenates non-empty parts with '\n' in order.
-func joinNonEmpty(parts ...string) string {
-	out := ""
-	for _, s := range parts {
-		if s == "" {
-			continue
-		}
-		if out == "" {
-			out = s
-		} else {
-			out += "\n" + s
-		}
-	}
-	return out
 }
 
 func (p *parser) posAtByte(b int) (int, int) {
@@ -714,69 +688,26 @@ func (p *parser) attachSameLineAnnots(n NodeID, refLine int) NodeID {
 }
 
 // IR-safe annotation attach: build ("annot", ("str", txt), base) in IR.
-//   - Normally, child "str" spans = [src.startTok, src.endTok] (fallback to base span).
-//   - For binding-site normalization, when src.pinToBaseStart==true, emit a synthetic
-//     zero-length child pinned at the base value's TokStart (ZeroAtStart=true).
+//   - child "str" spans = [src.startTok, src.endTok] (fallback to base span).
 //   - Wrapper inherits base span.
 func (p *parser) attachAnnotFrom(src annSrc, val NodeID) NodeID {
 	if !src.ok || src.txt == "" {
 		return val
 	}
 
-	base := val
-	have := ""
-	if b, h, ok := p.unwrapAnnotIR(val); ok {
-		base, have = b, h
+	bn := p.ir.Nodes[val]
+	startTok := src.startTok
+	endTok := src.endTok
+	if startTok < 0 {
+		startTok = bn.TokStart
 	}
-	bn := p.ir.Nodes[base]
-	txt := joinNonEmpty(src.txt, have)
-
-	var str NodeID
-	if src.pinToBaseStart {
-		// Synthetic zero-length at value start.
-		startTok := bn.TokStart
-		if startTok < 0 {
-			// Fallback: keep synthetic with no location.
-			str = p.mkLeafIR("str", -1, txt)
-		} else {
-			str = p.mkLeafIR("str", startTok, txt)
-			p.ir.Nodes[str].TokEnd = startTok
-			p.ir.Nodes[str].ZeroAtStart = true
-		}
-	} else {
-		// Normal case: use annotation tokens' combined range (fallback to base).
-		startTok := src.startTok
-		endTok := src.endTok
-		if startTok < 0 {
-			startTok = bn.TokStart
-		}
-		if endTok < 0 {
-			endTok = bn.TokEnd
-		}
-		str = p.mkLeafIR("str", startTok, txt)
-		p.ir.Nodes[str].TokEnd = endTok
+	if endTok < 0 {
+		endTok = bn.TokEnd
 	}
+	str := p.mkLeafIR("str", startTok, src.txt)
+	p.ir.Nodes[str].TokEnd = endTok
 
-	return p.mkIR("annot", bn.TokStart, bn.TokEnd, str, base)
-}
-
-// ───────────────────── centralized A+B+C+D normalization ─────────────────────
-// A: PRE from the "left" side (e.g., LHS annot, key annot, pending PRE)
-// B: annotations immediately after the binding site token (e.g., '=' or ':')
-// C: PRE already on the parsed right/value node
-// D: annotations immediately following the right/value node (same adjacency rule as parser)
-//
-// Central ABCD normalization for VALUE sites (assign RHS, params value, map value, etc.).
-// A and B are source-carrying; C (existing on right) is folded in; D is adjacent after right.
-// The resulting annotation child is *synthetic* and must be pinned as zero-length at the
-// start of the VALUE span.
-func (p *parser) normalizeABCD(a annSrc, b annSrc, right NodeID) NodeID {
-	baseRight, cTxt, _ := p.unwrapAnnotIR(right) // C
-	c := annSrc{txt: cTxt, startTok: -1, endTok: -1, ok: cTxt != ""}
-	d := p.collectAnnotsSrc() // D
-	merged := mergeAnn(mergeAnn(a, b), mergeAnn(c, d))
-	merged.pinToBaseStart = true // <<— request zero-length child at value start
-	return p.attachAnnotFrom(merged, baseRight)
+	return p.mkIR("annot", bn.TokStart, bn.TokEnd, str, val)
 }
 
 // ───────────────────────── program / blocks ────────────────────────────
@@ -904,7 +835,6 @@ func (p *parser) expr(minBP int) (NodeID, error) {
 	p.i++
 
 	var left NodeID
-	leftAnnA := annNone()
 	leftStartTok := tokIndexOfThis
 
 	// ---- prefix ----
@@ -1047,8 +977,10 @@ func (p *parser) expr(minBP int) (NodeID, error) {
 			if err != nil {
 				return 0, err
 			}
+			if a.ok {
+				pat = p.attachAnnotFrom(a, pat)
+			}
 			left = pat
-			leftAnnA = a
 			leftStartTok = tokIndexOfThis
 
 			// If destructuring, require an '=' (after any annotations).
@@ -1136,31 +1068,6 @@ func (p *parser) expr(minBP int) (NodeID, error) {
 			if err != nil {
 				return 0, err
 			}
-			endTok := p.lastSpanEndTok
-			if endTok < 0 {
-				endTok = tokIndexOfThis
-			}
-
-			// If operand is an assignment, fold PRE onto the RHS value
-			if p.isTag(operand, "assign") {
-				lhs := p.child(operand, 0)
-				rhs := p.child(operand, 1)
-				src.pinToBaseStart = true
-				rhs = p.attachAnnotFrom(src, rhs)
-				return p.mkIR("assign", -1, -1, lhs, rhs), nil
-			}
-
-			// If operand is a control form, PRE attaches to the control's VALUE
-			if p.isTag(operand, "return") || p.isTag(operand, "break") || p.isTag(operand, "continue") {
-				val := p.child(operand, 0)
-				val = p.attachAnnotFrom(src, val)
-				tag := p.ir.Nodes[operand].Tag
-				left = p.mkIR(tag, tokIndexOfThis, endTok, val)
-				leftStartTok = tokIndexOfThis
-				return left, nil
-			}
-
-			// Normal (non-assignment, non-control) case: wrap operand with PRE
 			left = p.attachAnnotFrom(src, operand)
 			return left, nil
 
@@ -1211,12 +1118,6 @@ func (p *parser) expr(minBP int) (NodeID, error) {
 			return 0, err
 		}
 
-		var b annSrc
-		if op.Type == ASSIGN {
-			// Use the immediate post-'=' gap as B.
-			b = preOp
-		}
-
 		rightParsed, err := p.expr(nextBP)
 		if err != nil {
 			return 0, err
@@ -1224,10 +1125,14 @@ func (p *parser) expr(minBP int) (NodeID, error) {
 		endTok := p.lastSpanEndTok
 
 		if op.Type == ASSIGN {
-			// A (from prior 'let' pattern if any) + B + (C on right) + D
-			normRight := p.normalizeABCD(leftAnnA, b, rightParsed)
-			left = p.mkIR("assign", leftStartTok, endTok, left, normRight)
-			leftAnnA = annNone()
+			right := rightParsed
+			if preOp.ok {
+				right = p.attachAnnotFrom(preOp, right)
+			}
+			if endTok >= 0 && endTok < len(p.toks) {
+				right = p.attachSameLineAnnots(right, p.toks[endTok].Line)
+			}
+			left = p.mkIR("assign", leftStartTok, endTok, left, right)
 		} else {
 			left = p.mkIRVal("binop", leftStartTok, endTok, op.Lexeme, left, rightParsed)
 		}
@@ -1507,7 +1412,11 @@ func (p *parser) params() (NodeID, error) {
 				if err != nil {
 					return 0, 0, err
 				}
-				val = p.normalizeABCD(pendingPRE, b, tExpr)
+				ann := mergeAnn(pendingPRE, b)
+				if ann.ok {
+					tExpr = p.attachAnnotFrom(ann, tExpr)
+				}
+				val = tExpr
 			} else {
 				base := p.mkLeafIR("id", -1, "Any")
 				val = p.attachAnnotFrom(pendingPRE, base)
@@ -1557,8 +1466,11 @@ func (p *parser) mapLiteralAfterOpen(openTok int) (NodeID, error) {
 				return 0, 0, err
 			}
 
-			// Value normalization (A + B + C + D)
-			val := p.normalizeABCD(mergeAnn(pendingPRE, aKey), b, v)
+			val := v
+			ann := mergeAnn(mergeAnn(pendingPRE, aKey), b)
+			if ann.ok {
+				val = p.attachAnnotFrom(ann, val)
+			}
 
 			// Pair span must start at the earliest PRE (pending or key PRE) if present.
 			pairStartTok := elemStartTok
@@ -1602,8 +1514,11 @@ func (p *parser) parseControl(t Token, startTok int) (NodeID, error) {
 
 	p.skipNoops()
 	// Same line but next token can't start a value → also Null.
+	// NOTE: An inline annotation after a control word (e.g. `return # note`)
+	// is treated as a trailing comment on the bare control, not as the start
+	// of a value expression on the next line.
 	switch p.peek().Type {
-	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY:
+	case END, ELSE, ELIF, THEN, RROUND, RSQUARE, RCURLY, ANNOTATION:
 		return p.mkIR(tag, startTok, startTok, p.mkLeafIR("null", -1)), nil
 	}
 
@@ -1617,37 +1532,6 @@ func (p *parser) parseControl(t Token, startTok int) (NodeID, error) {
 		x = p.attachAnnotFrom(tail, x)
 	}
 	return p.mkIR(tag, startTok, p.lastSpanEndTok, x), nil
-}
-
-// ────────────────────── Minimal annotation normalization helpers ─────────────
-//
-// Goal: annotations always attach to the VALUE. We normalize at construction
-// sites (ASSIGN, pairs in maps/types/params). Presentation (pre vs post) is a
-// pretty-printer concern.
-
-// unwrapAnnotIR collects stacked ("annot", ("str", s), base) wrappers:
-// - merges stacked texts with '\n' (no POST marker semantics);
-// - returns (baseID, mergedText, hadAnnot).
-func (p *parser) unwrapAnnotIR(id NodeID) (NodeID, string, bool) {
-	var parts []string
-	cur := id
-	for {
-		n := p.ir.Nodes[cur]
-		if n.Tag != "annot" || len(n.Kids) < 2 {
-			break
-		}
-		str := p.ir.Nodes[n.Kids[0]]
-		if str.Tag == "str" {
-			if s, _ := str.Value.(string); s != "" {
-				parts = append(parts, s)
-			}
-		}
-		cur = n.Kids[1]
-	}
-	if len(parts) == 0 {
-		return id, "", false
-	}
-	return cur, joinNonEmpty(parts...), true
 }
 
 func (p *parser) ifExpr() (NodeID, error) {
@@ -1953,9 +1837,11 @@ func (p *parser) objectDeclPattern() (NodeID, error) {
 			if aSub.ok {
 				pt = p.attachAnnotFrom(aSub, pt)
 			}
-			// Merge pending PRE + A(from key) + B + C + D onto VALUE (the subpattern)
-			val := p.normalizeABCD(mergeAnn(pendingPRE, aKey), b, pt)
-			return p.mkIR("pair", startTok, p.i-1, k, val), 0, nil
+			ann := mergeAnn(mergeAnn(pendingPRE, aKey), b)
+			if ann.ok {
+				pt = p.attachAnnotFrom(ann, pt)
+			}
+			return p.mkIR("pair", startTok, p.i-1, k, pt), 0, nil
 		},
 		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
 	)
@@ -2082,7 +1968,4 @@ func (p *parser) assignableIR(id NodeID) bool {
 // Small IR utilities
 func (p *parser) isTag(id NodeID, tag string) bool {
 	return p.ir.Nodes[id].Tag == tag
-}
-func (p *parser) child(id NodeID, i int) NodeID {
-	return p.ir.Nodes[id].Kids[i]
 }

@@ -64,44 +64,41 @@ func Test_Spans_DeclPatterns(t *testing.T) {
 // let
 // #p
 // [x, y] = v
-// After normalization: LHS is bare pattern; RHS value carries a zero-length annot pinned at value start.
+// Under the new annotation model, #p decorates the pattern [x, y] itself.
 func Test_Spans_PatternPreAnnotation(t *testing.T) {
 	src := "let\n#p\n[x, y] = v"
-	_, idx := mustParseWithSpansMS(t, src)
+	ast, idx := mustParseWithSpansMS(t, src)
 
-	// LHS of the assign is just the pattern (no annot wrapper).
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "[x, y]")
+	// Root is ("block", <assign>).
+	assign := ast[1].(S)
+	if tag := assign[0].(string); tag != "assign" {
+		t.Fatalf("root expr tag = %q, want %q", tag, "assign")
+	}
 
-	// Inner decls "x" and "y".
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "x")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "y")
+	// LHS is an annot wrapping the pattern [x, y].
+	lhs := assign[1].(S)
+	if tag := lhs[0].(string); tag != "annot" {
+		t.Fatalf("lhs tag = %q, want %q", tag, "annot")
+	}
+
+	// Annotation string spans the source "#p".
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "#p")
+
+	// The wrapped pattern and its inner decls retain their spans.
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "[x, y]")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "x")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "y")
 
 	// RHS value node spans the value itself.
 	assertSpanTextMS(t, idx, NodePath{0, 1}, src, "v")
-
-	// Annot child is a synthetic zero-length span at the start of the value.
-	as, ok := idx.Get(NodePath{0, 1, 0}) // annot "str"
-	if !ok {
-		t.Fatal("missing annot span")
-	}
-	vs, ok := idx.Get(NodePath{0, 1, 1}) // value leaf "v"
-	if !ok {
-		t.Fatal("missing value span")
-	}
-	if as.StartByte != vs.StartByte || as.EndByte != as.StartByte {
-		t.Fatalf("want zero-length annot at value start, got annot=%+v value=%+v", as, vs)
-	}
-
-	// Wrapped value leaf (under annot) is still "v".
-	assertSpanTextMS(t, idx, NodePath{0, 1, 1}, src, "v")
 }
 
 // {
 // #A
 // k: 1
 // }
-// After normalization: key is bare "k"; value carries a zero-length annot pinned at value start.
-// The pair's span starts at the pre-annotation.
+// After the new annotation model: key is bare "k"; value expression is "1",
+// wrapped by an annot whose string span covers "#A".
 func Test_Spans_KeyPreAnnotation(t *testing.T) {
 	src := "{\n#A\nk: 1\n}"
 	_, idx := mustParseWithSpansMS(t, src)
@@ -115,24 +112,11 @@ func Test_Spans_KeyPreAnnotation(t *testing.T) {
 	// Key is just "k" (no annot wrapper on the key).
 	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "k")
 
-	// Value node span is the literal.
+	// Value expression span is the literal; annotation wraps it.
 	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "1")
 
-	// Annot child is a synthetic zero-length span at the start of the value.
-	as, ok := idx.Get(NodePath{0, 0, 1, 0}) // annot "str"
-	if !ok {
-		t.Fatal("missing annot span")
-	}
-	vs, ok := idx.Get(NodePath{0, 0, 1, 1}) // value leaf "1"
-	if !ok {
-		t.Fatal("missing value span")
-	}
-	if as.StartByte != vs.StartByte || as.EndByte != as.StartByte {
-		t.Fatalf("want zero-length annot at value start, got annot=%+v value=%+v", as, vs)
-	}
-
-	// Wrapped value leaf (under annot) is still "1".
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "1")
+	// The inner annot string now spans the source "#A".
+	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "#A")
 }
 
 func Test_Spans_Module_Whole_And_Parts(t *testing.T) {
@@ -176,36 +160,4 @@ func Test_Spans_PropertyAfterDot_ModuleKeyword(t *testing.T) {
 	assertSpanTextMS(t, idx, NodePath{0, 0}, src, `obj`)
 	//   property name ("str") — taken from the ID token after '.'
 	assertSpanTextMS(t, idx, NodePath{0, 1}, src, `module`)
-}
-
-func Test_Spans_Assign_AB_AnchorsToB(t *testing.T) {
-	// A before target, B after '=', then value
-	src := "#A\nlet x =\n#B\n42"
-	ast, idx := mustParseWithSpansMS(t, src)
-
-	// Span of the annot child is zero-length at the value start → empty slice.
-	assertSpanTextMS(t, idx, NodePath{0, 1, 0}, src, "")
-
-	// But the annot node's own text must remain (A then B).
-	// AST path: ("block" <0>, ("assign" <1>, ("decl" "x") <1>, ("annot" <2>, ("str" TEXT) <1>, ("int" 42) <2>)))
-	annotStr := ast[1].(S)[2].(S)[1].(S) // block→assign→rhs(annot)→child0(str)
-	if got := annotStr[1].(string); got != "A\nB" {
-		t.Fatalf("annot text mismatch: got %q want %q", got, "A\nB")
-	}
-}
-
-func Test_Spans_MapValue_BD_AnchorsToD(t *testing.T) {
-	// Map with B after colon, D after value (same-line ok)
-	src := "{ k: \n#B\n1 #D\n }"
-	ast, idx := mustParseWithSpansMS(t, src)
-
-	// Span of the annot child is zero-length at the value start → empty slice.
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "")
-
-	// But the annot node's own text must remain (B then D).
-	// AST path: ("block" <0>, ("map" <1>, ("pair" <1>, ("str" "k") <1>, ("annot" <2>, ("str" TEXT) <1>, ("int" 1) <2>))))
-	annotStr := ast[1].(S)[1].(S)[2].(S)[1].(S) // block→map→pair→value(annot)→child0(str)
-	if got := annotStr[1].(string); got != "B\nD" {
-		t.Fatalf("annot text mismatch: got %q want %q", got, "B\nD")
-	}
 }

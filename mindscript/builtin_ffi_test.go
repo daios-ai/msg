@@ -1632,10 +1632,14 @@ func Test_Builtin_FFI_Aggregate_HandleSemantics_Matrix(t *testing.T) {
 				do
 				  let src = C.__mem.box("Inner", { x:7, y:11 })
 				  let out = C.__mem.box("Outer", { a:0 })   # 'inner' zeroed
+				  
 				  # getf(inner) must return a handle → return its formatted string
+
 				  let gotH = C.__mem.getf("Outer", out, "inner")
 				  let gotFmt = formatValue(gotH)
+				 
 				  # setf(inner, handle) must copy bytes
+				 
 				  C.__mem.setf("Outer", out, "inner", src)
 				  let after = C.__mem.getf("Outer", out, "inner")
 				  let n = C.__mem.sizeof("Inner")

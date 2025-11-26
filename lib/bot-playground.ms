@@ -14,49 +14,35 @@ let arr = [
 	17 # the age
 ]
 
+# a function
+let  f  =  fun(
+	name:  Str,  # the name
+	age:  Int  # the age
+)  do
+	name
+	age
+	return  null
+end
+
 obj.name
 obj."name"
 obj["name"]
 arr[0]
-arr.0
+arr.1
 
 # -----------------------------
 # Public data types
 # -----------------------------
 
 let Role = type Enum["user", "assistant"]
-
 let Message = type {role!: Role, text!: Str}
-
 let ChatState = type {summary: Str?, turns!: [Message]}
 
 # Add optional system background (e.g., a manual) to config.
 let ChatConfig = type {maxTurns!: Int, system: Str?}
 
-
-
-# -----------------------------
-# Oracles
-# -----------------------------
-
-# Core responder.
-# Be helpful and concise.
-# Respect: system (background/manual) + summary + turns.
-# No external facts.
-let respond = oracle(summary: Str?, context: [Message], user: Str, system: Str?) -> {
-	reply!: Str
-}
-
-# Summarize overflowed history (≤ 120 words; preserve intent/decisions).
-let summarize = oracle(older: [Message], prior: Str?) -> {gist!: Str}
-
-# -----------------------------
-# Helpers
-# -----------------------------
-
-let _push = fun(ts: [Message], r: Role, t: Str) -> [Message] do
-	ts + [{role: r, text: t}]
-end
+# Summarize the text.
+let summarize = oracle(past: [Str], present: Str) -> Str
 
 let _trimIfNeeded = fun(state: ChatState, cfg: ChatConfig) -> ChatState do
 	if len(state.turns) <= cfg.maxTurns then
@@ -75,6 +61,21 @@ let _trimIfNeeded = fun(state: ChatState, cfg: ChatConfig) -> ChatState do
 	end
 end
 
+
+
+# -----------------------------
+# Oracles
+# -----------------------------
+
+# Core responder.
+# Be helpful and concise.
+# Respect: system (background/manual) + summary + turns.
+# No external facts.
+let respond = oracle(summary: Str?, context: [Message], user: Str, system: Str?) -> {
+	reply!: Str
+}
+
+
 # -----------------------------
 # Single-turn interaction
 # -----------------------------
@@ -84,17 +85,17 @@ let step = fun(state: ChatState, cfg: ChatConfig, userMsg: Str) -> {
 	state!: ChatState
 } do
 	let s0 = _trimIfNeeded(state, cfg)
-	let ctx = _push(s0.turns, "user", userMsg)
+	let ctx = push(s0.turns, userMsg)
 
 	let r = respond(s0.summary, ctx, userMsg, cfg.system)
 	if r == null then
 		let fb = "Sorry—I'm having trouble right now. Could you rephrase?"
-		let turns2 = _push(ctx, "assistant", fb)
+		let turns2 = push(ctx, fb)
 		return {state: {summary: s0.summary, turns: turns2}, reply: fb}
 	end
 
 	let reply = r.reply
-	let turns2 = _push(ctx, "assistant", reply)
+	let turns2 = push(ctx, reply)
 	{
 		state: {summary: s0.summary, turns: turns2},
 		reply: reply
@@ -128,7 +129,6 @@ let bot = fun(cfg: ChatConfig?) -> Str -> Str do
 	end
 end
 
-# botWithSystem(system, cfg?) -> (userMsg: Str) -> Str
 # Convenience: supply a manual/background string while keeping other defaults.
 let botWithSystem = fun(system: Str, cfg: ChatConfig?) -> Str -> Str do
 	let base = if cfg == null then

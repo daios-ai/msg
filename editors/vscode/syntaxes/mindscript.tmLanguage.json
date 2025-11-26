@@ -31,14 +31,14 @@
     "keywords": {
       "patterns": [
         { "name": "keyword.control.mindscript", "match": "\\b(if|then|elif|else|for|while|do|end|return|break|continue|from|in)\\b" },
-        { "name": "keyword.declaration.mindscript", "match": "\\b(let|fun|oracle|type|enum)\\b" },
+        { "name": "keyword.declaration.mindscript", "match": "\\b(let|fun|oracle|type)\\b" },
         { "name": "keyword.operator.word.mindscript", "match": "\\b(and|or|not)\\b" },
-        { "name": "keyword.operator.symbol.mindscript", "match": "(==|!=|<=|>=|->|[+\\-*/%<>=!?.,:\\[\\]\\(\\){}])" }
+        { "name": "keyword.operator.symbol.mindscript", "match": "(==|!=|<=|>=|&|~|->|[|+\\-*/%<>=!?.,:\\[\\]\\(\\){}])" }
       ]
     },
     "types": {
       "patterns": [
-        { "name": "support.type.primitive.mindscript", "match": "\\b(Any|Null|Bool|Int|Num|Str|Type)\\b" }
+        { "name": "support.type.primitive.mindscript", "match": "\\b(Any|Null|Bool|Int|Num|Str|Type|Enum)\\b" }
       ]
     },
     "identifiers": {

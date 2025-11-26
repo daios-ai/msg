@@ -147,6 +147,19 @@ func docFromTypeAst(t mindscript.S) string {
 	return ""
 }
 
+// stripOuterTypeAnnot removes a single outer ("annot", ["str", ...], inner) from a type AST,
+// returning the inner type. If there is no such wrapper, it returns t unchanged.
+func stripOuterTypeAnnot(t mindscript.S) mindscript.S {
+	if len(t) >= 3 {
+		if tag, _ := t[0].(string); tag == "annot" {
+			if inner, ok := t[2].(mindscript.S); ok {
+				return inner
+			}
+		}
+	}
+	return t
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Initialization.
 ////////////////////////////////////////////////////////////////////////////////
@@ -343,11 +356,13 @@ func formatHoverMarkdown(te *TokenEntry) string {
 	case mindscript.VTSymbol:
 		// Symbols: print the declared type WITHOUT resolving; provide the defining env via payload only.
 		if sym, ok := asSymbol(te.Payload); ok {
-			// If payload had no doc, fall back to the outer annot on the declared type.
+			// Prefer payload doc (set by the analyzer at binding sites). If missing, fall back to the type's outer annot.
 			if doc == "" {
 				doc = docFromTypeAst(sym.Type)
 			}
-			typ := mindscript.FormatType(sym.Type)
+			// Render the type WITHOUT its outer annot, so the doc is shown as a separate paragraph.
+			typAst := stripOuterTypeAnnot(sym.Type)
+			typ := mindscript.FormatType(typAst)
 			if typ == "" {
 				typ = "Any"
 			}

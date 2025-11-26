@@ -1,6 +1,7 @@
 // cmd/msg-lsp/analysis_engine.go
 //
 // MindScript Static Analyzer — engine (private implementation)
+//
 // ------------------------------------------------------------
 // This file contains the private folding engine and helpers used by
 // Analyzer.Analyze(). It depends ONLY on data structures and helpers
@@ -29,6 +30,117 @@ type foldCtx struct {
 
 	topLevel bool
 	path     mindscript.NodePath
+}
+
+// ---------------------------------------------------------------------------
+// Centralized resolvers/stampers (single source of truth)
+// ---------------------------------------------------------------------------
+
+// resolveName resolves an identifier to a payload (VTType or VTSymbol) and its type.
+// It also lazily seeds ambient runtime values into the current env as VTSymbols,
+// so subsequent lookups hit a uniform representation without re-conversion.
+func resolveName(ip *mindscript.Interpreter, env *mindscript.Env, name string) (payload mindscript.Value, typ mindscript.S, isType bool, ok bool) {
+	v, err := env.Get(name)
+	if err != nil {
+		return mindscript.Value{}, nil, false, false
+	}
+	// Keep VTType values as-is (preserves alias docs).
+	if v.Tag == mindscript.VTType {
+		if tv, _ := v.Data.(*mindscript.TypeValue); tv != nil {
+			return v, tv.Ast, true, true
+		}
+		return v, mindscript.S{"id", "Type"}, true, true
+	}
+	// Keep VTSymbol as-is (locals/ambient already promoted).
+	if sym, ok := asSymbol(v); ok {
+		return v, sym.Type, false, true
+	}
+	// Ambient runtime value: convert once to a VTSymbol (preserve v.Annot) and seed it.
+	var t mindscript.S
+	if ip != nil {
+		t = ip.ValueToType(v, env)
+	} else {
+		t = mindscript.S{"id", "Any"}
+	}
+	s := newSymbolValIn(env, t, strings.TrimSpace(v.Annot))
+	// Seed into the *current* env to avoid repeated conversions and to unify def–use.
+	// Define is safe here because lookups reached the parent; this creates a child binding shadow.
+	env.Define(name, s)
+	return s, t, false, true
+}
+
+type fieldInfo struct {
+	Type     mindscript.S
+	Required bool
+	Doc      string
+	Found    bool
+}
+
+// resolveField extracts field info from RAW and RESOLVED receiver types.
+func resolveField(ip *mindscript.Interpreter, env *mindscript.Env, recvTRaw, recvT mindscript.S, key string) fieldInfo {
+	var doc string
+	// Normalize helper: peel ("alias", *TypeValue) and outer ("annot", ..., inner)
+	unwrap := func(t mindscript.S) mindscript.S {
+		for {
+			if len(t) == 0 {
+				return t
+			}
+			switch tag := t[0].(string); tag {
+			case "alias":
+				if len(t) >= 2 {
+					if tv, _ := t[1].(*mindscript.TypeValue); tv != nil {
+						t = tv.Ast
+						continue
+					}
+				}
+				return t
+			case "annot":
+				if len(t) >= 3 {
+					if inner, ok := t[2].(mindscript.S); ok {
+						t = inner
+						continue
+					}
+				}
+				return t
+			default:
+				return t
+			}
+		}
+	}
+	get := func(t mindscript.S) (ft mindscript.S, req bool, ok bool) {
+		t = unwrap(t)
+		if len(t) == 0 || t[0] != "map" {
+			return nil, false, false
+		}
+		for i := 1; i < len(t); i++ {
+			p, _ := t[i].(mindscript.S)
+			if len(p) < 3 {
+				continue
+			}
+			ptag, _ := p[0].(string)
+			if ptag != "pair" && ptag != "pair!" {
+				continue
+			}
+			k, _ := p[1].(mindscript.S)
+			if len(k) >= 2 && k[0] == "str" {
+				if s, _ := k[1].(string); s == key {
+					ft, _ := p[2].(mindscript.S)
+					if ft == nil {
+						ft = mindscript.S{"id", "Any"}
+					}
+					return ft, ptag == "pair!", true
+				}
+			}
+		}
+		return nil, false, false
+	}
+	if ftRaw, _, ok := get(recvTRaw); ok {
+		doc = outerDocFromType(ftRaw)
+	}
+	if ftRes, req, ok := get(recvT); ok {
+		return fieldInfo{Type: ftRes, Required: req, Doc: doc, Found: true}
+	}
+	return fieldInfo{Doc: doc}
 }
 
 type blockMode int
@@ -226,6 +338,108 @@ func (c *foldCtx) diagAt(slot int, code, msg string) {
 	c.diagBytes(s, e, code, msg)
 }
 
+// stampTypeID stamps a type identifier leaf, reusing stored VTType when present.
+func (c *foldCtx) stampTypeID(name string, p mindscript.NodePath, typeAst mindscript.S) {
+	if sp, ok := c.idx.Spans.Get(p); ok {
+		if payload, _, isType, ok := resolveName(c.ip, c.env, name); ok && isType && payload.Tag == mindscript.VTType {
+			c.idx.emitIdentAtStart(sp.StartByte, name, false, payload)
+			return
+		}
+		c.idx.emitIdentAtStart(sp.StartByte, name, false, mindscript.TypeValIn(typeAst, c.env))
+	}
+}
+
+// ---- Type AST stamping ------------------------------------------------------
+// stampTypeIDs walks a *type* AST 't' whose root lives at node-path 'p' and
+// stamps every ("id", name) leaf with a VTType payload so hover shows
+//
+//	name: Type (type <structure>)
+//
+// rather than a generic "symbol".
+func (c *foldCtx) stampTypeIDs(t mindscript.S, p mindscript.NodePath) {
+	if len(t) == 0 {
+		return
+	}
+	tag, _ := t[0].(string)
+	switch tag {
+	case "id":
+		if len(t) >= 2 {
+			if name, ok := t[1].(string); ok && name != "" {
+				c.stampTypeID(name, p, t)
+				return
+			}
+		}
+	case "annot":
+		// ("annot", ["str", ...], inner)
+		if inner, ok := t[2].(mindscript.S); ok {
+			c.stampTypeIDs(inner, appendPath(p, 1))
+		}
+	case "unop":
+		// ("unop", "?", T)
+		if len(t) >= 3 {
+			if inner, ok := t[2].(mindscript.S); ok {
+				c.stampTypeIDs(inner, appendPath(p, 1))
+			}
+		}
+	case "array":
+		// ("array", T)
+		if len(t) >= 2 {
+			if et, ok := t[1].(mindscript.S); ok {
+				c.stampTypeIDs(et, appendPath(p, 0))
+			}
+		}
+	case "map":
+		// ("map", ("pair"| "pair!", ("str", key), T) ...)
+		for i := 1; i < len(t); i++ {
+			pair, ok := t[i].(mindscript.S)
+			if !ok || len(pair) < 3 {
+				continue
+			}
+			ptag, _ := pair[0].(string)
+			// Stamp value type identifiers inside the field type T.
+			if vt, ok := pair[2].(mindscript.S); ok {
+				c.stampTypeIDs(vt, appendPath(p, i-1))
+			}
+			// Also stamp the field *key* token inside the type map so hovers show "key: T".
+			keyNode, _ := pair[1].(mindscript.S)
+			if len(keyNode) >= 2 && keyNode[0] == "str" {
+				if key, _ := keyNode[1].(string); key != "" {
+					// Use the field type (possibly annotated) for the symbol payload; prefer its outer doc.
+					ft := mindscript.S(nil)
+					if vt, ok := pair[2].(mindscript.S); ok {
+						ft = vt
+					}
+					if ft == nil {
+						ft = mindscript.S{"id", "Any"}
+					}
+					doc := outerDocFromType(ft)
+					label := key
+					if ptag == "pair!" {
+						label = key + "!"
+					}
+					kPath := appendPath(appendPath(p, i-1), 0) // path to ["str", key]
+					if sp, ok := c.idx.Spans.Get(kPath); ok {
+						c.idx.emitIdentAtStart(sp.StartByte, label, false, newSymbolValIn(c.env, ft, doc))
+					}
+				}
+			}
+		}
+		// skip other tags
+	case "binop":
+		// ("binop","->", A, B)
+		if len(t) >= 4 && t[1] == "->" {
+			if a, ok := t[2].(mindscript.S); ok {
+				c.stampTypeIDs(a, appendPath(p, 1))
+			}
+			if b, ok := t[3].(mindscript.S); ok {
+				c.stampTypeIDs(b, appendPath(p, 2))
+			}
+		}
+	case "enum":
+		// literals only; nothing to stamp
+	}
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Per-tag handlers
 ////////////////////////////////////////////////////////////////////////////////
@@ -332,27 +546,19 @@ func (c *foldCtx) foldId(n mindscript.S) flow {
 		return c.newFlow(nil)
 	}
 
-	v, err := c.env.Get(name)
-	if err != nil {
+	payload, typ, _, ok := resolveName(c.ip, c.env, name)
+	if !ok {
 		c.stampIdent(0, name, false, mindscript.Value{})
 		c.diagAt(0, "MS-UNKNOWN-NAME", "unknown name: "+name)
 		return c.newFlowFromType(mindscript.S{"id", "Any"})
 	}
-
-	if _, ok := asSymbol(v); ok {
-		c.stampIdent(0, name, false, v)
-		return flow{Val: v}
+	// Stamp the resolved payload (VTType or VTSymbol) for proper hover.
+	c.stampIdent(0, name, false, payload)
+	// Return the same payload as the value so downstream sees the exact type.
+	if typ == nil {
+		typ = mindscript.S{"id", "Any"}
 	}
-	if v.Tag == mindscript.VTType {
-		c.stampIdent(0, name, false, v)
-		return flow{Val: v}
-	}
-	if c.ip != nil {
-		c.stampIdent(0, name, false, mindscript.Value{})
-		return c.newFlowFromType(c.ip.ValueToType(v, c.env))
-	}
-	c.stampIdent(0, name, false, mindscript.Value{})
-	return c.newFlowFromType(mindscript.S{"id", "Any"})
+	return flow{Val: payload}
 }
 
 func (c *foldCtx) foldArray(n mindscript.S) flow {
@@ -423,6 +629,8 @@ func (c *foldCtx) foldMap(n mindscript.S) flow {
 		if strings.TrimSpace(doc) != "" {
 			valTypeWithDoc = mindscript.S{"annot", mindscript.S{"str", doc}, valType}
 		}
+		// Stamp the map-literal key token so hovering the key at the declaration site shows field type + doc.
+		c.childCtx(i).stampIdent(1, key, false, newSymbolValIn(c.env, valType, doc))
 		out = append(out, mindscript.S{"pair!", mindscript.S{"str", key}, valTypeWithDoc})
 	}
 	return c.newFlowFromType(out)
@@ -483,12 +691,13 @@ func (c *foldCtx) foldGet(n mindscript.S) flow {
 	keyNode, _ := n[2].(mindscript.S)
 
 	recvFlow := c.childCtx(1).fold(recvNode)
-	recvT := typeOf(c.ip, c.env, recvFlow.Val)
-	if recvT == nil {
-		recvT = mindscript.S{"id", "Any"}
+	recvTRaw := typeOf(c.ip, c.env, recvFlow.Val)
+	if recvTRaw == nil {
+		recvTRaw = mindscript.S{"id", "Any"}
 	}
+	recvT := recvTRaw
 	if c.ip != nil {
-		recvT = c.ip.ResolveType(recvT, c.env)
+		recvT = c.ip.ResolveType(recvTRaw, c.env)
 	}
 
 	if len(keyNode) < 2 || keyNode[0].(string) != "str" {
@@ -496,17 +705,19 @@ func (c *foldCtx) foldGet(n mindscript.S) flow {
 	}
 	key, _ := keyNode[1].(string)
 
-	{
-		var payload mindscript.Value
-		if ft, ok := mapFieldType(recvT, key); ok {
-			// Keep full (possibly annotated) field type; extract doc only for payload.Annot.
-			payload = newSymbolValIn(c.env, ft, outerDocFromType(ft))
-		}
-		c.stampIdent(2, key, false, payload)
+	fi := resolveField(c.ip, c.env, recvTRaw, recvT, key)
+	label := key
+	if fi.Required {
+		label = key + "!"
 	}
 
-	if ft, ok := mapFieldType(recvT, key); ok {
-		return c.newFlowFromType(ft)
+	// Stamp only when the field is known; do not fabricate payloads on misses.
+	if fi.Found {
+		c.childCtx(2).stampIdent(0, label, false, newSymbolValIn(c.env, fi.Type, fi.Doc))
+	}
+
+	if fi.Found {
+		return c.newFlowFromType(fi.Type)
 	}
 
 	if len(recvT) > 0 {
@@ -527,10 +738,12 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 	recvFlow := c.childCtx(1).fold(recvNode)
 	idxFlow := c.childCtx(2).fold(idxNode)
 
-	recvT := typeOf(c.ip, c.env, recvFlow.Val)
-	if recvT == nil {
-		recvT = mindscript.S{"id", "Any"}
+	// Keep RAW and RESOLVED receiver types (docs may live only on RAW).
+	recvTRaw := typeOf(c.ip, c.env, recvFlow.Val)
+	if recvTRaw == nil {
+		recvTRaw = mindscript.S{"id", "Any"}
 	}
+	recvT := recvTRaw
 	idxT := typeOf(c.ip, c.env, idxFlow.Val)
 	if idxT == nil {
 		idxT = mindscript.S{"id", "Any"}
@@ -538,7 +751,7 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 
 	ip := c.ip
 	if ip != nil {
-		recvT = ip.ResolveType(recvT, c.env)
+		recvT = ip.ResolveType(recvTRaw, c.env)
 		idxT = ip.ResolveType(idxT, c.env)
 	}
 
@@ -561,7 +774,6 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 		if len(idxNode) >= 2 && idxNode[0].(string) == "int" {
 			if v, ok := idxNode[1].(int64); ok {
 				name := fmt.Sprintf("%d", v)
-				// If element type carries an outer annot, prefer it for the payload doc.
 				doc := outerDocFromType(elemT)
 				c.stampIdent(2, name, false, newSymbolValIn(c.env, elemT, doc))
 			}
@@ -574,17 +786,16 @@ func (c *foldCtx) foldIdx(n mindscript.S) flow {
 		if tag, _ := recvT[0].(string); tag == "map" {
 			if len(idxNode) >= 2 && idxNode[0].(string) == "str" {
 				key, _ := idxNode[1].(string)
-				{
-					var payload mindscript.Value
-					if ft, ok := mapFieldType(recvT, key); ok {
-						// Preserve full annotated field type; doc from outer annot for hover.
-						payload = newSymbolValIn(c.env, ft, outerDocFromType(ft))
-					}
-					c.stampIdent(2, key, false, payload)
+				fi := resolveField(c.ip, c.env, recvTRaw, recvT, key)
+				label := key
+				if fi.Required {
+					label = key + "!"
 				}
-				if ft, ok := mapFieldType(recvT, key); ok {
-					return c.newFlowFromType(ft)
+				if fi.Found {
+					c.childCtx(2).stampIdent(0, label, false, newSymbolValIn(c.env, fi.Type, fi.Doc))
+					return c.newFlowFromType(fi.Type)
 				}
+				// Unknown key: diagnose but do not stamp a payload.
 				c.diagAt(2, "MS-MAP-MISSING-KEY", "missing key '"+key+"' on map/module")
 				return c.newFlowFromType(mindscript.S{"id", "Any"})
 			}
@@ -692,6 +903,15 @@ func (c *foldCtx) foldBinop(n mindscript.S) flow {
 
 	switch op {
 	case "-", "*", "%", "/", "**":
+		// Nullable-operand hint (conservative, single-pass).
+		isNullable := func(t mindscript.S) bool {
+			return len(t) >= 3 && t[0] == "unop" && t[1] == "?"
+		}
+		if isNullable(lt) || isNullable(rt) {
+			// Anchor on RHS by convention (mirrors other binop diags).
+			c.diagAt(3, "MS-MAYBE-NULL-UNSAFE", "nullable value used in numeric operator")
+		}
+		// Numeric typing: Int ⊖ Int → Int; any Num involvement → Num; else mismatch.
 		if isId(lt, "Int") && isId(rt, "Int") {
 			return c.newFlowFromType(mindscript.S{"id", "Int"})
 		}
@@ -700,6 +920,7 @@ func (c *foldCtx) foldBinop(n mindscript.S) flow {
 			(isId(lt, "Num") && isId(rt, "Num")) {
 			return c.newFlowFromType(mindscript.S{"id", "Num"})
 		}
+		c.diagAt(3, "MS-ARG-TYPE-MISMATCH", "argument type mismatch")
 		return c.newFlowFromType(mindscript.S{"id", "Any"})
 	case "+":
 		// strings
@@ -731,13 +952,6 @@ func (c *foldCtx) foldBinop(n mindscript.S) flow {
 		// otherwise: type mismatch — anchor to RHS expression (slot 3)
 		c.diagAt(3, "MS-ARG-TYPE-MISMATCH", "argument type mismatch")
 		return c.newFlowFromType(mindscript.S{"id", "Any"})
-	case "&", "|", "^", "<<", ">>":
-		if !(isId(lt, "Int") && isId(rt, "Int")) {
-			// anchor to RHS expression (slot 3)
-			c.diagAt(3, "MS-BITWISE-NONINT", "bitwise operators require Int operands")
-			return c.newFlowFromType(mindscript.S{"id", "Any"})
-		}
-		return c.newFlowFromType(mindscript.S{"id", "Int"})
 	}
 	return c.newFlowFromType(mindscript.S{"id", "Any"})
 }
@@ -768,6 +982,8 @@ func (c *foldCtx) foldTypeExpr(n mindscript.S) flow {
 		return c.newFlowFromType(mindscript.S{"id", "Type"})
 	}
 	typeAst, _ := n[1].(mindscript.S)
+	// Stamp identifiers and map-field keys inside this type AST for hover.
+	c.stampTypeIDs(typeAst, appendPath(c.path, 0))
 	tv := mindscript.TypeValIn(typeAst, c.env)
 	return flow{Val: tv}
 }
@@ -1047,22 +1263,30 @@ func (c *foldCtx) foldAssign(n mindscript.S) flow {
 					isRHSLiteralMap := len(rhsNode) > 0 && rhsNode[0] == "map"
 					if isRHSLiteralMap {
 						for j := 1; j < len(rhsNode); j++ {
-							if rp, ok := rhsNode[j].(mindscript.S); ok && len(rp) >= 3 && rp[0] == "pair" {
-								if rk, ok := rp[1].(mindscript.S); ok && len(rk) >= 2 && rk[0] == "str" {
-									if k, _ := rk[1].(string); k == key {
-										if rv, ok := rp[2].(mindscript.S); ok {
-											subRHS = rv
-											cc := c.childCtx(2)
-											// element j is at (assign slot 2) -> (map element j-1)
-											cc.path = appendPath(cc.path, j-1)
-											sf := cc.fold(subRHS)
-											if tv := typeOf(c.ip, cc.env, sf.Val); tv != nil {
-												ft = tv
-											}
-											if d := preferDoc(sf.Val, ft); d != "" {
-												docForField = d
-											}
-										}
+							rp, ok := rhsNode[j].(mindscript.S)
+							if !ok || len(rp) < 3 {
+								continue
+							}
+							ptag, _ := rp[0].(string)
+							if ptag != "pair" && ptag != "pair!" {
+								continue
+							}
+							rk, _ := rp[1].(mindscript.S)
+							if len(rk) < 2 || rk[0].(string) != "str" {
+								continue
+							}
+							if k, _ := rk[1].(string); k == key {
+								if rv, ok := rp[2].(mindscript.S); ok {
+									subRHS = rv
+									cc := c.childCtx(2)
+									// element j is at (assign slot 2) -> (map element j-1)
+									cc.path = appendPath(cc.path, j-1)
+									sf := cc.fold(subRHS)
+									if tv := typeOf(c.ip, cc.env, sf.Val); tv != nil {
+										ft = tv
+									}
+									if d := preferDoc(sf.Val, ft); d != "" {
+										docForField = d
 									}
 								}
 							}
@@ -1488,12 +1712,33 @@ func (c *foldCtx) foldFunLike(n mindscript.S) flow {
 		}
 	}
 
+	// Stamp type identifiers inside parameter type ASTs for hover.
+	if len(paramTypes) > 0 {
+		for i := range paramTypes {
+			// paramsPath -> element i -> slot 1 is the type AST
+			tp := appendPath(appendPath(paramsPath, i), 1)
+			c.stampTypeIDs(paramTypes[i], tp)
+		}
+	}
+
 	retT := mindscript.S{"id", "Any"}
 	if rt, ok := n[2].(mindscript.S); ok {
 		retT = rt
 	}
 
+	// Apply oracle nullability quirk:
 	effRet := retT
+	if isOracle {
+		isNullable := len(retT) >= 3 && retT[0] == "unop" && retT[1] == "?"
+		isAny := len(retT) >= 2 && retT[0] == "id" && retT[1] == "Any"
+		if !isNullable && !isAny {
+			effRet = mindscript.S{"unop", "?", retT}
+		}
+	}
+
+	// Stamp type identifiers inside return type AST for hover.
+	rtPath := appendPath(c.path, 1)
+	c.stampTypeIDs(retT, rtPath)
 
 	funType := effRet
 	if len(paramTypes) == 0 {

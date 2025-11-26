@@ -36,7 +36,7 @@
 // SCOPE OF THIS FILE
 // ------------------
 // • Public (top): slim shims, stable types, and entrypoints required elsewhere.
-// • Private (bottom): helpers, internal logic, and implementation details.
+// • Private (bottom): helpers, internal logic, implementation details.
 //   The separator `//// END_OF_PUBIC` (intentional spelling) marks the split.
 
 package main
@@ -142,6 +142,10 @@ func (a *Analyzer) Analyze(uri, text string) *FileIndex {
 	}
 	idx.AST, idx.Spans = ast, spans
 
+	// Build a file root env shadowing the ambient/global.
+	// We deliberately do *not* modify ip.Global. Ambient seeding is performed lazily
+	// by resolveName (analysis_engine.go) the first time a global is referenced,
+	// ensuring a uniform VTSymbol/VTType surface without duplicate code paths.
 	if ip != nil && ip.Global != nil {
 		idx.RootEnv = mindscript.NewEnv(ip.Global)
 	} else {

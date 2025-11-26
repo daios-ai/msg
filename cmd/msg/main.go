@@ -16,7 +16,7 @@ import (
 	"github.com/peterh/liner"
 
 	// Adjust this to your actual module path
-	mindscript "github.com/daios-ai/msg/internal/mindscript"
+	mindscript "github.com/daios-ai/msg/mindscript"
 )
 
 const (

@@ -17,8 +17,3 @@ echo "3) CLI: building and testing"
 go build -trimpath -ldflags="-s -w" -o ./bin/msg ./cmd/msg
 ./bin/msg test lib -v -p
 printf "Done.\n\n"
-
-echo "4) LSP: testing and building"
-go test -v ./cmd/msg-lsp
-go build -trimpath -ldflags="-s -w" -o ./editors/vscode/bin/msg-lsp ./cmd/msg-lsp
-printf "Done.\n\n"

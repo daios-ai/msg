@@ -507,9 +507,10 @@ type emitter struct {
 	ctrlStack []ctrlCtx
 
 	// Source mapping
-	src   *SourceRef
-	marks []PCMark
-	path  NodePath
+	src       *SourceRef
+	marks     []PCMark
+	path      NodePath
+	rootDepth int
 }
 
 type ctrlCtx struct {
@@ -523,8 +524,13 @@ func newEmitter(ip *Interpreter, src *SourceRef) *emitter {
 	if src != nil && len(src.PathBase) > 0 {
 		e.path = append(e.path, src.PathBase...)
 	}
+	// Record depth at chunk root; root "block" executes in provided Env,
+	// nested blocks get their own Env via PushEnv/PopEnv.
+	e.rootDepth = len(e.path)
 	return e
 }
+
+func (e *emitter) inRootBlock() bool { return len(e.path) == e.rootDepth }
 
 // ---------------------- mark helpers (centralized) ---------------------------
 
@@ -761,6 +767,13 @@ func (e *emitter) emitExpr(n S) {
 
 	// ----- blocks -----
 	case "block":
+		// Root block (whole chunk) executes directly in the provided Env.
+		// Nested blocks get their own lexical Env via PushEnv/PopEnv.
+		isRoot := e.inRootBlock()
+		if !isRoot {
+			e.emit(opPushEnv, 0)
+		}
+
 		e.pushBlockCtx()
 		emitted := 0
 		for j := 1; j < len(n); j++ {
@@ -785,6 +798,11 @@ func (e *emitter) emitExpr(n S) {
 		}
 		for _, at := range ctx.contJumps {
 			e.patch(at, exit)
+		}
+		if !isRoot {
+			// Pop the lexical Env for this block, leaving the block's
+			// value on the stack (PopEnv only touches Env, not stack).
+			e.emit(opPopEnv, 0)
 		}
 
 	// ----- flow: break / continue -----

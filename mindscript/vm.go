@@ -171,6 +171,10 @@ const (
 
 	// calls/closures
 	opCall // argc = imm; pops argc args then callee; pushes result
+
+	// lexical environments
+	opPushEnv // env = NewEnv(env)
+	opPopEnv  // env = env.parent
 )
 
 // pack/unpack helpers
@@ -400,6 +404,21 @@ func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res v
 		imm := uimm(raw)
 
 		switch opc {
+
+		case opPushEnv:
+			m.env = NewEnv(m.env)
+
+		case opPopEnv:
+			// Never pop below the initial environment for this chunk.
+			// Root env has nil parent.
+			if m.env == nil {
+				return m.fail("cannot pop from nil environment")
+			}
+			parent := m.env.GetParent()
+			if parent == nil {
+				return m.fail("cannot pop root environment")
+			}
+			m.env = parent
 
 		case opNop:
 			// no-op

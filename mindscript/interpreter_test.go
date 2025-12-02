@@ -2424,3 +2424,80 @@ func Test_Interpreter_Bitwise_Not_TypeError(t *testing.T) {
 	err := evalSrcExpectError(t, `~1.5`)
 	wantErrContains(t, err, "bitwise not expects integer")
 }
+
+func Test_BlockScoping_TopLevelLetPersists(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	v := mustEvalPersistent(t, ip, `
+let x = 0
+x
+`)
+	wantInt(t, v, 0)
+
+	got, err := ip.Global.Get("x")
+	if err != nil {
+		t.Fatalf("expected x to be defined in Global, got error: %v", err)
+	}
+	wantInt(t, got, 0)
+}
+
+func Test_BlockScoping_DoBlockScopesLet(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	v := mustEvalPersistent(t, ip, `
+do
+  let x = 0
+end
+`)
+	wantInt(t, v, 0)
+
+	if _, err := ip.Global.Get("x"); err == nil {
+		t.Fatalf("expected x to be undefined in Global after do-block")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "undefined variable") {
+		t.Fatalf("unexpected error for x: %v", err)
+	}
+}
+
+func Test_BlockScoping_ForBodyScopesLet(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	mustEvalPersistent(t, ip, `
+for i in [0] do
+  let x = 0
+end
+`)
+
+	// Body-local binding should NOT leak.
+	if _, err := ip.Global.Get("x"); err == nil {
+		t.Fatalf("expected x to be undefined in Global after for-body")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "undefined variable") {
+		t.Fatalf("unexpected error for x: %v", err)
+	}
+
+	// Header binding (i) lives in the outer env and should remain.
+	got, err := ip.Global.Get("i")
+	if err != nil {
+		t.Fatalf("expected i to be defined in Global after for-loop, got error: %v", err)
+	}
+	// For `for i in [0]`, i should end as 0.
+	wantInt(t, got, 0)
+}
+
+func Test_BlockScoping_InnerBlockCanAssignOuter(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	v := mustEvalPersistent(t, ip, `
+let x = 0
+do
+  x = 1
+end
+x
+`)
+	wantInt(t, v, 1)
+
+	got, err := ip.Global.Get("x")
+	if err != nil {
+		t.Fatalf("expected x to be defined in Global, got error: %v", err)
+	}
+	wantInt(t, got, 1)
+}

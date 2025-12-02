@@ -1893,12 +1893,15 @@ func (e *emitter) emitExpr(n S) {
 	case "assign":
 		lhs := n[1].(S)
 		opName := "__assign_set"
+		pat := lhs
 		if len(lhs) > 0 && lhs[0].(string) == "let" {
 			opName = "__assign_def"
+			// Declarative assignment: ("let", P) on the LHS.
+			pat = lhs[1].(S)
 		}
 		e.emit(opLoadGlobal, e.ks(opName))
-		// LHS as a pure AST handle.
-		e.emit(opConst, e.k(HandleVal("ast", lhs)))
+		// Pass the **pattern** as a pure AST handle (no leading "let").
+		e.emit(opConst, e.k(HandleVal("ast", pat)))
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
 		e.callWithMarkChild(2, 0)
@@ -2219,12 +2222,14 @@ func (e *emitter) emitExpr(n S) {
 			lhs := subj[1].(S)
 			rhs := subj[2].(S)
 			opName := "__assign_set"
+			pat := lhs
 			if len(lhs) > 0 && lhs[0].(string) == "let" {
 				opName = "__assign_def"
+				pat = lhs[1].(S)
 			}
 			e.emit(opLoadGlobal, e.ks(opName))
-			// LHS as AST handle
-			e.emit(opConst, e.k(HandleVal("ast", lhs)))
+			// Bare pattern as AST handle
+			e.emit(opConst, e.k(HandleVal("ast", pat)))
 			e.emit(opLoadGlobal, e.ks("__annotate"))
 			e.emit(opConst, e.k(Str(text)))
 			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
@@ -2241,12 +2246,14 @@ func (e *emitter) emitExpr(n S) {
 			switch subj[0].(string) {
 			case "id", "get", "idx", "let":
 				opName := "__assign_set"
+				pat := subj
 				if subj[0].(string) == "let" {
 					opName = "__assign_def"
+					pat = subj[1].(S)
 				}
 				e.emit(opLoadGlobal, e.ks(opName))
-				// Subject as AST handle
-				e.emit(opConst, e.k(HandleVal("ast", subj)))
+				// Subject pattern (no leading "let") as AST handle
+				e.emit(opConst, e.k(HandleVal("ast", pat)))
 				e.emit(opLoadGlobal, e.ks("__annotate"))
 				e.emit(opConst, e.k(Str(text)))
 				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS
@@ -2299,6 +2306,7 @@ package mindscript
 
 import (
 	"fmt"
+	// "strings" already imported below
 	"strings"
 )
 
@@ -2344,9 +2352,11 @@ func initCore(ip *Interpreter) {
 		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.Arg("targetAst"), "__assign_set")
+			// targetAst is a **pattern** AST (no leading "let").
+			pat := expectAST(ctx.Arg("targetAst"), "__assign_set")
 			v := ctx.Arg("value")
-			ip.assignTo(ast, v, ctx.Env())
+			// Plain assignment: P = E
+			ip.assignPattern(pat, v, ctx.Env(), false)
 			return v
 		})
 
@@ -2355,9 +2365,12 @@ func initCore(ip *Interpreter) {
 		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.Arg("targetAst"), "__assign_def")
+			// targetAst is a **pattern** AST (no leading "let").
+			pat := expectAST(ctx.Arg("targetAst"), "__assign_def")
 			v := ctx.Arg("value")
-			ip.assignTo(ast, v, ctx.Env(), true)
+			// Declarative assignment: let P = E  ≡  let P; P = E
+			ip.declarePattern(pat, ctx.Env())
+			ip.assignPattern(pat, v, ctx.Env(), false)
 			return v
 		})
 
@@ -2748,44 +2761,6 @@ func initCore(ip *Interpreter) {
 //                                ASSIGNMENT
 ////////////////////////////////////////////////////////////////////////////////
 
-func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine ...bool) {
-	allowDefine := len(optAllowDefine) > 0 && optAllowDefine[0]
-
-	if len(target) == 0 {
-		fail("invalid assignment target")
-	}
-
-	// Declarative assignment: let P = E
-	if target[0].(string) == "let" {
-		if len(target) < 2 {
-			fail("invalid let pattern")
-		}
-		pat, ok := target[1].(S)
-		if !ok {
-			fail("invalid let pattern")
-		}
-		// Step 1: pure declaration (let P)
-		ip.declarePattern(pat, env)
-		// Step 2: destructuring assignment (P = E)
-		ip.assignPattern(pat, value, env, true)
-		return
-	}
-
-	// Strip top-level annotations on the LHS; value/docs are handled in the emitter.
-	for target[0].(string) == "annot" {
-		if len(target) < 3 {
-			fail("invalid assignment target")
-		}
-		next, ok := target[2].(S)
-		if !ok {
-			fail("invalid assignment target")
-		}
-		target = next
-	}
-
-	ip.assignPattern(target, value, env, allowDefine)
-}
-
 // declarePattern implements the runtime semantics of `let P`:
 // walk the pattern and Define all identifier leaves to null, propagating any
 // pattern-local annotations to the initial null value.
@@ -2819,6 +2794,11 @@ func (ip *Interpreter) declarePatternWithDoc(p S, env *Env, doc string) {
 
 	case "id":
 		name := p[1].(string)
+		// Forbid declarations of built-in type atoms (Int, Num, Handle, ...).
+		// This mirrors the Env.Set guard and keeps type namespace reserved.
+		if isBuiltinTypeAtom(name) {
+			fail(fmt.Sprintf("cannot declare reserved name: %s", name))
+		}
 		v := Null
 		if doc != "" {
 			v = withAnnot(v, doc)

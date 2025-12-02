@@ -636,8 +636,8 @@ func (e *emitter) addContJump(at int) {
 // helpers for loops/blocks persisting "last" value
 func (e *emitter) preloadAssignToLast(lastName string) {
 	e.emit(opLoadGlobal, e.ks("__assign_set"))
-	// Preload the lvalue (("decl", lastName)) as AST handle. No call yet.
-	e.emit(opConst, e.k(HandleVal("ast", S{"decl", lastName})))
+	// Preload the lvalue pattern (("id", lastName)) as AST handle. No call yet.
+	e.emit(opConst, e.k(HandleVal("ast", S{"id", lastName})))
 }
 
 func (e *emitter) saveLastAndJumpHead(head int) {
@@ -926,19 +926,28 @@ func (e *emitter) emitExpr(n S) {
 	case "assign":
 		lhs := n[1].(S)
 		opName := "__assign_set"
-		switch lhs[0].(string) {
-		case "decl", "darr", "dobj", "annot":
+		pat := lhs
+		if len(lhs) > 0 && lhs[0].(string) == "let" {
 			opName = "__assign_def"
+			// Declarative assignment: ("let", P) on the LHS.
+			pat = lhs[1].(S)
 		}
 		e.emit(opLoadGlobal, e.ks(opName))
-		// LHS as a pure AST handle.
-		e.emit(opConst, e.k(HandleVal("ast", lhs)))
+		// Pass the **pattern** as a pure AST handle (no leading "let").
+		e.emit(opConst, e.k(HandleVal("ast", pat)))
 		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
 		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
 		e.callWithMarkChild(2, 0)
 
-	case "decl":
-		e.callBuiltinV("__assign_def", HandleVal("ast", n), Null)
+	case "let":
+		// Declaration-only:
+		//   let P
+		// lowers to:
+		//   __declare_pattern(<AST pattern P>)
+		e.emit(opLoadGlobal, e.ks("__declare_pattern"))
+		e.emit(opConst, e.k(HandleVal("ast", n[1].(S))))
+		e.markChild(0)
+		e.emit(opCall, 1)
 
 	// ----- arrays / maps -----
 	case "array":
@@ -1082,9 +1091,9 @@ func (e *emitter) emitExpr(n S) {
 		body := n[2].(S)
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
-		// Declare $last_* using an AST handle (no type building here).
+		// Declare $last_* as a simple identifier binding initialized to null.
 		e.callBuiltinV("__assign_def",
-			HandleVal("ast", S{"decl", lastName}),
+			HandleVal("ast", S{"id", lastName}),
 			Null,
 		)
 		e.emit(opPop, 0)
@@ -1127,21 +1136,21 @@ func (e *emitter) emitExpr(n S) {
 		// Declare the hidden iterator binding with an AST handle (not a Type).
 		// We'll initialize it immediately with __to_iter(iterExpr) below.
 		e.emit(opLoadGlobal, e.ks("__assign_def"))
-		e.emit(opConst, e.k(HandleVal("ast", S{"decl", iterName})))
+		e.emit(opConst, e.k(HandleVal("ast", S{"id", iterName})))
 
 		// __to_iter(iterExpr); mark the iterExpr (child #1) at this call site.
 		e.emit(opLoadGlobal, e.ks("__to_iter"))
 		e.withChild(1, func() { e.emitExpr(iterExpr) })
 		e.callWithMarkChild(1, 1) // __to_iter(iterExpr)
-		e.emit(opCall, 2)         // assign_def(<AST decl>, iterator)
+		e.emit(opCall, 2)         // assign_def(<AST id>, iterator)
 		e.emit(opPop, 0)
 
 		tmpName := fmt.Sprintf("$tmp_%d", e.here())
-		e.callBuiltinV("__assign_def", HandleVal("ast", S{"decl", tmpName}), Null)
+		e.callBuiltinV("__assign_def", HandleVal("ast", S{"id", tmpName}), Null)
 		e.emit(opPop, 0)
 
 		lastName := fmt.Sprintf("$last_%d", e.here())
-		e.callBuiltinV("__assign_def", HandleVal("ast", S{"decl", lastName}), Null)
+		e.callBuiltinV("__assign_def", HandleVal("ast", S{"id", lastName}), Null)
 		e.emit(opPop, 0)
 
 		head := e.here()
@@ -1149,7 +1158,7 @@ func (e *emitter) emitExpr(n S) {
 		// tmp = iter(Null)
 		e.emit(opLoadGlobal, e.ks("__assign_set"))
 		// lvalue as AST handle
-		e.emit(opConst, e.k(HandleVal("ast", S{"decl", tmpName})))
+		e.emit(opConst, e.k(HandleVal("ast", S{"id", tmpName})))
 		e.emit(opLoadGlobal, e.ks(iterName))
 		e.emit(opConst, e.k(Null))
 		e.emit(opCall, 1) // iter(Null)
@@ -1170,12 +1179,9 @@ func (e *emitter) emitExpr(n S) {
 
 		e.preloadAssignToLast(lastName)
 
-		assignName := "__assign_set"
-		switch target[0].(string) {
-		case "decl", "darr", "dobj", "annot":
-			assignName = "__assign_def"
-		}
-		e.emit(opLoadGlobal, e.ks(assignName))
+		// For `for` headers, the pattern is always treated as declarative.
+		e.emit(opLoadGlobal, e.ks("__assign_def"))
+
 		e.emit(opConst, e.k(HandleVal("ast", target)))
 		e.emit(opLoadGlobal, e.ks(tmpName))
 		e.emit(opCall, 2)
@@ -1249,13 +1255,14 @@ func (e *emitter) emitExpr(n S) {
 			lhs := subj[1].(S)
 			rhs := subj[2].(S)
 			opName := "__assign_set"
-			switch lhs[0].(string) {
-			case "decl", "darr", "dobj", "annot":
+			pat := lhs
+			if len(lhs) > 0 && lhs[0].(string) == "let" {
 				opName = "__assign_def"
+				pat = lhs[1].(S)
 			}
 			e.emit(opLoadGlobal, e.ks(opName))
-			// LHS as AST handle
-			e.emit(opConst, e.k(HandleVal("ast", lhs)))
+			// Bare pattern as AST handle
+			e.emit(opConst, e.k(HandleVal("ast", pat)))
 			e.emit(opLoadGlobal, e.ks("__annotate"))
 			e.emit(opConst, e.k(Str(text)))
 			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
@@ -1267,17 +1274,19 @@ func (e *emitter) emitExpr(n S) {
 			return
 		}
 
-		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx,decl}
+		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx,let}
 		if len(subj) > 0 {
 			switch subj[0].(string) {
-			case "decl", "id", "get", "idx":
+			case "id", "get", "idx", "let":
 				opName := "__assign_set"
-				if subj[0].(string) == "decl" {
+				pat := subj
+				if subj[0].(string) == "let" {
 					opName = "__assign_def"
+					pat = subj[1].(S)
 				}
 				e.emit(opLoadGlobal, e.ks(opName))
-				// Subject as AST handle
-				e.emit(opConst, e.k(HandleVal("ast", subj)))
+				// Subject pattern (no leading "let") as AST handle
+				e.emit(opConst, e.k(HandleVal("ast", pat)))
 				e.emit(opLoadGlobal, e.ks("__annotate"))
 				e.emit(opConst, e.k(Str(text)))
 				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS
@@ -1299,5 +1308,3 @@ func (e *emitter) emitExpr(n S) {
 		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
 	}
 }
-
-// Private panic/null helpers live in interpreter_ops.go.

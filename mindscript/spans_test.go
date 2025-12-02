@@ -16,12 +16,14 @@ func mustParseWithSpansMS(t *testing.T, src string) (S, *SpanIndex) {
 	_ = ast
 	return ast, idx
 }
+
 func sliceMS(src string, sp Span) string {
 	if sp.StartByte < 0 || sp.EndByte < 0 || sp.EndByte > len(src) || sp.StartByte > sp.EndByte {
 		return ""
 	}
 	return src[sp.StartByte:sp.EndByte]
 }
+
 func assertSpanTextMS(t *testing.T, idx *SpanIndex, path NodePath, src, want string) {
 	t.Helper()
 	got, ok := idx.Get(path)
@@ -35,30 +37,31 @@ func assertSpanTextMS(t *testing.T, idx *SpanIndex, path NodePath, src, want str
 }
 
 // let {a: x, b: [y]} = rhs
-// Covers: object pattern ("dobj"), inner ("pair")s, nested array pattern ("darr"), and decl spans.
+// Covers: object pattern, inner ("pair")s, nested array pattern, and decl spans.
 // NOTE: destructuring let requires an assignment; the pattern is the LHS of ("assign", ...).
 func Test_Spans_DeclPatterns(t *testing.T) {
 	src := "let {a: x, b: [y]} = rhs"
 	_, idx := mustParseWithSpansMS(t, src)
 
-	// Root is ("assign" ...); the pattern is the LHS at path {0,0}
-	assertSpanTextMS(t, idx, NodePath{0, 0}, src, "{a: x, b: [y]}")
+	// Root is ("assign" ...); the LHS is ("let", pattern),
+	// and the pattern itself is its child at path {0,0,0}.
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "{a: x, b: [y]}")
 
 	// First pair "a: x"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "a: x")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0}, src, "a: x")
 	//   key "a"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0}, src, "a")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0, 0}, src, "a")
 	//   decl "x"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1}, src, "x")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0, 1}, src, "x")
 
 	// Second pair "b: [y]"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "b: [y]")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1}, src, "b: [y]")
 	//   key "b"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "b")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1, 0}, src, "b")
 	//   darr "[y]"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "[y]")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1, 1}, src, "[y]")
 	//     inner decl "y"
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1, 0}, src, "y")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1, 1, 0}, src, "y")
 }
 
 // let
@@ -75,19 +78,23 @@ func Test_Spans_PatternPreAnnotation(t *testing.T) {
 		t.Fatalf("root expr tag = %q, want %q", tag, "assign")
 	}
 
-	// LHS is an annot wrapping the pattern [x, y].
+	// LHS is a "let" whose child is an annot wrapping the pattern [x, y].
 	lhs := assign[1].(S)
-	if tag := lhs[0].(string); tag != "annot" {
-		t.Fatalf("lhs tag = %q, want %q", tag, "annot")
+	if tag := lhs[0].(string); tag != "let" {
+		t.Fatalf("lhs tag = %q, want %q", tag, "let")
+	}
+	pat := lhs[1].(S)
+	if tag := pat[0].(string); tag != "annot" {
+		t.Fatalf("pattern tag = %q, want %q", tag, "annot")
 	}
 
 	// Annotation string spans the source "#p".
-	assertSpanTextMS(t, idx, NodePath{0, 0, 0}, src, "#p")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 0}, src, "#p")
 
 	// The wrapped pattern and its inner decls retain their spans.
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1}, src, "[x, y]")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 0}, src, "x")
-	assertSpanTextMS(t, idx, NodePath{0, 0, 1, 1}, src, "y")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1}, src, "[x, y]")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1, 0}, src, "x")
+	assertSpanTextMS(t, idx, NodePath{0, 0, 0, 1, 1}, src, "y")
 
 	// RHS value node spans the value itself.
 	assertSpanTextMS(t, idx, NodePath{0, 1}, src, "v")

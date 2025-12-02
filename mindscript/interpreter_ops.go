@@ -26,6 +26,7 @@ package mindscript
 
 import (
 	"fmt"
+	// "strings" already imported below
 	"strings"
 )
 
@@ -71,9 +72,11 @@ func initCore(ip *Interpreter) {
 		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.Arg("targetAst"), "__assign_set")
+			// targetAst is a **pattern** AST (no leading "let").
+			pat := expectAST(ctx.Arg("targetAst"), "__assign_set")
 			v := ctx.Arg("value")
-			ip.assignTo(ast, v, ctx.Env())
+			// Plain assignment: P = E
+			ip.assignPattern(pat, v, ctx.Env(), false)
 			return v
 		})
 
@@ -82,10 +85,24 @@ func initCore(ip *Interpreter) {
 		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
 		S{"id", "Any"},
 		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.Arg("targetAst"), "__assign_def")
+			// targetAst is a **pattern** AST (no leading "let").
+			pat := expectAST(ctx.Arg("targetAst"), "__assign_def")
 			v := ctx.Arg("value")
-			ip.assignTo(ast, v, ctx.Env(), true)
+			// Declarative assignment: let P = E  ≡  let P; P = E
+			ip.declarePattern(pat, ctx.Env())
+			ip.assignPattern(pat, v, ctx.Env(), false)
 			return v
+		})
+
+	// __declare_pattern(patternAst: Any) -> Any
+	// Pure declaration: walk the pattern and Define all identifier leaves to null.
+	reg("__declare_pattern",
+		[]ParamSpec{{"patternAst", S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(ctx CallCtx) Value {
+			ast := expectAST(ctx.Arg("patternAst"), "__declare_pattern")
+			ip.declarePattern(ast, ctx.Env())
+			return Null
 		})
 
 	// __plus (numbers/strings/arrays/maps)
@@ -432,7 +449,7 @@ func initCore(ip *Interpreter) {
 				envInit.Define("$keys", Arr(keyVals))
 
 				then := S{"block",
-					S{"assign", S{"decl", "$k"},
+					S{"assign", S{"let", S{"id", "$k"}},
 						S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
 					},
 					inc(),
@@ -464,11 +481,119 @@ func initCore(ip *Interpreter) {
 //                                ASSIGNMENT
 ////////////////////////////////////////////////////////////////////////////////
 
-func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine ...bool) {
-	allowDefine := len(optAllowDefine) > 0 && optAllowDefine[0]
-	switch target[0].(string) {
+// declarePattern implements the runtime semantics of `let P`:
+// walk the pattern and Define all identifier leaves to null, propagating any
+// pattern-local annotations to the initial null value.
+func (ip *Interpreter) declarePattern(p S, env *Env) {
+	ip.declarePatternWithDoc(p, env, "")
+}
+
+// declarePatternWithDoc threads a pending annotation doc string down to the
+// identifier leaves that are directly under an ("annot", ...) wrapper. Outer
+// annotations do not bleed across siblings; last annotation wins.
+func (ip *Interpreter) declarePatternWithDoc(p S, env *Env, doc string) {
+	if len(p) == 0 {
+		fail("invalid pattern")
+	}
+	switch p[0].(string) {
+	case "annot":
+		if len(p) < 3 {
+			fail("invalid pattern")
+		}
+		text, ok := p[1].(S)
+		if !ok || len(text) < 2 || text[0].(string) != "str" {
+			fail("invalid pattern")
+		}
+		sub, ok := p[2].(S)
+		if !ok {
+			fail("invalid pattern")
+		}
+		// Pattern annotation attaches to the binding(s) inside this subpattern.
+		// Last annotation wins, so override any outer doc.
+		ip.declarePatternWithDoc(sub, env, text[1].(string))
+
 	case "id":
-		name := target[1].(string)
+		name := p[1].(string)
+		// Forbid declarations of built-in type atoms (Int, Num, Handle, ...).
+		// This mirrors the Env.Set guard and keeps type namespace reserved.
+		if isBuiltinTypeAtom(name) {
+			fail(fmt.Sprintf("cannot declare reserved name: %s", name))
+		}
+		v := Null
+		if doc != "" {
+			v = withAnnot(v, doc)
+		}
+		env.Define(name, v)
+
+	case "array":
+		for i := 1; i < len(p); i++ {
+			child, ok := p[i].(S)
+			if !ok {
+				fail("invalid pattern")
+			}
+			// Annotations for a whole array pattern do not propagate to its
+			// elements unless explicitly wrapped in their own ("annot", ...).
+			ip.declarePatternWithDoc(child, env, "")
+		}
+
+	case "map":
+		for i := 1; i < len(p); i++ {
+			pair, ok := p[i].(S)
+			if !ok || len(pair) < 3 || pair[0].(string) != "pair" {
+				fail("invalid pattern")
+			}
+			sub, ok := pair[2].(S)
+			if !ok {
+				fail("invalid pattern")
+			}
+			// As with arrays, annotations on individual bindings are expressed
+			// via an inner ("annot", ...) around the binding subpattern.
+			ip.declarePatternWithDoc(sub, env, "")
+		}
+
+	default:
+		// get/idx or any other non-pattern expressions are invalid in `let P`.
+		fail("invalid pattern")
+	}
+}
+
+// assignPattern implements destructuring semantics for P = E where P is a
+// pattern (id / get / idx / array / map, optionally wrapped in annot).
+func (ip *Interpreter) assignPattern(p S, value Value, env *Env, allowDefine bool) {
+	ip.assignPatternWithDoc(p, value, env, allowDefine, "")
+}
+
+// assignPatternWithDoc threads a pending annotation doc string down to the
+// actual write target(s). When a pattern leaf is reached, the doc (if any) is
+// applied to the value being assigned, so pattern annotations end up on the
+// final bound value (last annotation wins).
+func (ip *Interpreter) assignPatternWithDoc(p S, value Value, env *Env, allowDefine bool, doc string) {
+	if len(p) == 0 {
+		fail("invalid assignment target")
+	}
+
+	switch p[0].(string) {
+	case "annot":
+		if len(p) < 3 {
+			fail("invalid assignment target")
+		}
+		text, ok := p[1].(S)
+		if !ok || len(text) < 2 || text[0].(string) != "str" {
+			fail("invalid assignment target")
+		}
+		sub, ok := p[2].(S)
+		if !ok {
+			fail("invalid assignment target")
+		}
+		// Pattern annotation applies to the binding(s) inside this subpattern.
+		// Last annotation wins over any outer doc.
+		ip.assignPatternWithDoc(sub, value, env, allowDefine, text[1].(string))
+
+	case "id":
+		if doc != "" {
+			value = withAnnot(value, doc)
+		}
+		name := p[1].(string)
 		if err := env.Set(name, value); err != nil {
 			if allowDefine {
 				env.Define(name, value)
@@ -476,16 +601,19 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			}
 			fail(err.Error())
 		}
-	case "decl":
-		env.Define(target[1].(string), value)
+
 	case "get":
-		obj := ip.evalFull(target[1].(S), env)
+		if doc != "" {
+			value = withAnnot(value, doc)
+		}
+
+		obj := ip.evalFull(p[1].(S), env)
 		// resolve key string (literal or computed)
 		var keyStr string
-		if ks := target[2].(S); len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
+		if ks, ok := p[2].(S); ok && len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
 			keyStr = ks[1].(string)
 		} else {
-			k := ip.evalFull(target[2].(S), env)
+			k := ip.evalFull(p[2].(S), env)
 			if k.Tag != VTStr {
 				fail("object assignment requires map and string key")
 			}
@@ -501,15 +629,18 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			syncModuleEnv(obj, keyStr, value) // no-op for plain maps
 			return
 		}
-		if obj.Tag == VTModule {
-			fail("object assignment requires map and string key") // unreachable, safety
-		}
-		if obj.Tag == VTArray {
+		if obj.Tag == VTModule || obj.Tag == VTArray {
 			fail("object assignment requires map and string key")
 		}
 		fail("object assignment requires map and string key")
+
 	case "idx":
-		obj, idx := ip.evalFull(target[1].(S), env), ip.evalFull(target[2].(S), env)
+		if doc != "" {
+			value = withAnnot(value, doc)
+		}
+
+		obj := ip.evalFull(p[1].(S), env)
+		idx := ip.evalFull(p[2].(S), env)
 		if obj.Tag == VTArray && idx.Tag == VTInt {
 			xs := obj.Data.(*ArrayObject).Elems
 			if len(xs) == 0 {
@@ -537,49 +668,50 @@ func (ip *Interpreter) assignTo(target S, value Value, env *Env, optAllowDefine 
 			return
 		}
 		fail("index assignment requires array[int] or map[string]")
-	case "darr":
+
+	case "array":
 		if value.Tag != VTArray {
-			for i := 1; i < len(target); i++ {
-				ip.assignTo(target[i].(S), annotNull("array pattern: RHS is not an array"), env, true)
-			}
-			return
+			fail("array pattern: RHS is not an array")
 		}
 		xs := value.Data.(*ArrayObject).Elems
-		for i := 1; i < len(target); i++ {
-			if i-1 < len(xs) {
-				ip.assignTo(target[i].(S), xs[i-1], env, true)
-			} else {
-				ip.assignTo(target[i].(S), annotNull(fmt.Sprintf("array pattern: missing element #%d", i-1)), env, true)
+		patLen := len(p) - 1
+		for i := 0; i < patLen; i++ {
+			elemPat, ok := p[i+1].(S)
+			if !ok {
+				fail("invalid array pattern")
 			}
+			var elemVal Value
+			if i < len(xs) {
+				elemVal = xs[i]
+			} else {
+				elemVal = Null
+			}
+			ip.assignPatternWithDoc(elemPat, elemVal, env, allowDefine, "")
 		}
-	case "dobj":
+
+	case "map":
 		vmap := AsMapValue(value)
 		if vmap.Tag != VTMap {
-			for i := 1; i < len(target); i++ {
-				p := target[i].(S) // ("pair", key, pattern)
-				ip.assignTo(p[2].(S), annotNull("object pattern: RHS is not a map"), env, true)
-			}
-			return
+			fail("object pattern: RHS is not a map")
 		}
 		mo := vmap.Data.(*MapObject)
-		m := mo.Entries
-		for i := 1; i < len(target); i++ {
-			p := target[i].(S)
-			k := unwrapKeyStr(p[1].(S))
-			if v, ok := m[k]; ok {
-				ip.assignTo(p[2].(S), v, env, true)
-			} else {
-				ip.assignTo(p[2].(S), annotNull(fmt.Sprintf("object pattern: missing key '%s'", k)), env, true)
+		for i := 1; i < len(p); i++ {
+			pair, ok := p[i].(S)
+			if !ok || len(pair) < 3 || pair[0].(string) != "pair" {
+				fail("invalid object pattern")
 			}
+			key := unwrapKeyStr(pair[1].(S))
+			sub, ok := pair[2].(S)
+			if !ok {
+				fail("invalid object pattern")
+			}
+			fieldVal, ok := mo.Entries[key]
+			if !ok {
+				fieldVal = Null
+			}
+			ip.assignPatternWithDoc(sub, fieldVal, env, allowDefine, "")
 		}
-	case "annot":
-		text := target[1].(S)[1].(string)
-		sub := target[2].(S)
-		if len(sub) > 0 && sub[0].(string) == "decl" {
-			env.Define(sub[1].(string), withAnnot(value, text))
-			return
-		}
-		ip.assignTo(sub, value, env, true)
+
 	default:
 		fail("invalid assignment target")
 	}

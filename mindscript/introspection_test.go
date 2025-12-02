@@ -282,7 +282,7 @@ end`
 	// Expect CANONICAL inline form:
 	// ["module", ["str","Refl"],
 	//   ["block",
-	//     ["assign", ["decl","a"], ["int",1]]
+	//     ["assign", ["let", ["id","a"]], ["int",1]]
 	//   ]
 	// ]
 	want := vArray(
@@ -292,7 +292,10 @@ end`
 			vStr("block"),
 			vArray(
 				vStr("assign"),
-				vArray(vStr("decl"), vStr("a")),
+				vArray(
+					vStr("let"),
+					vArray(vStr("id"), vStr("a")),
+				),
 				vArray(vStr("int"), vInt(1)),
 			),
 		),
@@ -319,7 +322,11 @@ func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
 	)
 
 	// Canonical module form:
-	// ["module", ["str","M"], ["block", ["assign", ["decl","x"], ["call", ["id","tick"]]]]]
+	// ["module", ["str","M"],
+	//   ["block",
+	//     ["assign", ["let", ["id","x"]], ["call", ["id","tick"]]]
+	//   ]
+	// ]
 	rt := vArray(
 		vStr("module"),
 		vArray(vStr("str"), vStr("M")),
@@ -327,7 +334,10 @@ func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
 			vStr("block"),
 			vArray(
 				vStr("assign"),
-				vArray(vStr("decl"), vStr("x")),
+				vArray(
+					vStr("let"),
+					vArray(vStr("id"), vStr("x")),
+				),
 				vArray(vStr("call"), vArray(vStr("id"), vStr("tick"))),
 			),
 		),
@@ -378,7 +388,10 @@ func Test_Introspection_IxReify_Module_Nested_Canonical_Form(t *testing.T) {
 			vStr("block"),
 			vArray(
 				vStr("assign"),
-				vArray(vStr("decl"), vStr("sub")),
+				vArray(
+					vStr("let"),
+					vArray(vStr("id"), vStr("sub")),
+				),
 				vArray(
 					vStr("module"),
 					vArray(vStr("str"), vStr("Inner")),
@@ -386,7 +399,10 @@ func Test_Introspection_IxReify_Module_Nested_Canonical_Form(t *testing.T) {
 						vStr("block"),
 						vArray(
 							vStr("assign"),
-							vArray(vStr("decl"), vStr("y")),
+							vArray(
+								vStr("let"),
+								vArray(vStr("id"), vStr("y")),
+							),
 							vArray(vStr("int"), vInt(2)),
 						),
 					),

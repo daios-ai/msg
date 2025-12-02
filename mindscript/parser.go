@@ -50,6 +50,7 @@
 //
 //	("unop",  op,  rhs)           // prefix "-" or "not"; postfix "?"  (op is string)
 //	("binop", op,  lhs, rhs)      // "+", "-", "*", "/", "%", comparisons, "==", "!=", "and", "or", "->"
+//	("let",   patternExpr)        // "let P" declaration (pattern in expr form)
 //	("assign", target, value)     // "=" (right-assoc)
 //
 // Property / call / index:
@@ -76,12 +77,6 @@
 //	("return", value)  // value may be "null" per newline semantics
 //	("break",  value)  // value may be "null"
 //	("continue", value)// value may be "null"
-//
-// Declaration patterns (used by 'let' and 'for' targets):
-//
-//	("decl", name)
-//	("darr", p1, p2, ...)
-//	("dobj", ("pair", keyStrExpr, subPattern), ...)
 //
 // Annotations:
 //
@@ -973,38 +968,26 @@ func (p *parser) expr(minBP int) (NodeID, error) {
 			leftStartTok = tokIndexOfThis
 
 		case LET:
-			pat, a, err := p.declPattern()
+			// let P        → ("let", P)
+			// let P = E    → ("assign", ("let", P), E) via infix ASSIGN
+			pre, err := p.takeReqGap(t, "expected pattern after 'let'")
 			if err != nil {
 				return 0, err
 			}
-			if a.ok {
-				pat = p.attachAnnotFrom(a, pat)
+			const assignBP = 10
+			pat, err := p.expr(assignBP + 1)
+			if err != nil {
+				return 0, err
 			}
-			left = pat
+			if pre.ok {
+				pat = p.attachAnnotFrom(pre, pat)
+			}
+			endTok := p.lastSpanEndTok
+			if endTok < 0 {
+				endTok = tokIndexOfThis
+			}
+			left = p.mkIR("let", tokIndexOfThis, endTok, pat)
 			leftStartTok = tokIndexOfThis
-
-			// If destructuring, require an '=' (after any annotations).
-			if p.isTag(pat, "darr") || p.isTag(pat, "dobj") {
-				// Skip GAPs (ANNOTATION/NOOP) without letting them satisfy the requirement.
-				j := p.i
-				for j < len(p.toks) && (p.toks[j].Type == ANNOTATION || p.toks[j].Type == NOOP) {
-					j++
-				}
-				// If only gaps/EOF remain, report same message across modes.
-				if j >= len(p.toks) || p.toks[j].Type == EOF {
-					line, col := p.posAfterLastSpan()
-					kind := DiagParse
-					if p.interactive {
-						kind = DiagIncomplete
-					}
-					return 0, &Error{Kind: kind, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-				}
-				// Not EOF: require ASSIGN next; if not, hard parse error at that token.
-				if p.toks[j].Type != ASSIGN {
-					line, col := p.posAtByte(p.toks[j].StartByte)
-					return 0, &Error{Kind: DiagParse, Msg: "expected '=' after destructuring let pattern", Line: line, Col: col}
-				}
-			}
 
 		case TYPECONS:
 			x, err := p.parseExprAfterBP(t, "expected type expression after 'type'", 1)
@@ -1741,113 +1724,6 @@ func (p *parser) oracleExpr(openTok int) (NodeID, error) {
 	return body, nil
 }
 
-// ─────────────────────── declaration patterns (let/for) ───────────────────
-
-func (p *parser) declPattern() (NodeID, annSrc, error) {
-	// Gather stacked PRE immediately before pattern (do not wrap yet).
-	pre := annNone()
-	for !p.atEnd() && p.peek().Type == ANNOTATION {
-		pre = mergeAnn(pre, p.collectAnnotsSrc())
-	}
-	if p.match(ID) {
-		idIdx := p.i - 1
-		return p.mkLeafIR("decl", idIdx, tokText(p.prev())), pre, nil
-	}
-	if p.match(LSQUARE, CLSQUARE) {
-		n, err := p.arrayDeclPattern()
-		return n, pre, err
-	}
-	if p.match(LCURLY) {
-		n, err := p.objectDeclPattern()
-		return n, pre, err
-	}
-	g := p.peek()
-	if p.interactive && p.onlyGapsToEOF() {
-		line, col := p.posAfterLastSpan()
-		return 0, annNone(), &Error{Kind: DiagIncomplete, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-	}
-	line, col := p.posAtByte(g.StartByte)
-	return 0, annNone(), &Error{Kind: DiagParse, Msg: "expected let pattern (id, [], or {})", Line: line, Col: col}
-}
-
-func (p *parser) arrayDeclPattern() (NodeID, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RSQUARE) {
-		return p.mkIR("darr", openTok, p.i-1), nil
-	}
-
-	parts, _, closeTok, err := p.bracketed(
-		RSQUARE, "expected ']' in array pattern",
-		func(pending annSrc) (NodeID, error) {
-			pt, a, err := p.declPattern()
-			if err != nil {
-				return 0, err
-			}
-			// attach element's own PRE + interstitial PRE to the subpattern itself
-			if a.ok {
-				pt = p.attachAnnotFrom(a, pt)
-			}
-			if pending.ok {
-				pt = p.attachAnnotFrom(pending, pt)
-			}
-			return pt, nil
-		},
-		nil, // POST-after-comma attaches to the element itself
-	)
-	if err != nil {
-		return 0, err
-	}
-	return p.mkIR("darr", openTok, closeTok, parts...), nil
-}
-
-func (p *parser) objectDeclPattern() (NodeID, error) {
-	openTok := p.i - 1
-	p.skipNoops()
-	if p.match(RCURLY) {
-		return p.mkIR("dobj", openTok, p.i-1), nil
-	}
-
-	pairs, _, closeTok, err := p.bracketed(
-		RCURLY, "expected '}' in object pattern",
-		func(pendingPRE annSrc) (NodeID, error) {
-			startTok := p.i
-			k, aKey, err := p.readKeyString()
-			if err != nil {
-				return 0, err
-			}
-
-			if _, err := p.need(COLON, "expected ':' after key"); err != nil {
-				return 0, err
-			}
-			// B = GAP after ':' (cannot satisfy requirement)
-			b, err := p.takeReqGap(p.toks[p.i-1], "expected pattern after ':'")
-			if err != nil {
-				return 0, err
-			}
-			pt, aSub, err := p.declPattern()
-			if err != nil {
-				return 0, err
-			}
-
-			// subpattern-local PRE attaches to the pattern node itself
-			if aSub.ok {
-				pt = p.attachAnnotFrom(aSub, pt)
-			}
-			ann := mergeAnn(mergeAnn(pendingPRE, aKey), b)
-			if ann.ok {
-				pt = p.attachAnnotFrom(ann, pt)
-			}
-			return p.mkIR("pair", startTok, p.i-1, k, pt), nil
-		},
-		func(last NodeID, comma Token, _ string) NodeID { return p.onCommaPostAttachToValue(last, comma) },
-	)
-	if err != nil {
-		return 0, err
-	}
-	return p.mkIR("dobj", openTok, closeTok, pairs...), nil
-}
-
 // readKeyString allows stacked PRE-annotations (handled recursively).
 // Span order: (1) PRE "str" child; (2) "annot" wrapper; (3) final key "str" leaf.
 func (p *parser) readKeyString() (NodeID, annSrc, error) {
@@ -1891,34 +1767,27 @@ func isWordLike(tt TokenType) bool {
 // ───────────────────────────── for-target helpers ─────────────────────────
 
 func (p *parser) forTarget() (NodeID, error) {
-	// 'for let <pattern> in ...'
+	// 'for let P in ...'
 	if p.match(LET) {
-		pt, a, err := p.declPattern()
+		letTokIdx := p.i - 1
+		letTok := p.toks[letTokIdx]
+		pre, err := p.takeReqGap(letTok, "expected pattern after 'let'")
 		if err != nil {
 			return 0, err
 		}
-		// In a for-target, attach the pattern's own PRE to the pattern itself.
-		if a.ok {
-			pt = p.attachAnnotFrom(a, pt)
-		}
-		return pt, nil
-	}
-
-	// Heuristic: pattern-looking starts — try a decl pattern first.
-	switch p.peek().Type {
-	case LSQUARE, CLSQUARE, LCURLY, ANNOTATION:
-		save := p.i
-		pt, a, err := p.declPattern()
-		if err == nil {
-			if a.ok {
-				pt = p.attachAnnotFrom(a, pt)
-			}
-			return pt, nil
-		}
-		if p.interactive && IsIncomplete(err) {
+		const assignBP = 10
+		pat, err := p.expr(assignBP + 1)
+		if err != nil {
 			return 0, err
 		}
-		p.i = save
+		if pre.ok {
+			pat = p.attachAnnotFrom(pre, pat)
+		}
+		endTok := p.lastSpanEndTok
+		if endTok < 0 {
+			endTok = letTokIdx
+		}
+		return p.mkIR("let", letTokIdx, endTok, pat), nil
 	}
 
 	// Otherwise parse an expression and require it to be assignable.
@@ -1931,13 +1800,7 @@ func (p *parser) forTarget() (NodeID, error) {
 		p.i = save
 		g := p.peek()
 		line, col := p.posAtByte(g.StartByte)
-		return 0, &Error{Kind: DiagParse, Msg: "invalid for-target (must be id/get/idx/decl/pattern)", Line: line, Col: col}
-	}
-	// id → decl, preserving the original id token span (TokStart/TokEnd)
-	if p.ir.Nodes[e].Tag == "id" {
-		idn := p.ir.Nodes[e]
-		name, _ := idn.Value.(string)
-		return p.mkIRVal("decl", idn.TokStart, idn.TokEnd, name), nil
+		return 0, &Error{Kind: DiagParse, Msg: "invalid for-target", Line: line, Col: col}
 	}
 	return e, nil
 }
@@ -1955,14 +1818,9 @@ func (p *parser) assignableIR(id NodeID) bool {
 	}
 	tag := p.ir.Nodes[cur].Tag
 	switch tag {
-	case "id", "get", "idx", "decl", "darr", "dobj":
+	case "id", "get", "idx", "array", "map", "let":
 		return true
 	default:
 		return false
 	}
-}
-
-// Small IR utilities
-func (p *parser) isTag(id NodeID, tag string) bool {
-	return p.ir.Nodes[id].Tag == tag
 }

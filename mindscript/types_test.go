@@ -620,12 +620,12 @@ func Test_Types_ValueToType_Module_Inference(t *testing.T) {
 	fields := mapTypeFields(typ)
 
 	fx, ok := fields["x"]
-	if !ok || !isId(fx.typ, "Str") || !fx.required {
+	if !ok || !testIsId(fx.typ, "Str") || !fx.required {
 		t.Fatalf("expected field x: Str (required), got: %#v", fx)
 	}
 
 	fn, ok := fields["n"]
-	if !ok || !isId(fn.typ, "Int") || !fn.required {
+	if !ok || !testIsId(fn.typ, "Int") || !fn.required {
 		t.Fatalf("expected field n: Int (required), got: %#v", fn)
 	}
 }
@@ -727,10 +727,10 @@ func Test_Types_ValueToType_Map_SelfCycle(t *testing.T) {
 
 	fs := mapTypeFields(got)
 	// self: Any (widened due to cycle), x: Int (optional/open-world)
-	if f, ok := fs["self"]; !ok || !isId(f.typ, "Any") {
+	if f, ok := fs["self"]; !ok || !testIsId(f.typ, "Any") {
 		t.Fatalf("expected field self: Any (from cycle), got %#v", f)
 	}
-	if f, ok := fs["x"]; !ok || !isId(f.typ, "Int") {
+	if f, ok := fs["x"]; !ok || !testIsId(f.typ, "Int") {
 		t.Fatalf("expected field x: Int, got %#v", f)
 	}
 }
@@ -1415,8 +1415,8 @@ func Test_Types_Handle_Infer_Solo_And_ArrayNullable(t *testing.T) {
 
 func Test_Types_Handle_ReservedName_ShadowingForbidden(t *testing.T) {
 	ip, _ := NewInterpreter()
-	// Parser should reject binding the reserved name "Handle" (mirrors Int/Num/etc.)
-	evalExpectError(t, ip, `let Handle = type Int`, "expected let pattern")
+	// Interpreter should reject binding the reserved name "Handle" (mirrors Int/Num/etc.)
+	evalExpectError(t, ip, `let Handle = type Int`, "reserved")
 }
 
 func Test_Types_Handle_PropertyName_Allowed(t *testing.T) {

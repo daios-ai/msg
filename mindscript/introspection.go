@@ -17,7 +17,7 @@ package mindscript
 //   IxReflect(v Value) Value
 //     • Return CONSTRUCTOR CODE as runtime-S (a program AST-in-[] that, when
 //       evaluated, rebuilds v). Always emits **canonical modules**:
-//       ["module", ["str", name], ["block", ("assign", ("decl", k), ctor)*]].
+//       ["module", ["str", name], ["block", ("assign", ("let", ("id", k)), ctor)*]].
 //       - Scalars/arrays/maps → literal nodes
 //       - VTType → ["type", <typeAst>]
 //       - Fun/oracle → ["fun"/"oracle", params, ret/out, body]
@@ -290,7 +290,9 @@ func ixConstructorS_core(v Value) (S, bool) {
 			if !ok {
 				return nil, false
 			}
-			body = append(body, S{"assign", S{"decl", k}, ctor})
+			// Module exports are canonicalized as ("assign", ("let", ("id", k)), ctor)
+			pat := S{"let", S{"id", k}}
+			body = append(body, S{"assign", pat, ctor})
 		}
 		return S{"module", S{"str", name}, body}, true
 
@@ -416,7 +418,7 @@ func ValidateCanonicalS(s S) Value {
 			return false
 		}
 		switch tagOf(n) {
-		case "id", "get", "idx", "decl", "darr", "dobj":
+		case "let", "id", "get", "idx", "array", "map":
 			return true
 		default:
 			return false
@@ -788,7 +790,7 @@ func ValidateCanonicalS(s S) Value {
 				return
 			}
 			if !assignableS(n[1].(S)) {
-				push(path+"/assign/lhs", "E_ASSIGN_TARGET", "invalid assignment target", tagOf(n[1]), "id|get|idx|decl|darr|dobj")
+				push(path+"/assign/lhs", "E_ASSIGN_TARGET", "invalid assignment target", tagOf(n[1]), "id|get|idx|array|map|let")
 			}
 			if rhs, ok := n[2].(S); ok {
 				walk(rhs, path+"/assign/rhs", inType)
@@ -796,48 +798,17 @@ func ValidateCanonicalS(s S) Value {
 				push(path+"/assign/rhs", "E_NODE_SHAPE", "rhs must be a node", fmt.Sprintf("%T", n[2]), "node")
 			}
 
-		// ---- patterns ----
-		case "decl":
-			checkScalarPayload(path, n, "id")
-		case "darr":
-			for i := 1; i < len(n); i++ {
-				sub, ok := n[i].(S)
-				if !ok {
-					push(fmtIdx(path, "darr", i-1), "E_NODE_SHAPE", "array pattern element must be a node", fmt.Sprintf("%T", n[i]), "node")
-					continue
-				}
-				walk(sub, fmtIdx(path, "darr", i-1), inType)
+		case "let":
+			if len(n) != 2 {
+				push(path, "E_ARITY", "let requires exactly one pattern child", arity(n), "2")
+				return
 			}
-		case "dobj":
-			for i := 1; i < len(n); i++ {
-				p, ok := n[i].(S)
-				idx := fmtIdx(path, "dobj", i-1)
-				if !ok || len(p) != 3 || tagOf(p) != "pair" {
-					push(idx, "E_PAIR_SHAPE", "object pattern entries must be pair triples", tagOf(p), `["pair", keyStr, subPattern]`)
-					continue
-				}
-				key, ok := p[1].(S)
-				if !ok || (tagOf(key) != "str" && tagOf(key) != "annot") {
-					push(idx+"/key", "E_KEY_SHAPE", "key must be a string (optionally annotated)", tagOf(p[1]), `["str",k] or ["annot",...]`)
-					continue
-				}
-				if tagOf(key) == "annot" {
-					if !checkAnnot(key, idx+"/key") {
-						continue
-					}
-					key = key[2].(S)
-				}
-				if tagOf(key) != "str" {
-					push(idx+"/key", "E_KEY_STR", "annotated key must wrap a string node", tagOf(key), `["str",k]`)
-				} else {
-					checkScalarPayload(idx+"/key", key, "str")
-				}
-				if sub, ok := p[2].(S); ok {
-					walk(sub, idx+"/val", inType)
-				} else {
-					push(idx+"/val", "E_NODE_SHAPE", "subpattern must be a node", fmt.Sprintf("%T", p[2]), "node")
-				}
+			pat, ok := n[1].(S)
+			if !ok {
+				push(path+"/let/pattern", "E_NODE_SHAPE", "let pattern must be a node", fmt.Sprintf("%T", n[1]), "node")
+				return
 			}
+			walk(pat, path+"/let/pattern", inType)
 
 		// ---- statements / blocks ----
 		case "block":

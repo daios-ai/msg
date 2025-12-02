@@ -475,15 +475,15 @@ func Test_Error_Parse_MissingRParen_CaretColumn(t *testing.T) {
 }
 
 func Test_Error_Parse_UnexpectedToken_CaretAtTokenStart(t *testing.T) {
-	// "let 123" → caret at the start of the unexpected token '1' (after "let ")
-	src := "let 123"
+	// "let ?" → caret at the start of the unexpected token '?' (after "let ")
+	src := "let ?"
 	_, err := Pretty(src)
 	if err == nil {
 		t.Fatalf("expected parse error, got nil")
 	}
 	msg := err.Error()
 	mustHaveHeader(t, msg, "PARSE ERROR")
-	mustContain(t, msg, "   1 | let 123")
+	mustContain(t, msg, "   1 | let ?")
 	mustContain(t, msg, "     | ")
 	mustContain(t, msg, "^")
 
@@ -503,13 +503,13 @@ func Test_Error_Parse_UnexpectedToken_CaretAtTokenStart(t *testing.T) {
 	if pad < 0 {
 		t.Fatalf("no caret found\n--- output ---\n%s", msg)
 	}
-	// caret must sit exactly under the first byte of "123"
-	want := strings.Index(codeLine, "1")
+	// caret must sit exactly under the first byte of "?" (the unexpected token)
+	want := strings.Index(codeLine, "?")
 	if want < 0 {
-		t.Fatalf("test sanity: no '1' in code line: %q", codeLine)
+		t.Fatalf("test sanity: no '?' in code line: %q", codeLine)
 	}
 	if pad != want {
-		t.Fatalf("caret column = %d, want %d (under first digit of unexpected token)", pad, want)
+		t.Fatalf("caret column = %d, want %d (under unexpected token '?')", pad, want)
 	}
 }
 

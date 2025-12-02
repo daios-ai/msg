@@ -50,10 +50,10 @@
 // • parser.go
 //   - S = []any (AST payload shape)
 //   - ParseSExpr(string) (used by Pretty/Standardize)
-//   - AST tags: "block", "fun", "oracle", "for", "while", "if",
-//     "type", "return", "break", "continue", "assign", "array", "map",
+//   - AST tags: "block", "fun", "oracle", "for", "if",
+//     "type", "return", "break", "continue", "assign", "let", "array", "map",
 //     "pair"/"pair!", "get", "idx", "call", "id", "str", "int", "num", "bool",
-//     "null", "unop", "binop", "decl", "darr", "dobj", "annot", "noop".
+//     "null", "unop", "binop", "annot", "noop".
 //
 // • interpreter.go (runtime model)
 //   - Value, ValueTag (VTNull, VTBool, VTInt, VTNum, VTStr, VTArray, VTMap,
@@ -783,14 +783,27 @@ func docStmt(n S) *Doc {
 		}
 		return Concat(Text("continue "), docExpr(arg))
 
-	case "decl", "darr", "dobj":
-		return Concat(Text("let "), docPattern(n))
+	case "let":
+		// Declaration-only: let P
+		if len(n) >= 2 {
+			return Concat(Text("let "), docPattern(n[1].(S)))
+		}
+		return Text("let")
+
 	case "assign":
 		// Decide PRE vs POST for the whole binding (let-or-assign).
 		lhs, rhs := n[1].(S), n[2].(S)
 		var head *Doc
 		if isDeclPattern(lhs) {
-			head = Concat(Text("let "), docPattern(lhs), Text(" = "))
+			// Declarative assignment: let P = E
+			// Strip the syntactic 'let' wrapper from the pattern.
+			var pat S
+			if tag(lhs) == "let" && len(lhs) >= 2 {
+				pat = lhs[1].(S)
+			} else {
+				pat = lhs
+			}
+			head = Concat(Text("let "), docPattern(pat), Text(" = "))
 		} else {
 			head = Concat(docExprMin(lhs, 10), Text(" = "))
 		}
@@ -914,6 +927,16 @@ func docExpr(n S) *Doc {
 
 	case "assign":
 		l, r := n[1].(S), n[2].(S)
+		if isDeclPattern(l) {
+			// let P = E in expression position
+			var pat S
+			if tag(l) == "let" && len(l) >= 2 {
+				pat = l[1].(S)
+			} else {
+				pat = l
+			}
+			return Concat(Text("let "), docPattern(pat), Text(" = "), docExprMin(r, 10))
+		}
 		return Concat(docExprMin(l, 10), Text(" = "), docExprMin(r, 10))
 
 	case "call":
@@ -1007,8 +1030,12 @@ func docExpr(n S) *Doc {
 			return SoftLineDoc()
 		}())), "]"))
 
-	case "decl", "darr", "dobj":
-		return docPattern(n)
+	case "let":
+		// let P used as an expression
+		if len(n) >= 2 {
+			return Concat(Text("let "), docPattern(n[1].(S)))
+		}
+		return Text("let")
 
 	case "return", "break", "continue", "fun", "oracle", "for", "while", "if", "type", "block", "annot", "module":
 		return docStmt(n)
@@ -1025,7 +1052,7 @@ func docExpr(n S) *Doc {
 
 func isDeclPattern(n S) bool {
 	switch tag(n) {
-	case "decl", "darr", "dobj":
+	case "let":
 		return true
 	case "annot":
 		return isDeclPattern(n[2].(S))
@@ -1036,9 +1063,17 @@ func isDeclPattern(n S) bool {
 
 func docPattern(n S) *Doc {
 	switch tag(n) {
-	case "decl":
+	case "let":
+		// Pattern wrapper: strip 'let' and print the inner shape.
+		if len(n) >= 2 {
+			return docPattern(n[1].(S))
+		}
+		return Text("<pattern>")
+
+	case "id":
 		return Text(getId(n))
-	case "darr":
+
+	case "array":
 		items := listS(n, 1)
 		if len(items) == 0 {
 			return Text("[]")
@@ -1060,7 +1095,8 @@ func docPattern(n S) *Doc {
 			}
 			return SoftLineDoc()
 		}())), "]"))
-	case "dobj":
+
+	case "map":
 		items := listS(n, 1)
 		if len(items) == 0 {
 			return Text("{}")
@@ -1083,10 +1119,12 @@ func docPattern(n S) *Doc {
 			}
 			return SoftLineDoc()
 		}())), "}"))
+
 	case "annot":
 		text, wrapped, _ := asAnnotASTRaw(n)
 		// Pattern wrapper: render as PRE. Entry/element sites decide inline.
 		return Concat(annotPre(text), docPattern(wrapped))
+
 	default:
 		return docExpr(n)
 	}

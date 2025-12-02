@@ -387,7 +387,7 @@ func Test_Schema_JSONUnsupported_Unions_ToAny(t *testing.T) {
 		},
 	}
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
-	if !isId(got, "Any") {
+	if !testIsId(got, "Any") {
 		t.Fatalf("complex anyOf should map to Any; got %v", got)
 	}
 }
@@ -400,7 +400,7 @@ func Test_Schema_JSONConstraints_Ignored(t *testing.T) {
 		"pattern": "^[a-z]+$",
 	}
 	got := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
-	if !isId(got, "Str") {
+	if !testIsId(got, "Str") {
 		t.Fatalf("string with pattern should still be Str; got %v", got)
 	}
 }
@@ -544,7 +544,7 @@ func Test_Schema_Alias_Roundtrip_Smoke(t *testing.T) {
 	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(js))
 
 	// The top-level will typically be ("id","Order") due to $ref handling
-	if !isId(ms, "Order") {
+	if !testIsId(ms, "Order") {
 		// Fallback: allow expanded object as well (depending on pointer resolution)
 		if !(len(ms) > 0 && ms[0].(string) == "map") {
 			t.Fatalf("expected id(Order) or expanded map; got %v", ms)
@@ -598,7 +598,7 @@ func Test_Schema_JSON_ComplexOneOf_ToAny(t *testing.T) {
 		},
 	}
 	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(doc))
-	if !isId(ms, "Any") {
+	if !testIsId(ms, "Any") {
 		t.Fatalf("complex oneOf should map to Any; got %v", ms)
 	}
 }
@@ -663,7 +663,7 @@ func Test_Schema_Helper_JSONSchemaStringToObject_Integration(t *testing.T) {
 	ip, _ := NewInterpreter()
 	ms := typeSFromValue(t, ip.JSONSchemaToTypeValue(m))
 	// For $ref to #/$defs/User, we map to ("id","User")
-	if !isId(ms, "User") {
+	if !testIsId(ms, "User") {
 		t.Fatalf("expected id(User); got %v", ms)
 	}
 }

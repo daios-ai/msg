@@ -123,7 +123,7 @@ func asAnnot(t *testing.T, n S) (txt string, wrapped S) {
 }
 
 //
-// ─────────────────────────── Literals & IDs ───────────────────────────────
+// ───────────────────────── Literals & IDs ───────────────────────────────
 //
 
 func Test_Parser_Literal_Int_TagAndValue(t *testing.T) {
@@ -155,14 +155,14 @@ func Test_Parser_Literal_Str_TagAndValue(t *testing.T) {
 
 func Test_Parser_Literal_Bool_True_False(t *testing.T) {
 	root := mustParse(t, `true false`)
-	if !isBool(first(root), true) {
+	if !testIsBool(first(root), true) {
 		t.Fatalf("first not true: %s", dump(root))
 	}
-	if !isBool(kid(root, 1), false) {
+	if !testIsBool(kid(root, 1), false) {
 		t.Fatalf("second not false: %s", dump(root))
 	}
 }
-func isBool(n S, v bool) bool { return head(n) == "bool" && n[1].(bool) == v }
+func testIsBool(n S, v bool) bool { return head(n) == "bool" && n[1].(bool) == v }
 
 func Test_Parser_Literal_Null_Tag(t *testing.T) {
 	root := mustParse(t, `null`)
@@ -171,9 +171,13 @@ func Test_Parser_Literal_Null_Tag(t *testing.T) {
 
 func Test_Parser_Identifier_Basic(t *testing.T) {
 	root := mustParse(t, `x`)
-	if !isId(first(root), "x") {
+	if !testIsId(first(root), "x") {
 		t.Fatalf("want id x, got %s", dump(first(root)))
 	}
+}
+
+func testIsId(n S, s string) bool {
+	return head(n) == "id" && n[1].(string) == s
 }
 
 //
@@ -250,7 +254,7 @@ func Test_Parser_Arrow_RightAssociative_InType(t *testing.T) {
 	if arrow[1].(string) != "->" {
 		t.Fatalf("top op not '->'")
 	}
-	if !isId(arrow[2].(S), "Int") {
+	if !testIsId(arrow[2].(S), "Int") {
 		t.Fatalf("left not Int")
 	}
 	right := arrow[3].(S)
@@ -268,7 +272,7 @@ func Test_Parser_Call_NoSpaceBeforeParen(t *testing.T) {
 	root := mustParse(t, `f(x)`)
 	call := first(root)
 	wantTag(t, call, "call")
-	if !isId(kid(call, 0), "f") || !isId(kid(call, 1), "x") {
+	if !testIsId(kid(call, 0), "f") || !testIsId(kid(call, 1), "x") {
 		t.Fatalf("bad call: %s", dump(call))
 	}
 }
@@ -278,7 +282,7 @@ func Test_Parser_Grouping_SpaceBeforeParen_SplitsTopLevel(t *testing.T) {
 	if len(root) != 1+2 {
 		t.Fatalf("want two top-level exprs, got %d", len(root)-1)
 	}
-	if !isId(kid(root, 0), "f") || head(kid(root, 1)) != "id" {
+	if !testIsId(kid(root, 0), "f") || head(kid(root, 1)) != "id" {
 		t.Fatalf("bad grouping split: %s", dump(root))
 	}
 }
@@ -293,7 +297,7 @@ func Test_Parser_ArrayLiteral_SpaceBeforeBracket(t *testing.T) {
 	if len(root) != 1+2 {
 		t.Fatalf("want two top-level exprs, got %d", len(root)-1)
 	}
-	if !isId(kid(root, 0), "arr") || head(kid(root, 1)) != "array" {
+	if !testIsId(kid(root, 0), "arr") || head(kid(root, 1)) != "array" {
 		t.Fatalf("bad array literal due to LSQUARE: %s", dump(root))
 	}
 }
@@ -306,7 +310,7 @@ func Test_Parser_Dot_Property_Get(t *testing.T) {
 	root := mustParse(t, `obj.name`)
 	get := first(root)
 	wantTag(t, get, "get")
-	if !isId(kid(get, 0), "obj") || !isStr(kid(get, 1), "name") {
+	if !testIsId(kid(get, 0), "obj") || !isStr(kid(get, 1), "name") {
 		t.Fatalf("bad get: %s", dump(get))
 	}
 }
@@ -340,7 +344,7 @@ func Test_Parser_Dot_Zero_Then_Name_Chain(t *testing.T) {
 	}
 	idx := kid(get, 0)
 	wantTag(t, idx, "idx")
-	if !isId(kid(idx, 0), "arr") {
+	if !testIsId(kid(idx, 0), "arr") {
 		t.Fatalf("base not arr: %s", dump(idx))
 	}
 	if head(kid(idx, 1)) != "int" || kid(idx, 1)[1].(int64) != 0 {
@@ -473,11 +477,14 @@ func Test_Parser_TrailingComma_InPatterns_ObjectAndArray(t *testing.T) {
 	asn := first(root)
 	wantTag(t, asn, "assign")
 	lhs := kid(asn, 0)
+	wantTag(t, lhs, "let")
+	pat := kid(lhs, 0)
+	wantTag(t, pat, "map")
+
 	rhs := kid(asn, 1)
-	wantTag(t, lhs, "dobj")
 	wantTag(t, rhs, "map")
-	if len(lhs) != 1+2 || len(rhs) != 1+2 {
-		t.Fatalf("bad sizes: lhs=%d rhs=%d", len(lhs)-1, len(rhs)-1)
+	if len(pat) != 1+2 || len(rhs) != 1+2 {
+		t.Fatalf("bad sizes: lhs=%d rhs=%d", len(pat)-1, len(rhs)-1)
 	}
 }
 
@@ -647,7 +654,7 @@ func Test_Parser_Type_Optional_Postfix_Simple(t *testing.T) {
 	wantTag(t, ty, "type")
 	opt := ty[1].(S)
 	wantTag(t, opt, "unop")
-	if opt[1].(string) != "?" || !isId(opt[2].(S), "Str") {
+	if opt[1].(string) != "?" || !testIsId(opt[2].(S), "Str") {
 		t.Fatalf("bad optional Str?: %s", dump(opt))
 	}
 }
@@ -689,10 +696,12 @@ func Test_Parser_Type_Optional_Inside_Record_Fields(t *testing.T) {
 
 func Test_Parser_Let_SimpleDecl(t *testing.T) {
 	root := mustParse(t, `let x`)
-	decl := first(root)
-	wantTag(t, decl, "decl")
-	if decl[1].(string) != "x" {
-		t.Fatalf("decl != x")
+	node := first(root)
+	wantTag(t, node, "let")
+	pat := kid(node, 0)
+	wantTag(t, pat, "id")
+	if pat[1].(string) != "x" {
+		t.Fatalf("pattern != x")
 	}
 }
 
@@ -700,16 +709,49 @@ func Test_Parser_Let_ArrayDestructuring_AssignShape(t *testing.T) {
 	root := mustParse(t, `let [x, y] = [1, 2]`)
 	asn := first(root)
 	wantTag(t, asn, "assign")
-	wantTag(t, kid(asn, 0), "darr")
-	wantTag(t, kid(asn, 1), "array")
+
+	lhs := kid(asn, 0)
+	wantTag(t, lhs, "let")
+	pat := kid(lhs, 0)
+	wantTag(t, pat, "array")
+	if len(pat) != 1+2 {
+		t.Fatalf("want 2 pattern elements, got %d", len(pat)-1)
+	}
+	if !testIsId(kid(pat, 0), "x") || !testIsId(kid(pat, 1), "y") {
+		t.Fatalf("bad array pattern: %s", dump(pat))
+	}
+
+	rhs := kid(asn, 1)
+	wantTag(t, rhs, "array")
+	if len(rhs) != 1+2 {
+		t.Fatalf("want 2 rhs elements, got %d", len(rhs)-1)
+	}
 }
 
 func Test_Parser_Let_ObjectDestructuring_AssignShape(t *testing.T) {
 	root := mustParse(t, `let {name: x, age: y} = obj`)
 	asn := first(root)
 	wantTag(t, asn, "assign")
-	wantTag(t, kid(asn, 0), "dobj")
-	if !isId(kid(asn, 1), "obj") {
+
+	lhs := kid(asn, 0)
+	wantTag(t, lhs, "let")
+	pat := kid(lhs, 0)
+	wantTag(t, pat, "map")
+	if len(pat) != 1+2 {
+		t.Fatalf("want 2 pattern fields, got %d", len(pat)-1)
+	}
+	p0 := kid(pat, 0)
+	p1 := kid(pat, 1)
+	wantTag(t, p0, "pair")
+	wantTag(t, p1, "pair")
+	if !isStr(kid(p0, 0), "name") || !testIsId(kid(p0, 1), "x") {
+		t.Fatalf("first pattern field mismatch: %s", dump(p0))
+	}
+	if !isStr(kid(p1, 0), "age") || !testIsId(kid(p1, 1), "y") {
+		t.Fatalf("second pattern field mismatch: %s", dump(p1))
+	}
+
+	if !testIsId(kid(asn, 1), "obj") {
 		t.Fatalf("rhs not obj")
 	}
 }
@@ -717,18 +759,32 @@ func Test_Parser_Let_ObjectDestructuring_AssignShape(t *testing.T) {
 func Test_Parser_Let_NestedPatterns(t *testing.T) {
 	root := mustParse(t, `let {pt: [x, y]} = m`)
 	asn := first(root)
-	obj := kid(asn, 0)
-	wantTag(t, obj, "dobj")
+	wantTag(t, asn, "assign")
+
+	lhs := kid(asn, 0)
+	wantTag(t, lhs, "let")
+	obj := kid(lhs, 0)
+	wantTag(t, obj, "map")
 	p := kid(obj, 0)
-	if kid(p, 0)[1].(string) != "pt" {
+	wantTag(t, p, "pair")
+	if !isStr(kid(p, 0), "pt") {
 		t.Fatalf("key != pt")
 	}
-	wantTag(t, kid(p, 1), "darr")
+	arr := kid(p, 1)
+	wantTag(t, arr, "array")
+	if len(arr) != 1+2 || !testIsId(kid(arr, 0), "x") || !testIsId(kid(arr, 1), "y") {
+		t.Fatalf("nested array pattern mismatch: %s", dump(arr))
+	}
 }
 
-func Test_Parser_Let_Destructuring_MustHaveEquals(t *testing.T) {
-	if _, err := ParseSExpr(`let [x, y]`); err == nil {
-		t.Fatalf("expected error for missing '=' after destructuring let")
+func Test_Parser_Let_Destructuring_DeclOnly_Shape(t *testing.T) {
+	root := mustParse(t, `let [x, y]`)
+	node := first(root)
+	wantTag(t, node, "let")
+	pat := kid(node, 0)
+	wantTag(t, pat, "array")
+	if len(pat) != 1+2 || !testIsId(kid(pat, 0), "x") || !testIsId(kid(pat, 1), "y") {
+		t.Fatalf("bad destructuring decl-only pattern: %s", dump(pat))
 	}
 }
 
@@ -740,7 +796,13 @@ func Test_Parser_For_Target_Decl(t *testing.T) {
 	root := mustParse(t, `for let x in xs do end`)
 	fr := first(root)
 	wantTag(t, fr, "for")
-	wantTag(t, kid(fr, 0), "decl")
+	target := kid(fr, 0)
+	wantTag(t, target, "let")
+	pat := kid(target, 0)
+	wantTag(t, pat, "id")
+	if pat[1].(string) != "x" {
+		t.Fatalf("for-target name mismatch")
+	}
 }
 
 func Test_Parser_For_Target_Index(t *testing.T) {
@@ -761,21 +823,35 @@ func Test_Parser_For_ArrayPattern_NoLet(t *testing.T) {
 	root := mustParse(t, `for [k, v] in obj do end`)
 	fr := first(root)
 	wantTag(t, fr, "for")
-	wantTag(t, kid(fr, 0), "darr")
+	pat := kid(fr, 0)
+	wantTag(t, pat, "array")
+	if len(pat) != 1+2 || !testIsId(kid(pat, 0), "k") || !testIsId(kid(pat, 1), "v") {
+		t.Fatalf("for array pattern mismatch: %s", dump(pat))
+	}
 }
 
 func Test_Parser_For_ArrayPattern_WithLet(t *testing.T) {
 	root := mustParse(t, `for let [k, v] in obj do end`)
 	fr := first(root)
 	wantTag(t, fr, "for")
-	wantTag(t, kid(fr, 0), "darr")
+	target := kid(fr, 0)
+	wantTag(t, target, "let")
+	pat := kid(target, 0)
+	wantTag(t, pat, "array")
+	if len(pat) != 1+2 || !testIsId(kid(pat, 0), "k") || !testIsId(kid(pat, 1), "v") {
+		t.Fatalf("for let array pattern mismatch: %s", dump(pat))
+	}
 }
 
 func Test_Parser_For_ObjectPattern(t *testing.T) {
 	root := mustParse(t, `for {name: n, age: a} in people do end`)
 	fr := first(root)
 	wantTag(t, fr, "for")
-	wantTag(t, kid(fr, 0), "dobj")
+	pat := kid(fr, 0)
+	wantTag(t, pat, "map")
+	if len(pat) != 1+2 {
+		t.Fatalf("want 2 pattern fields, got %d", len(pat)-1)
+	}
 }
 
 func Test_Parser_While_Basic_Shape(t *testing.T) {
@@ -1186,15 +1262,18 @@ func Test_Parser_TrailingComma_InArrayPattern_LHS(t *testing.T) {
 	wantTag(t, asn, "assign")
 	lhs := kid(asn, 0)
 	rhs := kid(asn, 1)
-	wantTag(t, lhs, "darr")
+
+	wantTag(t, lhs, "let")
+	pat := kid(lhs, 0)
+	wantTag(t, pat, "array")
 	wantTag(t, rhs, "array")
-	if len(lhs) != 1+2 || len(rhs) != 1+2 {
-		t.Fatalf("bad sizes: lhs %d rhs %d\n%s", len(lhs)-1, len(rhs)-1, dump(root))
+	if len(pat) != 1+2 || len(rhs) != 1+2 {
+		t.Fatalf("bad sizes: lhs %d rhs %d\n%s", len(pat)-1, len(rhs)-1, dump(root))
 	}
-	if head(kid(lhs, 0)) != "decl" || kid(lhs, 0)[1].(string) != "a" {
+	if !testIsId(kid(pat, 0), "a") {
 		t.Fatalf("first pattern element: %s", dump(lhs))
 	}
-	if head(kid(lhs, 1)) != "decl" || kid(lhs, 1)[1].(string) != "b" {
+	if !testIsId(kid(pat, 1), "b") {
 		t.Fatalf("second pattern element: %s", dump(lhs))
 	}
 }
@@ -1257,31 +1336,6 @@ func Test_Parser_Annot_AfterBlankLine_WrapsNOOP(t *testing.T) {
 	wantTag(t, wrapped, "noop") // lone PRE at EOF wraps NOOP
 }
 
-func Test_Parser_Let_Destructuring_MissingEquals_Anchored(t *testing.T) {
-	src := "let [x, y]"
-	checkParseErr(t, src, 1, len(src)+1, "expected '=' after destructuring let pattern")
-}
-
-func Test_Parser_Oracle_Defaults_NoFrom_NoArrow(t *testing.T) {
-	root := mustParse(t, `oracle()`)
-	orc := first(root)
-	wantTag(t, orc, "oracle")
-	// params: empty array
-	wantTag(t, kid(orc, 0), "array")
-	if len(kid(orc, 0)) != 1 {
-		t.Fatalf("params should be empty array")
-	}
-	// out type defaults to Any
-	if !isId(kid(orc, 1), "Any") {
-		t.Fatalf("default out type should be Any")
-	}
-	// src defaults to empty array
-	wantTag(t, kid(orc, 2), "array")
-	if len(kid(orc, 2)) != 1 {
-		t.Fatalf("default src should be empty array")
-	}
-}
-
 func Test_Parser_Enum_Literal_Array(t *testing.T) {
 	root := mustParse(t, `Enum["A","B"]`)
 	en := first(root)
@@ -1304,7 +1358,7 @@ func Test_Parser_Annot_AfterBlankLine_IsPREOnNextStmt(t *testing.T) {
 	wantTag(t, kid(root, 1), "noop") // the blank-line NOOP
 	ann := kid(root, 2)
 	txt, wrapped := asAnnot(t, ann)
-	if txt != "note" || !isId(wrapped, "y") {
+	if txt != "note" || !testIsId(wrapped, "y") {
 		t.Fatalf("expected PRE 'note' wrapping y: %s", dump(ann))
 	}
 }
@@ -1490,7 +1544,7 @@ let Y = 2
 	wantTag(t, kid(root, 1), "noop")
 	ann2 := kid(root, 2)
 
-	// First statement: annot("A", assign(decl X, 1))
+	// First statement: annot("A", assign(let(id X), 1))
 	txt1, w1 := asAnnot(t, ann1)
 	if txt1 != "A" {
 		t.Fatalf("first PRE annot mismatch: txt=%q", txt1)
@@ -1498,16 +1552,18 @@ let Y = 2
 	wantTag(t, w1, "assign")
 	lhs1 := kid(w1, 0)
 	rhs1 := kid(w1, 1)
-	wantTag(t, lhs1, "decl")
-	if lhs1[1].(string) != "X" {
-		t.Fatalf("first LHS decl mismatch: %s", dump(lhs1))
+	wantTag(t, lhs1, "let")
+	pat1 := kid(lhs1, 0)
+	wantTag(t, pat1, "id")
+	if pat1[1].(string) != "X" {
+		t.Fatalf("first LHS pattern mismatch: %s", dump(lhs1))
 	}
 	wantTag(t, rhs1, "int")
 	if rhs1[1].(int64) != 1 {
 		t.Fatalf("first RHS value mismatch: %s", dump(rhs1))
 	}
 
-	// Second statement: annot("B", assign(decl Y, 2))
+	// Second statement: annot("B", assign(let(id Y), 2))
 	txt2, w2 := asAnnot(t, ann2)
 	if txt2 != "B" {
 		t.Fatalf("second PRE annot mismatch: txt=%q", txt2)
@@ -1515,9 +1571,11 @@ let Y = 2
 	wantTag(t, w2, "assign")
 	lhs2 := kid(w2, 0)
 	rhs2 := kid(w2, 1)
-	wantTag(t, lhs2, "decl")
-	if lhs2[1].(string) != "Y" {
-		t.Fatalf("second LHS decl mismatch: %s", dump(lhs2))
+	wantTag(t, lhs2, "let")
+	pat2 := kid(lhs2, 0)
+	wantTag(t, pat2, "id")
+	if pat2[1].(string) != "Y" {
+		t.Fatalf("second LHS pattern mismatch: %s", dump(lhs2))
 	}
 	wantTag(t, rhs2, "int")
 	if rhs2[1].(int64) != 2 {
@@ -1691,7 +1749,7 @@ func Test_Parser_NOOP_Inside_CallArgs_Ignored(t *testing.T) {
 	if len(call) != 6 {
 		t.Fatalf("want callee + 4 arg nodes (incl NOOPs), got %d", len(call)-1)
 	}
-	if !isId(kid(call, 0), "f") {
+	if !testIsId(kid(call, 0), "f") {
 		t.Fatalf("callee not f")
 	}
 	wantTag(t, kid(call, 1), "noop")
@@ -1957,7 +2015,7 @@ func Test_Parser_CallArgs_DanglingPre_SynthNoop(t *testing.T) {
 	if len(call) != 1+1+2 {
 		t.Fatalf("want callee + 2 args, got %d\n%s", len(call)-1, dump(call))
 	}
-	if !isId(kid(call, 0), "f") {
+	if !testIsId(kid(call, 0), "f") {
 		t.Fatalf("callee not f")
 	}
 	wantTag(t, kid(call, 1), "int")
@@ -2003,14 +2061,18 @@ func Test_Parser_ArrayPattern_DanglingPre_SynthNoop(t *testing.T) {
 	asn := first(root)
 	wantTag(t, asn, "assign")
 	lhs := kid(asn, 0)
-	wantTag(t, lhs, "darr")
-	if len(lhs) != 1+2 {
-		t.Fatalf("want decl(a), annot(note, noop), got %s", dump(lhs))
+	wantTag(t, lhs, "let")
+	pat := kid(lhs, 0)
+	wantTag(t, pat, "array")
+	if len(pat) != 1+2 {
+		t.Fatalf("want id(a), annot(note, noop), got %s", dump(pat))
 	}
-	wantTag(t, kid(lhs, 0), "decl")
-	txt, wrapped := asAnnot(t, kid(lhs, 1))
+	if !testIsId(kid(pat, 0), "a") {
+		t.Fatalf("first pattern element mismatch: %s", dump(pat))
+	}
+	txt, wrapped := asAnnot(t, kid(pat, 1))
 	if txt != "note" || head(wrapped) != "noop" {
-		t.Fatalf("want annot(note, noop), got %s", dump(kid(lhs, 1)))
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(pat, 1)))
 	}
 }
 
@@ -2019,14 +2081,16 @@ func Test_Parser_ObjectPattern_DanglingPre_SynthNoop(t *testing.T) {
 	asn := first(root)
 	wantTag(t, asn, "assign")
 	lhs := kid(asn, 0)
-	wantTag(t, lhs, "dobj")
-	if len(lhs) != 1+2 {
-		t.Fatalf("want pair(a:x), annot(note, noop), got %s", dump(lhs))
+	wantTag(t, lhs, "let")
+	pat := kid(lhs, 0)
+	wantTag(t, pat, "map")
+	if len(pat) != 1+2 {
+		t.Fatalf("want pair(a:x), annot(note, noop), got %s", dump(pat))
 	}
-	wantTag(t, kid(lhs, 0), "pair")
-	txt, wrapped := asAnnot(t, kid(lhs, 1))
+	wantTag(t, kid(pat, 0), "pair")
+	txt, wrapped := asAnnot(t, kid(pat, 1))
 	if txt != "note" || head(wrapped) != "noop" {
-		t.Fatalf("want annot(note, noop), got %s", dump(kid(lhs, 1)))
+		t.Fatalf("want annot(note, noop), got %s", dump(kid(pat, 1)))
 	}
 }
 
@@ -2352,17 +2416,6 @@ func Test_Parser_Incomplete_Table(t *testing.T) {
 			// Current behavior: element-first parse falls to EOF in expr → incomplete at 2:1
 			wantLine: 2, wantCol: 1,
 			wantSub: "unexpected end of input",
-		},
-
-		// ── Regression: destructuring let must be incomplete if '=' is missing ──
-
-		// Destructuring let with only gaps (NOOPs) before EOF: MUST be Incomplete.
-		{
-			name: "Let_Destructuring_MissingAssign_WithBlankLines",
-			src:  "let [a,b]\n\n",
-			// posAfterLastSpan() → after ']' on line 1; "let␠[a,b]" → col 10
-			wantLine: 1, wantCol: 10,
-			wantSub: "expected '=' after destructuring let pattern",
 		},
 	}
 

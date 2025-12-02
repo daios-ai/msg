@@ -244,7 +244,7 @@ func Test_Interpreter_For_Array_Sum_With_Continue(t *testing.T) {
 	// NOTE: continue is supported in the loop body; avoid break in this minimal test
 	src := `
 let sum = 0
-for let x in [1,2,3,4] do
+for x in [1,2,3,4] do
   if x == 3 then
     continue(0)
   end
@@ -362,17 +362,19 @@ func Test_Interpreter_Let_ArrayDestructuring_AnnotatedNull_When_Short(t *testing
 let [a, b] = [1]
 b
 `)
-	wantAnnotatedNullContains(t, v, "array pattern")
-	wantAnnotatedNullContains(t, v, "missing")
+	wantNull(t, v)
+	if isAnnotatedNull(v) {
+		t.Fatalf("want plain null for missing array element, got annotated null: %#v", v)
+	}
 }
 
 func Test_Interpreter_Let_ArrayDestructuring_WrongShape_AnnotatedNull(t *testing.T) {
-	v := evalSrc(t, `
+	err := evalSrcExpectError(t, `
 let [a] = 42
 a
 `)
-	wantAnnotatedNullContains(t, v, "array pattern")
-	wantAnnotatedNullContains(t, v, "not an array")
+	wantErrContains(t, err, "array pattern")
+	wantErrContains(t, err, "not an array")
 }
 
 func Test_Interpreter_Let_ObjectDestructuring_Binds_Selected_Keys(t *testing.T) {
@@ -390,12 +392,12 @@ x
 }
 
 func Test_Interpreter_Let_ObjectDestructuring_WrongShape_AnnotatedNull(t *testing.T) {
-	v := evalSrc(t, `
+	err := evalSrcExpectError(t, `
 let {foo: x} = 10
 x
 `)
-	wantAnnotatedNullContains(t, v, "object pattern")
-	wantAnnotatedNullContains(t, v, "not a map")
+	wantErrContains(t, err, "object pattern")
+	wantErrContains(t, err, "not a map")
 }
 
 func Test_Interpreter_Let_ObjectDestructuring_MissingKey_AnnotatedNull(t *testing.T) {
@@ -403,8 +405,10 @@ func Test_Interpreter_Let_ObjectDestructuring_MissingKey_AnnotatedNull(t *testin
 let {age: a, name: n} = {name: "Pedro"}
 a
 `)
-	wantAnnotatedNullContains(t, v, "object pattern")
-	wantAnnotatedNullContains(t, v, "missing key")
+	wantNull(t, v)
+	if isAnnotatedNull(v) {
+		t.Fatalf("want plain null for missing object key, got annotated null: %#v", v)
+	}
 }
 
 func Test_Interpreter_Let_Nested_Patterns_ArrayInObject(t *testing.T) {
@@ -454,18 +458,20 @@ func Test_Interpreter_Let_Nested_Missing_Key_Annotated(t *testing.T) {
 let {b: {d: q}} = {b: {}}
 q
 `)
-	wantAnnotatedNullContains(t, v, "object pattern")
-	wantAnnotatedNullContains(t, v, "missing key")
+	wantNull(t, v)
+	if isAnnotatedNull(v) {
+		t.Fatalf("want plain null for nested missing key, got annotated null: %#v", v)
+	}
 }
 
 func Test_Interpreter_Let_Nested_WrongShape_Annotated(t *testing.T) {
-	v := evalSrc(t, `
+	err := evalSrcExpectError(t, `
 let {a: [x]} = {a: 5}
 x
 `)
-	// It's an array pattern, so assert "not an array"
-	wantAnnotatedNullContains(t, v, "array pattern")
-	wantAnnotatedNullContains(t, v, "not an array")
+	// It's an array pattern, so assert "not an array" via hard runtime error
+	wantErrContains(t, err, "array pattern")
+	wantErrContains(t, err, "not an array")
 }
 
 func Test_Interpreter_Let_ArrayOfObjects_Destructuring(t *testing.T) {
@@ -494,8 +500,29 @@ let {a: [x, y, z]} = {a: [1]}
 	if arr.Tag != VTArray || len(arr.Data.(*ArrayObject).Elems) != 2 {
 		t.Fatalf("want array of 2, got %#v", v)
 	}
-	wantAnnotatedNullContains(t, arr.Data.(*ArrayObject).Elems[0], "array pattern") // z
-	wantAnnotatedNullContains(t, arr.Data.(*ArrayObject).Elems[1], "array pattern") // y
+	vz := arr.Data.(*ArrayObject).Elems[0] // z
+	vy := arr.Data.(*ArrayObject).Elems[1] // y
+
+	wantNull(t, vz)
+	if isAnnotatedNull(vz) {
+		t.Fatalf("want plain null for missing z, got annotated null: %#v", vz)
+	}
+
+	wantNull(t, vy)
+	if isAnnotatedNull(vy) {
+		t.Fatalf("want plain null for missing y, got annotated null: %#v", vy)
+	}
+}
+
+// New: for-loop destructuring should also treat wrong-shape elements as a hard error.
+func Test_Interpreter_For_ArrayDestructuring_WrongShape_RuntimeError(t *testing.T) {
+	err := evalSrcExpectError(t, `
+let xs = [1, 2]
+for [a, b] in xs do
+  a
+end
+`)
+	wantErrContains(t, err, "array pattern")
 }
 
 func Test_Interpreter_Let_ObjectDestructuring_WithAnnotations(t *testing.T) {
@@ -644,7 +671,7 @@ func Test_Interpreter_For_Map_Yields_Pairs_As_Array(t *testing.T) {
 	src := `
 let m = {a: 1, b: 2}
 let sum = 0
-for let p in m do
+for p in m do
   sum = sum + p.1
 end
 sum
@@ -671,7 +698,7 @@ let range = fun(start: Int, finish: Int) -> Null -> Int? do
 end
 
 let sum = 0
-for let x in range(5, 8) do
+for x in range(5, 8) do
   sum = sum + x
 end
 sum
@@ -807,7 +834,7 @@ end
 func Test_Interpreter_For_Expression_Value_Null(t *testing.T) {
 	v := evalSrc(t, `
 let s = 0
-for let x in [1,2] do
+for x in [1,2] do
   s = s + x
 end
 `)
@@ -841,7 +868,7 @@ let bad = fun() -> Int? do
   )
 end
 let sum = 0
-for let x in bad do
+for x in bad do
   sum = sum + x
 end
 sum
@@ -864,7 +891,7 @@ let iter = fun() -> Int? do
   end
 end
 let sum = 0
-for let x in iter do
+for x in iter do
   sum = sum + x
 end
 sum
@@ -1446,7 +1473,7 @@ func Test_Interpreter_For_Expr_Evaluated_Once_Array_WithPreAnnotation(t *testing
 	// PRE annotation sits immediately above the for-loop.
 	res := mustEvalPersistent(t, ip, `
 # doc: EXPR should be evaluated exactly once
-for let x in (fun() do calls = calls + 1
+for x in (fun() do calls = calls + 1
 [10, 20, 30] end)() do
   x
 end
@@ -1461,7 +1488,7 @@ func Test_Interpreter_For_Expr_Evaluated_Once_Map_WithPreAnnotation(t *testing.T
 
 	res := mustEvalPersistent(t, ip, `
 # doc: map EXPR evaluated once; iterator yields [key, value]
-for let v in (fun() do mcalls = mcalls + 1
+for v in (fun() do mcalls = mcalls + 1
 {a: 1, b: 2} end)() do
   v[1]     # grab the value from [key, value]
 end
@@ -1489,7 +1516,7 @@ let makeIter = fun() do
   end
 end
 
-for let x in makeIter() do
+for x in makeIter() do
   x
 end
 `)
@@ -1500,7 +1527,7 @@ end
 func Test_Interpreter_For_Destructure_Map_Yields_KeyValue(t *testing.T) {
 	// Ensure the map iterator yields [key, value] and destructuring works.
 	v := evalSrc(t, `
-for let [k, v] in {a: 1, b: 2} do
+for [k, v] in {a: 1, b: 2} do
   [k, v]
 end
 `)
@@ -1513,7 +1540,7 @@ end
 
 func Test_Interpreter_For_Target_Binding_Persists(t *testing.T) {
 	v := evalSrc(t, `
-for let y in [7, 8, 9] do
+for y in [7, 8, 9] do
   y
 end
 y
@@ -1524,7 +1551,7 @@ y
 func Test_Interpreter_For_ToIterContractError_Message(t *testing.T) {
 	err := evalSrcExpectError(t, `
 # PRE annotation above the loop should not mask the correct error
-for let x in "oops" do
+for x in "oops" do
   x
 end
 `)

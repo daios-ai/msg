@@ -851,7 +851,6 @@ func (ip *Interpreter) buildBaseTemplate() error {
 
 	ip.baseTemplate = tmpl
 
-	ip.SeedRuntimeInto(tmpl)
 	if err := ip.SeedRuntimeInto(tmpl); err != nil {
 		return err
 	}

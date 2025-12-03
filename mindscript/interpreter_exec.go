@@ -111,13 +111,14 @@ func (x *execImpl) funMeta(fn Value) (Callable, bool) {
 //                      CORE EXECUTION PLUMBING (PRIVATE)
 ////////////////////////////////////////////////////////////////////////////////
 
-func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (out Value, err error) {
-
-	// Debug spans.
-	if DebuggingMode {
-		_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
-	}
-
+// runWithTrampoline centralizes fatal error handling for top-level runs.
+// It converts panics and structured runtime errors into either an annotated-null
+// Value (when uncaught==true) or a *Error with caret information.
+func (ip *Interpreter) runWithTrampoline(
+	sr *SourceRef,
+	uncaught bool,
+	run func() Value,
+) (out Value, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			switch sig := r.(type) {
@@ -141,57 +142,73 @@ func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *Sour
 					line, col = ip.sourcePosFromChunk(nil, srcRef, 0)
 				}
 				if uncaught {
-					out, err = errNull(sig.msg), nil
+					out, err = annotNull(sig.msg), nil
 					return
 				}
 				err = &Error{Kind: DiagRuntime, Msg: sig.msg, Src: srcRef, Line: line, Col: col}
 				out = Value{}
 			case error:
+				msg := sig.Error()
 				if uncaught {
-					out, err = annotNull(sig.Error()), nil
+					out, err = annotNull(msg), nil
 					return
 				}
 				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = &Error{Kind: DiagRuntime, Msg: sig.Error(), Src: sr, Line: line, Col: col}
+				err = &Error{Kind: DiagRuntime, Msg: msg, Src: sr, Line: line, Col: col}
 				out = Value{}
 			default:
+				msg := fmt.Sprintf("runtime panic: %v", r)
 				if uncaught {
-					out, err = annotNull(fmt.Sprintf("runtime panic: %v", r)), nil
+					out, err = annotNull(msg), nil
 					return
 				}
 				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = &Error{Kind: DiagRuntime, Msg: fmt.Sprintf("runtime panic: %v", r), Src: sr, Line: line, Col: col}
+				err = &Error{Kind: DiagRuntime, Msg: msg, Src: sr, Line: line, Col: col}
 				out = Value{}
 			}
 		}
 	}()
 
-	ch := ip.jitTop(ast, sr)
-	prev := ip.currentSrc
-	ip.currentSrc = ch.Src
-	res := ip.runChunk(ch, env, 0)
-	ip.currentSrc = prev
+	out = run()
+	return out, nil
+}
 
-	switch res.status {
-	case vmOK, vmReturn:
-		return res.value, nil
-	case vmRuntimeError:
-		if uncaught {
-			return res.value, nil
-		}
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		msg := res.value.Annot
-		if msg == "" {
-			msg = "runtime error"
-		}
-		return Value{}, &Error{Kind: DiagRuntime, Msg: msg, Src: ch.Src, Line: line, Col: col}
-	default:
-		if uncaught {
-			return errNull("unknown VM status"), nil
-		}
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		return Value{}, &Error{Kind: DiagRuntime, Msg: "unknown VM status", Src: ch.Src, Line: line, Col: col}
+func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (Value, error) {
+
+	// Debug spans.
+	if DebuggingMode {
+		_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
 	}
+
+	return ip.runWithTrampoline(sr, uncaught, func() Value {
+		ch := ip.jitTop(ast, sr)
+		prev := ip.currentSrc
+		ip.currentSrc = ch.Src
+		res := ip.runChunk(ch, env, 0)
+		ip.currentSrc = prev
+
+		switch res.status {
+		case vmOK, vmReturn:
+			return res.value
+		case vmRuntimeError:
+			if uncaught {
+				return res.value
+			}
+			line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+			msg := res.value.Annot
+			if msg == "" {
+				msg = "runtime error"
+			}
+			// Bubble as *Error; trampoline will convert to API-level (Value, error).
+			panic(&Error{Kind: DiagRuntime, Msg: msg, Src: ch.Src, Line: line, Col: col})
+		default:
+			if uncaught {
+				return errNull("unknown VM status")
+			}
+			line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
+			panic(&Error{Kind: DiagRuntime, Msg: "unknown VM status", Src: ch.Src, Line: line, Col: col})
+		}
+	})
 }
 
 // Build a one-off top-level function body and ensure it is compiled.

@@ -1,19 +1,36 @@
-# JSON-MindScript Manual (Revised, MindScript-aligned)
 
-**JSON-MindScript** is a strict-JSON, machine-readable S-expressions language. Every construct is an expression, every file is **pure JSON**, and evaluation is **strict left-to-right**. It supports **deductive** (deterministic functions) and **inductive** (first-class **oracles**) computation. Structural **types are first-class**. Documentation and machine metadata travel via **annotations**.
+# JSON-MindScript Manual (Updated)
+
+JSON-MindScript is a strict-JSON, machine-readable encoding of MindScript’s canonical S-expressions. Every construct is an expression, every file is **pure JSON**, and evaluation is **strict left-to-right**. It supports **deductive** (deterministic functions) and **inductive** (first-class oracles) computation. Structural **types are first-class**. Documentation and machine metadata travel via **annotations**.
 
 Canonical output ends with exactly **one** trailing newline.
 
+This manual describes the canonical runtime S-grammar used by the introspection layer (`IxToS`, `IxFromS`, `IxReflect`, `IxValidateS`, `IxReify`).
+
 ---
 
-## 1) Parsing & File Rules
+## 1) Core Ideas
 
-* Source files are **pure JSON**: no comments, trailing commas, JSON5/JSONC, etc.
+* **Everything is an expression.** Blocks, conditionals, loops, declarations, and assignments evaluate to a value (usually the last subexpression).
+* **Strict left-to-right evaluation.** Receivers, operands, and arguments evaluate left→right.
+* **Structural types are first-class.** Types can be constructed as values (`["type", typeNode]`), passed around, and introspected.
+* **Two kinds of failure:**
+
+  * **Errors** are values: idiomatically a **nullable type** (`T?`) whose error case is an (optionally annotated) `["null"]`.
+  * **Panics** abort evaluation (lexer/parser/runtime). Use `try` to capture them.
+
+---
+
+## 2) Files, JSON & Node Shape
+
+### 2.1 Pure JSON
+
+* Source files are **pure JSON**: no comments, trailing commas, JSON5/JSONC features, etc.
 * Implementations **must** reject invalid JSON **before** evaluation.
 
-**Self-test:** the file should pass a vanilla JSON parser (e.g., `jq -e .`).
+Self-test: the file must parse under a vanilla JSON parser.
 
-**Invalid (do not copy):**
+Invalid:
 
 ```json
 ["array",
@@ -28,197 +45,418 @@ Canonical output ends with exactly **one** trailing newline.
 ]
 ```
 
----
+### 2.2 Runtime S node shape
 
-## 2) Evaluation Model (Strict, Expression-Oriented)
+* Every node is a JSON array:
 
-* **Everything is an expression.** Blocks return the last subexpression (or `["null"]` if empty).
-* **Strict L→R evaluation** for receivers, operands, and arguments.
-* **Assignment** evaluates to the assigned value.
+  * First element: a **string tag** (e.g. `"int"`, `"fun"`, `"map"`).
+  * Remaining elements: tag-specific **children** (subnodes or scalars).
+* Example:
+
+```json
+["binop", "+", ["int", 1], ["int", 2]]
+```
+
+`IxFromS` accepts only:
+
+* arrays (`VTArray`) whose first element is `VTStr` tag;
+* children that are arrays (recursively S), `VTStr`, `VTInt`, `VTNum`, or `VTBool`.
+  Any other scalar tag is rejected as a **hard error**.
 
 ---
 
 ## 3) Core Values
 
-**Tagged scalars**
+### 3.1 Tagged scalars
+
+All scalars are tagged:
 
 * `["null"]`
-* `["bool", true|false]`
+* `["bool", true | false]`
 * `["int", <int64>]`
 * `["num", <float64>]`
 * `["str", "<utf8>"]`
 
-**Arrays**
+Negative numbers encode directly as `["int",-2]`, `["num",-1.5]`.
 
-* `["array", v1, v2, ...]` — 0-based; negative indices count from the end.
-* **Monomorphic**: all elements share one type; violations panic at construction/update.
+### 3.2 Arrays (value context)
 
-**Maps (string-keyed)**
-
-* `["map", ["pair", ["str","k"], v], ...]`
-* In **type** positions, `["pair!", ["str","k"], T]` marks **required**.
-* Later duplicate keys **overwrite** earlier ones.
-* Insertion order is preserved for display/iteration; ignored by equality/subtyping.
-
-**Functions**
-
-* `["fun", paramsArray, retTypeOrAny, bodyBlock]`
-* **No zero-arity functions**: every function/oracle has **≥1 parameter**.
-
-**Oracles**
-
-* `["oracle", paramsArray, retType, optsMap?]` (§12)
-
-**Modules**
-
-* `["module", nameExpr, bodyBlock]` — yields a writable export map (§11)
-
-**Types (first-class)**
-
-* `["type", typeExpr]` — see §9
-
-**Annotations**
-
-* `["annot", ["str", textOrAngleText], value]` — docs/metadata (§10)
-
----
-
-## 4) Operators, Calls & Access
-
-**Unary**
-
-* Arithmetic / logic: `["unop","-", x]`, `["unop","not", x]`
-* Nullable **type constructor**: `["unop","?", T]` → `T?` (see §9)
-
-**Binary**
-
-* Arithmetic: `"+" "-" "*" "/" "%"`
-
-  * **Numeric tower**: `Int` (int64), `Num` (float64).
-  * **Promotion**: only when **one operand is `Num`**.
-  * **Division**: `Int/Int` → **Int** (e.g., `1/2 == 0`); otherwise → **Num**.
-  * **Modulo**: sign follows the **dividend**.
-  * **Divide-by-zero**: **panic**.
-* Comparisons: `"<" "<=" ">" ">="` — only **number–number** (Int & Num mix OK) or **string–string**; other mixes **panic**.
-* Equality: `"==" "!="` — deep for arrays/maps; numbers by value (`2 == 2.0` true); annotations ignored.
-* Boolean: `"and" "or"` — short-circuit; operands must be `Bool` (no implicit truthiness here).
-
-**Access & call**
-
-* Property: `["get", obj, ["str","name"]]`
-* Index array: `["idx", arr, i]` (0-based; negatives from end)
-* Index map: `["idx", map, ["str","k"]]`
-* **Call**: `["call", callee, a1, ...]` (L→R evaluation) — **must include ≥1 argument** (see “No zero-arity” below).
-
-**No zero-arity calls**
-
-* `["call", f]` is **invalid**.
-* To “run” a callable with no meaningful input, declare **one parameter** (e.g., `Any` or `Null`) and **pass an argument** (often `["null"]`).
-
-**Panics** for invalid operations: invalid receiver/target, missing key, out-of-bounds index, illegal comparison, divide-by-zero, arity overflow.
-
-**Examples**
+Value arrays:
 
 ```json
-["binop","+", ["int",2], ["num",2.5]]
+["array", v1, v2, ...]
 ```
 
-```json
-["binop","/", ["int",1], ["int",2]]      // => Int 0
-```
+* Elements are expression nodes.
+* Semantically **monomorphic** at the language level (all elements conceptually share one element type).
+* Indices:
+
+  * 0-based.
+  * Negative indices count from the end: `-1` is last, `-2` is second-last.
+* Out-of-bounds access **panics**.
+
+### 3.3 Maps (value context)
+
+String-keyed maps:
 
 ```json
-["binop","/", ["int",3], ["num",2.0]]    // => Num 1.5
-```
-
-```json
-["idx", ["array", ["int",10], ["int",20]], ["int",-1]]
-```
-
-```json
-["binop","and", ["bool", false], ["call", ["id","expensive"], ["null"]]]
-```
-
----
-
-## 5) Collections
-
-* **Arrays**: 0-based; `-1` is the last element; negatives count from end; **monomorphic**.
-* **Maps**: string keys; open-world; later duplicates overwrite.
-
-**Examples**
-
-```json
-["idx", ["array", ["int",1], ["int",2], ["int",3]], ["int",-1]]
-```
-
-```json
-["idx",
-  ["map",
-    ["pair", ["str","x"], ["int",1]],
-    ["pair", ["str","x"], ["int",2]]
-  ],
-  ["str","x"]
+["map",
+  ["pair", ["str","k1"], v1],
+  ["pair", ["str","k2"], v2]
 ]
 ```
+
+* Keys:
+
+  * Key node is `["str","k"]` or an annotated string (see §10).
+* Value node is any expression.
+* Later duplicate keys **overwrite** earlier ones.
+* Insertion order is preserved for display/iteration but ignored by equality/subtyping.
+* **Value maps** use only `"pair"` (not `"pair!"`; `"pair!"` is type-only, §4.3).
+
+### 3.4 Special values
+
+* **No handle literals:** the `"handle"` tag is forbidden in canonical runtime S. Handles exist only as opaque runtime values obtained from built-ins (e.g. `open`, `netConnect`).
+* **Noop:** `["noop"]` is a special “do nothing” value used to represent blanks between annotations in surface code. It is rarely needed in JSON directly.
+
+---
+
+## 4) Types (Structural & First-Class)
+
+Type ASTs appear inside `["type", typeNode]` values and in function/oracle signatures.
+
+### 4.1 Type IDs
+
+Primitive type identifiers (as `["id", "..."]`):
+
+* `Any | Null | Bool | Int | Num | Str | Handle | Type`
+
+Handle hierarchy:
+
+* `Handle` is a base type identifier.
+* Handle kinds are qualified forms, e.g. `Handle.file`, encoded as:
+
+```json
+["get", ["id","Handle"], ["str","file"]]
+```
+
+Each `Handle.<kind>` is a distinct nominal type; kinds do not unify structurally and only subtype `Any`.
+
+### 4.2 Nullable types
+
+Nullable type:
+
+```json
+["unop", "?", T]
+```
+
+Rendered as `T?`.
+
+Special case:
+
+* **`Any? = Any`**: `["unop","?", ["id","Any"]]` is semantically equivalent to `["id","Any"]`.
+
+### 4.3 Arrays (type context)
+
+Array type:
+
+```json
+["array", ElemType]
+```
+
+* Exactly one child type; `IxValidateS` enforces arity 2 for this node.
+* At the value level, arrays are monomorphic by this element type.
+
+### 4.4 Maps (type context, open maps)
+
+Open maps (string keys, optional/required fields):
+
+```json
+["map",
+  ["pair",  KeyNode, TypeNode],   // optional
+  ["pair!", KeyNode, TypeNode]    // required
+]
+```
+
+* Key node: `["str","fieldName"]` or an annotated string (see §10).
+* `"pair"` → optional field; when present must conform to `TypeNode`.
+* `"pair!"` → **required** field.
+* Requiredness is only meaningful in **type–type** comparison; value conformance (`isType`) ignores requiredness flags.
+
+### 4.5 Enums
+
+Enum of members:
+
+```json
+["enum", member1, member2, ...]
+```
+
+Current semantics:
+
+* **Members are arbitrary expressions**, not just literals.
+* `IxValidateS` validates each member as an expression (not a `block`).
+* At **evaluation time** (e.g. via `IxReify`), members must evaluate to **literal values**:
+
+  * `null`, `bool`, `int`, `num`, `str`, array of literals, or map of literals.
+* The runtime type system operates on the resulting **literal member set**.
+
+### 4.6 Function & oracle types
+
+Function/oracle arrow type:
+
+```json
+["binop", "->", A, B]
+```
+
+* Right-associative: `A -> B -> R` ≡ `A -> (B -> R)` ≡ `(A, B) -> R`.
+* Used for function/oracle type declarations, not for value-level calls.
+
+### 4.7 Type nodes vs value nodes
+
+* Type ASTs appear:
+
+  * In `["type", typeNode]` values.
+  * In function/oracle signatures directly.
+* Inside a `["fun", ...]` or `["oracle", ...]`:
+
+  * Parameter types and return/output types are **type ASTs**, e.g.:
+
+    ```json
+    ["id","Int"]
+    ["array", ["id","Str"]]
+    ["enum", ["str","GET"], ["str","POST"]]
+    ```
+
+  * They are **not** wrapped in `["type", ...]`.
+
+`["type", typeNode]` itself is a **value node** of type `Type`.
+
+---
+
+## 5) Expressions, Operators, Calls & Access
+
+### 5.1 Unary operators
+
+Value-level unary ops:
+
+```json
+["unop", "-", x]        // numeric negation
+["unop", "not", x]      // boolean not
+```
+
+Type-level unary operator:
+
+```json
+["unop", "?", T]        // nullable type, §4.2
+```
+
+### 5.2 Binary operators
+
+Arithmetic (`["binop", op, lhs, rhs]`):
+
+* `op ∈ { "+", "-", "*", "/", "%" }`
+* Numeric tower:
+
+  * `Int` = 64-bit signed integer
+  * `Num` = 64-bit float
+* Promotion:
+
+  * Only when **at least one operand is `Num`**.
+* Division:
+
+  * `Int / Int` → `Int` (truncating toward zero), e.g. `1/2 == 0`.
+  * Otherwise `Num`.
+* Modulo:
+
+  * Sign follows the **dividend**.
+  * Divide-by-zero **panics**.
+
+Comparisons:
+
+* `op ∈ { "<", "<=", ">", ">=" }`
+* Only **number–number** (mixing `Int`/`Num` allowed) or **string–string`.
+* Other mixes **panic**.
+
+Equality:
+
+* `op ∈ { "==", "!=" }`
+* Deep comparison for arrays/maps (map key order ignored).
+* Numbers compare by value (`2 == 2.0` is true).
+* Annotations are ignored.
+
+Boolean operators:
+
+```json
+["binop", "and", a, b]
+["binop", "or",  a, b]
+```
+
+* Short-circuit semantics.
+* Operands must be `Bool` (no implicit truthiness here).
+
+### 5.3 Access & call
+
+Property access:
+
+```json
+["get", objExpr, ["str","field"]]
+```
+
+Index array:
+
+```json
+["idx", arrExpr, indexExpr]   // indexExpr is an expression producing an Int
+```
+
+Index map:
+
+```json
+["idx", mapExpr, ["str","key"]]
+```
+
+Call:
+
+```json
+["call", calleeExpr, arg1Expr, arg2Expr, ...]
+```
+
+* **No zero-arg calls:** `["call", f]` is invalid.
+* Argument list must have ≥ 1 expression.
+
+Panics:
+
+* Invalid receiver/target (e.g. calling non-callables).
+* Missing key / out-of-bounds index.
+* Illegal comparison (wrong operand kinds).
+* Divide-by-zero.
+* Arity overflow (too many arguments) when calling functions.
 
 ---
 
 ## 6) Variables, Patterns & Assignment
 
-**Identifiers**
+### 6.1 Identifiers
 
-* `["id","name"]`
-
-**Patterns**
-
-* Name declaration: `["decl","x"]`
-* Array destructure: `["darr", p1, p2, ...]`
-* Object destructure: `["dobj", ["pair", ["str","k"], subPattern], ...]`
-
-**Binding vs update**
-
-* **Bind** when target is a *pattern* → introduces names.
-* **Update** when target is an l-value (`"id"|"get"|"idx"`) → updates existing.
-  Updating an unbound name/invalid property/index **panics**.
-
-**Destructuring semantics**
-
-* Arrays: missing entries bind `["null"]`; extra items ignored unless matched.
-* Objects: missing keys bind `["null"]`.
-
-**Assignment result**
-
-* `["assign", target, value]` evaluates to the **assigned value**.
-
-**Examples**
+Identifier node:
 
 ```json
-["assign", ["decl","x"], ["int",10]]
+["id","name"]
 ```
+
+### 6.2 Patterns (canonical form)
+
+Bindings are introduced via `["let", pattern]`:
+
+* Simple binding:
+
+  ```json
+  ["let", ["id","x"]]
+  ```
+
+* Array destructuring pattern:
+
+  ```json
+  ["let",
+    ["array",
+      ["id","a"],
+      ["id","b"]
+    ]
+  ]
+  ```
+
+* Map destructuring pattern:
+
+  ```json
+  ["let",
+    ["map",
+      ["pair", ["str","name"], ["id","n"]],
+      ["pair", ["str","age"],  ["id","a"]]
+    ]
+  ]
+  ```
+
+Patterns are ordinary S-nodes (`"id"`, `"array"`, `"map"`) interpreted in **pattern position**.
+
+### 6.3 Assignable targets
+
+Left-hand side (LHS) of `["assign", ...]` may be:
+
+* `["let", pattern]` — binding (declaration).
+* `["id", ...]` — variable update.
+* `["get", obj, keyStrNode]` — property update.
+* `["idx", arrOrMap, indexExprOrKeyStrNode]` — index update.
+* `["array", ...patternElements...]` — destructuring assignment.
+* `["map", ...pair(key, pattern)...]` — destructuring assignment.
+
+The helper in the validator treats tags `let`, `id`, `get`, `idx`, `array`, `map` as assignable.
+
+### 6.4 Binding vs update
+
+Assignment:
+
+```json
+["assign", targetNode, valueExpr]
+```
+
+* If `targetNode` is `["let", pattern]`:
+
+  * Introduces new bindings per the pattern.
+* Otherwise:
+
+  * Updates existing variables/fields/indices.
+  * Updating an unbound name or invalid property/index **panics**.
+
+Destructuring semantics (same as surface MindScript):
+
+* Arrays:
+
+  * Missing entries bind to `["null"]`.
+  * Extra items are ignored unless matched by the pattern shape.
+* Maps:
+
+  * Missing keys bind to `["null"]`.
+
+The result of `["assign", ...]` is the **assigned value** (the RHS result).
+
+### 6.5 Examples
+
+Simple bind + update:
 
 ```json
 ["block",
-  ["assign", ["decl","x"], ["int",1]],
+  ["assign", ["let", ["id","x"]], ["int",1]],
   ["assign", ["id","x"], ["int",2]],
   ["id","x"]
 ]
 ```
 
+Array destructuring bind:
+
 ```json
 ["assign",
-  ["darr", ["decl","a"], ["decl","b"]],
+  ["let",
+    ["array",
+      ["id","a"],
+      ["id","b"]
+    ]
+  ],
   ["array", ["int",1], ["int",2], ["int",3]]
 ]
 ```
 
+Map destructuring bind:
+
 ```json
 ["assign",
-  ["dobj",
-    ["pair", ["str","name"], ["decl","n"]],
-    ["pair", ["str","age"],  ["decl","a"]]
+  ["let",
+    ["map",
+      ["pair", ["str","name"], ["id","n"]],
+      ["pair", ["str","age"],  ["id","a"]]
+    ]
   ],
-  ["map", ["pair", ["str","name"], ["str","Ada"]]]
+  ["map",
+    ["pair", ["str","name"], ["str","Ada"]]
+  ]
 ]
 ```
 
@@ -226,238 +464,212 @@ Canonical output ends with exactly **one** trailing newline.
 
 ## 7) Control Flow
 
-**Block**
+### 7.1 Block
 
-* `["block", e1, e2, ...]` → value of last expression (or `["null"]` if empty).
+Block:
 
-**If / elif / else**
+```json
+["block", e1, e2, ...]
+```
 
-* `["if", ["pair", cond1, thenBlock1], ["pair", cond2, thenBlock2], ..., elseBlock]`
-  `elseBlock` required (use `["block"]` for empty).
+* Evaluates each child expression in order.
+* Returns the value of the **last** child, or `["null"]` if empty.
 
-**While**
+### 7.2 If / elif / else
 
-* `["while", cond, bodyBlock]`
-
-**For** (arrays, maps, modules, host iterables)
-
-* `["for", patOrLval, iterable, bodyBlock]`
-
-  * Arrays yield elements.
-  * Maps yield `["array", ["str",key], value]` pairs.
-  * Modules yield exported bindings (name/value).
-  * Host iterables may end by panicking or naturally.
-
-**Early exits** (exactly one value; use `["null"]` for “empty”)
-
-* `["return", value]`
-* `["break", value]`
-* `["continue", value]`
-
-**Examples**
+Canonical shape:
 
 ```json
 ["if",
-  ["pair", ["bool", false], ["block", ["str","no"]]],
-  ["block", ["str","yes"]]
+  ["pair", cond1Expr, thenBlock1],
+  ["pair", cond2Expr, thenBlock2],
+  ...,
+  elseBlock
 ]
 ```
 
-```json
-["block",
-  ["assign", ["decl","i"], ["int",0]],
-  ["while", ["binop","<", ["id","i"], ["int",3]],
-    ["block",
-      ["assign", ["id","i"], ["binop","+", ["id","i"], ["int",1]]]
-    ]
-  ],
-  ["id","i"]
-]
-```
+* Each non-final arm is a `["pair", condExpr, thenBlock]` where `thenBlock` is a `"block"`.
+* The final element is an **else block**:
+
+  * Must be a `["block", ...]`.
+  * JSON-MindScript requires an explicit `else` (use `["block"]` for empty).
+
+### 7.3 While
 
 ```json
-["block",
-  ["assign", ["decl","sum"], ["int",0]],
-  ["for", ["decl","x"], ["array", ["int",1], ["int",2], ["int",3]],
-    ["block", ["assign", ["id","sum"], ["binop","+", ["id","sum"], ["id","x"]]]]
-  ],
-  ["id","sum"]
-]
+["while", condExpr, bodyBlock]
+```
+
+* `bodyBlock` must be a `"block"` node.
+
+### 7.4 For (arrays, maps, modules, iterables)
+
+```json
+["for", patternOrLval, iterableExpr, bodyBlock]
+```
+
+* Arrays yield elements.
+* Maps yield `["array", keyNode, valueExpr]` pairs where `keyNode` is `["str","k"]`.
+* Modules yield exported bindings as `[name,value]` pairs.
+* `bodyBlock` is a `"block"`.
+
+### 7.5 Early exits
+
+Each carries exactly one value (use `["null"]` if “empty”):
+
+```json
+["return", valueExpr]
+["break",  valueExpr]
+["continue", valueExpr]
 ```
 
 ---
 
-## 8) Errors vs Panics
+## 8) Functions & Oracles
 
-* **Error**: an intentional result using a **nullable type** `T?` with `["annot", ["str","<msg>"], ["null"]]`.
-* **Panic**: exceptional runtime fault (e.g., invalid index, missing key, type/arity **overflow** violation, illegal comparison, divide-by-zero). Panics abort evaluation unless captured.
+### 8.1 Functions
 
-**Capturing panics — `try`**
-
-* `["call", ["id","try"], expr]` returns **exactly** `{ ok!: Bool, value!: Any }`.
-  When `ok=false`, `value` carries implementation-defined panic info (there is **no** `error` field).
-
-**Quick table**
-
-| Situation                       | Behavior                                    |
-| ------------------------------- | ------------------------------------------- |
-| Oracle output doesn’t match `R` | Return `["annot","<reason>",["null"]]`      |
-| Oracle unavailable              | Return `["annot","<unavailable>",["null"]]` |
-| **Arity underflow**             | Returns a **function** awaiting the rest    |
-| **Arity overflow**              | **Panic** (capture via `try`)               |
-| Missing map key / OOB index     | **Panic**                                   |
-| Divide by zero                  | **Panic**                                   |
-
-**Example**
+Function value:
 
 ```json
-["block",
-  ["assign", ["decl","r1"],
-    ["call", ["id","try"],
-      ["block", ["binop","/", ["int",1], ["int",0]]]
-    ]
+["fun",
+  ["array",
+    ["pair", ["id","paramName1"], ParamType1],
+    ["pair", ["id","paramName2"], ParamType2]
   ],
-  ["assign", ["decl","r2"],
-    ["call", ["id","try"],
-      ["block", ["int",42]]
-    ]
-  ],
-  ["array", ["id","r1"], ["id","r2"]]
+  ReturnType,
+  bodyBlock
 ]
 ```
 
----
+Rules:
 
-## 9) Types (Structural, First-Class)
+* **No zero-arity functions:** the params array must have **at least one** `"pair"`.
+* Parameter and return types are **type ASTs** (not wrapped in `["type", ...]`).
+* The body must be a `"block"`.
+* At call time:
 
-**Type IDs**
+  * Each argument must conform to the parameter type; otherwise **panic**.
+  * The returned value must conform to the declared return type; otherwise **panic**.
 
-* `Any | Null | Bool | Int | Num | Str | Type`
+Arity behavior:
 
-**Nullable**
+* **Underflow** (fewer arguments than parameters):
 
-* `["unop","?", T]` renders as `T?`.
-* **Special case:** **`Any? = Any`**. That is, `["unop","?", ["id","Any"]]` ≡ `["id","Any"]`.
+  * Returns a **function** waiting for the remaining parameters (currying).
+* **Overflow** (too many arguments):
 
-**Arrays**
+  * **Panic**.
 
-* `["array", T]` (monomorphic element type)
-
-**Maps (open)**
-
-* `["map", ["pair",  ["str","k"], T], ...]` — optional field
-* `["map", ["pair!", ["str","k"], T], ...]` — **required** field
-
-**Enums**
-
-* `["enum", lit1, lit2, ...]` — literals may be scalars, arrays, or maps
-* (If empty enums are disallowed in your implementation, treat `["enum"]` as invalid.)
-
-**Functions & Oracles**
-
-* Type arrow: `["binop","->", A, B]` (right-associative).
-  `(A -> (B -> R))` ≡ `(A, B) -> R`.
-
-**Subtyping (informal)**
-
-* `Int <: Num`
-* `T?` matches `Null` or `T`
-* Arrays covariant by element type
-* Maps fieldwise; **requiredness may only become more required** in **type–type** comparison
-* Enums by member subset
-* Functions/oracles: params **contravariant**, return **covariant**
-* `Any` is top
-
-**Value conformance vs requiredness**
-
-* `isType(x, T)` ignores requiredness/optionality bits (they apply to **type–type** subtyping, not value checks).
-
-**Examples**
+Call form (JSON):
 
 ```json
-["type", ["id","Int"]]
+["call", funExpr, arg1Expr, arg2Expr]
 ```
 
-````json
-["type", ["array", ["unop","?", ["id","Str"]]]]
-``]
+* **No zero-arg calls**: there must be ≥1 argument.
+* To emulate surface MindScript’s `f()`, you explicitly pass `["null"]` to a one-parameter function.
+
+### 8.2 Oracles (typed inductive calls)
+
+Oracle value:
+
 ```json
-["type",
-  ["map",
-    ["pair!", ["str","name"], ["id","Str"]],
-    ["pair",  ["str","age"],  ["id","Int"]]
-  ]
+["oracle",
+  ["array",
+    ["pair", ["id","paramName1"], ParamType1],
+    ...
+  ],
+  OutputType,
+  sourceExpr
 ]
-````
-
-```json
-["type", ["enum", ["str","GET"], ["str","POST"]]]
 ```
 
----
+* Exactly **4 children**:
 
-## 10) Annotations (Docs & Machine Metadata)
+  1. Params array (same format as `fun`).
+  2. Output type (type AST, not `["type", ...]`).
+  3. `sourceExpr`: an **expression** that describes how to call the oracle (e.g. a doc string, examples map, etc.). It is not a `block`.
+* **No zero-arity oracles:** params array must contain ≥1 `"pair"`.
 
-**Form**
+Calling rules:
 
-* `["annot", ["str","text"], value]` — human-oriented docs
-* `["annot", ["str","<text>"], value]` — machine metadata (e.g., error reason)
+* Arguments are strictly type-checked; mismatch **panics**.
+* **Automatic nullable boundary**:
 
-**Semantics**
+  * Static output type: `R`.
+  * Dynamic behavior: calls return `R?`.
+  * If the oracle candidate value conforms to `R`, you get that value.
+  * Otherwise (or if unavailable), you get an `["annot", ["str", reason], ["null"]]` or an unannotated `["null"]`.
 
-* Evaluates `value` and returns the same result and type.
-* Ignored for equality and subtyping.
-
-**Placement patterns**
+Example (one “don’t care” parameter to allow zero-meaningful-input calls):
 
 ```json
-["assign", ["decl","x"], ["annot", ["str","counter"], ["int",1]]]
-```
-
-```json
-["annot", ["str","Greet.\n\nArgs: name:Str\nReturn: Str"],
-  ["fun",
-    ["array", ["pair", ["id","name"], ["id","Str"]]],
-    ["id","Str"],
-    ["block", ["call", ["id","sprintf"], ["str","Hello, %s"], ["id","name"]]]
+["assign",
+  ["let", ["id","chooseColor"]],
+  ["oracle",
+    ["array",
+      ["pair", ["id","_"], ["id","Any"]]
+    ],
+    ["enum", ["str","red"], ["str","green"], ["str","blue"]],
+    ["str","Pick a primary color."]
   ]
 ]
 ```
 
-```json
-["return", ["annot", ["str","fast path"], ["id","result"]]]
-```
+Call:
 
 ```json
-["annot", ["str","<not found>"], ["null"]]
+["call", ["id","chooseColor"], ["null"]]
 ```
-
-**Pretty-printing guidance (surface syntax)**
-
-* An annotation that logically *follows* a value on a line should render as a **trailing annotation** on that value. When following separators (`,` or `:`), it attaches to the last value before the separator for display.
 
 ---
 
-## 11) Modules
+## 9) Modules
 
-`["module", nameExpr, bodyBlock]` yields a **module value**:
+Module value:
 
-* Behaves like a **map** for typing/iteration.
-* **Namespace encapsulation:** the body has its own scope.
-* **Writability:** `get`/`set` reflect **exports**; writes update the export table (overwrites allowed).
-* **Import semantics:** multiple imports of the **same module** get the **same instance**.
-* **Write locality:** writes affect **only the current runtime**.
+```json
+["module", nameExpr, bodyBlock]
+```
 
-**Example**
+* `nameExpr` is usually `["str","ModuleName"]`, but any expression is allowed.
+* `bodyBlock` is a `"block"` of assignments; by convention, exports are `["assign", ["let", ["id","x"]], value]` forms.
+
+Semantics:
+
+* Modules evaluate to **module values** that behave like maps:
+
+  * Visible fields correspond to exported bindings.
+  * `dir` / iteration see the module as a map.
+* **Namespace encapsulation:** the body runs in its own environment.
+* **Exports & writability:**
+
+  * `["get", moduleValue, ["str","name"]]` reads exported fields.
+  * `["assign", ["get", moduleValue, ["str","name"]], v]` writes them.
+* **Import semantics:**
+
+  * Multiple imports of the same module path yield the **same module instance** (shared).
+* **Write locality:**
+
+  * Writes affect only the current runtime (process), but they are visible to all importers within that runtime.
+
+Example:
 
 ```json
 ["block",
-  ["assign", ["decl","M"],
+  ["assign",
+    ["let", ["id","M"]],
     ["module", ["str","M"],
       ["block",
-        ["assign", ["decl","x"], ["int",12]],
-        ["assign", ["decl","id"],
-          ["fun", ["array", ["pair", ["id","y"], ["id","Any"]]], ["id","Any"], ["block", ["id","y"]]]
+        ["assign", ["let", ["id","x"]], ["int",12]],
+        ["assign",
+          ["let", ["id","id"]],
+          ["fun",
+            ["array", ["pair", ["id","y"], ["id","Any"]]],
+            ["id","Any"],
+            ["block", ["id","y"]]
+          ]
         ]
       ]
     ]
@@ -469,184 +681,126 @@ Canonical output ends with exactly **one** trailing newline.
 
 ---
 
-## 12) Functions, Oracles & Calls
+## 10) Annotations & Errors
 
-**Function form**
+### 10.1 Annotation form
 
-```json
-["fun",
-  ["array", ["pair", ["id","name"], typeOrAny], ...],
-  retTypeOrAny,
-  bodyBlock]
-```
-
-**Rules**
-
-* Each argument must be a **subtype** of its parameter type.
-* The actual returned value must be a subtype of the declared return type.
-* Violations **panic**.
-* Calls are **curried** semantically; JSON call form is `["call", f, a1, ...]`.
-* **No zero-arity**: declarations have **≥1 parameter**.
-
-**Arity behavior**
-
-* **Underflow** (fewer args): returns a **function** awaiting remaining arguments.
-* **Overflow** (too many args): **panic**.
-
-**Underflow example**
+Annotation node:
 
 ```json
-["block",
-  ["assign", ["decl","add2"],
-    ["fun",
-      ["array",
-        ["pair", ["id","a"], ["id","Int"]],
-        ["pair", ["id","b"], ["id","Int"]]
-      ],
-      ["id","Int"],
-      ["block", ["binop","+", ["id","a"], ["id","b"]]]
-    ]
-  ],
-  ["assign", ["decl","add2_10"], ["call", ["id","add2"], ["int",10]]],
-  ["call", ["id","add2_10"], ["int",5]]
+["annot",
+  ["str","text"],
+  valueNode
 ]
 ```
 
-**Overflow example (captured)**
+* Exactly 3 elements.
+* Second element must be a `"str"` node.
+* **No nested annotations**:
+
+  * `valueNode` must not itself be an `"annot"` node in canonical runtime S.
+  * `IxValidateS` rejects nested `annot` trees.
+
+Machine-oriented text (e.g. error reasons) can use a convention like `"<...>"`, but angle brackets have no special semantics in this layer.
+
+### 10.2 Semantics
+
+* Evaluating `["annot", textNode, valueNode]`:
+
+  * Evaluates `valueNode` and returns that value.
+  * The annotation is attached as metadata to the resulting value (accessible via `noteGet`).
+* Annotations are ignored by:
+
+  * Equality (`==` / `!=`).
+  * Subtyping / type checks.
+
+### 10.3 Errors as annotated null
+
+Idiomatic “soft errors” (nullable types):
+
+* Use a nullable type `T?` and return an (optionally annotated) `["null"]` on failure:
+
+  * Simple null: `["null"]`.
+  * Annotated null:
+
+    ```json
+    ["annot", ["str","<reason>"], ["null"]]
+    ```
+
+* `IxToS` uses this shape for soft errors during encoding:
+
+  * `["annot", ["str", msg], ["null"]]`.
+
+### 10.4 Panics & try
+
+* Panics are hard runtime faults (e.g. bad index, type/arity violation, divide-by-zero).
+* `try` has type:
+
+  ```text
+  try: (Null -> Any) -> { ok!: Bool, value!: Any }
+  ```
+
+Call form in JSON:
 
 ```json
-["call", ["id","try"],
-  ["call", ["id","add2"], ["int",1], ["int",2], ["int",3]]
-]
-```
-
-**Zero-arg sugar note (surface vs JSON)**
-In surface MindScript, `f()` lowers to `f(null)` (implying the function has **one** parameter). In JSON, you **must** pass the argument explicitly: `["call", f, ["null"]]`.
-
-### Oracles (typed inductive calls)
-
-**Declaration**
-
-```json
-["oracle",
-  ["array", ["pair", ["id","name"], type], ...],
-  retType,
-  ["map",
-    ["pair", ["str","doc"], ["str","..."]],
-    ["pair", ["str","examples"], ["array",
-      ["array", inputArray1, output1]
-    ]]
-  ]?]
-```
-
-**Calling rules**
-
-* Parameter arity/types are **checked**; mismatch **panics**.
-* **Automatic nullable boundary:** calls **never panic for result** — treat output as `R?`. If the candidate conforms to `R`, return it; else return `["annot", "<reason>", ["null"]]`.
-
-**Examples**
-
-*A. Oracle with typed output & doc (one param that accepts `null`)*
-
-```json
-["assign", ["decl","chooseColor"],
-  ["oracle",
-    ["array", ["pair", ["id","_"], ["id","Any"]]],    // one parameter
-    ["type", ["enum", ["str","red"], ["str","green"], ["str","blue"]]],
-    ["map", ["pair", ["str","doc"], ["str","Pick a primary color."]]]
+["call",
+  ["id","try"],
+  ["fun",
+    ["array", ["pair", ["id","_"], ["id","Null"]]],
+    ["id","Any"],
+    ["block", exprToRun]
   ]
 ]
 ```
 
-Call:
+* On success: returns `{ ok: true, value: result }`.
+* On panic: returns `{ ok: false, value: panicInfo }` (panic info is implementation-defined).
+
+---
+
+## 11) Equality, Comparison & Truthiness
+
+* `["binop","==", a, b]`, `["binop","!=", a, b]`:
+
+  * Deep for arrays/maps (map key order ignored).
+  * Numbers by value (`2 == 2.0` → `true`).
+  * Annotations ignored.
+* `["binop","<", ...]`, `["binop","<=", ...]`, `["binop",">", ...]`, `["binop",">=", ...]`:
+
+  * Number–number or string–string only; else **panic**.
+
+Truthiness for `bool` conversion (library function):
+
+* Falsey: `null`, `0`, `0.0`, `""`, `[]`, `{}`.
+* Everything else truthy.
+* `bool(x)` has type `Bool?`:
+
+  * Returns `["bool", true]` or `["bool", false]` on success.
+  * Returns `["null"]` (optionally annotated) when `x` is not convertible (e.g. functions, types).
+
+Example (non-convertible):
 
 ```json
-["call", ["id","chooseColor"], ["null"]]
-```
-
-*B. Oracle with examples*
-
-```json
-["assign", ["decl","numberToWord"],
-  ["oracle",
-    ["array", ["pair", ["id","n"], ["id","Int"]]],
-    ["id","Str"],
-    ["map",
-      ["pair", ["str","doc"], ["str","Say the English word for a small integer."]],
-      ["pair", ["str","examples"],
-        ["array",
-          ["array", ["array", ["int",0]], ["str","zero"]],
-          ["array", ["array", ["int",1]], ["str","one"]],
-          ["array", ["array", ["int",2]], ["str","two"]]
-        ]
-      ]
-    ]
+["call",
+  ["id","bool"],
+  ["fun",
+    ["array", ["pair", ["id","_"], ["id","Any"]]],
+    ["id","Any"],
+    ["block", ["null"]]
   ]
 ]
 ```
 
-*C. Failure path → annotated null (`R?`)*
-
-```json
-["assign", ["decl","cc"],
-  ["oracle",
-    ["array", ["pair", ["id","name"], ["id","Str"]]],
-    ["id","Str"],
-    ["map", ["pair", ["str","doc"], ["str","ISO 3166-1 alpha-2 code."]]]
-  ]
-],
-["call", ["id","cc"], ["str","Wakanda"]]
-// => ["annot", ["str","<unrecognized country>"], ["null"]]
-```
+Result is a `Bool?` (`["null"]` or annotated null).
 
 ---
 
-## 13) Equality, Comparison & Truthiness
 
-* `==` / `!=` deep for arrays/maps (map key order ignored). Numbers by value; `2 == 2.0` is true.
-* `< <= > >=` only allow number–number or string–string; otherwise **panic**.
-* **Truthiness** for `bool` coercion: **falsey** = `null`, `0`, `0.0`, `""`, `[]`, `{}`; everything else truthy.
-* **Non-convertibles**: `bool(function)` and `bool(type)` return **`Bool?`** as an **annotated null** (not `false`).
+## 12) Standard Library (Practical Reference)
 
-**Example**
+> Conversions like `int/num/bool/str`  **return `null` on failure**; attach a POST reason if helpful.
 
-```json
-["call", ["id","bool"],
-  ["fun", ["array", ["pair", ["id","_"], ["id","Any"]]], ["id","Any"], ["block", ["null"]]]
-]
-// => ["annot", ["str","<non-convertible to Bool>"], ["null"]]
-```
-
----
-
-## 14) Code Conventions
-
-* Names: modules `snake_case`; funcs/vars `camelCase`; types `PascalCase`; consts `SCREAMING_SNAKE_CASE`; private `_prefix`.
-* Docs: public functions carry a concise `annot` docstring (one-line summary; blank line; Args/Return; error notes if any).
-* Types: public APIs use explicit param & return types; use `T?` only when error/absence is possible.
-* No “void”: every expression yields a value; avoid exposing raw `["null"]` unless type is `T?`.
-* **Indentation:** tabs.
-* **Formatters** should end files with **exactly one trailing newline**.
-
----
-
-## 15) Simplifying Assumptions (Runtime)
-
-* **Int** is **int64**; **Num** is **float64**.
-* **Promotion** only when one operand is `Num`.
-* **Division**: `Int/Int` → **Int**; otherwise → **Num**.
-* **Modulo** sign follows dividend.
-* **Maps** are open-world; requiredness is a type property.
-* **Missing key** / **array OOB** **panic**.
-* **Annotations** never affect equality or subtyping.
-* **Modules** act like maps; multiple imports share the **same instance**; writes are **local to the current runtime**.
-
----
-
-## 16) Built-in Functions (Practical Reference)
-
-Types below use MindScript type notation; `?` = nullable (soft error). When a function may **panic**, it is noted. **`try` is corrected** per §8.
-
+(Shown here in MindScript notation; `?` indicates nullable/soft-error results.)
 ```
 E: 2.718281828459045 — Euler's number e.
 PI: 3.141592653589793 — Mathematical constant π.
@@ -678,9 +832,10 @@ dateNow: <fun: _:Null -> {}> — Current local date/time components.
 dir: <fun: x:{} -> [Str]> — Directory listing of visible fields/functions.
 dirList: <fun: path:Str -> [Str]?> — List directory entries as an array of names.
 error: <fun: msg:Str -> Null> — Produce an annotated null (soft error).
-exec: <fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> { status!: Int, stderr!: Str, stdout!: Str }?> — Run an external program.
+exec: <fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> {status!: Int, stderr!: Str, stdout!: Str}?> — Run an external program.
 exit: <fun: code:Int? -> Null> — Terminate the current process with an optional status code.
 exp: <fun: x:Num -> Num> — Exponential function e^x.
+ffiOpen: <fun: spec:Any -> Any> — Open a shared library (ELF/SysV) and return an FFI module.
 filter: <fun: cond:(Any -> Bool) -> it:(Null -> Any?) -> Null -> Any?> — Filter an iterator (lazy predicate).
 flush: <fun: h:Any -> Bool?> — Flush buffered output for a handle.
 formatCode: <fun: src:Str -> Str?> — Format source code.
@@ -690,8 +845,8 @@ gzipDecompress: <fun: data:Str -> Str?> — Decompress a gzip payload.
 hexDecode: <fun: s:Str -> Str?> — Decode a hexadecimal string.
 hexEncode: <fun: x:Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
 hmacSha256: <fun: key:Str -> msg:Str -> Str> — HMAC-SHA256 authentication tag (raw bytes).
-http: <fun: req:{ body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str } -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
-httpStream: <fun: req:{ body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str } -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
+http: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
+httpStream: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Any, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
 import: <fun: path:Str -> Any> — Load a module from filesystem or HTTP(S).
 importCode: <fun: name:Str -> src:Str -> Any> — Evaluate source text as a module in memory.
 importUrl: <fun: url:Str -> {}?> — Import a module from a URL.
@@ -736,6 +891,12 @@ oracleLog: <fun: _:Null -> [[Str]]> — Return the full recorded oracle prompt/o
 oracleStatus: <fun: _:Null -> Str> — Show oracle installation status.
 osEnv: <fun: name:Str -> Str?> — Read an environment variable.
 osSetEnv: <fun: name:Str -> value:Str? -> Bool?> — Set or unset an environment variable.
+ownerCall: <fun: o:Any -> f:Any -> args:[Any] -> Any> — Call f(...args) inside the owner's single thread.
+ownerClose: <fun: o:Any -> Bool?> — Close the owner's request queue (idempotent).
+ownerGet: <fun: o:Any -> key:Str -> Any> — Get a property from the wrapped value (map/module) inside the owner.
+ownerRun: <fun: o:Any -> f:Any -> Any> — Run function f(m) inside the owner's single thread.
+ownerSet: <fun: o:Any -> key:Str -> v:Any -> Any> — Set a property on the wrapped value (map/module) inside the owner.
+ownerWrap: <fun: m:Any -> pinOSThread:Bool? -> Any> — Create a single-thread owner wrapper for value 'm'.
 panic: <fun: message:Str? -> Null> — Fail: throw a runtime error (hard fault).
 pathBase: <fun: path:Str -> Str> — Return the last element of a path (OS-specific).
 pathClean: <fun: path:Str -> Str> — Clean a path by applying lexical simplifications.
@@ -769,7 +930,7 @@ remove: <fun: path:Str -> Bool?> — Delete a file or an empty directory.
 rename: <fun: old:Str -> new:Str -> Bool?> — Rename (move) a file or directory.
 replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str> — Replace all non-overlapping regex matches.
 rstrip: <fun: s:Str -> Str> — Remove trailing whitespace (Unicode).
-runtime: { argv: [], isEntry: true, path: "/home/pedro/Documents/Projects/msg/builtins.ms" } — 
+runtime: { isEntry: true, path: "/home/pedro/Documents/Projects/msg/builtins.ms", argv: [] } — 
 seedRand: <fun: n:Int -> Null> — Seed the pseudo-random number generator.
 sha256: <fun: x:Str -> Str> — SHA-256 digest (raw bytes).
 shift: <fun: arr:[Any] -> Any> — Remove and return the first element of an array.
@@ -808,101 +969,72 @@ write: <fun: h:Any -> s:Str -> Int?> — Write a string to a file or network han
 writeFile: <fun: path:Str -> data:Str -> Int?> — Write a string to a file (overwriting if it exists).
 ```
 
----
-
-## 17) Conformant Illustrations
-
-**Strict function checks (panic on mismatch)**
-
-```json
-["call",
-  ["fun",
-    ["array", ["pair", ["id","n"], ["id","Int"]]],
-    ["id","Int"],
-    ["block", ["binop","+", ["id","n"], ["int",1]]]
-  ],
-  ["num", 2.5]
-]
-```
-
-**Short-circuit boolean**
-
-```json
-["binop","and", ["bool", false], ["call", ["id","f"], ["null"]]]
-```
-
-**Encapsulated, writable module (shared import; local write)**
-
-```json
-["block",
-  ["assign", ["decl","M"],
-    ["module", ["str","M"],
-      ["block", ["assign", ["decl","x"], ["int",12]]]
-    ]
-  ],
-  ["assign", ["get", ["id","M"], ["str","x"]], ["int", 99]],
-  ["get", ["id","M"], ["str","x"]]
-]
-```
-
-**Error vs panic**
-
-```json
-["block",
-  ["assign", ["decl","m"], ["map", ["pair", ["str","a"], ["int",1]]]],
-  ["assign", ["decl","v1"], ["idx", ["id","m"], ["str","a"]]],
-
-  // Panic example (missing key)
-  ["call", ["id","try"],
-    ["idx", ["id","m"], ["str","b"]]
-  ],
-
-  // Error (nullable) example
-  ["assign", ["decl","u"],
-    ["call", ["id","urlParse"], ["str","not a url"]]
-  ]
-]
-```
-
-**Division and modulo**
-
-```json
-["binop","/", ["int",7], ["int",3]]   // => Int 2
-```
-
-```json
-["binop","%", ["int",3], ["int",-2]]  // => Int 1 (dividend sign)
-```
 
 ---
 
-## 18) Quick Start Examples
+## 13) Collections & Access Semantics
 
-**Increment**
+* Arrays:
 
-```json
-["assign", ["decl","inc"],
-  ["annot", ["str","Increment an Int by 1.\n\nArgs: n:Int\nReturn: Int"],
-    ["fun",
-      ["array", ["pair", ["id","n"], ["id","Int"]]],
-      ["id","Int"],
-      ["block", ["binop","+", ["id","n"], ["int",1]]]
-    ]
+  * 0-based; negative indices count from the end.
+  * `["idx", arrExpr, indexExpr]`:
+
+    * Index must evaluate to `Int`.
+    * OOB indices **panic**.
+
+* Maps:
+
+  * String keys.
+
+  * Open-world: unknown keys may be added at any time.
+
+  * Duplicate keys in literals: later wins.
+
+  * Access via:
+
+    ```json
+    ["get", moduleOrMapExpr, ["str","field"]]   // for module/map as property
+    ["idx", mapExpr, ["str","key"]]             // map index
+    ```
+
+  * Missing key **panics**.
+
+* Map addition (at language level, as in surface MindScript):
+
+  ```json
+  ["binop", "+",
+    mapExpr1,
+    mapExpr2
   ]
-]
-```
+  ```
 
-**Sum an array**
+  merges maps like:
+
+  `{a:0, b:1} + {a:1, c:2} ⇒ {a:1, b:1, c:2}`.
+
+---
+
+## 14) Worked Examples
+
+### 14.1 Sum array
 
 ```json
-["assign", ["decl","sum"],
+["assign",
+  ["let", ["id","sum"]],
   ["fun",
-    ["array", ["pair", ["id","xs"], ["array", ["id","Int"]]]],
+    ["array",
+      ["pair", ["id","xs"], ["array", ["id","Int"]]]
+    ],
     ["id","Int"],
     ["block",
-      ["assign", ["decl","acc"], ["int",0]],
-      ["for", ["decl","x"], ["id","xs"],
-        ["block", ["assign", ["id","acc"], ["binop","+", ["id","acc"], ["id","x"]]]]
+      ["assign", ["let", ["id","acc"]], ["int",0]],
+      ["for", ["let", ["id","x"]], ["id","xs"],
+        ["block",
+          ["assign",
+            ["id","acc"],
+            ["binop", "+", ["id","acc"], ["id","x"]]
+          ]
+        ]
       ],
       ["id","acc"]
     ]
@@ -910,52 +1042,182 @@ writeFile: <fun: path:Str -> data:Str -> Int?> — Write a string to a file (ove
 ]
 ```
 
-**Oracle with typed output & examples**
+### 14.2 Map iteration with destructuring
 
 ```json
-["assign", ["decl","numberToWord"],
-  ["oracle",
-    ["array", ["pair", ["id","n"], ["id","Int"]]],
-    ["id","Str"],
+["block",
+  ["for",
+    ["let",
+      ["array",
+        ["id","k"],
+        ["id","v"]
+      ]
+    ],
     ["map",
-      ["pair", ["str","doc"], ["str","Say the English word for a small integer."]],
-      ["pair", ["str","examples"],
-        ["array",
-          ["array", ["array", ["int",0]], ["str","zero"]],
-          ["array", ["array", ["int",1]], ["str","one"]],
-          ["array", ["array", ["int",2]], ["str","two"]]
-        ]
+      ["pair", ["str","a"], ["int",1]],
+      ["pair", ["str","b"], ["int",2]]
+    ],
+    ["block",
+      ["call",
+        ["id","printf"],
+        ["str","%s=%d\n"],
+        ["array", ["id","k"], ["id","v"]]
       ]
     ]
   ]
 ]
 ```
 
-**Oracle (nullable boundary)**
+### 14.3 If / elif / else
 
 ```json
-["assign", ["decl","chooseColor"],
+["assign",
+  ["let", ["id","msg"]],
+  ["if",
+    ["pair",
+      ["id","ok"],
+      ["block", ["str","yes"]]
+    ],
+    ["pair",
+      ["id","maybe"],
+      ["block", ["str","maybe"]]
+    ],
+    ["block", ["str","no"]]
+  ]
+]
+```
+
+### 14.4 Oracle with typed output & nullable result
+
+```json
+["assign",
+  ["let", ["id","chooseColor"]],
   ["oracle",
-    ["array", ["pair", ["id","_"], ["id","Any"]]],
-    ["type", ["enum", ["str","red"], ["str","green"], ["str","blue"]]],
-    ["map", ["pair", ["str","doc"], ["str","Pick a primary color."]]]
+    ["array",
+      ["pair", ["id","_"], ["id","Any"]]
+    ],
+    ["enum", ["str","red"], ["str","green"], ["str","blue"]],
+    ["str","Pick a primary color."]
   ]
 ],
 ["call", ["id","chooseColor"], ["null"]]
 ```
 
-**Arity underflow (currying)**
+---
+
+## 15) Design Guidelines
+
+* **Public APIs:** use explicit parameter and return types. Use `T?` only when `null` is a legitimate outcome.
+* **Annotations:** use `annot` for documentation and machine-readable metadata. Do not base control flow on annotation text.
+* **Canonicalization:**
+
+  * Formatter removes redundant parens/trailing commas in surface code.
+  * JSON runtime S uses stable tagging; printers should normalize quoting and map key order for reproducibility.
+* **Avoid panics** in library-level code; prefer `T?` with a clear annotated `null` where failure is expected.
+* **Favor duck typing:** in type signatures, declare only what is required; rely on structural checks (`isType`, runtime checks) at call time.
+
+---
+
+## 16) Quick Reference (JSON Node Cheat Sheet)
 
 ```json
-["assign", ["decl","add2_10"], ["call", ["id","sum"], ["int",10]]]
-```
+// Values
+["null"]
+["bool", true]
+["int", 42]
+["num", 3.14]
+["str", "hello"]
 
-**Arity overflow (panic, captured)**
+["array", v1, v2, ...]
+["map", ["pair", ["str","k"], v], ...]
 
-```json
-["call", ["id","try"],
-  ["call", ["id","sum"], ["int",1], ["int",2], ["int",3]]
+["annot", ["str","text"], value]
+
+// Types
+["type", TypeNode]
+
+["id","Int"]
+["unop","?", ["id","Str"]]          // Str?
+["array", ElemType]                 // [ElemType]
+["map",
+  ["pair!", ["str","name"], ["id","Str"]],
+  ["pair",  ["str","age"],  ["id","Int"]]
+]
+["enum", memberExpr1, memberExpr2]
+
+["binop","->", A, B]                // function/oracle type
+
+// Functions & oracles
+["fun",
+  ["array", ["pair", ["id","n"], ["id","Int"]]],
+  ["id","Int"],
+  ["block",
+    ["binop", "+", ["id","n"], ["int",1]]
+  ]
+]
+
+["oracle",
+  ["array", ["pair", ["id","n"], ["id","Int"]]],
+  ["id","Str"],
+  ["str","Say the English word for a small integer."]
+]
+
+// Calls (≥1 arg)
+["call", funOrOracleExpr, arg1, arg2]
+
+// Variables, patterns, assignment
+["id","x"]
+["assign", ["let", ["id","x"]], ["int",1]]
+["assign", ["id","x"], ["int",2]]
+
+["assign",
+  ["let",
+    ["array", ["id","a"], ["id","b"]]
+  ],
+  ["array", ["int",1], ["int",2]]
+]
+
+// Control flow
+["block", e1, e2, ...]
+["if",
+  ["pair", cond1, thenBlock1],
+  ["pair", cond2, thenBlock2],
+  elseBlock
+]
+["while", condExpr, bodyBlock]
+["for", patternOrLval, iterableExpr, bodyBlock]
+
+["return", value]
+["break",  value]
+["continue", value]
+
+// Access
+["get", objExpr, ["str","field"]]
+["idx", arrExpr, indexExpr]
+["idx", mapExpr, ["str","k"]]
+
+// Modules
+["module", ["str","M"],
+  ["block",
+    ["assign", ["let", ["id","x"]], ["int",12]]
+  ]
+]
+
+// Errors vs panics
+// nullable result (soft error):
+["annot", ["str","<reason>"], ["null"]]
+
+// panic capture:
+["call",
+  ["id","try"],
+  ["fun",
+    ["array", ["pair", ["id","_"], ["id","Null"]]],
+    ["id","Any"],
+    ["block",
+      exprThatMayPanic
+    ]
+  ]
 ]
 ```
 
-**End of Manual.**
+**End of JSON-MindScript Manual.**

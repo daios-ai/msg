@@ -857,8 +857,10 @@ func docStmt(n S) *Doc {
 			probe := Concat(head, val)
 			main, post := attachInlineOrPre(probe, txt)
 			if post != "" {
-				return Concat(head, val, annotInline(post))
+				// Inline binding-level annotation: same behavior as docStmt("annot")
+				return Concat(main, Text(" # "+oneLine(post)))
 			}
+			// PRE-style: annotPre already baked into main.
 			return main
 		}
 		return Concat(head, docExprMin(rhs, 10))

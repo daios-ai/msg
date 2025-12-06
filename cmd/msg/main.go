@@ -138,10 +138,10 @@ func usage() {
 	fmt.Printf(`MindScript CLI
 
 Usage:
-  %s run <file.ms> [--] [args...]         Run a script (argv via runtime.argv)
-  %s repl                                 Start the REPL
+  %s run <file.ms> [--] [args...]         Run a script.
+  %s repl                                 Start the REPL.
   %s fmt [--check] [path ...]             Format file(s) or tree(s) canonically
-  %s test [path] [-p] [-v] [-timeout <ms>]  Run tests (default root=".")
+  %s test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
   %s get <module>@<version?>              Install a third-party module (stub)
 
 `, appName, appName, appName, appName, appName)
@@ -462,7 +462,7 @@ func cmdTest(args []string) int {
 	timeoutMs := 0
 
 	// Tolerant manual parse so flags can appear before/after the path.
-	// Supports: -p, -v, -timeout=123, -timeout 123, and optional "--".
+	// Supports: -p, -v, -t=123, -t 123, and optional "--".
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 
@@ -480,24 +480,24 @@ func cmdTest(args []string) int {
 				parallel = true
 			case a == "-v":
 				verbose = true
-			case strings.HasPrefix(a, "-timeout="):
-				val := strings.TrimPrefix(a, "-timeout=")
+			case strings.HasPrefix(a, "-t="):
+				val := strings.TrimPrefix(a, "-t=")
 				n, err := strconv.Atoi(val)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "%s: invalid -timeout value %q\n", appName, val)
+					fmt.Fprintf(os.Stderr, "%s: invalid -t value %q\n", appName, val)
 					return 2
 				}
 				timeoutMs = n
-			case a == "-timeout":
+			case a == "-t":
 				if i+1 >= len(args) {
-					fmt.Fprintf(os.Stderr, "%s: -timeout requires a value\n", appName)
+					fmt.Fprintf(os.Stderr, "%s: -t requires a value\n", appName)
 					return 2
 				}
 				i++
 				val := args[i]
 				n, err := strconv.Atoi(val)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "%s: invalid -timeout value %q\n", appName, val)
+					fmt.Fprintf(os.Stderr, "%s: invalid -t value %q\n", appName, val)
 					return 2
 				}
 				timeoutMs = n
@@ -553,8 +553,7 @@ func cmdGet(args []string) int {
 		fmt.Fprintf(os.Stderr, "usage: %s get <module>@<version?>\n", appName)
 		return 2
 	}
-	spec := args[0]
-	fmt.Printf("Installing %s ... (stub)\n", spec)
-	fmt.Printf("Downloaded to %s (not really yet)\n", filepath.Join(os.Getenv("HOME"), ".msg", "modules"))
+	// spec := args[0]
+	fmt.Printf("Installing third-party modules is not implemented yet.\n")
 	return 0
 }

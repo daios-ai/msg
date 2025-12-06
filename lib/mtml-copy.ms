@@ -6,19 +6,18 @@
 # style/event attrs forbidden
 # <script> requires final | tojson
 
-
 # my fun
 # more
 let f = fun(x: Int, y: Int) -> Str do
-	let g = fun(z: Int) -> Int do z end
+	let g = fun(z: Int) -> Int do
+		z
+	end
 	str(g(x + y))
 end
-
-# ---------------- Types & constructors ----------------
+ # ---------------- Types & constructors ----------------
 
 let SafeHTML = type {__brand__!: Str, __safe_html__!: Bool, html!: Str}
 let SafeURL = type {__brand__!: Str, __safe_url__!: Bool, url!: Str}
-
 # module-private brand (unforgeable token)
 # Generate a per-process random brand used to authenticate Safe* wrappers.
 # 
@@ -34,7 +33,6 @@ let _BRAND = fun(_: Null) -> Str do
 	end
 	str(nowNanos())
 end()
-
 # Wrap a raw HTML string as SafeHTML (host-only, unforgeable).
 # 
 # Args:
@@ -49,7 +47,6 @@ let safeHTML = fun(s: Str) -> SafeHTML do
 		html: s
 	}
 end
-
 # Check whether a URL string is allowed by policy (scheme/path allow-list).
 # 
 # Args:
@@ -88,7 +85,6 @@ let _urlAllowed = fun(u: Str) -> Bool do
 	end
 	false
 end
-
 # Wrap a URL string as SafeURL if it passes policy; otherwise annotated null.
 # 
 # Args:
@@ -102,7 +98,6 @@ let safeURL = fun(u: Str) -> SafeURL? do
 	end
 	{__safe_url__: true, __brand__: _BRAND, url: u}
 end
-
 let RenderOpts = type {
 	autoescape: Bool,
 	baseDir: Str,
@@ -125,8 +120,7 @@ let Env = type {
 	_loader: Str -> {name: Str, src: Str}?,
 	opts: RenderOpts
 }
-
-# ---------------- Utilities ----------------
+ # ---------------- Utilities ----------------
 
 # Merge user options with defaults, preferring user keys.
 # 
@@ -149,7 +143,6 @@ let _defaultOpts = fun(o: RenderOpts) -> RenderOpts do
 	end
 	out
 end
-
 # Construct a TemplateError record (helper).
 # 
 # Args:
@@ -167,7 +160,6 @@ let _err = fun(kind: Str, msg: Str, line: Int, col: Int) -> TemplateError do
 		where: {line: line, col: col}
 	}
 end
-
 # Render a human-readable diagnostic string for a TemplateError.
 # 
 # Args:
@@ -189,7 +181,6 @@ let diagnostics = fun(e: TemplateError) -> Str do
 		int(e.where.col)
 	])
 end
-
 # Produce an annotated null for a failure at a source location.
 # 
 # Args:
@@ -212,7 +203,6 @@ let _fail = fun(kind: Str, msg: Str, at: {}) -> Null do
 	end
 	error(diagnostics(_err(kind, msg, ln, co)))
 end
-
 # HTML-escape a string (&, <, >, ", ').
 # 
 # Args:
@@ -230,7 +220,6 @@ let _htmlEscape = fun(s: Str) -> Str do
 	let t4 = replace("\"", "&quot;", t3)
 	replace("'", "&#39;", t4)
 end
-
 # Check SafeHTML brand authenticity.
 # 
 # Args:
@@ -241,7 +230,6 @@ end
 let _isSafeHTML = fun(v) -> Bool do
 	isType(v, type {}) and mapHas(v, "__safe_html__") and mapHas(v, "__brand__") and v.__brand__ == _BRAND
 end
-
 # Check SafeURL brand authenticity.
 # 
 # Args:
@@ -252,7 +240,6 @@ end
 let _isSafeURL = fun(v) -> Bool do
 	isType(v, type {}) and mapHas(v, "__safe_url__") and mapHas(v, "__brand__") and v.__brand__ == _BRAND
 end
-
 # Trim leading indentation and a single following newline (for {% -%} trims).
 # 
 # Args:
@@ -275,7 +262,6 @@ let _trimLeadingWSNL = fun(s: Str) -> Str do
 	end
 	substr(s, i, len(s))
 end
-
 # Trim trailing spaces/tabs (not newline) from the right.
 # 
 # Args:
@@ -295,7 +281,6 @@ let _trimRightWS = fun(s: Str) -> Str do
 	end
 	substr(s, 0, i + 1)
 end
-
 # Resolve a template-relative path within baseDir jail.
 # 
 # Args:
@@ -319,7 +304,6 @@ let _resolvePath = fun(baseDir: Str, fromName: Str, req: Str) -> Str? do
 	end
 	clean
 end
-
 # Convert an absolute path back to a jailed logical name.
 # 
 # Args:
@@ -338,8 +322,7 @@ let _relName = fun(baseDir: Str, full: Str) -> Str do
 	end
 	full
 end
-
-# ---------------- Environment ----------------
+ # ---------------- Environment ----------------
 
 # Create a rendering environment with defaults and a jailed loader.
 # 
@@ -369,7 +352,6 @@ let env = fun(opts: RenderOpts) -> Env do
 		end
 	}
 end
-
 # Register a filter (curried function of Any arity).
 # 
 # Args:
@@ -383,7 +365,6 @@ let registerFilter = fun(e: Env, name: Str, f) -> Bool do
 	e._filters[name] = f
 	true
 end
-
 # Register a helper (callable from expressions like helper(a,b)).
 # 
 # Args:
@@ -397,7 +378,6 @@ let registerHelper = fun(e: Env, name: Str, f) -> Bool do
 	e._helpers[name] = f
 	true
 end
-
 # Register a global variable visible to templates.
 # 
 # Args:
@@ -411,8 +391,7 @@ let registerGlobal = fun(e: Env, name: Str, value) -> Bool do
 	e._globals[name] = value
 	true
 end
-
-# ---------------- Tokenizer helpers ----------------
+ # ---------------- Tokenizer helpers ----------------
 
 # Whether an attribute name is treated as a URL context.
 # 
@@ -452,7 +431,6 @@ let _isURLAttr = fun(n: Str) -> Bool do
 	end
 	false
 end
-
 # Whether an attribute name is an inline event handler (on*).
 # 
 # Args:
@@ -463,7 +441,6 @@ end
 let _isEventAttr = fun(n: Str) -> Bool do
 	len(n) >= 2 and toLower(substr(n, 0, 2)) == "on"
 end
-
 # Classify a quote character.
 # 
 # Args:
@@ -480,7 +457,6 @@ let _quoteOf = fun(ch: Str) -> Str do
 		"unquoted"
 	end
 end
-
 # Case-insensitive literal check at offset i.
 # 
 # Args:
@@ -501,7 +477,6 @@ let _hasInsensitiveAt = fun(s: Str, i: Int, lit: Str) -> Bool do
 	let seg = toLower(substr(s, i, i + n))
 	toLower(lit) == seg
 end
-
 # ---------------- Tokenizer (HTML-aware, minimal) ----------------
 # Emits [{kind:"text"|"expr"|"stmt", value, trimL, trimR, line, col, ctx?, quote?, attrName?}]
 
@@ -518,14 +493,12 @@ let _lex = fun(src: Str) -> [Any]? do
 	let line = 1
 	let col = 1
 	let trimNext = false
-
 	let ctx = "HtmlText"
 	let inTag = false
 	let curAttr = ""
 	let inAttr = false
 	let q = ""
 	let pendingCtx = ""
-
 	let pushText = fun(s: Str, ln: Int, co: Int, tl: Bool, tr: Bool) -> Null do
 		if len(s) == 0 then
 			return
@@ -548,7 +521,6 @@ let _lex = fun(src: Str) -> [Any]? do
 		]
 		null
 	end
-
 	let bump = fun(ch: Str) -> Null do
 		if ch == "\n" then
 			line = line + 1
@@ -558,11 +530,9 @@ let _lex = fun(src: Str) -> [Any]? do
 		end
 		null
 	end
-
 	while i < len(src) do
 		let startL = line
 		let startC = col
-
 		let j = i
 		let tag = ""
 		let found = -1
@@ -572,7 +542,6 @@ let _lex = fun(src: Str) -> [Any]? do
 			if j + 1 < len(src) then
 				b = substr(src, j + 1, j + 2)
 			end
-
 			if a == "<" then
 				inTag = true
 				curAttr = ""
@@ -611,7 +580,6 @@ let _lex = fun(src: Str) -> [Any]? do
 					end
 				end
 			end
-
 			if a == "<" and _hasInsensitiveAt(src, j, "<script") then
 				pendingCtx = "RawJS"
 			end
@@ -624,7 +592,6 @@ let _lex = fun(src: Str) -> [Any]? do
 			if _hasInsensitiveAt(src, j - 1, "</style>") then
 				ctx = "HtmlText"
 			end
-
 			if a == "{" and (b == "{" or b == "%") then
 				found = j
 				tag = a + b
@@ -633,20 +600,16 @@ let _lex = fun(src: Str) -> [Any]? do
 			bump(a)
 			j = j + 1
 		end
-
 		if found == -1 then
 			pushText(substr(src, i, len(src)), startL, startC, false, false)
 			break
 		end
-
 		pushText(substr(src, i, found), startL, startC, false, false)
-
 		let trimL = false
 		if found + 2 < len(src) and substr(src, found + 2, found + 3) == "-" then
 			trimL = true
 			tag = tag + "-"
 		end
-
 		let close = if substr(tag, 0, 2) == "{{" then
 			"}}"
 		else
@@ -688,7 +651,6 @@ let _lex = fun(src: Str) -> [Any]? do
 		else
 			"stmt"
 		end
-
 		let tokCtx = null
 		if kind == "expr" then
 			if ctx == "RawJS" then
@@ -710,12 +672,10 @@ let _lex = fun(src: Str) -> [Any]? do
 				tokCtx = "HtmlText"
 			end
 		end
-
 		let qk = ""
 		if kind == "expr" and inTag and inAttr then
 			qk = _quoteOf(q)
 		end
-
 		out = out + [
 			{
 				kind: kind,
@@ -732,7 +692,6 @@ let _lex = fun(src: Str) -> [Any]? do
 		if trimR then
 			trimNext = true
 		end
-
 		let chunk = substr(src, found, endSpan)
 		let p = 0
 		while p < len(chunk) do
@@ -741,11 +700,9 @@ let _lex = fun(src: Str) -> [Any]? do
 		end
 		i = endSpan
 	end
-
 	out
 end
-
-# ---------------- Parser (AST) ----------------
+ # ---------------- Parser (AST) ----------------
 
 # Construct a tiny node record with optional payloads.
 # 
@@ -761,7 +718,6 @@ end
 let _node = fun(tag: Str, a, b, c, d) -> {} do
 	{tag: tag, a: a, b: b, c: c, d: d}
 end
-
 # Split a string by a separator at top level (respects quotes/brackets/parens).
 # 
 # Args:
@@ -820,7 +776,6 @@ let _splitTopLevel = fun(s: Str, sep: Str) -> [Str] do
 	out = out + [strip(substr(s, last, len(s)))]
 	out
 end
-
 # Parse tokens into an AST (sequence of nodes). Returns annotated null on errors.
 # 
 # Args:
@@ -830,7 +785,6 @@ end
 # [Any]?  # null # <parse: ...> on structural errors
 let _parse = fun(tokens: [Any]) -> [Any]? do
 	let pos = 0
-
 	let parseSeq = fun(stopTags: [Str]) -> [Any]? do
 		let out = []
 		while pos < len(tokens) do
@@ -864,17 +818,14 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 				]
 				continue
 			end
-
 			let body = t.value
 			let parts = split(body, " ")
 			let head = parts[0]
-
 			for tag in stopTags do
 				if head == tag then
 					return out
 				end
 			end
-
 			if head == "if" then
 				pos = pos + 1
 				let branches = []
@@ -884,7 +835,6 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 					return _fail("parse", "unterminated if", t)
 				end
 				branches = branches + [[cond, thenBody]]
-
 				while pos < len(tokens) and tokens[pos].kind == "stmt" do
 					let st = tokens[pos].value
 					let p2 = split(st, " ")
@@ -926,7 +876,6 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 					end
 					break
 				end
-
 				if len(out) == 0 or out[len(out) - 1].tag != "if" then
 					let endTL2 = tokens[pos].trimL
 					let endTR2 = tokens[pos].trimR
@@ -948,7 +897,6 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 				end
 				continue
 			end
-
 			if head == "for" then
 				pos = pos + 1
 				let rest = strip(substr(body, 4, len(body)))
@@ -981,7 +929,6 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 				end
 				continue
 			end
-
 			if head == "include" then
 				pos = pos + 1
 				let rest = strip(substr(body, 8, len(body)))
@@ -1001,7 +948,6 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 				]
 				continue
 			end
-
 			if head == "block" then
 				pos = pos + 1
 				let nm = strip(substr(body, 6, len(body)))
@@ -1028,7 +974,6 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 				end
 				continue
 			end
-
 			if head == "extends" then
 				pos = pos + 1
 				let p = strip(substr(body, 8, len(body)))
@@ -1042,24 +987,20 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 				]
 				continue
 			end
-
 			if head == "end" then
 				return out
 			end
-
 			return _fail("parse", "unknown tag", tokens[pos])
 		end
 		out
 	end
-
 	let ast = parseSeq([])
 	if ast == null then
 		return _fail("parse", "invalid structure", {line: 0, col: 0})
 	end
 	ast
 end
-
-# ---------------- Expression evaluation ----------------
+ # ---------------- Expression evaluation ----------------
 
 # Parse a quoted string literal and return its contents.
 # 
@@ -1081,7 +1022,6 @@ let _parseStringLit = fun(s: Str) -> Str? do
 	end
 	substr(s, 1, len(s) - 1)
 end
-
 # Parse number/bool/null primitives from a bare token.
 # 
 # Args:
@@ -1109,7 +1049,6 @@ let _numOrBoolOrNull = fun(s: Str) -> Any? do
 	end
 	null
 end
-
 # Split a comma-separated argument string at top level.
 # 
 # Args:
@@ -1123,7 +1062,6 @@ let _argsParse = fun(s: Str) -> [Str] do
 	end
 	_splitTopLevel(s, ",")
 end
-
 # Parse Jinja-style ternary: A if cond else B (top-level only).
 # 
 # Args:
@@ -1142,7 +1080,6 @@ let _splitTernary = fun(s: Str) -> {A: Str, B: Str, cond: Str}? do
 	end
 	{A: partsIf[0], cond: partsElse[0], B: partsElse[1]}
 end
-
 # Find the index of the first top-level '('; -1 if none.
 # 
 # Args:
@@ -1182,7 +1119,6 @@ let _findTopLevelParen = fun(s: Str) -> Int do
 		i = i + 1
 	end - 1
 end
-
 # Evaluate a dotted name path in scope (globals override by scope merge).
 # 
 # Args:
@@ -1230,7 +1166,6 @@ let _evalNamePath = fun(scope: {}, name: Str, strict: Bool) -> Any? do
 	end
 	cur
 end
-
 # Evaluate an expression string within scope using filters/helpers/globals.
 # 
 # Args:
@@ -1246,10 +1181,8 @@ let _evalExpr = fun(e: Env, scope: {}, code: Str, at: {}) -> Any? do
 	if len(pipes) == 0 then
 		return
 	end
-
 	let base = strip(pipes[0])
 	let val = null
-
 	let ter = _splitTernary(base)
 	if ter != null then
 		let cv = _evalExpr(e, scope, ter.cond, at)
@@ -1334,7 +1267,6 @@ let _evalExpr = fun(e: Env, scope: {}, code: Str, at: {}) -> Any? do
 			end
 		end
 	end
-
 	let i = 1
 	while i < len(pipes) do
 		let spec = strip(pipes[i])
@@ -1378,11 +1310,9 @@ let _evalExpr = fun(e: Env, scope: {}, code: Str, at: {}) -> Any? do
 		val = out
 		i = i + 1
 	end
-
 	val
 end
-
-# ---------------- Rendering ----------------
+ # ---------------- Rendering ----------------
 
 # Whether an expression’s final pipe is tojson (required in <script>).
 # 
@@ -1398,7 +1328,6 @@ let _endsWithToJSON = fun(code: Str) -> Bool do
 	end
 	toLower(strip(pipes[len(pipes) - 1])) == "tojson"
 end
-
 # Trim a single newline to the left of the current position (for trims).
 # 
 # Args:
@@ -1421,7 +1350,6 @@ let _trimLeftNL = fun(s: Str) -> Str do
 	end
 	s
 end
-
 # Flush a pending newline to the writer if present.
 # 
 # Args:
@@ -1446,7 +1374,6 @@ let _flushPendingNL = fun(w: Writer, buf: {
 	end
 	true
 end
-
 # Write a string to the writer honoring trimming rules.
 # 
 # Args:
@@ -1462,7 +1389,6 @@ let _write = fun(w: Writer, buf: {pendingNL: Bool, s: Str, trimNext: Bool}, s: S
 		s = _trimLeadingWSNL(s)
 		buf.trimNext = false
 	end
-
 	if buf.pendingNL and len(s) > 0 then
 		let n1 = w.write("\n")
 		if n1 == null then
@@ -1471,7 +1397,6 @@ let _write = fun(w: Writer, buf: {pendingNL: Bool, s: Str, trimNext: Bool}, s: S
 		buf.s = buf.s + "\n"
 		buf.pendingNL = false
 	end
-
 	if len(s) > 0 and substr(s, len(s) - 1, len(s)) == "\n" then
 		let body = substr(s, 0, len(s) - 1)
 		if len(body) > 0 then
@@ -1484,7 +1409,6 @@ let _write = fun(w: Writer, buf: {pendingNL: Bool, s: Str, trimNext: Bool}, s: S
 		buf.pendingNL = true
 		return true
 	end
-
 	if len(s) > 0 then
 		let n = w.write(s)
 		if n == null then
@@ -1494,7 +1418,6 @@ let _write = fun(w: Writer, buf: {pendingNL: Bool, s: Str, trimNext: Bool}, s: S
 	end
 	true
 end
-
 # Render a sequence of AST nodes into a Writer with a scope.
 # 
 # Args:
@@ -1517,7 +1440,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 	let i = 0
 	while i < len(ast) do
 		let n = ast[i]
-
 		if n.tag == "text" then
 			let s = n.a.s
 			if n.a.tl and buf.pendingNL then
@@ -1530,12 +1452,10 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if ok == null then
 				return ok
 			end
-
 		elif n.tag == "expr" then
 			if mapHas(n.a, "tl") and n.a.tl and buf.pendingNL then
 				buf.pendingNL = false
 			end
-
 			let c = n.a.ctx
 			if c == "RawCSS" or c == "StyleAttr" then
 				return _fail("render", "interpolation in CSS/style is forbidden", n.a)
@@ -1549,12 +1469,10 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if (c == "GenericAttr" or c == "URLAttr") and n.a.quote == "unquoted" then
 				return _fail("render", "unquoted attribute interpolation is forbidden", n.a)
 			end
-
 			let v = _evalExpr(e, scope, n.a.code, n.a)
 			if v == null and noteGet(v) != null then
 				return v
 			end
-
 			let out = ""
 			if v == null then
 				let src = strip(n.a.code)
@@ -1630,7 +1548,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 					end
 				end
 			end
-
 			if mapHas(n.a, "tr") and n.a.tr then
 				buf.trimNext = true
 			end
@@ -1638,12 +1555,10 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if ok2 == null then
 				return ok2
 			end
-
 		elif n.tag == "if" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
 			end
-
 			let done = false
 			let bi = 0
 			while bi < len(n.a) do
@@ -1675,24 +1590,20 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 					return ok3
 				end
 			end
-
 			if n.d != null and n.d.tlEnd and buf.pendingNL then
 				buf.pendingNL = false
 			end
 			if n.d != null and n.d.trEnd then
 				buf.trimNext = true
 			end
-
 		elif n.tag == "for" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
 			end
-
 			let it = _evalExpr(e, scope, n.b, n.d)
 			if it == null and noteGet(it) != null then
 				return it
 			end
-
 			if it == null then
 				null
 			elif isType(it, type [Any]) then
@@ -1765,19 +1676,16 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			else
 				null
 			end
-
 			if n.d != null and n.d.tlEnd and buf.pendingNL then
 				buf.pendingNL = false
 			end
 			if n.d != null and n.d.trEnd then
 				buf.trimNext = true
 			end
-
 		elif n.tag == "include" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
 			end
-
 			let pthLit = _parseStringLit(n.a)
 			let pathVal = if pthLit != null then
 				pthLit
@@ -1790,7 +1698,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if pathVal == null then
 				return _fail("render", "include path", n.d)
 			end
-
 			let full = _resolvePath(e.opts.baseDir, curName, str(pathVal))
 			if full == null then
 				return full
@@ -1803,7 +1710,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if childT == null then
 				return childT
 			end
-
 			let ctx2 = scope
 			if n.b != null then
 				let evalRes = _evalExpr(e, scope, n.b, n.d)
@@ -1865,7 +1771,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 					return _fail("render", "include ctx must be map", n.d)
 				end
 			end
-
 			let z = 0
 			while z < len(stack) do
 				if stack[z] == childT.name then
@@ -1873,12 +1778,10 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 				end
 				z = z + 1
 			end
-
 			let ok6 = _renderTemplate(e, childT, ctx2, w, stack + [childT.name])
 			if ok6 == null then
 				return ok6
 			end
-
 		elif n.tag == "block" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
@@ -1893,19 +1796,15 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if n.d != null and n.d.trEnd then
 				buf.trimNext = true
 			end
-
 		elif n.tag == "extends" then
 			null
-
 		else
 			return _fail("render", "unknown node", n.a)
 		end
-
 		i = i + 1
 	end
 	true
 end
-
 # Collect block bodies from an AST by block name.
 # 
 # Args:
@@ -1925,7 +1824,6 @@ let _collectBlocks = fun(ast: [Any]) -> {} do
 	end
 	m
 end
-
 # Apply block overrides from child onto base AST (full replacement; no super()).
 # 
 # Args:
@@ -1952,7 +1850,6 @@ let _applyBlocks = fun(baseAst: [Any], slots: {}) -> [Any] do
 	end
 	out
 end
-
 # Render a compiled template, handling extends/blocks/include.
 # 
 # Args:
@@ -2020,7 +1917,6 @@ let _renderTemplate = fun(e: Env, t: Template, data: {}, w: Writer, stack: [Str]
 			end
 			cyc = cyc + 1
 		end
-
 		let slots = _collectBlocks(t.ast)
 		let combined = _applyBlocks(baseT.ast, slots)
 		let buf2 = {s: "", trimNext: false, pendingNL: false}
@@ -2040,8 +1936,7 @@ let _renderTemplate = fun(e: Env, t: Template, data: {}, w: Writer, stack: [Str]
 		true
 	end
 end
-
-# ---------------- Compilation & I/O ----------------
+ # ---------------- Compilation & I/O ----------------
 
 # Compile a template from a string into a Template value.
 # 
@@ -2071,7 +1966,6 @@ let fromString = fun(e: Env, src: Str, name: Str?) -> Template? do
 		ast: ast
 	}
 end
-
 # Load and compile a template via the environment loader (jailed).
 # 
 # Args:
@@ -2087,7 +1981,6 @@ let load = fun(e: Env, path: Str) -> Template? do
 	end
 	fromString(e, info.src, info.name)
 end
-
 # Create a string-backed writer for internal rendering.
 # 
 # Args:
@@ -2108,7 +2001,6 @@ let _stringWriter = fun(_: Null) -> {buf: {s: Str}, w: Writer} do
 	}
 	{w: w, buf: state}
 end
-
 # Render a template to a string (convenience).
 # 
 # Args:
@@ -2129,7 +2021,6 @@ let render = fun(e: Env, t: Template, data: {}) -> Str? do
 	end
 	pack.buf.s
 end
-
 # Render a template into a Writer; returns total bytes written.
 # 
 # Args:
@@ -2162,8 +2053,7 @@ let renderTo = fun(e: Env, t: Template, w: Writer, data: {}) -> Int? do
 	let _ = ww.flush(null)
 	counter.n
 end
-
-# ---------------- Built-ins ----------------
+ # ---------------- Built-ins ----------------
 
 # Install a minimal set of built-in filters (upper, lower, default, join, tojson, url).
 # 
@@ -2179,7 +2069,6 @@ let _installBuiltins = fun(e: Env) -> Null do
 	let lower = fun(s: Str) -> Str do
 		toLower(s)
 	end
-
 	let default = fun(x, fallback) do
 		if x == null then
 			fallback
@@ -2189,7 +2078,6 @@ let _installBuiltins = fun(e: Env) -> Null do
 			x
 		end
 	end
-
 	let joinF = fun(xs: [Any], sep: Str) -> Str do
 		let ss = []
 		let i = 0
@@ -2203,7 +2091,6 @@ let _installBuiltins = fun(e: Env) -> Null do
 		end
 		join(ss, sep)
 	end
-
 	let tojson = fun(x) -> SafeHTML do
 		let s = jsonStringify(x)
 		if s == null then
@@ -2213,15 +2100,13 @@ let _installBuiltins = fun(e: Env) -> Null do
 		let s3 = replace("&", "\\u0026", s2)
 		let s4 = replace("<", "\\u003c", s3)
 		let s5 = replace(">", "\\u003e", s4)
-		let s6 = replace("\u2028", "\\u2028", s5)
-		let s7 = replace("\u2029", "\\u2029", s6)
+		let s6 = replace(" ", "\\u2028", s5)
+		let s7 = replace(" ", "\\u2029", s6)
 		safeHTML(s7)
 	end
-
 	let url = fun(u: Str) -> SafeURL? do
 		safeURL(u)
 	end
-
 	let _ = registerFilter(e, "upper", upper)
 	let _ = registerFilter(e, "lower", lower)
 	let _ = registerFilter(e, "default", default)
@@ -2230,7 +2115,6 @@ let _installBuiltins = fun(e: Env) -> Null do
 	let _ = registerFilter(e, "url", url)
 	null
 end
-
 # Public entry to install built-ins (fluent).
 # 
 # Args:

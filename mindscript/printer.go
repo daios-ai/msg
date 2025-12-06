@@ -664,24 +664,54 @@ func parenIfLE(need int, d *Doc, n S) *Doc {
 
 /* ---------- AST → Doc ---------- */
 
+// docSeq renders a sequence of statements, preserving explicit blank-line
+// separators represented as "noop" nodes:
+//
+//	stmt1, noop, stmt2  →  stmt1\n\nstmt2
+//
+// while keeping the old behavior when no "noop" is present:
+//
+//	stmt1, stmt2        →  stmt1\nstmt2
+//
+// Leading and trailing noops in a block are ignored.
+func docSeq(kids []S) *Doc {
+	var ds []*Doc
+	firstStmt := true
+	pendingNoop := false
+
+	for _, k := range kids {
+		if tag(k) == "noop" {
+			// A noop only has effect when it appears between real statements.
+			if !firstStmt {
+				pendingNoop = true
+			}
+			continue
+		}
+
+		if firstStmt {
+			ds = append(ds, docStmt(k))
+			firstStmt = false
+			pendingNoop = false
+			continue
+		}
+
+		// Always separate statements with at least one newline, and add an
+		// extra blank line when an explicit noop was present between them.
+		ds = append(ds, HardLineDoc())
+		if pendingNoop {
+			ds = append(ds, HardLineDoc())
+		}
+		ds = append(ds, docStmt(k))
+		pendingNoop = false
+	}
+	return Concat(ds...)
+}
+
 func docProgram(n S) *Doc {
 	if tag(n) != "block" {
 		return docStmt(n)
 	}
-	kids := listS(n, 1)
-	var ds []*Doc
-	firstReal := true
-	for _, k := range kids {
-		if tag(k) == "noop" {
-			continue
-		}
-		if !firstReal {
-			ds = append(ds, HardLineDoc())
-		}
-		ds = append(ds, docStmt(k))
-		firstReal = false
-	}
-	return Concat(ds...)
+	return docSeq(listS(n, 1))
 }
 
 func docStmt(n S) *Doc {
@@ -690,16 +720,31 @@ func docStmt(n S) *Doc {
 		return Concat()
 
 	case "annot":
-		// Apply the centralized inline-vs-PRE policy even at statement level.
-		// If it fits, place as a trailing inline comment on the same line;
-		// otherwise render as a PRE header.
 		text, wrapped, _ := asAnnotASTRaw(n)
+
+		// Special case: ("annot", text, "noop") represents a floating header
+		// annotation with a blank-line run afterwards, e.g.:
+		//
+		//   # a
+		//
+		//   x
+		//
+		// Render it as a PRE-style comment block here; docSeq/docBlock will
+		// supply the blank line between this and the next real statement.
+		if tag(wrapped) == "noop" {
+			return annotPre(text)
+		}
+
 		body := docStmt(wrapped)
 		main, post := attachInlineOrPre(body, text)
 		if post != "" {
-			// Inline comments consume the rest of the line; force newline.
-			return Concat(body, annotInline(post))
+			// Inline statement annotation: keep it on the same line as the
+			// wrapped statement; line-breaking between statements is handled
+			// centrally by docSeq/docBlock.
+			return Concat(main, Text(" # "+oneLine(post)))
 		}
+		// PRE-style or multi-line annotations are already baked into main
+		// by attachInlineOrPre (via annotPre).
 		return main
 
 	case "fun":
@@ -830,20 +875,7 @@ func docBlock(n S) *Doc {
 	if tag(n) != "block" {
 		return docStmt(n)
 	}
-	kids := listS(n, 1)
-	var ds []*Doc
-	firstReal := true
-	for _, k := range kids {
-		if tag(k) == "noop" {
-			continue
-		}
-		if !firstReal {
-			ds = append(ds, HardLineDoc())
-		}
-		ds = append(ds, docStmt(k))
-		firstReal = false
-	}
-	return Concat(ds...)
+	return docSeq(listS(n, 1))
 }
 
 func docParams(arr S) *Doc {
@@ -1470,22 +1502,5 @@ func valueOpaqueString(v Value) string {
 		return quoteString(v.Data.(string))
 	default:
 		return "<unknown>"
-	}
-}
-
-// Local helper to avoid depending on parser.go's joinNonEmpty.
-// Concatenates non-empty strings with a single space.
-func joinNonEmptyLocal(a, b string) string {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	switch {
-	case a == "" && b == "":
-		return ""
-	case a == "":
-		return b
-	case b == "":
-		return a
-	default:
-		return a + " " + b
 	}
 }

@@ -1044,3 +1044,77 @@ func Test_Printer_Value_Cycle_MapValue_PostAfterCommaBetweenEntries(t *testing.T
 	want := "{\n\ta: {...}, # first\n\tb: 1\n}"
 	eq(t, got, want)
 }
+
+func Test_Printer_StringEscapes_SecurityRules(t *testing.T) {
+	t.Run("LineAndParagraphSeparatorsEscaped", func(t *testing.T) {
+		src := `let s1 = "\u2028"
+let s2 = "\u2029"`
+		want := `let s1 = "\u2028"
+let s2 = "\u2029"`
+		got := pretty(t, src)
+		eq(t, got, want)
+	})
+
+	t.Run("ControlAndC1Escapes", func(t *testing.T) {
+		src := `let a = "\u0001"
+let b = "\u0085"`
+		want := `let a = "\u0001"
+let b = "\u0085"`
+		got := pretty(t, src)
+		eq(t, got, want)
+	})
+
+	t.Run("BidiAndZeroWidthEscapes", func(t *testing.T) {
+		src := `let a = "\u202E"
+let b = "\u200B"
+let c = "\uFEFF"`
+		want := `let a = "\u202E"
+let b = "\u200B"
+let c = "\uFEFF"`
+		got := pretty(t, src)
+		eq(t, got, want)
+	})
+
+	t.Run("CommonEscapesRemainShortForm", func(t *testing.T) {
+		src := `let n = "\n"
+let t = "\t"`
+		want := `let n = "\n"
+let t = "\t"`
+		got := pretty(t, src)
+		eq(t, got, want)
+	})
+
+	t.Run("NonAsciiSafeCharsStayLiteral", func(t *testing.T) {
+		// \u00E9 is decoded to 'é' in the AST; printer should emit literal 'é',
+		// not a \u escape.
+		src := `let e = "\u00E9"`
+		want := `let e = "é"`
+		got := pretty(t, src)
+		eq(t, got, want)
+	})
+}
+
+func Test_Printer_StringEscapes_InTypes(t *testing.T) {
+	t.Run("EnumLiteral_UnsafeAndSafeChars", func(t *testing.T) {
+		// Enum literal in a type: first member is U+2028 (must stay escaped),
+		// second member is \u00E9 (prints as literal 'é').
+		prog := parse(t, `type Enum["\u2028", "\u00E9"]`)
+		if len(prog) < 2 {
+			t.Fatalf("unexpected AST shape for program: %#v", prog)
+		}
+		typeStmt, ok := prog[1].(S)
+		if !ok || len(typeStmt) < 2 || typeStmt[0].(string) != "type" {
+			t.Fatalf("expected top-level type statement, got %#v", prog[1])
+		}
+		typeExpr, ok := typeStmt[1].(S)
+		if !ok {
+			t.Fatalf("expected type expression node, got %#v", typeStmt[1])
+		}
+
+		got := FormatType(typeExpr)
+		want := `Enum["\u2028", "é"]`
+		if got != want {
+			t.Fatalf("FormatType mismatch\nwant: %q\ngot:  %q", want, got)
+		}
+	})
+}

@@ -249,6 +249,41 @@ func isIdent(s string) bool {
 	return true
 }
 
+// isUnsafeLiteralRune reports runes that must always be escaped in string
+// *source code* for correctness and security. Normal printable Unicode
+// (letters, emoji, CJK, etc.) is left as UTF-8.
+func isUnsafeLiteralRune(r rune) bool {
+	// ASCII control characters (except those handled by short escapes above)
+	if r < 0x20 || r == 0x7F {
+		return true
+	}
+	// C1 controls
+	if r >= 0x80 && r <= 0x9F {
+		return true
+	}
+	// Unicode line / paragraph separators
+	if r == 0x2028 || r == 0x2029 {
+		return true
+	}
+	// Bidi controls
+	if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) {
+		return true
+	}
+	// Directional marks
+	if r == 0x200E || r == 0x200F {
+		return true
+	}
+	// Zero-width / invisible format characters
+	switch r {
+	case 0x200B, // ZWSP
+		0x200C, // ZWNJ
+		0x200D, // ZWJ
+		0xFEFF: // BOM / ZWNBSP
+		return true
+	}
+	return false
+}
+
 func quoteString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -269,7 +304,20 @@ func quoteString(s string) string {
 		case '\f':
 			b.WriteString(`\f`)
 		default:
-			b.WriteRune(r)
+			// For string *literals* in source, escape control / security-sensitive
+			// runes so they are visible and cannot be smuggled into the code.
+			if isUnsafeLiteralRune(r) {
+				if r <= 0xFFFF {
+					// Use \uXXXX for all problematic BMP runes.
+					b.WriteString(fmt.Sprintf(`\u%04X`, r))
+				} else {
+					// All currently marked problematic characters are in the BMP,
+					// but fall back to a raw rune for non-BMP just in case.
+					b.WriteRune(r)
+				}
+			} else {
+				b.WriteRune(r)
+			}
 		}
 	}
 	b.WriteByte('"')

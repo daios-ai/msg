@@ -6,11 +6,12 @@
 # style/event attrs forbidden
 # <script> requires final | tojson
 
-
 # my fun
 # more
 let f = fun(x: Int, y: Int) -> Str do
-	let g = fun(z: Int) -> Int do z end
+	let g = fun(z: Int) -> Int do
+		z
+	end
 	str(g(x + y))
 end
 
@@ -1530,7 +1531,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if ok == null then
 				return ok
 			end
-
 		elif n.tag == "expr" then
 			if mapHas(n.a, "tl") and n.a.tl and buf.pendingNL then
 				buf.pendingNL = false
@@ -1638,7 +1638,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if ok2 == null then
 				return ok2
 			end
-
 		elif n.tag == "if" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
@@ -1682,7 +1681,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if n.d != null and n.d.trEnd then
 				buf.trimNext = true
 			end
-
 		elif n.tag == "for" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
@@ -1772,7 +1770,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if n.d != null and n.d.trEnd then
 				buf.trimNext = true
 			end
-
 		elif n.tag == "include" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
@@ -1878,7 +1875,6 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if ok6 == null then
 				return ok6
 			end
-
 		elif n.tag == "block" then
 			if n.d != null and n.d.trOpen then
 				buf.trimNext = true
@@ -1893,10 +1889,8 @@ let _renderSeq = fun(e: Env, ast: [Any], scope: {}, w: Writer, buf: {
 			if n.d != null and n.d.trEnd then
 				buf.trimNext = true
 			end
-
 		elif n.tag == "extends" then
 			null
-
 		else
 			return _fail("render", "unknown node", n.a)
 		end

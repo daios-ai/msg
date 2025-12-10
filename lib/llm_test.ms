@@ -165,7 +165,6 @@ T.test("llm/auth_shallow_merge_nonkey_fields", fun(_: Null) do
 
 	let s = L.status(null)
 	T.assertEq(s.authed, false) # still unauthenticated
-
 end)
 
 T.test("llm/auth_clears_key_when_null", fun(_: Null) do
@@ -188,8 +187,7 @@ T.test("llm/auth_is_per_backend", fun(_: Null) do
 	let _ = L.useBackend("cohere")
 	let _ = L.auth({apiKey: null})
 
-	# Auth only OpenAI.
-	let _ = L.useBackend("openai")
+	let _ = L.useBackend("openai") # Auth only OpenAI.
 	let _ = L.auth({apiKey: "XYZ"})
 	T.assertEq(L.status(null).authed, true)
 
@@ -212,7 +210,6 @@ T.test("llm/ollama_exec_requires_model", fun(_: Null) do
 
 	let out = L.exec("hello")
 	T.assertEq(null, out) # expect soft-null
-
 end)
 
 T.test("llm/openai_exec_requires_key", fun(_: Null) do
@@ -221,7 +218,6 @@ T.test("llm/openai_exec_requires_key", fun(_: Null) do
 
 	let out = L.exec("hi")
 	T.assertEq(out, null) # soft-null due to missing API key
-
 end)
 
 T.test("llm/openai_exec_requires_model_even_when_authed", fun(_: Null) do
@@ -232,7 +228,6 @@ T.test("llm/openai_exec_requires_model_even_when_authed", fun(_: Null) do
 
 	let out = L.exec("hi")
 	T.assertEq(null, out) # soft-null due to missing model
-
 end)
 
 T.test("llm/cohere_exec_requires_model", fun(_: Null) do
@@ -240,7 +235,6 @@ T.test("llm/cohere_exec_requires_model", fun(_: Null) do
 	let _ = L.auth({apiKey: "XYZ"})
 	let out = L.exec("ping")
 	T.assertEq(out, null) # soft-null due to missing model
-
 end)
 
 T.test("llm/exec_ignores_unknown_options", fun(_: Null) do
@@ -261,7 +255,6 @@ T.test("llm/models_softnull_when_missing_key", fun(_: Null) do
 	let _ = L.auth({apiKey: null})
 	let m = L.models(null)
 	T.assertEq(m, null) # soft-null due to missing key
-
 end)
 
 T.test("llm/models_supported_returns_array_or_null", fun(_: Null) do
@@ -290,5 +283,4 @@ T.test("llm/useBackend_switch_is_localized", fun(_: Null) do
 
 	let _3 = L.useBackend("openai")
 	T.assertEq(L.status(null).model, "gpt-X") # original model preserved
-
 end)

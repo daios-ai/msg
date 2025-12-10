@@ -409,7 +409,6 @@ testing.test("openapi/path params declared_vs_synth", fun(_: Null) do
 	testing.assertEq("name", p2[0].name)
 	testing.assertEq("path", p2[0].in)
 	testing.assertEq("string", p2[0].schema.type) # synthesized as Str
-
 end)
 
 # 2) QUERY — explode only for scalar arrays
@@ -488,8 +487,7 @@ testing.test("openapi/params deterministic_order", fun(_: Null) do
 	let ps = doc.paths["/o/{z}"].get.parameters
 	testing.assertEq("path", ps[0].in)
 	testing.assertEq("z", ps[0].name)
-	# collect query names in listed order
-	let qs = []
+	let qs = [] # collect query names in listed order
 	let i = 0
 	while i < len(ps) do
 		if ps[i].in == "query" then
@@ -567,14 +565,21 @@ end)
 # 4) Security: root schemes + root requirement + per-route clear
 testing.test("openapi/security root_and_override", fun(_: Null) do
 	let routes = [
-		{method: "GET", pattern: "/a", style: "value", contract: {}}, # inherits root security
+		# inherits root security
+		{
+			method: "GET",
+			pattern: "/a",
+			style: "value",
+			contract: {}
+		},
+		# clears
 		{
 			method: "GET",
 			pattern: "/b",
 			style: "value",
 			contract: {},
 			security: []
-		} # clears
+		}
 	]
 	let d = _spec(routes, {title: "t", version: "1"}, [], {
 		securitySchemes: {
@@ -588,7 +593,6 @@ testing.test("openapi/security root_and_override", fun(_: Null) do
 	testing.assert(opA.security == null, "should inherit root")
 	testing.assertEq(1, len(d.security))
 	testing.assertEq(0, len(opB.security)) # explicit clear
-
 end)
 
 # 5) Request body: application/octet-stream -> string/binary

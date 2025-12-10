@@ -813,8 +813,7 @@ let auth = fun(creds: {}) -> {}? do
 	if mapHas(creds, "apiKey") then
 		b.state.apiKey = creds.apiKey
 	end
-	# Shallow-merge any other credential keys.
-	b.state = b.state + creds
+	b.state = b.state + creds # Shallow-merge any other credential keys.
 	status(null)
 end
 

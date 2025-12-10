@@ -16,8 +16,7 @@ let _tempDir = fun(_: Null) -> Str do
 	if r.ok then
 		return r.value
 	end
-	# Assume zero-arg in this runtime.
-	tempDir()
+	tempDir() # Assume zero-arg in this runtime.
 end
 
 # Create an empty temporary directory and return its absolute path.
@@ -28,7 +27,6 @@ let _mkTempDir = fun(_: Null) -> Str do
 	let ok = mkdir(dir)
 	if not ok then
 		return pathClean(dir) # <mkdir failed>
-
 	end
 	pathClean(dir)
 end
@@ -92,8 +90,7 @@ T.test("canon/files_discovery", fun(_: Null) do
 	T.assert(got != null, "files returned null")
 	T.assertEq(len(got), 2)
 
-	# Order not guaranteed; check presence.
-	let joined = join(got, "|")
+	let joined = join(got, "|") # Order not guaranteed; check presence.
 	T.assert(bool(len(match(pathClean(a), joined)) > 0), "missing a.ms")
 	T.assert(bool(len(match(pathClean(c), joined)) > 0), "missing c.ms")
 end)
@@ -134,8 +131,7 @@ T.test("canon/formatFile_change", fun(_: Null) do
 	T.assert(res != null, "formatFile returned null unexpectedly")
 	T.assertEq(true, res.changed)
 
-	# File now equals canonical
-	let now = _mustRead(p)
+	let now = _mustRead(p) # File now equals canonical
 	let canon = C.format(_validSrc(null))
 	T.assertEq(canon, now)
 end)

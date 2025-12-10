@@ -147,7 +147,6 @@ T.test("testing/snapshot/write-and-read", fun(_: Null) do
 	T.snapshotUpdate(path, {hello: "world", n: 7})
 	T.assert(T.snapshot(path, {hello: "world", n: 7}, null), null)
 	remove(path) # cleanup
-
 end)
 
 T.test("testing/snapshot/mismatch-detected", fun(_: Null) do
@@ -157,7 +156,6 @@ T.test("testing/snapshot/mismatch-detected", fun(_: Null) do
 		T.snapshot(path, [1, 2, 4], null)
 	end, "snapshot mismatch")
 	remove(path) # cleanup
-
 end)
 
 # --- seed(n) & RNG reproducibility -----------------------------------------
@@ -212,8 +210,7 @@ end)
 # --- assertType: subtyping & function values --------------------------------
 
 T.test("testing/assertType/subtyping-Int-to-Num", fun(_: Null) do
-	# 42:Int should satisfy Num.
-	T.assertType(42, typeOf(0.0))
+	T.assertType(42, typeOf(0.0)) # 42:Int should satisfy Num.
 end)
 
 T.test("testing/assertType/function-value", fun(_: Null) do
@@ -246,7 +243,6 @@ T.test("testing/snapshot/update-overwrites", fun(_: Null) do
 	T.snapshotUpdate(path, {v: 2})
 	T.assert(T.snapshot(path, {v: 2}, null), null)
 	remove(path) # cleanup
-
 end)
 
 # --- reset: clears registry -------------------------------------------------

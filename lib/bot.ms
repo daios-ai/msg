@@ -124,5 +124,4 @@ let botWithSystem = fun(system: Str, cfg: ChatConfig?) -> Str -> Str do
 	bot({maxTurns: base.maxTurns, system: system})
 end
 
-# Ask the bot.
-let ask = bot()
+let ask = bot() # Ask the bot.

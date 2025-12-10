@@ -361,8 +361,7 @@ let _connLoop = fun(conn, rtr: {}, server: _ServerHandle) -> Null do
 			continue
 		end
 
-		# Buffered value route
-		let out = rtr._entryCall(req)
+		let out = rtr._entryCall(req) # Buffered value route
 		# Auto-HEAD for value routes: same headers (accurate Content-Length), no body
 		if req.method == "HEAD" then
 			let hdr = clone(out.headers)

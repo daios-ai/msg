@@ -2,9 +2,11 @@
 package mindscript
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -103,8 +105,23 @@ func registerCastBuiltins(ip *Interpreter, target *Env) {
 		"formatCode",
 		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
 		S{"unop", "?", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
+		func(_ *Interpreter, ctx CallCtx) (v Value) {
 			s := ctx.Arg("src").Data.(string)
+
+			// Catch panics from Pretty / printer and turn them into a soft error.
+			defer func() {
+				if r := recover(); r != nil {
+					// Print Go-side details to stderr for debugging.
+					fmt.Fprintf(
+						os.Stderr, // or os.Stderr, depending on your wiring
+						"formatCode panic: %v\n%s\n",
+						r,
+						debug.Stack(),
+					)
+					v = annotNull(fmt.Sprintf("formatCode panic: %v", r))
+				}
+			}()
+
 			out, err := Pretty(s)
 			if err != nil {
 				return annotNull(err.Error())

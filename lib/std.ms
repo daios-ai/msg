@@ -621,8 +621,7 @@ end
 
 # Load the llm module, install its executor, and select a default backend/model.
 
-# The LLM module.
-let llm = import("llm")
+let llm = import("llm") # The LLM module.
 oracleInstall(llm.exec)
 llm.useBackend("openai-responses")
 llm.useModel("gpt-4.1-mini")

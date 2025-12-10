@@ -4,31 +4,30 @@
 
 # an object
 let obj = {
-	name: "John", # the name 
+	name: "John", # the name
 	age: 17 # the age
 }
 
 # an array
 let arr = [
-	"John", # the name 
+	"John", # the name
 	17 # the age
 ]
 
 # a function
-let  f  =  fun(
-	name:  Str,  # the name
-	age:  Int  # the age
-)  do
+let f = fun(name: # the name
+Str, age: # the age
+Int) do
 	name
 	age
-	return  null
+	return
 end
 
 obj.name
-obj."name"
+obj.name
 obj["name"]
 arr[0]
-arr.1
+arr[1]
 
 # -----------------------------
 # Public data types
@@ -61,8 +60,6 @@ let _trimIfNeeded = fun(state: ChatState, cfg: ChatConfig) -> ChatState do
 	end
 end
 
-
-
 # -----------------------------
 # Oracles
 # -----------------------------
@@ -74,7 +71,6 @@ end
 let respond = oracle(summary: Str?, context: [Message], user: Str, system: Str?) -> {
 	reply!: Str
 }
-
 
 # -----------------------------
 # Single-turn interaction
@@ -146,5 +142,4 @@ let botWithSystem = fun(system: Str, cfg: ChatConfig?) -> Str -> Str do
 	bot({maxTurns: base.maxTurns, system: system})
 end
 
-# Ask the bot.
-let ask = bot()
+let ask = bot() # Ask the bot.

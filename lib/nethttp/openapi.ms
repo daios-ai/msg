@@ -239,8 +239,7 @@ let _addParams = fun(ps: [{}], where: Str, T: Type, reg: {}, comps: {}) -> [{}] 
 						p.explode = false
 					end
 				else
-					# Unknown/compound element type → do not explode
-					p.explode = false
+					p.explode = false # Unknown/compound element type → do not explode
 				end
 			elif rt != null and rt[1][0] == "map" then
 				p.style = "deepObject"

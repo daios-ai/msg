@@ -1017,16 +1017,14 @@ let tests = fun(spec: {}) -> [Any]? do
 		return
 	end
 
-	# Spawn one worker per idea (parallelizable)
-	let ps = []
+	let ps = [] # Spawn one worker per idea (parallelizable)
 	for idea in ideas do
 		push(ps, procSpawn(fun() do
 			_buildTest(spec, idea)
 		end))
 	end
 
-	# Collect results, drop nulls
-	let out = []
+	let out = [] # Collect results, drop nulls
 	for r in procJoinAll(ps) do
 		if r != null then
 			push(out, r)

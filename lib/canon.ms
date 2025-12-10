@@ -1,5 +1,4 @@
-# File extension for MindScript sources.
-let EXT_MS = ".ms"
+let EXT_MS = ".ms" # File extension for MindScript sources.
 
 # -------------------------
 # Internal helpers (private)
@@ -50,7 +49,6 @@ let _walk = fun(dir: Str) -> [Str]? do
 	let entries = dirList(dir)
 	if entries == null then
 		return null # <cannot list directory>
-
 	end
 	let out = []
 	for entry in entries do
@@ -58,13 +56,11 @@ let _walk = fun(dir: Str) -> [Str]? do
 		let st = stat(p)
 		if st == null then
 			return null # <stat failed>
-
 		end
 		if st.isDir then
 			let rec = _walk(p)
 			if rec == null then
 				return null # <walk failed>
-
 			end
 			for q in rec do
 				out = out + [q]
@@ -127,7 +123,6 @@ let format = fun(src: Str) -> Str? do
 	let out = formatCode(src)
 	if out == null then
 		return null # <unformattable>
-
 	end
 	out
 end
@@ -147,12 +142,10 @@ let files = fun(root: Str) -> [Str]? do
 	let st = stat(rootPath)
 	if st == null or not st.isDir then
 		return null # <root not a directory>
-
 	end
 	let all = _walk(rootPath)
 	if all == null then
 		return null # <walk error>
-
 	end
 	let out = []
 	for f in all do
@@ -177,12 +170,10 @@ let checkFile = fun(path: Str) -> Bool? do
 	let src = readFile(abs)
 	if src == null then
 		return null # <cannot read file>
-
 	end
 	let fmtd = format(src)
 	if fmtd == null then
 		return null # <format failed>
-
 	end
 	fmtd == src
 end
@@ -198,16 +189,15 @@ end
 # Return:
 # { changed!: Bool }? — change flag; null on error.
 let formatFile = fun(path: Str) -> {changed: Bool}? do
+	printf("Formatting: %s\n", [path])
 	let abs = _toAbsClean(path)
 	let src = readFile(abs)
 	if src == null then
 		return null # <cannot read file>
-
 	end
 	let fmtd = format(src)
 	if fmtd == null then
 		return null # <format failed>
-
 	end
 	if fmtd == src then
 		return {changed: false}
@@ -215,7 +205,6 @@ let formatFile = fun(path: Str) -> {changed: Bool}? do
 	let n = writeFile(abs, fmtd)
 	if n == null then
 		return null # <cannot write file>
-
 	end
 	{changed: true}
 end
@@ -233,7 +222,6 @@ let formatTree = fun(root: Str) -> {changed: Int, errors: Int, total: Int}? do
 	let fs = files(root)
 	if fs == null then
 		return null # <discovery failed>
-
 	end
 	let total = 0
 	let changed = 0

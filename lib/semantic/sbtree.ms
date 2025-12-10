@@ -94,8 +94,7 @@ let _safeSplit = fun(cs: [Str]) -> {left!: [Int], right!: [Int]} do
 	if g != null and len(g.left) > 0 and len(g.right) > 0 then
 		return g
 	end
-	# Fallback: balanced halving by index
-	let n = len(cs)
+	let n = len(cs) # Fallback: balanced halving by index
 	let mid = if n % 2 == 0 then
 		n / 2
 	else
@@ -237,7 +236,6 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 		if isLeaf(n) then
 			if n.content == text then
 				return null # deleted
-
 			end
 			return n
 		end
@@ -247,8 +245,7 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 		let child = rec(ks[i])
 
 		if child == null then
-			# drop child i
-			let out = []
+			let out = [] # drop child i
 			let j = 0
 			while j < len(ks) do
 				if j != i then
@@ -258,10 +255,8 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 			end
 			if len(out) == 0 then
 				return null # prune empty internal
-
 			elif len(out) == 1 then
 				return out[0] # collapse single-child internal
-
 			end
 			return internal(out)
 		end
@@ -273,7 +268,6 @@ let remove = fun(root: Node, text: Str, b: Int) -> Node do
 	let r = rec(root)
 	if r == null then
 		leaf("") # empty-tree sentinel: single empty leaf (still a valid tree)
-
 	else
 		if not isLeaf(r) and len(r.children) == 1 then
 			r.children[0]

@@ -106,7 +106,6 @@ package mindscript
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -581,29 +580,6 @@ func braced(open string, inside *Doc, close string) *Doc {
 	return Concat(Text(open), inside, Text(close))
 }
 
-// inlineOrMultiAdvanced builds a `[ a, b ]` or multi-line with indentation.
-// If endsLastLine is true, the trailing SoftLine is omitted to avoid an extra
-// blank line before the closing bracket/brace.
-func inlineOrMultiAdvanced(open string, elems []*Doc, close string, endsLastLine bool) *Doc {
-	if len(elems) == 0 {
-		// exact-empty without spaces: [] or {}
-		return Text(open + close)
-	}
-	sep := Concat(Text(","), LineDoc())
-	inside := Join(sep, elems)
-	body := Concat(SoftLineDoc(), inside)
-	if !endsLastLine {
-		body = Concat(body, SoftLineDoc())
-	}
-	return Group(braced(open, Nest(1, body), close))
-}
-
-// inlineOrMulti is the default variant when the last element does not force
-// a newline (or when callers don't track it).
-func inlineOrMulti(open string, elems []*Doc, close string) *Doc {
-	return inlineOrMultiAdvanced(open, elems, close, false)
-}
-
 // Minimal entry builder; annotation handling is centralized elsewhere.
 func kvEntry(keyDoc *Doc, valDoc *Doc) *Doc {
 	return Concat(keyDoc, Text(": "), valDoc)
@@ -612,29 +588,109 @@ func kvEntry(keyDoc *Doc, valDoc *Doc) *Doc {
 /* ---------- Comma-aware joining (centralized POST-after-comma logic) ---------- */
 
 type sepItem struct {
-	main *Doc // rendered item (element or entry) without its trailing POST
-	post string
+	before *Doc // layout that should appear immediately before main
+	main   *Doc // rendered item (element or entry) without its trailing POST
+	post   string
+	after  *Doc // layout that should appear after this item (before next item/closer)
+}
+
+// concatDocs flattens two doc fragments, avoiding nested empty concats.
+func concatDocs(a, b *Doc) *Doc {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return Concat(a, b)
+}
+
+// layoutDocForNode returns a pure-layout doc for nodes that represent blank
+// lines or comment-only entries inside arrays/maps/enums/patterns.
+func layoutDocForNode(n S) *Doc {
+	switch tag(n) {
+	case "noop":
+		// Blank line inside a collection.
+		return HardLineDoc()
+	case "annot":
+		txt, wrapped, _ := asAnnotASTRaw(n)
+		if tag(wrapped) == "noop" {
+			// Comment-only line inside a collection.
+			return annotPre(txt)
+		}
+	}
+	return nil
+}
+
+// buildSepItems walks a list of AST children, separating value entries from
+// layout-only nodes. Layout preceding the first value becomes .before on that
+// value; trailing layout after the last value becomes .after on the last item.
+// If the list contains only layout nodes, it produces a single sepItem whose
+// .before holds the layout and whose main is empty.
+func buildSepItems(nodes []S, makeVal func(S) sepItem) []sepItem {
+	var items []sepItem
+	var pendingLayout *Doc
+
+	for _, n := range nodes {
+		if ld := layoutDocForNode(n); ld != nil {
+			pendingLayout = concatDocs(pendingLayout, ld)
+			continue
+		}
+		it := makeVal(n)
+		if pendingLayout != nil {
+			it.before = concatDocs(it.before, pendingLayout)
+			pendingLayout = nil
+		}
+		items = append(items, it)
+	}
+
+	if pendingLayout != nil {
+		if len(items) == 0 {
+			items = append(items, sepItem{before: pendingLayout, main: Concat()})
+		} else {
+			last := &items[len(items)-1]
+			last.after = concatDocs(last.after, pendingLayout)
+		}
+	}
+	return items
 }
 
 // joinCommaWithPost joins items with commas, printing any item's POST
 // *after the comma that follows that item*. The last item's POST (if any)
 // prints after the item (no comma). POST forces newline via annotInline.
+// Layout in .before/.after is emitted around the item as appropriate.
 func joinCommaWithPost(items []sepItem) *Doc {
 	if len(items) == 0 {
 		return Concat()
 	}
-	out := make([]*Doc, 0, len(items)*3)
+	out := make([]*Doc, 0, len(items)*4)
 	for i, it := range items {
+		if it.before != nil {
+			out = append(out, it.before)
+		}
 		out = append(out, it.main)
-		if i < len(items)-1 {
-			out = append(out, Text(","))
+
+		isLast := i == len(items)-1
+		if isLast {
 			if it.post != "" {
 				out = append(out, annotInline(it.post))
-			} else {
-				out = append(out, LineDoc())
 			}
-		} else if it.post != "" {
+			if it.after != nil {
+				out = append(out, it.after)
+			}
+			continue
+		}
+
+		// Not last: comma, then either inline-post or normal separator,
+		// then any "after" layout that belongs between this and the next item.
+		out = append(out, Text(","))
+		if it.post != "" {
 			out = append(out, annotInline(it.post))
+		} else {
+			out = append(out, LineDoc())
+		}
+		if it.after != nil {
+			out = append(out, it.after)
 		}
 	}
 	return Concat(out...)
@@ -1047,15 +1103,13 @@ func docExpr(n S) *Doc {
 		if len(elems) == 0 {
 			return Text("[]")
 		}
-		items := make([]sepItem, 0, len(elems))
-		for _, e := range elems {
+		items := buildSepItems(elems, func(e S) sepItem {
 			if txt, inner, ok := asAnnotASTRaw(e); ok {
 				main, post := attachInlineOrPre(docExpr(inner), txt)
-				items = append(items, sepItem{main: main, post: post})
-			} else {
-				items = append(items, sepItem{main: docExpr(e), post: ""})
+				return sepItem{main: main, post: post}
 			}
-		}
+			return sepItem{main: docExpr(e)}
+		})
 		inside := joinCommaWithPost(items)
 		lastEnds := items[len(items)-1].post != ""
 		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
@@ -1070,16 +1124,14 @@ func docExpr(n S) *Doc {
 		if len(items) == 0 {
 			return Text("{}")
 		}
-		joined := make([]sepItem, 0, len(items))
-		for _, pr := range items {
+		joined := buildSepItems(items, func(pr S) sepItem {
 			key := unwrapKeyName(pr[1].(S))
 			val := pr[2].(S)
 			if txt, inner, ok := asAnnotASTRaw(val); ok {
-				joined = append(joined, entryWithAnn(idOrQuoted(key), docExpr(inner), txt))
-			} else {
-				joined = append(joined, sepItem{main: kvEntry(idOrQuoted(key), docExpr(val)), post: ""})
+				return entryWithAnn(idOrQuoted(key), docExpr(inner), txt)
 			}
-		}
+			return sepItem{main: kvEntry(idOrQuoted(key), docExpr(val))}
+		})
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
 		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
@@ -1094,15 +1146,13 @@ func docExpr(n S) *Doc {
 		if len(elems) == 0 {
 			return Text("Enum[]")
 		}
-		items := make([]sepItem, 0, len(elems))
-		for _, e := range elems {
+		items := buildSepItems(elems, func(e S) sepItem {
 			if txt, inner, ok := asAnnotASTRaw(e); ok {
 				main, post := attachInlineOrPre(docExpr(inner), txt)
-				items = append(items, sepItem{main: main, post: post})
-			} else {
-				items = append(items, sepItem{main: docExpr(e), post: ""})
+				return sepItem{main: main, post: post}
 			}
-		}
+			return sepItem{main: docExpr(e)}
+		})
 		inside := joinCommaWithPost(items)
 		lastEnds := items[len(items)-1].post != ""
 		return Group(braced("Enum[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
@@ -1160,15 +1210,13 @@ func docPattern(n S) *Doc {
 		if len(items) == 0 {
 			return Text("[]")
 		}
-		joined := make([]sepItem, 0, len(items))
-		for _, it := range items {
+		joined := buildSepItems(items, func(it S) sepItem {
 			if txt, inner, ok := asAnnotASTRaw(it); ok {
 				main, post := attachInlineOrPre(docPattern(inner), txt)
-				joined = append(joined, sepItem{main: main, post: post})
-			} else {
-				joined = append(joined, sepItem{main: docPattern(it), post: ""})
+				return sepItem{main: main, post: post}
 			}
-		}
+			return sepItem{main: docPattern(it)}
+		})
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
 		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
@@ -1183,16 +1231,14 @@ func docPattern(n S) *Doc {
 		if len(items) == 0 {
 			return Text("{}")
 		}
-		joined := make([]sepItem, 0, len(items))
-		for _, it := range items {
+		joined := buildSepItems(items, func(it S) sepItem {
 			key := unwrapKeyName(it[1].(S))
 			val := it[2].(S)
 			if txt, inner, ok := asAnnotASTRaw(val); ok {
-				joined = append(joined, entryWithAnn(idOrQuoted(key), docPattern(inner), txt))
-			} else {
-				joined = append(joined, sepItem{main: kvEntry(idOrQuoted(key), docPattern(val)), post: ""})
+				return entryWithAnn(idOrQuoted(key), docPattern(inner), txt)
 			}
-		}
+			return sepItem{main: kvEntry(idOrQuoted(key), docPattern(val))}
+		})
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
 		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
@@ -1231,67 +1277,85 @@ func docType(t S) *Doc {
 	switch tag(t) {
 	case "id":
 		return Text(getStr(t))
+
 	case "get":
 		recv := t[1].(S)
 		prop := t[2].(S)[1].(string)
 		// Reuse docType for the receiver so nested gets print as a.b.c
 		// If the receiver were ever non-type-ish, docType will fall back gracefully.
 		return Concat(docType(recv), Text("."), idOrQuoted(prop))
+
 	case "unop":
 		if t[1].(string) == "?" {
 			return Concat(docType(t[2].(S)), Text("?"))
 		}
 		return Text("<unop>")
+
 	case "array":
-		elem := S{"id", "Any"}
-		if len(t) == 2 {
-			elem = t[1].(S)
+		items := listS(t, 1)
+		if len(items) == 0 {
+			return Text("[]")
 		}
-		return Concat(Text("["), docType(elem), Text("]"))
+		joined := buildSepItems(items, func(it S) sepItem {
+			if txt, inner, ok := asAnnotASTRaw(it); ok {
+				main, post := attachInlineOrPre(docType(inner), txt)
+				return sepItem{main: main, post: post}
+			}
+			return sepItem{main: docType(it)}
+		})
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
+
 	case "enum":
 		elems := listS(t, 1)
 		if len(elems) == 0 {
 			return Text("Enum[]")
 		}
-		var ds []*Doc
-		for _, e := range elems {
-			ds = append(ds, docTypeLiteral(e))
-		}
-		return inlineOrMulti("Enum[", ds, "]")
-	case "map":
-		type fld struct {
-			name string
-			req  bool
-			typ  S
-			vAnn string
-		}
-		var fs []fld
-		for _, raw := range listS(t, 1) {
-			req := raw[0].(string) == "pair!"
-			k := unwrapKeyName(raw[1].(S))
-			ft := raw[2].(S)
-			txt, inner, ok := asAnnotASTRaw(ft)
-			if ok {
-				ft = inner
+		joined := buildSepItems(elems, func(e S) sepItem {
+			if txt, inner, ok := asAnnotASTRaw(e); ok {
+				main, post := attachInlineOrPre(docTypeLiteral(inner), txt)
+				return sepItem{main: main, post: post}
 			}
-			fs = append(fs, fld{name: k, req: req, typ: ft, vAnn: strings.TrimSpace(txt)})
-		}
-		sort.Slice(fs, func(i, j int) bool { return fs[i].name < fs[j].name })
-		if len(fs) == 0 {
+			return sepItem{main: docTypeLiteral(e)}
+		})
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("Enum[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
+
+	case "map":
+		items := listS(t, 1)
+		if len(items) == 0 {
 			return Text("{}")
 		}
-		joined := make([]sepItem, 0, len(fs))
-		for _, f := range fs {
-			key := idOrQuoted(f.name)
-			if f.req {
-				key = Concat(key, Text("!"))
+		joined := buildSepItems(items, func(raw S) sepItem {
+			switch tag(raw) {
+			case "pair", "pair!":
+				key := unwrapKeyName(raw[1].(S))
+				val := raw[2].(S)
+				keyDoc := idOrQuoted(key)
+				if tag(raw) == "pair!" {
+					keyDoc = Concat(keyDoc, Text("!"))
+				}
+				if txt, inner, ok := asAnnotASTRaw(val); ok {
+					return entryWithAnn(keyDoc, docType(inner), txt)
+				}
+				return sepItem{main: kvEntry(keyDoc, docType(val))}
+			default:
+				// Fallback: render unknown nodes in place.
+				return sepItem{main: docType(raw)}
 			}
-			if f.vAnn != "" {
-				joined = append(joined, entryWithAnn(key, docType(f.typ), f.vAnn))
-			} else {
-				joined = append(joined, sepItem{main: kvEntry(key, docType(f.typ)), post: ""})
-			}
-		}
+		})
 		inside := joinCommaWithPost(joined)
 		lastEnds := joined[len(joined)-1].post != ""
 		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
@@ -1300,6 +1364,7 @@ func docType(t S) *Doc {
 			}
 			return SoftLineDoc()
 		}())), "}"))
+
 	case "binop":
 		if t[1].(string) == "->" && len(t) >= 4 {
 			left := t[2].(S)
@@ -1314,10 +1379,12 @@ func docType(t S) *Doc {
 			return Concat(leftDoc, Text(" -> "), docType(right))
 		}
 		return Text("<binop>")
+
 	case "annot":
 		txt, wrapped, _ := asAnnotASTRaw(t)
 		// Outside binding sites, render as PRE.
 		return Concat(annotPre(txt), docType(wrapped))
+
 	default:
 		return Text("<type>")
 	}
@@ -1343,23 +1410,28 @@ func docTypeLiteral(lit S) *Doc {
 		if len(items) == 0 {
 			return Text("[]")
 		}
-		var ds []*Doc
-		for _, s := range items {
-			ds = append(ds, docTypeLiteral(s))
-		}
-		return inlineOrMulti("[", ds, "]")
+		joined := buildSepItems(items, func(s S) sepItem {
+			return sepItem{main: docTypeLiteral(s)}
+		})
+		inside := joinCommaWithPost(joined)
+		lastEnds := joined[len(joined)-1].post != ""
+		return Group(braced("[", Nest(1, Concat(SoftLineDoc(), inside, func() *Doc {
+			if lastEnds {
+				return Concat()
+			}
+			return SoftLineDoc()
+		}())), "]"))
 	case "map":
 		items := listS(lit, 1)
 		if len(items) == 0 {
 			return Text("{}")
 		}
-		joined := make([]sepItem, 0, len(items))
-		for _, pr := range items {
+		joined := buildSepItems(items, func(pr S) sepItem {
 			k := pr[1].(S)[1].(string)
 			val := docTypeLiteral(pr[2].(S))
 			entry := kvEntry(idOrQuoted(k), val)
-			joined = append(joined, sepItem{main: entry, post: ""})
-		}
+			return sepItem{main: entry}
+		})
 		inside := joinCommaWithPost(joined)
 		return Group(braced("{", Nest(1, Concat(SoftLineDoc(), inside, SoftLineDoc())), "}"))
 	default:
@@ -1398,7 +1470,7 @@ func entryWithAnn(keyDoc, valDoc *Doc, ann string) sepItem {
 	if post != "" {
 		return sepItem{main: probe, post: post}
 	}
-	return sepItem{main: main, post: ""}
+	return sepItem{main: main}
 }
 
 /* ---------- Value → AST adapter (single source of truth) ---------- */

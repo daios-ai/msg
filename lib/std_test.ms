@@ -125,9 +125,10 @@ T.test("std/filter/lazy", fun(_: Null) do
 end)
 
 T.test("std/reduce/non-empty", fun(_: Null) do
+	# 1+2+3
 	let sum = reduce(fun(a, b) do
 		int(a) + int(b)
-	end, range(1, 4)) # 1+2+3
+	end, range(1, 4))
 
 	T.assertEq(sum, 6)
 end)
@@ -207,13 +208,9 @@ end)
 
 T.test("std/dir/filters-and-annotates", fun(_: Null) do
 	let obj = {
-		a:
-			# alpha
-			1,
+		a: 1, # alpha
 		_hidden: 2,
-		b:
-			# bravo
-			3
+		b: 3 # bravo
 	}
 	let ds = dir(obj)
 	T.assertEq(len(ds), 2)

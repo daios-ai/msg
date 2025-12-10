@@ -156,7 +156,6 @@ let _json = fun(v) -> Str? do
 		return s
 	end
 	null # <json stringify failed>
-
 end
 
 let _getHeader = fun(h: {}, name: Str) -> Str? do
@@ -240,7 +239,6 @@ let _rawBody = fun(req: Request) -> Str? do
 	let s = readAll(req.body)
 	if s == null then
 		return null # <read body failed>
-
 	end
 	s
 end
@@ -264,7 +262,6 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 			return pj
 		end
 		return null # <bad int>
-
 	end
 	if isSubtype(T, type Num) then
 		let n = num(s)
@@ -276,7 +273,6 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 			return pj
 		end
 		return null # <bad num>
-
 	end
 	if isSubtype(T, type Bool) then
 		let sl = toLower(s)
@@ -291,22 +287,18 @@ let _coerceScalar = fun(s: Str, T: Type) -> Any? do
 			return pj
 		end
 		return null # <bad bool>
-
 	end
 	null # <unsupported scalar type>
-
 end
 
 let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 	let rt = reflect(T)
 	if rt == null then
 		return null # <reflect failed>
-
 	end
 	let node = rt[1]
 	if node[0] != "map" then
 		return null # <only object types supported for query>
-
 	end
 
 	let out = {}
@@ -327,7 +319,6 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		if vs == null or len(vs) == 0 then
 			if tag == "pair!" then
 				return null # <missing key: {k}>
-
 			end
 			i = i + 1
 			continue
@@ -345,7 +336,6 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 						let u = _coerceScalar(s, U)
 						if u == null then
 							return null # <bad element for {k}>
-
 						end
 						arr = arr + [u]
 						j = j + 1
@@ -361,7 +351,6 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 				let u2 = _coerceScalar(vs[j2], U)
 				if u2 == null then
 					return null # <bad element for {k}>
-
 				end
 				arr2 = arr2 + [u2]
 				j2 = j2 + 1
@@ -375,7 +364,6 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		let v = _coerceScalar(s, Tk)
 		if v == null then
 			return null # <coercion failed: {k}>
-
 		end
 		out[k] = v
 		i = i + 1
@@ -385,7 +373,6 @@ let _bindQueryMap = fun(m: {}, T: Type) -> Any? do
 		return out
 	end
 	null # <query validation failed>
-
 end
 
 let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
@@ -396,7 +383,6 @@ let _bindQueryFromReq = fun(req: Request, TQ: Type) -> Any? do
 	end)
 	if qm == null then
 		return null # <invalid query string>
-
 	end
 	_bindQueryMap(qm, TQ)
 end
@@ -418,12 +404,10 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 	let rt = reflect(TP)
 	if rt == null then
 		return null # <reflect failed>
-
 	end
 	let node = rt[1]
 	if node[0] != "map" then
 		return null # <path must be object type>
-
 	end
 	let out = {}
 	let entries = slice(node, 1, len(node))
@@ -441,7 +425,6 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		if raw == null then
 			if tag == "pair!" then
 				return null # <missing key: {k}>
-
 			end
 			i = i + 1
 			continue
@@ -449,7 +432,6 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		let v = _coerceScalar(raw, Tk)
 		if v == null then
 			return null # <coercion failed: {k}>
-
 		end
 		out[k] = v
 		i = i + 1
@@ -458,23 +440,19 @@ let _bindPath = fun(ps: {}, TP: Type) -> Any? do
 		return out
 	end
 	null # <path validation failed>
-
 end
 
 let _bindBody = fun(req: Request, TB: Type) -> Any? do
 	let raw = _rawBody(req)
 	if raw == null then
 		return null # <read body failed>
-
 	end
 	let v = jsonParse(raw)
 	if v == null then
 		return null # <invalid json>
-
 	end
 	if not isType(v, TB) then
 		return null # <validation failed: expected body to satisfy {str(TB)}>
-
 	end
 	v
 end
@@ -648,21 +626,17 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 		end
 		if not _emitHead() then
 			return null # <write head failed>
-
 		end
 		if st.chunked then
 			let pre = sprintf("%x\r\n", [len(chunk)])
 			if write(conn, pre) == null then
 				return null # <write failed>
-
 			end
 			if write(conn, chunk) == null then
 				return null # <write failed>
-
 			end
 			if write(conn, "\r\n") == null then
 				return null # <write failed>
-
 			end
 			let _ = flush(conn)
 			len(chunk)
@@ -670,7 +644,6 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 			let n = write(conn, chunk)
 			if n == null then
 				return null # <write failed>
-
 			end
 			let _ = flush(conn)
 			n
@@ -691,7 +664,6 @@ let _newSockResponder = fun(conn, opts: {}) -> {api: Responder, state: {}} do
 		if st.chunked then
 			if write(conn, "0\r\n\r\n") == null then
 				return null # <write failed>
-
 			end
 		end
 		let _ = flush(conn)
@@ -1776,22 +1748,22 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 
 			let colorOn = true
 			let GRN = if colorOn then
-				"[32m"
+				"\u001B[32m"
 			else
 				""
 			end
 			let RED = if colorOn then
-				"[31m"
+				"\u001B[31m"
 			else
 				""
 			end
 			let DIM = if colorOn then
-				"[2m"
+				"\u001B[2m"
 			else
 				""
 			end
 			let RST = if colorOn then
-				"[0m"
+				"\u001B[0m"
 			else
 				""
 			end
@@ -1851,11 +1823,9 @@ let _ServerHandle = type {
 let serve = fun(listener, r, opts: {}) -> {}? do
 	if listener == null then
 		return null # <serve: missing listener>
-
 	end
 	if not mapHas(r, "_entryCall") then
 		return null # <serve: not a router>
-
 	end
 
 	if not mapHas(opts, "readHeaderTimeoutMs") or opts.readHeaderTimeoutMs == null then
@@ -2267,8 +2237,7 @@ let _connLoop = fun(conn, router, server) -> Null do
 			continue
 		end
 
-		# Buffered value route
-		let out = router._entryCall(req)
+		let out = router._entryCall(req) # Buffered value route
 		# Auto-HEAD for value routes: same headers (with accurate Content-Length), no body
 		if req.method == "HEAD" then
 			let hdr = clone(out.headers)

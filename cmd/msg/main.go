@@ -140,7 +140,7 @@ func usage() {
 Usage:
   %s run <file.ms> [--] [args...]         Run a script.
   %s repl                                 Start the REPL.
-  %s fmt [--check] [path ...]             Format file(s) or tree(s) canonically
+  %s fmt [--check] [path ...]             Format MindScript file(s) by path prefix
   %s test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
   %s get <module>@<version?>              Install a third-party module (stub)
 
@@ -361,7 +361,9 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 func cmdFmt(args []string) int {
 	fs := flag.NewFlagSet("fmt", flag.ContinueOnError)
 	check := fs.Bool("check", false, "check format; exit 1 if any file would change")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 	paths := fs.Args()
 	if len(paths) == 0 {
 		paths = []string{"."}
@@ -378,42 +380,36 @@ func cmdFmt(args []string) int {
 	}
 
 	if *check {
-		var bad int64 = 0
-		for _, p := range paths {
-			info, err := os.Stat(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
-				return 1
-			}
-			if !info.IsDir() {
-				v, err := call(fmt.Sprintf(`import("canon").checkFile(%q)`, p))
-				if err != nil {
-					fmt.Fprintln(os.Stderr, err.Error())
-					return 1
-				}
-				if v.Tag == mindscript.VTBool && !v.Data.(bool) {
-					fmt.Println(p)
-					bad++
-				}
-				continue
-			}
-			// dir: get file list and check each
-			vlist, err := call(fmt.Sprintf(`import("canon").files(%q)`, p))
+		var bad int64
+
+		for _, prefix := range paths {
+			// Discover files by prefix via canon.files
+			vlist, err := call(fmt.Sprintf(`import("canon").files(%q)`, prefix))
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err.Error())
+				return 1
+			}
+			if vlist.Tag == mindscript.VTNull {
+				fmt.Fprintf(os.Stderr, "%s: discovery failed for %s\n", appName, prefix)
 				return 1
 			}
 			if vlist.Tag != mindscript.VTArray {
 				continue
 			}
+
 			for _, ev := range vlist.Data.([]mindscript.Value) {
 				if ev.Tag != mindscript.VTStr {
 					continue
 				}
 				f := ev.Data.(string)
+
 				vok, err := call(fmt.Sprintf(`import("canon").checkFile(%q)`, f))
 				if err != nil {
 					fmt.Fprintln(os.Stderr, err.Error())
+					return 1
+				}
+				if vok.Tag == mindscript.VTNull {
+					fmt.Fprintf(os.Stderr, "%s: cannot check %s\n", appName, f)
 					return 1
 				}
 				if vok.Tag == mindscript.VTBool && !vok.Data.(bool) {
@@ -422,31 +418,34 @@ func cmdFmt(args []string) int {
 				}
 			}
 		}
+
 		if bad > 0 {
 			return 1
 		}
 		return 0
 	}
 
-	// Write mode: file → formatFile; dir → formatTree
-	for _, p := range paths {
-		info, err := os.Stat(p)
+	// Write mode: delegate tree formatting to canon.formatTree using prefix semantics.
+	for _, prefix := range paths {
+		v, err := call(fmt.Sprintf(`import("canon").formatTree(%q)`, prefix))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", appName, err)
+			fmt.Fprintln(os.Stderr, err.Error())
 			return 1
 		}
-		if info.IsDir() {
-			if _, err := ip.EvalPersistentSource(fmt.Sprintf(`import("canon").formatTree(%q)`, p)); err != nil {
-				fmt.Fprintln(os.Stderr, err.Error())
-				return 1
-			}
-		} else {
-			if _, err := ip.EvalPersistentSource(fmt.Sprintf(`import("canon").formatFile(%q)`, p)); err != nil {
-				fmt.Fprintln(os.Stderr, err.Error())
-				return 1
+		if v.Tag == mindscript.VTNull {
+			fmt.Fprintf(os.Stderr, "%s: discovery/formatting failed for %s\n", appName, prefix)
+			return 1
+		}
+		// If canon reported per-file errors, treat as failure.
+		if v.Tag == mindscript.VTMap {
+			if mo, ok := v.Data.(*mindscript.MapObject); ok {
+				if e, ok := mo.Entries["errors"]; ok && e.Tag == mindscript.VTInt && e.Data.(int64) > 0 {
+					return 1
+				}
 			}
 		}
 	}
+
 	return 0
 }
 

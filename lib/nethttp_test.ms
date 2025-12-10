@@ -476,8 +476,7 @@ testing.test("nethttp/hello over tcp", fun(_: Null) do
 	let srv = http.serve(l, r, {})
 	testing.assert(srv != null, "serve failed")
 
-	# raw client
-	let c = netConnect(addr)
+	let c = netConnect(addr) # raw client
 	testing.assert(c != null, "connect failed")
 	let _ = write(c, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _ = flush(c)
@@ -585,8 +584,7 @@ testing.test("nethttp/stream + options", fun(_: Null) do
 	let l = netListen(addr)
 	let srv = http.serve(l, root, {})
 
-	# GET stream
-	let c1 = netConnect(addr)
+	let c1 = netConnect(addr) # GET stream
 	let _ = write(c1, "GET /time/now HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _ = flush(c1)
 	let resp1 = readAll(c1)
@@ -918,16 +916,14 @@ testing.test("nethttp/shutdown stops accepts", fun(_: Null) do
 	let srv = http.serve(l, r, {})
 	testing.assert(srv != null, "serve failed")
 
-	# First request succeeds.
-	let c1 = netConnect(addr)
+	let c1 = netConnect(addr) # First request succeeds.
 	testing.assert(c1 != null, "connect1 failed")
 	let _ = write(c1, "GET /once HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _ = flush(c1)
 	let _ = readAll(c1)
 	close(c1)
 
-	# Now shutdown.
-	let _ = http.shutdown(srv, 0)
+	let _ = http.shutdown(srv, 0) # Now shutdown.
 
 	# Late connection should fail to connect or produce no valid response.
 	let c2 = netConnect(addr)
@@ -980,16 +976,14 @@ testing.test("nethttp/options known-vs-unknown", fun(_: Null) do
 	let l = netListen(addr)
 	let srv = http.serve(l, r, {})
 
-	# known shape
-	let c1 = netConnect(addr)
+	let c1 = netConnect(addr) # known shape
 	let _ = write(c1, "OPTIONS /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _ = flush(c1)
 	let resp1 = readAll(c1)
 	close(c1)
 	testing.assert(len(split(resp1, "HTTP/1.1 204 No Content")) > 1, "expected 204 on known path")
 
-	# unknown
-	let c2 = netConnect(addr)
+	let c2 = netConnect(addr) # unknown
 	let _2 = write(c2, "OPTIONS /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _2f = flush(c2)
 	let resp2 = readAll(c2)
@@ -1365,8 +1359,7 @@ testing.test("nethttp/HEAD auto value route", fun(_: Null) do
 	let l = netListen(addr)
 	let srv = http.serve(l, r, {}) # default: no Date header (fine)
 
-	# Send HEAD (no body expected)
-	let c = netConnect(addr)
+	let c = netConnect(addr) # Send HEAD (no body expected)
 	let _ = write(c, "HEAD /h HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 	let _ = flush(c)
 	let resp = readAll(c)

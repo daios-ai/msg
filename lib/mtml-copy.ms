@@ -14,7 +14,7 @@ let f = fun(x: Int, y: Int) -> Str do
 	end
 	str(g(x + y))
 end
- # ---------------- Types & constructors ----------------
+# ---------------- Types & constructors ----------------
 
 let SafeHTML = type {__brand__!: Str, __safe_html__!: Bool, html!: Str}
 let SafeURL = type {__brand__!: Str, __safe_url__!: Bool, url!: Str}
@@ -120,7 +120,7 @@ let Env = type {
 	_loader: Str -> {name: Str, src: Str}?,
 	opts: RenderOpts
 }
- # ---------------- Utilities ----------------
+# ---------------- Utilities ----------------
 
 # Merge user options with defaults, preferring user keys.
 # 
@@ -322,7 +322,7 @@ let _relName = fun(baseDir: Str, full: Str) -> Str do
 	end
 	full
 end
- # ---------------- Environment ----------------
+# ---------------- Environment ----------------
 
 # Create a rendering environment with defaults and a jailed loader.
 # 
@@ -391,7 +391,7 @@ let registerGlobal = fun(e: Env, name: Str, value) -> Bool do
 	e._globals[name] = value
 	true
 end
- # ---------------- Tokenizer helpers ----------------
+# ---------------- Tokenizer helpers ----------------
 
 # Whether an attribute name is treated as a URL context.
 # 
@@ -702,7 +702,7 @@ let _lex = fun(src: Str) -> [Any]? do
 	end
 	out
 end
- # ---------------- Parser (AST) ----------------
+# ---------------- Parser (AST) ----------------
 
 # Construct a tiny node record with optional payloads.
 # 
@@ -1000,7 +1000,7 @@ let _parse = fun(tokens: [Any]) -> [Any]? do
 	end
 	ast
 end
- # ---------------- Expression evaluation ----------------
+# ---------------- Expression evaluation ----------------
 
 # Parse a quoted string literal and return its contents.
 # 
@@ -1312,7 +1312,7 @@ let _evalExpr = fun(e: Env, scope: {}, code: Str, at: {}) -> Any? do
 	end
 	val
 end
- # ---------------- Rendering ----------------
+# ---------------- Rendering ----------------
 
 # Whether an expression’s final pipe is tojson (required in <script>).
 # 
@@ -1936,7 +1936,7 @@ let _renderTemplate = fun(e: Env, t: Template, data: {}, w: Writer, stack: [Str]
 		true
 	end
 end
- # ---------------- Compilation & I/O ----------------
+# ---------------- Compilation & I/O ----------------
 
 # Compile a template from a string into a Template value.
 # 
@@ -2053,7 +2053,7 @@ let renderTo = fun(e: Env, t: Template, w: Writer, data: {}) -> Int? do
 	let _ = ww.flush(null)
 	counter.n
 end
- # ---------------- Built-ins ----------------
+# ---------------- Built-ins ----------------
 
 # Install a minimal set of built-in filters (upper, lower, default, join, tojson, url).
 # 
@@ -2100,8 +2100,8 @@ let _installBuiltins = fun(e: Env) -> Null do
 		let s3 = replace("&", "\\u0026", s2)
 		let s4 = replace("<", "\\u003c", s3)
 		let s5 = replace(">", "\\u003e", s4)
-		let s6 = replace(" ", "\\u2028", s5)
-		let s7 = replace(" ", "\\u2029", s6)
+		let s6 = replace("\u2028", "\\u2028", s5)
+		let s7 = replace("\u2029", "\\u2029", s6)
 		safeHTML(s7)
 	end
 	let url = fun(u: Str) -> SafeURL? do

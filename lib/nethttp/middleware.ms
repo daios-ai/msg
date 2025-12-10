@@ -302,22 +302,22 @@ let mwAccessLog = fun(_: Null) -> _Mw do
 
 			let colorOn = true
 			let GRN = if colorOn then
-				"[32m"
+				"\u001B[32m"
 			else
 				""
 			end
 			let RED = if colorOn then
-				"[31m"
+				"\u001B[31m"
 			else
 				""
 			end
 			let DIM = if colorOn then
-				"[2m"
+				"\u001B[2m"
 			else
 				""
 			end
 			let RST = if colorOn then
-				"[0m"
+				"\u001B[0m"
 			else
 				""
 			end

@@ -377,7 +377,8 @@ end
 
 let RunnerOpts = type {
 	parallel: Bool, # run tests concurrently
-	pathPrefix: Str, # run tests whose paths start with this prefix (dir or file)
+	# run tests whose paths start with this prefix (dir or file)
+	pathPrefix: Str,
 	timeoutMs: Int, # per-test timeout in ms (<=0 or null disables)
 	verbose: Bool # Go-style per-test RUN/PASS/FAIL lines
 }

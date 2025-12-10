@@ -250,8 +250,7 @@ testing.test("mtml/for object destructuring", fun(_: Null) do
 	let e = mtml.env({})
 	let t = mtml.fromString(e, "{% for [k, v] in m %}{{ k }}={{ v }};{% end %}", "for-map-destr.html")
 	let out = mtml.render(e, t, {m: {a: 1, b: 2}})
-	# map order preserved per spec
-	testing.assertEq("a=1;b=2;", out)
+	testing.assertEq("a=1;b=2;", out) # map order preserved per spec
 end)
 
 # --- Extends: missing parent annotated -------------------------------------
@@ -432,7 +431,6 @@ testing.test("mtml/helper arity mismatch annotated", fun(_: Null) do
 	let rep = fun(s: Str) do
 		fun(n: Int) -> Str do
 			"s" # stub content, arity is what we care about
-
 		end
 	end
 	let _ = mtml.registerHelper(e, "repeat", rep)

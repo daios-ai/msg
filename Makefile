@@ -62,7 +62,8 @@ else
 endif
 
 # --- version & paths ---
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo 0.0.0)
+VERSION := $(shell cat VERSION)
+BUILD_DATE := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 DIST_DIR := dist
 ROOT     := $(DIST_DIR)/mindscript
 BIN_DIR  := $(ROOT)/bin
@@ -153,9 +154,12 @@ build:
 	@rm -rf $(ROOT)
 	@mkdir -p $(BIN_DIR) $(LIB_DIR)
 ifeq ($(UNAME_S),Linux)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_LINUX)" -s -w' \
-	 -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" \
+	go build -trimpath \
+		-ldflags "-linkmode external -extldflags '$(RPATH_LINUX)' -s -w \
+		-X github.com/daios-ai/msg/mindscript.Version=$(VERSION) \
+		-X github.com/daios-ai/msg/mindscript.BuildDate=$(BUILD_DATE)" \
+		-o $(BIN_DIR)/msg ./cmd/msg
 	@# If we didn't successfully vendor libffi before build, fall back to post-build discovery (old, proven path)
 	@if ! ls "$(VENDOR_LIB_DIR)"/libffi.so* >/dev/null 2>&1; then \
 	  set -e; \
@@ -169,9 +173,12 @@ ifeq ($(UNAME_S),Linux)
 	  echo "Post-build discovered Linux libffi: $$REAL → $(LIB_DIR)/$$BASENAME (SONAME=$$SONAME)"; \
 	fi
 else ifeq ($(UNAME_S),Darwin)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" go build -trimpath \
-	 -ldflags='-linkmode external -extldflags "$(RPATH_MACOS)" -s -w' \
-	 -o $(BIN_DIR)/msg     ./cmd/msg
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_LDFLAGS="-L$(PWD)/$(VENDOR_LIB_DIR) -lffi" \
+	go build -trimpath \
+		-ldflags "-linkmode external -extldflags '$(RPATH_MACOS)' -s -w \
+		-X github.com/daios-ai/msg/mindscript.Version=$(VERSION) \
+		-X github.com/daios-ai/msg/mindscript.BuildDate=$(BUILD_DATE)" \
+		-o $(BIN_DIR)/msg ./cmd/msg
 	@# On macOS we pre-vendored and set the dylib id; binaries now reference @loader_path/../lib/<BASE>
 endif
 	@test -d lib      && cp -R lib      $(ROOT)/ || true

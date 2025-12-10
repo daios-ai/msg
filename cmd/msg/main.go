@@ -135,16 +135,16 @@ func main() {
 }
 
 func usage() {
-	fmt.Printf(`MindScript CLI
+	fmt.Printf(`MindScript %s (built %s)
 
 Usage:
   %s run <file.ms> [--] [args...]         Run a script.
   %s repl                                 Start the REPL.
   %s fmt [--check] [path ...]             Format MindScript file(s) by path prefix
   %s test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
-  %s get <module>@<version?>              Install a third-party module (stub)
+  %s get <module>@<version?>              Install a third-party module (not implemented)
 
-`, appName, appName, appName, appName, appName)
+`, mindscript.Version, mindscript.BuildDate, appName, appName, appName, appName, appName)
 }
 
 // -----------------------------------------------------------------------------

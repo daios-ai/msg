@@ -628,7 +628,7 @@ func Test_Printer_Type_Rendering(t *testing.T) {
 		S{"pair", S{"str", "age"}, S{"id", "Int"}},
 	}
 	got := FormatValue(TypeValIn(typ, env))
-	want := "<type: {age: Int, name: Str}>"
+	want := "<type: {name: Str, age: Int}>"
 	if got != want {
 		t.Fatalf("type rendering mismatch:\n got:  %q\n want: %q", got, want)
 	}

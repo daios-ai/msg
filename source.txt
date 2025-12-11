@@ -1,631 +1,419 @@
-=== BEGIN FILE: ./VERSION ===
-0.0.12
-
-=== END FILE: ./VERSION ===
-
-=== BEGIN FILE: ./mindscript/init.go ===
-package mindscript
-
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-)
-
-const MindScriptRootEnv = "MSGPATH"
-
-var installRoot string
-
-func init() {
-	installRoot = root()
-	if err := needDirs(installRoot, "bin", "lib", "data"); err != nil {
-		fmt.Fprintf(os.Stderr,
-			`MindScript installation at 
-%q 
-
-is invalid: %v
-
-Fix: ensure these directories exist and are readable:
-  %s
-  %s
-  %s
-(Set %s to override the MindScript root directory.)
-`, installRoot, err,
-			filepath.Join(installRoot, "bin"),
-			filepath.Join(installRoot, "lib"),
-			filepath.Join(installRoot, "data"),
-			MindScriptRootEnv,
-		)
-		os.Exit(1)
-	}
-}
-
-func root() string {
-	if env := os.Getenv(MindScriptRootEnv); env != "" {
-		if abs, err := filepath.Abs(env); err == nil {
-			return filepath.Clean(abs)
-		}
-		return filepath.Clean(env)
-	}
-	exe, _ := os.Executable()
-	return filepath.Clean(filepath.Join(filepath.Dir(exe), ".."))
-}
-
-func needDirs(root string, subs ...string) error {
-	for _, s := range subs {
-		p := filepath.Join(root, s)
-		fi, err := os.Stat(p)
-		switch {
-		case os.IsNotExist(err):
-			return fmt.Errorf("missing directory %q", p)
-		case err != nil:
-			return fmt.Errorf("cannot stat %q: %w", p, err)
-		case !fi.IsDir():
-			return fmt.Errorf("%q exists but is not a directory", p)
-		}
-	}
-	return nil
-}
-=== END FILE: ./mindscript/init.go ===
-
-=== BEGIN FILE: ./cmd/msg/main.go ===
-// cmd/cli/main.go
-package main
-
-import (
-	"errors"
-	"flag"
-	"fmt"
-	"io"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"syscall"
-
-	"github.com/peterh/liner"
-
-	// Adjust this to your actual module path
-	mindscript "github.com/daios-ai/msg/mindscript"
-)
-
-const (
-	colorReset = "\x1b[0m"
-	colorRed   = "\x1b[31m"
-	colorGreen = "\x1b[32m"
-	colorBlue  = "\x1b[94m"
-)
-
-func red(s string) string   { return colorRed + s + colorReset }
-func green(s string) string { return colorGreen + s + colorReset }
-func blue(s string) string  { return colorBlue + s + colorReset }
-
-// splitInlineComment finds the first unquoted '#' (preceded by space/tab) that
-// looks like an inline comment. It ignores '#' inside double-quoted strings and
-// respects backslash escapes. Returns left/code and right/comment (starting at '#').
-func splitInlineComment(line string) (left, comment string, ok bool) {
-	inStr := false
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-
-		if inStr {
-			if c == '\\' {
-				if i+1 < len(line) {
-					i++
-				}
-				continue
-			}
-			if c == '"' {
-				inStr = false
-			}
-			continue
-		}
-
-		switch c {
-		case '"':
-			inStr = true
-		case '#':
-			if i > 0 && (line[i-1] == ' ' || line[i-1] == '\t') {
-				return line[:i], line[i:], true
-			}
-		}
-	}
-	return "", "", false
-}
-
-// Colorize a formatted value:
-//   - Lines whose first non-space char is '#' → whole line green.
-//   - Other non-empty lines: if they contain an unquoted inline '#' → left blue, trailing comment green.
-//   - Otherwise → whole line blue.
-//
-// Empty lines unchanged.
-func colorizeValue(val string) string {
-	lines := strings.Split(val, "\n")
-	for i, ln := range lines {
-		trimLeft := strings.TrimLeft(ln, " \t")
-		if strings.HasPrefix(trimLeft, "#") {
-			lines[i] = green(ln)
-			continue
-		}
-		if strings.TrimSpace(ln) == "" {
-			continue
-		}
-		if left, comment, ok := splitInlineComment(ln); ok {
-			lines[i] = blue(left) + green(comment)
-		} else {
-			lines[i] = blue(ln)
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-const (
-	appName     = "msg"
-	historyFile = ".mindscript_history"
-	promptMain  = "==> "
-	promptCont  = "... "
-	banner      = "MindScript REPL — Ctrl+C cancels input, Ctrl+D exits. Type :help for commands."
-	helpText    = `
-REPL commands:
-  :help            Show this help
-  :quit / :exit    Exit the REPL
-`
-)
-
-// -----------------------------------------------------------------------------
-// main
-// -----------------------------------------------------------------------------
-
-func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-
-	cmd := os.Args[1]
-	switch cmd {
-	case "run":
-		os.Exit(cmdRun(os.Args[2:]))
-	case "repl":
-		os.Exit(cmdRepl(os.Args[2:]))
-	case "fmt":
-		os.Exit(cmdFmt(os.Args[2:]))
-	case "test":
-		os.Exit(cmdTest(os.Args[2:]))
-	case "get":
-		os.Exit(cmdGet(os.Args[2:]))
-	case "-h", "--help", "help":
-		usage()
-		os.Exit(0)
-	default:
-		fmt.Fprintf(os.Stderr, "%s: unknown command %q\n", appName, cmd)
-		usage()
-		os.Exit(2)
-	}
-}
-
-func usage() {
-	fmt.Printf(`MindScript CLI
-
-Usage:
-  %s run <file.ms> [--] [args...]         Run a script.
-  %s repl                                 Start the REPL.
-  %s fmt [--check] [path ...]             Format MindScript file(s) by path prefix
-  %s test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
-  %s get <module>@<version?>              Install a third-party module (stub)
-
-`, appName, appName, appName, appName, appName)
-}
-
-// -----------------------------------------------------------------------------
-// run
-// -----------------------------------------------------------------------------
-
-func cmdRun(args []string) int {
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s run <file.ms> [--] [args...]\n", appName)
-		return 2
-	}
-
-	// Split script path and argv (after optional "--")
-	file := args[0]
-	argv := []string{}
-	if len(args) > 1 {
-		sep := -1
-		for i, a := range args[1:] {
-			if a == "--" {
-				sep = i + 1
-				break
-			}
-		}
-		if sep >= 0 {
-			argv = args[1+sep:]
-		} else {
-			argv = args[1:]
-		}
-	}
-
-	src, err := os.ReadFile(file)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: cannot read %s: %v\n", appName, file, err)
-		return 1
-	}
-
-	ip, rtErr := mindscript.NewInterpreter()
-	if rtErr != nil {
-		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		return 1
-	}
-
-	// Build AST so we can evaluate in a custom environment (fresh child with runtime map)
-	ast, perr := mindscript.ParseSExpr(string(src))
-	if perr != nil {
-		fmt.Fprintln(os.Stderr, perr.Error()) // already pretty-printed
-		return 1
-	}
-
-	child := mindscript.NewEnv(ip.Global)
-	rt := &mindscript.MapObject{
-		Entries: map[string]mindscript.Value{
-			"isEntry": mindscript.Bool(true),
-			"path":    mindscript.Str(fileAbsOrOrig(file)),
-			"argv":    mindscript.Arr(strSliceToVals(argv)),
-		},
-		Keys: []string{"isEntry", "path", "argv"},
-	}
-	child.Define("runtime", mindscript.Value{Tag: mindscript.VTMap, Data: rt})
-
-	val, err := ip.EvalAST(ast, child)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		return 1
-	}
-	// Plain pretty output in file mode (no REPL color accents)
-	fmt.Println(mindscript.FormatValue(val))
-	return 0
-}
-
-func fileAbsOrOrig(p string) string {
-	if abs, err := filepath.Abs(p); err == nil {
-		return abs
-	}
-	return p
-}
-
-func strSliceToVals(xs []string) []mindscript.Value {
-	out := make([]mindscript.Value, 0, len(xs))
-	for _, s := range xs {
-		out = append(out, mindscript.Str(s))
-	}
-	return out
-}
-
-// -----------------------------------------------------------------------------
-// repl
-// -----------------------------------------------------------------------------
-
-func cmdRepl(_ []string) (ret int) {
-	fmt.Println(banner)
-
-	home, _ := os.UserHomeDir()
-	histPath := filepath.Join(home, historyFile)
-
-	ln := liner.NewLiner()
-	defer ln.Close()
-	ln.SetCtrlCAborts(true)
-
-	// Persist history on any return/panic.
-	defer func() {
-		if f, err := os.Create(histPath); err == nil {
-			_, _ = ln.WriteHistory(f)
-			_ = f.Close()
-		}
-	}()
-
-	// Trap common termination signals and restore TTY before exiting.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigc)
-	go func() {
-		<-sigc
-		ln.Close()
-		os.Exit(130)
-	}()
-
-	// Load history (best-effort)
-	if f, err := os.Open(histPath); err == nil {
-		_, _ = ln.ReadHistory(f)
-		_ = f.Close()
-	}
-
-	ip, rtErr := mindscript.NewInterpreter()
-	if rtErr != nil {
-		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		return 1
-	}
-
-	for {
-		// Accumulate possibly-multiline input until parser says it's complete.
-		code, ok := readByParseProbe(ln, promptMain, promptCont)
-		if !ok { // user pressed Ctrl+D or EOF
-			fmt.Println()
-			break
-		}
-
-		// Minimal REPL commands
-		if strings.HasPrefix(strings.TrimSpace(code), ":") {
-			switch strings.TrimSpace(strings.ToLower(code)) {
-			case ":help":
-				fmt.Print(helpText)
-			case ":quit", ":exit":
-				return 0
-			default:
-				fmt.Printf("unknown command. Type :help for help.\n")
-			}
-			continue
-		}
-
-		// Skip blank
-		if strings.TrimSpace(code) == "" {
-			continue
-		}
-
-		// Evaluate (persistent session)
-		v, err := ip.EvalPersistentSource(code)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, red(err.Error()))
-			continue
-		}
-		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
-
-		// Save to history
-		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
-	}
-
-	return 0
-}
-
-// readByParseProbe reads one or more lines until the parser accepts the buffer
-// as a complete program, or returns early if the parser reports a non-recoverable error.
-func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
-	var b strings.Builder
-
-	for {
-		var line string
-		var err error
-		if b.Len() == 0 {
-			line, err = ln.Prompt(prompt)
-		} else {
-			line, err = ln.Prompt(cont)
-		}
-		if errors.Is(err, io.EOF) {
-			return "", false
-		}
-		if err != nil {
-			// Ctrl+C aborts the current input; let user start again.
-			return "", true
-		}
-
-		if b.Len() > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(line)
-
-		src := b.String()
-		_, _, perr := mindscript.ParseSExprInteractiveWithSpans(src)
-		if perr == nil {
-			return src, true
-		}
-		if mindscript.IsIncomplete(perr) {
-			continue
-		}
-		// Real error → return current buffer so the caller can print it.
-		return src, true
-	}
-}
-
-// -----------------------------------------------------------------------------
-// fmt
-// -----------------------------------------------------------------------------
-
-func cmdFmt(args []string) int {
-	fs := flag.NewFlagSet("fmt", flag.ContinueOnError)
-	check := fs.Bool("check", false, "check format; exit 1 if any file would change")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	paths := fs.Args()
-	if len(paths) == 0 {
-		paths = []string{"."}
-	}
-
-	ip, rtErr := mindscript.NewInterpreter()
-	if rtErr != nil {
-		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		return 1
-	}
-
-	call := func(code string) (mindscript.Value, error) {
-		return ip.EvalPersistentSource(code)
-	}
-
-	if *check {
-		var bad int64
-
-		for _, prefix := range paths {
-			// Discover files by prefix via canon.files
-			vlist, err := call(fmt.Sprintf(`import("canon").files(%q)`, prefix))
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err.Error())
-				return 1
-			}
-			if vlist.Tag == mindscript.VTNull {
-				fmt.Fprintf(os.Stderr, "%s: discovery failed for %s\n", appName, prefix)
-				return 1
-			}
-			if vlist.Tag != mindscript.VTArray {
-				continue
-			}
-
-			for _, ev := range vlist.Data.([]mindscript.Value) {
-				if ev.Tag != mindscript.VTStr {
-					continue
-				}
-				f := ev.Data.(string)
-
-				vok, err := call(fmt.Sprintf(`import("canon").checkFile(%q)`, f))
-				if err != nil {
-					fmt.Fprintln(os.Stderr, err.Error())
-					return 1
-				}
-				if vok.Tag == mindscript.VTNull {
-					fmt.Fprintf(os.Stderr, "%s: cannot check %s\n", appName, f)
-					return 1
-				}
-				if vok.Tag == mindscript.VTBool && !vok.Data.(bool) {
-					fmt.Println(f)
-					bad++
-				}
-			}
-		}
-
-		if bad > 0 {
-			return 1
-		}
-		return 0
-	}
-
-	// Write mode: delegate tree formatting to canon.formatTree using prefix semantics.
-	for _, prefix := range paths {
-		v, err := call(fmt.Sprintf(`import("canon").formatTree(%q)`, prefix))
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err.Error())
-			return 1
-		}
-		if v.Tag == mindscript.VTNull {
-			fmt.Fprintf(os.Stderr, "%s: discovery/formatting failed for %s\n", appName, prefix)
-			return 1
-		}
-		// If canon reported per-file errors, treat as failure.
-		if v.Tag == mindscript.VTMap {
-			if mo, ok := v.Data.(*mindscript.MapObject); ok {
-				if e, ok := mo.Entries["errors"]; ok && e.Tag == mindscript.VTInt && e.Data.(int64) > 0 {
-					return 1
-				}
-			}
-		}
-	}
-
-	return 0
-}
-
-// -----------------------------------------------------------------------------
-// test
-// -----------------------------------------------------------------------------
-
-func cmdTest(args []string) int {
-	// Defaults
-	pathPrefix := "."
-	parallel := false
-	verbose := false
-	timeoutMs := 0
-
-	// Tolerant manual parse so flags can appear before/after the path.
-	// Supports: -p, -v, -t=123, -t 123, and optional "--".
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-
-		// End-of-flags marker: next non-flag (if any) becomes the path prefix.
-		if a == "--" {
-			if i+1 < len(args) {
-				pathPrefix = args[i+1]
-			}
-			break
-		}
-
-		if strings.HasPrefix(a, "-") {
-			switch {
-			case a == "-p":
-				parallel = true
-			case a == "-v":
-				verbose = true
-			case strings.HasPrefix(a, "-t="):
-				val := strings.TrimPrefix(a, "-t=")
-				n, err := strconv.Atoi(val)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "%s: invalid -t value %q\n", appName, val)
-					return 2
-				}
-				timeoutMs = n
-			case a == "-t":
-				if i+1 >= len(args) {
-					fmt.Fprintf(os.Stderr, "%s: -t requires a value\n", appName)
-					return 2
-				}
-				i++
-				val := args[i]
-				n, err := strconv.Atoi(val)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "%s: invalid -t value %q\n", appName, val)
-					return 2
-				}
-				timeoutMs = n
-			default:
-				fmt.Fprintf(os.Stderr, "%s: unknown flag %q\n", appName, a)
-				return 2
-			}
-			continue
-		}
-
-		// First non-flag token → path prefix (if not already set by "--").
-		if pathPrefix == "." {
-			pathPrefix = a
-		}
-	}
-
-	ip, rtErr := mindscript.NewInterpreter()
-	if rtErr != nil {
-		fmt.Fprintln(os.Stderr, red(rtErr.Error()))
-		return 1
-	}
-
-	code := fmt.Sprintf(`import("testing").run({
-  pathPrefix: %q,
-  parallel: %v,
-  verbose: %v,
-  timeoutMs: %d
-})`, pathPrefix, parallel, verbose, timeoutMs)
-
-	v, err := ip.EvalPersistentSource(code)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		return 1
-	}
-
-	// testing.run returns Summary: {passed:Int, failed:Int, total:Int, durationMs:Int}
-	if v.Tag == mindscript.VTMap {
-		if mo, ok := v.Data.(*mindscript.MapObject); ok {
-			if f, ok := mo.Entries["failed"]; ok && f.Tag == mindscript.VTInt && f.Data.(int64) == 0 {
-				return 0
-			}
-		}
-	}
-	return 1
-}
-
-// -----------------------------------------------------------------------------
-// get (stub)
-// -----------------------------------------------------------------------------
-
-func cmdGet(args []string) int {
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s get <module>@<version?>\n", appName)
-		return 2
-	}
-	// spec := args[0]
-	fmt.Printf("Installing third-party modules is not implemented yet.\n")
-	return 0
-}
-=== END FILE: ./cmd/msg/main.go ===
+=== BEGIN FILE: ./lib/canon.ms ===
+let EXT_MS = ".ms" # File extension for MindScript sources.
+
+# -------------------------
+# Internal helpers (private)
+# -------------------------
+
+# Return true if string s ends with suffix.
+# 
+# Args:
+# s: Str — input string.
+# suffix: Str — suffix to check.
+# Return:
+# Bool — true iff s ends with suffix.
+let _endsWith = fun(s: Str, suffix: Str) -> Bool do
+	let n = len(s)
+	let m = len(suffix)
+	if m == 0 then
+		return true
+	end
+	if n < m then
+		return false
+	end
+	substr(s, n - m, n) == suffix
+end
+
+# Return true if path p is absolute (POSIX/Windows).
+# 
+# Args:
+# p: Str — path to test.
+# Return:
+# Bool — true if absolute.
+let _isAbs = fun(p: Str) -> Bool do
+	if len(p) > 0 and substr(p, 0, 1) == "/" then
+		return true
+	end
+	if len(p) >= 2 and substr(p, 0, 2) == "\\\\" then
+		return true
+	end
+	len(match("^[A-Za-z]:[\\\\/]", p)) > 0
+end
+
+# Recursively walk a directory and return all file paths.
+# 
+# Args:
+# dir: Str — absolute, cleaned directory path.
+# Return:
+# [Str]? — list of absolute file paths; null on error.
+let _walk = fun(dir: Str) -> [Str]? do
+	let entries = dirList(dir)
+	if entries == null then
+		return null # <cannot list directory>
+	end
+	let out = []
+	for entry in entries do
+		let p = pathJoin([dir, entry])
+		let st = stat(p)
+		if st == null then
+			return null # <stat failed>
+		end
+		if st.isDir then
+			let rec = _walk(p)
+			if rec == null then
+				return null # <walk failed>
+			end
+			for q in rec do
+				out = out + [q]
+			end
+		else
+			out = out + [p]
+		end
+	end
+	out
+end
+
+# Return true if file path looks like a MindScript source.
+# 
+# Args:
+# path: Str — file path.
+# Return:
+# Bool — true if *.ms file.
+let _isMsFile = fun(path: Str) -> Bool do
+	# Prefer extension check; fall back to suffix as a guard.
+	let ext = pathExt(path)
+	if ext != null and ext == EXT_MS then
+		return true
+	end
+	_endsWith(path, EXT_MS)
+end
+
+# Compute an absolute, cleaned path from root (cwd-aware).
+# 
+# Args:
+# root: Str — input path (relative or absolute).
+# Return:
+# Str — absolute, cleaned path (best-effort).
+let _toAbsClean = fun(root: Str) -> Str do
+	let base = if cwd() == null then
+		"."
+	else
+		cwd()
+	end
+	if _isAbs(root) then
+		pathClean(root)
+	else
+		pathClean(pathJoin([base, root]))
+	end
+end
+
+# -------------------------
+# Public API
+# -------------------------
+
+# Format a source string using the canonical formatter.
+# 
+# Summary:
+# Thin wrapper around formatCode. Pure; no I/O.
+# 
+# Args:
+# src: Str — MindScript source code.
+# Return:
+# Str? — canonical source on success; null on failure (e.g., syntax error).
+let format = fun(src: Str) -> Str? do
+	let out = formatCode(src)
+	if out == null then
+		return null # <unformattable>
+	end
+	out
+end
+
+# Discover MindScript files from a root directory.
+# 
+# Summary:
+# Recursively walks from root (default runner should pass "."),
+# and returns absolute, cleaned paths for files ending with ".ms".
+# 
+# Args:
+# root: Str — directory to scan (relative or absolute).
+# Return:
+# [Str]? — list of files; null if root is not a directory or on I/O errors.
+let files = fun(root: Str) -> [Str]? do
+	let rootPath = _toAbsClean(root)
+	let st = stat(rootPath)
+	if st == null or not st.isDir then
+		return null # <root not a directory>
+	end
+	let all = _walk(rootPath)
+	if all == null then
+		return null # <walk error>
+	end
+	let out = []
+	for f in all do
+		if _isMsFile(f) then
+			out = out + [f]
+		end
+	end
+	out
+end
+
+# Check if a file is already canonically formatted.
+# 
+# Summary:
+# Reads file, formats its contents, and compares with original.
+# 
+# Args:
+# path: Str — file path (relative or absolute).
+# Return:
+# Bool? — true if canonical, false if differs, null on read/format error.
+let checkFile = fun(path: Str) -> Bool? do
+	let abs = _toAbsClean(path)
+	let src = readFile(abs)
+	if src == null then
+		return null # <cannot read file>
+	end
+	let fmtd = format(src)
+	if fmtd == null then
+		return null # <format failed>
+	end
+	fmtd == src
+end
+
+# Format a single file in place iff it differs.
+# 
+# Summary:
+# Reads file, runs canonical formatter, and writes back only when changed.
+# No hard failures; returns null on any read/format/write error.
+# 
+# Args:
+# path: Str — file path (relative or absolute).
+# Return:
+# { changed!: Bool }? — change flag; null on error.
+let formatFile = fun(path: Str) -> {changed: Bool}? do
+	printf("Formatting: %s\n", [path])
+	let abs = _toAbsClean(path)
+	let src = readFile(abs)
+	if src == null then
+		return null # <cannot read file>
+	end
+	let fmtd = format(src)
+	if fmtd == null then
+		return null # <format failed>
+	end
+	if fmtd == src then
+		return {changed: false}
+	end
+	let n = writeFile(abs, fmtd)
+	if n == null then
+		return null # <cannot write file>
+	end
+	{changed: true}
+end
+
+# Format all MindScript files under a directory tree.
+# 
+# Summary:
+# Walks files(root), formats each in place, and aggregates a concise report.
+# 
+# Args:
+# root: Str — directory to scan (relative or absolute).
+# Return:
+# { total!: Int, changed!: Int, errors!: Int }? — totals; null if discovery fails.
+let formatTree = fun(root: Str) -> {changed: Int, errors: Int, total: Int}? do
+	let fs = files(root)
+	if fs == null then
+		return null # <discovery failed>
+	end
+	let total = 0
+	let changed = 0
+	let errors = 0
+	for f in fs do
+		total = total + 1
+		let r = formatFile(f)
+		if r == null then
+			errors = errors + 1
+		elif r.changed then
+			changed = changed + 1
+		end
+	end
+	{total: total, changed: changed, errors: errors}
+end=== END FILE: ./lib/canon.ms ===
+
+=== BEGIN FILE: ./lib/canon_test.ms ===
+# canon_test.ms — tiny, orthogonal tests for canon
+
+let T = import("testing")
+let C = import("canon")
+
+# =========================
+# Test helpers (private)
+# =========================
+
+# Compat: tempDir wrapper that supports both tempDir(null) and tempDir().
+let _tempDir = fun(_: Null) -> Str do
+	# Try 1-arg form first (per spec); fall back to 0-arg if needed.
+	let r = try(fun(_: Null) do
+		tempDir(null)
+	end)
+	if r.ok then
+		return r.value
+	end
+	tempDir() # Assume zero-arg in this runtime.
+end
+
+# Create an empty temporary directory and return its absolute path.
+let _mkTempDir = fun(_: Null) -> Str do
+	let base = _tempDir(null)
+	let ts = sprintf("canon-test-%d", [nowNanos()])
+	let dir = pathJoin([base, ts])
+	let ok = mkdir(dir)
+	if not ok then
+		return pathClean(dir) # <mkdir failed>
+	end
+	pathClean(dir)
+end
+
+# Write a file with given content in dir; return absolute path.
+let _write = fun(dir: Str, name: Str, data: Str) -> Str do
+	let p = pathJoin([dir, name])
+	let _ = writeFile(p, data)
+	pathClean(p)
+end
+
+# Read file contents (hard-fail in tests on error).
+let _mustRead = fun(path: Str) -> Str do
+	let s = readFile(path)
+	if s == null then
+		panic(sprintf("mustRead failed: %s", [path]))
+	end
+	s
+end
+
+# Minimal valid MindScript snippet (canonical form should be idempotent).
+let _validSrc = fun(_: Null) -> Str do
+	"let x = 1\n"
+end
+
+# Messy but valid snippet that should format to _validSrc().
+let _messySrc = fun(_: Null) -> Str do
+	"   let    x=1   \n"
+end
+
+# Syntactically invalid snippet (formatter should soft-error).
+let _badSrc = fun(_: Null) -> Str do
+	"let\n"
+end
+
+# =========================
+# Tests
+# =========================
+
+T.test("canon/format_valid", fun(_: Null) do
+	let src = _validSrc(null)
+	let fmtd = C.format(src)
+	T.assert(fmtd != null, "format returned null on valid input")
+	T.assertEq(fmtd, C.format(fmtd))
+end)
+
+T.test("canon/format_unformattable", fun(_: Null) do
+	let fmtd = C.format(_badSrc(null))
+	T.assertEq(null, fmtd)
+end)
+
+T.test("canon/files_discovery", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let a = _write(dir, "a.ms", _validSrc(null))
+	let _ = _write(dir, "b.txt", "not mindscript\n")
+	let sub = pathJoin([dir, "sub"])
+	let _mk = mkdir(sub)
+	let c = _write(sub, "c.ms", _validSrc(null))
+
+	let got = C.files(dir)
+	T.assert(got != null, "files returned null")
+	T.assertEq(len(got), 2)
+
+	let joined = join(got, "|") # Order not guaranteed; check presence.
+	T.assert(bool(len(match(pathClean(a), joined)) > 0), "missing a.ms")
+	T.assert(bool(len(match(pathClean(c), joined)) > 0), "missing c.ms")
+end)
+
+T.test("canon/files_no_dir", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let p = _write(dir, "just_a_file.ms", _validSrc(null))
+	let got = C.files(p)
+	T.assertEq(null, got)
+end)
+
+T.test("canon/checkFile_true", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let canon = C.format(_validSrc(null))
+	let p = _write(dir, "ok.ms", canon)
+	let ok = C.checkFile(p)
+	T.assertEq(true, ok)
+end)
+
+T.test("canon/checkFile_false", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let p = _write(dir, "messy.ms", _messySrc(null))
+	let ok = C.checkFile(p)
+	T.assertEq(false, ok)
+end)
+
+T.test("canon/checkFile_read_fail", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let missing = pathJoin([dir, "nope.ms"])
+	let ok = C.checkFile(missing)
+	T.assertEq(null, ok)
+end)
+
+T.test("canon/formatFile_change", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let p = _write(dir, "needs_format.ms", _messySrc(null))
+	let res = C.formatFile(p)
+	T.assert(res != null, "formatFile returned null unexpectedly")
+	T.assertEq(true, res.changed)
+
+	let now = _mustRead(p) # File now equals canonical
+	let canon = C.format(_validSrc(null))
+	T.assertEq(canon, now)
+end)
+
+T.test("canon/formatFile_noop", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let canon = C.format(_validSrc(null))
+	let p = _write(dir, "already_ok.ms", canon)
+	let res = C.formatFile(p)
+	T.assert(res != null, "formatFile returned null unexpectedly")
+	T.assertEq(false, res.changed)
+	T.assertEq(canon, _mustRead(p))
+end)
+
+T.test("canon/formatFile_fail", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let p = _write(dir, "bad.ms", _badSrc(null))
+	let res = C.formatFile(p)
+	T.assertEq(null, res)
+end)
+
+T.test("canon/formatTree_happy", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let canon = C.format(_validSrc(null))
+	let _ = _write(dir, "a_ok.ms", canon)
+	let _ = _write(dir, "b_messy.ms", _messySrc(null))
+	let _ = _write(dir, "c_bad.ms", _badSrc(null))
+
+	let rep = C.formatTree(dir)
+	T.assert(rep != null, "formatTree returned null unexpectedly")
+	T.assertEq(3, rep.total)
+	T.assertEq(1, rep.changed)
+	T.assertEq(1, rep.errors)
+end)
+
+T.test("canon/formatTree_discovery_fail", fun(_: Null) do
+	let dir = _mkTempDir(null)
+	let file = _write(dir, "lonely.ms", _validSrc(null))
+	let rep = C.formatTree(file) # not a directory
+
+	T.assertEq(null, rep)
+end)=== END FILE: ./lib/canon_test.ms ===
 

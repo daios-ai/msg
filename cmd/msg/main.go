@@ -1,4 +1,3 @@
-// cmd/cli/main.go
 package main
 
 import (
@@ -20,15 +19,23 @@ import (
 )
 
 const (
-	colorReset = "\x1b[0m"
-	colorRed   = "\x1b[31m"
-	colorGreen = "\x1b[32m"
-	colorBlue  = "\x1b[94m"
+	appName     = "msg"
+	historyFile = ".mindscript_history"
+	promptMain  = "==> "
+	promptCont  = "... "
 )
 
-func red(s string) string   { return colorRed + s + colorReset }
-func green(s string) string { return colorGreen + s + colorReset }
-func blue(s string) string  { return colorBlue + s + colorReset }
+var (
+	banner   = fmt.Sprintf("MindScript %s REPL\nCtrl+C cancels input, Ctrl+D exits. Type :quit to exit.", mindscript.Version)
+	helpText = `
+REPL commands:
+  :quit    Exit the REPL
+`
+)
+
+func red(s string) string   { return "\x1b[31m" + s + "\x1b[0m" }
+func green(s string) string { return "\x1b[32m" + s + "\x1b[0m" }
+func blue(s string) string  { return "\x1b[94m" + s + "\x1b[0m" }
 
 // splitInlineComment finds the first unquoted '#' (preceded by space/tab) that
 // looks like an inline comment. It ignores '#' inside double-quoted strings and
@@ -89,23 +96,6 @@ func colorizeValue(val string) string {
 	return strings.Join(lines, "\n")
 }
 
-const (
-	appName     = "msg"
-	historyFile = ".mindscript_history"
-	promptMain  = "==> "
-	promptCont  = "... "
-	banner      = "MindScript REPL — Ctrl+C cancels input, Ctrl+D exits. Type :help for commands."
-	helpText    = `
-REPL commands:
-  :help            Show this help
-  :quit / :exit    Exit the REPL
-`
-)
-
-// -----------------------------------------------------------------------------
-// main
-// -----------------------------------------------------------------------------
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -124,6 +114,9 @@ func main() {
 		os.Exit(cmdTest(os.Args[2:]))
 	case "get":
 		os.Exit(cmdGet(os.Args[2:]))
+	case "version":
+		fmt.Println(mindscript.Version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -143,8 +136,9 @@ Usage:
   %s fmt [--check] [path ...]             Format MindScript file(s) by path prefix
   %s test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
   %s get <module>@<version?>              Install a third-party module (not implemented)
+  %s version                              Print the compiled version
 
-`, mindscript.Version, mindscript.BuildDate, appName, appName, appName, appName, appName)
+`, mindscript.Version, mindscript.BuildDate, appName, appName, appName, appName, appName, appName)
 }
 
 // -----------------------------------------------------------------------------
@@ -157,7 +151,6 @@ func cmdRun(args []string) int {
 		return 2
 	}
 
-	// Split script path and argv (after optional "--")
 	file := args[0]
 	argv := []string{}
 	if len(args) > 1 {
@@ -187,10 +180,9 @@ func cmdRun(args []string) int {
 		return 1
 	}
 
-	// Build AST so we can evaluate in a custom environment (fresh child with runtime map)
 	ast, perr := mindscript.ParseSExpr(string(src))
 	if perr != nil {
-		fmt.Fprintln(os.Stderr, perr.Error()) // already pretty-printed
+		fmt.Fprintln(os.Stderr, perr.Error())
 		return 1
 	}
 
@@ -210,7 +202,6 @@ func cmdRun(args []string) int {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 1
 	}
-	// Plain pretty output in file mode (no REPL color accents)
 	fmt.Println(mindscript.FormatValue(val))
 	return 0
 }
@@ -244,7 +235,6 @@ func cmdRepl(_ []string) (ret int) {
 	defer ln.Close()
 	ln.SetCtrlCAborts(true)
 
-	// Persist history on any return/panic.
 	defer func() {
 		if f, err := os.Create(histPath); err == nil {
 			_, _ = ln.WriteHistory(f)
@@ -252,7 +242,6 @@ func cmdRepl(_ []string) (ret int) {
 		}
 	}()
 
-	// Trap common termination signals and restore TTY before exiting.
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigc)
@@ -262,7 +251,6 @@ func cmdRepl(_ []string) (ret int) {
 		os.Exit(130)
 	}()
 
-	// Load history (best-effort)
 	if f, err := os.Open(histPath); err == nil {
 		_, _ = ln.ReadHistory(f)
 		_ = f.Close()
@@ -275,48 +263,38 @@ func cmdRepl(_ []string) (ret int) {
 	}
 
 	for {
-		// Accumulate possibly-multiline input until parser says it's complete.
 		code, ok := readByParseProbe(ln, promptMain, promptCont)
-		if !ok { // user pressed Ctrl+D or EOF
+		if !ok {
 			fmt.Println()
 			break
 		}
 
-		// Minimal REPL commands
 		if strings.HasPrefix(strings.TrimSpace(code), ":") {
 			switch strings.TrimSpace(strings.ToLower(code)) {
-			case ":help":
-				fmt.Print(helpText)
-			case ":quit", ":exit":
+			case ":quit":
 				return 0
 			default:
-				fmt.Printf("unknown command. Type :help for help.\n")
+				fmt.Printf("unknown command. Type :quit to exit.\n")
 			}
 			continue
 		}
 
-		// Skip blank
 		if strings.TrimSpace(code) == "" {
 			continue
 		}
 
-		// Evaluate (persistent session)
 		v, err := ip.EvalPersistentSource(code)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, red(err.Error()))
 			continue
 		}
 		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
-
-		// Save to history
 		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
 	}
 
 	return 0
 }
 
-// readByParseProbe reads one or more lines until the parser accepts the buffer
-// as a complete program, or returns early if the parser reports a non-recoverable error.
 func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 	var b strings.Builder
 
@@ -332,7 +310,6 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 			return "", false
 		}
 		if err != nil {
-			// Ctrl+C aborts the current input; let user start again.
 			return "", true
 		}
 
@@ -349,7 +326,6 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 		if mindscript.IsIncomplete(perr) {
 			continue
 		}
-		// Real error → return current buffer so the caller can print it.
 		return src, true
 	}
 }
@@ -383,7 +359,6 @@ func cmdFmt(args []string) int {
 		var bad int64
 
 		for _, prefix := range paths {
-			// Discover files by prefix via canon.files
 			vlist, err := call(fmt.Sprintf(`import("canon").files(%q)`, prefix))
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err.Error())
@@ -425,7 +400,6 @@ func cmdFmt(args []string) int {
 		return 0
 	}
 
-	// Write mode: delegate tree formatting to canon.formatTree using prefix semantics.
 	for _, prefix := range paths {
 		v, err := call(fmt.Sprintf(`import("canon").formatTree(%q)`, prefix))
 		if err != nil {
@@ -436,7 +410,6 @@ func cmdFmt(args []string) int {
 			fmt.Fprintf(os.Stderr, "%s: discovery/formatting failed for %s\n", appName, prefix)
 			return 1
 		}
-		// If canon reported per-file errors, treat as failure.
 		if v.Tag == mindscript.VTMap {
 			if mo, ok := v.Data.(*mindscript.MapObject); ok {
 				if e, ok := mo.Entries["errors"]; ok && e.Tag == mindscript.VTInt && e.Data.(int64) > 0 {
@@ -454,18 +427,13 @@ func cmdFmt(args []string) int {
 // -----------------------------------------------------------------------------
 
 func cmdTest(args []string) int {
-	// Defaults
 	pathPrefix := "."
 	parallel := false
 	verbose := false
 	timeoutMs := 0
 
-	// Tolerant manual parse so flags can appear before/after the path.
-	// Supports: -p, -v, -t=123, -t 123, and optional "--".
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-
-		// End-of-flags marker: next non-flag (if any) becomes the path prefix.
 		if a == "--" {
 			if i+1 < len(args) {
 				pathPrefix = args[i+1]
@@ -507,7 +475,6 @@ func cmdTest(args []string) int {
 			continue
 		}
 
-		// First non-flag token → path prefix (if not already set by "--").
 		if pathPrefix == "." {
 			pathPrefix = a
 		}
@@ -532,7 +499,6 @@ func cmdTest(args []string) int {
 		return 1
 	}
 
-	// testing.run returns Summary: {passed:Int, failed:Int, total:Int, durationMs:Int}
 	if v.Tag == mindscript.VTMap {
 		if mo, ok := v.Data.(*mindscript.MapObject); ok {
 			if f, ok := mo.Entries["failed"]; ok && f.Tag == mindscript.VTInt && f.Data.(int64) == 0 {
@@ -552,7 +518,6 @@ func cmdGet(args []string) int {
 		fmt.Fprintf(os.Stderr, "usage: %s get <module>@<version?>\n", appName)
 		return 2
 	}
-	// spec := args[0]
 	fmt.Printf("Installing third-party modules is not implemented yet.\n")
 	return 0
 }

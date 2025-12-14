@@ -1,4 +1,4 @@
-//go:build (linux || darwin) && cgo
+//go:build !tinygo && (linux || darwin) && cgo
 
 package mindscript
 

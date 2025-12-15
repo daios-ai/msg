@@ -1,3116 +1,918 @@
-=== BEGIN FILE: ./mindscript/runtime.go ===
-// runtime.go
-//
-// This file implements the standard runtime/builtins *against the stable engine
-// surface* defined in interpreter.go. It avoids reaching into the engine's
-// internals (no ip.eval, no direct stack/VM knowledge). The only remaining
-// intentional touch-point is for `spawn`, where we temporarily copy a function's
-// closure to a snapshot Env to preserve isolation semantics. See the TODO there.
-
-package mindscript
-
-import "fmt"
-
-// --- Handle helpers (use central Handle from interpreter.go) ---
-
-// asHandle asserts v is a VTHandle (and optionally of a specific kind)
-// and returns the underlying *Handle. Used by runtime builtins.
-func asHandle(v Value, want string) *Handle {
-	if v.Tag != VTHandle {
-		fail("expected handle")
-	}
-	h := v.Data.(*Handle)
-	if want != "" && h.Kind != want {
-		fail("wrong handle kind")
-	}
-	return h
-}
-
-// annotate a core builtin function value with a docstring
-func setBuiltinDoc(target *Env, name, doc string) {
-	if v, err := target.Get(name); err == nil {
-		target.Define(name, withAnnot(v, doc))
-	}
-}
-
-// RegisterRuntimeBuiltin registers a native host function into the interpreter's
-// host registry (ip.native) but BINDS the callable into the provided target env.
-// The function value's closure Env is ip.Core (so effects occur at call-site),
-// and NativeName triggers native dispatch. Unlike RegisterNative, this does NOT
-// write into Core, allowing per-namespace overrides.
-func (ip *Interpreter) RegisterRuntimeBuiltin(
-	target *Env, name string, params []ParamSpec, ret S, impl NativeImpl,
-) {
-	if ip.native == nil {
-		ip.native = map[string]NativeImpl{}
-	}
-	ip.native[name] = impl
-
-	names := make([]string, len(params))
-	types := make([]S, len(params))
-	for i, p := range params {
-		names[i], types[i] = p.Name, p.Type
-	}
-	fn := FunVal(&Fun{
-		Params:     names,
-		ParamTypes: types,
-		ReturnType: ret,
-		Body:       S{"native", name}, // sentinel
-		Env:        ip.Core,           // effects resolve at call-site
-		NativeName: name,
-	})
-	target.Define(name, fn)
-}
-
-// SeedRuntimeInto installs the standard runtime natives and prelude into `target`.
-// This makes runtime symbols overrideable per-namespace (process/module).
-// RETURNS ERROR if prelude load fails (constructor MUST fail fast on this).
-func (ip *Interpreter) SeedRuntimeInto(target *Env) error {
-	// --- Register std natives into target (NOT Core) ---
-	// Change the register* functions to accept (ip, target) and use
-	// RegisterRuntimeBuiltin instead of RegisterNative inside those helpers.
-	registerCoreBuiltins(ip, target)
-	registerIntrospectionBuiltins(ip, target)
-	registerCastBuiltins(ip, target)
-	registerIOBuiltins(ip, target)
-	registerOsBuiltins(ip, target)
-	registerNetBuiltins(ip, target)
-	registerConcurrencyBuiltins(ip, target)
-	registerProcessBuiltins(ip, target)
-	registerEncodingURLBuiltins(ip, target)
-	registerCryptoBuiltins(ip, target)
-	registerCompressionBuiltins(ip, target)
-	registerExecBuiltins(ip, target)
-	registerTimeBuiltins(ip, target)
-	registerPathBuiltins(ip, target)
-	registerJsonBuiltins(ip, target)
-	registerStringBuiltins(ip, target)
-	registerRandomBuiltins(ip, target)
-	registerMathBuiltins(ip, target)
-	registerFFIBuiltins(ip, target)
-	registerActorBuiltins(ip, target)
-
-	// --- Load prelude into the SAME target (overrideable within namespace) ---
-	// If you need to load from a different spec, make this configurable by caller.
-	if err := ip.LoadPreludeInto(target, "std.ms", ""); err != nil {
-		return err
-	}
-	return nil
-}
-
-// LoadPreludeInto resolves `spec`, parses it with spans, and evaluates it
-// into the provided `target` environment (NOT Core). Errors are pretty-printed.
-func (ip *Interpreter) LoadPreludeInto(target *Env, spec string, importer string) error {
-
-	// 1) Resolve + fetch
-	src, display, _, err := resolveAndFetch(spec, importer)
-	if err != nil {
-		return err
-	}
-
-	// 2) Parse with spans for caret diagnostics
-	ast, spans, perr := ParseSExprWithSpans(src)
-	if perr != nil {
-		if e, ok := perr.(*Error); ok {
-			if e.Src == nil {
-				e.Src = &SourceRef{Name: display, Src: src}
-			}
-			return fmt.Errorf("%s", FormatError(e))
-		}
-		return perr
-	}
-
-	// 3) Evaluate in the provided target environment. We want real errors for VM runtime failures,
-	//    and we also want to treat annotated-null as an error.
-	v, rterr := ip.runTopWithSource(ast, target, false, &SourceRef{
-		Name:  display,
-		Src:   src,
-		Spans: spans,
-	})
-	if rterr != nil {
-		if e, ok := rterr.(*Error); ok {
-			// Already has proper Src/coords; just pretty-print here.
-			return fmt.Errorf("%s", FormatError(e))
-		}
-		return rterr
-	}
-
-	// Top-level returned an annotated null → promote to a hard runtime *Error*.
-	if v.Tag == VTNull && v.Annot != "" {
-		return fmt.Errorf("%s", FormatError(&Error{
-			Kind: DiagRuntime,
-			Msg:  v.Annot,
-			Src:  &SourceRef{Name: display, Src: src},
-			Line: 1, Col: 1, // no precise PC; anchor at file start
-		}))
-	}
-
-	return nil
-}
-=== END FILE: ./mindscript/runtime.go ===
-
-=== BEGIN FILE: ./mindscript/ffi.go ===
-//go:build !tinygo && (linux || darwin) && cgo
-
-package mindscript
-
-/*
-#define _GNU_SOURCE
-#cgo LDFLAGS: -ldl
-#cgo pkg-config: libffi
-#include <ffi.h>
-#include <dlfcn.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <stdint.h> // uintptr_t
-#include <stddef.h>
-
-// Thin wrapper so cgo/gopls reliably sees the symbol.
-static int ms_ffi_prep_cif_var(ffi_cif* cif, ffi_abi abi,
-    unsigned int nfixedargs, unsigned int ntotalargs,
-    ffi_type* rtype, ffi_type** atypes) {
-  return ffi_prep_cif_var(cif, abi, nfixedargs, ntotalargs, rtype, atypes);
-}
-
-// ffi_call wrapper: accept a generic void* fn and a void** argv vector.
-// This avoids cgo’s function-pointer type constraints at the call site.
-static void ms_ffi_call(ffi_cif* cif, void* fn, void* rvalue, void** avalue) {
-    ffi_call(cif, (void (*)(void))fn, rvalue, avalue);
-}
-
-// Allocate a cif on the C heap (so it outlives the Go stack frame).
-static ffi_cif* ms_alloc_cif(void) {
-    return (ffi_cif*)malloc(sizeof(ffi_cif));
-}
-
-static void* ms_dlopen(const char* path) {
-	return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-}
-static const char* ms_dlerror(void) {
-	return dlerror();
-}
-static int ms_dlclose(void* h) {
-	return dlclose(h);
-}
-
-// Clear dlerror, call dlsym, and return the error (if any) alongside the symbol.
-static void* ms_dlsym_clear(void* h, const char* name, char** err) {
- 	dlerror(); // clear
- 	void* p = dlsym(h, name);
-	char* e = dlerror();
- 	if (e) { if (err) *err = e; return NULL; }
- 	if (err) *err = NULL;
- 	return p;
-}
-
-// errno helpers
-static int* ms_errno_loc(void) {
-#if defined(__GLIBC__)
-  extern int* __errno_location(void);
-  return __errno_location();
-#else
-  return &errno;
-#endif
-}
-
-// Call a destructor with signature: void (*)(void*)
-typedef void (*ms_destructor_fn)(void*);
-static inline void ms_call_destructor(void* fn, void* p) {
-  ((ms_destructor_fn)fn)(p);
-}
-
-// -------- libffi closure helpers (callbacks) ----------
-static void* ms_closure_alloc(void** executable) {
-  return ffi_closure_alloc(sizeof(ffi_closure), executable);
-}
-// Wrapper that binds the thunk on the C side to avoid cgo func-ptr typing pitfalls.
-// Forward declare the static thunk we define below.
-static void ms_callback_thunk(ffi_cif*, void*, void**, void*);
-static int ms_prep_closure_with_thunk(void* closure, ffi_cif* cif,
-                               void* userdata, void* executable) {
-  return ffi_prep_closure_loc((ffi_closure*)closure, cif,
-                              ms_callback_thunk, userdata, executable);
-}
-static void ms_closure_free(void* closure) {
-  ffi_closure_free((ffi_closure*)closure);
-}
-
-// Forward decl to Go; C thunk forwards into it with integer handle.
-extern void msCallbackInvoke(ffi_cif*, void*, void**, uintptr_t);
-static void ms_callback_thunk(ffi_cif* cif, void* ret, void** args, void* user) {
-  msCallbackInvoke(cif, ret, args, (uintptr_t)user);
-}
-
-// -------- helpers to allocate/customize ffi_type on the C heap --------------
-static ffi_type* ms_alloc_ffi_type_struct(size_t nfields) {
-  ffi_type* t = (ffi_type*)malloc(sizeof(ffi_type));
-  if (!t) return NULL;
-  t->size = 0;
-  t->alignment = 0;
-  t->type = FFI_TYPE_STRUCT;
-  ffi_type** elems = (ffi_type**)calloc(nfields + 1, sizeof(ffi_type*)); // +1 for NULL
-  if (!elems) { free(t); return NULL; }
-  t->elements = elems;
-  return t;
-}
-static void ms_struct_set_elem(ffi_type* t, size_t i, ffi_type* e) {
-  t->elements[i] = e;
-}
-static ffi_type* ms_alloc_ffi_type_opaque(size_t size, unsigned short align) {
-  ffi_type* t = (ffi_type*)malloc(sizeof(ffi_type));
-  if (!t) return NULL;
-  t->size = size;
-  t->alignment = align ? align : 1;
-  t->type = FFI_TYPE_STRUCT;   // opaque aggregate per libffi convention
-  t->elements = NULL;          // no element layout; size/alignment provided
-  return t;
-}
-static void ms_free_ffi_type_and_elems(ffi_type* t) {
-  if (!t) return;
-  if (t->elements) { free(t->elements); t->elements = NULL; }
-  free(t);
-}
-*/
-import "C"
-
-import (
-	"errors"
-	"fmt"
-	"runtime/cgo"
-	"sort"
-	"sync"
-	"unsafe"
-)
-
-// -------------------------
-// Centralized cgo helpers
-// -------------------------
-
-// dlerr returns the last dlerror as a Go string, or a fallback label.
-func dlerr() string {
-	errC := C.ms_dlerror()
-	if errC != nil {
-		return C.GoString(errC)
-	}
-	return "unknown dlerror"
-}
-
-// openLib returns the handle for a library path/soname and records it for later dlclose.
-// If lib is already the default and hDefault != nil, reuse the default handle.
-func (m *ffiModule) openLib(lib, defaultName string, hDefault unsafe.Pointer) (unsafe.Pointer, error) {
-	if lib == "" || lib == defaultName {
-		return hDefault, nil
-	}
-	h, err := cDlopen(lib)
-	if err != nil {
-		return nil, err
-	}
-	m.openLibs = append(m.openLibs, h)
-	return h, nil
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Step (2): spec parsing, type system, layout engine, symbol binding (ELF/SysV)
-////////////////////////////////////////////////////////////////////////////////
-
-// -------------------------
-// C shim helpers (single TU)
-// -------------------------
-
-// memory
-func cMalloc(n uintptr) unsafe.Pointer                    { return C.malloc(C.size_t(n)) }
-func cCalloc(count, size uintptr) unsafe.Pointer          { return C.calloc(C.size_t(count), C.size_t(size)) }
-func cRealloc(p unsafe.Pointer, n uintptr) unsafe.Pointer { return C.realloc(p, C.size_t(n)) }
-func cFree(p unsafe.Pointer)                              { C.free(p) }
-func cMemcpy(dst, src unsafe.Pointer, n uintptr)          { C.memcpy(dst, src, C.size_t(n)) }
-func cMemset(dst unsafe.Pointer, b byte, n uintptr)       { C.memset(dst, C.int(int(b)), C.size_t(n)) }
-
-// strings
-func cGoString(p unsafe.Pointer) string { return C.GoString((*C.char)(p)) }
-func cGoStringN(p unsafe.Pointer, n int) string {
-	return C.GoStringN((*C.char)(p), C.int(n))
-}
-func cCString(s string) unsafe.Pointer { return unsafe.Pointer(C.CString(s)) }
-func cCStringFree(p unsafe.Pointer)    { C.free(p) }
-
-// dlopen/dlsym/dlclose wrappers
-func cDlopen(path string) (unsafe.Pointer, error) {
-	cs := (*C.char)(cCString(path))
-	defer cCStringFree(unsafe.Pointer(cs))
-	h := C.ms_dlopen(cs)
-	if h == nil {
-		return nil, fmt.Errorf("dlopen(%q) failed: %s", path, dlerr())
-	}
-	return unsafe.Pointer(h), nil
-}
-func cDlclose(h unsafe.Pointer) error {
-	if int(C.ms_dlclose(h)) != 0 {
-		return fmt.Errorf("dlclose failed: %s", dlerr())
-	}
-	return nil
-}
-func cDlsymClear(h unsafe.Pointer, name string) (unsafe.Pointer, error) {
-	cs := (*C.char)(cCString(name))
-	defer cCStringFree(unsafe.Pointer(cs))
-	var cerr *C.char
-	p := C.ms_dlsym_clear(h, cs, &cerr)
-	if cerr != nil {
-		return nil, fmt.Errorf("dlsym(%q) failed: %s", name, C.GoString(cerr))
-	}
-	return p, nil
-}
-
-// libffi call helpers
-type cif = *C.ffi_cif
-
-func cAllocCIF() *C.ffi_cif { return C.ms_alloc_cif() }
-func cFFICall(cif *C.ffi_cif, fn unsafe.Pointer, rvalue unsafe.Pointer, argv unsafe.Pointer) {
-	C.ms_ffi_call(cif, fn, rvalue, (*unsafe.Pointer)(argv))
-}
-
-// errno get/set
-func cErrnoGet() int  { return int(*C.ms_errno_loc()) }
-func cErrnoSet(v int) { *C.ms_errno_loc() = C.int(v) }
-
-// One generic pointer-array allocator + slice adapters.
-func allocPtrArray(n int) unsafe.Pointer {
-	return C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
-}
-func asFFITypeSlice(mem unsafe.Pointer, n int) []*C.ffi_type {
-	return (*[1<<30 - 1]*C.ffi_type)(mem)[:n:n]
-}
-
-// -------- Small allocation helpers to reduce boilerplate ----------
-
-// mustMalloc allocates n bytes on the C heap or hard-fails with a uniform OOM.
-func mustMalloc(n uintptr) unsafe.Pointer {
-	p := C.malloc(C.size_t(n))
-	if p == nil {
-		fail("ffi: OOM")
-	}
-	return p
-}
-
-// --- Opaque libffi type helpers (keep all C references in this file) ---
-// Return opaque pointers to common builtin ffi_type objects.
-func ffiTypeSint32Ptr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_sint32) }
-func ffiTypeDoublePtr() unsafe.Pointer  { return unsafe.Pointer(&C.ffi_type_double) }
-func ffiTypePointerPtr() unsafe.Pointer { return unsafe.Pointer(&C.ffi_type_pointer) }
-
-// Fill a ffi_type** array (allocated via allocPtrArray) from registry keys.
-func fillFFITypesFromKeys(reg *ffiRegistry, mem unsafe.Pointer, keys []string) error {
-	vec := asFFITypeSlice(mem, len(keys)) // uses *C.ffi_type internally (C access kept here)
-	for i, k := range keys {
-		t, err := ffiTypeFor(reg, k)
-		if err != nil {
-			return err
-		}
-		vec[i] = t
-	}
-	return nil
-}
-
-// Set one entry in a ffi_type** array at index idx using an opaque pointer.
-func setFFITypeAt(mem unsafe.Pointer, idx int, ty unsafe.Pointer) {
-	vec := asFFITypeSlice(mem, idx+1)
-	vec[idx] = (*C.ffi_type)(ty)
-}
-
-func ffiReturnTypePtr(reg *ffiRegistry, key string) (unsafe.Pointer, error) {
-	t, err := ffiTypeFor(reg, key)
-	if err != nil {
-		return nil, err
-	}
-	return unsafe.Pointer(t), nil
-}
-
-func cFFIPrepCIFVarOpaque(cif *C.ffi_cif, nfixed, ntotal int, rtype unsafe.Pointer, atypes unsafe.Pointer) error {
-	st := C.ms_ffi_prep_cif_var(cif, C.FFI_DEFAULT_ABI, C.uint(nfixed), C.uint(ntotal), (*C.ffi_type)(rtype), (**C.ffi_type)(atypes))
-	if st != C.FFI_OK {
-		return fmt.Errorf("ffi_prep_cif_var failed: %d", int(st))
-	}
-	return nil
-}
-
-// --- Internal FFI model ------------------------------------------------------
-
-type ffiKind int
-
-const (
-	ffiVoid ffiKind = iota
-	ffiInt
-	ffiFloat
-	ffiPointer
-	ffiArray
-	ffiStruct
-	ffiUnion
-	ffiEnum
-	ffiFuncPtr
-	ffiAlias
-	ffiHandle // semantic handle (tagged) backed by rep TypeRef
-)
-
-// ffiType is the canonical structural description plus computed layout.
-// Layout (Size/Align/Offsets) is filled by the layout engine once.
-type ffiType struct {
-	Kind     ffiKind
-	Name     string           // display/debug name (optional in spec)
-	Doc      string           // docs
-	Key      string           // registry key (reverse map; set by addType)
-	Bits     int              // int/float width
-	Signed   bool             // ints
-	Elem     string           // array element type (registry key)
-	Len      int              // array fixed length, or -1 for VLA/flexible
-	To       string           // pointer/alias target type (registry key)
-	Fields   []ffiField       // struct/union fields
-	EnumBase string           // enum underlying int type
-	EnumVals map[string]int64 // enum named constants
-	Params   []string         // funcptr param types
-	Ret      string           // funcptr return type
-	Variadic bool             // funcptr variadic
-
-	// Optional pointer/handle tag (semantic label, used to build VTHandle.Kind)
-	Tag string
-
-	// Computed layout (SysV ABI)
-	Size    uintptr
-	Align   uintptr
-	Offsets []uintptr // struct: per-field; union: nil; array: nil
-
-	// Cached libffi representation (C-heap); freed on module close
-	cffi *C.ffi_type
-
-	// --- callbacks (funcptr): cached callback CIF (C-heap) ---
-	cbCIF *C.ffi_cif
-}
-
-type ffiField struct {
-	Name string
-	Type string // registry key
-	Bits int    // bitfield width; 0 = force new storage unit per C rule
-}
-
-type ffiFunction struct {
-	Name      string
-	Lib       string // if empty, use spec.lib
-	Ret       string // type key
-	Params    []string
-	Variadic  bool
-	Doc       string
-	RetAsStr  bool // char*/uchar* -> Str convenience
-	SymbolPtr unsafe.Pointer
-	cif       *C.ffi_cif
-	typesVec  unsafe.Pointer // malloc'd array of ffi_type* (argv type vector)
-}
-
-type ffiVariable struct {
-	Name      string
-	Lib       string // if empty, use spec.lib
-	Type      string
-	SymbolPtr unsafe.Pointer // address of the object (void*)
-}
-
-type ffiRegistry struct {
-	types map[string]*ffiType
-}
-
-func newFFIRegistry() *ffiRegistry { return &ffiRegistry{types: make(map[string]*ffiType)} }
-
-// addType inserts or errors if duplicate.
-func (r *ffiRegistry) addType(key string, t *ffiType) error {
-	if _, exists := r.types[key]; exists {
-		return fmt.Errorf("duplicate type name: %s", key)
-	}
-	t.Key = key
-	r.types[key] = t
-	return nil
-}
-
-func (r *ffiRegistry) mustGet(key string) *ffiType {
-	t, ok := r.types[key]
-	if !ok {
-		panic("ffi: internal: missing type: " + key)
-	}
-	return t
-}
-
-// ffiModule is a per-module state bag we hide behind a VTHandle.
-type ffiModule struct {
-	libName string
-	libH    unsafe.Pointer // dlopen handle
-	reg     *ffiRegistry
-	funcs   map[string]*ffiFunction
-	vars    map[string]*ffiVariable
-
-	// track all opened handles (default + per-symbol overrides) to close later
-	openLibs []unsafe.Pointer
-
-	// live libffi closures for callbacks (freed on close)
-	cbs []cbRecord
-}
-
-// One record per created callback closure.
-type cbRecord struct {
-	closure unsafe.Pointer // ffi_closure*
-	handle  cgo.Handle     // cgo handle for callback context
-}
-
-// Callback context carried through cgo.Handle.
-type cbContext struct {
-	ip  *Interpreter
-	fn  Value
-	typ *ffiType
-	reg *ffiRegistry
-}
-
-// -------- Small shared values (avoid repeat allocations) ---------------------
-var (
-	promInt = &ffiType{Kind: ffiInt, Bits: 32, Signed: true} // C default promotions
-	promDbl = &ffiType{Kind: ffiFloat, Bits: 64}
-)
-
-// ---------------- One-shot GC destructor registry (shared) --------------------
-type gcDtorKind uint8
-
-const (
-	gcNone  gcDtorKind = iota
-	gcFree             // C.free
-	gcCFunc            // void(*)(void*)
-)
-
-type gcEntry struct {
-	once sync.Once
-	kind gcDtorKind
-	fn   unsafe.Pointer // for gcCFunc
-	lib  unsafe.Pointer // retained dlopen until run; may be nil
-}
-
-var gcReg sync.Map // raw pointer -> *gcEntry
-
-func gcInstall(p unsafe.Pointer, e *gcEntry) {
-	if p != nil {
-		gcReg.Store(p, e)
-	}
-}
-func gcDetach(p unsafe.Pointer) {
-	if p != nil {
-		gcReg.Delete(p)
-	}
-}
-func gcRunOnce(p unsafe.Pointer) bool {
-	if p == nil {
-		return false
-	}
-	v, ok := gcReg.Load(p)
-	if !ok {
-		return false
-	}
-	e := v.(*gcEntry)
-	e.once.Do(func() {
-		switch e.kind {
-		case gcFree:
-			C.free(p)
-		case gcCFunc:
-			if e.fn != nil {
-				C.ms_call_destructor(e.fn, p)
-			}
-		}
-		if e.lib != nil {
-			_ = cDlclose(e.lib)
-			e.lib = nil
-		}
-	})
-	return true
-}
-
-// move (used by realloc): re-attach entry to q (fresh Once).
-func gcMove(p, q unsafe.Pointer) {
-	if p == nil || q == nil || p == q {
-		return
-	}
-	if v, ok := gcReg.Load(p); ok {
-		e := v.(*gcEntry)
-		e.once = sync.Once{}
-		gcReg.Delete(p)
-		gcReg.Store(q, e)
-	}
-}
-
-func ffiTypeFor(reg *ffiRegistry, key string) (*C.ffi_type, error) {
-	t := reg.mustGet(key)
-	switch t.Kind {
-	case ffiVoid:
-		return &C.ffi_type_void, nil
-	case ffiInt:
-		switch t.Bits {
-		case 8:
-			if t.Signed {
-				return &C.ffi_type_sint8, nil
-			}
-			return &C.ffi_type_uint8, nil
-		case 16:
-			if t.Signed {
-				return &C.ffi_type_sint16, nil
-			}
-			return &C.ffi_type_uint16, nil
-		case 32:
-			if t.Signed {
-				return &C.ffi_type_sint32, nil
-			}
-			return &C.ffi_type_uint32, nil
-		case 64:
-			if t.Signed {
-				return &C.ffi_type_sint64, nil
-			}
-			return &C.ffi_type_uint64, nil
-
-		default:
-			return nil, fmt.Errorf("int bits=%d not supported", t.Bits)
-		}
-	case ffiFloat:
-		switch t.Bits {
-		case 32:
-			return &C.ffi_type_float, nil
-		case 64:
-			return &C.ffi_type_double, nil
-		default:
-			return nil, fmt.Errorf("float bits=%d not supported (only 32/64)", t.Bits)
-		}
-	case ffiPointer, ffiFuncPtr, ffiHandle:
-		return &C.ffi_type_pointer, nil
-	case ffiEnum:
-		return ffiTypeFor(reg, t.EnumBase)
-	case ffiArray, ffiStruct, ffiUnion:
-		return ensureCFFIType(reg, t)
-	case ffiAlias:
-		return ffiTypeFor(reg, t.To)
-	default:
-		return nil, fmt.Errorf("unhandled kind")
-	}
-}
-
-// ensureCFFIType builds (and caches) a libffi aggregate type for arrays/structs/unions.
-func ensureCFFIType(reg *ffiRegistry, t *ffiType) (*C.ffi_type, error) {
-	if t.cffi != nil {
-		return t.cffi, nil
-	}
-	switch t.Kind {
-	case ffiStruct:
-		// True struct: elements describe layout; libffi computes size/align.
-		n := len(t.Fields)
-		tf := C.ms_alloc_ffi_type_struct(C.size_t(n))
-		if tf == nil {
-			return nil, fmt.Errorf("ffi_type OOM")
-		}
-		// Fill field element types.
-		for i := 0; i < n; i++ {
-			ft := reg.mustGet(t.Fields[i].Type)
-			et, err := ffiTypeFor(reg, ft.Key)
-			if err != nil {
-				C.ms_free_ffi_type_and_elems(tf)
-				return nil, fmt.Errorf("field %s: %w", t.Fields[i].Name, err)
-			}
-			C.ms_struct_set_elem(tf, C.size_t(i), et)
-		}
-		t.cffi = tf
-		return t.cffi, nil
-	case ffiUnion, ffiArray:
-		// Opaque aggregate with known size/alignment.
-		// Arrays with flexible size are rejected via layout (Size=0) in by-value positions.
-		if t.Kind == ffiArray && t.Len < 0 {
-			return nil, fmt.Errorf("flexible array cannot be passed/returned by value")
-		}
-		if t.Size == 0 {
-			return nil, fmt.Errorf("opaque aggregate has zero size")
-		}
-		tf := C.ms_alloc_ffi_type_opaque(C.size_t(t.Size), C.ushort(t.Align))
-		if tf == nil {
-			return nil, fmt.Errorf("ffi_type OOM")
-		}
-		t.cffi = tf
-		return t.cffi, nil
-	default:
-		return nil, fmt.Errorf("internal: ensureCFFIType non-aggregate")
-	}
-}
-
-// ensureFuncptrCIF lazily prepares a callback-side CIF for a funcptr type.
-func ensureFuncptrCIF(reg *ffiRegistry, ft *ffiType) error {
-	if ft.Kind != ffiFuncPtr {
-		return fmt.Errorf("internal: ensureFuncptrCIF on non-funcptr")
-	}
-	if ft.cbCIF != nil {
-		return nil
-	}
-	cf, _, err := prepCIF(reg, ft.Ret, ft.Params)
-	if err != nil {
-		return err
-	}
-	ft.cbCIF = cf
-	return nil
-}
-
-// prepCIF allocates a C-heap cif and a C-heap ffi_type** argv vector.
-// The caller is responsible for freeing both.
-func prepCIF(reg *ffiRegistry, ret string, params []string) (cif, unsafe.Pointer, error) {
-	rty, err := ffiTypeFor(reg, ret)
-	if err != nil {
-		return nil, nil, err
-	}
-	n := len(params)
-	var typesPtr **C.ffi_type
-	if n > 0 {
-		bytes := mustMalloc(uintptr(n) * uintptr(unsafe.Sizeof(uintptr(0))))
-		types := (*[1<<30 - 1]*C.ffi_type)(bytes)[:n:n]
-		for i, p := range params {
-			pt, err := ffiTypeFor(reg, p)
-			if err != nil {
-				return nil, nil, fmt.Errorf("param[%d]: %w", i, err)
-			}
-			types[i] = pt
-		}
-		typesPtr = (**C.ffi_type)(bytes) // keep allocated; libffi reads it on call
-	} else {
-		typesPtr = nil
-	}
-	c := C.ms_alloc_cif()
-	if c == nil {
-		return nil, nil, fmt.Errorf("ffi_prep_cif: OOM")
-	}
-	st := C.ffi_prep_cif(c, C.FFI_DEFAULT_ABI, C.uint(n), rty, typesPtr)
-	if st != C.FFI_OK {
-		return nil, unsafe.Pointer(typesPtr), fmt.Errorf("ffi_prep_cif failed: %d", int(st))
-	}
-	return c, unsafe.Pointer(typesPtr), nil
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Spec parsing & normalization (JSON-compatible Value -> ffiModule)
-////////////////////////////////////////////////////////////////////////////////
-
-func parseFFISpec(spec *MapObject) (string, *ffiRegistry, []*ffiFunction, []*ffiVariable, error) {
-	// version
-	v, ok := spec.Entries["version"]
-	if !ok {
-		return "", nil, nil, nil, errors.New("ffiOpen: missing 'version'")
-	}
-	if v.Tag != VTStr || v.Data.(string) != "1" {
-		return "", nil, nil, nil, errors.New("ffiOpen: unsupported version (expected \"1\")")
-	}
-
-	// lib
-	libV, ok := spec.Entries["lib"]
-	if !ok || libV.Tag != VTStr {
-		return "", nil, nil, nil, errors.New("ffiOpen: missing or invalid 'lib' (expected Str)")
-	}
-	lib := libV.Data.(string)
-
-	reg := newFFIRegistry()
-
-	// seed some builtin atoms for convenience
-	_ = reg.addType("__void__", &ffiType{Kind: ffiVoid, Name: "void", Size: 0, Align: 1})
-	_ = reg.addType("__char__", &ffiType{Kind: ffiInt, Name: "char", Bits: 8, Signed: true})
-	_ = reg.addType("__uchar__", &ffiType{Kind: ffiInt, Name: "unsigned char", Bits: 8, Signed: false})
-
-	// types (optional)
-	if tv, ok := spec.Entries["types"]; ok {
-		if tv.Tag != VTMap {
-			return "", nil, nil, nil, errors.New("ffiOpen: 'types' must be a map")
-		}
-		for _, k := range tv.Data.(*MapObject).Keys {
-			tvV := tv.Data.(*MapObject).Entries[k]
-			t, err := parseTypeObject(reg, k, tvV)
-			if err != nil {
-				return "", nil, nil, nil, fmt.Errorf("ffiOpen.types[%s]: %v", k, err)
-			}
-			if err := reg.addType(k, t); err != nil {
-				return "", nil, nil, nil, err
-			}
-		}
-	}
-
-	// functions (optional)
-	var funs []*ffiFunction
-	if fv, ok := spec.Entries["functions"]; ok {
-		if fv.Tag != VTArray {
-			return "", nil, nil, nil, errors.New("ffiOpen: 'functions' must be an array")
-		}
-		seen := map[string]bool{}
-		for i, raw := range fv.Data.(*ArrayObject).Elems {
-			fn, err := parseFunctionObject(reg, raw)
-			if err != nil {
-				return "", nil, nil, nil, fmt.Errorf("ffiOpen.functions[%d]: %v", i, err)
-			}
-			if seen[fn.Name] {
-				return "", nil, nil, nil, fmt.Errorf("ffiOpen: duplicate function name: %s", fn.Name)
-			}
-			seen[fn.Name] = true
-			funs = append(funs, fn)
-		}
-	}
-
-	// variables (optional)
-	var vars []*ffiVariable
-	if vv, ok := spec.Entries["variables"]; ok {
-		if vv.Tag != VTArray {
-			return "", nil, nil, nil, errors.New("ffiOpen: 'variables' must be an array")
-		}
-		seen := map[string]bool{}
-		for i, raw := range vv.Data.(*ArrayObject).Elems {
-			vd, err := parseVariableObject(reg, raw)
-			if err != nil {
-				return "", nil, nil, nil, fmt.Errorf("ffiOpen.variables[%d]: %v", i, err)
-			}
-			if seen[vd.Name] {
-				return "", nil, nil, nil, fmt.Errorf("ffiOpen: duplicate variable name: %s", vd.Name)
-			}
-			seen[vd.Name] = true
-			vars = append(vars, vd)
-		}
-	}
-
-	// Resolve/normalize types: replace inline refs with names
-	if err := normalizeTypes(reg); err != nil {
-		return "", nil, nil, nil, err
-	}
-	// Compute layout
-	if err := computeAllLayouts(reg); err != nil {
-		return "", nil, nil, nil, err
-	}
-
-	// Enforce: ret_as_str is only valid for char*/unsigned char*
-	for _, f := range funs {
-		if f.RetAsStr {
-			rt := reg.mustGet(f.Ret)
-			if !((rt.Kind == ffiPointer || rt.Kind == ffiHandle) && isCharPtr(reg, rt)) {
-				return "", nil, nil, nil, fmt.Errorf("function %s: ret_as_str on non-char*", f.Name)
-			}
-		}
-	}
-
-	// Validate function & variable type refs exist
-	for _, f := range funs {
-		if _, ok := reg.types[f.Ret]; !ok {
-			return "", nil, nil, nil, fmt.Errorf("function %s: unknown return type %q", f.Name, f.Ret)
-		}
-		for i, p := range f.Params {
-			if _, ok := reg.types[p]; !ok {
-				return "", nil, nil, nil, fmt.Errorf("function %s: unknown param[%d] type %q", f.Name, i, p)
-			}
-		}
-	}
-	for _, v := range vars {
-		if _, ok := reg.types[v.Type]; !ok {
-			return "", nil, nil, nil, fmt.Errorf("variable %s: unknown type %q", v.Name, v.Type)
-		}
-	}
-
-	return lib, reg, funs, vars, nil
-}
-
-// resolveTypeRef normalizes a TypeRef (string key or inline type object) into a registry key.
-// If inline, it parses the object, assigns it an anonymous key based on ctx, and inserts it.
-func resolveTypeRef(reg *ffiRegistry, ctx string, v Value) (string, error) {
-	if v.Tag == VTStr {
-		return v.Data.(string), nil
-	}
-	if v.Tag != VTMap {
-		return "", fmt.Errorf("%s: type reference must be a name (Str) or map", ctx)
-	}
-	anonKey := "__anon__" + ctx
-	t, err := parseTypeObject(reg, anonKey, v)
-	if err != nil {
-		return "", err
-	}
-	if err := reg.addType(anonKey, t); err != nil {
-		return "", err
-	}
-	return anonKey, nil
-}
-
-// parseTypeObject accepts a spec value (map or alias string) describing a Type.
-func parseTypeObject(reg *ffiRegistry, key string, v Value) (*ffiType, error) {
-	if v.Tag == VTStr {
-		// alias to another declared type key
-		return &ffiType{Kind: ffiAlias, To: v.Data.(string), Name: key}, nil
-	}
-	if v.Tag != VTMap {
-		return nil, errors.New("type must be a map or string alias")
-	}
-	m := v.Data.(*MapObject)
-	kindV, ok := m.Entries["kind"]
-	if !ok || kindV.Tag != VTStr {
-		return nil, errors.New(`type: missing "kind": string`)
-	}
-	kind := kindV.Data.(string)
-	t := &ffiType{Name: ffiGetStr(m, "name", ""), Doc: ffiGetStr(m, "doc", "")}
-
-	switch kind {
-	case "void":
-		t.Kind = ffiVoid
-	case "int":
-		t.Kind = ffiInt
-		t.Bits = int(ffiGetInt(m, "bits", -1))
-		sv, ok := m.Entries["signed"]
-		if !ok || (sv.Tag != VTBool) {
-			return nil, errors.New(`int: missing "signed": bool`)
-		}
-		t.Signed = sv.Data.(bool)
-		if t.Bits != 8 && t.Bits != 16 && t.Bits != 32 && t.Bits != 64 {
-			return nil, errors.New("int: bits must be 8/16/32/64")
-		}
-	case "float":
-		t.Kind = ffiFloat
-		t.Bits = int(ffiGetInt(m, "bits", -1))
-		if t.Bits != 32 && t.Bits != 64 {
-			return nil, errors.New("float: bits must be 32/64")
-		}
-	case "pointer":
-		t.Kind = ffiPointer
-		to, ok := m.Entries["to"]
-		if !ok {
-			return nil, errors.New(`pointer: missing "to"`)
-		}
-		ref, err := resolveTypeRef(reg, "ptr_to__"+key, to)
-		if err != nil {
-			return nil, err
-		}
-		t.To = ref
-		t.Tag = ffiGetStr(m, "tag", "")
-	case "array":
-		t.Kind = ffiArray
-		of, ok := m.Entries["of"]
-		if !ok {
-			return nil, errors.New(`array: missing "of"`)
-		}
-		ref, err := resolveTypeRef(reg, "array_of__"+key, of)
-		if err != nil {
-			return nil, err
-		}
-		t.Elem = ref
-		if lnV, ok := m.Entries["len"]; ok {
-			if lnV.Tag != VTInt || lnV.Data.(int64) < 0 {
-				return nil, errors.New("array.len must be non-negative int")
-			}
-			t.Len = int(lnV.Data.(int64))
-		} else {
-			t.Len = -1 // VLA/flexible, placement rules apply
-		}
-	case "struct":
-		t.Kind = ffiStruct
-		fl, ok := m.Entries["fields"]
-		if !ok || fl.Tag != VTArray {
-			return nil, errors.New(`struct: missing "fields": [ ... ]`)
-		}
-		for i, e := range fl.Data.(*ArrayObject).Elems {
-			fm, ok := ffiAsMap(e)
-			if !ok {
-				return nil, fmt.Errorf("struct.fields[%d]: must be map", i)
-			}
-			f := ffiField{
-				Name: ffiGetReqStr(fm, "name"),
-			}
-			ttv, ok := fm.Entries["type"]
-			if !ok {
-				return nil, fmt.Errorf("struct.fields[%d]: missing 'type'", i)
-			}
-			ref, err := resolveTypeRef(reg, fmt.Sprintf("struct_%s_field_%d", key, i), ttv)
-			if err != nil {
-				return nil, err
-			}
-			f.Type = ref
-			if bf, ok := fm.Entries["bits"]; ok {
-				if bf.Tag != VTInt || bf.Data.(int64) < 0 {
-					return nil, fmt.Errorf("struct.fields[%d]: bits must be non-negative int", i)
-				}
-				f.Bits = int(bf.Data.(int64))
-			}
-			t.Fields = append(t.Fields, f)
-		}
-	case "union":
-		t.Kind = ffiUnion
-		fl, ok := m.Entries["fields"]
-		if !ok || fl.Tag != VTArray {
-			return nil, errors.New(`union: missing "fields": [ ... ]`)
-		}
-		for i, e := range fl.Data.(*ArrayObject).Elems {
-			fm, ok := ffiAsMap(e)
-			if !ok {
-				return nil, fmt.Errorf("union.fields[%d]: must be map", i)
-			}
-			f := ffiField{
-				Name: ffiGetReqStr(fm, "name"),
-			}
-			ttv, ok := fm.Entries["type"]
-			if !ok {
-				return nil, fmt.Errorf("union.fields[%d]: missing 'type'", i)
-			}
-			ref, err := resolveTypeRef(reg, fmt.Sprintf("union_%s_field_%d", key, i), ttv)
-			if err != nil {
-				return nil, err
-			}
-			f.Type = ref
-			t.Fields = append(t.Fields, f)
-		}
-	case "enum":
-		t.Kind = ffiEnum
-		if bv, ok := m.Entries["base"]; ok && bv.Tag == VTStr {
-			t.EnumBase = bv.Data.(string)
-		} else {
-			return nil, errors.New(`enum: missing "base": string`)
-		}
-		t.EnumVals = map[string]int64{}
-		if vv, ok := m.Entries["values"]; ok {
-			vm, ok := ffiAsMap(vv)
-			if !ok {
-				return nil, errors.New("enum.values must be a map")
-			}
-			for _, k := range vm.Keys {
-				val := vm.Entries[k]
-				if val.Tag != VTInt {
-					return nil, fmt.Errorf("enum.values[%s] must be int", k)
-				}
-				t.EnumVals[k] = val.Data.(int64)
-			}
-		}
-	case "funcptr":
-		t.Kind = ffiFuncPtr
-		// ret
-		rv, ok := m.Entries["ret"]
-		if !ok {
-			return nil, errors.New("funcptr: missing 'ret'")
-		}
-		ref, err := resolveTypeRef(reg, "funcptr_ret__"+key, rv)
-		if err != nil {
-			return nil, err
-		}
-		t.Ret = ref
-		// params
-		pv, ok := m.Entries["params"]
-		if !ok || pv.Tag != VTArray {
-			return nil, errors.New("funcptr: missing 'params' array")
-		}
-		for i, e := range pv.Data.(*ArrayObject).Elems {
-			ref, err := resolveTypeRef(reg, fmt.Sprintf("funcptr_param_%s_%d", key, i), e)
-			if err != nil {
-				return nil, err
-			}
-			t.Params = append(t.Params, ref)
-		}
-		if vv, ok := m.Entries["variadic"]; ok && vv.Tag == VTBool {
-			t.Variadic = vv.Data.(bool)
-		}
-	case "alias":
-		t.Kind = ffiAlias
-		tv, ok := m.Entries["to"]
-		if !ok || tv.Tag != VTStr {
-			return nil, errors.New(`alias: missing "to": string`)
-		}
-		t.To = tv.Data.(string)
-	case "handle":
-		t.Kind = ffiHandle
-		t.Tag = ffiGetReqStr(m, "tag")
-		tv, ok := m.Entries["rep"]
-		if !ok {
-			return nil, errors.New(`handle: missing "rep"`)
-		}
-		ref, err := resolveTypeRef(reg, "handle_rep__"+key, tv)
-		if err != nil {
-			return nil, err
-		}
-		t.To = ref
-	default:
-		return nil, fmt.Errorf("unknown kind %q", kind)
-	}
-	return t, nil
-}
-
-func parseFunctionObject(reg *ffiRegistry, v Value) (*ffiFunction, error) {
-	m, ok := ffiAsMap(v)
-	if !ok {
-		return nil, errors.New("function must be a map")
-	}
-	name := ffiGetReqStr(m, "name")
-	retV, ok := m.Entries["ret"]
-	if !ok {
-		return nil, errors.New("function: missing 'ret'")
-	}
-	var ret string
-	rk, err := resolveTypeRef(reg, "fn_ret__"+name, retV)
-	if err != nil {
-		return nil, err
-	}
-	ret = rk
-	params := []string{}
-	pv, ok := m.Entries["params"]
-	if !ok || pv.Tag != VTArray {
-		return nil, errors.New("function: missing 'params' array")
-	}
-	for i, e := range pv.Data.(*ArrayObject).Elems {
-		rk, err := resolveTypeRef(reg, fmt.Sprintf("fn_%s_param_%d", name, i), e)
-		if err != nil {
-			return nil, err
-		}
-		params = append(params, rk)
-	}
-	fn := &ffiFunction{
-		Name:     name,
-		Lib:      ffiGetStr(m, "lib", ""),
-		Ret:      ret,
-		Params:   params,
-		Variadic: ffiGetBool(m, "variadic", false),
-		Doc:      ffiGetStr(m, "doc", ""),
-		RetAsStr: ffiGetBool(m, "ret_as_str", false),
-	}
-	return fn, nil
-}
-
-func parseVariableObject(reg *ffiRegistry, v Value) (*ffiVariable, error) {
-	m, ok := ffiAsMap(v)
-	if !ok {
-		return nil, errors.New("variable must be a map")
-	}
-	name := ffiGetReqStr(m, "name")
-	tv, ok := m.Entries["type"]
-	if !ok {
-		return nil, errors.New("variable: missing 'type'")
-	}
-	rk, err := resolveTypeRef(reg, "var_type__"+name, tv)
-	if err != nil {
-		return nil, err
-	}
-	return &ffiVariable{
-		Name: name,
-		Lib:  ffiGetStr(m, "lib", ""),
-		Type: rk,
-	}, nil
-}
-
-// normalizeTypes resolves aliases transitively and detects cycles.
-// After normalization, all ffiAlias.To point to a non-alias concrete type key.
-func normalizeTypes(reg *ffiRegistry) error {
-	for name, t := range reg.types {
-		if t.Kind != ffiAlias {
-			continue
-		}
-		target := t.To
-		seen := map[string]bool{name: true}
-		for {
-			tt, ok := reg.types[target]
-			if !ok {
-				return fmt.Errorf("alias %s: unknown target %q", name, target)
-			}
-			if tt.Kind == ffiAlias {
-				if seen[target] {
-					return fmt.Errorf("alias cycle at %s", target)
-				}
-				seen[target] = true
-				target = tt.To
-				continue
-			}
+=== BEGIN FILE: ./lib/std.ms ===
+
+# # std.ms
+# # Minimal standard library implemented in MindScript on top of builtins.
+# #
+# # === MINDSCRIPT CODE CONVENTION
+# #
+# # 1) Naming
+# #	Functions/vars: camelCase; Types: PascalCase; Consts: SCREAMING_SNAKE_CASE;
+# #	Modules: snake_case; Private: _prefix.
+# #
+# # 2) Errors
+# #	Soft errors: use nullable returns (T?); return `null  # <reason>`.
+# #	Any? = Any → do NOT use Any for maybes; pick a concrete T.
+# #	Hard errors: `panic(msg)` only for invariants/programmer bugs or unrecoverable state.
+# #	Catch hard errors with `try`; prefer soft errors for expected conditions.
+# #	Caller check idiom:
+# #	```
+# #		let v = parseX(s)
+# #		if v == null then return null  # <invalid input> end
+# #		use(v)
+# #	```
+# #	Add brief, grep-able slugs: `<not found>`, `<timeout: 200ms>`.
+# #
+# # 3) Function docs (PRE)
+# #	First line: short summary. Then blank line. Then Args/Returns/Soft-fail notes.
+# #	Example:
+# #	```
+# #		# Parse URL string.
+# #		#
+# #		# Args: s: Str
+# #		# Returns: {…}? (null on <invalid url>)
+# #		fun parseUrl(s: Str) -> { scheme!:Str, host!:Str, port:Int, path!:Str, query!:Str, fragment:Str }? do
+# #			let u = urlParse(s); if u == null then return null  # <invalid url> end; u
+# #		end
+# #	```
+# #
+# # 4) Formatting
+# #	Tabs for indentation. POST forces newline and follows after-separator rule.
+# #	Canonical output ends with exactly one trailing newline.
+
+# # -----------------------------
+# # Error/Assert
+# # -----------------------------
+
+# Produce an annotated null (soft error).
+# 
+# Returns `null` annotated with `msg`. Use for recoverable failures.
+# Args: msg: Str
+# Returns: Null
+let error = fun(msg: Str) -> Null do
+	__annotate(msg, null)
+end
+
+# Assert that a condition holds.
+# 
+# Returns true if `cond` is true; otherwise throws a hard failure.
+# Args: cond: Bool
+# Returns: Bool
+let assert = fun(cond: Bool) -> Bool do
+	if cond then
+		true
+	else
+		panic("assertion failed")
+	end
+end
+
+# # -----------------------------
+# # Console I/O
+# # -----------------------------
+
+# Print a formatted string to standard output.
+# 
+# Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
+# Caller controls newlines:
+# printf("%s = %v\n", ["x", 42])
+# 
+# Params:
+# fmt:  Str
+# args: [Any]
+# 
+# Returns:
+# Str? — the printed string, or null (annotated) on write error.
+let printf = fun(fmt: Str, args: [Any]) -> Str? do
+	let out = sprintf(fmt, args)
+	write(STDOUT, out)
+	flush(STDOUT)
+	out
+end
+
+# Print a value and return it.
+# 
+# Prints the string form of `x` without a trailing newline, and returns `x`.
+# Args: x: Any
+# Returns: Any
+let print = fun(x) do
+	write(STDOUT, sprintf("%s", [str(x)]))
+	flush(STDOUT)
+	x
+end
+
+# Print a value with newline and return it.
+# 
+# Prints the string form of `x` followed by a newline, and returns `x`.
+# Args: x: Any
+# Returns: Any
+let println = fun(x) do
+	write(STDOUT, sprintf("%s\n", [str(x)]))
+	flush(STDOUT)
+	x
+end
+
+# # -----------------------------
+# # Iterators
+# # -----------------------------
+
+# Infinite iterator: 0, 1, 2, ...
+# 
+# Produces a thunk `(Null -> Int)` that increments on each call.
+# Args: _: Null (ignored)
+# Returns: (Null -> Int)
+let naturals0 = fun(_: Null) -> Null -> Int do
+	let i = 0
+	fun(_: Null) -> Int do
+		let v = i
+		i = i + 1
+		v
+	end
+end
+
+# Infinite iterator: 1, 2, 3, ...
+# 
+# Produces a thunk `(Null -> Int)` that starts at 1.
+# Args: _: Null (ignored)
+# Returns: (Null -> Int)
+let naturals = fun(_: Null) -> Null -> Int do
+	let i = 1
+	fun(_: Null) -> Int do
+		let v = i
+		i = i + 1
+		v
+	end
+end
+
+# Integer range iterator (stop exclusive; infinite if stop is null).
+# 
+# Returns a thunk that yields start, start+1, ... until `stop-1`, or forever if `stop` is null.
+# Args: start: Int, stop: Int?
+# Returns: (Null -> Int?)
+let range = fun(start: Int, stop: Int?) -> Null -> Int? do
+	let i = start
+	fun(_: Null) -> Int? do
+		if stop == null then
+			let v = i
+			i = i + 1
+			v
+		elif i >= stop then
+			null
+		else
+			let v = i
+			i = i + 1
+			v
+		end
+	end
+end
+
+# Turn arrays or maps into (Null -> Any?) iterators; pass iterators through unchanged.
+# 
+# - [Any]      → yields elements
+# - {}         → yields [key, value] pairs
+# - (Null->?)  → returned as-is
+# Else: hard error.
+# Args: v: Any
+# Returns: (Null -> Any?)
+let iter = fun(v) -> Null -> Any? do
+	if isType(v, type [Any]) then
+		let xs = v
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(xs) then
+				let y = xs[i]
+				i = i + 1
+				y
+			else
+				null
+			end
+		end
+	elif isType(v, type {}) then
+		let kvs = []
+		for [k, val] in v do
+			kvs = kvs + [[k, val]]
+		end
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(kvs) then
+				let p = kvs[i]
+				i = i + 1
+				p
+			else
+				null
+			end
+		end
+	elif isType(v, type Null -> Any?) then
+		v
+	else
+		panic("iter: expected array, map, or iterator")
+	end
+end
+
+# Collect an iterator into an array.
+# 
+# Consumes `it` until it returns null.
+# Args: it: (Null -> Any?)
+# Returns: [Any]
+let list = fun(it: Null -> Any?) -> [Any] do
+	let out = []
+	for _ in naturals0(null) do
+		let x = it(null)
+		if x == null then
 			break
-		}
-		t.To = target
-	}
-	return nil
-}
+		end
+		out = out + [x]
+	end
+	out
+end
 
-////////////////////////////////////////////////////////////////////////////////
-// Layout engine (SysV ABI, Linux x86-64 assumptions for step 2)
-// NOTE: Conservative, correct-by-construction for common cases.
-// Bitfields left for later; emit clear error when present.
-////////////////////////////////////////////////////////////////////////////////
+# Map over an iterator (lazy transform).
+# 
+# Returns a thunk that yields `f(x)` for each `x` in `it`.
+# Args: f: (Any -> Any), it: (Null -> Any?)
+# Returns: (Null -> Any?)
+let map = fun(f: Any -> Any, it: Null -> Any?) -> Null -> Any? do
+	fun(_: Null) -> Any? do
+		let x = it(null)
+		if x == null then
+			null
+		else
+			f(x)
+		end
+	end
+end
 
-func computeAllLayouts(reg *ffiRegistry) error {
-	names := make([]string, 0, len(reg.types))
-	for k := range reg.types {
-		names = append(names, k)
-	}
-	sort.Strings(names)
+# Filter an iterator (lazy predicate).
+# 
+# Returns a thunk that yields only values where `cond(x)` is true.
+# Args: cond: (Any -> Bool), it: (Null -> Any?)
+# Returns: (Null -> Any?)
+let filter = fun(cond: Any -> Bool, it: Null -> Any?) -> Null -> Any? do
+	fun(_: Null) -> Any? do
+		for _ in naturals0(null) do
+			let x = it(null)
+			if x == null then
+				break
+			end
+			if cond(x) then
+				return x
+			end
+		end
+		null
+	end
+end
 
-	state := make(map[string]uint8, len(reg.types)) // 0=unseen,1=visiting,2=done
-	var visit func(string) error
-	visit = func(k string) error {
-		switch state[k] {
-		case 2:
-			return nil
-		case 1:
-			return fmt.Errorf("layout(%s): cyclic aggregate reference", k)
-		}
-		state[k] = 1
-		t := reg.mustGet(k)
-		switch t.Kind {
-		case ffiAlias:
-			if err := visit(t.To); err != nil {
-				return err
-			}
-		case ffiArray:
-			if err := visit(t.Elem); err != nil {
-				return err
-			}
-		case ffiStruct, ffiUnion:
-			for _, f := range t.Fields {
-				ft := reg.mustGet(f.Type)
-				if ft.Kind != ffiPointer && ft.Kind != ffiFuncPtr && ft.Kind != ffiHandle {
-					if err := visit(f.Type); err != nil {
-						return err
-					}
-				}
-			}
-		case ffiEnum:
-			if err := visit(t.EnumBase); err != nil {
-				return err
-			}
-		}
-		if err := computeLayoutOne(reg, t); err != nil {
-			return fmt.Errorf("layout(%s): %w", k, err)
-		}
-		state[k] = 2
-		return nil
-	}
-	for _, k := range names {
-		if err := visit(k); err != nil {
-			return err
-		}
-	}
-	for _, k := range names {
-		t := reg.types[k]
-		if t.Align == 0 && t.Kind != ffiVoid {
-			return fmt.Errorf("layout(%s): unresolved alignment", k)
-		}
-	}
-	return nil
-}
+# Fold an iterator with a binary function.
+# 
+# Reduces `it` by applying `f` left-to-right. Returns null for empty iterator.
+# Args: f: (Any -> Any -> Any), it: (Null -> Any?)
+# Returns: Any?
+let reduce = fun(f: Any -> Any -> Any, it: Null -> Any?) -> Any? do
+	let first = it(null)
+	if first == null then
+		null
+	else
+		let acc = first
+		for _ in naturals0(null) do
+			let x = it(null)
+			if x == null then
+				break
+			end
+			acc = f(acc, x)
+		end
+		acc
+	end
+end
 
-func computeLayoutOne(reg *ffiRegistry, t *ffiType) error {
-	switch t.Kind {
-	case ffiVoid:
-		t.Size, t.Align = 0, 1
-	case ffiInt:
-		t.Align = alignOfIntBits(t.Bits)
-		t.Size = sizeOfIntBits(t.Bits)
-	case ffiFloat:
-		switch t.Bits {
-		case 32:
-			t.Size, t.Align = 4, 4
-		case 64:
-			t.Size, t.Align = 8, 8
-		default:
-			return fmt.Errorf("float bits=%d not supported (only 32/64)", t.Bits)
-		}
-	case ffiPointer, ffiFuncPtr, ffiHandle:
-		// Pointers/funcptrs/handles pass as pointers: 8-byte size/align on x86-64
-		t.Size, t.Align = 8, 8
-	case ffiAlias:
-		tt := reg.mustGet(t.To)
-		t.Size, t.Align = tt.Size, tt.Align
-	case ffiArray:
-		elem := reg.mustGet(t.Elem)
-		if elem.Align == 0 {
-			if err := computeLayoutOne(reg, elem); err != nil {
-				return fmt.Errorf("array element %s: %w", t.Elem, err)
-			}
-		}
-		if elem.Align == 0 {
-			return fmt.Errorf("array element %s unresolved align", t.Elem)
-		}
-		if t.Len < 0 {
-			// VLA/flexible: size unknown until allocated; we expose size=0, align=elem.Align
-			t.Size, t.Align = 0, elem.Align
-		} else {
-			t.Align = elem.Align
-			t.Size = uintptr(t.Len) * elem.Size
-		}
-	case ffiStruct:
-		var off uintptr
-		maxAlign := uintptr(1)
-		offsets := make([]uintptr, len(t.Fields))
-		for i, f := range t.Fields {
-			if f.Bits != 0 {
-				return fmt.Errorf("bitfields not supported yet")
-			}
-			ft := reg.mustGet(f.Type)
-			if ft.Align == 0 {
-				if err := computeLayoutOne(reg, ft); err != nil {
-					return fmt.Errorf("field %s: %w", f.Name, err)
-				}
-			}
-			if ft.Align == 0 {
-				return fmt.Errorf("field %s unresolved align", f.Name)
-			}
-			a := ft.Align
-			off = alignUp(off, a)
-			offsets[i] = off
-			off += ft.Size
-			if a > maxAlign {
-				maxAlign = a
-			}
-		}
-		t.Align = maxAlign
-		t.Size = alignUp(off, maxAlign)
-		t.Offsets = offsets
-	case ffiUnion:
-		var maxS, maxA uintptr
-		for _, f := range t.Fields {
-			ft := reg.mustGet(f.Type)
-			if ft.Align == 0 {
-				if err := computeLayoutOne(reg, ft); err != nil {
-					return fmt.Errorf("union field %s: %w", f.Name, err)
-				}
-			}
+# # -----------------------------
+# # Arrays
+# # -----------------------------
 
-			if ft.Size > maxS {
-				maxS = ft.Size
-			}
-			if ft.Align > maxA {
-				maxA = ft.Align
-			}
-		}
-		if maxA == 0 {
-			maxA = 1
-		}
-		t.Align = maxA
-		t.Size = alignUp(maxS, maxA)
-	default:
-		// enum uses base integer layout
-		if t.Kind == ffiEnum {
-			bt := reg.mustGet(t.EnumBase)
-			t.Size, t.Align = bt.Size, bt.Align
-			return nil
-		}
-		return fmt.Errorf("layout for kind %v not implemented", t.Kind)
-	}
-	return nil
-}
+# Slice an array [s, e).
+# 
+# Returns a shallow copy of `xs` from index `s` (inclusive) to `e` (exclusive).
+# Args: xs: [Any], s: Int, e: Int
+# Returns: [Any]
+let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
+	let out = []
+	for i in range(s, e) do
+		out = out + [xs[i]]
+	end
+	out
+end
 
-func sizeOfIntBits(bits int) uintptr {
-	switch bits {
-	case 8:
-		return 1
-	case 16:
-		return 2
-	case 32:
-		return 4
-	case 64:
-		return 8
-	default:
-		return 0
-	}
-}
-func alignOfIntBits(bits int) uintptr {
-	switch bits {
-	case 8:
-		return 1
-	case 16:
-		return 2
-	case 32:
-		return 4
-	case 64:
-		return 8
-	default:
-		return 1
-	}
-}
+# Sort an array in-place using a comparison function.
+# Args: arr:[Any] - array to sort (modified in-place)
+# cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
+# Return: [Any] - the sorted array (same reference)
+let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
+	let swap = fun(i: Int, j: Int) -> Null do
+		let t = arr[i]
+		arr[i] = arr[j]
+		arr[j] = t
+		null
+	end
 
-func alignUp(x, a uintptr) uintptr {
-	m := a - 1
-	return (x + m) &^ m
-}
+	let partition = fun(lo: Int, hi: Int) -> [Int] do
+		let pivot = arr[lo]
+		let lt = lo
+		let gt = hi
+		let i = lo
+		while i <= gt do
+			let c = cmp(arr[i], pivot)
+			if c < 0 then
+				swap(lt, i)
+				lt = lt + 1
+				i = i + 1
+			elif c > 0 then
+				swap(i, gt)
+				gt = gt - 1
+			else
+				i = i + 1
+			end
+		end
+		[lt, gt]
+	end
 
-// abiSlotSize returns the ABI slot size for a return/arg buffer (min 8 bytes).
-func abiSlotSize(t *ffiType) uintptr {
-	if t.Size < 8 {
-		return 8
-	}
-	return t.Size
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Binding helpers used by runtime glue (builtin_ffi.go)
-////////////////////////////////////////////////////////////////////////////////
-
-// NOTE: The actual registration of the builtin (`registerFFIBuiltins`) lives in
-// builtin_ffi.go. The helpers below are kept here so both engine and glue share
-// the same small utilities.
-
-func ffiAsMap(v Value) (*MapObject, bool) {
-	if v.Tag != VTMap {
-		return nil, false
-	}
-	return v.Data.(*MapObject), true
-}
-func ffiGetStr(m *MapObject, key, def string) string {
-	if v, ok := m.Entries[key]; ok && v.Tag == VTStr {
-		return v.Data.(string)
-	}
-	return def
-}
-func ffiGetReqStr(m *MapObject, key string) string {
-	if v, ok := m.Entries[key]; ok && v.Tag == VTStr {
-		return v.Data.(string)
-	}
-	fail("ffi: missing field " + key + " (string)")
-	return ""
-}
-func ffiGetInt(m *MapObject, key string, def int64) int64 {
-	if v, ok := m.Entries[key]; ok && v.Tag == VTInt {
-		return v.Data.(int64)
-	}
-	return def
-}
-func ffiGetBool(m *MapObject, key string, def bool) bool {
-	if v, ok := m.Entries[key]; ok && v.Tag == VTBool {
-		return v.Data.(bool)
-	}
-	return def
-}
-
-func canonicalPtrTagKey(reg *ffiRegistry, t *ffiType) string {
-	// Handles/explicitly-tagged pointers: honor verbatim.
-	if t.Kind == ffiHandle && t.Tag != "" {
-		return t.Tag
-	}
-	if t.Kind == ffiPointer && t.Tag != "" {
-		return t.Tag
-	}
-	// Prefer stable registry key if present.
-	if t.Key != "" {
-		if t.Kind == ffiPointer {
-			return t.To
-		}
-		return t.Key
-	}
-	if t.Kind == ffiPointer {
-		return t.To
-	}
-	if t.Name != "" {
-		return t.Name
-	}
-	return "(anon)"
-}
-
-// typeKey returns the registry key for t if known, otherwise t.Name (best-effort).
-func typeKey(reg *ffiRegistry, t *ffiType) string {
-	if t.Key != "" {
-		return t.Key
-	}
-	if t.Name != "" {
-		return t.Name
-	}
-	return "(anon)"
-}
-
-func buildParamSpecs(_ *ffiModule, f *ffiFunction) []ParamSpec {
-	ps := make([]ParamSpec, 0, len(f.Params))
-	// We can’t express C types in MindScript Type S-exprs; for now declare Any.
-	for i := range f.Params {
-		ps = append(ps, ParamSpec{Name: fmt.Sprintf("p%d", i), Type: S{"id", "Any"}})
-	}
-	if f.Variadic {
-		// One extra MindScript parameter carrying the varargs bundle (must be an array).
-		ps = append(ps, ParamSpec{Name: fmt.Sprintf("p%d", len(f.Params)), Type: S{"id", "Any"}})
-	}
-	return ps
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Marshalling helpers
-////////////////////////////////////////////////////////////////////////////////
-
-type cleanupFn func()
-
-func expectPtr(v Value) unsafe.Pointer {
-	if v.Tag != VTHandle {
-		fail("expected pointer handle")
-	}
-	h := v.Data.(*Handle)
-	if h == nil {
-		fail("bad handle")
-	}
-	p, ok := h.Data.(unsafe.Pointer)
-	if !ok {
-		fail("bad pointer payload")
-	}
-	return p
-}
-
-func isCharPtr(reg *ffiRegistry, t *ffiType) bool {
-	if t.Kind != ffiPointer && t.Kind != ffiHandle {
-		return false
-	}
-	pt := reg.mustGet(t.To)
-	return pt.Kind == ffiInt && pt.Bits == 8
-}
-
-// Pointer/handle to aggregate?
-func isPtrToAggregate(reg *ffiRegistry, t *ffiType) (*ffiType, bool) {
-	if t.Kind != ffiPointer && t.Kind != ffiHandle {
-		return nil, false
-	}
-	to := reg.mustGet(t.To)
-	switch to.Kind {
-	case ffiStruct, ffiUnion, ffiArray:
-		return to, true
-	}
-	return nil, false
-}
-
-// Range & numeric conversions
-
-func mustIntRange(v Value, t *ffiType) int64 {
-	switch v.Tag {
-	case VTBool:
-		if v.Data.(bool) {
-			return 1
-		}
-		return 0
-	case VTInt:
-		x := v.Data.(int64)
-		// early signedness check
-		if !t.Signed && x < 0 {
-			fail("negative to unsigned")
-		}
-		min, max := intRange(t)
-		if x < min || x > max {
-			fail("integer out of range")
-		}
-		return x
-	case VTNum:
-		f := v.Data.(float64)
-		if f != float64(int64(f)) {
-			fail("non-integral float to int")
-		}
-		return mustIntRange(Int(int64(f)), t)
-	default:
-		fail("expected integer-compatible")
-	}
-	return 0
-}
-
-func intRange(t *ffiType) (int64, int64) {
-	switch t.Bits {
-	case 8:
-		if t.Signed {
-			return -128, 127
-		} else {
-			return 0, 255
-		}
-	case 16:
-		if t.Signed {
-			return -32768, 32767
-		} else {
-			return 0, 65535
-		}
-	case 32:
-		if t.Signed {
-			return -2147483648, 2147483647
-		} else {
-			return 0, 4294967295
-		}
-	case 64:
-		if t.Signed {
-			return -9223372036854775808, 9223372036854775807
-		} else {
-			return 0, 9223372036854775807
-		}
-	}
-	return 0, 0
-}
-func mustFloat(v Value) float64 {
-	switch v.Tag {
-	case VTNum:
-		return v.Data.(float64)
-	case VTInt:
-		return float64(v.Data.(int64))
-	case VTBool:
-		if v.Data.(bool) {
-			return 1
-		}
-		return 0
-	default:
-		fail("expected number")
-	}
-	return 0
-}
-
-// Single-point write/read used by calls and variables
-func writeValue(reg *ffiRegistry, t *ffiType, dst unsafe.Pointer, v Value) {
-	switch t.Kind {
-	case ffiInt:
-		x := mustIntRange(v, t)
-		switch t.Bits {
-		case 8:
-			*(*C.schar)(dst) = C.schar(x)
-		case 16:
-			*(*C.short)(dst) = C.short(x)
-		case 32:
-			*(*C.int)(dst) = C.int(x)
-		case 64:
-			*(*C.longlong)(dst) = C.longlong(x)
-		}
-	case ffiFloat:
-		switch t.Bits {
-		case 32:
-			*(*C.float)(dst) = C.float(mustFloat(v))
-		case 64:
-			*(*C.double)(dst) = C.double(mustFloat(v))
-		}
-	case ffiEnum:
-		base := reg.mustGet(t.EnumBase)
-		writeValue(reg, base, dst, v)
-	case ffiPointer, ffiHandle, ffiFuncPtr:
-		if v.Tag == VTNull {
-			*(*unsafe.Pointer)(dst) = nil
+	let qsort = fun(lo: Int, hi: Int) -> Null do
+		if lo >= hi then
 			return
-		}
-		*(*unsafe.Pointer)(dst) = expectPtr(v)
-	default:
-		fail("unsupported type (by-value aggregate)")
+		end
+		let [lt, gt] = partition(lo, hi)
+		qsort(lo, lt - 1)
+		qsort(gt + 1, hi)
+		null
+	end
+
+	qsort(0, len(arr) - 1)
+	arr
+end
+
+# # -----------------------------
+# # Objects (maps)
+# # -----------------------------
+
+# Iterator over keys of an object.
+# 
+# Args: obj: {}
+# Returns: (Null -> Str?)
+let keys = fun(obj: {}) -> Null -> Str? do
+	let it = iter(obj) # yields [k, v]
+
+	fun(_: Null) -> Str? do
+		let pair = it(null)
+		if pair == null then
+			null
+		else
+			pair[0]
+		end
+	end
+end
+
+# Iterator over values of an object.
+# 
+# Args: obj: {}
+# Returns: (Null -> Any?)
+let values = fun(obj: {}) -> Null -> Any? do
+	let it = iter(obj)
+	fun(_: Null) -> Any? do
+		let pair = it(null)
+		if pair == null then
+			null
+		else
+			pair[1]
+		end
+	end
+end
+
+# Directory listing of visible fields/functions.
+# 
+# For maps: returns keys not starting with "_".
+# For modules: returns exported names (not starting with "_"), or [] if unavailable.
+# If a value has a PRE note, the first line is attached as an annotation to the key.
+# Args: x: {}
+# Returns: [Str]
+let dir = fun(x: {}) -> [Str] do
+	let out = []
+	for [k, v] in x do
+		if not (substr(k, 0, 1) == "_") then
+			let ann = noteGet(v)
+			if ann != null then
+				ann = split(ann, "\n")[0]
+				k = noteSet(ann, k)
+			end
+			out = out + [k]
+		end
+	end
+	out
+end
+
+# # -----------------------------
+# # Importing / modules
+# # -----------------------------
+
+# Create an importer from a code string.
+# 
+# Returns a function that imports the code under a given module name.
+# Args: code: Str
+# Returns: (Str -> {})
+let codeImport = fun(code: Str) -> Str -> {} do
+	fun(name: Str) -> {} do
+		importCode(name, code)
+	end
+end
+
+# Import a module from a URL.
+# 
+# Returns the module object, or annotated null on failure.
+# Args: url: Str
+# Returns: {}?
+let importUrl = fun(url: Str) -> {}? do
+	let r = try(fun() do
+		import(url)
+	end)
+	if r.ok then
+		r.value
+	else
+		error("import failed: " + str(r.error))
+	end
+end
+
+# # -----------------------------
+# # Misc
+# # -----------------------------
+
+# Stable-ish integer id for a value’s content.
+# 
+# Hashes the UTF-8 bytes of `str(value)` via sha256, then folds over the hex string
+# with a DJB2-like accumulator for a compact Int.
+# Args: value: Any
+# Returns: Int
+let uid = fun(value) -> Int do
+	let hx = hexEncode(sha256(formatValue(value)))
+	let h = 5381
+	let n = len(hx)
+	let i = 0
+
+	let hexVal = fun(c: Str) -> Int do
+		if c == "0" then
+			0
+		elif c == "1" then
+			1
+		elif c == "2" then
+			2
+		elif c == "3" then
+			3
+		elif c == "4" then
+			4
+		elif c == "5" then
+			5
+		elif c == "6" then
+			6
+		elif c == "7" then
+			7
+		elif c == "8" then
+			8
+		elif c == "9" then
+			9
+		elif c == "a" or c == "A" then
+			10
+		elif c == "b" or c == "B" then
+			11
+		elif c == "c" or c == "C" then
+			12
+		elif c == "d" or c == "D" then
+			13
+		elif c == "e" or c == "E" then
+			14
+		elif c == "f" or c == "F" then
+			15
+		else
+			0
+		end
+	end
+
+	while i < n do
+		let nib = substr(hx, i, i + 1)
+		h = h * 33 + hexVal(nib)
+		i = i + 1
+	end
+	h
+end
+
+# Mute (sink) a value.
+# 
+# Accepts any value and returns null.
+# Args: _: Any
+# Returns: Null
+let mute = fun(_) -> Null do
+	null
+end
+
+# # -----------------------------
+# # Oracle hook (prelude-owned, minimal)
+# # -----------------------------
+
+# Global oracle execution hook.
+# 
+# Backends install their executor here via `oracleInstall`.
+# Until installed, oracle calls should return an annotated null via this hook.
+# Once installed, this function is supposed to return a JSON string containing
+# a value `x` boxed as `{output: x}`.
+# Args: prompt: Str
+# Returns: Str?
+let __oracle_execute = fun(prompt: Str) -> Str? do
+	error("oracle backend not configured")
+end
+
+# Internal flag for diagnostics.
+# 
+# Tracks whether a backend was installed via `oracleInstall`.
+# Args: (none)
+# Returns: (stateful)
+let _oracleInstalled = false
+
+# Install a new global oracle executor.
+# 
+# Rebinds `__oracle_execute` to the provided function.
+# Args: exec: (Str -> Str?)
+# Returns: Null
+let oracleInstall = fun(exec: Str -> Str?) -> Bool do
+	__oracle_execute = exec
+	_oracleInstalled = true
+	true
+end
+
+# Show oracle installation status.
+# 
+# Returns a short string indicating whether a backend is installed.
+# Args: _: Null (ignored)
+# Returns: Str
+let oracleStatus = fun(_: Null) -> Str do
+	if _oracleInstalled then
+		"oracle: installed"
+	else
+		"oracle: not installed"
+	end
+end
+
+# Quick oracle health check (real call, tiny).
+# Success: { ok:true, ms }; failure/not installed: annotated null.
+let oracleHealth = fun(_: Null) -> {}? do
+	if not _oracleInstalled then
+		return error("oracle not installed")
+	end
+
+	let ping = oracle(msg: Str) -> Str
+	let t0 = nowMillis()
+	let out = ping("ping")
+	let dt = nowMillis() - t0
+	if out == null then
+		return out
+	end
+	if out == "pong" then
+		return {ok: true, ms: dt}
+	end
+
+	let j = jsonParse(out)
+	if j != null and mapHas(j, "output") and j.output == "pong" then
+		return {ok: true, ms: dt}
+	end
+
+	error("pong mismatch")
+end
+
+# ---- Prompt tap (diagnostics) ----
+
+# Most recent oracle prompt captured for diagnostics.
+# Type: Str?
+let _oracleLastPrompt = null
+
+# Rolling log of oracle prompts and outputs captured for diagnostics.
+# Type: [[Str]]
+let _oracleLog = []
+
+# Install an oracle executor that records each prompt before forwarding.
+# Args: exec: (Str -> Str?)  # underlying executor
+# Return: Bool               # true on install
+let oracleInstallWithTap = fun(exec: Str -> Str?) -> Bool do
+	oracleInstall(fun(p: Str) -> Str? do
+		_oracleLastPrompt = p
+		let out = exec(p)
+		push(_oracleLog, [p, out])
+		out
+	end)
+	true
+end
+
+# Return the most recently recorded oracle prompt (if any).
+# Args: _: Null (ignored)
+# Return: Str?
+let oracleLastPrompt = fun(_: Null) -> Str? do
+	_oracleLastPrompt
+end
+
+# Return the full recorded oracle prompt/output log.
+# Args: _: Null (ignored)
+# Return: [[Str]]
+let oracleLog = fun(_: Null) -> [[Str]] do
+	_oracleLog
+end
+
+# # -----------------------------
+# # LLM backend bootstrap (installed in prelude)
+# # -----------------------------
+
+# Load the llm module, install its executor, and select a default backend/model.
+
+let llm = import("llm") # The LLM module.
+oracleInstall(llm.exec)
+llm.useBackend("openai-responses")
+llm.useModel("gpt-4.1-mini")
+=== END FILE: ./lib/std.ms ===
+
+=== BEGIN FILE: ./lib/std_test.ms ===
+
+let T = import("testing")
+
+# -----------------------------
+# Errors & Console I/O
+# -----------------------------
+
+T.test("std/error/annotated-null", fun(_: Null) do
+	let e = error("boom")
+	T.assertEq(e, null)
+	T.assertEq(noteGet(e), "boom")
+end)
+
+T.test("std/assert/success", fun(_: Null) do
+	T.assertEq(assert(true), true)
+end)
+
+T.test("std/assert/failure-throws", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		assert(false)
+	end, "assertion failed")
+end)
+
+T.test("std/print/returns-value", fun(_: Null) do
+	T.assertEq(print(123), 123)
+end)
+
+T.test("std/println/returns-value", fun(_: Null) do
+	T.assertEq(println("x"), "x")
+end)
+
+# -----------------------------
+# Iterators
+# -----------------------------
+
+T.test("std/naturals0/three-steps", fun(_: Null) do
+	let it = naturals0(null)
+	T.assertEq(it(null), 0)
+	T.assertEq(it(null), 1)
+	T.assertEq(it(null), 2)
+end)
+
+T.test("std/naturals/three-steps", fun(_: Null) do
+	let it = naturals(null)
+	T.assertEq(it(null), 1)
+	T.assertEq(it(null), 2)
+	T.assertEq(it(null), 3)
+end)
+
+T.test("std/range/bounded", fun(_: Null) do
+	let it = range(3, 6)
+	T.assertEq(it(null), 3)
+	T.assertEq(it(null), 4)
+	T.assertEq(it(null), 5)
+	T.assertEq(it(null), null)
+end)
+
+T.test("std/range/unbounded-head", fun(_: Null) do
+	let it = range(7, null)
+	T.assertEq(it(null), 7)
+	T.assertEq(it(null), 8)
+	T.assertEq(it(null), 9)
+end)
+
+T.test("std/iter/array", fun(_: Null) do
+	let it = iter([10, 20])
+	T.assertEq(it(null), 10)
+	T.assertEq(it(null), 20)
+	T.assertEq(it(null), null)
+end)
+
+T.test("std/iter/map", fun(_: Null) do
+	let it = iter({a: 1, b: 2})
+	let p1 = it(null)
+	let p2 = it(null)
+	let p3 = it(null)
+	T.assertType(p1, type [Any])
+	T.assertType(p2, type [Any])
+	T.assertEq(p3, null)
+	let k1 = if p1 == null then
+		""
+	else
+		p1[0]
+	end
+	let k2 = if p2 == null then
+		""
+	else
+		p2[0]
+	end
+	T.assert(k1 == "a" or k2 == "a", null)
+	T.assert(k1 == "b" or k2 == "b", null)
+end)
+
+T.test("std/iter/passthrough-iterator", fun(_: Null) do
+	let base = naturals0(null) # (Null->Int) should subtype (Null->Any?)
+
+	let it = iter(base)
+	T.assertEq(it(null), 0)
+	T.assertEq(it(null), 1)
+end)
+
+T.test("std/list/collect", fun(_: Null) do
+	let it = range(1, 4) # 1,2,3
+
+	T.assertEq(list(it), [1, 2, 3])
+end)
+
+T.test("std/map/lazy", fun(_: Null) do
+	let it = map(fun(x) do
+		int(x) + 1
+	end, range(0, 3))
+	T.assertEq(it(null), 1)
+	T.assertEq(it(null), 2)
+	T.assertEq(it(null), 3)
+	T.assertEq(it(null), null)
+end)
+
+T.test("std/filter/lazy", fun(_: Null) do
+	let it = filter(fun(x) -> Bool do
+		int(x) % 2 == 0
+	end, range(0, 5))
+	T.assertEq(it(null), 0)
+	T.assertEq(it(null), 2)
+	T.assertEq(it(null), 4)
+	T.assertEq(it(null), null)
+end)
+
+T.test("std/reduce/non-empty", fun(_: Null) do
+	# 1+2+3
+	let sum = reduce(fun(a, b) do
+		int(a) + int(b)
+	end, range(1, 4))
+
+	T.assertEq(sum, 6)
+end)
+
+T.test("std/reduce/empty", fun(_: Null) do
+	let empty = reduce(fun(a, b) do
+		a
+	end, range(0, 0))
+	T.assertEq(empty, null)
+end)
+
+# -----------------------------
+# Arrays
+# -----------------------------
+
+T.test("std/slice/basic", fun(_: Null) do
+	let xs = [0, 1, 2, 3, 4]
+	T.assertEq(slice(xs, 1, 4), [1, 2, 3])
+end)
+
+T.test("std/push/appends", fun(_: Null) do
+	T.assertEq(push([1, 2], 3), [1, 2, 3])
+end)
+
+T.test("std/pop/last", fun(_: Null) do
+	T.assertEq(pop([9, 8]), 8)
+end)
+
+T.test("std/pop/empty-panics", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		pop([])
+	end, null)
+end)
+
+T.test("std/shift/first", fun(_: Null) do
+	T.assertEq(shift([1, 2, 3]), 1)
+end)
+
+T.test("std/shift/empty-panics", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		shift([])
+	end, null)
+end)
+
+T.test("std/unshift/prepend", fun(_: Null) do
+	T.assertEq(unshift([2, 3], 1), [1, 2, 3])
+	T.assertEq(unshift([], 5), [5])
+end)
+
+# -----------------------------
+# Objects (maps)
+# -----------------------------
+
+T.test("std/keys/iterator", fun(_: Null) do
+	let obj = {a: 1, b: 2}
+	let it = keys(obj)
+	let k1 = it(null)
+	let k2 = it(null)
+	let k3 = it(null)
+	T.assertType(k1, type Str?)
+	T.assertType(k2, type Str?)
+	T.assertEq(k3, null)
+	T.assert(k1 == "a" or k2 == "a", null)
+	T.assert(k1 == "b" or k2 == "b", null)
+end)
+
+T.test("std/values/iterator", fun(_: Null) do
+	let obj = {a: 7, b: 9}
+	let it = values(obj)
+	let v1 = it(null)
+	let v2 = it(null)
+	let v3 = it(null)
+	T.assert(v1 == 7 or v2 == 7, null)
+	T.assert(v1 == 9 or v2 == 9, null)
+	T.assertEq(v3, null)
+end)
+
+T.test("std/dir/filters-and-annotates", fun(_: Null) do
+	let obj = {
+		a: 1, # alpha
+		_hidden: 2,
+		b: 3 # bravo
 	}
-}
-
-func readValue(reg *ffiRegistry, t *ffiType, src unsafe.Pointer) Value {
-	switch t.Kind {
-	case ffiVoid:
-		return Null
-	case ffiInt:
-		switch t.Bits {
-		case 8:
-			return Int(int64(*(*C.schar)(src)))
-		case 16:
-			return Int(int64(*(*C.short)(src)))
-		case 32:
-			return Int(int64(*(*C.int)(src)))
-		case 64:
-			return Int(int64(*(*C.longlong)(src)))
-		}
-	case ffiFloat:
-		switch t.Bits {
-		case 32:
-			return Num(float64(*(*C.float)(src)))
-		case 64:
-			return Num(float64(*(*C.double)(src)))
-		}
-	case ffiEnum:
-		base := reg.mustGet(t.EnumBase)
-		return readValue(reg, base, src)
-	case ffiPointer, ffiHandle, ffiFuncPtr:
-		return HandleVal(canonicalPtrTagKey(reg, t), *(*unsafe.Pointer)(src))
-	}
-	fail("unsupported type (by-value aggregate)")
-	return Null
-}
-
-// makeFuncptrArg resolves a funcptr parameter to an executable pointer.
-// Supports: null, raw pointer handles, or MindScript callables (via libffi closure).
-func makeFuncptrArg(ip *Interpreter, mod *ffiModule, pt *ffiType, val Value) (fnptr unsafe.Pointer, cleanup cleanupFn) {
-	switch val.Tag {
-	case VTNull:
-		return nil, nil
-	case VTHandle:
-		return expectPtr(val), nil
-	default:
-		// MindScript callable → libffi closure
-		if err := ensureFuncptrCIF(mod.reg, pt); err != nil {
-			fail("ffi: callback prep: " + err.Error())
-		}
-		var exec unsafe.Pointer
-		cl := C.ms_closure_alloc((*unsafe.Pointer)(unsafe.Pointer(&exec)))
-		if cl == nil {
-			fail("ffi: closure_alloc OOT")
-		}
-		ctxObj := &cbContext{ip: ip, fn: val, typ: pt, reg: mod.reg}
-		h := cgo.NewHandle(ctxObj)
-		if st := C.ms_prep_closure_with_thunk(cl, pt.cbCIF, unsafe.Pointer(uintptr(h)), exec); st != C.FFI_OK {
-			C.ms_closure_free(cl)
-			h.Delete()
-			fail(fmt.Sprintf("ffi: callback prep failed: %d", int(st)))
-		}
-		// retain in module for lifetime management
-		mod.cbs = append(mod.cbs, cbRecord{closure: cl, handle: h})
-		return exec, nil
-	}
-}
-
-//export msCallbackInvoke
-func msCallbackInvoke(_cif *C.ffi_cif, ret unsafe.Pointer, args *unsafe.Pointer, user C.uintptr_t) {
-	// Rebuild handle → context
-	h := cgo.Handle(user)
-	v := h.Value()
-	ctx, ok := v.(*cbContext)
-	if !ok || ctx == nil || ctx.typ == nil {
-		return
-	}
-	ft := ctx.typ
-	n := len(ft.Params)
-
-	// args is void** → slice of unsafe.Pointer (each entry is a pointer to the arg storage)
-	argv := (*[1<<30 - 1]unsafe.Pointer)(unsafe.Pointer(args))[:n:n]
-
-	in := make([]Value, n)
-	for i := 0; i < n; i++ {
-		pt := ctx.reg.mustGet(ft.Params[i])
-		in[i] = readValue(ctx.reg, pt, argv[i]) // note: no extra deref now
-	}
-	res := ctx.ip.Apply(ctx.fn, in)
-
-	// Handle void return
-	rt := ctx.reg.mustGet(ft.Ret)
-	if rt.Kind != ffiVoid {
-		writeValue(ctx.reg, rt, ret, res)
-	}
-}
-
-// Free per-type cached ffi_type allocations (called from module close).
-func freeCachedCFFITypes(reg *ffiRegistry) {
-	for _, t := range reg.types {
-		if t.cffi != nil {
-			// elements (if any) are owned by cffi and freed by helper
-			C.ms_free_ffi_type_and_elems(t.cffi)
-			t.cffi = nil
-		}
-	}
-}
-
-// freeModuleFFIResources releases callbacks and cached aggregate ffi types.
-func freeModuleFFIResources(mod *ffiModule) {
-	// free callback closures and handles
-	for _, cb := range mod.cbs {
-		if cb.closure != nil {
-			C.ms_closure_free(cb.closure)
-		}
-		cb.handle.Delete()
-	}
-	mod.cbs = nil
-	// free cached aggregate ffi_type allocations
-	freeCachedCFFITypes(mod.reg)
-}
-=== END FILE: ./mindscript/ffi.go ===
-
-=== BEGIN FILE: ./mindscript/builtin_ffi.go ===
-//go:build !tinygo && (linux || darwin) && cgo
-
-package mindscript
-
-import (
-	"fmt"
-	"runtime"
-	"sort"
-	"strings"
-	"sync"
-	"unsafe"
-)
-
-// callFFI centralizes return-buffer sizing, ffi_call, and result unmarshalling.
-// keep... are values/slices that must remain alive across the ccall boundary.
-func callFFI(mod *ffiModule, fn *ffiFunction, cf cif, av unsafe.Pointer, keep ...interface{}) Value {
-	rt := mod.reg.mustGet(fn.Ret)
-	slot := int(abiSlotSize(rt))
-	if slot <= 8 {
-		var r8 [8]byte
-		cFFICall(cf, fn.SymbolPtr, unsafe.Pointer(&r8[0]), av)
-		for _, k := range keep {
-			runtime.KeepAlive(k)
-		}
-		return unmarshalRet(mod, fn, unsafe.Pointer(&r8[0]))
-	}
-	rb, put := getBytes(slot)
-	defer put()
-	cFFICall(cf, fn.SymbolPtr, unsafe.Pointer(&rb[0]), av)
-	for _, k := range keep {
-		runtime.KeepAlive(k)
-	}
-	return unmarshalRet(mod, fn, unsafe.Pointer(&rb[0]))
-}
-
-// tempCStringFromStr builds a temporary NUL-terminated copy of s on the C heap.
-// NOTE: Use ONLY for C APIs that require char*/unsigned char* parameters.
-func tempCStringFromStr(s string) (unsafe.Pointer, func()) {
-	n := len(s) + 1
-	p := cMalloc(uintptr(n))
-	if p == nil {
-		fail("ffi: OOM")
-	}
-	buf, put := getBytes(n)
-	copy(buf, s)
-	buf[len(s)] = 0
-	cMemcpy(p, unsafe.Pointer(&buf[0]), uintptr(n))
-	put()
-	return p, func() { cFree(p) }
-}
-
-// ---------- pools & tiny helpers (hot path) ----------
-
-var (
-	argvPool = sync.Pool{
-		New: func() any {
-			b := make([]uintptr, 0, 16) // stores raw addresses (no Go pointers)
-			return &b
-		},
-	}
-	argsPool = sync.Pool{
-		New: func() any {
-			b := make([]uint64, 0, 16) // 8-byte ABI slots
-			return &b
-		},
-	}
-	bytePool = sync.Pool{
-		New: func() any {
-			b := make([]byte, 0, 1024) // small scratch buffers (ret >8, vararg agg copies, etc.)
-			return &b
-		},
-	}
-)
-
-// getArgv returns a []uintptr of length n with capacity >= n and a put() cleanup.
-func getArgv(n int) ([]uintptr, func()) {
-	if n <= 0 {
-		return nil, func() {}
-	}
-	p := argvPool.Get().(*[]uintptr)
-	if cap(*p) < n {
-		*p = make([]uintptr, n)
-	}
-	out := (*p)[:n]
-	// zero out to avoid holding stale pointers
-	for i := range out {
-		out[i] = 0
-	}
-	return out, func() { argvPool.Put(p) }
-}
-
-// getArgsSlots returns a []uint64 of length n (ABI 8-byte slots) and put().
-func getArgsSlots(n int) ([]uint64, func()) {
-	if n <= 0 {
-		return nil, func() {}
-	}
-	p := argsPool.Get().(*[]uint64)
-	if cap(*p) < n {
-		*p = make([]uint64, n)
-	}
-	out := (*p)[:n]
-	// zeroing for safety
-	for i := range out {
-		out[i] = 0
-	}
-	return out, func() { argsPool.Put(p) }
-}
-
-// getBytes returns a []byte of length n and a put(); pooled if n<=1024, fresh otherwise.
-func getBytes(n int) ([]byte, func()) {
-	if n <= 0 {
-		return nil, func() {}
-	}
-	if n <= 1024 {
-		p := bytePool.Get().(*[]byte)
-		if cap(*p) < n {
-			*p = make([]byte, n)
-		}
-		out := (*p)[:n]
-		for i := range out {
-			out[i] = 0
-		}
-		return out, func() { bytePool.Put(p) }
-	}
-	b := make([]byte, n)
-	return b, func() {}
-}
-
-// writeScalarIntoSlot writes a scalar/pointer value into an 8-byte ABI slot.
-func writeScalarIntoSlot(reg *ffiRegistry, t *ffiType, slot *uint64, v Value) {
-	switch t.Kind {
-	case ffiInt:
-		x := mustIntRange(v, t)
-		switch t.Bits {
-		case 8:
-			*slot = (*slot &^ 0xFF) | (uint64(uint8(x)))
-		case 16:
-			*slot = (*slot &^ 0xFFFF) | (uint64(uint16(x)))
-		case 32:
-			*slot = (*slot &^ 0xFFFFFFFF) | (uint64(uint32(x)))
-		case 64:
-			*slot = uint64(uint64(x))
-		}
-	case ffiFloat:
-		switch t.Bits {
-		case 32:
-			f := float32(mustFloat(v))
-			u := *(*uint32)(unsafe.Pointer(&f))
-			*slot = (*slot &^ 0xFFFFFFFF) | uint64(u)
-		case 64:
-			f := float64(mustFloat(v))
-			u := *(*uint64)(unsafe.Pointer(&f))
-			*slot = u
-		}
-	case ffiEnum:
-		base := reg.mustGet(t.EnumBase)
-		writeScalarIntoSlot(reg, base, slot, v)
-	case ffiPointer, ffiHandle, ffiFuncPtr:
-		if v.Tag == VTNull {
-			*slot = 0
-			return
-		}
-		p := expectPtr(v)
-		*slot = uint64(uintptr(p))
-	default:
-		fail("unsupported scalar slot type")
-	}
-}
-
-// Convert the return buffer into a Value, honoring ret_as_str for char*/uchar*.
-func unmarshalRet(mod *ffiModule, fn *ffiFunction, rbuf unsafe.Pointer) Value {
-	rt := mod.reg.mustGet(fn.Ret)
-	if fn.RetAsStr {
-		p := *(*unsafe.Pointer)(rbuf)
-		if p == nil {
-			return Null
-		}
-		return Str(cGoString(p))
-	}
-	// Aggregates-by-value: always boxed → return a pointer handle to copied storage.
-	switch rt.Kind {
-	case ffiStruct, ffiUnion, ffiArray:
-		p := mustMalloc(rt.Size)
-		cMemcpy(p, rbuf, rt.Size)
-		// Tag handle using the canonical key for this type.
-		return HandleVal(canonicalPtrTagKey(mod.reg, rt), p)
-	default:
-		return readValue(mod.reg, rt, rbuf)
-	}
-}
-
-// registerFFIBuiltins wires the user-facing ffiOpen builtin and builds the
-// returned Module with callables, variables, and the __mem toolbox.
-func registerFFIBuiltins(ip *Interpreter, target *Env) {
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"ffiOpen",
-		[]ParamSpec{{Name: "spec", Type: S{"id", "Any"}}},
-		S{"id", "Any"}, // Module
-		func(_ *Interpreter, ctx CallCtx) Value {
-			specV := ctx.Arg("spec")
-			if specV.Tag != VTMap {
-				fail("ffiOpen expects a map specification")
-			}
-			spec := specV.Data.(*MapObject)
-
-			// ------------- Parse, normalize, layout -----------------------------
-			lib, reg, funDecls, varDecls, err := parseFFISpec(spec)
-			if err != nil {
-				fail(err.Error())
-			}
-
-			// ------------- Pre-validate function signatures --------------------
-			// Validate types (including rejecting flexible arrays in by-value positions)
-			// BEFORE performing any dlsym, so users see type errors rather than symbol errors.
-			for _, f := range funDecls {
-				if _, err := ffiTypeFor(reg, f.Ret); err != nil {
-					fail("ffiOpen: " + err.Error())
-				}
-				for i, p := range f.Params {
-					if _, err := ffiTypeFor(reg, p); err != nil {
-						fail(fmt.Sprintf("ffiOpen: function %s param[%d]: %v", f.Name, i, err))
-					}
-				}
-			}
-
-			// ------------- dlopen ----------------------------------------------
-			h, e := cDlopen(lib)
-			if e != nil {
-				fail("ffiOpen: " + e.Error())
-			}
-
-			mod := &ffiModule{
-				libName: lib,
-				libH:    h,
-				reg:     reg,
-				funcs:   map[string]*ffiFunction{},
-				vars:    map[string]*ffiVariable{},
-				openLibs: []unsafe.Pointer{
-					h,
-				},
-			}
-			//runtime.LockOSThread()
-
-			// ------------- dlsym functions/variables ---------------------------
-			for _, f := range funDecls {
-				libH, err := mod.openLib(f.Lib, lib, h)
-				if err != nil {
-					fail(fmt.Sprintf("ffiOpen: %s", err.Error()))
-				}
-				ptr, err := cDlsymClear(libH, f.Name)
-				if err != nil {
-					fail("ffiOpen: " + err.Error())
-				}
-				f.SymbolPtr = ptr
-				mod.funcs[f.Name] = f
-			}
-			for _, v := range varDecls {
-				libH, err := mod.openLib(v.Lib, lib, h)
-				if err != nil {
-					fail(fmt.Sprintf("ffiOpen: %s", err.Error()))
-				}
-				ptr, err := cDlsymClear(libH, v.Name)
-				if err != nil {
-					fail("ffiOpen: " + err.Error())
-				}
-				v.SymbolPtr = ptr
-				mod.vars[v.Name] = v
-			}
-
-			// ------------- Build the MindScript Module --------------------------
-			modEnv := NewEnv(ip.Core)
-			modMap := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
-
-			// __lib, __handle, __types
-			modMap.Entries["__lib"] = Str(lib)
-			modMap.Keys = append(modMap.Keys, "__lib")
-			modMap.Entries["__handle"] = HandleVal("c.dl", mod.libH)
-			modMap.Keys = append(modMap.Keys, "__handle")
-
-			// Export __types as a map of name -> Handle("c.type", *ffiType)
-			typeMap := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
-			typeNames := make([]string, 0, len(reg.types))
-			for k := range reg.types {
-				typeNames = append(typeNames, k)
-			}
-			sort.Strings(typeNames)
-			for _, k := range typeNames {
-				// Skip internal anonymous helpers from leaking unless referenced by name
-				if strings.HasPrefix(k, "__anon_") || strings.HasPrefix(k, "__anon") || strings.HasPrefix(k, "__") {
-					continue
-				}
-				typeMap.Entries[k] = HandleVal("c.type", reg.types[k])
-				typeMap.Keys = append(typeMap.Keys, k)
-			}
-			modMap.Entries["__types"] = Value{Tag: VTMap, Data: typeMap}
-			modMap.Keys = append(modMap.Keys, "__types")
-
-			// close()
-			ip.RegisterRuntimeBuiltin(
-				modEnv,
-				"close",
-				[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
-				S{"id", "Null"},
-				func(_ *Interpreter, _ CallCtx) Value {
-					//runtime.UnlockOSThread()
-					// close all opened libs once
-					if len(mod.openLibs) == 0 {
-						fail("ffi.close: handle already closed")
-					}
-					var firstErr string
-					// free libffi allocations (cif + typesVec) first
-					for _, f := range mod.funcs {
-						if f.typesVec != nil {
-							cFree(f.typesVec)
-							f.typesVec = nil
-						}
-						if f.cif != nil {
-							cFree(unsafe.Pointer(f.cif))
-							f.cif = nil
-						}
-					}
-					// free cached aggregate ffi_type allocations and callbacks
-					freeModuleFFIResources(mod)
-					for i := len(mod.openLibs) - 1; i >= 0; i-- {
-						ptr := mod.openLibs[i]
-						if ptr == nil {
-							continue
-						}
-						if err := cDlclose(ptr); err != nil && firstErr == "" {
-							firstErr = err.Error()
-						}
-					}
-					mod.openLibs = nil
-					mod.libH = nil
-					if firstErr != "" {
-						fail("ffi.close: dlclose failed: " + firstErr)
-					}
-					return Null
-				},
-			)
-			if fun, err := modEnv.Get("close"); err == nil {
-				modMap.Entries["close"] = fun
-				modMap.Keys = append(modMap.Keys, "close")
-			}
-
-			// -------------------- __mem submodule -------------------------------
-			memEnv := NewEnv(ip.Core)
-			memMap := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
-
-			// Helper: resolve a TypeRef argument of either Str (name) or Handle("c.type") or inline map.
-			resolveTypeArg := func(v Value) *ffiType {
-				switch v.Tag {
-				case VTStr:
-					name := v.Data.(string)
-					t, ok := reg.types[name]
-					if !ok {
-						fail("ffi.__mem: unknown type name: " + name)
-					}
-					return t
-				case VTHandle:
-					h := v.Data.(*Handle)
-					if h == nil || h.Kind != "c.type" {
-						fail("ffi.__mem: expected type (name or c.type handle)")
-					}
-					ft, _ := h.Data.(*ffiType)
-					if ft == nil {
-						fail("ffi.__mem: corrupt type handle")
-					}
-					return ft
-				case VTMap:
-					// accept inline type object
-					key := "__anon__typeof_inline"
-					t, err := parseTypeObject(reg, key, v)
-					if err != nil {
-						fail("ffi.__mem.typeof: " + err.Error())
-					}
-					_ = reg.addType(key, t) // allow overwrite silently
-					// ensure layout is computed for this ad-hoc type (and its children)
-					if err := computeLayoutOne(reg, t); err != nil {
-						fail("ffi.__mem.typeof: " + err.Error())
-					}
-					return t
-				default:
-					fail("ffi.__mem: expected type (name or c.type handle)")
-				}
-				return nil
-			}
-
-			registerMem := func(name string, params []ParamSpec, ret S, body func(CallCtx) Value, doc string) {
-				ip.RegisterRuntimeBuiltin(memEnv, name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
-				if f, err := memEnv.Get(name); err == nil {
-					memMap.Entries[name] = f
-					memMap.Keys = append(memMap.Keys, name)
-				}
-				setBuiltinDoc(memEnv, name, doc)
-			}
-
-			// sizeof/alignof/offsetof/typeof
-			registerMem("sizeof",
-				[]ParamSpec{{Name: "T", Type: S{"id", "Any"}}}, S{"id", "Int"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					return Int(int64(t.Size))
-				},
-				"Return the ABI size (bytes) of a declared FFI type.",
-			)
-			registerMem("alignof",
-				[]ParamSpec{{Name: "T", Type: S{"id", "Any"}}}, S{"id", "Int"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					return Int(int64(t.Align))
-				},
-				"Return the ABI alignment (bytes) of a declared FFI type.",
-			)
-			registerMem("offsetof",
-				[]ParamSpec{{Name: "T", Type: S{"id", "Any"}}, {Name: "field", Type: S{"id", "Str"}}},
-				S{"id", "Int"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					if t.Kind != ffiStruct {
-						fail("offsetof: first arg must be a struct type")
-					}
-					field := ctx.Arg("field").Data.(string)
-					for i, f := range t.Fields {
-						if f.Name == field {
-							return Int(int64(t.Offsets[i]))
-						}
-					}
-					fail("offsetof: unknown field: " + field)
-					return Null
-				},
-				"Return byte offset of a named field within a struct type.",
-			)
-			registerMem("typeof",
-				[]ParamSpec{{Name: "T", Type: S{"id", "Any"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					return HandleVal("c.type", t)
-				},
-				"Normalize a type-ref (name or inline) to a c.type handle.",
-			)
-
-			// Memory helpers (raw)
-			registerMem("malloc",
-				[]ParamSpec{{"n", S{"id", "Int"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					n := ctx.Arg("n").Data.(int64)
-					if n < 0 {
-						fail("malloc: size < 0")
-					}
-					p := cMalloc(uintptr(n))
-					if p == nil {
-						fail("malloc: out of memory")
-					}
-					return HandleVal("void*", p)
-				}, "Allocate n bytes; returns a tagged pointer.")
-			registerMem("free",
-				[]ParamSpec{{"p", S{"id", "Any"}}}, S{"id", "Null"},
-				func(ctx CallCtx) Value {
-					p := expectPtr(ctx.Arg("p"))
-					if !gcRunOnce(p) {
-						cFree(p)
-					}
-					return Null
-				}, "Free a pointer previously allocated.")
-			registerMem("calloc",
-				[]ParamSpec{{"count", S{"id", "Int"}}, {"size", S{"id", "Int"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					c := ctx.Arg("count").Data.(int64)
-					s := ctx.Arg("size").Data.(int64)
-					if c < 0 || s < 0 {
-						fail("calloc: negative")
-					}
-					p := cCalloc(uintptr(c), uintptr(s))
-					if p == nil {
-						fail("calloc: out of memory")
-					}
-					return HandleVal("void*", p)
-				}, "Allocate zero-initialized memory.")
-			registerMem("realloc",
-				[]ParamSpec{{"p", S{"id", "Any"}}, {"n", S{"id", "Int"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					p := expectPtr(ctx.Arg("p"))
-					n := ctx.Arg("n").Data.(int64)
-					if n < 0 {
-						fail("realloc: negative")
-					}
-					q := cRealloc(p, uintptr(n))
-					if q == nil && n != 0 {
-						fail("realloc: out of memory")
-					}
-					// move any registered destructor from old to new
-					if q != nil {
-						gcMove(p, q)
-					} else {
-						gcDetach(p)
-					}
-					return HandleVal("void*", q)
-				}, "Resize memory.")
-
-			// Spec-driven helpers (new/cast/string/copy/fill/errno)
-			registerMem("new",
-				[]ParamSpec{{"T", S{"id", "Any"}}, {"count", S{"id", "Int"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					cnt := ctx.Arg("count").Data.(int64)
-					if cnt <= 0 {
-						cnt = 1
-					}
-					// Tag result as "pointer to T"
-					ptrTag := typeKey(reg, t)
-					if t.Kind == ffiArray && t.Len < 0 {
-						// Flexible array: allocate elem.Size * count (header handling left to caller)
-						elem := reg.mustGet(t.Elem)
-						total := uintptr(cnt) * elem.Size
-						p := cMalloc(total)
-						if p == nil {
-							fail("new: OOM")
-						}
-						return HandleVal(ptrTag, p)
-					}
-					total := uintptr(cnt) * t.Size
-					p := cMalloc(total)
-					if p == nil {
-						fail("new: OOM")
-					}
-					return HandleVal(ptrTag, p)
-				}, "Allocate storage for T (optionally count).")
-			registerMem("cast",
-				[]ParamSpec{{"T", S{"id", "Any"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					p := expectPtr(ctx.Arg("v"))
-					return HandleVal(canonicalPtrTagKey(reg, t), p)
-				}, "Retag a pointer to T (checked cast).")
-			registerMem("string",
-				[]ParamSpec{{"p", S{"id", "Any"}}, {"len", S{"id", "Any"}}}, S{"id", "Str"},
-				func(ctx CallCtx) Value {
-					p := expectPtr(ctx.Arg("p"))
-					lv := ctx.Arg("len")
-					if lv.Tag == VTNull {
-						return Str(cGoString(p))
-					}
-					n := lv.Data.(int64)
-					if n < 0 {
-						fail("string: len < 0")
-					}
-					return Str(cGoStringN(p, int(n)))
-				}, "Read UTF-8 from char* (NUL-terminated or fixed len).")
-			registerMem("copy",
-				[]ParamSpec{{"dst", S{"id", "Any"}}, {"src", S{"id", "Any"}}, {"n", S{"id", "Int"}}}, S{"id", "Null"},
-				func(ctx CallCtx) Value {
-					dst := expectPtr(ctx.Arg("dst"))
-					n := ctx.Arg("n").Data.(int64)
-					if n < 0 {
-						fail("copy: n < 0")
-					}
-					sv := ctx.Arg("src")
-					switch sv.Tag {
-					case VTStr:
-						// Go-managed C-string: avoid C.CString; ensure NUL-terminated buffer during call
-						s := sv.Data.(string)
-						buf, put := getBytes(len(s))
-						defer put()
-						copy(buf, s)
-						// caller promises n bytes; if n > len(s), we still respect n and may copy trailing zeros
-						cMemcpy(dst, unsafe.Pointer(&buf[0]), uintptr(n))
-					default:
-						src := expectPtr(sv)
-						cMemcpy(dst, src, uintptr(n))
-					}
-					return Null
-				}, "memcpy with tag checks.")
-			registerMem("fill",
-				[]ParamSpec{{"dst", S{"id", "Any"}}, {"byte", S{"id", "Int"}}, {"n", S{"id", "Int"}}}, S{"id", "Null"},
-				func(ctx CallCtx) Value {
-					dst := expectPtr(ctx.Arg("dst"))
-					b := ctx.Arg("byte").Data.(int64)
-					n := ctx.Arg("n").Data.(int64)
-					if n < 0 || b < 0 || b > 255 {
-						fail("fill: invalid arguments")
-					}
-					cMemset(dst, byte(b), uintptr(n))
-					return Null
-				}, "memset with tag checks.")
-			registerMem("errno",
-				[]ParamSpec{{"v", S{"id", "Any"}}}, S{"id", "Int"},
-				func(ctx CallCtx) Value {
-					v := ctx.Arg("v")
-					if v.Tag != VTNull {
-						cErrnoSet(int(v.Data.(int64)))
-					}
-					return Int(int64(cErrnoGet()))
-				}, "Get/set thread-local errno.")
-
-			// gc(ptr, finalizer) -> ptr
-			// finalizer: null | "free" | {sym, lib?}
-			registerMem("gc",
-				[]ParamSpec{{"p", S{"id", "Any"}}, {"finalizer", S{"id", "Any"}}}, S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					vp := ctx.Arg("p")
-					if vp.Tag != VTHandle {
-						fail("gc: first argument must be a pointer handle")
-					}
-					h := vp.Data.(*Handle)
-					p := expectPtr(vp)
-
-					fv := ctx.Arg("finalizer")
-					if fv.Tag == VTNull {
-						gcDetach(p)
-						runtime.SetFinalizer(h, nil)
-						return vp
-					}
-
-					e := &gcEntry{}
-					switch fv.Tag {
-					case VTStr:
-						if fv.Data.(string) != "free" {
-							fail(`gc: string finalizer must be "free"`)
-						}
-						e.kind = gcFree
-					case VTMap:
-						m, ok := ffiAsMap(fv)
-						if !ok {
-							fail("gc: invalid finalizer map")
-						}
-						sym := ffiGetReqStr(m, "sym")
-						lib := ffiGetStr(m, "lib", "")
-						if lib == "" {
-							lib = mod.libName
-						}
-						hlib, err := cDlopen(lib)
-						if err != nil {
-							fail(fmt.Sprintf("gc: %s", err.Error()))
-						}
-						fn, err := cDlsymClear(hlib, sym)
-						if err != nil {
-							_ = cDlclose(hlib)
-							fail(fmt.Sprintf("gc: %s", err.Error()))
-						}
-						e.kind, e.fn, e.lib = gcCFunc, fn, hlib
-					default:
-						fail("gc: finalizer must be null, \"free\", or {sym, lib?}")
-					}
-
-					gcInstall(p, e)
-					// Clear any existing finalizer before setting a new one.
-					runtime.SetFinalizer(h, nil)
-					runtime.SetFinalizer(h, func(_ *Handle) {
-						_ = gcRunOnce(p)
-						gcDetach(p)
-					})
-					return vp
-				},
-				"Attach/detach a destructor for a pointer; one-shot per allocation.",
-			)
-
-			// box(T, initMap?) -> PtrHandle
-			// Allocate storage for an aggregate type and optionally initialize fields/elements.
-			registerMem("box",
-				[]ParamSpec{{Name: "T", Type: S{"id", "Any"}}, {Name: "init", Type: S{"id", "Any"}}},
-				S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					if !(t.Kind == ffiStruct || t.Kind == ffiUnion || t.Kind == ffiArray) {
-						fail("box: aggregate type required (struct/union/array)")
-					}
-					if t.Kind == ffiArray && t.Len < 0 {
-						fail("box: flexible arrays require explicit size; use __mem.new with count")
-					}
-					if t.Size == 0 {
-						fail("box: type has zero size")
-					}
-					p := cMalloc(t.Size)
-					if p == nil {
-						fail("box: OOM")
-					}
-					// Zero-initialize
-					cMemset(p, 0, t.Size)
-
-					initv := ctx.Arg("init")
-					switch t.Kind {
-					case ffiStruct:
-						if initv.Tag == VTMap {
-							m := initv.Data.(*MapObject)
-							for i, f := range t.Fields {
-								if v, ok := m.Entries[f.Name]; ok {
-									ft := reg.mustGet(f.Type)
-									dst := unsafe.Pointer(uintptr(p) + t.Offsets[i])
-									writeValue(reg, ft, dst, v)
-								}
-							}
-						} else if initv.Tag != VTNull {
-							fail("box: struct init must be a map or null")
-						}
-					case ffiUnion:
-						if initv.Tag == VTMap {
-							m := initv.Data.(*MapObject)
-							var set bool
-							for _, f := range t.Fields {
-								if v, ok := m.Entries[f.Name]; ok {
-									ft := reg.mustGet(f.Type)
-									writeValue(reg, ft, p, v) // unions start at offset 0
-									set = true
-									break
-								}
-							}
-							if !set && len(m.Keys) > 0 {
-								fail("box: union init must specify exactly one known field")
-							}
-						} else if initv.Tag != VTNull {
-							fail("box: union init must be a map or null")
-						}
-					case ffiArray:
-						if initv.Tag == VTArray {
-							elem := reg.mustGet(t.Elem)
-							avs := initv.Data.(*ArrayObject).Elems
-							n := len(avs)
-							if n > t.Len {
-								n = t.Len
-							}
-							// Only scalar/pointer elements supported for initialization.
-							if elem.Kind == ffiStruct || elem.Kind == ffiUnion || elem.Kind == ffiArray {
-								fail("box: array element initialization for aggregates is not supported")
-							}
-							for i := 0; i < n; i++ {
-								dst := unsafe.Pointer(uintptr(p) + uintptr(i)*elem.Size)
-								writeValue(reg, elem, dst, avs[i])
-							}
-						} else if initv.Tag != VTNull {
-							fail("box: array init must be an array or null")
-						}
-					}
-					return HandleVal(typeKey(reg, t), p)
-				},
-				"Allocate storage for an aggregate T and optionally initialize fields/elements; returns a tagged pointer.",
-			)
-
-			// getf/setf (unchanged functionality; returns handles for aggregate fields)
-			registerMem("getf",
-				[]ParamSpec{
-					{Name: "T", Type: S{"id", "Any"}},
-					{Name: "ptr", Type: S{"id", "Any"}},
-					{Name: "field", Type: S{"id", "Str"}},
-				},
-				S{"id", "Any"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					p := expectPtr(ctx.Arg("ptr"))
-					name := ctx.Arg("field").Data.(string)
-					switch t.Kind {
-					case ffiStruct:
-						for i, f := range t.Fields {
-							if f.Name == name {
-								ft := reg.mustGet(f.Type)
-								src := unsafe.Pointer(uintptr(p) + t.Offsets[i])
-								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
-									return HandleVal(typeKey(reg, ft), src)
-								}
-								return readValue(reg, ft, src)
-							}
-						}
-						fail("getf: unknown struct field: " + name)
-					case ffiUnion:
-						for _, f := range t.Fields {
-							if f.Name == name {
-								ft := reg.mustGet(f.Type)
-								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
-									return HandleVal(typeKey(reg, ft), p)
-								}
-								return readValue(reg, ft, p) // unions start at offset 0
-							}
-						}
-						fail("getf: unknown union field: " + name)
-					default:
-						fail("getf: T must be a struct or union")
-					}
-					return Null
-				},
-				"Read a field from a struct/union instance.",
-			)
-
-			// copyAggregateFromHandle performs a byte copy from a handle's storage into dst.
-			// The caller supplies the error text to preserve exact messages.
-			copyAggregateFromHandle := func(t *ffiType, dst unsafe.Pointer, v Value, errText string) {
-				if v.Tag != VTHandle {
-					fail(errText)
-				}
-				src := expectPtr(v)
-				cMemcpy(dst, src, t.Size)
-			}
-
-			registerMem("setf",
-				[]ParamSpec{
-					{Name: "T", Type: S{"id", "Any"}},
-					{Name: "ptr", Type: S{"id", "Any"}},
-					{Name: "field", Type: S{"id", "Str"}},
-					{Name: "value", Type: S{"id", "Any"}},
-				},
-				S{"id", "Null"},
-				func(ctx CallCtx) Value {
-					t := resolveTypeArg(ctx.Arg("T"))
-					p := expectPtr(ctx.Arg("ptr"))
-					name := ctx.Arg("field").Data.(string)
-					val := ctx.Arg("value")
-					switch t.Kind {
-					case ffiStruct:
-						for i, f := range t.Fields {
-							if f.Name == name {
-								ft := reg.mustGet(f.Type)
-								dst := unsafe.Pointer(uintptr(p) + t.Offsets[i])
-								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
-									copyAggregateFromHandle(ft, dst, val, "setf: aggregate field requires handle to compatible storage")
-									return Null
-								}
-								writeValue(reg, ft, dst, val)
-								return Null
-							}
-						}
-						fail("setf: unknown struct field: " + name)
-					case ffiUnion:
-						for _, f := range t.Fields {
-							if f.Name == name {
-								ft := reg.mustGet(f.Type)
-								if ft.Kind == ffiStruct || ft.Kind == ffiUnion || ft.Kind == ffiArray {
-									copyAggregateFromHandle(ft, p, val, "setf: aggregate field requires handle to compatible storage")
-									return Null
-								}
-								writeValue(reg, ft, p, val) // unions start at offset 0
-								return Null
-							}
-						}
-						fail("setf: unknown union field: " + name)
-					default:
-						fail("setf: T must be a struct or union")
-					}
-					return Null
-				},
-				"Write a field in a struct/union instance.",
-			)
-
-			// ---- Minimal packed-bit helpers (little-endian only, x86-64/SysV) ----
-			registerMem("readBits",
-				[]ParamSpec{
-					{Name: "ptr", Type: S{"id", "Any"}},
-					{Name: "byteOffset", Type: S{"id", "Int"}},
-					{Name: "bitOffset", Type: S{"id", "Int"}},
-					{Name: "width", Type: S{"id", "Int"}},
-					{Name: "signed", Type: S{"id", "Any"}},
-				},
-				S{"id", "Int"},
-				func(ctx CallCtx) Value {
-					p := expectPtr(ctx.Arg("ptr"))
-					bo := ctx.Arg("byteOffset").Data.(int64)
-					bi := ctx.Arg("bitOffset").Data.(int64)
-					w := ctx.Arg("width").Data.(int64)
-					if bo < 0 || bi < 0 {
-						fail("readBits: offsets must be >= 0")
-					}
-					if w < 1 || w > 64 {
-						fail("readBits: width must be in 1..64")
-					}
-					sgn := false
-					if s := ctx.Arg("signed"); s.Tag == VTBool {
-						sgn = s.Data.(bool)
-					} else if s.Tag != VTNull {
-						fail("readBits: signed must be bool or null")
-					}
-
-					start := int(bi % 8)
-					need := int((int64(start) + w + 7) / 8) // 1..9
-					if need < 1 || need > 9 {
-						fail("readBits: internal length check failed")
-					}
-
-					base := unsafe.Pointer(uintptr(p) + uintptr(bo))
-					var buf [9]byte
-					cMemcpy(unsafe.Pointer(&buf[0]), base, uintptr(need))
-
-					// assemble little-endian chunk
-					var x uint64
-					for i := 0; i < need; i++ {
-						x |= uint64(buf[i]) << (8 * i)
-					}
-					x >>= uint(start)
-
-					var mask uint64
-					if w == 64 {
-						mask = ^uint64(0)
-					} else {
-						mask = (uint64(1) << uint(w)) - 1
-					}
-					val := x & mask
-					if sgn && w < 64 && ((val>>(uint(w)-1))&1) == 1 {
-						val |= ^mask
-					} // sign-extend
-					return Int(int64(val))
-				},
-				"Read up to 64 bits from a packed little-endian field: readBits(ptr, byteOffset, bitOffset, width, signed?).",
-			)
-			registerMem("writeBits",
-				[]ParamSpec{
-					{Name: "ptr", Type: S{"id", "Any"}},
-					{Name: "byteOffset", Type: S{"id", "Int"}},
-					{Name: "bitOffset", Type: S{"id", "Int"}},
-					{Name: "width", Type: S{"id", "Int"}},
-					{Name: "value", Type: S{"id", "Int"}},
-				},
-				S{"id", "Null"},
-				func(ctx CallCtx) Value {
-					p := expectPtr(ctx.Arg("ptr"))
-					bo := ctx.Arg("byteOffset").Data.(int64)
-					bi := ctx.Arg("bitOffset").Data.(int64)
-					w := ctx.Arg("width").Data.(int64)
-					if bo < 0 || bi < 0 {
-						fail("writeBits: offsets must be >= 0")
-					}
-					if w < 1 || w > 64 {
-						fail("writeBits: width must be in 1..64")
-					}
-					v := ctx.Arg("value").Data.(int64)
-					if v < 0 {
-						fail("writeBits: negative value not allowed")
-					}
-
-					var mask uint64
-					if w == 64 {
-						mask = ^uint64(0)
-					} else {
-						mask = (uint64(1) << uint(w)) - 1
-					}
-					if uint64(v) > mask {
-						fail("writeBits: value does not fit width")
-					}
-
-					start := int(bi % 8)
-					need := int((int64(start) + w + 7) / 8) // 1..9
-					if need < 1 || need > 9 {
-						fail("writeBits: internal length check failed")
-					}
-
-					base := unsafe.Pointer(uintptr(p) + uintptr(bo))
-					var buf [9]byte
-					cMemcpy(unsafe.Pointer(&buf[0]), base, uintptr(need))
-
-					var x uint64
-					for i := 0; i < need; i++ {
-						x |= uint64(buf[i]) << (8 * i)
-					}
-					field := mask << uint(start)
-					x &^= field
-					x |= (uint64(v) & mask) << uint(start)
-					for i := 0; i < need; i++ {
-						buf[i] = byte((x >> (8 * i)) & 0xFF)
-					}
-					cMemcpy(base, unsafe.Pointer(&buf[0]), uintptr(need))
-					return Null
-				},
-				"Write up to 64 bits into a packed little-endian field: writeBits(ptr, byteOffset, bitOffset, width, value).",
-			)
-
-			// Export __mem
-			modMap.Entries["__mem"] = Value{Tag: VTMap, Data: memMap}
-			modMap.Keys = append(modMap.Keys, "__mem")
-
-			// -------------------- Export functions ------------------------------
-			for name, f := range mod.funcs {
-				fn := f // capture
-
-				// Precompute CIF (non-variadic)
-				cf, tp, err := prepCIF(reg, fn.Ret, fn.Params)
-				if err != nil {
-					fail("ffi: " + fn.Name + ": " + err.Error())
-				}
-				fn.cif = cf
-				fn.typesVec = tp
-				cif := fn.cif
-				// Keep the extra validation to preserve historical error text locality.
-				if fn.RetAsStr {
-					rt := mod.reg.mustGet(fn.Ret)
-					if !((rt.Kind == ffiPointer || rt.Kind == ffiHandle) && isCharPtr(mod.reg, rt)) {
-						// exact string preserved (do not change)
-						fail("ffi: " + fn.Name + ": ret_as_str valid only for char*/unsigned char*")
-					}
-				}
-
-				ip.RegisterRuntimeBuiltin(
-					modEnv,
-					name,
-					buildParamSpecs(mod, fn),
-					S{"id", "Any"},
-					func(ip2 *Interpreter, ctx CallCtx) Value {
-						// ================== FAST HOT PATH ==================
-
-						nFixed := len(fn.Params)
-
-						// ---- Small stack fast path for common arities ----
-						var argvSmall [8]uintptr
-						var argsSmall [8]uint64
-
-						var argv []uintptr
-						var putArgv func()
-						if nFixed <= len(argvSmall) {
-							argv, _ = argvSmall[:nFixed], func() {}
-							for i := range argv {
-								argv[i] = 0
-							}
-						} else {
-							argv, putArgv = getArgv(nFixed)
-							defer putArgv()
-						}
-
-						var args []uint64
-						var putArgs func()
-						if nFixed <= len(argsSmall) {
-							args, _ = argsSmall[:nFixed], func() {}
-							for i := range args {
-								args[i] = 0
-							}
-						} else {
-							args, putArgs = getArgsSlots(nFixed)
-							defer putArgs()
-						}
-
-						// buffers we must keep alive until after ffi_call (Go heap)
-						var keepBytes [][]byte
-						var cleanups []func() // for callback closures and temp C strings
-
-						// ----- marshal fixed prefix -----
-						for i, key := range fn.Params {
-							pt := mod.reg.mustGet(key)
-							val := ctx.Arg(fmt.Sprintf("p%d", i))
-
-							// Reject aggregate literals for any aggregate parameter (pointer or by-value).
-							if _, ok := isPtrToAggregate(mod.reg, pt); ok && (val.Tag == VTMap || val.Tag == VTArray) {
-								fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
-							}
-
-							// char*/uchar* bridge for strings (allow embedded NUL)
-							if (pt.Kind == ffiPointer || pt.Kind == ffiHandle) && isCharPtr(mod.reg, pt) && val.Tag == VTStr {
-								cbuf, free := tempCStringFromStr(val.Data.(string))
-								args[i] = uint64(uintptr(cbuf))
-								argv[i] = uintptr(unsafe.Pointer(&args[i]))
-								cleanups = append(cleanups, free)
-								continue
-							}
-
-							// funcptr: accept MindScript callable → build libffi closure; or accept pointer handle/null.
-							if pt.Kind == ffiFuncPtr {
-								fnptr, cl := makeFuncptrArg(ip2, mod, pt, val)
-								if cl != nil {
-									cleanups = append(cleanups, cl)
-								}
-								args[i] = uint64(uintptr(fnptr))
-								argv[i] = uintptr(unsafe.Pointer(&args[i]))
-								continue
-							}
-
-							// By-value aggregates: require a handle to storage; copy bytes into a scratch buffer.
-							if pt.Kind == ffiStruct || pt.Kind == ffiUnion || pt.Kind == ffiArray {
-								if val.Tag != VTHandle {
-									fail(fmt.Sprintf("ffi: %s: p%d: aggregate parameter requires handle to compatible storage", fn.Name, i))
-								}
-								src := expectPtr(val)
-								need := int(abiSlotSize(pt)) // libffi may read full slot-size
-								buf, put := getBytes(need)
-								// copy only the aggregate's size (rest already zeroed)
-								if pt.Size > 0 {
-									cMemcpy(unsafe.Pointer(&buf[0]), src, pt.Size)
-								}
-								argv[i] = uintptr(unsafe.Pointer(&buf[0]))
-								keepBytes = append(keepBytes, buf)
-								defer put()
-								continue
-							}
-
-							// Scalar / pointer
-							writeScalarIntoSlot(mod.reg, pt, &args[i], val)
-							argv[i] = uintptr(unsafe.Pointer(&args[i]))
-						}
-
-						// Ensure kept values survive until after ffi_call
-						defer func() {
-							for _, f := range cleanups {
-								f()
-							}
-							// Keep slices alive
-							for _, b := range keepBytes {
-								runtime.KeepAlive(b)
-							}
-							runtime.KeepAlive(argv)
-							runtime.KeepAlive(args)
-						}()
-
-						// ----- non-variadic fast path -----
-						if !fn.Variadic {
-							var av unsafe.Pointer
-							if nFixed > 0 {
-								av = unsafe.Pointer(&argv[0])
-							}
-							return callFFI(mod, fn, cif, av, args, argv)
-						}
-
-						// ----- variadic path (MindScript: final argument must be an array) -----
-						vaVal := ctx.Arg(fmt.Sprintf("p%d", nFixed))
-						if vaVal.Tag != VTArray {
-							fail("variadic function expects final argument to be an array")
-						}
-						vaElems := vaVal.Data.(*ArrayObject).Elems
-
-						// Build promoted vararg values (Go memory only; no Go pointers will go into C).
-						nVA := len(vaElems)
-						var vaArgsSmall [8]uint64
-						var vaArgs []uint64
-						var putVArgs func()
-						if nVA <= len(vaArgsSmall) {
-							vaArgs, _ = vaArgsSmall[:nVA], func() {}
-							for i := range vaArgs {
-								vaArgs[i] = 0
-							}
-						} else {
-							vaArgs, putVArgs = getArgsSlots(nVA)
-							defer putVArgs()
-						}
-
-						// Collect ffi_type* for varargs
-						vaTypePtrs := make([]unsafe.Pointer, 0, nVA)
-						for i, a := range vaElems {
-							switch a.Tag {
-							case VTInt, VTBool:
-								writeScalarIntoSlot(mod.reg, promInt, &vaArgs[i], a)
-								vaTypePtrs = append(vaTypePtrs, ffiTypeSint32Ptr())
-							case VTNum:
-								writeScalarIntoSlot(mod.reg, promDbl, &vaArgs[i], a)
-								vaTypePtrs = append(vaTypePtrs, ffiTypeDoublePtr())
-							case VTHandle:
-								p := expectPtr(a)
-								vaArgs[i] = uint64(uintptr(p))
-								vaTypePtrs = append(vaTypePtrs, ffiTypePointerPtr())
-							case VTNull:
-								vaArgs[i] = 0
-								vaTypePtrs = append(vaTypePtrs, ffiTypePointerPtr())
-							default:
-								fail(fmt.Sprintf("unsupported variadic arg[%d]", i))
-							}
-						}
-
-						// Grow argv to hold fixed + varargs and plug pointers to our Go slots.
-						total := nFixed + nVA
-						if total > len(argv) {
-							// Need a larger argv; copy existing fixed entries
-							newArgv, put2 := getArgv(total)
-							defer put2()
-							copy(newArgv[:nFixed], argv[:nFixed])
-							argv = newArgv
-						} else {
-							argv = argv[:total]
-						}
-						// Point varargs entries at vaArgs slots
-						for j := 0; j < nVA; j++ {
-							argv[nFixed+j] = uintptr(unsafe.Pointer(&vaArgs[j]))
-						}
-
-						// Build combined ffi_type* array for ffi_prep_cif_var (C memory for the array only)
-						typeMem := allocPtrArray(total)
-						defer cFree(typeMem)
-						// Fill fixed portion from registry keys
-						if err := fillFFITypesFromKeys(mod.reg, typeMem, fn.Params); err != nil {
-							fail("ffi: " + err.Error())
-						}
-						// Append vararg promoted types
-						for i, ty := range vaTypePtrs {
-							setFFITypeAt(typeMem, nFixed+i, ty)
-						}
-
-						// Prepare CIF (variadic) using heap-allocated cif
-						rty, err := ffiReturnTypePtr(mod.reg, fn.Ret)
-						if err != nil {
-							fail("ffi: " + err.Error())
-						}
-						cifVar := cAllocCIF()
-						defer cFree(unsafe.Pointer(cifVar))
-						if err := cFFIPrepCIFVarOpaque(cifVar, nFixed, total, rty, typeMem); err != nil {
-							fail(err.Error())
-						}
-
-						// avalue points to Go-managed argv (void**)
-						var av unsafe.Pointer
-						if total > 0 {
-							av = unsafe.Pointer(&argv[0])
-						}
-
-						return callFFI(mod, fn, cifVar, av, args, vaArgs, argv)
-					},
-				)
-				if v, err := modEnv.Get(name); err == nil {
-					modMap.entriesPut(name, v)
-				}
-				if f.Doc != "" {
-					setBuiltinDoc(modEnv, name, f.Doc)
-				}
-			}
-
-			// -------------------- Export variables ------------------------------
-			for name, v := range mod.vars {
-				vEnv := NewEnv(modEnv)
-
-				// addr()
-				ip.RegisterRuntimeBuiltin(
-					vEnv,
-					"addr",
-					[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
-					S{"id", "Any"},
-					func(_ *Interpreter, _ CallCtx) Value {
-						t := mod.reg.mustGet(v.Type)
-						return HandleVal(canonicalPtrTagKey(mod.reg, t), v.SymbolPtr)
-					},
-				)
-				// get()
-				ip.RegisterRuntimeBuiltin(
-					vEnv, "get",
-					[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
-					S{"id", "Any"},
-					func(_ *Interpreter, _ CallCtx) Value {
-						t := mod.reg.mustGet(v.Type)
-						switch t.Kind {
-						case ffiStruct, ffiUnion, ffiArray:
-							if t.Size == 0 {
-								fail("ffi: get(): aggregate has zero size")
-							}
-							p := mustMalloc(t.Size)
-							cMemcpy(p, v.SymbolPtr, t.Size)
-							return HandleVal(canonicalPtrTagKey(mod.reg, t), p)
-						default:
-							return readValue(mod.reg, t, v.SymbolPtr)
-						}
-					},
-				)
-				// set()
-				ip.RegisterRuntimeBuiltin(
-					vEnv, "set",
-					[]ParamSpec{{Name: "value", Type: S{"id", "Any"}}},
-					S{"id", "Null"},
-					func(_ *Interpreter, ctx CallCtx) Value {
-						t := mod.reg.mustGet(v.Type)
-						// Aggregates require a handle value whose bytes are copied into the variable.
-						switch t.Kind {
-						case ffiStruct, ffiUnion, ffiArray:
-							if t.Size == 0 {
-								fail("ffi: set(): aggregate has zero size")
-							}
-							copyAggregateFromHandle(t, v.SymbolPtr, ctx.Arg("value"),
-								"ffi: set(): aggregate variable requires handle to compatible storage")
-							return Null
-						default:
-							writeValue(mod.reg, t, v.SymbolPtr, ctx.Arg("value"))
-							return Null
-						}
-					},
-				)
-
-				// export object map
-				vm := &MapObject{Entries: map[string]Value{}, Keys: []string{}}
-				for _, n := range []string{"get", "set", "addr"} {
-					if f, err := vEnv.Get(n); err == nil {
-						vm.Entries[n] = f
-						vm.Keys = append(vm.Keys, n)
-					}
-				}
-				modMap.Entries[name] = Value{Tag: VTMap, Data: vm}
-				modMap.Keys = append(modMap.Keys, name)
-			}
-
-			// Final module
-			m := &Module{
-				Name: lib,
-				Map:  modMap,
-				Env:  modEnv,
-			}
-			return Value{Tag: VTModule, Data: m}
-		},
-	)
-
-	setBuiltinDoc(target, "ffiOpen", `Open a shared library (ELF/SysV) and return an FFI module.
-
-Implements:
-  • Full spec parsing/validation (version/lib/types/functions/variables)
-  • Type registry and ABI layout (size/align/offsetof) for common kinds
-  • Symbol binding via dlsym for functions and variables
-  • __mem with: sizeof, alignof, offsetof, typeof, malloc/calloc/realloc/free,
-    new, cast, string, copy, fill, errno, box, getf, setf
-  • Functions are real callables (scalars/pointers); vars expose get/set/addr
-
-Performance:
-  • No per-call C allocations for argv/arg slots/return buffers in the common path.
-  • Small stack fast-paths for up to 8 fixed params and short char* strings.
-  • sync.Pool reuse for argv/slots/byte scratch; varargs slots are in Go memory.
-
-Limitations:
-   • Bitfields in structs are not supported (use readBits/writeBits for packed fields).
-   • Variadics are supported (MindScript last arg = array; C default promotions applied).
-   • Aggregates: by-value params require handles; by-value returns are boxed and returned as handles.
-`)
-}
-
-// tiny helper to keep map insertion consistent
-func (m *MapObject) entriesPut(k string, v Value) {
-	if m.Entries == nil {
-		m.Entries = map[string]Value{}
-	}
-	found := false
-	for _, x := range m.Keys {
-		if x == k {
-			found = true
-			break
-		}
-	}
-	if !found {
-		m.Keys = append(m.Keys, k)
-	}
-	m.Entries[k] = v
-}
-=== END FILE: ./mindscript/builtin_ffi.go ===
+	let ds = dir(obj)
+	T.assertEq(len(ds), 2)
+	let s0 = ds[0]
+	let s1 = ds[1]
+	T.assert(s0 == "a" or s1 == "a", null)
+	T.assert(s0 == "b" or s1 == "b", null)
+	let ann0 = noteGet(s0)
+	let ann1 = noteGet(s1)
+	T.assert(ann0 == "alpha" or ann0 == "bravo", null)
+	T.assert(ann1 == "alpha" or ann1 == "bravo", null)
+	T.assert(ann0 != ann1, null)
+end)
+
+# -----------------------------
+# Import helpers
+# -----------------------------
+
+T.test("std/codeImport/basic", fun(_: Null) do
+	let src = "let foo = 7\n"
+	let imp = codeImport(src)
+	let m = imp("m_std_code_import")
+	T.assertEq(m.foo, 7)
+end)
+
+T.test("std/importUrl/failure-soft-null", fun(_: Null) do
+	let r = importUrl("http://invalid.localhost/does-not-exist.ms")
+	T.assertEq(r, null)
+	T.assert(not (noteGet(r) == null), "expected annotated null")
+end)
+
+# -----------------------------
+# Misc
+# -----------------------------
+
+T.test("std/uid/deterministic-and-different", fun(_: Null) do
+	let a1 = uid("x")
+	let a2 = uid("x")
+	let b = uid("y")
+	T.assertEq(a1, a2)
+	T.assert(a1 != b, null)
+end)
+
+T.test("std/mute/always-null", fun(_: Null) do
+	T.assertEq(mute(123), null)
+end)
+
+# -----------------------------
+# Oracle hook & health
+# -----------------------------
+
+T.test("std/oracleStatus/prints-state", fun(_: Null) do
+	let s = oracleStatus(null)
+	# Accept either state without coupling to environment
+	T.assert(println(s) != null, null)
+	T.assert(s == "oracle: installed" or s == "oracle: not installed", null)
+end)
+
+T.test("std/oracleHealth/installed-or-soft-null", fun(_: Null) do
+	let r = oracleHealth(null)
+	if r == null then
+		let ann = noteGet(r)
+		T.assert(ann != null, "<missing annotation>")
+		T.assert(str(ann) == "oracle not installed" or len(str(ann)) > 0, null)
+	else
+		T.assertType(r, type {ms: Int, ok: Bool})
+		T.assertEq(r.ok, true)
+		T.assert(r.ms >= 0, null)
+	end
+end)
+=== END FILE: ./lib/std_test.ms ===
 

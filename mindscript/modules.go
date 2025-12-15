@@ -47,6 +47,7 @@
 package mindscript
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,6 +59,8 @@ import (
 	"strings"
 	"time"
 )
+
+var errAmbiguousModule = errors.New("ambiguous module")
 
 ////////////////////////////////////////////////////////////////////////////////
 //                                   PUBLIC API
@@ -133,17 +136,38 @@ func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
 // Caching:
 //   - Uniform caching is centralized in nativeMakeModule.
 func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
-	src, display, canon, rerr := resolveAndFetch(spec, importer)
+	// Users import by module name; never write ".ms" explicitly (file or URL).
+	spec = strings.TrimSuffix(spec, "/")
+	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
+		if u, perr := url.Parse(spec); perr == nil {
+			p := strings.TrimSuffix(u.Path, "/")
+			if path.Ext(p) == defaultModuleExt {
+				u2 := *u
+				u2.Path = strings.TrimSuffix(p, defaultModuleExt)
+				return Null, fmt.Errorf("imports are extensionless; write import(%q), not import(%q)", u2.String(), spec)
+			}
+		}
+	} else if strings.HasSuffix(spec, defaultModuleExt) {
+		base := strings.TrimSuffix(spec, defaultModuleExt)
+		return Null, fmt.Errorf("imports are extensionless; write import(%q), not import(%q)", base, spec)
+	}
+
+	src, _, canon, rerr := resolveAndFetch(spec, importer)
 	if rerr != nil {
+		// Hard: ambiguity must stop execution.
+		if errors.Is(rerr, errAmbiguousModule) {
+			return Null, rerr
+		}
 		// Operational/soft: return annotated null; nil Go error.
 		return annotNull(fmt.Sprintf("import %q: %v", spec, rerr)), nil
 	}
-	ast, spans, perr := parseSourceWithSpans(display, src)
+	// Diagnostics should show the module name the user imported (e.g. "nethttp").
+	ast, spans, perr := parseSourceWithSpans(spec, src)
 	if perr != nil {
 		return Null, perr
 	}
-	// Pass both canonical identity and display name to preserve error labels.
-	return ip.importWithBody(canon, display, ast, src, spans)
+	// Canonical identity stays the resolved path/URL; display is the import spec.
+	return ip.importWithBody(canon, spec, ast, src, spans)
 }
 
 //// END_OF_PUBLIC
@@ -320,9 +344,37 @@ func resolveAndFetch(spec string, importer string) (string, string, string, erro
 		if perr != nil {
 			return "", "", "", fmt.Errorf("invalid import url: %w", perr)
 		}
-		if path.Ext(u.Path) == "" && defaultModuleExt != "" {
-			u.Path = strings.TrimSuffix(u.Path, "/") + defaultModuleExt
+		// Extensionless URL: probe both <url>.ms and <url>/init.ms to detect ambiguity.
+		p := strings.TrimSuffix(u.Path, "/")
+		if path.Ext(p) == "" {
+			u1 := *u
+			u1.Path = p + defaultModuleExt
+			u2 := *u
+			u2.Path = p + "/init" + defaultModuleExt
+
+			ok1, e1 := httpProbe(u1.String())
+			ok2, e2 := httpProbe(u2.String())
+			if ok1 && ok2 {
+				return "", "", "", fmt.Errorf("%w: %q: both %q and %q exist", errAmbiguousModule, spec, u1.String(), u2.String())
+			}
+			if ok1 {
+				src, display, err := httpFetch(u1.String())
+				return src, display, u1.String(), err
+			}
+			if ok2 {
+				src, display, err := httpFetch(u2.String())
+				return src, display, u2.String(), err
+			}
+			if e1 != nil {
+				return "", "", "", e1
+			}
+			if e2 != nil {
+				return "", "", "", e2
+			}
+			return "", "", "", fmt.Errorf("module not found: %s", spec)
 		}
+
+		// URL with a non-empty extension (but not ".ms" — rejected earlier): fetch directly.
 		canon := u.String()
 		src, display, err := httpFetch(canon)
 		return src, display, canon, err
@@ -351,31 +403,56 @@ func resolveFS(spec string, importer string) (string, error) {
 		bases = append(bases, cwd)
 	}
 
-	try := func(base, s string) (string, bool) {
-		cands := []string{}
+	try := func(base, s string) (string, bool, error) {
+		// If caller provides an explicit extension (not ".ms"), treat it as exact.
 		if filepath.Ext(s) != "" {
-			cands = append(cands, filepath.Join(base, s))
-		} else {
-			cands = append(cands, filepath.Join(base, s)+defaultModuleExt, filepath.Join(base, s))
-		}
-		for _, c := range cands {
-			if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
-				abs, _ := filepath.Abs(c)
-				return filepath.Clean(abs), true
+			p := filepath.Join(base, s)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				abs, _ := filepath.Abs(p)
+				return filepath.Clean(abs), true, nil
 			}
+			return "", false, nil
 		}
-		return "", false
+
+		p1 := filepath.Join(base, s) + defaultModuleExt
+		p2 := filepath.Join(base, s, "init"+defaultModuleExt)
+
+		ex1 := false
+		ex2 := false
+		if fi, err := os.Stat(p1); err == nil && !fi.IsDir() {
+			ex1 = true
+		}
+		if fi, err := os.Stat(p2); err == nil && !fi.IsDir() {
+			ex2 = true
+		}
+
+		if ex1 && ex2 {
+			return "", false, fmt.Errorf("%w: %q: both %q and %q exist", errAmbiguousModule, s, p1, p2)
+		}
+		if ex1 {
+			abs, _ := filepath.Abs(p1)
+			return filepath.Clean(abs), true, nil
+		}
+		if ex2 {
+			abs, _ := filepath.Abs(p2)
+			return filepath.Clean(abs), true, nil
+		}
+		return "", false, nil
 	}
 
 	// Absolute path?
 	if filepath.IsAbs(spec) {
-		if p, ok := try("", spec); ok {
+		if p, ok, err := try("", spec); err != nil {
+			return "", err
+		} else if ok {
 			return p, nil
 		}
 		// fallthrough to stdlib for completeness.
 	} else {
 		for _, b := range bases {
-			if p, ok := try(b, spec); ok {
+			if p, ok, err := try(b, spec); err != nil {
+				return "", err
+			} else if ok {
 				return p, nil
 			}
 		}
@@ -384,7 +461,9 @@ func resolveFS(spec string, importer string) (string, error) {
 	// Standard library fallback: <install-root>/lib
 	if installRoot != "" {
 		libRoot := filepath.Join(installRoot, "lib")
-		if p, ok := try(libRoot, spec); ok {
+		if p, ok, err := try(libRoot, spec); err != nil {
+			return "", err
+		} else if ok {
 			return p, nil
 		}
 	}
@@ -409,6 +488,30 @@ func httpFetch(canonURL string) (src string, display string, err error) {
 	return string(b), canonURL, nil
 }
 
+// httpProbe checks existence without downloading the full body.
+// Returns (exists, err). Not-found is (false, nil). Other failures are err.
+func httpProbe(canonURL string) (bool, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", canonURL, nil)
+	if err != nil {
+		return false, err
+	}
+	// Small body, widely supported; avoids HEAD quirks.
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return true, nil
+	}
+	if resp.StatusCode == 404 || resp.StatusCode == 410 {
+		return false, nil
+	}
+	return false, fmt.Errorf("http %d", resp.StatusCode)
+}
+
 // prettySpec returns a short display name for a canonical spec:
 //   - file path   -> basename without extension
 //   - http(s) URL -> last segment without extension
@@ -418,6 +521,12 @@ func prettySpec(s string) string {
 	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
 		base := path.Base(u.Path)
 		name := strings.TrimSuffix(base, path.Ext(base))
+		if name == "init" {
+			parent := path.Base(path.Dir(u.Path))
+			if parent != "" && parent != "." && parent != "/" {
+				return parent
+			}
+		}
 		if name != "" {
 			return name
 		}
@@ -426,6 +535,12 @@ func prettySpec(s string) string {
 	// Filesystem path (or arbitrary name)
 	base := filepath.Base(s)
 	name := strings.TrimSuffix(base, filepath.Ext(base))
+	if name == "init" {
+		parent := filepath.Base(filepath.Dir(s))
+		if parent != "" && parent != "." {
+			return parent
+		}
+	}
 	if name != "" {
 		return name
 	}

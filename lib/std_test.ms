@@ -237,7 +237,25 @@ T.test("std/codeImport/basic", fun(_: Null) do
 end)
 
 T.test("std/importUrl/failure-soft-null", fun(_: Null) do
-	let r = importUrl("http://invalid.localhost/does-not-exist.ms")
+	# Extensionless URL: resolver probes <url>.ms and <url>/init.ms.
+	# Neither exists / fetch fails => operational soft-failure => annotated null.
+	let r = importUrl("http://invalid.localhost/does-not-exist")
+	T.assertEq(r, null)
+	T.assert(not (noteGet(r) == null), "expected annotated null")
+end)
+
+T.test("import/rejects-dot-ms-spec", fun(_: Null) do
+	T.assertThrows(fun(_: Null) do
+		import("std.ms")
+	end, null)
+
+	T.assertThrows(fun(_: Null) do
+		import("https://example.com/x.ms")
+	end, null)
+end)
+
+T.test("std/importUrl/extensionless-url-soft-null", fun(_: Null) do
+	let r = importUrl("http://invalid.localhost/does-not-exist")
 	T.assertEq(r, null)
 	T.assert(not (noteGet(r) == null), "expected annotated null")
 end)

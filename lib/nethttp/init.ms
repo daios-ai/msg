@@ -11,9 +11,9 @@
 # serve(), shutdown()
 # mwRecover(), mwRequestID(), mwTimeout(), mwCors(), mwAccessLog()
 
-let router = import("nethttp/router")
-let mw = import("nethttp/middleware")
-let server = import("nethttp/server")
+let router = import("router")
+let mw = import("middleware")
+let server = import("server")
 
 # =========================
 # Types (re-export)

@@ -20,6 +20,7 @@ for file in "$@"; do
     if [ -f "$file" ]; then
         echo "=== BEGIN FILE: $file ==="
         cat "$file"
+        echo
         echo "=== END FILE: $file ==="
         echo # blank line for readability
     else

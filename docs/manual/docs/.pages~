@@ -1,0 +1,9 @@
+nav:
+    - index.md
+    - installation.md
+    - basics.md
+    - examples.md
+    - builtin.md
+    - python.md
+    
+

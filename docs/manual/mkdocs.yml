@@ -1,0 +1,68 @@
+site_name: MindScript
+site_url: https://mindscript.daios.ai
+site_dir: .site
+theme:
+  name: material
+  logo: assets/mindscript-white-logo.svg
+  favicon: assets/favicon.ico
+  custom_dir: overrides
+  features:
+    -content.code.copy
+    -navigation.tabs
+    -navigation.footer
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+plugins:
+  - search
+  - awesome-pages
+extra:
+  analytics:
+    provider: google
+    property: G-SLFLSG11FM
+    feedback:
+      title: Was this page helpful?
+      ratings:
+        - icon: material/emoticon-happy-outline
+          name: This page was helpful
+          data: 1
+          note: >-
+            Thanks for your feedback!
+        - icon: material/emoticon-sad-outline
+          name: This page could be improved
+          data: 0
+          note: >- 
+            Thanks for your feedback!
+  social:
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/9yfxVtyjdc
+      name: MindScript on Discord
+    - icon: fontawesome/brands/x-twitter
+      link: https://x.com/daiosai
+      name: Daios on X.com
+    - icon: fontawesome/solid/globe
+      link: https://daios.ai
+      name: Daios homepage
+extra_javascript:
+  - javascripts/feedback.js
+nav:
+  - index.md
+  - installation.md
+  - basics.md
+  - examples.md
+  - User Manual:
+    - manual/intro.md
+    - manual/values.md
+    - manual/scopes.md
+    - manual/functions.md
+    - manual/oracles.md
+    - manual/stdlib.md
+

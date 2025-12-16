@@ -10,10 +10,10 @@ actorRun: <fun: a:Handle.actor -> f:Any -> Any> — Run function f(m) inside the
 actorSet: <fun: a:Handle.actor -> key:Str -> v:Any -> Any> — Set a property on the wrapped value (map/module) inside the actor.
 actorStart: <fun: m:Any -> pinOSThread:Bool? -> Handle.actor> — Create a single-thread actor wrapper for value 'm'.
 assert: <fun: cond:Bool -> Bool> — Assert that a condition holds.
-astEval: <fun: ast:[Any] -> Any> — Evaluate a runtime-S AST in the caller's scope.
-astFormat: <fun: ast:[Any] -> Str?> — Format a runtime-S AST into stable source.
-astParse: <fun: src:Str -> [Any]?> — Parse source code into runtime-S (VTArray).
-astValidate: <fun: ast:[Any] -> [Any]> — Validate a runtime-S AST.
+astEval: <fun: ast:[] -> Any> — Evaluate a runtime-S AST in the caller's scope.
+astFormat: <fun: ast:[] -> Str?> — Format a runtime-S AST into stable source.
+astParse: <fun: src:Str -> []?> — Parse source code into runtime-S (VTArray).
+astValidate: <fun: ast:[] -> []> — Validate a runtime-S AST.
 base64Decode: <fun: s:Str -> Str?> — Decode a standard Base64 string.
 base64Encode: <fun: x:Str -> Str> — Base64-encode bytes from a string.
 bool: <fun: x:Any -> Bool?> — Convert to Bool using common "truthiness" rules; otherwise errs.
@@ -34,7 +34,7 @@ dateNow: <fun: _:Null -> {}> — Current local date/time components.
 dir: <fun: x:{} -> [Str]> — Directory listing of visible fields/functions.
 dirList: <fun: path:Str -> [Str]?> — List directory entries as an array of names.
 error: <fun: msg:Str -> Null> — Produce an annotated null (soft error).
-exec: <fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> {status!: Int, stderr!: Str, stdout!: Str}?> — Run an external program.
+exec: <fun: cmd:[Str] -> opts:{cwd: Str, env: {}, stdin: Str}? -> {status!: Int, stdout!: Str, stderr!: Str}?> — Run an external program.
 exit: <fun: code:Int? -> Null> — Terminate the current process with an optional status code.
 exp: <fun: x:Num -> Num> — Exponential function e^x.
 ffiOpen: <fun: spec:Any -> Any> — Open a shared library (ELF/SysV) and return an FFI module.
@@ -47,8 +47,8 @@ gzipDecompress: <fun: data:Str -> Str?> — Decompress a gzip payload.
 hexDecode: <fun: s:Str -> Str?> — Decode a hexadecimal string.
 hexEncode: <fun: x:Str -> Str> — Hex-encode bytes to a lowercase hexadecimal string.
 hmacSha256: <fun: key:Str -> msg:Str -> Str> — HMAC-SHA256 authentication tag (raw bytes).
-http: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Handle.net, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (buffered).
-httpStream: <fun: req:{body: Str, bodyH: Any, headers: {}, method: Str, timeoutMs: Int, url!: Str} -> { body: Str, bodyH: Handle.net, durationMs: Int, headers!: {}, proto: Str, status!: Int, statusText: Str, url: Str }?> — Make an HTTP request (streaming).
+http: <fun: req:{url!: Str, method: Str, headers: {}, body: Str, bodyH: Any, timeoutMs: Int} -> { status!: Int, statusText: Str, headers!: {}, url: Str, proto: Str, durationMs: Int, body: Str, bodyH: Handle.net }?> — Make an HTTP request (buffered).
+httpStream: <fun: req:{url!: Str, method: Str, headers: {}, body: Str, bodyH: Any, timeoutMs: Int} -> { status!: Int, statusText: Str, headers!: {}, url: Str, proto: Str, durationMs: Int, body: Str, bodyH: Handle.net }?> — Make an HTTP request (streaming).
 import: <fun: path:Str -> Any> — Load a module from filesystem or HTTP(S).
 importCode: <fun: name:Str -> src:Str -> Any> — Evaluate source text as a module in memory.
 importUrl: <fun: url:Str -> {}?> — Import a module from a URL.
@@ -120,8 +120,8 @@ readFile: <fun: path:Str -> Str?> — Read an entire file into a string.
 readLine: <fun: h:Any -> Str?> — Read one line from a handle (without the trailing newline).
 readN: <fun: h:Any -> n:Int -> Str?> — Read up to n bytes from a handle.
 reduce: <fun: f:(Any -> Any -> Any) -> it:(Null -> Any?) -> Any?> — Fold an iterator with a binary function.
-reflect: <fun: val:Any -> [Any]?> — Reflect a value into constructor code (runtime-S).
-reify: <fun: rt:[Any] -> Any> — Decode and evaluate constructor code (runtime-S).
+reflect: <fun: val:Any -> []?> — Reflect a value into constructor code (runtime-S).
+reify: <fun: rt:[] -> Any> — Decode and evaluate constructor code (runtime-S).
 remove: <fun: path:Str -> Bool?> — Delete a file or an empty directory.
 rename: <fun: old:Str -> new:Str -> Bool?> — Rename (move) a file or directory.
 replace: <fun: pattern:Str -> replace:Str -> string:Str -> Str> — Replace all non-overlapping regex matches.
@@ -138,7 +138,7 @@ sort: <fun: arr:[Any] -> cmp:(Any -> Any -> Int) -> [Any]> — Sort an array in-
 split: <fun: s:Str -> sep:Str -> [Str]> — Split a string on a separator (no regex).
 sprintf: <fun: fmt:Str -> args:[Any] -> Str?> — Format a string with printf-style verbs.
 sqrt: <fun: x:Num -> Num> — Square root.
-stat: <fun: path:Str -> {isDir!: Bool, modTimeMillis!: Int, mode!: Int, size!: Int}?> — File status (like ls -l metadata).
+stat: <fun: path:Str -> {isDir!: Bool, size!: Int, modTimeMillis!: Int, mode!: Int}?> — File status (like ls -l metadata).
 str: <fun: x:Any -> Str?> — Convert to string if possible; otherwise err.
 strip: <fun: s:Str -> Str> — Remove leading and trailing whitespace (Unicode).
 substr: <fun: s:Str -> i:Int -> j:Int -> Str> — Unicode-safe substring by rune index.

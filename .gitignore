@@ -6,6 +6,10 @@
 *.dylib
 *.test
 
+# --- Hidden directories (dotdirs) ---
+**/.*/          # ignore any directory starting with a dot (e.g. .site/, .cache/, .idea/)
+!.github/    # keep GitHub workflows/config tracked (optional but common)
+
 # --- Coverage & profiles ---
 *.out
 coverage.*

@@ -6,10 +6,6 @@
 *.dylib
 *.test
 
-# --- Hidden directories (dotdirs) ---
-**/.*/          # ignore any directory starting with a dot (e.g. .site/, .cache/, .idea/)
-!.github/    # keep GitHub workflows/config tracked (optional but common)
-
 # --- Coverage & profiles ---
 *.out
 coverage.*
@@ -29,18 +25,6 @@ go.work.sum
 Thumbs.db
 *.swp
 .idea/
-.vscode/
-
-# VS Code extension (scoped Node/TS outputs)
-editors/vscode/node_modules/
-editors/vscode/dist/
-editors/vscode/out/
-editors/vscode/.vscode-test/
-editors/vscode/*.tsbuildinfo
-editors/vscode/*.vsix
-editors/vscode/npm-debug.log*
-editors/vscode/yarn-*.log*
-editors/vscode/pnpm-debug.log*
 
 # --- Build outputs ---
 bin/
@@ -50,6 +34,7 @@ out/
 generated/
 artifacts/
 release/
+docs/manual/.site/
 
 # --- Release artifacts ---
 mindscript-*.tar.gz

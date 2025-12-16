@@ -1,5 +1,5 @@
 nav:
-    - index.md
+    - Mindscript: index.md
     - installation.md
     - basics.md
     - examples.md

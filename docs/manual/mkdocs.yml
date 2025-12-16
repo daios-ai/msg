@@ -54,15 +54,15 @@ extra:
 extra_javascript:
   - javascripts/feedback.js
 nav:
-  - index.md
-  - installation.md
-  - basics.md
-  - examples.md
-  - User Manual:
-    - manual/intro.md
-    - manual/values.md
-    - manual/scopes.md
-    - manual/functions.md
-    - manual/oracles.md
-    - manual/stdlib.md
+  - MindScript: index.md
+  - Installation: installation.md
+  - Quick Tour: basics.md
+  - Learn: 
+    - learn/index.md
+    - learn/values.md
+    - learn/scopes.md
+    - learn/functions.md
+    - learn/oracles.md
+    - learn/stdlib.md
+  - Examples: examples.md
 

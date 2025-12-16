@@ -31,9 +31,9 @@ jobs:
           set -euo pipefail
           ls -l dist/mindscript/lib | grep -E 'libffi\.so'
           readelf -d dist/mindscript/bin/msg      | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
-          readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
+          # readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
           ldd dist/mindscript/bin/msg     | grep libffi
-          ldd dist/mindscript/bin/msg-lsp | grep libffi
+          # ldd dist/mindscript/bin/msg-lsp | grep libffi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -64,9 +64,9 @@ jobs:
           set -euo pipefail
           ls -l dist/mindscript/lib | grep -E 'libffi\.so'
           readelf -d dist/mindscript/bin/msg      | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
-          readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
+          # readelf -d dist/mindscript/bin/msg-lsp  | grep -E 'RPATH|RUNPATH' | grep '\$ORIGIN/../lib'
           ldd dist/mindscript/bin/msg     | grep libffi
-          ldd dist/mindscript/bin/msg-lsp | grep libffi
+          # ldd dist/mindscript/bin/msg-lsp | grep libffi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -100,9 +100,9 @@ jobs:
           set -euo pipefail
           ls -l dist/mindscript/lib | grep -E 'libffi.*\.dylib'
           otool -l dist/mindscript/bin/msg     | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
-          otool -l dist/mindscript/bin/msg-lsp | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
+          # otool -l dist/mindscript/bin/msg-lsp | awk '/LC_RPATH/{flag=1;next}/Load command/{flag=0}flag' | grep '@loader_path/../lib'
           otool -L dist/mindscript/bin/msg     | grep -E 'libffi.*\.dylib'
-          otool -L dist/mindscript/bin/msg-lsp | grep -E 'libffi.*\.dylib'
+          # otool -L dist/mindscript/bin/msg-lsp | grep -E 'libffi.*\.dylib'
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

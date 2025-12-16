@@ -6,7 +6,7 @@ set -euo pipefail
 # -----------------------------
 APP_NAME="mindscript"
 BIN1="msg"
-BIN2="msg-lsp"
+# BIN2="msg-lsp"
 INSTALL_DIR="${HOME}/.mindscript"
 
 # Online source (works if repo is public)
@@ -137,7 +137,7 @@ fi
 
 # Ensure binaries exist
 [[ -x "${INSTALL_DIR}/bin/${BIN1}" ]] || { echo "Missing ${BIN1} in bin/"; exit 1; }
-[[ -x "${INSTALL_DIR}/bin/${BIN2}" ]] || { echo "Missing ${BIN2} in bin/"; exit 1; }
+# [[ -x "${INSTALL_DIR}/bin/${BIN2}" ]] || { echo "Missing ${BIN2} in bin/"; exit 1; }
 
 # -----------------------------
 # Shell profile setup (bash/zsh + fish)

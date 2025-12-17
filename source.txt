@@ -1,4164 +1,1458 @@
-=== BEGIN FILE: ./mindscript/interpreter.go ===
-// interpreter.go — SINGLE PUBLIC API SURFACE for the MindScript interpreter.
-//
-// OVERVIEW
-// ========
-// This file exposes the **entire public surface** of the MindScript runtime. It
-// deliberately contains **only exported types and thin methods**. All behavior
-// is specified here in enough detail that a consumer can use the interpreter
-// without reading any private implementation.
-//
-// What you get in this file:
-//   • The **runtime value model** (`Value`, `ValueTag`, constructors like `Int/Str/Arr`).
-//   • **Ordered maps** with per-key annotations (`MapObject`) and helpers.
-//   • **Functions / closures** (`Fun`) as first-class values.
-//   • **Environments** (`Env`) with lexical scoping.
-//   • The **Interpreter** type with the canonical entry points:
-//        - parsing+evaluation of source/AST (ephemeral vs persistent),
-//        - function application (`Apply`, `Call0`),
-//        - function introspection (`FunMeta`),
-//        - native registration (`RegisterNative`),
-//        - type helpers (`ResolveType`, `IsType`, `IsSubtype`, `UnifyTypes`, `ValueToType`).
-//   • Hard errors bubble as a single `*Error` (see errors.go). Entry points
-//     format them with caret snippets; internals do **not** format.
-//
-// What this file does **not** include:
-//   • Any algorithmic implementation, bytecode generation, or the VM. Those live
-//     in private files and are intentionally hidden behind narrow private
-//     interfaces that are wired up during `NewInterpreter()`.
-//
-// EXECUTION & SCOPING SEMANTICS
-// -----------------------------
-// MindScript code evaluates in **environments** (`*Env`) that form a lexical
-// chain via `parent`. The Interpreter exposes two well-known frames:
-//   • `Core`: built-ins and registered natives (read-only to user code).
-//   • `Global`: user-visible program state (REPL/module globals).
-//
-// Entry points differ only in *which* environment they target:
-//   • Ephemeral (sandboxed) runs: `EvalSource` and `Eval` create a **fresh child
-//     of Global**; names bound during evaluation land in that throwaway child,
-//     so `Global` remains unchanged unless the program **explicitly** mutates it.
-//   • Persistent (REPL-style) runs: `EvalPersistentSource` and `EvalPersistent`
-//     evaluate **in Global** itself, so `let`/assignment update the persistent
-//     state.
-//   • Advanced embedding: `EvalAST(ast, env)` evaluates exactly in the provided
-//     environment, letting hosts control scoping explicitly.
-//
-// ERROR MODEL
-// -----------
-// MindScript distinguishes:
-//   1) **Soft errors** for operational conditions (file-not-found, no space,
-//      etc.). These surface as annotated-null **Values** (not Go errors).
-//   2) **Hard errors** for contractual failures (lex/parse mistakes, wrong
-//      arity/type contracts, runtime invariants). These bubble as a single
-//      `*Error` with (Kind, Msg, Line, Col, Src). Internals NEVER pretty print.
-//      Public entry points attach the correct SourceRef and format them.
-//
-// All `Eval*` methods return `(Value, error)`. On hard failure they return a Go
-// `error` whose message is a caret-formatted snippet produced **only here** at
-// the API surface via `FormatError` (see errors.go). Internals pass `*Error` up
-// unformatted.
-//
-// VALUES & MAPS
-// -------------
-// `Value` is a tagged sum covering: null, bool, int64, float64, string, arrays,
-// ordered maps, functions, type values, modules, and opaque handles. `MapObject`
-// preserves **insertion order** (`Keys`). Its `Entries` is a string→Value map;
-// order-sensitive operations must consult `Keys`. The helper `AsMapValue`
-// exposes a module’s map view.
-//
-// FUNCTIONS & NATIVES
-// -------------------
-// `Fun` carries parameter names/types, a body (as an S-expression), its closure
-// environment, and an optional `NativeName` when the function is implemented in
-// the host. Natives are registered via `RegisterNative(name, params, ret, impl)`
-// and are **type-checked both on call and on return** using the MindScript type
-// engine (see Type Helpers below). `Apply` performs call/currying semantics and
-// enforces parameter types. `FunMeta` exposes arity, parameter specs, return
-// type, docs, and closure environment for tooling.
-//
-// TYPES (STRUCTURAL)
-// ------------------
-// Types are S-expressions (`type S = []any`, defined in parser.go). The public
-// helpers delegate to the private type engine:
-//   • `ResolveType(t, env)` — resolve identifiers within a type expression.
-//   • `IsType(v, t, env)`   — runtime value check against a type.
-//   • `IsSubtype(a, b, env)`— structural subtyping.
-//   • `UnifyTypes(t1, t2, env)` — least common supertype (LUB).
-//   • `ValueToType(v, env)` — pragmatic structural type inference.
-// The precise structural rules (nullable, arrays, maps with required/optional,
-// functions contravariant/covariant, enums, `Int <: Num`, etc.) are defined in
-// `types.go` and fully respected by this API.
-//
-// PROCESSES & CONCURRENCY (MINIMAL, LUA-STYLE)
-// --------------------------------------------
-// The simplest safe model is **isolates**: each `Interpreter` instance is an
-// independent “process” with its own `Global`, module cache, stacks, and
-// ephemeral state. The `Core` environment is shared **read-only** across
-// isolates (user code cannot mutate Core; see sealing notes below).
-//
-// You can spawn concurrent work by **cloning** an interpreter and running code
-// in a new goroutine. This file exposes:
-//   • `(*Interpreter) Clone()` — snapshot the current interpreter into a new
-//     isolate (shares a read-only Core; copies native registry; new Global).
-//   • Host-level spawns: `SpawnSource` / `SpawnAST` returning a `ProcessHandle`.
-//   • A helper `HandleVal` to wrap/unwrap process handles as `Value` (VTHandle),
-//     so `spawn`/`join` natives can be implemented in `interpreter_ops.go`.
-//
-// Concurrency contract:
-//   • Instantiate and register natives **before** spawning concurrent processes.
-//     (Clones copy the native registry; mutating a Go `map` concurrently is not
-//     allowed. Core is treated as immutable after init.)
-//   • Each `Interpreter` instance is not re-entrant; run at most one evaluation
-//     at a time per instance. For parallel work, use `Clone()`.
-//   • `Global`/module caches are **not** shared between clones.
-//
-// DEPENDENCIES (OTHER FILES)
-// --------------------------
-//   • lexer.go / parser.go: tokenization and Pratt parser that produce S-expr ASTs.
-//     (Public alias `type S = []any` is defined in parser.go.)
-//   • spans.go: sidecar source spans used for caret-style runtime errors.
-//   • vm.go: bytecode `Chunk`, opcodes, and VM execution (internal).
-//   • interpreter_exec.go (private): parsing, JIT, VM dispatch, calls/currying.
-//   • interpreter_ops.go  (private): built-ins, assignment, iteration, emitter.
-//   • types.go: structural type system (used via public wrappers here).
-//   • errors.go: unified diagnostic (`*Error`) and pretty-printing at API surface.
-//   • oracles.go, modules.go: optional features used internally (opaque here).
-//
-// DESIGN INTENT
-// -------------
-// The API is intentionally **narrow and predictable**. You can:
-//   • Choose source or AST inputs.
-//   • Choose ephemeral (child) or persistent (Global) scope.
-//   • Register natives with explicit param/return types.
-//   • Call functions and introspect them.
-//   • Ask type questions and perform type inference.
-//   • Clone interpreters and spawn concurrent processes safely.
-//
-// Everything else—parsing details, bytecode shapes, opcodes, cache strategies,
-// optimization passes—remains private and may evolve without breaking this API.
+=== BEGIN FILE: ./lib/llm.ms ===
+# llm.ms — minimal LLM backend manager (uniform contract + startup probe)
+# 
+# Public surface:
+# init()                 -> { backends!: [Str], current!: Str }          # probe all, pick a usable default, print diagnostics
+# backends()             -> [Str]                                        # available backend names
+# status()               -> { backend!: Str, model: Str?, authed!: Bool, options!: {} }
+# useBackend(Str)        -> {}?                                          # switch current; returns status or soft-null
+# models()               -> [Str]?                                       # list models for current backend (if supported)
+# useModel(Str)          -> {}?                                          # set model for current backend; returns status
+# getConfig()            -> {}                                           # editable snapshot {backend, baseUrl, model, options, [timeoutMs]}
+# setConfig({})          -> {}?                                          # shallow-merge config; returns status
+# auth({})               -> {}?                                          # store credentials (e.g., {"apiKey":"…"}); returns status
+# exec(Str)              -> Str?                                         # run and return the provider's RAW STRING (or soft-null on error)
+# 
+# Notes:
+# - Backends expose { name, state, listModels?, probe, exec }.
+# - init() prints diagnostics and auto-selects the first OK backend if current is not OK.
+# - Only API keys are read from env; baseUrl/model are configured via setConfig/useModel.
+# - Options live in per-backend state.options. Common knobs:
+# temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
+# Backends ignore unknown/unsupported options gracefully.
+# - HTTP failures and provider error payloads are surfaced as soft errors (annotated null) with clear messages.
+# - Oracles are responsible for validating/boxing as {"output": x}. Backends DO NOT normalize/box.
 
-package mindscript
+# =============================
+# Internal state and minimal helpers
+# =============================
 
-import (
-	"fmt"
-	"strconv"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                              PUBLIC TYPES & CTORS
-////////////////////////////////////////////////////////////////////////////////
-
-// ValueTag enumerates all runtime kinds a Value may hold.
-// The tag determines which field of Value.Data is valid (see Value docs).
-type ValueTag int
-
-const (
-	VTNull   ValueTag = iota // null (no payload)
-	VTBool                   // bool
-	VTInt                    // int64
-	VTNum                    // float64
-	VTStr                    // string
-	VTArray                  // *ArrayObject
-	VTMap                    // *MapObject (ordered map)
-	VTFun                    // *Fun (closure; native or user-defined)
-	VTType                   // *TypeValue (type AST + definition env)
-	VTModule                 // module handle (opaque; maps to a MapObject view)
-	VTHandle                 // opaque host handle (integration-specific)
-	VTSymbol                 // reserved ONLY for static analysis, not runtime
-)
-
-// Value is the universal runtime carrier used by the interpreter.
-//
-// Fields:
-//   - Tag   — discriminant indicating which case is active.
-//   - Data  — Go value appropriate for Tag (see ValueTag; e.g., int64 for VTInt).
-//   - Annot — optional annotation used by the runtime to propagate user-facing
-//     documentation or error context. Annotations never affect equality.
-//
-// Invariants:
-//   - When Tag==VTNull, Data is nil.
-//   - When Tag==VTMap, Data is *MapObject preserving insertion order.
-//   - Modules (VTModule) can be viewed as maps via AsMapValue.
-type Value struct {
-	Tag   ValueTag
-	Data  interface{}
-	Annot string
+let _state = {
+	current: "ollama",
+	backends: {} # name -> backend record
 }
 
-// ArrayObject gives arrays reference semantics (like MapObject), so mutations
-// (push/pop/shift/unshift/index-assign) are observed by all aliases.
-type ArrayObject struct {
-	Elems []Value
-}
+# Soft error → annotated null.
+let _err = fun(msg: Str) -> Null do
+	error("llm: " + msg)
+end
 
-// Handle is the single opaque/userdata-like carrier (Lua-style).
-// Hosts can box arbitrary data behind a "kind" discriminator.
-type Handle struct {
-	Kind string
-	Data any
-}
+# Render a short backend status line.
+let _diagLine = fun(name: Str, ok: Bool, authed: Bool, model: Str?, baseUrl: Str?, reason: Str?) -> Str do
+	let mark = if ok then
+		"✓"
+	else
+		"✗"
+	end
+	let m = if model == null then
+		""
+	else
+		" model=" + model
+	end
+	let u = if baseUrl == null then
+		""
+	else
+		" @ " + baseUrl
+	end
+	let a = if ok then
+		""
+	else
+		if reason == null then
+			""
+		else
+			" — " + reason
+		end
+	end
+	sprintf("llm: %s %s%s%s%s", [name, mark, m, u, a])
+end
 
-// HandleVal boxes host data into an opaque runtime Value.
-func HandleVal(kind string, data any) Value {
-	return Value{Tag: VTHandle, Data: &Handle{Kind: kind, Data: data}}
-}
+# =============================
+# Backends (raw-string exec, no boxing)
+# =============================
 
-// String renders a human-friendly debug representation (annotations are omitted).
-func (v Value) String() string {
-	switch v.Tag {
-	case VTNull:
-		return "null"
-	case VTBool:
-		return fmt.Sprintf("%v", v.Data.(bool))
-	case VTInt:
-		return strconv.FormatInt(v.Data.(int64), 10)
-	case VTNum:
-		return strconv.FormatFloat(v.Data.(float64), 'g', -1, 64)
-	case VTStr:
-		return fmt.Sprintf("%q", v.Data.(string))
-	case VTArray:
-		return fmt.Sprintf("<array len=%d>", len(v.Data.(*ArrayObject).Elems))
-	case VTMap:
-		return "<map>"
-	case VTFun:
-		return "<fun>"
-	case VTType:
-		return "<type>"
-	case VTModule:
-		return "<module>"
-	case VTHandle:
-		return "<handle>"
-	default:
-		return "<unknown>"
-	}
-}
-
-// Null is the singleton null Value (no annotation, no payload).
-var Null = Value{Tag: VTNull}
-
-// Primitive constructors for convenience. They do not attach annotations.
-func Bool(b bool) Value    { return Value{Tag: VTBool, Data: b} }
-func Int(n int64) Value    { return Value{Tag: VTInt, Data: n} }
-func Num(f float64) Value  { return Value{Tag: VTNum, Data: f} }
-func Str(s string) Value   { return Value{Tag: VTStr, Data: s} }
-func Arr(xs []Value) Value { return Value{Tag: VTArray, Data: &ArrayObject{Elems: xs}} }
-
-// MapObject is an ordered map preserving insertion order.
-//
-// Fields:
-//   - Entries — the key/value storage (by string key).
-//   - Keys    — insertion order (unique keys); use this to iterate predictably.
-//
-// Semantics:
-//   - Insert order is the iteration order.
-//   - Setting a value for a new key appends that key to Keys.
-//   - Removing keys (if implemented in hosts) must also update Keys.
-//
-// Values of map type are represented as Value{Tag: VTMap, Data: *MapObject}.
-type MapObject struct {
-	Entries map[string]Value
-	Keys    []string
-}
-
-// Map constructs a VTMap from a plain Go map. Note: Literal maps constructed
-// from source preserve exact key order via internal built-ins; hosts building
-// maps programmatically can use Map for convenience (order equals Go map
-// iteration order if Keys is not supplied, so this helper synthesizes Keys
-// from the initial map contents).
-func Map(m map[string]Value) Value {
-	mo := &MapObject{
-		Entries: m,
-	}
-	mo.Keys = make([]string, 0, len(m))
-	for k := range m {
-		mo.Keys = append(mo.Keys, k)
-	}
-	return Value{Tag: VTMap, Data: mo}
-}
-
-// TypeValue carries a type expression AST (S) and the lexical Env where it was
-// defined. Resolution uses the stored Env when available.
-type TypeValue struct {
-	Ast S
-	Env *Env
-}
-
-// TypeValIn builds a VTType and pins its resolution environment explicitly.
-// Use this when exporting user-defined types from specific scopes.
-func TypeValIn(expr S, env *Env) Value {
-	return Value{Tag: VTType, Data: &TypeValue{Ast: expr, Env: env}}
-}
-
-// Fun represents a function/closure. Functions are first-class Values (VTFun).
-//
-// Fields (stable API; implementation specifics like bytecode are private):
-//   - Params      — parameter names in order.
-//   - ParamTypes  — declared parameter types (S-expression per param).
-//   - ReturnType  — declared return type (S). Oracles are made nullable internally.
-//   - Body        — function body as an S-expression (opaque to callers).
-//   - Env         — closure environment captured at definition time.
-//   - NativeName  — non-empty iff implemented by a registered native.
-//   - Examples    — optional example values for tooling; ignored by runtime.
-//   - IsOracle    — marks oracle functions (different return-type semantics).
-//   - HiddenNull  — internal arity placeholder for zero-arg construction (not API).
-//   - Src         — optional source metadata for enriched runtime errors.
-//
-// Note: `Chunk` is an internal JIT product stored here for caching; callers
-// should treat it as opaque and never rely on it.
-type Fun struct {
-	Params     []string
-	Body       S
-	Env        *Env
-	ParamTypes []S
-	ReturnType S
-	HiddenNull bool
-
-	Chunk      *Chunk // JIT result (from vm.go) — internal use only
-	NativeName string // non-empty for registered natives
-
-	IsOracle bool  // oracle marker
-	Examples Value // VTArray of [input, output] pairs, or Null when none
-
-	Src *SourceRef // source metadata (optional)
-
-	// Original declaration signature (names/types): tools/oracles can
-	// reference it even after currying changes Params.
-	Sig *SigMeta
-}
-
-// SigMeta is an immutable, engine-internal carrier of the original signature.
-// It replaces the old $__sig_names / $__sig_types closure bindings for oracles.
-type SigMeta struct {
-	Names []string // original parameter names, in order
-	Types []S      // original declared parameter types, in order
-}
-
-// FunVal wraps *Fun into a Value (Tag=VTFun).
-func FunVal(f *Fun) Value { return Value{Tag: VTFun, Data: f} }
-
-// Env is a lexical environment frame with a parent link. Lookups walk parent-ward.
-// Use Define to bind in the current frame, Set to update an existing visible
-// binding (nearest frame), and Get to retrieve.
-type Env struct {
-	parent           *Env
-	table            map[string]Value
-	sealParentWrites bool
-}
-
-// ---- Builtin type names/constructors (value-namespace guards) ----
-var builtinTypeAtoms = map[string]struct{}{
-	"Any": {}, "Null": {}, "Bool": {}, "Int": {}, "Num": {}, "Str": {}, "Handle": {}, "Type": {}, "Enum": {},
-}
-
-func isBuiltinTypeAtom(name string) bool { _, ok := builtinTypeAtoms[name]; return ok }
-
-// SealParentWrites prevents Set from climbing into parent frames.
-// Lookups (Get) still traverse parents as usual.
-func (e *Env) SealParentWrites() { e.sealParentWrites = true }
-
-// NewEnv creates a new lexical frame with the given parent (which may be nil).
-func NewEnv(parent *Env) *Env { return &Env{parent: parent, table: make(map[string]Value)} }
-
-// Define binds name to v in the current frame, shadowing any outer binding.
-func (e *Env) Define(name string, v Value) {
-	e.table[name] = v
-}
-
-// Set updates the nearest existing binding of name to v. If no binding exists
-// in any visible frame, Set returns an error (it does not implicitly define).
-func (e *Env) Set(name string, v Value) error {
-	// Disallow assignment to language-level builtins (even if not present in envs).
-	if isBuiltinTypeAtom(name) {
-		return fmt.Errorf("cannot assign to type atom/constructor: %s", name)
-	}
-	if _, ok := e.table[name]; ok {
-		e.table[name] = v
-		return nil
-	}
-	// If this frame is sealed, do not climb; emit a friendlier message
-	// when the name exists in an ancestor (e.g., Core builtins).
-	if e.sealParentWrites {
-		for p := e.parent; p != nil; p = p.parent {
-			if _, ok := p.table[name]; ok {
-				return fmt.Errorf("cannot assign to builtin: %s", name)
-			}
+# Backend: Ollama
+let _ollama = {
+	name: "ollama",
+	state: {baseUrl: "http://localhost:11434", model: null, options: {}},
+	listModels: fun(self: {}) -> [Str]? do
+		let url = self.state.baseUrl + "/api/tags"
+		let r = http({url: url, method: "GET"})
+		if r == null then
+			return _err("ollama listModels: request failed")
+		end
+		if r.status != 200 then
+			return _err("ollama listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return _err("ollama listModels: bad JSON")
+		end
+		let out = []
+		if mapHas(body, "models") then
+			for m in iter(body.models) do
+				out = out + [m.name]
+			end
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let r = http({url: self.state.baseUrl + "/api/tags", method: "GET"})
+		if r == null then
+			return {ok: false, authed: true, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: true, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: true}
+	end,
+	exec: fun(self: {}, prompt: Str) -> Str? do
+		if self.state.model == null then
+			return _err("ollama: model not set (use llm.useModel)")
+		end
+		let eff = self.state.options
+		let reqBody = {
+			model: self.state.model,
+			prompt: prompt,
+			stream: false,
+			options: {}
 		}
-		return fmt.Errorf("undefined variable: %s", name)
-	}
-	if e.parent != nil {
-		return e.parent.Set(name, v)
-	}
-	return fmt.Errorf("undefined variable: %s", name)
-}
-
-// Get retrieves the nearest visible binding for name or returns an error.
-func (e *Env) Get(name string) (Value, error) {
-	if v, ok := e.table[name]; ok {
-		return v, nil
-	}
-	if e.parent != nil {
-		return e.parent.Get(name)
-	}
-	// If the miss is a type atom/ctor, explain how to obtain a runtime Type.
-	if isBuiltinTypeAtom(name) {
-		return Value{}, fmt.Errorf("'%s' is a type expression, not a value. Use 'type %s' to obtain a runtime Type, or use it in a type annotation", name, name)
-	}
-	return Value{}, fmt.Errorf("undefined variable: %s", name)
-}
-
-func (e *Env) GetTable() map[string]Value { return e.table }
-
-func (e *Env) GetParent() *Env { return e.parent }
-
-// ParamSpec documents a function parameter (name + declared type). Used by
-// native registration and function introspection.
-type ParamSpec struct {
-	Name string
-	Type S
-}
-
-// Callable exposes metadata about a function Value (for tooling, docs, REPLs).
-// The returned values reflect the function’s declared signature and closure env.
-type Callable interface {
-	Arity() int
-	ParamSpecs() []ParamSpec
-	ReturnType() S
-	Doc() string
-	ClosureEnv() *Env
-}
-
-// CallCtx is passed to native functions, providing access to bound arguments
-// (by parameter name) and the effect scope (where side effects should land).
-type CallCtx interface {
-	Arg(name string) Value
-	Env() *Env
-}
-
-// NativeImpl is the implementation signature for registered host/native functions.
-// Implementations must return a Value conforming to the declared return type;
-// the interpreter enforces parameter and return types on every call.
-type NativeImpl func(ip *Interpreter, ctx CallCtx) Value
-
-////////////////////////////////////////////////////////////////////////////////
-//                          PROCESSES (MINIMAL CONCURRENCY)
-////////////////////////////////////////////////////////////////////////////////
-
-// ProcessHandle is a tiny, host-visible handle for a spawned evaluation.
-// Join blocks until the process completes and returns the same (Value, error)
-// shape as Eval* entry points (errors already pretty-printed).
-type ProcessHandle struct {
-	ch chan processResult
-}
-
-type processResult struct {
-	v   Value
-	err error
-}
-
-// Join waits for the spawned evaluation to finish and returns its result.
-func (h *ProcessHandle) Join() (Value, error) {
-	if h == nil || h.ch == nil {
-		return Null, fmt.Errorf("invalid process handle")
-	}
-	r := <-h.ch
-	return r.v, r.err
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                               PUBLIC INTERPRETER
-////////////////////////////////////////////////////////////////////////////////
-
-// Interpreter is the entry point for evaluating MindScript programs.
-//
-// Public fields:
-//   - Core   — built-in environment; parent of Global. Populated by NewInterpreter.
-//   - Global — persistent program environment (REPL/module state).
-//
-// Construction:
-//   - Use NewInterpreter() to obtain a ready-to-use instance. Core natives are
-//     installed automatically; Global is an empty child of Core.
-//
-// Behavior summary:
-//   - EvalSource/Eval run in a **fresh child of Global** (ephemeral).
-//   - EvalPersistentSource/EvalPersistent run **in Global** (persistent).
-//   - EvalAST runs in the environment you pass.
-//   - Apply/Call0 invoke function Values with type-checking & currying.
-//   - FunMeta returns a Callable to inspect signatures/docs.
-//   - (New) Clone returns an isolated interpreter suitable for concurrent runs.
-//   - (New) SpawnSource/SpawnAST run code in a fresh isolate on a goroutine.
-//
-// Hard-error discipline:
-//   - Internals bubble `*Error` up **unformatted**.
-//   - Public entry points attach the correct `SourceRef` and return a Go error
-//     whose message is a pretty, caret-labeled snippet via `FormatError`.
-type Interpreter struct {
-	// Publicly visible environments:
-	Global *Env // user-visible namespace (per-interpreter)
-	Base   *Env // per-namespace runtime/prelude layer (overwritable)
-	Core   *Env // engine-critical intrinsics (read-only)
-
-	// Immutable, pre-seeded Base template used for fast namespace snapshots.
-	baseTemplate *Env
-
-	// Private internals (opaque to callers):
-	modules   map[string]*moduleRec // private module system (defined elsewhere)
-	native    map[string]NativeImpl // registered natives
-	loadStack []string              // import guard
-
-	currentSrc *SourceRef
-
-	// Private facades implemented in private files:
-	_exec execCore
-}
-
-// Private contracts the internals satisfy (wired by NewInterpreter).
-// These are intentionally unexported and may evolve.
-type execCore interface {
-	// Parse + evaluate source into the given env (fresh or persistent).
-	evalSource(src string, env *Env) (Value, error)
-	// Evaluate AST in the given env.
-	evalAST(ast S, env *Env) (Value, error)
-	// Calls & metadata
-	applyArgsScoped(fn Value, args []Value, callSite *Env) Value
-	funMeta(fn Value) (Callable, bool)
-}
-
-// NewInterpreter constructs an engine with core natives and a seeded Base,
-// failing fast if the standard prelude cannot be loaded. After construction:
-//   - Core is populated with built-ins and any subsequently registered natives.
-//   - Global is empty and inherits from Core.
-//   - Global is sealed from mutating Core (user code cannot overwrite builtins).
-//   - The interpreter is ready for Eval*/Apply/FunMeta/etc.
-func NewInterpreter() (*Interpreter, error) {
-	ip := &Interpreter{}
-	ip.Core = NewEnv(nil)
-	ip.modules = map[string]*moduleRec{}
-	ip.native = map[string]NativeImpl{}
-
-	// Wire private implementations (defined in private files).
-	ip._exec = newExec(ip)
-
-	// Install core built-ins.
-	initCore(ip)
-
-	// Build a pre-seeded, immutable Base template once, then snapshot per namespace.
-	if err := ip.buildBaseTemplate(); err != nil {
-		return nil, err
-	}
-	ip.Base = ip.newBaseFromTemplate()
-	// Global is the user frame. It may climb into Base to overwrite runtime/prelude.
-	ip.Global = NewEnv(ip.Base)
-
-	return ip, nil
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                         PUBLIC METHODS (THIN DELEGATIONS)
-////////////////////////////////////////////////////////////////////////////////
-
-// ensureErrorHasSource attaches sr to e if e is a *Error and Src is nil.
-// Returns the possibly-updated error.
-func ensureErrorHasSource(err error, sr *SourceRef) error {
-	if err == nil || sr == nil {
-		return err
-	}
-	if e, ok := err.(*Error); ok && e.Src == nil {
-		e.Src = sr
-	}
-	return err
-}
-
-// formatAtAPI pretty-prints a hard error to a Go error (string message).
-// If err is not a *Error, it is passed through unchanged.
-func formatAtAPI(err error) error {
-	if err == nil {
-		return nil
-	}
-	if e, ok := err.(*Error); ok {
-		return fmt.Errorf("%s", FormatError(e))
-	}
-	return err
-}
-
-// EvalSource parses and evaluates source **in a fresh child of Global**.
-// Effects (lets/assignments) land in that ephemeral child; Global is unchanged
-// unless the program explicitly mutates it.
-//
-// Returns the resulting Value; on hard failure returns a Go error with a
-// caret-formatted snippet (LEXICAL/PARSE/RUNTIME) produced at the API surface.
-func (ip *Interpreter) EvalSource(src string) (Value, error) {
-	ast, spans, err := ParseSExprWithSpans(src)
-	if err != nil {
-		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
-	if err != nil {
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	return val, nil
-}
-
-// Eval evaluates a pre-parsed AST **in a fresh child of Global**.
-// See EvalSource for scoping and error semantics.
-//
-// Implementation detail:
-//
-//	We format the AST back to source to construct a SourceRef with spans
-//	(via ParseSExprWithSpans) so hard errors can be shown with carets.
-func (ip *Interpreter) Eval(root S) (Value, error) {
-	src := FormatSExpr(root)
-	ast, spans, err := ParseSExprWithSpans(src)
-	if err != nil {
-		sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-	val, err := ip.runTopWithSource(ast, NewEnv(ip.Global), false, sr)
-	if err != nil {
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	return val, nil
-}
-
-// EvalPersistentSource parses and evaluates source **in Global** (REPL-style).
-// Effects directly mutate Global. Returns Value; on hard failure returns a
-// caret-formatted Go error produced at the API surface.
-func (ip *Interpreter) EvalPersistentSource(src string) (Value, error) {
-	ast, spans, err := ParseSExprWithSpans(src)
-	if err != nil {
-		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
-	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
-	if err != nil {
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	return val, nil
-}
-
-// EvalPersistent evaluates a pre-parsed AST **in Global** (REPL-style).
-// Effects directly mutate Global. Returns Value; on hard failure returns a
-// caret-formatted Go error produced at the API surface.
-func (ip *Interpreter) EvalPersistent(root S) (Value, error) {
-	src := FormatSExpr(root)
-	ast, spans, err := ParseSExprWithSpans(src)
-	if err != nil {
-		sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	sr := &SourceRef{Name: "<repl>", Src: src, Spans: spans}
-	val, err := ip.runTopWithSource(ast, ip.Global, false, sr)
-	if err != nil {
-		err = ensureErrorHasSource(err, sr)
-		return Null, formatAtAPI(err)
-	}
-	return val, nil
-}
-
-// EvalAST evaluates an AST in the provided environment exactly as given.
-// Hosts use this to control scoping (e.g., per-request envs, sandboxes).
-// Returns Value; on hard failure returns a caret-formatted Go error if the
-// bubbled *Error already carries a SourceRef; otherwise the error is passed
-// through unchanged (callers without source can still inspect *Error fields).
-func (ip *Interpreter) EvalAST(ast S, env *Env) (Value, error) {
-	val, err := ip._exec.evalAST(ast, env)
-	if err != nil {
-		// If the error already has a SourceRef, pretty print; else pass through.
-		if _, ok := err.(*Error); ok {
-			return Null, formatAtAPI(err)
-		}
-		return Null, err
-	}
-	return val, nil
-}
-
-// Apply applies a function Value to the provided argument Values.
-//
-// Semantics:
-//   - Performs arity/type checking against the function’s declared ParamTypes.
-//   - Supports currying: if fewer args than parameters are provided, returns a
-//     partially-applied function Value; if more are provided, they are applied
-//     in sequence to the results.
-//   - Side effects from natives occur in the call-site/program scope.
-//
-// Panics inside the engine are caught by Eval* callers; Apply itself follows
-// the runtime’s internal error discipline. Use via evaluated programs or in
-// hosts that handle runtime errors accordingly.
-func (ip *Interpreter) Apply(fn Value, args []Value) Value {
-	return ip._exec.applyArgsScoped(fn, args, nil)
-}
-
-// Call0 invokes a function with zero arguments (equivalent to Apply(fn, nil)).
-func (ip *Interpreter) Call0(fn Value) Value { return ip._exec.applyArgsScoped(fn, nil, nil) }
-
-// FunMeta exposes a function Value as a Callable for introspection (arity,
-// parameter specs with declared types, return type, documentation string taken
-// from Value.Annot, and the closure environment). Returns (nil, false) if the
-// Value is not a function.
-func (ip *Interpreter) FunMeta(fn Value) (Callable, bool) {
-	return ip._exec.funMeta(fn)
-}
-
-// ResolveType expands a type expression by resolving identifiers bound to
-// user-defined types in the provided environment. See types.go for semantics.
-func (ip *Interpreter) ResolveType(t S, env *Env) S { return ip.resolveType(t, env) }
-
-// IsType reports whether runtime value v conforms to type t.
-// Structural rules are defined in types.go (Int<:Num, nullable, arrays/maps,
-// function subtyping, enums, open-world objects, etc.).
-func (ip *Interpreter) IsType(v Value, t S, env *Env) bool { return ip.isType(v, t, env) }
-
-// IsSubtype reports whether type a is a structural subtype of type b.
-func (ip *Interpreter) IsSubtype(a, b S, env *Env) bool { return ip.isSubtype(a, b, env) }
-
-// UnifyTypes computes a least common supertype (LUB) of t1 and t2.
-func (ip *Interpreter) UnifyTypes(t1 S, t2 S, env *Env) S { return ip.unifyTypes(t1, t2, env) }
-
-// ValueToType infers a pragmatic structural type for v (JSON-friendly).
-// Arrays unify element types; maps become open-world with observed fields.
-func (ip *Interpreter) ValueToType(v Value, env *Env) S { return ip.valueToTypeS(v, env) }
-
-// RegisterNative installs a host/native function into Core and exposes it as a
-// first-class function Value available by `name` to programs.
-//
-// Contract:
-//   - `params` declares parameter names and types (enforced on call).
-//   - `ret` declares the return type (enforced on return).
-//   - `impl` is invoked with (ip, CallCtx) at runtime.
-//   - The created function is placed in Core under `name`.
-//
-// Notes:
-//   - Natives participate in currying and type-checking like user functions.
-//   - The doc string for introspection is taken from the Value’s Annot (callers
-//     may annotate after registration if desired).
-//
-// Concurrency:
-//   - Register natives **before** using Clone/Spawn for concurrent work.
-//     Clones copy the native registry; mutating maps concurrently is not supported.
-//
-// 2) Public API (unchanged): also install into Core under the public name.
-func (ip *Interpreter) RegisterNative(
-	name string, params []ParamSpec, ret S, impl NativeImpl,
-) {
-	// For Core natives, use the same key for lookup and public name.
-	funVal := ip.newNativeFun(name, params, ret, impl)
-	if ip.Core == nil {
-		ip.Core = NewEnv(nil)
-	}
-	ip.Core.Define(name, funVal)
-}
-
-// AsMapValue returns a VTMap view for VTMap/VTModule (sharing the same MapObject),
-// else returns the input unchanged. This is useful when callers want uniform map
-// handling for modules and plain maps.
-func AsMapValue(v Value) Value {
-	if v.Tag == VTModule {
-		return Value{Tag: VTMap, Data: v.Data.(*Module).Map}
-	}
-	return v
-}
-
-// Clone creates an isolated Interpreter that shares no mutable runtime state
-// with the original. It shares the read-only Core, reuses the prebuilt
-// baseTemplate, creates a fresh Base + Global, and copies the native registry
-// (name -> implementation) without mutating Core.
-//
-// Notes:
-//   - Core is shared and treated as immutable after init (no writes here).
-//   - Base is recreated from the immutable template; Global is a fresh child.
-//   - Module cache and loader state are fresh per-clone.
-//   - The exec facade is rebound to the clone.
-func (ip *Interpreter) Clone() *Interpreter {
-	// New interpreter shell
-	cl := &Interpreter{}
-
-	// Share read-only Core; do not mutate it here.
-	cl.Core = ip.Core
-
-	// Fresh per-clone state
-	cl.modules = map[string]*moduleRec{}
-	cl.native = make(map[string]NativeImpl, len(ip.native))
-	cl._exec = newExec(cl)
-
-	// Reuse immutable template to create a fresh Base, then make a fresh Global.
-	cl.baseTemplate = ip.baseTemplate
-	cl.Base = cl.newBaseFromTemplate()
-	cl.Global = NewEnv(cl.Base)
-
-	// Copy native registry implementations for this clone (no Core writes).
-	for name, impl := range ip.native {
-		cl.native[name] = impl
-	}
-
-	// Fresh loader/source tracking
-	cl.loadStack = nil
-	cl.currentSrc = nil
-
-	return cl
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                      ISOLATES: CLONE & HOST-LEVEL SPAWN
-////////////////////////////////////////////////////////////////////////////////
-
-// SpawnSource clones the interpreter and evaluates `src` persistently (in the
-// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
-// yields the same (Value, error) contract as EvalPersistentSource.
-func (ip *Interpreter) SpawnSource(src string) *ProcessHandle {
-	child := ip.Clone()
-	h := &ProcessHandle{ch: make(chan processResult, 1)}
-	go func() {
-		v, err := child.EvalPersistentSource(src)
-		h.ch <- processResult{v: v, err: err}
-	}()
-	return h
-}
-
-// SpawnAST clones the interpreter and evaluates `ast` persistently (in the
-// child’s Global) on a new goroutine. It returns a ProcessHandle whose Join()
-// yields the same (Value, error) contract as EvalPersistent.
-func (ip *Interpreter) SpawnAST(ast S) *ProcessHandle {
-	child := ip.Clone()
-	h := &ProcessHandle{ch: make(chan processResult, 1)}
-	go func() {
-		v, err := child.EvalPersistent(ast)
-		h.ch <- processResult{v: v, err: err}
-	}()
-	return h
-}
-
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                    BASE TEMPLATE + SNAPSHOT HELPERS (PRIVATE)
-////////////////////////////////////////////////////////////////////////////////
-
-// Build a pre-seeded, sealed Base template parented to Core. Treat as immutable.
-// RETURNS ERROR if the runtime/prelude fails to load.
-func (ip *Interpreter) buildBaseTemplate() error {
-	tmpl := NewEnv(ip.Core)
-	tmpl.SealParentWrites()
-
-	ip.baseTemplate = tmpl
-
-	if err := ip.SeedRuntimeInto(tmpl); err != nil {
-		return err
-	}
-	ip.baseTemplate = tmpl
-	return nil
-}
-
-// Create a fresh Base(ns) by cloning the template and rebinding closures/types.
-func (ip *Interpreter) newBaseFromTemplate() *Env {
-	// Base template must be constructed during NewInterpreter(). Do not
-	// silently build it here (that would swallow prelude errors).
-	if ip.baseTemplate == nil {
-		panic("base template not initialized (constructor should have failed)")
-	}
-	return cloneEnvRebinding(ip.baseTemplate, ip.Core)
-}
-
-// cloneEnvRebinding clones src into a new Env with newParent, rebinding
-// closures and type envs that *directly* referenced src -> to the new Env.
-// We do not rebuild entire env chains anymore; functions/types now capture
-// the real parent env (Base/module), so a simple pointer equality rebind
-// is sufficient and avoids deep recursion/stack growth.
-func cloneEnvRebinding(src *Env, newParent *Env) *Env {
-	dst := NewEnv(newParent)
-	dst.sealParentWrites = src.sealParentWrites
-	dst.table = make(map[string]Value, len(src.table))
-	for k, v := range src.table {
-		dst.table[k] = rebindValue(v, src, dst)
-	}
-	return dst
-}
-
-// rebindValue: if a function/type closes over 'from', re-pin to 'to'.
-// For arrays/maps we deep-copy the container shape and rebind contained values
-// (to avoid aliasing across namespaces). Primitives pass through unchanged.
-func rebindValue(v Value, from, to *Env) Value {
-	switch v.Tag {
-	case VTFun:
-		f := *v.Data.(*Fun) // copy
-		if f.Env == from {
-			f.Env = to
-		}
-		nv := FunVal(&f)
-		nv.Annot = v.Annot
-		return nv
-	case VTType:
-		tv := *v.Data.(*TypeValue) // copy
-		// Pin envs that were defined in the template (or env-less) to 'to'.
-		if tv.Env == nil || tv.Env == from {
-			tv.Env = to
-		}
-		return Value{Tag: VTType, Data: &tv, Annot: v.Annot}
-	case VTArray:
-		src := v.Data.(*ArrayObject).Elems
-		out := make([]Value, len(src))
-		for i := range src {
-			out[i] = rebindValue(src[i], from, to)
-		}
-		return Arr(out)
-	case VTMap:
-		sm := v.Data.(*MapObject)
-		nm := &MapObject{
-			Entries: make(map[string]Value, len(sm.Entries)),
-			Keys:    append([]string(nil), sm.Keys...),
-		}
-		for k, vv := range sm.Entries {
-			nm.Entries[k] = rebindValue(vv, from, to)
-		}
-		nv := Value{Tag: VTMap, Data: nm, Annot: v.Annot}
-		return nv
-	default:
-		return v
-	}
-}
-
-//  1. Single internal constructor (no Core side effects).
-//     Returns a VTFun wired to ip.native[uniq]. Caller decides where to place it.
-func (ip *Interpreter) newNativeFun(
-	uniq string, params []ParamSpec, ret S, impl NativeImpl,
-) Value {
-	if ip.native == nil {
-		ip.native = map[string]NativeImpl{}
-	}
-	ip.native[uniq] = impl
-
-	names := make([]string, len(params))
-	types := make([]S, len(params))
-	for i, p := range params {
-		names[i], types[i] = p.Name, p.Type
-	}
-	hidden := false
-	if len(names) == 0 {
-		names = []string{"_"}
-		types = []S{S{"id", "Null"}}
-		hidden = true
-	}
-
-	f := &Fun{
-		Params:     names,
-		ParamTypes: types,
-		ReturnType: ret,
-		Body:       S{"native", uniq}, // sentinel for debugging
-		Env:        nil,               // let execFunBodyScoped use call-site scope when provided
-		NativeName: uniq,
-		HiddenNull: hidden,
-		Sig:        &SigMeta{Names: append([]string{}, names...), Types: append([]S{}, types...)},
-	}
-	return FunVal(f)
-}
-
-=== END FILE: ./mindscript/interpreter.go ===
-
-=== BEGIN FILE: ./mindscript/interpreter_ops.go ===
-// interpreter_ops.go — PRIVATE: language ops (built-ins, assignment, iteration)
-// and the AST → bytecode emitter used by the exec layer.
-//
-// This file:
-//  - Implements `newOps(ip)` with `initCore()` (registers all core natives).
-//  - Provides assignment semantics (`assignTo`) and helpers.
-//  - Normalizes collections to iterators (`__to_iter`) and drives iteration.
-//  - Implements deep value equality for const interning in the emitter.
-//  - Hosts the private emitter (`newEmitter`) used by exec for JIT.
-//
-// Public API is in interpreter.go. Exec/call engine is in interpreter_exec.go.
-//
-// Concurrency model (minimal, Lua-style isolates):
-//  - A single *Interpreter is **not re-entrant**; do not call it from multiple
-//    goroutines. For parallelism, clone via (*Interpreter).Clone() and use the
-//    clone in another goroutine. Each clone has its own Core/Global/env graph,
-//    module cache, and source-tracking, so no locks are required here.
-//  - All state touched in this file is per-interpreter (o.ip / ip.*). There are
-//    no package-level mutable singletons. As long as an Interpreter isn't shared
-//    concurrently, operations here are race-free without additional locking.
-//  - Host native functions you register may themselves use goroutines, but they
-//    must not touch the *same* Interpreter or its Env from multiple goroutines.
-//    Use isolates (clones) for truly concurrent execution.
-
-package mindscript
-
-import (
-	"fmt"
-	// "strings" already imported below
-	"strings"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                         PRIVATE PANIC / ERROR HELPERS
-////////////////////////////////////////////////////////////////////////////////
-
-type rtErr struct {
-	msg  string
-	src  *SourceRef
-	line int
-	col  int
-}
-
-func fail(msg string)          { panic(rtErr{msg: msg}) }
-func errNull(msg string) Value { return withAnnot(Null, msg) }
-func annotNull(msg string) Value {
-	return Value{Tag: VTNull, Annot: msg}
-}
-func withAnnot(v Value, ann string) Value { v.Annot = ann; return v }
-
-// panicRt rethrows a structured runtime error as a **value** (never a pointer).
-// Always use this (or fail) to signal runtime errors within the interpreter.
-func panicRt(msg string, src *SourceRef, line, col int) {
-	panic(rtErr{msg: msg, src: src, line: line, col: col})
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                          PRIVATE OPS FACADE (to API)
-////////////////////////////////////////////////////////////////////////////////
-
-func initCore(ip *Interpreter) {
-	if ip.Core == nil {
-		ip.Core = NewEnv(nil)
-	}
-	// sugar for native registration with a ctx-only closure
-	reg := func(name string, params []ParamSpec, ret S, body func(ctx CallCtx) Value) {
-		ip.RegisterNative(name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
-	}
-
-	// __assign_set(targetAst: Any, value: Any) -> Any
-	reg("__assign_set",
-		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			// targetAst is a **pattern** AST (no leading "let").
-			pat := expectAST(ctx.Arg("targetAst"), "__assign_set")
-			v := ctx.Arg("value")
-			// Plain assignment: P = E
-			ip.assignPattern(pat, v, ctx.Env(), false)
-			return v
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			reqBody.options.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			reqBody.options.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "top_k") and num(eff.top_k) != null then
+			reqBody.options.top_k = int(num(eff.top_k))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/api/generate",
+			method: "POST",
+			headers: {"Content-Type": "application/json"},
+			body: jsonStringify(reqBody)
 		})
+		if r == null then
+			return r
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") then
+				return _err("ollama: " + str(b.error))
+			end
+			return r
+		end
 
-	// __assign_def(targetAst: Any, value: Any) -> Any
-	reg("__assign_def",
-		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			// targetAst is a **pattern** AST (no leading "let").
-			pat := expectAST(ctx.Arg("targetAst"), "__assign_def")
-			v := ctx.Arg("value")
-			// Declarative assignment: let P = E  ≡  let P; P = E
-			ip.declarePattern(pat, ctx.Env())
-			ip.assignPattern(pat, v, ctx.Env(), false)
-			return v
+		let j = jsonParse(r.body)
+		if j == null then
+			return r
+		end
+		if not mapHas(j, "response") or j.response == null then
+			return _err("ollama: missing response")
+		end
+		j.response
+	end
+}
+
+# Backend: OpenAI (Chat Completions)
+let _openai = {
+	name: "openai",
+	state: {
+		baseUrl: "https://api.openai.com/v1",
+		model: null,
+		apiKey: osEnv("OPENAI_API_KEY"),
+		options: {}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return _err("openai listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
-
-	// __declare_pattern(patternAst: Any) -> Any
-	// Pure declaration: walk the pattern and Define all identifier leaves to null.
-	reg("__declare_pattern",
-		[]ParamSpec{{"patternAst", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.Arg("patternAst"), "__declare_pattern")
-			ip.declarePattern(ast, ctx.Env())
-			return Null
+		if r == null then
+			return r
+		end
+		if r.status != 200 then
+			return _err("openai listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return _err("openai listModels: bad JSON")
+		end
+		let out = []
+		for m in iter(body.data) do
+			out = out + [m.id]
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
+		if r == null then
+			return {ok: false, authed: authed, reason: noteGet(r)}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, prompt: Str) -> Str? do
+		if self.state.apiKey == null then
+			return _err("openai: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return _err("openai: model not set")
+		end
 
-	// __plus (numbers/strings/arrays/maps)
-	reg("__plus",
-		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			a := AsMapValue(ctx.Arg("a"))
-			b := AsMapValue(ctx.Arg("b"))
-			if isNumber(a) && isNumber(b) {
-				if a.Tag == VTInt && b.Tag == VTInt {
-					return Int(a.Data.(int64) + b.Data.(int64))
-				}
-				return Num(toFloat(a) + toFloat(b))
-			}
-			if a.Tag == VTStr && b.Tag == VTStr {
-				return Str(a.Data.(string) + b.Data.(string))
-			}
-			if a.Tag == VTArray && b.Tag == VTArray {
-				x := append(append([]Value{}, a.Data.(*ArrayObject).Elems...),
-					b.Data.(*ArrayObject).Elems...)
-				return Arr(x)
-			}
-			if a.Tag == VTMap && b.Tag == VTMap {
-				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
-				out := &MapObject{
-					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
-					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
-				}
-				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
-				// LHS order/content
-				for _, k := range am.Keys {
-					out.Keys = append(out.Keys, k)
-					seen[k] = struct{}{}
-				}
-				for k, v := range am.Entries {
-					out.Entries[k] = v
-				}
-				// overlay RHS; append new keys in RHS order
-				for _, k := range bm.Keys {
-					if _, ok := seen[k]; !ok {
-						out.Keys = append(out.Keys, k)
-						seen[k] = struct{}{}
-					}
-				}
-				for k, v := range bm.Entries {
-					out.Entries[k] = v
-				}
-				return Value{Tag: VTMap, Data: out}
-			}
-			return errNull("unsupported operands for '+'")
-		})
-
-	// __resolve_type: Value(Type) -> Value(Type(resolved))
-	reg("__resolve_type",
-		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
-		func(ctx CallCtx) Value {
-			t := ctx.Arg("t")
-			resolved := ip.resolveTypeValue(t, ctx.Env())
-			// Always return a pinned Type; never emit env-less types.
-			return TypeValIn(resolved, ctx.Env())
-		})
-
-	// __type_from_ast(ast: Any-handle) -> Type
-	// Build a Type at *instantiation* time from a serialized S-expression,
-	// pinning it to the current lexical environment (like closures do).
-	reg("__type_from_ast",
-		[]ParamSpec{{"ast", S{"id", "Any"}}}, S{"id", "Type"},
-		func(ctx CallCtx) Value {
-			h := ctx.Arg("ast")
-			if h.Tag != VTHandle {
-				return errNull("__type_from_ast: expected internal type-ast handle")
-			}
-			hd := h.Data.(*Handle)
-			if hd == nil || hd.Kind != "type-ast" {
-				return errNull("__type_from_ast: bad handle kind")
-			}
-			s, ok := hd.Data.(S)
-			if !ok {
-				return errNull("__type_from_ast: payload not a type AST")
-			}
-			if msg := validateTypeShape(s); msg != "" {
-				fail(msg)
-			}
-			return TypeValIn(s, ctx.Env())
-		})
-
-	// __annotate(text: Str, v: Any) -> Any
-	reg("__annotate",
-		[]ParamSpec{{"text", S{"id", "Str"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value { return withAnnot(ctx.Arg("v"), ctx.Arg("text").Data.(string)) })
-
-	// __collect_for_elems(iter: Any) -> Any   (used by high-level mapping helpers)
-	reg("__collect_for_elems",
-		[]ParamSpec{{"iter", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) (out Value) {
-			defer func() {
-				if r := recover(); r != nil {
-					if e, ok := r.(rtErr); ok {
-						out = errNull(e.msg)
-						return
-					}
-					panic(r)
-				}
-			}()
-			out = Arr(ip.collectForElemsScoped(ctx.Arg("iter"), ctx.Env()))
-			return
-		})
-
-	// __map_from(keys:[Str], vals:[Any]) -> Map
-	reg("__map_from",
-		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			ka := ctx.Arg("keys").Data.(*ArrayObject).Elems
-			va := ctx.Arg("vals").Data.(*ArrayObject).Elems
-			if len(ka) != len(va) {
-				return errNull("map_from: mismatched arity")
-			}
-			mo := &MapObject{
-				Entries: make(map[string]Value, len(ka)),
-				Keys:    make([]string, 0, len(ka)),
-			}
-			for i := range ka {
-				if ka[i].Tag != VTStr {
-					return errNull("map key must be string")
-				}
-				k := ka[i].Data.(string)
-				mo.Entries[k] = va[i]
-				mo.Keys = append(mo.Keys, k)
-			}
-			return Value{Tag: VTMap, Data: mo}
-		})
-
-	// __len(array|map) -> Int
-	reg("__len",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
-		func(ctx CallCtx) Value {
-			x := AsMapValue(ctx.Arg("x"))
-			switch x.Tag {
-			case VTArray:
-				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
-			case VTMap:
-				return Int(int64(len(x.Data.(*MapObject).Entries)))
-			default:
-				return errNull("len expects array or map")
-			}
-		})
-
-	// __make_fun(params:[Str], types:[Type], ret:Type, bodyAst:Any, isOracle:Bool, examples:Any, basePath:[Int]) -> Fun
-	ip.RegisterNative("__make_fun",
-		[]ParamSpec{
-			{"params", S{"array", S{"id", "Str"}}},
-			{"types", S{"array", S{"id", "Type"}}},
-			{"ret", S{"id", "Type"}},
-			{"bodyAst", S{"id", "Any"}},
-			{"isOracle", S{"id", "Bool"}},
-			{"examples", S{"id", "Any"}},
-			{"basePath", S{"array", S{"id", "Int"}}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			namesV := ctx.Arg("params").Data.(*ArrayObject).Elems
-			typesV := ctx.Arg("types").Data.(*ArrayObject).Elems
-			retTV := ctx.Arg("ret").Data.(*TypeValue)
-			bodyAny := ctx.Arg("bodyAst")
-			isOr := ctx.Arg("isOracle").Data.(bool)
-			exAny := ctx.Arg("examples")
-			baseAny := ctx.Arg("basePath")
-
-			names := make([]string, len(namesV))
-			types := make([]S, len(typesV))
-			for i := range namesV {
-				names[i] = namesV[i].Data.(string)
-			}
-			for i := range typesV {
-				types[i] = typesV[i].Data.(*TypeValue).Ast
-			}
-
-			// ---- Validate and box examples as a VTArray of [input, output] pairs ----
-			var examples Value
-			if exAny.Tag == VTNull {
-				examples = Arr(nil)
-			} else if exAny.Tag == VTArray {
-				pairs := exAny.Data.(*ArrayObject).Elems
-				for i, ex := range pairs {
-					if ex.Tag != VTArray {
-						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
-					}
-					pp := ex.Data.(*ArrayObject).Elems
-					if len(pp) != 2 {
-						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
-					}
-				}
-				// Detach the slice so later mutations to the caller's array don't alias.
-				examples = Arr(append([]Value(nil), pairs...))
-			} else {
-				return errNull("examples must be an array of [input, output] pairs (or null)")
-			}
-
-			hidden := false
-			if len(names) == 0 {
-				names = []string{"_"}
-				types = []S{S{"id", "Null"}}
-				hidden = true
-			}
-
-			// Build absolute base path for the body
-			var base NodePath
-			if baseAny.Tag == VTArray {
-				xs := baseAny.Data.(*ArrayObject).Elems
-				base = make(NodePath, 0, len(xs))
-				for _, v := range xs {
-					if v.Tag == VTInt {
-						base = append(base, int(v.Data.(int64)))
-					}
-				}
-			}
-
-			retAst := retTV.Ast
-			if isOr {
-				retAst = ensureNullableUnlessAny(retAst)
-			}
-
-			// Clone current SourceRef and attach base path
-			var sr *SourceRef
-			if ip.currentSrc != nil {
-				cpy := *ip.currentSrc
-				// IMPORTANT: 'base' is ABSOLUTE - overwrite.
-				cpy.PathBase = append(NodePath(nil), base...)
-				sr = &cpy
-			}
-
-			// Unbox function BODY from AST handle ----
-			bodyAst := expectAST(bodyAny, "__make_fun")
-
-			// Construct the function closing over the **parent env directly** (no extra frame).
-			return FunVal(&Fun{
-				Params:     names,
-				ParamTypes: types,
-				ReturnType: retAst,
-				Body:       bodyAst,
-				Env:        ctx.Env(), // <-- direct parent; makes globals late-bind correctly
-				HiddenNull: hidden,
-				IsOracle:   isOr,
-				Examples:   examples,
-				Src:        sr,
-				Sig: &SigMeta{
-					Names: append([]string{}, names...),
-					Types: append([]S{}, types...),
+		let eff = self.state.options
+		let body = {
+			model: self.state.model,
+			messages: [
+				{
+					role: "system",
+					content: "You are a careful assistant that outputs only JSON."
 				},
-			})
+				{role: "user", content: prompt}
+			]
+		}
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "presence_penalty") and num(eff.presence_penalty) != null then
+			body.presence_penalty = num(eff.presence_penalty)
+		end
+		if mapHas(eff, "frequency_penalty") and num(eff.frequency_penalty) != null then
+			body.frequency_penalty = num(eff.frequency_penalty)
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_tokens = int(num(eff.max_tokens))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/chat/completions",
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer " + self.state.apiKey
+			},
+			body: jsonStringify(body)
 		})
+		if r == null then
+			return r
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
+				return _err("openai: " + b.error.message)
+			end
+			return _err("openai: HTTP " + str(r.status))
+		end
 
-	// __is_fun(x: Any) -> Bool
-	reg("__is_fun",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value { return Bool(ctx.Arg("x").Tag == VTFun) })
+		let j = jsonParse(r.body)
+		if j == null then
+			return _err("openai: bad JSON from server")
+		end
+		if not mapHas(j, "choices") or len(j.choices) == 0 or not mapHas(j.choices[0], "message") or not mapHas(j.choices[0].message, "content") or j.choices[0].message.content == null then
+			return _err("openai: missing content")
+		end
+		j.choices[0].message.content
+	end
+}
 
-	// __iter_should_stop(x: Any) -> Bool
-	reg("__iter_should_stop",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value {
-			v := ctx.Arg("x")
-			if v.Tag == VTNull {
-				if v.Annot != "" {
-					fail(v.Annot)
-				}
-				return Bool(true)
-			}
-			return Bool(false)
+# Backend: OpenAI (Responses API)
+let _openai_responses = {
+	name: "openai-responses",
+	state: {
+		baseUrl: "https://api.openai.com/v1",
+		model: null,
+		apiKey: osEnv("OPENAI_API_KEY"),
+		options: {}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return _err("openai-responses listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
-
-	// __to_iter(x: Any) -> (Null -> Any?)  |  error
-	ip.RegisterNative("__to_iter",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.Arg("x"))
-
-			// Already an iterator?
-			if x.Tag == VTFun {
-				f := x.Data.(*Fun)
-				if len(f.Params) == 1 && ip.isType(Null, f.ParamTypes[0], f.Env) {
-					return x
-				}
-				fail("for expects array, map, or iterator function (Null -> Any?)")
-			}
-
-			// Helpers
-			newIter := func(parent *Env, lenTarget S, thenBlock S) Value {
-				env := NewEnv(parent)
-				env.Define("$i", Int(0))
-				body := S{"if",
-					S{"pair",
-						S{"binop", "<",
-							S{"id", "$i"},
-							S{"call", S{"id", "__len"}, lenTarget},
-						},
-						S{"block", thenBlock},
-					},
-					S{"block", S{"null"}},
-				}
-				var sr *SourceRef
-				if ip.currentSrc != nil {
-					cpy := *ip.currentSrc // shallow copy; Spans pointer intentionally shared
-					sr = &cpy
-				}
-				return FunVal(&Fun{
-					Params:     []string{"_"},
-					ParamTypes: []S{S{"id", "Null"}},
-					ReturnType: S{"unop", "?", S{"id", "Any"}},
-					Body:       body,
-					Env:        env,
-					Src:        sr,
-				})
-			}
-			inc := func() S {
-				return S{"assign", S{"id", "$i"},
-					S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
-				}
-			}
-
-			// Array → iterator
-			if x.Tag == VTArray {
-				envInit := NewEnv(ctx.Env())
-				envInit.Define("$arr", x)
-				then := S{"block",
-					inc(),
-					S{"idx",
-						S{"id", "$arr"},
-						S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
-					},
-				}
-				return newIter(envInit, S{"id", "$arr"}, then)
-			}
-
-			// Map → iterator (yields [key, value]) preserving insertion order
-			if x.Tag == VTMap {
-				mo := x.Data.(*MapObject)
-				envInit := NewEnv(ctx.Env())
-				envInit.Define("$map", x)
-				keyVals := make([]Value, 0, len(mo.Keys))
-				for _, k := range mo.Keys {
-					keyVals = append(keyVals, Str(k))
-				}
-				envInit.Define("$keys", Arr(keyVals))
-
-				then := S{"block",
-					S{"assign", S{"let", S{"id", "$k"}},
-						S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
-					},
-					inc(),
-					S{"array",
-						S{"id", "$k"},
-						S{"idx", S{"id", "$map"}, S{"id", "$k"}},
-					},
-				}
-				return newIter(envInit, S{"id", "$keys"}, then)
-			}
-
-			fail("for expects array, map, or iterator function (Null -> Any?)")
-			return annotNull("__for_iter: unreachable")
+		if r == null then
+			return r
+		end
+		if r.status != 200 then
+			return _err("openai-responses listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return _err("openai-responses listModels: bad JSON")
+		end
+		let out = []
+		for m in iter(body.data) do
+			out = out + [m.id]
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
+		if r == null then
+			return {ok: false, authed: authed, reason: noteGet(r)}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, prompt: Str) -> Str? do
+		if self.state.apiKey == null then
+			return _err("openai-responses: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return _err("openai-responses: model not set")
+		end
 
-	ip.RegisterNative(
-		"__make_module",
-		[]ParamSpec{
-			{Name: "name", Type: S{"id", "Str"}}, // keep lax; runtime checks enforce string
-			{Name: "body", Type: S{"id", "Any"}}, // Type-carried AST
-			{Name: "base", Type: S{"id", "Any"}}, // [Int] path
-		},
-		S{"id", "Any"}, // could be a dedicated Module type later; Any is simplest now
-		nativeMakeModule,
-	)
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                                ASSIGNMENT
-////////////////////////////////////////////////////////////////////////////////
-
-// declarePattern implements the runtime semantics of `let P`:
-// walk the pattern and Define all identifier leaves to null, propagating any
-// pattern-local annotations to the initial null value.
-func (ip *Interpreter) declarePattern(p S, env *Env) {
-	ip.declarePatternWithDoc(p, env, "")
-}
-
-// declarePatternWithDoc threads a pending annotation doc string down to the
-// identifier leaves that are directly under an ("annot", ...) wrapper. Outer
-// annotations do not bleed across siblings; last annotation wins.
-func (ip *Interpreter) declarePatternWithDoc(p S, env *Env, doc string) {
-	if len(p) == 0 {
-		fail("invalid pattern")
-	}
-	switch p[0].(string) {
-	case "annot":
-		if len(p) < 3 {
-			fail("invalid pattern")
+		let eff = self.state.options
+		let body = {
+			model: self.state.model,
+			input: prompt,
+			text: {format: {type: "json_object"}}
 		}
-		text, ok := p[1].(S)
-		if !ok || len(text) < 2 || text[0].(string) != "str" {
-			fail("invalid pattern")
-		}
-		sub, ok := p[2].(S)
-		if !ok {
-			fail("invalid pattern")
-		}
-		// Pattern annotation attaches to the binding(s) inside this subpattern.
-		// Last annotation wins, so override any outer doc.
-		ip.declarePatternWithDoc(sub, env, text[1].(string))
-
-	case "id":
-		name := p[1].(string)
-		// Forbid declarations of built-in type atoms (Int, Num, Handle, ...).
-		// This mirrors the Env.Set guard and keeps type namespace reserved.
-		if isBuiltinTypeAtom(name) {
-			fail(fmt.Sprintf("cannot declare reserved name: %s", name))
-		}
-		v := Null
-		if doc != "" {
-			v = withAnnot(v, doc)
-		}
-		env.Define(name, v)
-
-	case "array":
-		for i := 1; i < len(p); i++ {
-			child, ok := p[i].(S)
-			if !ok {
-				fail("invalid pattern")
-			}
-			// Annotations for a whole array pattern do not propagate to its
-			// elements unless explicitly wrapped in their own ("annot", ...).
-			ip.declarePatternWithDoc(child, env, "")
-		}
-
-	case "map":
-		for i := 1; i < len(p); i++ {
-			pair, ok := p[i].(S)
-			if !ok || len(pair) < 3 || pair[0].(string) != "pair" {
-				fail("invalid pattern")
-			}
-			sub, ok := pair[2].(S)
-			if !ok {
-				fail("invalid pattern")
-			}
-			// As with arrays, annotations on individual bindings are expressed
-			// via an inner ("annot", ...) around the binding subpattern.
-			ip.declarePatternWithDoc(sub, env, "")
-		}
-
-	default:
-		// get/idx or any other non-pattern expressions are invalid in `let P`.
-		fail("invalid pattern")
-	}
-}
-
-// assignPattern implements destructuring semantics for P = E where P is a
-// pattern (id / get / idx / array / map, optionally wrapped in annot).
-func (ip *Interpreter) assignPattern(p S, value Value, env *Env, allowDefine bool) {
-	ip.assignPatternWithDoc(p, value, env, allowDefine, "")
-}
-
-// assignPatternWithDoc threads a pending annotation doc string down to the
-// actual write target(s). When a pattern leaf is reached, the doc (if any) is
-// applied to the value being assigned, so pattern annotations end up on the
-// final bound value (last annotation wins).
-func (ip *Interpreter) assignPatternWithDoc(p S, value Value, env *Env, allowDefine bool, doc string) {
-	if len(p) == 0 {
-		fail("invalid assignment target")
-	}
-
-	switch p[0].(string) {
-	case "annot":
-		if len(p) < 3 {
-			fail("invalid assignment target")
-		}
-		text, ok := p[1].(S)
-		if !ok || len(text) < 2 || text[0].(string) != "str" {
-			fail("invalid assignment target")
-		}
-		sub, ok := p[2].(S)
-		if !ok {
-			fail("invalid assignment target")
-		}
-		// Pattern annotation applies to the binding(s) inside this subpattern.
-		// Last annotation wins over any outer doc.
-		ip.assignPatternWithDoc(sub, value, env, allowDefine, text[1].(string))
-
-	case "id":
-		if doc != "" {
-			value = withAnnot(value, doc)
-		}
-		name := p[1].(string)
-		if err := env.Set(name, value); err != nil {
-			if allowDefine {
-				env.Define(name, value)
-				return
-			}
-			fail(err.Error())
-		}
-
-	case "get":
-		if doc != "" {
-			value = withAnnot(value, doc)
-		}
-
-		obj := ip.evalFull(p[1].(S), env)
-		// resolve key string (literal or computed)
-		var keyStr string
-		if ks, ok := p[2].(S); ok && len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
-			keyStr = ks[1].(string)
-		} else {
-			k := ip.evalFull(p[2].(S), env)
-			if k.Tag != VTStr {
-				fail("object assignment requires map and string key")
-			}
-			keyStr = k.Data.(string)
-		}
-		mv := AsMapValue(obj)
-		if mv.Tag == VTMap {
-			mo := mv.Data.(*MapObject)
-			if _, exists := mo.Entries[keyStr]; !exists {
-				mo.Keys = append(mo.Keys, keyStr)
-			}
-			mo.Entries[keyStr] = value
-			syncModuleEnv(obj, keyStr, value) // no-op for plain maps
-			return
-		}
-		if obj.Tag == VTModule || obj.Tag == VTArray {
-			fail("object assignment requires map and string key")
-		}
-		fail("object assignment requires map and string key")
-
-	case "idx":
-		if doc != "" {
-			value = withAnnot(value, doc)
-		}
-
-		obj := ip.evalFull(p[1].(S), env)
-		idx := ip.evalFull(p[2].(S), env)
-		if obj.Tag == VTArray && idx.Tag == VTInt {
-			xs := obj.Data.(*ArrayObject).Elems
-			if len(xs) == 0 {
-				fail("index on empty array")
-			}
-			i := int(idx.Data.(int64))
-			if i < 0 {
-				i = len(xs) + i // -1 -> last, -len -> 0
-			}
-			if i < 0 || i >= len(xs) {
-				fail("array index out of range")
-			}
-			xs[i] = value
-			return
-		}
-		mv := AsMapValue(obj)
-		if mv.Tag == VTMap && idx.Tag == VTStr {
-			mo := mv.Data.(*MapObject)
-			k := idx.Data.(string)
-			if _, exists := mo.Entries[k]; !exists {
-				mo.Keys = append(mo.Keys, k)
-			}
-			mo.Entries[k] = value
-			syncModuleEnv(obj, k, value)
-			return
-		}
-		fail("index assignment requires array[int] or map[string]")
-
-	case "array":
-		if value.Tag != VTArray {
-			fail("array pattern: RHS is not an array")
-		}
-		xs := value.Data.(*ArrayObject).Elems
-		patLen := len(p) - 1
-		for i := 0; i < patLen; i++ {
-			elemPat, ok := p[i+1].(S)
-			if !ok {
-				fail("invalid array pattern")
-			}
-			var elemVal Value
-			if i < len(xs) {
-				elemVal = xs[i]
-			} else {
-				elemVal = Null
-			}
-			ip.assignPatternWithDoc(elemPat, elemVal, env, allowDefine, "")
-		}
-
-	case "map":
-		vmap := AsMapValue(value)
-		if vmap.Tag != VTMap {
-			fail("object pattern: RHS is not a map")
-		}
-		mo := vmap.Data.(*MapObject)
-		for i := 1; i < len(p); i++ {
-			pair, ok := p[i].(S)
-			if !ok || len(pair) < 3 || pair[0].(string) != "pair" {
-				fail("invalid object pattern")
-			}
-			key := unwrapKeyStr(pair[1].(S))
-			sub, ok := pair[2].(S)
-			if !ok {
-				fail("invalid object pattern")
-			}
-			fieldVal, ok := mo.Entries[key]
-			if !ok {
-				fieldVal = Null
-			}
-			ip.assignPatternWithDoc(sub, fieldVal, env, allowDefine, "")
-		}
-
-	default:
-		fail("invalid assignment target")
-	}
-}
-
-// syncModuleEnv keeps a module's Env consistent after a write to its map.
-// NOTE (isolates): modules live within a single Interpreter instance; this
-// function updates the module's *local* Env only. Do not cross-post between
-// interpreters.
-func syncModuleEnv(obj Value, key string, val Value) {
-	if obj.Tag == VTModule {
-		m := obj.Data.(*Module)
-		if _, ok := m.Env.table[key]; ok {
-			m.Env.table[key] = val
-		} else {
-			m.Env.Define(key, val)
-		}
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                     TINY EVALUATORS (used by assignment)
-////////////////////////////////////////////////////////////////////////////////
-
-// evalFull compiles and runs a single expression in env.
-// Annotated null is turned into a runtime failure (panic(rtErr)) to align with assignment.
-func (ip *Interpreter) evalFull(n S, env *Env) Value {
-	em := newEmitter(ip, ip.currentSrc)
-	em.emitExpr(n)
-	em.emit(opReturn, 0)
-	ch := em.chunk()
-	res := ip.runChunk(ch, env, 0)
-	switch res.status {
-	case vmOK, vmReturn:
-		if res.value.Tag == VTNull && res.value.Annot != "" {
-			fail(res.value.Annot)
-		}
-		return res.value
-	case vmRuntimeError:
-		if res.value.Tag == VTNull && res.value.Annot != "" {
-			fail(res.value.Annot)
-		}
-		fail("runtime error")
-	default:
-		fail("unknown VM status")
-	}
-	return Null
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                             ITERATOR EXPANSION
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
-	iter = AsMapValue(iter)
-
-	// Normalize to iterator function via Core's __to_iter when needed.
-	if iter.Tag != VTFun {
-		toIter, err := ip.Core.Get("__to_iter")
-		if err != nil {
-			fail("for expects array, map, or iterator function (Null -> Any?)")
-		}
-		iter = ip.applyArgsScoped(toIter, []Value{iter}, scope)
-
-		// Safety: __to_iter now fails itself for bad inputs; if it ever
-		// returns non-fun here, keep the user-facing invariant.
-		if iter.Tag != VTFun {
-			fail("for expects array, map, or iterator function (Null -> Any?)")
-		}
-	}
-
-	// At this point, iter must be a function of shape (Null) -> Any?
-	f, ok := iter.Data.(*Fun)
-	if !ok {
-		fail("for expects array, map, or iterator function (Null -> Any?)")
-	}
-	if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
-		name := "_"
-		if len(f.Params) > 0 {
-			name = f.Params[0]
-		}
-		fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
-	}
-
-	stopFn, err := ip.Core.Get("__iter_should_stop")
-	if err != nil {
-		fail("missing __iter_should_stop")
-	}
-
-	out := []Value{}
-	for {
-		next := ip.applyArgsScoped(iter, []Value{Null}, scope)
-		if ip.applyArgsScoped(stopFn, []Value{next}, scope).Data.(bool) {
-			break
-		}
-		out = append(out, next)
-	}
-	return out
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                          VALUE EQUALITY (for emitter)
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) deepEqual(a, b Value) bool {
-	// Visited set of (leftPtr,rightPtr) pairs to break cycles in arrays/maps.
-	type pair struct{ x, y any }
-	visited := make(map[pair]bool)
-
-	var eq func(x, y Value) bool
-	eq = func(x, y Value) bool {
-		// Treat modules as maps (same as the original function).
-		if x.Tag == VTModule {
-			x = Value{Tag: VTMap, Data: x.Data.(*Module).Map}
-		}
-		if y.Tag == VTModule {
-			y = Value{Tag: VTMap, Data: y.Data.(*Module).Map}
-		}
-
-		// Numeric unification (Int/Num compare by value).
-		if isNumber(x) && isNumber(y) {
-			return toFloat(x) == toFloat(y)
-		}
-
-		// Tags must match (after numeric normalization above).
-		if x.Tag != y.Tag {
-			return false
-		}
-
-		switch x.Tag {
-		case VTNull:
-			return true
-		case VTBool:
-			return x.Data.(bool) == y.Data.(bool)
-		case VTInt:
-			return x.Data.(int64) == y.Data.(int64)
-		case VTNum:
-			return x.Data.(float64) == y.Data.(float64)
-		case VTStr:
-			return x.Data.(string) == y.Data.(string)
-
-		case VTArray:
-			ax := x.Data.(*ArrayObject)
-			ay := y.Data.(*ArrayObject)
-			// Cycle guard: if we've already compared this pair, consider it equal.
-			k := pair{ax, ay}
-			if visited[k] {
-				return true
-			}
-			visited[k] = true
-
-			if len(ax.Elems) != len(ay.Elems) {
-				return false
-			}
-			for i := range ax.Elems {
-				if !eq(ax.Elems[i], ay.Elems[i]) {
-					return false
-				}
-			}
-			return true
-
-		case VTMap:
-			mx := x.Data.(*MapObject)
-			my := y.Data.(*MapObject)
-			// Cycle guard for maps.
-			k := pair{mx, my}
-			if visited[k] {
-				return true
-			}
-			visited[k] = true
-
-			if len(mx.Entries) != len(my.Entries) {
-				return false
-			}
-			for k, xv := range mx.Entries {
-				yv, ok := my.Entries[k]
-				if !ok || !eq(xv, yv) {
-					return false
-				}
-			}
-			return true
-
-		case VTFun:
-			// Pointer equality on closures (matches original behavior).
-			return x.Data.(*Fun) == y.Data.(*Fun)
-
-		case VTType:
-			// Resolve and structurally compare type ASTs (matches original behavior).
-			ta := x.Data.(*TypeValue)
-			tb := y.Data.(*TypeValue)
-			ea := ta.Env
-			if ea == nil {
-				ea = ip.Core
-			}
-			eb := tb.Env
-			if eb == nil {
-				eb = ip.Core
-			}
-			ra := ip.resolveType(ta.Ast, ea)
-			rb := ip.resolveType(tb.Ast, eb)
-			return equalLiteralS(ra, rb)
-
-		case VTHandle:
-			ah, okA := a.Data.(*Handle)
-			bh, okB := b.Data.(*Handle)
-			return okA && okB && ah == bh // identity equality
-
-		default:
-			// Handles VTHandle and any other tags we don't explicitly equal-compare.
-			return false
-		}
-	}
-
-	return eq(a, b)
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                                SMALL HELPERS
-////////////////////////////////////////////////////////////////////////////////
-
-func isNumber(v Value) bool { return v.Tag == VTInt || v.Tag == VTNum }
-func toFloat(v Value) float64 {
-	if v.Tag == VTInt {
-		return float64(v.Data.(int64))
-	}
-	return v.Data.(float64)
-}
-
-func unwrapKeyStr(k S) string {
-	for len(k) > 0 && k[0].(string) == "annot" {
-		k = k[2].(S)
-	}
-	if len(k) >= 2 && k[0].(string) == "str" {
-		return k[1].(string)
-	}
-	fail("map key is not a string")
-	return ""
-}
-
-// Noop detection: ("noop") and ("annot", ..., ("noop"), ...) are “noopish” and
-// generate no code inside blocks.
-func isNoopish(n S) bool {
-	if len(n) == 0 {
-		return false
-	}
-	switch n[0].(string) {
-	case "noop":
-		// Defensive: treat a stray ("noop") in expression position as plain Null.
-		return true
-	case "annot":
-		// n[2] is the subject node; treat annot(noop) as noop
-		if len(n) >= 3 {
-			if sub, ok := n[2].(S); ok {
-				return isNoopish(sub)
-			}
-		}
-		return false
-	default:
-		return false
-	}
-}
-
-// Given a VTType, resolve its AST using its own env if present; otherwise use fallback.
-func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
-	if v.Tag != VTType {
-		return S{"id", "Any"}
-	}
-	tv := v.Data.(*TypeValue)
-	env := tv.Env
-	if env == nil {
-		env = fallback
-	}
-	return ip.resolveType(tv.Ast, env)
-}
-
-// "A -> B -> C -> A" using pretty names instead of full canonical specs.
-func joinCyclePath(stack []string, again string) string {
-	i := 0
-	for idx, s := range stack {
-		if s == again {
-			i = idx
-			break
-		}
-	}
-	chain := append(stack[i:], again)
-	out := make([]string, len(chain))
-	for k, s := range chain {
-		out[k] = prettySpec(s)
-	}
-	return strings.Join(out, " -> ")
-}
-
-// expectAST extracts an S-expression from a VTHandle("ast", ...).
-// Fails with a friendly runtime error instead of panicking on bad inputs.
-func expectAST(v Value, where string) S {
-	if v.Tag != VTHandle {
-		fail(where + ": body must be an AST handle")
-	}
-	hd, _ := v.Data.(*Handle)
-	if hd == nil || hd.Kind != "ast" {
-		fail(where + ": body must be an AST handle")
-	}
-	s, ok := hd.Data.(S)
-	if !ok {
-		fail(where + ": AST payload corrupt")
-	}
-	return s
-}
-
-// nativeMakeModule is the implementation of the __make_module primitive.
-//
-// UNIFORM CACHING & CYCLE DETECTION LIVE HERE.
-// This ensures AST/Code/File/inline constructions all behave the same.
-//
-// It receives:
-//   - name: Str   — the **canonical identity** for the module (NOT overwritten).
-//   - body: Type  — AST for the module body wrapped as a type value.
-//   - base: [Int] — absolute NodePath indicating where the body lives in the
-//     caller’s SourceRef; used to re-root spans to the body.
-//
-// Plumbing:
-//   - We build a child SourceRef with PathBase=base so VM marks and PC→(line,col)
-//     map into the module body text.
-//   - Runtime errors are rethrown with exact location using panicRt, so they
-//     bubble to runTopWithSource and render a single caret at the true site.
-//
-// Concurrency note: module load state (ip.modules, ip.loadStack) belongs to a
-// single Interpreter isolate. Do not share the same Interpreter across goroutines.
-func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
-	nameV := ctx.Arg("name")
-	bodyV := ctx.Arg("body")
-	baseV := ctx.Arg("base")
-
-	if nameV.Tag != VTStr {
-		fail("module name must be a string")
-	}
-	canon := nameV.Data.(string)
-
-	// ---- Uniform cycle detection (stack + in-progress record) ----
-	for _, s := range ip.loadStack {
-		if s == canon {
-			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon)))
-		}
-	}
-	if ip.modules != nil {
-		if rec, ok := ip.modules[canon]; ok && rec.state == modLoading {
-			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(append(ip.loadStack, canon), canon)))
-		}
-	}
-
-	// ---- Uniform caching (success-only) ----
-	if ip.modules != nil {
-		if rec, ok := ip.modules[canon]; ok && rec.state == modLoaded && rec.mod != nil {
-			return Value{Tag: VTModule, Data: rec.mod}
-		}
-	} else {
-		ip.modules = map[string]*moduleRec{}
-	}
-
-	// Mark as loading and push on stack.
-	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
-	ip.loadStack = append(ip.loadStack, canon)
-
-	// Ensure we never leave a stale modLoading record or a stuck stack entry.
-	// On panic/failure, delete the cache record; always pop loadStack.
-	defer func() {
-		// Pop load stack
-		if n := len(ip.loadStack); n > 0 {
-			ip.loadStack = ip.loadStack[:n-1]
-		}
-		// If not successfully flipped to modLoaded, remove the half-built record.
-		if rec, ok := ip.modules[canon]; ok && rec.state != modLoaded {
-			delete(ip.modules, canon)
-		}
-		// Preserve existing error semantics.
-		if r := recover(); r != nil {
-			panic(r)
-		}
-	}()
-
-	// ---- Decode body AST and base path ----
-	bodyAst := expectAST(bodyV, "__make_module")
-
-	// Decode absolute base path from [Int]
-	var base NodePath
-	if baseV.Tag == VTArray {
-		xs := baseV.Data.(*ArrayObject).Elems
-		base = make(NodePath, 0, len(xs))
-		for _, v := range xs {
-			if v.Tag != VTInt {
-				fail("internal error: module base path must be [Int]")
-			}
-			base = append(base, int(v.Data.(int64)))
-		}
-	}
-
-	// Fresh env for the module using a fast snapshot of the pre-seeded Base.
-	modBase := ip.newBaseFromTemplate()
-	// User frame for the module (exports come from here). Allow overwriting into Base.
-	modEnv := NewEnv(modBase)
-
-	// SourceRef rooted at the module BODY path (absolute)
-	var sr *SourceRef
-	if ip.currentSrc != nil {
-		// Compose any existing PathBase with the module's absolute body path.
-		sr = &SourceRef{
-			Name:     ip.currentSrc.Name,
-			Src:      ip.currentSrc.Src,
-			Spans:    ip.currentSrc.Spans, // keep full index; marks are absolute
-			PathBase: append(NodePath(nil), base...),
-		}
-	}
-
-	// JIT + run (like runTopWithSource, but we handle errors to avoid re-wrap)
-	ch := ip.jitTop(bodyAst, sr)
-
-	prev := ip.currentSrc
-	ip.currentSrc = ch.Src
-	res := ip.runChunk(ch, modEnv, 0)
-	ip.currentSrc = prev
-
-	switch res.status {
-	case vmOK, vmReturn:
-		// ok
-	case vmRuntimeError:
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		msg := res.value.Annot
-		if msg == "" {
-			msg = "runtime error"
-		}
-		// Rethrow as structured inner-source error (single caret at true site).
-		panicRt(msg, ch.Src, line, col)
-	default:
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		panicRt("unknown VM status", ch.Src, line, col)
-	}
-
-	// Snapshot exports
-	mo := buildModuleMap(modEnv)
-	m := &Module{Name: canon, Map: mo, Env: modEnv}
-
-	// Commit cache (success-only)
-	rec := ip.modules[canon]
-	rec.mod = m
-	rec.env = modEnv
-	rec.state = modLoaded
-	rec.err = nil
-
-	return Value{Tag: VTModule, Data: m}
-}
-
-=== END FILE: ./mindscript/interpreter_ops.go ===
-
-=== BEGIN FILE: ./mindscript/interpreter_exec.go ===
-// interpreter_exec.go — PRIVATE: execution & call engine for MindScript.
-//   - Parses source (via lexer/parser), compiles S-expr → bytecode (via emitter),
-//     runs on the VM, and **bubbles unified hard errors (*Error) without formatting**.
-//   - Implements function application, currying, and native-call scoping.
-//   - No exported identifiers here. The public facade lives in interpreter.go.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// MARKING PLAN (PRECISE CARETS)
-// =============================
-//
-// We make runtime caret locations precise and predictable by aligning VM marks
-// with parser spans.
-//
-// Invariants
-// ----------
-//  1. **1:1 Node ↔ Span (parser)** — the parser records exactly one Span per AST
-//     node (every subexpression has a node and a span).
-//  2. **1:1 Node ↔ Mark (emitter)** — the emitter records **exactly one** PCMark
-//     for every AST node it emits code for. (Nodes that truly produce no code do
-//     not get a mark unless they are direct failure targets.)
-//  3. **Monotonic marks** — marks are appended in bytecode order with PC=here().
-//  4. **No late parent marks** — once we place a child’s mark immediately before
-//     a failure-prone instruction, we must not emit a parent/sibling mark before
-//     that instruction executes.
-//  5. **Correct PathBase** — chunks compiled for function bodies / module bodies
-//     carry a SourceRef whose PathBase points at the body’s absolute AST path,
-//     so marks inside map to the right spans.
-//
-// Placement Rules (authoritative)
-// -------------------------------
-//   - **Identifiers**: mark the identifier node **right before** opLoadGlobal.
-//   - **Unary** (-, not): mark the operand **right before** the opcode.
-//   - **Binary** (-,*,/,%, <,<=,>,>=, ==, !=): emit LHS, then RHS; mark the **RHS**
-//     **right before** the arithmetic/compare opcode (or before the builtin CALL
-//     for '+', which lowers to __plus).
-//   - **Calls**: evaluate callee (no mark). For each argument:
-//     1) emit arg code
-//     2) mark the **arg node** **right before** `opCall 1`
-//     3) emit `opCall 1`
-//     For zero-arg call: mark the **callee** right before `opCall 0`.
-//   - **Property** (`obj.name`): emit obj, mark the **property token** right before
-//     `opGetProp`.
-//   - **Index** (`obj[idx]`): emit obj then idx; mark the **idx node** right before
-//     `opGetIdx`.
-//   - **if / while gates**: mark the **tested condition node** right before
-//     `opJumpIfFalse`.
-//   - **Blocks**: never emit a parent mark between a child’s mark and its failing
-//     instruction. No extra block-level mark is needed. **Important:** child
-//     paths must use the **original AST child index** (do not compact after
-//     skipping noopish children), to keep NodePath ↔ Span alignment.
-//   - **Annotations**: attribute errors to the **subject** node (not the wrapper).
-//     For `#(doc) (lhs = rhs)`, we mark the **LHS** before the assignment call.
-//   - **for**: the iterator expression is marked once at the `__to_iter(iterExpr)`
-//     call site. We do not duplicate a mark at the loop head.
-//
-// NOTE: These rules ensure that the VM’s “last mark with PC ≤ failingPC” picks
-// the blameworthy child.
-//
-// Error policy (unchanged)
-// ------------------------
-//   - Soft errors → annotated-null Values.
-//   - Hard errors → *Error {Kind, Msg, Src, Line, Col} bubbled up; formatting only
-//     at the public API surface.
-package mindscript
-
-import (
-	"fmt"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                          PRIVATE EXEC FACADE (to API)
-////////////////////////////////////////////////////////////////////////////////
-
-type execImpl struct{ ip *Interpreter }
-
-func newExec(ip *Interpreter) execCore { return &execImpl{ip: ip} }
-
-// evalSource parses + evaluates in the provided env (fresh or persistent).
-// Returns Value on success; on hard failure returns a *Error with Src attached.
-// No pretty printing here.
-func (x *execImpl) evalSource(src string, env *Env) (Value, error) {
-	ast, spans, err := ParseSExprWithSpans(src)
-	if err != nil {
-		if e, ok := err.(*Error); ok && e.Src == nil {
-			e.Src = &SourceRef{Name: "<main>", Src: src, Spans: spans}
-		}
-		return Value{}, err
-	}
-	sr := &SourceRef{Name: "<main>", Src: src, Spans: spans}
-	return x.ip.runTopWithSource(ast, env, false, sr)
-}
-
-// evalAST evaluates an AST in the provided env.
-// No pretty printing here.
-func (x *execImpl) evalAST(ast S, env *Env) (Value, error) {
-	return x.ip.runTopWithSource(ast, env, false, nil)
-}
-
-func (x *execImpl) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
-	return x.ip.applyArgsScoped(fn, args, callSite)
-}
-
-func (x *execImpl) funMeta(fn Value) (Callable, bool) {
-	if fn.Tag != VTFun {
-		return nil, false
-	}
-	return &funCallable{f: fn.Data.(*Fun), doc: fn.Annot}, true
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                      CORE EXECUTION PLUMBING (PRIVATE)
-////////////////////////////////////////////////////////////////////////////////
-
-// runWithTrampoline centralizes fatal error handling for top-level runs.
-// It converts panics and structured runtime errors into either an annotated-null
-// Value (when uncaught==true) or a *Error with caret information.
-func (ip *Interpreter) runWithTrampoline(
-	sr *SourceRef,
-	uncaught bool,
-	run func() Value,
-) (out Value, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			switch sig := r.(type) {
-			case *Error:
-				if uncaught {
-					out, err = annotNull(sig.Msg), nil
-					return
-				}
-				if sig.Src == nil {
-					sig.Src = sr
-				}
-				err = sig
-				out = Value{}
-			case rtErr:
-				srcRef := sig.src
-				if srcRef == nil {
-					srcRef = sr
-				}
-				line, col := sig.line, sig.col
-				if line <= 0 || col <= 0 {
-					line, col = ip.sourcePosFromChunk(nil, srcRef, 0)
-				}
-				if uncaught {
-					out, err = annotNull(sig.msg), nil
-					return
-				}
-				err = &Error{Kind: DiagRuntime, Msg: sig.msg, Src: srcRef, Line: line, Col: col}
-				out = Value{}
-			case error:
-				msg := sig.Error()
-				if uncaught {
-					out, err = annotNull(msg), nil
-					return
-				}
-				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = &Error{Kind: DiagRuntime, Msg: msg, Src: sr, Line: line, Col: col}
-				out = Value{}
-			default:
-				msg := fmt.Sprintf("runtime panic: %v", r)
-				if uncaught {
-					out, err = annotNull(msg), nil
-					return
-				}
-				line, col := ip.sourcePosFromChunk(nil, sr, 0)
-				err = &Error{Kind: DiagRuntime, Msg: msg, Src: sr, Line: line, Col: col}
-				out = Value{}
-			}
-		}
-	}()
-
-	out = run()
-	return out, nil
-}
-
-func (ip *Interpreter) runTopWithSource(ast S, env *Env, uncaught bool, sr *SourceRef) (Value, error) {
-
-	// Debug spans.
-	if DebuggingMode {
-		_ = VerifySpanIndexPostOrder(ast, sr, 40, nil)
-	}
-
-	return ip.runWithTrampoline(sr, uncaught, func() Value {
-		ch := ip.jitTop(ast, sr)
-		prev := ip.currentSrc
-		ip.currentSrc = ch.Src
-		res := ip.runChunk(ch, env, 0)
-		ip.currentSrc = prev
-
-		switch res.status {
-		case vmOK, vmReturn:
-			return res.value
-		case vmRuntimeError:
-			if uncaught {
-				return res.value
-			}
-			line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-			msg := res.value.Annot
-			if msg == "" {
-				msg = "runtime error"
-			}
-			// Bubble as *Error; trampoline will convert to API-level (Value, error).
-			panic(&Error{Kind: DiagRuntime, Msg: msg, Src: ch.Src, Line: line, Col: col})
-		default:
-			if uncaught {
-				return errNull("unknown VM status")
-			}
-			line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-			panic(&Error{Kind: DiagRuntime, Msg: "unknown VM status", Src: ch.Src, Line: line, Col: col})
-		}
-	})
-}
-
-// Build a one-off top-level function body and ensure it is compiled.
-func (ip *Interpreter) jitTop(ast S, sr *SourceRef) *Chunk {
-	f := &Fun{ReturnType: S{"id", "Any"}, Body: ast, Src: sr}
-	ip.ensureChunkWithSource(f, sr)
-	return f.Chunk
-}
-
-func (ip *Interpreter) ensureChunkWithSource(f *Fun, sr *SourceRef) {
-	if f.Chunk != nil || f.NativeName != "" || f.IsOracle {
-		return
-	}
-	em := newEmitter(ip, sr)
-	em.emitFunBody(f.Body)
-	ch := em.chunk()
-	ch.Src = sr
-	f.Chunk = ch
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                    CALL ENGINE: APPLY / CURRY / EXECUTE
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) applyArgsScoped(fn Value, args []Value, callSite *Env) Value {
-	if fn.Tag != VTFun {
-		fail("not a function")
-	}
-	f := fn.Data.(*Fun)
-
-	if len(args) == 0 {
-		switch len(f.Params) {
-		case 0:
-			return ip.execFunBodyScoped(fn, callSite)
-		case 1:
-			if ip.isType(Null, f.ParamTypes[0], f.Env) {
-				return ip.applyOneScoped(fn, Null, callSite)
-			}
-			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
-		default:
-			fail(fmt.Sprintf("arity mismatch: expected %d, got 0", len(f.Params)))
-		}
-	}
-
-	cur := fn
-	for i := 0; i < len(args); i++ {
-		cur = ip.applyOneScoped(cur, args[i], callSite)
-		if i < len(args)-1 && cur.Tag != VTFun {
-			fail("too many arguments")
-		}
-	}
-	return cur
-}
-
-func (ip *Interpreter) applyOneScoped(fnVal Value, arg Value, callSite *Env) Value {
-	if fnVal.Tag != VTFun {
-		fail("not a function")
-	}
-	f := fnVal.Data.(*Fun)
-
-	if len(f.Params) == 0 {
-		res := ip.execFunBodyScoped(fnVal, callSite)
-		if res.Tag != VTFun {
-			fail("too many arguments")
-		}
-		return ip.applyOneScoped(res, arg, callSite)
-	}
-
-	paramName := f.Params[0]
-	paramType := f.ParamTypes[0]
-	if !ip.isType(arg, paramType, f.Env) {
-		exp := FormatType(paramType)
-		got := FormatType(ip.ValueToType(arg, f.Env))
-		fail(fmt.Sprintf("type mismatch in parameter '%s': expected %s, got %s",
-			paramName, exp, got))
-	}
-
-	parent := f.Env
-	if f.NativeName != "" && callSite != nil {
-		if f.Env == nil || f.Env == ip.Core {
-			parent = callSite
-		}
-	}
-	callEnv := NewEnv(parent)
-	callEnv.Define(paramName, arg)
-
-	if len(f.Params) > 1 {
-		next := FunVal(&Fun{
-			Params:     append([]string{}, f.Params[1:]...),
-			ParamTypes: append([]S{}, f.ParamTypes[1:]...),
-			ReturnType: f.ReturnType,
-			Body:       f.Body,
-			Env:        callEnv,
-			HiddenNull: f.HiddenNull,
-			Chunk:      f.Chunk,
-			NativeName: f.NativeName,
-			Src:        f.Src,
-			IsOracle:   f.IsOracle,
-			Examples:   f.Examples,
-			Sig:        f.Sig, // preserve original declaration signature across currying
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "presence_penalty") and num(eff.presence_penalty) != null then
+			body.presence_penalty = num(eff.presence_penalty)
+		end
+		if mapHas(eff, "frequency_penalty") and num(eff.frequency_penalty) != null then
+			body.frequency_penalty = num(eff.frequency_penalty)
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_output_tokens = int(num(eff.max_tokens))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/responses",
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer " + self.state.apiKey
+			},
+			body: jsonStringify(body)
 		})
-		next.Annot = fnVal.Annot
-		return next
-	}
-
-	execFun := &Fun{
-		Params:     nil,
-		ParamTypes: append([]S(nil), f.ParamTypes...),
-		ReturnType: f.ReturnType,
-		Body:       f.Body,
-		Env:        callEnv,
-		HiddenNull: f.HiddenNull,
-		Chunk:      f.Chunk,
-		NativeName: f.NativeName,
-		IsOracle:   f.IsOracle,
-		Examples:   f.Examples,
-		Src:        f.Src,
-		Sig:        f.Sig, // preserve for execution
-	}
-	execVal := FunVal(execFun)
-	execVal.Annot = fnVal.Annot
-	return ip.execFunBodyScoped(execVal, callSite)
-}
-
-func (ip *Interpreter) execFunBodyScoped(funVal Value, callSite *Env) Value {
-	if funVal.Tag != VTFun {
-		fail("not a function")
-	}
-	f := funVal.Data.(*Fun)
-
-	if f.NativeName != "" {
-		impl, ok := ip.native[f.NativeName]
-		if !ok {
-			fail(fmt.Sprintf("unknown native %q", f.NativeName))
-		}
-		scope := withScope(f.Env, callSite)
-		prev := ip.currentSrc
-		if f.Src != nil {
-			ip.currentSrc = f.Src
-		}
-		res := impl(ip, &callCtx{argEnv: f.Env, scope: scope})
-		ip.currentSrc = prev
-		if !ip.isType(res, f.ReturnType, f.Env) {
-			exp := FormatType(f.ReturnType)
-			got := FormatType(ip.ValueToType(res, f.Env))
-			fail(fmt.Sprintf("return type mismatch: expected %s, got %s", exp, got))
-		}
-		return res
-	}
-
-	if f.IsOracle {
-		scope := withScope(f.Env, callSite)
-		ctx := &callCtx{argEnv: f.Env, scope: scope}
-		return ip.execOracle(funVal, ctx)
-	}
-
-	ip.ensureChunkWithSource(f, f.Src)
-	prev := ip.currentSrc
-	if f.Src != nil {
-		ip.currentSrc = f.Src
-	}
-	res := ip.runChunk(f.Chunk, f.Env, 0)
-	ip.currentSrc = prev
-
-	switch res.status {
-	case vmOK, vmReturn:
-		if !ip.isType(res.value, f.ReturnType, f.Env) {
-			exp := FormatType(f.ReturnType)
-			got := FormatType(ip.ValueToType(res.value, f.Env))
-			line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
-			panicRt(fmt.Sprintf("return type mismatch: expected %s, got %s", exp, got), f.Src, line, col)
-		}
-		return res.value
-	case vmRuntimeError:
-		line, col := ip.sourcePosFromChunk(f.Chunk, f.Src, res.pc)
-		panicRt(res.value.Annot, f.Src, line, col)
-		return errNull("unreachable")
-	default:
-		return errNull("unknown VM status")
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                      SOURCE MAPPING (PC → (line, col))
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) sourcePosFromChunk(ch *Chunk, sr *SourceRef, pc int) (int, int) {
-	// Single debug hook
-	if DebuggingMode {
-		dumpSourcePosDebug(ch, sr, pc)
-	}
-
-	src := ""
-	if sr != nil {
-		src = sr.Src
-	}
-
-	// Early fallback if we don't have enough info
-	if ch == nil || sr == nil || sr.Spans == nil || len(ch.Marks) == 0 || src == "" {
-		return 1, 1
-	}
-
-	// Pick the last mark with PC <= failing PC
-	i := -1
-	for j := range ch.Marks {
-		if ch.Marks[j].PC <= pc {
-			i = j
-		} else {
-			break
-		}
-	}
-	if i < 0 {
-		return 1, 1
-	}
-
-	tryPath := func(p NodePath) (int, int, bool) {
-		for cut := len(p); cut >= 0; cut-- {
-			sub := p[:cut]
-			if sp, ok := sr.Spans.Get(sub); ok {
-				line, col := offsetToLineCol(src, sp.StartByte)
-				return line, col, true
-			}
-		}
-		return 1, 1, false
-	}
-
-	// Try the best mark's path
-	if line, col, ok := tryPath(ch.Marks[i].Path); ok {
-		return line, col
-	}
-
-	// Walk earlier marks backwards
-	for k := i - 1; k >= 0; k-- {
-		if line, col, ok := tryPath(ch.Marks[k].Path); ok {
-			return line, col
-		}
-	}
-
-	return 1, 1
-}
-
-// withScope returns override if non-nil (use the call-site env for effects),
-// otherwise it returns parent (the function's closure env).
-func withScope(parent, override *Env) *Env {
-	if override != nil {
-		return override
-	}
-	return parent
-}
-
-func offsetToLineCol(src string, off int) (int, int) {
-	if off < 0 {
-		return 1, 1
-	}
-	line, col := 1, 1
-	i := 0
-	for i < len(src) && i < off {
-		if src[i] == '\n' {
-			line++
-			col = 1
-			i++
-			continue
-		}
-		col++
-		i++
-	}
-	return line, col
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                 PRIVATE ADAPTERS: Callable / CallCtx impls
-////////////////////////////////////////////////////////////////////////////////
-
-type funCallable struct {
-	f   *Fun
-	doc string
-}
-
-func (c *funCallable) Arity() int { return len(c.f.Params) }
-func (c *funCallable) ParamSpecs() []ParamSpec {
-	ps := make([]ParamSpec, len(c.f.Params))
-	for i := range c.f.Params {
-		ps[i] = ParamSpec{Name: c.f.Params[i], Type: c.f.ParamTypes[i]}
-	}
-	return ps
-}
-func (c *funCallable) ReturnType() S    { return c.f.ReturnType }
-func (c *funCallable) Doc() string      { return c.doc }
-func (c *funCallable) ClosureEnv() *Env { return c.f.Env }
-
-type callCtx struct {
-	argEnv *Env
-	scope  *Env
-}
-
-func (c *callCtx) Arg(name string) Value {
-	if v, err := c.argEnv.Get(name); err == nil {
-		return v
-	}
-	fail("missing argument: " + name)
-	return Null
-}
-func (c *callCtx) Env() *Env { return c.scope }
-
-////////////////////////////////////////////////////////////////////////////////
-//                             EMITTER (AST → BYTECODE)
-////////////////////////////////////////////////////////////////////////////////
-
-type emitter struct {
-	ip        *Interpreter
-	code      []uint32
-	consts    []Value
-	ctrlStack []ctrlCtx
-
-	// Source mapping
-	src       *SourceRef
-	marks     []PCMark
-	path      NodePath
-	rootDepth int
-}
-
-type ctrlCtx struct {
-	isLoop     bool
-	breakJumps []int
-	contJumps  []int
-}
-
-func newEmitter(ip *Interpreter, src *SourceRef) *emitter {
-	e := &emitter{ip: ip, src: src}
-	if src != nil && len(src.PathBase) > 0 {
-		e.path = append(e.path, src.PathBase...)
-	}
-	// Record depth at chunk root; root "block" executes in provided Env,
-	// nested blocks get their own Env via PushEnv/PopEnv.
-	e.rootDepth = len(e.path)
-	return e
-}
-
-func (e *emitter) inRootBlock() bool { return len(e.path) == e.rootDepth }
-
-// ---------------------- mark helpers (centralized) ---------------------------
-
-// Emit a mark for an absolute AST path immediately before a failure-prone opcode.
-// NOTE: Marks MUST be appended immediately before the instruction that can fail
-// because of that path. Do NOT emit any other mark until that instruction.
-func (e *emitter) markHereFor(abs NodePath) {
-	e.marks = append(e.marks, PCMark{PC: e.here(), Path: append(NodePath(nil), abs...)})
-}
-
-// Mark the current node (rare; for node-level blame).
-func (e *emitter) markSelf() { e.markHereFor(append(NodePath(nil), e.path...)) }
-
-// Mark a direct child index under the current node.
-func (e *emitter) markChild(childIdx int) {
-	e.markHereFor(append(append(NodePath(nil), e.path...), childIdx))
-}
-
-// Wrappers that enforce "mark immediately before opcode" ordering.
-func (e *emitter) emitWithMarkChild(op opcode, childIdx int, imm uint32) {
-	e.markChild(childIdx)
-	e.emit(op, imm)
-}
-func (e *emitter) callWithMarkChild(argc int, childIdx int) {
-	e.markChild(childIdx)
-	e.emit(opCall, uint32(argc))
-}
-
-// ----------------------------------------------------------------------------
-
-func equalConst(a, b Value) bool {
-	if a.Tag != b.Tag {
-		return false
-	}
-	switch a.Tag {
-	case VTNull:
-		return true
-	case VTBool:
-		return a.Data.(bool) == b.Data.(bool)
-	case VTInt:
-		return a.Data.(int64) == b.Data.(int64)
-	case VTNum:
-		return a.Data.(float64) == b.Data.(float64)
-	case VTStr:
-		return a.Data.(string) == b.Data.(string)
-	case VTArray, VTMap, VTFun, VTType, VTModule, VTHandle:
-		// For const-pool purposes you usually don't intern compound values;
-		// fall back to pointer/identity if you really need it:
-		return &a == &b
-	default:
-		return false
-	}
-}
-
-func (e *emitter) k(v Value) uint32 {
-	for i := range e.consts {
-		if equalConst(e.consts[i], v) { // <-- use strict equality here
-			return uint32(i)
-		}
-	}
-	e.consts = append(e.consts, v)
-	return uint32(len(e.consts) - 1)
-}
-func (e *emitter) ks(s string) uint32         { return e.k(Str(s)) }
-func (e *emitter) emit(op opcode, imm uint32) { e.code = append(e.code, pack(op, imm)) }
-func (e *emitter) patch(at int, to int)       { e.code[at] = pack(uop(e.code[at]), uint32(to)) }
-func (e *emitter) here() int                  { return len(e.code) }
-func (e *emitter) chunk() *Chunk {
-	return &Chunk{Code: e.code, Consts: e.consts, Marks: e.marks, Src: e.src}
-}
-
-func (e *emitter) pushBlockCtx() { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: false}) }
-func (e *emitter) pushLoopCtx()  { e.ctrlStack = append(e.ctrlStack, ctrlCtx{isLoop: true}) }
-func (e *emitter) popCtx() ctrlCtx {
-	i := len(e.ctrlStack) - 1
-	c := e.ctrlStack[i]
-	e.ctrlStack = e.ctrlStack[:i]
-	return c
-}
-func (e *emitter) addBreakJump(at int) {
-	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
-		if e.ctrlStack[i].isLoop {
-			c := e.ctrlStack[i]
-			c.breakJumps = append(c.breakJumps, at)
-			e.ctrlStack[i] = c
-			return
-		}
-	}
-	i := len(e.ctrlStack) - 1
-	c := e.ctrlStack[i]
-	c.breakJumps = append(c.breakJumps, at)
-	e.ctrlStack[i] = c
-}
-func (e *emitter) addContJump(at int) {
-	for i := len(e.ctrlStack) - 1; i >= 0; i-- {
-		if e.ctrlStack[i].isLoop {
-			c := e.ctrlStack[i]
-			c.contJumps = append(c.contJumps, at)
-			e.ctrlStack[i] = c
-			return
-		}
-	}
-	i := len(e.ctrlStack) - 1
-	c := e.ctrlStack[i]
-	c.contJumps = append(c.contJumps, at)
-	e.ctrlStack[i] = c
-}
-
-// helpers for loops/blocks persisting "last" value
-func (e *emitter) preloadAssignToLast(lastName string) {
-	e.emit(opLoadGlobal, e.ks("__assign_set"))
-	// Preload the lvalue pattern (("id", lastName)) as AST handle. No call yet.
-	e.emit(opConst, e.k(HandleVal("ast", S{"id", lastName})))
-}
-
-func (e *emitter) saveLastAndJumpHead(head int) {
-	e.emit(opCall, 2)
-	e.emit(opPop, 0)
-	e.emit(opJump, uint32(head))
-}
-func (e *emitter) patchGateAndSaveLast(jumps []int, gate int) {
-	for _, at := range jumps {
-		e.patch(at, gate)
-	}
-	e.emit(opCall, 2)
-	e.emit(opPop, 0)
-}
-
-// Child path scaffolding
-func (e *emitter) withChild(childIdx int, f func()) {
-	e.path = append(e.path, childIdx)
-	f()
-	e.path = e.path[:len(e.path)-1]
-}
-
-// Builtin call (no automatic marks; callers place marks per plan).
-func (e *emitter) callBuiltin(name string, args ...S) {
-	e.emit(opLoadGlobal, e.ks(name))
-	for _, a := range args {
-		e.emitExpr(a)
-	}
-	e.emit(opCall, uint32(len(args)))
-}
-
-// callBuiltinV calls a Core builtin with constant Value arguments.
-// Use this only when *all* arguments are constants you can encode now.
-func (e *emitter) callBuiltinV(name string, args ...Value) {
-	e.emit(opLoadGlobal, e.ks(name))
-	for _, v := range args {
-		e.emit(opConst, e.k(v))
-	}
-	e.emit(opCall, uint32(len(args)))
-}
-
-func (e *emitter) emitMakeFun(params S, retT S, bodyCarrier S, isOracle bool, examples S, basePath NodePath) {
-	namesArr := make([]Value, 0, max(0, len(params)-1))
-	for i := 1; i < len(params); i++ {
-		p := params[i].(S)
-		if len(p) == 0 || p[0].(string) != "pair" {
-			continue
-		}
-		namesArr = append(namesArr, Str(p[1].(S)[1].(string)))
-	}
-	if len(retT) == 0 {
-		retT = S{"id", "Any"}
-	}
-	e.emit(opLoadGlobal, e.ks("__make_fun"))
-	for _, v := range namesArr {
-		e.emit(opConst, e.k(v))
-	}
-	e.emit(opMakeArr, uint32(len(namesArr)))
-
-	// Build the param types at runtime via ("type", …) so they capture env.
-	typeCount := 0
-	for i := 1; i < len(params); i++ {
-		p := params[i].(S)
-		if len(p) == 0 || p[0].(string) != "pair" {
-			continue
-		}
-		t := p[2].(S) // may be empty
-		if len(t) == 0 {
-			t = S{"id", "Any"}
-		}
-		e.emitExpr(S{"type", t})
-		typeCount++
-	}
-	e.emit(opMakeArr, uint32(typeCount))
-
-	// Return type (env-pinned) and BODY as AST handle
-	e.emitExpr(S{"type", retT})
-	e.emit(opConst, e.k(HandleVal("ast", bodyCarrier)))
-
-	e.emit(opConst, e.k(Bool(isOracle)))
-	e.emitExpr(examples)
-	for _, idx := range basePath {
-		e.emit(opConst, e.k(Int(int64(idx))))
-	}
-	e.emit(opMakeArr, uint32(len(basePath)))
-	e.emit(opCall, 7)
-}
-
-func (e *emitter) emitFunBody(body S) {
-	e.emitExpr(body)
-	e.emit(opReturn, 0)
-}
-
-// Emit an expression node following the precise mark rules.
-func (e *emitter) emitExpr(n S) {
-	if len(n) == 0 {
-		e.emit(opConst, e.k(Null))
-		return
-	}
-
-	switch n[0].(string) {
-
-	// ----- literals / ids -----
-	case "int":
-		e.emit(opConst, e.k(Int(n[1].(int64))))
-	case "num":
-		e.emit(opConst, e.k(Num(n[1].(float64))))
-	case "str":
-		e.emit(opConst, e.k(Str(n[1].(string))))
-	case "bool":
-		e.emit(opConst, e.k(Bool(n[1].(bool))))
-	case "noop":
-		// ignore
-	case "null":
-		e.emit(opConst, e.k(Null))
-
-	case "id":
-		// Identifier load can fail → mark the id right before opLoadGlobal.
-		e.markSelf()
-		e.emit(opLoadGlobal, e.ks(n[1].(string)))
-
-	// ----- blocks -----
-	case "block":
-		// Root block (whole chunk) executes directly in the provided Env.
-		// Nested blocks get their own lexical Env via PushEnv/PopEnv.
-		isRoot := e.inRootBlock()
-		if !isRoot {
-			e.emit(opPushEnv, 0)
-		}
-
-		e.pushBlockCtx()
-		emitted := 0
-		for j := 1; j < len(n); j++ {
-			child := n[j].(S)
-			if isNoopish(child) {
-				continue
-			}
-			if emitted > 0 {
-				e.emit(opPop, 0)
-			}
-			origIdx := j - 1 // original AST child index
-			e.withChild(origIdx, func() { e.emitExpr(child) })
-			emitted++
-		}
-		if emitted == 0 {
-			e.emit(opConst, e.k(Null))
-		}
-		exit := e.here()
-		ctx := e.popCtx()
-		for _, at := range ctx.breakJumps {
-			e.patch(at, exit)
-		}
-		for _, at := range ctx.contJumps {
-			e.patch(at, exit)
-		}
-		if !isRoot {
-			// Pop the lexical Env for this block, leaving the block's
-			// value on the stack (PopEnv only touches Env, not stack).
-			e.emit(opPopEnv, 0)
-		}
-
-	// ----- flow: break / continue -----
-	case "break":
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		at := e.here()
-		e.emit(opJump, 0)
-		e.addBreakJump(at)
-	case "continue":
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		at := e.here()
-		e.emit(opJump, 0)
-		e.addContJump(at)
-
-	// ----- unary -----
-	case "unop":
-		op := n[1].(string)
-		if op == "?" {
-			e.emit(opConst, e.k(errNull("postfix '?' invalid here")))
-			return
-		}
-		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-		// Mark operand right before opcode.
-		switch op {
-		case "not":
-			e.emitWithMarkChild(opNot, 1, 0)
-		case "-":
-			e.emitWithMarkChild(opNeg, 1, 0)
-		case "~":
-			// bitwise not (unary)
-			e.emitWithMarkChild(opBnot, 1, 0)
-		default:
-			e.emit(opConst, e.k(errNull("unknown unary op")))
-		}
-
-	// ----- binary -----
-	case "binop":
-		op := n[1].(string)
-		if op == "and" || op == "or" {
-			// Short-circuit: mark tested subexpr at the gate.
-			e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-			e.markChild(1)
-			jf := e.here()
-			e.emit(opJumpIfFalse, 0)
-
-			// unified AND/OR short-circuit
-			pre := func() { e.withChild(2, func() { e.emitExpr(n[3].(S)) }) } // RHS
-			post := func() { e.emit(opConst, e.k(Bool(false))) }              // const false
-			if op == "or" {
-				pre, post = func() { e.emit(opConst, e.k(Bool(true))) }, pre // const true, then RHS
-			}
-			pre()
-			jend := e.here()
-			e.emit(opJump, 0)
-			lother := e.here()
-			e.patch(jf, lother)
-			post()
-			lend := e.here()
-			e.patch(jend, lend)
-			return
-		}
-		a, b := n[2].(S), n[3].(S)
-		switch op {
-		case "==":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opEq, 2, 0)
-		case "!=":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opNe, 2, 0)
-		case "+":
-			e.emit(opLoadGlobal, e.ks("__plus"))
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.callWithMarkChild(2, 2)
-		case "-":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opSub, 2, 0)
-		case "*":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opMul, 2, 0)
-		case "/":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opDiv, 2, 0)
-		case "%":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opMod, 2, 0)
-		case "<":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opLt, 2, 0)
-		case "<=":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opLe, 2, 0)
-		case ">":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opGt, 2, 0)
-		case ">=":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opGe, 2, 0)
-		case "**":
-			// exponentiation
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opPow, 2, 0)
-		case "&":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opBand, 2, 0)
-		case "|":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opBor, 2, 0)
-		case "^":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opBxor, 2, 0)
-		case "<<":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opShl, 2, 0)
-		case ">>":
-			e.withChild(1, func() { e.emitExpr(a) })
-			e.withChild(2, func() { e.emitExpr(b) })
-			e.emitWithMarkChild(opShr, 2, 0)
-		default:
-			e.emit(opConst, e.k(errNull("unsupported operator")))
-		}
-
-	// ----- assignment -----
-	case "assign":
-		lhs := n[1].(S)
-		opName := "__assign_set"
-		pat := lhs
-		if len(lhs) > 0 && lhs[0].(string) == "let" {
-			opName = "__assign_def"
-			// Declarative assignment: ("let", P) on the LHS.
-			pat = lhs[1].(S)
-		}
-		e.emit(opLoadGlobal, e.ks(opName))
-		// Pass the **pattern** as a pure AST handle (no leading "let").
-		e.emit(opConst, e.k(HandleVal("ast", pat)))
-		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-		// Attribute assignment target errors to LHS: mark child #0 right before the CALL.
-		e.callWithMarkChild(2, 0)
-
-	case "let":
-		// Declaration-only:
-		//   let P
-		// lowers to:
-		//   __declare_pattern(<AST pattern P>)
-		e.emit(opLoadGlobal, e.ks("__declare_pattern"))
-		e.emit(opConst, e.k(HandleVal("ast", n[1].(S))))
-		e.markChild(0)
-		e.emit(opCall, 1)
-
-	// ----- arrays / maps -----
-	case "array":
-		emitted := 0
-		for i := 1; i < len(n); i++ {
-			child := n[i].(S)
-			if isNoopish(child) {
-				continue
-			}
-			e.withChild(i-1, func() { e.emitExpr(child) })
-			emitted++
-		}
-		e.emit(opMakeArr, uint32(emitted))
-
-	case "map":
-		keys := []S{}
-		vals := []S{}
-		for i := 1; i < len(n); i++ {
-			p := n[i].(S)
-			if len(p) == 0 {
-				continue
-			}
-			tag := p[0].(string)
-			if tag != "pair" && tag != "pair!" {
-				continue
-			}
-			keys = append(keys, p[1].(S))
-			vals = append(vals, p[2].(S))
-		}
-		e.emit(opLoadGlobal, e.ks("__map_from"))
-		for i := 0; i < len(keys); i++ {
-			idx := i
-			e.withChild(idx, func() { e.withChild(0, func() { e.emitExpr(keys[idx]) }) })
-		}
-		e.emit(opMakeArr, uint32(len(keys)))
-		for i := 0; i < len(vals); i++ {
-			idx := i
-			e.withChild(idx, func() { e.withChild(1, func() { e.emitExpr(vals[idx]) }) })
-		}
-		e.emit(opMakeArr, uint32(len(vals)))
-		e.emit(opCall, 2)
-
-	// ----- property / index -----
-	case "get":
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		// Blame the property token (child #1) right before opGetProp.
-		e.emitWithMarkChild(opGetProp, 1, e.ks(n[2].(S)[1].(string)))
-
-	case "idx":
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		e.withChild(1, func() { e.emitExpr(n[2].(S)) })
-		// Blame the index expression (child #1) right before opGetIdx.
-		e.emitWithMarkChild(opGetIdx, 1, 0)
-
-	// ----- call -----
-	case "call":
-		// Evaluate callee once.
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-
-		argc := 0
-		if len(n) == 2 {
-			// Zero-arg call: blame callee right before CALL 0.
-			e.callWithMarkChild(0, 0)
-			return
-		}
-		// Apply args one by one; skip noopish args; blame each emitted arg.
-		for i := 2; i < len(n); i++ {
-			arg := n[i].(S)
-			if isNoopish(arg) {
-				continue
-			}
-			argIdx := i - 1
-			e.withChild(argIdx, func() { e.emitExpr(arg) })
-			e.callWithMarkChild(1, argIdx)
-			argc++
-		}
-		if argc == 0 {
-			// No real arguments after skipping noops → call with 0 args.
-			e.callWithMarkChild(0, 0)
-		}
-		return
-
-	// ----- fun / oracle -----
-	case "fun":
-		// ("fun", params, ret, body) → body child index is 2
-		absBase := append(append(NodePath(nil), e.path...), 2)
-		e.emitMakeFun(n[1].(S), n[2].(S), n[3].(S), false, S{"null"}, absBase)
-	case "oracle":
-		e.withChild(2, func() {
-			e.emitMakeFun(n[1].(S), n[2].(S), S{"oracle"}, true, n[3].(S), nil)
-		})
-
-	// ----- return -----
-	case "return":
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		e.markSelf()
-		e.emit(opReturn, 0)
-
-	// ----- if -----
-	case "if":
-		arms := n[1:]
-		jends := []int{}
-		hasElse := false
-		if len(arms) > 0 {
-			if last, ok := arms[len(arms)-1].(S); ok && last[0].(string) == "block" {
-				hasElse = true
-			}
-		}
-		limit := len(arms)
-		if hasElse {
-			limit--
-		}
-		for i := 0; i < limit; i++ {
-			p := arms[i].(S) // ("pair", cond, thenBlock)
-			// Emit condition; mark the condition node (pair child #0) at the gate.
-			e.withChild(i, func() { e.withChild(0, func() { e.emitExpr(p[1].(S)) }) })
-			condAbs := append(append(NodePath(nil), e.path...), i, 0)
-			e.markHereFor(condAbs)
-			jf := e.here()
-			e.emit(opJumpIfFalse, 0)
-
-			e.withChild(i, func() { e.withChild(1, func() { e.emitExpr(p[2].(S)) }) })
-			jend := e.here()
-			e.emit(opJump, 0)
-			jends = append(jends, jend)
-			e.patch(jf, e.here())
-		}
-		if hasElse {
-			e.withChild(len(arms)-1, func() { e.emitExpr(arms[len(arms)-1].(S)) })
-		} else {
-			e.emit(opConst, e.k(Null))
-		}
-		tail := e.here()
-		for _, at := range jends {
-			e.patch(at, tail)
-		}
-
-	// ----- while -----
-	case "while":
-		cond := n[1].(S)
-		body := n[2].(S)
-
-		lastName := fmt.Sprintf("$last_%d", e.here())
-		// Declare $last_* as a simple identifier binding initialized to null.
-		e.callBuiltinV("__assign_def",
-			HandleVal("ast", S{"id", lastName}),
-			Null,
-		)
-		e.emit(opPop, 0)
-
-		head := e.here()
-		e.withChild(0, func() { e.emitExpr(cond) })
-		// Mark the condition node right before the gate.
-		e.markChild(0)
-		jf := e.here()
-		e.emit(opJumpIfFalse, 0)
-
-		e.preloadAssignToLast(lastName)
-		e.pushLoopCtx()
-		e.withChild(1, func() { e.emitExpr(body) })
-		loopCtx := e.popCtx()
-		e.saveLastAndJumpHead(head)
-
-		lcont := e.here()
-		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
-		e.emit(opJump, uint32(head))
-
-		lbreak := e.here()
-		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
-		jEnd := e.here()
-		e.emit(opJump, 0)
-
-		end := e.here()
-		e.patch(jf, end)
-		e.patch(jEnd, end)
-
-		e.emit(opLoadGlobal, e.ks(lastName))
-
-	// ----- for -----
-	case "for":
-		target := n[1].(S)
-		iterExpr := n[2].(S)
-		body := n[3].(S)
-
-		iterName := fmt.Sprintf("$iter_%d", e.here())
-		// Declare the hidden iterator binding with an AST handle (not a Type).
-		// We'll initialize it immediately with __to_iter(iterExpr) below.
-		e.emit(opLoadGlobal, e.ks("__assign_def"))
-		e.emit(opConst, e.k(HandleVal("ast", S{"id", iterName})))
-
-		// __to_iter(iterExpr); mark the iterExpr (child #1) at this call site.
-		e.emit(opLoadGlobal, e.ks("__to_iter"))
-		e.withChild(1, func() { e.emitExpr(iterExpr) })
-		e.callWithMarkChild(1, 1) // __to_iter(iterExpr)
-		e.emit(opCall, 2)         // assign_def(<AST id>, iterator)
-		e.emit(opPop, 0)
-
-		tmpName := fmt.Sprintf("$tmp_%d", e.here())
-		e.callBuiltinV("__assign_def", HandleVal("ast", S{"id", tmpName}), Null)
-		e.emit(opPop, 0)
-
-		lastName := fmt.Sprintf("$last_%d", e.here())
-		e.callBuiltinV("__assign_def", HandleVal("ast", S{"id", lastName}), Null)
-		e.emit(opPop, 0)
-
-		head := e.here()
-
-		// tmp = iter(Null)
-		e.emit(opLoadGlobal, e.ks("__assign_set"))
-		// lvalue as AST handle
-		e.emit(opConst, e.k(HandleVal("ast", S{"id", tmpName})))
-		e.emit(opLoadGlobal, e.ks(iterName))
-		e.emit(opConst, e.k(Null))
-		e.emit(opCall, 1) // iter(Null)
-		e.emit(opCall, 2) // assign_set(Type(tmp), result)
-		e.emit(opPop, 0)
-
-		// gate: __iter_should_stop(tmp)
-		e.emit(opLoadGlobal, e.ks("__iter_should_stop"))
-		e.emit(opLoadGlobal, e.ks(tmpName))
-		e.emit(opCall, 1)
-		jBody := e.here()
-		e.emit(opJumpIfFalse, 0)
-		jEnd := e.here()
-		e.emit(opJump, 0)
-
-		bodyStart := e.here()
-		e.patch(jBody, bodyStart)
-
-		e.preloadAssignToLast(lastName)
-
-		// For `for` headers, the pattern is always treated as declarative.
-		e.emit(opLoadGlobal, e.ks("__assign_def"))
-
-		e.emit(opConst, e.k(HandleVal("ast", target)))
-		e.emit(opLoadGlobal, e.ks(tmpName))
-		e.emit(opCall, 2)
-		e.emit(opPop, 0)
-
-		e.pushLoopCtx()
-		e.withChild(2, func() { e.emitExpr(body) })
-		loopCtx := e.popCtx()
-
-		e.saveLastAndJumpHead(head)
-
-		lcont := e.here()
-		e.patchGateAndSaveLast(loopCtx.contJumps, lcont)
-		e.emit(opJump, uint32(head))
-
-		lbreak := e.here()
-		e.patchGateAndSaveLast(loopCtx.breakJumps, lbreak)
-		jToEnd := e.here()
-		e.emit(opJump, 0)
-
-		end := e.here()
-		e.patch(jEnd, end)
-		e.patch(jToEnd, end)
-
-		e.emit(opLoadGlobal, e.ks(lastName))
-
-	// ----- type / module / annot -----
-	case "type":
-		// Lower to: __type_from_ast(<handle carrying AST>), pinning env at runtime.
-		e.emit(opLoadGlobal, e.ks("__type_from_ast"))
-		e.emit(opConst, e.k(HandleVal("type-ast", n[1].(S))))
-		// Blame the subject type node (child #0) at the call site.
-		e.markChild(0)
-		e.emit(opCall, 1)
-
-	// ----- type-only surface form seen in value position -----
-	case "enum":
-		// Users wrote Enum[...] as a *value*. Raise a compile-time hard error with a caret on Enum[...] itself.
-		if e.src != nil && e.src.Spans != nil {
-			if sp, ok := e.src.Spans.Get(e.path); ok {
-				line, col := offsetToLineCol(e.src.Src, sp.StartByte)
-				panicRt("Enum[...] is a type expression; wrap it with 'type' to obtain a runtime Type (e.g., type Enum[...]).", e.src, line, col)
-			}
-		}
-		// Fallback if no spans are available (defensive):
-		panicRt("Enum[...] is a type expression; wrap it with 'type' to obtain a runtime Type (e.g., type Enum[...]).", e.src, 1, 1)
-
-	case "module":
-		// Lower to: __make_module(nameExpr, <AST handle>, basePathArray)
-		e.emit(opLoadGlobal, e.ks("__make_module"))
-		e.withChild(0, func() { e.emitExpr(n[1].(S)) })
-		// Pass the module body as a pure AST handle (no env pinning).
-		e.emit(opConst, e.k(HandleVal("ast", n[2].(S))))
-		absBase := append(append(NodePath(nil), e.path...), 1) // ("module", name, body) → body at child #1
-		for _, idx := range absBase {
-			e.emit(opConst, e.k(Int(int64(idx))))
-		}
-		e.emit(opMakeArr, uint32(len(absBase)))
-		e.emit(opCall, 3)
-
-	case "annot":
-		text := n[1].(S)[1].(string)
-		subj := n[2].(S)
-
-		if isNoopish(subj) {
-			return
-		}
-
-		// #(doc) (lhs = rhs)  ==>  lhs = #(doc) rhs
-		if len(subj) > 0 && subj[0].(string) == "assign" {
-			lhs := subj[1].(S)
-			rhs := subj[2].(S)
-			opName := "__assign_set"
-			pat := lhs
-			if len(lhs) > 0 && lhs[0].(string) == "let" {
-				opName = "__assign_def"
-				pat = lhs[1].(S)
-			}
-			e.emit(opLoadGlobal, e.ks(opName))
-			// Bare pattern as AST handle
-			e.emit(opConst, e.k(HandleVal("ast", pat)))
-			e.emit(opLoadGlobal, e.ks("__annotate"))
-			e.emit(opConst, e.k(Str(text)))
-			e.withChild(1, func() { e.withChild(1, func() { e.emitExpr(rhs) }) })
-			e.emit(opCall, 2) // __annotate
-			// Attribute assignment errors to LHS (annot child #1 = assign, its child #0 = lhs).
-			lhsAbs := append(append(NodePath(nil), e.path...), 1, 0)
-			e.markHereFor(lhsAbs)
-			e.emit(opCall, 2) // __assign_*
-			return
-		}
-
-		// LVALUE-aware: #(doc) subj where subj ∈ {id,get,idx,let}
-		if len(subj) > 0 {
-			switch subj[0].(string) {
-			case "id", "get", "idx", "let":
-				opName := "__assign_set"
-				pat := subj
-				if subj[0].(string) == "let" {
-					opName = "__assign_def"
-					pat = subj[1].(S)
-				}
-				e.emit(opLoadGlobal, e.ks(opName))
-				// Subject pattern (no leading "let") as AST handle
-				e.emit(opConst, e.k(HandleVal("ast", pat)))
-				e.emit(opLoadGlobal, e.ks("__annotate"))
-				e.emit(opConst, e.k(Str(text)))
-				e.withChild(1, func() { e.emitExpr(subj) }) // build annotated RHS
-				e.emit(opCall, 2)
-				// Attribute to subject itself.
-				e.markChild(1)
-				e.emit(opCall, 2)
-				return
-			}
-		}
-
-		// default: #(doc) expr  ==>  __annotate(doc, expr)
-		e.emit(opLoadGlobal, e.ks("__annotate"))
-		e.emit(opConst, e.k(Str(text)))
-		e.withChild(1, func() { e.emitExpr(subj) })
-		e.emit(opCall, 2)
-
-	default:
-		e.emit(opConst, e.k(errNull(fmt.Sprintf("unknown AST tag: %s", n[0].(string)))))
-	}
-}
-
-=== END FILE: ./mindscript/interpreter_exec.go ===
-
-=== BEGIN FILE: ./mindscript/vm.go ===
-// vm.go: minimal bytecode virtual machine for MindScript.
-//
-// OVERVIEW
-// --------
-// This file implements a compact, goroutine-safe-by-isolation, stack-based VM
-// that executes MindScript bytecode ("Chunk") and returns a result Value.
-// The VM is *internal to the package*: it exposes only the Chunk container;
-// everything else (opcodes, instruction encoding, VM loop) is private.
-//
-// Concurrency model (Lua-style isolates)
-// -------------------------------------
-//   - A single *Interpreter is **not re-entrant**. Do not invoke its methods from
-//     multiple goroutines at the same time.
-//   - For parallelism, create multiple *Interpreter instances (or use Clone if
-//     provided) and run each in its own goroutine. Each instance maintains its own
-//     Core/Global envs, module cache, current source tracking, and VM state.
-//   - This file has no package-level mutable state; all VM state is per-run and
-//     per-Interpreter. As long as an Interpreter isn't shared concurrently, there
-//     are no data races here.
-//   - Host natives may spin goroutines, but they must not touch a *shared*
-//     Interpreter/Env concurrently. Use isolated instances to run work in parallel.
-//
-// Execution model
-//   - The interpreter (see interpreter.go) lowers S-expr AST into a Chunk using
-//     a small emitter. This VM then executes that Chunk in a given lexical Env.
-//   - The VM keeps the public engine surface stable by delegating CALL to
-//     Interpreter.Apply semantics via a private helper (applyArgsScoped). That
-//     preserves currying, native dispatch, type checks, and call-site scoping.
-//   - Runtime errors inside the VM are reported as annotated null Values and
-//     surfaced via a vmRuntimeError status to the interpreter. The vmResult also
-//     carries the instruction PC where the error occurred so the interpreter can
-//     map it back to a source (line, col) using Chunk.Marks and SourceRef.
-//
-// Instruction encoding (private)
-//   - 32-bit instruction: [ opcode:8 | imm:24 ].
-//   - Opcodes cover constants/globals, stack ops, property/index access,
-//     arithmetic/compare/unary, control flow, and calls.
-//   - The emitter constructs instruction words via `pack`. Decoding uses `uop`
-//     and `uimm`. These are all private to the package.
-//
-// Data & semantics used by the VM
-//   - Value / ValueTag hierarchy, Arr/Bool/Int/Num, Null, MapObject
-//   - Env (lexical chain) for resolving globals
-//   - Interpreter methods: deepEqual, applyArgsScoped
-//   - Negative array indices count from the end (Python-like -1 is last, -len is first),
-//     but indices < -len (and ≥ len) are out of bounds.
-//   - Property access on maps/modules; index access on arrays/maps
-//   - Numeric ops preserve integers where possible; division/mod guard zero;
-//     string relational comparisons are supported for <, <=, >, >=.
-//   - Control flow: Return yields vmReturn with a Value; fallthrough yields vmOK.
-//
-// DEPENDENCIES (other files)
-// --------------------------
-// • interpreter.go
-//   - Value/ValueTag/Null/Arr/Bool/Int/Num, MapObject, Env
-//   - (ip *Interpreter).deepEqual, (ip *Interpreter).applyArgsScoped
-//   - errNull, isNumber, toFloat helpers
-//
-// • modules.go (not shown here)
-//   - Module type and (m *Module).get(name) (used for VTModule property lookups)
-//
-// • parser.go / lexer.go (indirect; produce AST for the emitter that targets this VM)
-// • types.go (indirect; equality of types via deepEqual resolution)
-//
-// PUBLIC vs PRIVATE
-// -----------------
-// PUBLIC  : Chunk (bytecode container) — the only stable surface exported here.
-// PRIVATE : opcodes, instruction packing, VM loop/state, vmResult/status, helpers.
-package mindscript
-
-import (
-	"fmt"
-	"math"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                                   PUBLIC API
-////////////////////////////////////////////////////////////////////////////////
-
-// SourceRef attaches source text and an optional SpanIndex to bytecode.
-type SourceRef struct {
-	Name     string     // "main.ms", "mod:std/math", "<eval#3>", "<ast>"
-	Src      string     // full text
-	Spans    *SpanIndex // may be nil when unknown
-	PathBase NodePath   // optional absolute prefix for marks emitted in this chunk
-}
-
-// PCMark associates an instruction index with an AST node path.
-type PCMark struct {
-	PC   int
-	Path NodePath
-}
-
-// Chunk is an immutable bytecode container executed by the VM.
-//
-// Layout:
-//
-//	Code   — instruction stream; each instruction is a 32-bit word where the
-//	         high 8 bits encode the opcode and the low 24 bits hold an unsigned
-//	         immediate (operand). The encoding details are private to the VM.
-//	Consts — constant pool referenced by instructions (e.g., opConst pushes
-//	         Consts[k], opLoadGlobal/opGetProp carry string names as VTStr).
-//	Src    — optional source reference (used for caret-runtime errors).
-//	Marks  — PC→AST path marks for mapping instructions back to source spans.
-//
-// Producer & consumer:
-//   - Produced by the internal emitter (see interpreter.go) from an S-expr AST.
-//   - Consumed only by the VM entry (private) to execute code in an Env.
-//
-// Stability contract:
-//   - The existence of Chunk and its fields is stable for code that needs to
-//     hand bytecode across subsystems within this package. The instruction set
-//     and encoding are *not* public API.
-type Chunk struct {
-	Code   []uint32
-	Consts []Value
-	Src    *SourceRef
-	Marks  []PCMark
-}
-
-//// END_OF_PUBLIC
-
-////////////////////////////////////////////////////////////////////////////////
-//                             PRIVATE IMPLEMENTATION
-////////////////////////////////////////////////////////////////////////////////
-
-/************* Instruction encoding (private) *************/
-
-type opcode uint8
-
-const (
-	opNop opcode = iota
-
-	// constants & globals
-	opConst      // push consts[k]
-	opLoadGlobal // push Env[name];  imm = const index (name as VTStr)
-
-	// stack/values
-	opMakeArr // pop N → array; imm = N
-	opPop     // pop and discard top of stack
-
-	// property & index
-	opGetProp // obj.get(name);   imm = const index (name as VTStr)
-	opGetIdx  // pop idx,obj → push obj[idx]
-
-	// arithmetic / compare / unary
-	opSub
-	opMul
-	opDiv
-	opMod
-	opEq
-	opNe
-	opLt
-	opLe
-	opGt
-	opGe
-	opNeg
-	opNot
-	opPow  // a ** b
-	opBand // a & b
-	opBor  // a | b
-	opBxor // a ^ b
-	opBnot // ~ a
-	opShl  // a << b
-	opShr  // a >> b
-
-	// control flow
-	opJump        // ip = imm
-	opJumpIfFalse // pop cond; if false => ip = imm
-	opReturn      // pop v; signal Return with v
-
-	// calls/closures
-	opCall // argc = imm; pops argc args then callee; pushes result
-
-	// lexical environments
-	opPushEnv // env = NewEnv(env)
-	opPopEnv  // env = env.parent
-)
-
-// pack/unpack helpers
-func pack(op opcode, imm uint32) uint32 { return uint32(op)<<24 | (imm & 0xFFFFFF) }
-func uop(i uint32) opcode               { return opcode(i >> 24) }
-func uimm(i uint32) uint32              { return i & 0xFFFFFF }
-
-// unwrap a VTMap to *MapObject (nil if not a map)
-func asMap(v Value) *MapObject {
-	if v.Tag != VTMap {
-		return nil
-	}
-	return v.Data.(*MapObject)
-}
-
-/************* VM status/result (private) *************/
-
-type vmStatus int
-
-const (
-	vmOK vmStatus = iota
-	vmReturn
-	vmRuntimeError
-)
-
-type vmResult struct {
-	status vmStatus
-	value  Value
-	pc     int // instruction index where the status was produced (best-effort)
-}
-
-/************* VM state & helpers (private) *************/
-
-type vm struct {
-	ip    *Interpreter
-	chunk *Chunk
-	env   *Env
-	stack []Value
-	sp    int
-	iptr  int
-}
-
-func (m *vm) push(v Value) {
-	if m.sp >= len(m.stack) {
-		newCap := len(m.stack) * 2
-		if newCap == 0 {
-			newCap = 16
-		}
-		ns := make([]Value, newCap)
-		copy(ns, m.stack)
-		m.stack = ns
-	}
-	m.stack[m.sp] = v
-	m.sp++
-}
-
-func (m *vm) pop() Value {
-	if m.sp == 0 {
-		return errNull("stack underflow")
-	}
-	m.sp--
-	return m.stack[m.sp]
-}
-
-func (m *vm) top() Value {
-	if m.sp == 0 {
-		return Null
-	}
-	return m.stack[m.sp-1]
-}
-
-// fail returns a vmRuntimeError with the PC set to the currently executing
-// instruction (iptr-1, since iptr has advanced past the fetched instruction).
-func (m *vm) fail(msg string) vmResult {
-	return vmResult{status: vmRuntimeError, value: errNull(msg), pc: m.iptr - 1}
-}
-
-// Numeric helpers (mirror interpreter semantics)
-func (m *vm) binNum(op opcode, a, b Value) (Value, *vmResult) {
-	// numbers
-	if isNumber(a) && isNumber(b) {
-		// exponentiation handled specially below after common conversions
-		if op == opPow {
-			// Int ** Int with non-negative exponent ⇒ keep Int via fast power
-			if a.Tag == VTInt && b.Tag == VTInt {
-				base := a.Data.(int64)
-				exp := b.Data.(int64)
-				if exp < 0 {
-					return Num(math.Pow(float64(base), float64(exp))), nil
-				}
-				var out int64 = 1
-				x := base
-				e := exp
-				for e > 0 {
-					if (e & 1) == 1 {
-						out *= x
-					}
-					e >>= 1
-					if e != 0 {
-						x *= x
-					}
-				}
-				return Int(out), nil
-			}
-			return Num(math.Pow(toFloat(a), toFloat(b))), nil
-		}
-
-		lf, rf := toFloat(a), toFloat(b)
-		bothInt := a.Tag == VTInt && b.Tag == VTInt
-		switch op {
-		case opSub:
-			if bothInt {
-				return Int(a.Data.(int64) - b.Data.(int64)), nil
-			}
-			return Num(lf - rf), nil
-		case opMul:
-			if bothInt {
-				return Int(a.Data.(int64) * b.Data.(int64)), nil
-			}
-			return Num(lf * rf), nil
-		case opDiv:
-			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
-				res := m.fail("division by zero")
-				return Null, &res
-			}
-			if bothInt {
-				return Int(a.Data.(int64) / b.Data.(int64)), nil
-			}
-			return Num(lf / rf), nil
-		case opMod:
-			// guard zero (match division error text)
-			if (b.Tag == VTInt && b.Data.(int64) == 0) || (b.Tag == VTNum && b.Data.(float64) == 0.0) {
-				res := m.fail("modulo by zero")
-				return Null, &res
-			}
-			if bothInt {
-				return Int(a.Data.(int64) % b.Data.(int64)), nil
-			}
-			return Num(math.Mod(lf, rf)), nil
-		case opLt:
-			if bothInt {
-				return Bool(a.Data.(int64) < b.Data.(int64)), nil
-			}
-			return Bool(lf < rf), nil
-		case opLe:
-			if bothInt {
-				return Bool(a.Data.(int64) <= b.Data.(int64)), nil
-			}
-			return Bool(lf <= rf), nil
-		case opGt:
-			if bothInt {
-				return Bool(a.Data.(int64) > b.Data.(int64)), nil
-			}
-			return Bool(lf > rf), nil
-		case opGe:
-			if bothInt {
-				return Bool(a.Data.(int64) >= b.Data.(int64)), nil
-			}
-			return Bool(lf >= rf), nil
-		}
-	}
-
-	// string comparisons
-	if a.Tag == VTStr && b.Tag == VTStr {
-		as, bs := a.Data.(string), b.Data.(string)
-		switch op {
-		case opLt:
-			return Bool(as < bs), nil
-		case opLe:
-			return Bool(as <= bs), nil
-		case opGt:
-			return Bool(as > bs), nil
-		case opGe:
-			return Bool(as >= bs), nil
-		}
-	}
-	res := m.fail("bad numeric operator")
-	return Value{}, &res
-}
-
-/************* VM entry point (private) *************/
-
-// runChunk executes a bytecode Chunk in the provided environment.
-// It implements the full instruction set and returns:
-//   - vmOK           with the top-of-stack (or Null) if the program fell through,
-//   - vmReturn       with the explicit return value,
-//   - vmRuntimeError with an annotated-null explaining the error, plus a PC.
-//
-// Note: CALL delegates to ip.applyArgsScoped(callee, args, env) to preserve
-// currying, native dispatch, type checks, and call-site scoping.
-//
-// Concurrency: this method uses the *Interpreter instance* provided on the vm.
-// Do not call it concurrently on the same Interpreter from multiple goroutines.
-func (ip *Interpreter) runChunk(chunk *Chunk, env *Env, initStackCap int) (res vmResult) {
-	m := &vm{
-		ip:    ip,
-		chunk: chunk,
-		// evaluate in the provided environment (global-chain root for this run)
-		env:   env,
-		stack: make([]Value, 0, initStackCap),
-	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			// Structured inner-source error? Re-throw so the outer trampoline can
-			// surface it with the callee's SourceRef and exact (line,col).
-			if e, ok := r.(rtErr); ok {
-				if e.src != nil && e.line > 0 && e.col > 0 {
-					panic(e) // propagate structured inner-caret error
-				}
-				res.status = vmRuntimeError
-				res.value = annotNull(e.msg)
-				res.pc = m.iptr - 1
-				return
-			}
-			panic(r) // rethrow non-runtime panics
-		}
-	}()
-
-	code := chunk.Code
-	consts := chunk.Consts
-
-	for m.iptr < len(code) {
-		raw := code[m.iptr]
-		m.iptr++
-		opc := uop(raw)
-		imm := uimm(raw)
-
-		switch opc {
-
-		case opPushEnv:
-			m.env = NewEnv(m.env)
-
-		case opPopEnv:
-			// Never pop below the initial environment for this chunk.
-			// Root env has nil parent.
-			if m.env == nil {
-				return m.fail("cannot pop from nil environment")
-			}
-			parent := m.env.GetParent()
-			if parent == nil {
-				return m.fail("cannot pop root environment")
-			}
-			m.env = parent
-
-		case opNop:
-			// no-op
-
-		// ---- constants & globals ----
-		case opConst:
-			if int(imm) >= len(consts) {
-				return m.fail("const index out of range")
-			}
-			m.push(consts[imm])
-
-		case opLoadGlobal:
-			if int(imm) >= len(consts) {
-				return m.fail("name index out of range")
-			}
-			k := consts[imm]
-			if k.Tag != VTStr {
-				return m.fail("global name must be string const")
-			}
-			v, err := m.env.Get(k.Data.(string))
-			if err != nil {
-				return m.fail(err.Error())
-			}
-			m.push(v)
-
-		// ---- arrays ----
-		case opMakeArr:
-			n := int(imm)
-			if n < 0 || n > m.sp {
-				return m.fail("bad array length")
-			}
-			start := m.sp - n
-			elems := make([]Value, n)
-			copy(elems, m.stack[start:m.sp])
-			m.sp = start
-			m.push(Arr(elems))
-
-		// ---- pop value from stack ----
-		case opPop:
-			if m.sp == 0 {
-				return m.fail("pop on empty stack")
-			}
-			m.sp--
-
-		// ---- properties / indices ----
-		case opGetProp:
-			if int(imm) >= len(consts) {
-				return m.fail("name index out of range")
-			}
-			k := consts[imm]
-			if k.Tag != VTStr {
-				return m.fail("property name must be string const")
-			}
-			obj := m.pop()
-			key := k.Data.(string)
-
-			// Map lookup: use MapObject entries (annotation on keys is meta)
-			if obj.Tag == VTMap {
-				mo := asMap(obj)
-				if mo == nil {
-					return m.fail("property get requires map or module with string key")
-				}
-				if v, ok := mo.Entries[key]; ok {
-					m.push(v)
-					break
-				}
-				return m.fail(fmt.Sprintf("unknown property %q", key))
-			}
-
-			// Module export lookup
-			if obj.Tag == VTModule {
-				mod := obj.Data.(*Module)
-				if v, ok := mod.get(key); ok {
-					m.push(v)
-					break
-				}
-				return m.fail(fmt.Sprintf("unknown property %q on module", key))
-			}
-
-			return m.fail("property get requires map or module with string key")
-
-		case opGetIdx:
-			idx := m.pop()
-			obj := m.pop()
-
-			// array[int]
-			if obj.Tag == VTArray && idx.Tag == VTInt {
-				ao := obj.Data.(*ArrayObject)
-				xs := ao.Elems
-				if len(xs) == 0 {
-					return m.fail("index on empty array")
-				}
-				i := int(idx.Data.(int64))
-				if i < 0 {
-					i = len(xs) + i // -1 -> last, -len -> 0
-				}
-				if i < 0 || i >= len(xs) {
-					return m.fail("array index out of range")
-				}
-				m.push(xs[i])
+		if r == null then
+			return _err("openai-responses: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
+				return _err("openai-responses: " + b.error.message)
+			end
+			return _err("openai-responses: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return _err("openai-responses: bad JSON from server")
+		end
+		if not mapHas(j, "output") or len(j.output) == 0 then
+			return _err("openai-responses: missing content")
+		end
+
+		let text = null
+		for msg in j.output do
+			if mapHas(msg, "content") and len(msg.content) > 0 then
+				for part in msg.content do
+					if mapHas(part, "type") and part.type == "output_text" and mapHas(part, "text") and part.text != null then
+						text = part.text
+						break
+					end
+				end
 				break
-			}
-
-			// map[string]
-			if obj.Tag == VTMap && idx.Tag == VTStr {
-				mo := asMap(obj)
-				if mo == nil {
-					return m.fail("index requires array[int] or map[string]")
-				}
-				k := idx.Data.(string)
-				if v, ok := mo.Entries[k]; ok {
-					m.push(v)
-					break
-				}
-				return m.fail(fmt.Sprintf("unknown key %q", k))
-			}
-
-			return m.fail("index requires array[int] or map[string]")
-
-		// ---- arithmetic / compare / unary ----
-		case opSub, opMul, opDiv, opMod, opLt, opLe, opGt, opGe:
-			b := m.pop()
-			a := m.pop()
-			if out, failRes := m.binNum(opc, a, b); failRes != nil {
-				return *failRes
-			} else {
-				m.push(out)
-			}
-
-		case opEq, opNe:
-			b := m.pop()
-			a := m.pop()
-			eq := m.ip.deepEqual(a, b)
-			if opc == opEq {
-				m.push(Bool(eq))
-			} else {
-				m.push(Bool(!eq))
-			}
-
-		case opNeg:
-			x := m.pop()
-			switch x.Tag {
-			case VTInt:
-				m.push(Int(-x.Data.(int64)))
-			case VTNum:
-				m.push(Num(-x.Data.(float64)))
-			default:
-				return m.fail("unary - expects number")
-			}
-
-		case opNot:
-			x := m.pop()
-			if x.Tag != VTBool {
-				return m.fail("not expects boolean")
-			}
-			m.push(Bool(!x.Data.(bool)))
-
-		case opPow:
-			b := m.pop()
-			a := m.pop()
-			if out, failRes := m.binNum(opPow, a, b); failRes != nil {
-				return *failRes
-			} else {
-				m.push(out)
-			}
-
-		case opBand, opBor, opBxor, opShl, opShr:
-			b := m.pop()
-			a := m.pop()
-			if a.Tag != VTInt || b.Tag != VTInt {
-				return m.fail("bitwise operators expect integers")
-			}
-			ai := a.Data.(int64)
-			bi := b.Data.(int64)
-			switch opc {
-			case opBand:
-				m.push(Int(ai & bi))
-			case opBor:
-				m.push(Int(ai | bi))
-			case opBxor:
-				m.push(Int(ai ^ bi))
-			case opShl:
-				if bi < 0 || bi >= 64 {
-					return m.fail("shift count out of range (expected 0..63)")
-				}
-				m.push(Int(int64(uint64(ai) << uint(bi))))
-			case opShr:
-				if bi < 0 || bi >= 64 {
-					return m.fail("shift count out of range (expected 0..63)")
-				}
-				m.push(Int(ai >> uint(bi)))
-			}
-
-		case opBnot:
-			x := m.pop()
-			if x.Tag != VTInt {
-				return m.fail("bitwise not expects integer")
-			}
-			m.push(Int(^x.Data.(int64)))
-
-		// ---- control flow ----
-		case opJump:
-			m.iptr = int(imm)
-
-		case opJumpIfFalse:
-			cond := m.pop()
-			if cond.Tag != VTBool {
-				return m.fail("condition must be boolean")
-			}
-			if !cond.Data.(bool) {
-				m.iptr = int(imm)
-			}
-
-		case opReturn:
-			var v Value = Null
-			if m.sp > 0 {
-				v = m.pop()
-			}
-			return vmResult{status: vmReturn, value: v, pc: m.iptr - 1}
-
-		// ---- calls ----
-		case opCall:
-			nargs := int(imm)
-
-			// Stack layout (top on the right):
-			// [..., callee, arg1, ..., argN]
-			calleeIdx := m.sp - nargs - 1
-			if calleeIdx < 0 {
-				return m.fail("stack underflow in call")
-			}
-			callee := m.stack[calleeIdx]
-
-			// Collect args in order
-			args := make([]Value, nargs)
-			copy(args, m.stack[calleeIdx+1:m.sp])
-
-			// Pop callee + args
-			m.sp = calleeIdx
-			m.stack = m.stack[:m.sp]
-
-			// Use current frame env as the call-site (for natives & closures)
-			res := m.ip.applyArgsScoped(callee, args, m.env)
-
-			// Push result
-			m.push(res)
-
-		default:
-			return m.fail("unknown opcode")
-		}
-	}
-
-	if m.sp == 0 {
-		return vmResult{status: vmOK, value: Null, pc: m.iptr - 1}
-	}
-	return vmResult{status: vmOK, value: m.top(), pc: m.iptr - 1}
+			end
+		end
+		if text == null then
+			return _err("openai-responses: missing content")
+		end
+		text
+	end
 }
 
-=== END FILE: ./mindscript/vm.go ===
+# Backend: Anthropic (Messages API)
+let _anthropic = {
+	name: "anthropic",
+	state: {
+		baseUrl: "https://api.anthropic.com/v1",
+		model: null,
+		apiKey: osEnv("ANTHROPIC_API_KEY"),
+		version: "2023-06-01",
+		options: {max_tokens: 1024}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return _err("anthropic listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
+			}
+		})
+		if r == null then
+			return _err("anthropic listModels: request failed")
+		end
+		if r.status != 200 then
+			return _err("anthropic listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return _err("anthropic listModels: bad JSON")
+		end
+		let out = []
+		if mapHas(body, "data") then
+			for m in iter(body.data) do
+				out = out + [m.id]
+			end
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
+			}
+		})
+		if r == null then
+			return {ok: false, authed: authed, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, prompt: Str) -> Str? do
+		if self.state.apiKey == null then
+			return _err("anthropic: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return _err("anthropic: model not set")
+		end
+
+		let eff = self.state.options
+		let body = {
+			model: self.state.model,
+			messages: [{role: "user", content: prompt}]
+		}
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_tokens = int(num(eff.max_tokens))
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "top_k") and num(eff.top_k) != null then
+			body.top_k = int(num(eff.top_k))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/messages",
+			method: "POST",
+			headers: {
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
+			},
+			body: jsonStringify(body)
+		})
+		if r == null then
+			return _err("anthropic: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
+				return _err("anthropic: " + b.error.message)
+			end
+			return _err("anthropic: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return _err("anthropic: bad JSON from server")
+		end
+		if not mapHas(j, "content") or len(j.content) == 0 or not mapHas(j.content[0], "text") or j.content[0].text == null then
+			return _err("anthropic: missing content")
+		end
+		j.content[0].text
+	end
+}
+
+# Backend: Cohere (Chat API)
+let _cohere = {
+	name: "cohere",
+	state: {
+		baseUrl: "https://api.cohere.ai/v1",
+		model: null,
+		apiKey: osEnv("COHERE_API_KEY"),
+		options: {}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return _err("cohere listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return _err("cohere listModels: request failed")
+		end
+		if r.status != 200 then
+			return _err("cohere listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return _err("cohere listModels: bad JSON")
+		end
+		let out = []
+		if mapHas(body, "models") then
+			for m in iter(body.models) do
+				out = out + [m.name]
+			end
+		elif mapHas(body, "data") then
+			for m in iter(body.data) do
+				out = out + [m.id]
+			end
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return {ok: false, authed: authed, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, prompt: Str) -> Str? do
+		if self.state.apiKey == null then
+			return _err("cohere: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return _err("cohere: model not set")
+		end
+
+		let eff = self.state.options
+		let body = {model: self.state.model, message: prompt}
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.p = num(eff.top_p)
+		end
+		if mapHas(eff, "top_k") and num(eff.top_k) != null then
+			body.k = int(num(eff.top_k))
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_tokens = int(num(eff.max_tokens))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/chat",
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer " + self.state.apiKey
+			},
+			body: jsonStringify(body)
+		})
+		if r == null then
+			return _err("cohere: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "message") then
+				return _err("cohere: " + b.message)
+			end
+			return _err("cohere: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return _err("cohere: bad JSON from server")
+		end
+		if mapHas(j, "text") and j.text != null then
+			return j.text
+		end
+		if mapHas(j, "message") and mapHas(j.message, "content") and j.message.content != null then
+			return j.message.content
+		end
+		_err("cohere: missing content")
+	end
+}
+
+# =============================
+# Registry & environment sync
+# =============================
+
+_state.backends["ollama"] = _ollama
+_state.backends["openai"] = _openai
+_state.backends["openai-responses"] = _openai_responses
+_state.backends["anthropic"] = _anthropic
+_state.backends["cohere"] = _cohere
+
+# If OPENAI_API_KEY is present, mirror it into both OpenAI backends at load.
+if _openai.state.apiKey != null then
+	_state.backends["openai"].state.apiKey = _openai.state.apiKey
+	_state.backends["openai-responses"].state.apiKey = _openai.state.apiKey
+end
+
+# =============================
+# Public API
+# =============================
+
+# Probe all backends, print diagnostics, and ensure a usable current backend.
+# Args: _: Null (ignored)
+# Return: { backends!: [Str], current!: Str }
+let init = fun(_: Null) -> {} do
+	let names = []
+	let firstOK = null
+	for [k, _] in _state.backends do
+		names = names + [k]
+	end
+
+	let currentOK = false
+	for name in names do
+		let b = _state.backends[name]
+		let pr = b.probe(b)
+		let line = _diagLine(name, pr.ok, pr.authed, if mapHas(b.state, "model") then
+			b.state.model
+		else
+			null
+		end, if mapHas(b.state, "baseUrl") then
+			b.state.baseUrl
+		else
+			null
+		end, if mapHas(pr, "reason") then
+			pr.reason
+		else
+			null
+		end)
+		println(line)
+		if pr.ok and firstOK == null then
+			firstOK = name
+		end
+		if name == _state.current and pr.ok then
+			currentOK = true
+		end
+	end
+
+	if not currentOK and firstOK != null then
+		_state.current = firstOK
+		println(sprintf("llm: switched current backend to \"%s\"", [
+			_state.current
+		]))
+	end
+
+	{backends: names, current: _state.current}
+end
+
+# List registered backend names.
+let backends = fun(_: Null) -> [Str] do
+	let out = []
+	for [k, _] in _state.backends do
+		out = out + [k]
+	end
+	out
+end
+
+# Report current backend status without network calls.
+let status = fun(_: Null) -> {} do
+	let b = _state.backends[_state.current]
+	let requiresKey = b.name == "openai" or b.name == "openai-responses" or b.name == "anthropic" or b.name == "cohere"
+	let authed = if requiresKey then
+		mapHas(b.state, "apiKey") and b.state.apiKey != null
+	else
+		true
+	end
+	{
+		backend: b.name,
+		model: if mapHas(b.state, "model") then
+			b.state.model
+		else
+			null
+		end,
+		authed: authed,
+		options: if mapHas(b.state, "options") then
+			b.state.options
+		else
+			{}
+		end
+	}
+end
+
+# Switch the current backend by name.
+let useBackend = fun(name: Str) -> {}? do
+	if not mapHas(_state.backends, name) then
+		return _err("unknown backend: " + name)
+	end
+	_state.current = name
+	status(null)
+end
+
+# List models for the current backend (if supported).
+let models = fun(_: Null) -> [Str]? do
+	let b = _state.backends[_state.current]
+	if not mapHas(b, "listModels") then
+		return _err(b.name + " does not support model listing")
+	end
+	b.listModels(b)
+end
+
+# Set the active model for the current backend.
+let useModel = fun(name: Str) -> {}? do
+	let b = _state.backends[_state.current]
+	b.state.model = name
+	status(null)
+end
+
+# Get an editable config snapshot for the current backend.
+let getConfig = fun(_: Null) -> {} do
+	let b = _state.backends[_state.current]
+	let cfg = {
+		backend: b.name,
+		baseUrl: if mapHas(b.state, "baseUrl") then
+			b.state.baseUrl
+		else
+			null
+		end,
+		model: if mapHas(b.state, "model") then
+			b.state.model
+		else
+			null
+		end,
+		options: if mapHas(b.state, "options") then
+			b.state.options
+		else
+			{}
+		end
+	}
+	if mapHas(b.state, "timeoutMs") then
+		cfg.timeoutMs = b.state.timeoutMs
+	end
+	cfg
+end
+
+# Merge a config object into the current backend's state.
+let setConfig = fun(cfg: {}) -> {}? do
+	let b = _state.backends[_state.current]
+	if mapHas(cfg, "baseUrl") then
+		b.state.baseUrl = cfg.baseUrl
+	end
+	if mapHas(cfg, "model") then
+		b.state.model = cfg.model
+	end
+	if mapHas(cfg, "options") then
+		b.state.options = cfg.options
+	end
+	if mapHas(cfg, "timeoutMs") then
+		b.state.timeoutMs = cfg.timeoutMs
+	end
+	status(null)
+end
+
+# Store credentials for the current backend (never printed).
+let auth = fun(creds: {}) -> {}? do
+	let b = _state.backends[_state.current]
+	# Ensure apiKey is set/cleared where status() looks.
+	if mapHas(creds, "apiKey") then
+		b.state.apiKey = creds.apiKey
+	end
+	b.state = b.state + creds # Shallow-merge any other credential keys.
+	status(null)
+end
+
+# Execute the current backend with a prompt.
+# Returns the provider's RAW STRING (or soft-null on error).
+let exec = fun(prompt: Str) -> Str? do
+	let b = _state.backends[_state.current]
+	b.exec(b, prompt)
+end
+=== END FILE: ./lib/llm.ms ===
+
+=== BEGIN FILE: ./lib/std.ms ===
+# # std.ms
+# # Minimal standard library implemented in MindScript on top of builtins.
+# #
+# # === MINDSCRIPT CODE CONVENTION
+# #
+# # 1) Naming
+# #	Functions/vars: camelCase; Types: PascalCase; Consts: SCREAMING_SNAKE_CASE;
+# #	Modules: snake_case; Private: _prefix.
+# #
+# # 2) Errors
+# #	Soft errors: use nullable returns (T?); return `null  # <reason>`.
+# #	Any? = Any → do NOT use Any for maybes; pick a concrete T.
+# #	Hard errors: `panic(msg)` only for invariants/programmer bugs or unrecoverable state.
+# #	Catch hard errors with `try`; prefer soft errors for expected conditions.
+# #	Caller check idiom:
+# #	```
+# #		let v = parseX(s)
+# #		if v == null then return null  # <invalid input> end
+# #		use(v)
+# #	```
+# #	Add brief, grep-able slugs: `<not found>`, `<timeout: 200ms>`.
+# #
+# # 3) Function docs (PRE)
+# #	First line: short summary. Then blank line. Then Args/Returns/Soft-fail notes.
+# #	Example:
+# #	```
+# #		# Parse URL string.
+# #		#
+# #		# Args: s: Str
+# #		# Returns: {…}? (null on <invalid url>)
+# #		fun parseUrl(s: Str) -> { scheme!:Str, host!:Str, port:Int, path!:Str, query!:Str, fragment:Str }? do
+# #			let u = urlParse(s); if u == null then return null  # <invalid url> end; u
+# #		end
+# #	```
+# #
+# # 4) Formatting
+# #	Tabs for indentation. POST forces newline and follows after-separator rule.
+# #	Canonical output ends with exactly one trailing newline.
+
+# # -----------------------------
+# # Error/Assert
+# # -----------------------------
+
+# Produce an annotated null (soft error).
+# 
+# Returns `null` annotated with `msg`. Use for recoverable failures.
+# Args: msg: Str
+# Returns: Null
+let error = fun(msg: Str) -> Null do
+	__annotate(msg, null)
+end
+
+# Assert that a condition holds.
+# 
+# Returns true if `cond` is true; otherwise throws a hard failure.
+# Args: cond: Bool
+# Returns: Bool
+let assert = fun(cond: Bool) -> Bool do
+	if cond then
+		true
+	else
+		panic("assertion failed")
+	end
+end
+
+# # -----------------------------
+# # Console I/O
+# # -----------------------------
+
+# Print a formatted string to standard output.
+# 
+# Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
+# Caller controls newlines:
+# printf("%s = %v\n", ["x", 42])
+# 
+# Params:
+# fmt:  Str
+# args: [Any]
+# 
+# Returns:
+# Str? — the printed string, or null (annotated) on write error.
+let printf = fun(fmt: Str, args: [Any]) -> Str? do
+	let out = sprintf(fmt, args)
+	write(STDOUT, out)
+	flush(STDOUT)
+	out
+end
+
+# Print a value and return it.
+# 
+# Prints the string form of `x` without a trailing newline, and returns `x`.
+# Args: x: Any
+# Returns: Any
+let print = fun(x) do
+	write(STDOUT, sprintf("%s", [str(x)]))
+	flush(STDOUT)
+	x
+end
+
+# Print a value with newline and return it.
+# 
+# Prints the string form of `x` followed by a newline, and returns `x`.
+# Args: x: Any
+# Returns: Any
+let println = fun(x) do
+	write(STDOUT, sprintf("%s\n", [str(x)]))
+	flush(STDOUT)
+	x
+end
+
+# # -----------------------------
+# # Iterators
+# # -----------------------------
+
+# Infinite iterator: 0, 1, 2, ...
+# 
+# Produces a thunk `(Null -> Int)` that increments on each call.
+# Args: _: Null (ignored)
+# Returns: (Null -> Int)
+let naturals0 = fun(_: Null) -> Null -> Int do
+	let i = 0
+	fun(_: Null) -> Int do
+		let v = i
+		i = i + 1
+		v
+	end
+end
+
+# Infinite iterator: 1, 2, 3, ...
+# 
+# Produces a thunk `(Null -> Int)` that starts at 1.
+# Args: _: Null (ignored)
+# Returns: (Null -> Int)
+let naturals = fun(_: Null) -> Null -> Int do
+	let i = 1
+	fun(_: Null) -> Int do
+		let v = i
+		i = i + 1
+		v
+	end
+end
+
+# Integer range iterator (stop exclusive; infinite if stop is null).
+# 
+# Returns a thunk that yields start, start+1, ... until `stop-1`, or forever if `stop` is null.
+# Args: start: Int, stop: Int?
+# Returns: (Null -> Int?)
+let range = fun(start: Int, stop: Int?) -> Null -> Int? do
+	let i = start
+	fun(_: Null) -> Int? do
+		if stop == null then
+			let v = i
+			i = i + 1
+			v
+		elif i >= stop then
+			null
+		else
+			let v = i
+			i = i + 1
+			v
+		end
+	end
+end
+
+# Turn arrays or maps into (Null -> Any?) iterators; pass iterators through unchanged.
+# 
+# - [Any]      → yields elements
+# - {}         → yields [key, value] pairs
+# - (Null->?)  → returned as-is
+# Else: hard error.
+# Args: v: Any
+# Returns: (Null -> Any?)
+let iter = fun(v) -> Null -> Any? do
+	if isType(v, type [Any]) then
+		let xs = v
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(xs) then
+				let y = xs[i]
+				i = i + 1
+				y
+			else
+				null
+			end
+		end
+	elif isType(v, type {}) then
+		let kvs = []
+		for [k, val] in v do
+			kvs = kvs + [[k, val]]
+		end
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(kvs) then
+				let p = kvs[i]
+				i = i + 1
+				p
+			else
+				null
+			end
+		end
+	elif isType(v, type Null -> Any?) then
+		v
+	else
+		panic("iter: expected array, map, or iterator")
+	end
+end
+
+# Collect an iterator into an array.
+# 
+# Consumes `it` until it returns null.
+# Args: it: (Null -> Any?)
+# Returns: [Any]
+let list = fun(it: Null -> Any?) -> [Any] do
+	let out = []
+	for _ in naturals0(null) do
+		let x = it(null)
+		if x == null then
+			break
+		end
+		out = out + [x]
+	end
+	out
+end
+
+# Map over an iterator (lazy transform).
+# 
+# Returns a thunk that yields `f(x)` for each `x` in `it`.
+# Args: f: (Any -> Any), it: (Null -> Any?)
+# Returns: (Null -> Any?)
+let map = fun(f: Any -> Any, it: Null -> Any?) -> Null -> Any? do
+	fun(_: Null) -> Any? do
+		let x = it(null)
+		if x == null then
+			null
+		else
+			f(x)
+		end
+	end
+end
+
+# Filter an iterator (lazy predicate).
+# 
+# Returns a thunk that yields only values where `cond(x)` is true.
+# Args: cond: (Any -> Bool), it: (Null -> Any?)
+# Returns: (Null -> Any?)
+let filter = fun(cond: Any -> Bool, it: Null -> Any?) -> Null -> Any? do
+	fun(_: Null) -> Any? do
+		for _ in naturals0(null) do
+			let x = it(null)
+			if x == null then
+				break
+			end
+			if cond(x) then
+				return x
+			end
+		end
+		null
+	end
+end
+
+# Fold an iterator with a binary function.
+# 
+# Reduces `it` by applying `f` left-to-right. Returns null for empty iterator.
+# Args: f: (Any -> Any -> Any), it: (Null -> Any?)
+# Returns: Any?
+let reduce = fun(f: Any -> Any -> Any, it: Null -> Any?) -> Any? do
+	let first = it(null)
+	if first == null then
+		null
+	else
+		let acc = first
+		for _ in naturals0(null) do
+			let x = it(null)
+			if x == null then
+				break
+			end
+			acc = f(acc, x)
+		end
+		acc
+	end
+end
+
+# # -----------------------------
+# # Arrays
+# # -----------------------------
+
+# Slice an array [s, e).
+# 
+# Returns a shallow copy of `xs` from index `s` (inclusive) to `e` (exclusive).
+# Args: xs: [Any], s: Int, e: Int
+# Returns: [Any]
+let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
+	let out = []
+	for i in range(s, e) do
+		out = out + [xs[i]]
+	end
+	out
+end
+
+# Sort an array in-place using a comparison function.
+# Args: arr:[Any] - array to sort (modified in-place)
+# cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
+# Return: [Any] - the sorted array (same reference)
+let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
+	let swap = fun(i: Int, j: Int) -> Null do
+		let t = arr[i]
+		arr[i] = arr[j]
+		arr[j] = t
+		null
+	end
+
+	let partition = fun(lo: Int, hi: Int) -> [Int] do
+		let pivot = arr[lo]
+		let lt = lo
+		let gt = hi
+		let i = lo
+		while i <= gt do
+			let c = cmp(arr[i], pivot)
+			if c < 0 then
+				swap(lt, i)
+				lt = lt + 1
+				i = i + 1
+			elif c > 0 then
+				swap(i, gt)
+				gt = gt - 1
+			else
+				i = i + 1
+			end
+		end
+		[lt, gt]
+	end
+
+	let qsort = fun(lo: Int, hi: Int) -> Null do
+		if lo >= hi then
+			return
+		end
+		let [lt, gt] = partition(lo, hi)
+		qsort(lo, lt - 1)
+		qsort(gt + 1, hi)
+		null
+	end
+
+	qsort(0, len(arr) - 1)
+	arr
+end
+
+# # -----------------------------
+# # Objects (maps)
+# # -----------------------------
+
+# Iterator over keys of an object.
+# 
+# Args: obj: {}
+# Returns: (Null -> Str?)
+let keys = fun(obj: {}) -> Null -> Str? do
+	let it = iter(obj) # yields [k, v]
+
+	fun(_: Null) -> Str? do
+		let pair = it(null)
+		if pair == null then
+			null
+		else
+			pair[0]
+		end
+	end
+end
+
+# Iterator over values of an object.
+# 
+# Args: obj: {}
+# Returns: (Null -> Any?)
+let values = fun(obj: {}) -> Null -> Any? do
+	let it = iter(obj)
+	fun(_: Null) -> Any? do
+		let pair = it(null)
+		if pair == null then
+			null
+		else
+			pair[1]
+		end
+	end
+end
+
+# Directory listing of visible fields/functions.
+# 
+# For maps: returns keys not starting with "_".
+# For modules: returns exported names (not starting with "_"), or [] if unavailable.
+# If a value has a PRE note, the first line is attached as an annotation to the key.
+# Args: x: {}
+# Returns: [Str]
+let dir = fun(x: {}) -> [Str] do
+	let out = []
+	for [k, v] in x do
+		if not (substr(k, 0, 1) == "_") then
+			let ann = noteGet(v)
+			if ann != null then
+				ann = split(ann, "\n")[0]
+				k = noteSet(ann, k)
+			end
+			out = out + [k]
+		end
+	end
+	out
+end
+
+# # -----------------------------
+# # Importing / modules
+# # -----------------------------
+
+# Create an importer from a code string.
+# 
+# Returns a function that imports the code under a given module name.
+# Args: code: Str
+# Returns: (Str -> {})
+let codeImport = fun(code: Str) -> Str -> {} do
+	fun(name: Str) -> {} do
+		importCode(name, code)
+	end
+end
+
+# Import a module from a URL.
+# 
+# Returns the module object, or annotated null on failure.
+# Args: url: Str
+# Returns: {}?
+let importUrl = fun(url: Str) -> {}? do
+	let r = try(fun() do
+		import(url)
+	end)
+	if r.ok then
+		r.value
+	else
+		error("import failed: " + str(r.error))
+	end
+end
+
+# # -----------------------------
+# # Misc
+# # -----------------------------
+
+# Stable-ish integer id for a value’s content.
+# 
+# Hashes the UTF-8 bytes of `str(value)` via sha256, then folds over the hex string
+# with a DJB2-like accumulator for a compact Int.
+# Args: value: Any
+# Returns: Int
+let uid = fun(value) -> Int do
+	let hx = hexEncode(sha256(formatValue(value)))
+	let h = 5381
+	let n = len(hx)
+	let i = 0
+
+	let hexVal = fun(c: Str) -> Int do
+		if c == "0" then
+			0
+		elif c == "1" then
+			1
+		elif c == "2" then
+			2
+		elif c == "3" then
+			3
+		elif c == "4" then
+			4
+		elif c == "5" then
+			5
+		elif c == "6" then
+			6
+		elif c == "7" then
+			7
+		elif c == "8" then
+			8
+		elif c == "9" then
+			9
+		elif c == "a" or c == "A" then
+			10
+		elif c == "b" or c == "B" then
+			11
+		elif c == "c" or c == "C" then
+			12
+		elif c == "d" or c == "D" then
+			13
+		elif c == "e" or c == "E" then
+			14
+		elif c == "f" or c == "F" then
+			15
+		else
+			0
+		end
+	end
+
+	while i < n do
+		let nib = substr(hx, i, i + 1)
+		h = h * 33 + hexVal(nib)
+		i = i + 1
+	end
+	h
+end
+
+# Mute (sink) a value.
+# 
+# Accepts any value and returns null.
+# Args: _: Any
+# Returns: Null
+let mute = fun(_) -> Null do
+	null
+end
+
+# # -----------------------------
+# # Oracle hook (prelude-owned, minimal)
+# # -----------------------------
+
+# Global oracle execution hook.
+# 
+# Backends install their executor here via `oracleInstall`.
+# Until installed, oracle calls should return an annotated null via this hook.
+# Once installed, this function is supposed to return a JSON string containing
+# a value `x` boxed as `{output: x}`.
+# Args: prompt: Str
+# Returns: Str?
+let __oracle_execute = fun(prompt: Str) -> Str? do
+	error("oracle backend not configured")
+end
+
+# Internal flag for diagnostics.
+# 
+# Tracks whether a backend was installed via `oracleInstall`.
+# Args: (none)
+# Returns: (stateful)
+let _oracleInstalled = false
+
+# Install a new global oracle executor.
+# 
+# Rebinds `__oracle_execute` to the provided function.
+# Args: exec: (Str -> Str?)
+# Returns: Null
+let oracleInstall = fun(exec: Str -> Str?) -> Bool do
+	__oracle_execute = exec
+	_oracleInstalled = true
+	true
+end
+
+# Show oracle installation status.
+# 
+# Returns a short string indicating whether a backend is installed.
+# Args: _: Null (ignored)
+# Returns: Str
+let oracleStatus = fun(_: Null) -> Str do
+	if _oracleInstalled then
+		"oracle: installed"
+	else
+		"oracle: not installed"
+	end
+end
+
+# Quick oracle health check (real call, tiny).
+# Success: { ok:true, ms }; failure/not installed: annotated null.
+let oracleHealth = fun(_: Null) -> {}? do
+	if not _oracleInstalled then
+		return error("oracle not installed")
+	end
+
+	let ping = oracle(msg: Str) -> Str
+	let t0 = nowMillis()
+	let out = ping("ping")
+	let dt = nowMillis() - t0
+	if out == null then
+		return out
+	end
+	if out == "pong" then
+		return {ok: true, ms: dt}
+	end
+
+	let j = jsonParse(out)
+	if j != null and mapHas(j, "output") and j.output == "pong" then
+		return {ok: true, ms: dt}
+	end
+
+	error("pong mismatch")
+end
+
+# ---- Prompt tap (diagnostics) ----
+
+# Most recent oracle prompt captured for diagnostics.
+# Type: Str?
+let _oracleLastPrompt = null
+
+# Rolling log of oracle prompts and outputs captured for diagnostics.
+# Type: [[Str]]
+let _oracleLog = []
+
+# Install an oracle executor that records each prompt before forwarding.
+# Args: exec: (Str -> Str?)  # underlying executor
+# Return: Bool               # true on install
+let oracleInstallWithTap = fun(exec: Str -> Str?) -> Bool do
+	oracleInstall(fun(p: Str) -> Str? do
+		_oracleLastPrompt = p
+		let out = exec(p)
+		push(_oracleLog, [p, out])
+		out
+	end)
+	true
+end
+
+# Return the most recently recorded oracle prompt (if any).
+# Args: _: Null (ignored)
+# Return: Str?
+let oracleLastPrompt = fun(_: Null) -> Str? do
+	_oracleLastPrompt
+end
+
+# Return the full recorded oracle prompt/output log.
+# Args: _: Null (ignored)
+# Return: [[Str]]
+let oracleLog = fun(_: Null) -> [[Str]] do
+	_oracleLog
+end
+
+# # -----------------------------
+# # LLM backend bootstrap (installed in prelude)
+# # -----------------------------
+
+# Load the llm module, install its executor, and select a default backend/model.
+
+let llm = import("llm") # The LLM module.
+oracleInstall(llm.exec)
+llm.useBackend("openai-responses")
+llm.useModel("gpt-4.1-mini")
+=== END FILE: ./lib/std.ms ===
 

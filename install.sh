@@ -155,5 +155,8 @@ if [[ -d "$HOME/.config/fish/conf.d" ]]; then
   printf 'set -gx PATH "%s/bin" $PATH\n' "$INSTALL_DIR" > "$HOME/.config/fish/conf.d/mindscript.fish"
 fi
 
-echo "OK: Installed. Open a new terminal or run:  source ~/.bashrc   (or ~/.zshrc)"
-"${INSTALL_DIR}/bin/${BIN1}" --version || true
+"${INSTALL_DIR}/bin/${BIN1}" version || true
+echo
+echo "OK: Installation complete."
+echo 
+echo "Open a new terminal or run:  source ~/.bashrc   (or ~/.zshrc)"

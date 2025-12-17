@@ -58,15 +58,23 @@ chmod +x install.sh
 ```
 This will download the latest version and install it locally (in `~/.mindscript`). 
 
-You can test it by checking the version:
+Once installed, you can execute the runtime by running the `msg` command:
 ```bash
-msg version
+$ msg
+MindScript 0.1.4 (built 2025-12-16T13:12:08Z)
+
+Usage:
+  msg run <file.ms> [--] [args...]         Run a script.
+  msg repl                                 Start the REPL.
+  msg fmt [--check] [path ...]             Format MindScript file(s) by path prefix
+  msg test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
+  msg get <module>@<version?>              Install a third-party module (not implemented)
+  msg version                              Print the compiled version
 ```
 
 Want to use oracles? Follow the installation guide to configure an LLM backend.
 
-Start with **Quickstart and Installation**, then the **5-minute language tour**.
-
+For more installation options, check the **[Installation Guide](installation.md)**.
 
 ## Requirements
 

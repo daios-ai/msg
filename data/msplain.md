@@ -354,7 +354,7 @@ end
 
 ## 9) Modules
 
-Modules encapsulate a namespace and evaluate to a **module value**. The module has **its own environment**, and that environment is **visible as a map** from outside. A binding like `let x = 0` inside module `m` becomes visible as `m.x`. Modules are a **per-import copy**. Writes are confined to the **current runtime** only. `dir(m)` iterates the module (viewed as a map) to build a convenient listing.
+Modules encapsulate a namespace and evaluate to a **module value**. The module has **its own environment**, and that environment is **visible as a map** from outside. A binding like `let x = 0` inside module `m` becomes visible as `m.x`. Modules are a **per-process singletons**. Writes are confined to the **current runtime** only. `dir(m)` iterates the module (viewed as a map) to build a convenient listing.
 
 **Inline module (rare)**
 ```mindscript

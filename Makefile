@@ -187,6 +187,7 @@ endif
 	@test -d data     && cp -R data     $(ROOT)/ || true
 	@test -f LICENSE  && cp LICENSE     $(ROOT)/ || true
 	@test -f README.md && cp README.md  $(ROOT)/ || true
+	@test -f uninstall.sh && cp uninstall.sh $(ROOT)/uninstall.sh && chmod +x $(ROOT)/uninstall.sh || true
 	@echo "$(VERSION)" > $(ROOT)/VERSION
 
 package:

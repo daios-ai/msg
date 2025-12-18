@@ -623,5 +623,5 @@ end
 
 let llm = import("llm") # The LLM module.
 oracleInstall(llm.exec)
-llm.useBackend("openai-responses")
-llm.useModel("gpt-4.1-mini")
+llm.useBackend("ollama")
+llm.useModel("llama3.2")

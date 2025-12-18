@@ -1,12 +1,12 @@
-## Installation Guide
+# Installation 
 
-This page covers installing the `msg` runtime (MindScript), making sure it’s on your `PATH`, upgrading/rolling back, uninstalling, and setting up oracle backends (LLM providers).
+This page covers installing the `msg` MindScript runtime, upgrading/rolling back, uninstalling, and setting up oracle backends (LLM providers).
 
 MindScript is split into:
 
 * **The language** (your `.ms` scripts)
 * **The runtime** (**`msg`**, which runs scripts and provides built-ins + the bundled standard library)
-* **Oracle backends** (optional; only needed when scripts call **oracles**)
+* **Oracle backends** (optional, but necessary for **oracles**)
 
 Installing MindScript gives you the interpreter and standard library; installing a backend gives you an LLM to execute oracle calls.
 
@@ -20,7 +20,7 @@ Installing MindScript gives you the interpreter and standard library; installing
 
 ---
 
-## Install MindScript
+## Installing `msg`
 
 ### Install the latest release
 
@@ -28,6 +28,11 @@ This is the default install path. It downloads the latest release bundle and ins
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DAIOS-AI/msg/main/install.sh | bash
+```
+
+And then either open a new terminal or run the shell startup file
+```bash
+source ~/.bashrc    # or ~/.zshrc, etc.
 ```
 
 What you get:
@@ -39,7 +44,7 @@ What you get:
 
 ### Verify your install
 
-Check that `msg` is on your `PATH`:
+The installer adds `~/.mindscript/bin` to your shell startup file. Check that `msg` is on your `PATH`:
 
 ```bash
 msg
@@ -63,7 +68,7 @@ Run a bundled example:
 msg run examples/hello.ms
 ```
 
-If these work, the runtime and bundle discovery are correct.
+If these work, the runtime and bundle discovery are correct. 
 
 ### Upgrade to the latest release
 
@@ -82,8 +87,6 @@ VERSION=vX.Y.Z bash -c "$(curl -fsSL https://raw.githubusercontent.com/DAIOS-AI/
 
 Use tags like `v0.4.1`.
 
-!!! info
-    Pin a version for shared environments (CI, team scripts, teaching) so everyone gets the same runtime behavior.
 
 ### Offline / air-gapped install
 

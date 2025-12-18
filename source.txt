@@ -1,1458 +1,1600 @@
-=== BEGIN FILE: ./lib/llm.ms ===
-# llm.ms — minimal LLM backend manager (uniform contract + startup probe)
-# 
-# Public surface:
-# init()                 -> { backends!: [Str], current!: Str }          # probe all, pick a usable default, print diagnostics
-# backends()             -> [Str]                                        # available backend names
-# status()               -> { backend!: Str, model: Str?, authed!: Bool, options!: {} }
-# useBackend(Str)        -> {}?                                          # switch current; returns status or soft-null
-# models()               -> [Str]?                                       # list models for current backend (if supported)
-# useModel(Str)          -> {}?                                          # set model for current backend; returns status
-# getConfig()            -> {}                                           # editable snapshot {backend, baseUrl, model, options, [timeoutMs]}
-# setConfig({})          -> {}?                                          # shallow-merge config; returns status
-# auth({})               -> {}?                                          # store credentials (e.g., {"apiKey":"…"}); returns status
-# exec(Str)              -> Str?                                         # run and return the provider's RAW STRING (or soft-null on error)
-# 
-# Notes:
-# - Backends expose { name, state, listModels?, probe, exec }.
-# - init() prints diagnostics and auto-selects the first OK backend if current is not OK.
-# - Only API keys are read from env; baseUrl/model are configured via setConfig/useModel.
-# - Options live in per-backend state.options. Common knobs:
-# temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
-# Backends ignore unknown/unsupported options gracefully.
-# - HTTP failures and provider error payloads are surfaced as soft errors (annotated null) with clear messages.
-# - Oracles are responsible for validating/boxing as {"output": x}. Backends DO NOT normalize/box.
+=== BEGIN FILE: ./docs/manual/docs/learn/functions.md ===
+<style>
+  .my-code span.prompt { color: black; }
+  .my-code span.note { color: green; }
+  .my-code span.value { color: blue; }
+</style>
 
-# =============================
-# Internal state and minimal helpers
-# =============================
+# Functions
 
-let _state = {
-	current: "ollama",
-	backends: {} # name -> backend record
+In this chapter we'll see how to create functions in MindScript. But before we dive into functions, we need to introduce type schemas. Recall that types in MindScript are runtime-checked. This means that whenever we invoke a function (or return from it), the interpreter will check whether the values conform to the type constraints. If they don't, then we get a runtime error. Type schemas are the type annotations that MindScript uses to perform these checks.
+
+
+## Type Schemas
+
+MindScript allows you to specify the *template* or *shape* of values&mdash;**type schemas**&mdash;using type annotations. These annotations can appear on function parameters, return types, or when defining custom types.
+
+Type schemas are created using the `type` keyword, followed by a type specification. Below are some basic examples:
+```
+type Str
+type Int
+type [Int]
+type {name: Str, age: Int, hobbies: [Str]}
+```
+
+There are three handy functions to perform type checking: `typeOf(val)`, which we have already met; `isType(val, templ)`, which returns `true` if the value `val` conforms to the type schema `templ`; and `isSubtype(sub, super)`, which returns `true` is the type schema `sub` conforms to the type schema `super`. For instance, the followig examples show how to check whether a given value conforms to a schema:
+
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> isType(42, type Int)</span>
+<span class="value">true</span>
+
+<span class="prompt">> isType({name: "John"}, type {name: Str})</span>
+<span class="value">true</span>
+</code></pre>
+</div>
+
+We will see example of comparing two schemas using `subType` later.
+
+In addition, there are ways of constraining and relaxing the allowed values.
+
+### Enumerated types
+
+Sometimes we only want to allow values within a fixed list. These correspond to *enumerated types* in MindScript, also known as *enums*. Enums are declared using the `enum` keyword, followed by an array of permitted values. For instance, if there are only handful of order statuses we can declare this as:
+```
+type Enum ["pending", "processing", "shipped", "delivered", "cancelled"]
+```
+This says that the allowed values are only those in the list.
+
+Note an enum `a` that contains another enum `b` as a subset is a supertype:
+```
+let a = type Enum [1, 2, 3]
+let b = type Enum [1, 2]
+
+subType(a, b)    ## false
+subType(b, a)    ## true
+```
+
+### Nullable types
+
+Nullable types let you express that a value may either be of a given type or null. You indicate this with the `?` operator after the base type. For instance, consider a situation where we want users to provide a name and age, but the bio is optional (i.e. a string, but potentially missing). Then this would be expressed as
+```mindscript
+let User = type {
+    name: Str,
+    age: Int,
+    bio: Str?
+}
+```
+Of course, any type can be nullable, not just object properties. For instance,
+```mindscript
+let Tags = type [Str?]
+```
+This schema allows for list like
+```mindscript
+["sports", null, "international news", "movies"]
+```
+
+
+### Mandatory types in objects
+
+When specifying a type schema for objects, the default is to consider the properties as optional. So, for instance:
+```mindscript
+let Person = type {
+    name: Str
+    age: Int
 }
 
-# Soft error → annotated null.
-let _err = fun(msg: Str) -> Null do
-	error("llm: " + msg)
-end
+isType({name: "John", age: 45})  ## true
+isType({}, Person)               ## true
+```
+While this is slightly confusing, it was deliberately designed like this so as to conform to the [JSON schema](https://json-schema.org) standard, because REST API often have named yet optional arguments.
 
-# Render a short backend status line.
-let _diagLine = fun(name: Str, ok: Bool, authed: Bool, model: Str?, baseUrl: Str?, reason: Str?) -> Str do
-	let mark = if ok then
-		"✓"
-	else
-		"✗"
-	end
-	let m = if model == null then
-		""
-	else
-		" model=" + model
-	end
-	let u = if baseUrl == null then
-		""
-	else
-		" @ " + baseUrl
-	end
-	let a = if ok then
-		""
-	else
-		if reason == null then
-			""
-		else
-			" — " + reason
-		end
-	end
-	sprintf("llm: %s %s%s%s%s", [name, mark, m, u, a])
-end
-
-# =============================
-# Backends (raw-string exec, no boxing)
-# =============================
-
-# Backend: Ollama
-let _ollama = {
-	name: "ollama",
-	state: {baseUrl: "http://localhost:11434", model: null, options: {}},
-	listModels: fun(self: {}) -> [Str]? do
-		let url = self.state.baseUrl + "/api/tags"
-		let r = http({url: url, method: "GET"})
-		if r == null then
-			return _err("ollama listModels: request failed")
-		end
-		if r.status != 200 then
-			return _err("ollama listModels: HTTP " + str(r.status))
-		end
-		let body = jsonParse(r.body)
-		if body == null then
-			return _err("ollama listModels: bad JSON")
-		end
-		let out = []
-		if mapHas(body, "models") then
-			for m in iter(body.models) do
-				out = out + [m.name]
-			end
-		end
-		out
-	end,
-	probe: fun(self: {}) -> {} do
-		let r = http({url: self.state.baseUrl + "/api/tags", method: "GET"})
-		if r == null then
-			return {ok: false, authed: true, reason: "request failed"}
-		end
-		if r.status != 200 then
-			return {ok: false, authed: true, reason: "HTTP " + str(r.status)}
-		end
-		{ok: true, authed: true}
-	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
-		if self.state.model == null then
-			return _err("ollama: model not set (use llm.useModel)")
-		end
-		let eff = self.state.options
-		let reqBody = {
-			model: self.state.model,
-			prompt: prompt,
-			stream: false,
-			options: {}
-		}
-		if mapHas(eff, "temperature") and num(eff.temperature) != null then
-			reqBody.options.temperature = num(eff.temperature)
-		end
-		if mapHas(eff, "top_p") and num(eff.top_p) != null then
-			reqBody.options.top_p = num(eff.top_p)
-		end
-		if mapHas(eff, "top_k") and num(eff.top_k) != null then
-			reqBody.options.top_k = int(num(eff.top_k))
-		end
-
-		let r = http({
-			url: self.state.baseUrl + "/api/generate",
-			method: "POST",
-			headers: {"Content-Type": "application/json"},
-			body: jsonStringify(reqBody)
-		})
-		if r == null then
-			return r
-		end
-		if r.status != 200 then
-			let b = jsonParse(r.body)
-			if b != null and mapHas(b, "error") then
-				return _err("ollama: " + str(b.error))
-			end
-			return r
-		end
-
-		let j = jsonParse(r.body)
-		if j == null then
-			return r
-		end
-		if not mapHas(j, "response") or j.response == null then
-			return _err("ollama: missing response")
-		end
-		j.response
-	end
+To indicate that a property is required/mandatory, use `!` after the name of the property. For instance, 
+```
+let MusicRecord = type {
+    title!: Str,            ## required
+    artist!: Str,           ## required
+    releaseYear: Int,       ## optional
+    genre!: Str?,           ## required, can be null
+}
+```
+In the `MusicRecord` type schema, the title, the artist's name, and the genre are all mandatory, while the release year is optional. Note that the genre, while required, can be equal to `null`.
+```
+let song1 = {
+    title: "Carousel",
+    artist: "Mr. Bungle",
+    album: "Mr. Bungle",
+    genre: null
 }
 
-# Backend: OpenAI (Chat Completions)
-let _openai = {
-	name: "openai",
-	state: {
-		baseUrl: "https://api.openai.com/v1",
-		model: null,
-		apiKey: osEnv("OPENAI_API_KEY"),
-		options: {}
-	},
-	listModels: fun(self: {}) -> [Str]? do
-		if self.state.apiKey == null then
-			return _err("openai listModels: missing API key")
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {Authorization: "Bearer " + self.state.apiKey}
-		})
-		if r == null then
-			return r
-		end
-		if r.status != 200 then
-			return _err("openai listModels: HTTP " + str(r.status))
-		end
-		let body = jsonParse(r.body)
-		if body == null then
-			return _err("openai listModels: bad JSON")
-		end
-		let out = []
-		for m in iter(body.data) do
-			out = out + [m.id]
-		end
-		out
-	end,
-	probe: fun(self: {}) -> {} do
-		let authed = self.state.apiKey != null
-		if not authed then
-			return {ok: false, authed: false, reason: "missing API key"}
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {Authorization: "Bearer " + self.state.apiKey}
-		})
-		if r == null then
-			return {ok: false, authed: authed, reason: noteGet(r)}
-		end
-		if r.status != 200 then
-			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
-		end
-		{ok: true, authed: authed}
-	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
-		if self.state.apiKey == null then
-			return _err("openai: missing API key (llm.auth)")
-		end
-		if self.state.model == null then
-			return _err("openai: model not set")
-		end
-
-		let eff = self.state.options
-		let body = {
-			model: self.state.model,
-			messages: [
-				{
-					role: "system",
-					content: "You are a careful assistant that outputs only JSON."
-				},
-				{role: "user", content: prompt}
-			]
-		}
-		if mapHas(eff, "temperature") and num(eff.temperature) != null then
-			body.temperature = num(eff.temperature)
-		end
-		if mapHas(eff, "top_p") and num(eff.top_p) != null then
-			body.top_p = num(eff.top_p)
-		end
-		if mapHas(eff, "presence_penalty") and num(eff.presence_penalty) != null then
-			body.presence_penalty = num(eff.presence_penalty)
-		end
-		if mapHas(eff, "frequency_penalty") and num(eff.frequency_penalty) != null then
-			body.frequency_penalty = num(eff.frequency_penalty)
-		end
-		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
-			body.max_tokens = int(num(eff.max_tokens))
-		end
-
-		let r = http({
-			url: self.state.baseUrl + "/chat/completions",
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer " + self.state.apiKey
-			},
-			body: jsonStringify(body)
-		})
-		if r == null then
-			return r
-		end
-		if r.status != 200 then
-			let b = jsonParse(r.body)
-			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
-				return _err("openai: " + b.error.message)
-			end
-			return _err("openai: HTTP " + str(r.status))
-		end
-
-		let j = jsonParse(r.body)
-		if j == null then
-			return _err("openai: bad JSON from server")
-		end
-		if not mapHas(j, "choices") or len(j.choices) == 0 or not mapHas(j.choices[0], "message") or not mapHas(j.choices[0].message, "content") or j.choices[0].message.content == null then
-			return _err("openai: missing content")
-		end
-		j.choices[0].message.content
-	end
+let song2 = {
+    title: "Yesterday",
+    artist: "The Beatles",
+    releaseYear: 1965
 }
 
-# Backend: OpenAI (Responses API)
-let _openai_responses = {
-	name: "openai-responses",
-	state: {
-		baseUrl: "https://api.openai.com/v1",
-		model: null,
-		apiKey: osEnv("OPENAI_API_KEY"),
-		options: {}
-	},
-	listModels: fun(self: {}) -> [Str]? do
-		if self.state.apiKey == null then
-			return _err("openai-responses listModels: missing API key")
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {Authorization: "Bearer " + self.state.apiKey}
-		})
-		if r == null then
-			return r
-		end
-		if r.status != 200 then
-			return _err("openai-responses listModels: HTTP " + str(r.status))
-		end
-		let body = jsonParse(r.body)
-		if body == null then
-			return _err("openai-responses listModels: bad JSON")
-		end
-		let out = []
-		for m in iter(body.data) do
-			out = out + [m.id]
-		end
-		out
-	end,
-	probe: fun(self: {}) -> {} do
-		let authed = self.state.apiKey != null
-		if not authed then
-			return {ok: false, authed: false, reason: "missing API key"}
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {Authorization: "Bearer " + self.state.apiKey}
-		})
-		if r == null then
-			return {ok: false, authed: authed, reason: noteGet(r)}
-		end
-		if r.status != 200 then
-			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
-		end
-		{ok: true, authed: authed}
-	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
-		if self.state.apiKey == null then
-			return _err("openai-responses: missing API key (llm.auth)")
-		end
-		if self.state.model == null then
-			return _err("openai-responses: model not set")
-		end
+isType(song1, MusicRecord)  ## true, in spite of missing release year
+isType(song2, MusicRecord)  ## false, missing genre
+```
 
-		let eff = self.state.options
-		let body = {
-			model: self.state.model,
-			input: prompt,
-			text: {format: {type: "json_object"}}
-		}
-		if mapHas(eff, "temperature") and num(eff.temperature) != null then
-			body.temperature = num(eff.temperature)
-		end
-		if mapHas(eff, "top_p") and num(eff.top_p) != null then
-			body.top_p = num(eff.top_p)
-		end
-		if mapHas(eff, "presence_penalty") and num(eff.presence_penalty) != null then
-			body.presence_penalty = num(eff.presence_penalty)
-		end
-		if mapHas(eff, "frequency_penalty") and num(eff.frequency_penalty) != null then
-			body.frequency_penalty = num(eff.frequency_penalty)
-		end
-		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
-			body.max_output_tokens = int(num(eff.max_tokens))
-		end
 
-		let r = http({
-			url: self.state.baseUrl + "/responses",
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer " + self.state.apiKey
-			},
-			body: jsonStringify(body)
-		})
-		if r == null then
-			return _err("openai-responses: request failed")
-		end
-		if r.status != 200 then
-			let b = jsonParse(r.body)
-			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
-				return _err("openai-responses: " + b.error.message)
-			end
-			return _err("openai-responses: HTTP " + str(r.status))
-		end
+### Universal Type
 
-		let j = jsonParse(r.body)
-		if j == null then
-			return _err("openai-responses: bad JSON from server")
-		end
-		if not mapHas(j, "output") or len(j.output) == 0 then
-			return _err("openai-responses: missing content")
-		end
+MindScript also has the type `Any`, which serves as the universal fallback type representing any possible type. Hence
+```
+isType(a, type Any)
+```
+will evaluate to `true` no matter what `a` is.
 
-		let text = null
-		for msg in j.output do
-			if mapHas(msg, "content") and len(msg.content) > 0 then
-				for part in msg.content do
-					if mapHas(part, "type") and part.type == "output_text" and mapHas(part, "text") and part.text != null then
-						text = part.text
-						break
-					end
-				end
-				break
-			end
-		end
-		if text == null then
-			return _err("openai-responses: missing content")
-		end
-		text
-	end
+While it is recommended to be specific whenever possible, sometimes the univesal type is useful or even necessary. For instance,
+
+- it allows you to write quick, un-typed helper functions without boilerplate, while still preserving the ability to add types later;
+- core library functions like `map`, `filter`, and `reduce` operate over collections of arbitrary elements;
+- sometimes you don't know the schema in advance, especially in interoperation with unstructured data.
+
+
+### Type Aliases
+
+When you have a complex type expression that you reuse in multiple places, giving it a name makes your code clearer and easier to maintain. In MindScript, you create a *type alias* by binding a `type` expression to a name:
+```mindscript
+let [AliasName] = type [TypeExpression]
+```
+From then on, you can refer to `[AliasName]` anywhere a type is expected.
+
+Creating descriptive aliases like `GeoPoint` or `Track` immediately tells you what the shape represents, instead of forcing you to parse a long inline `{…}` or `[…]` every time. If multiple functions accept the same structured argument, you avoid copying-and-pasting the shape. If the shape changes, you update the alias in one place.
+
+Let's have a look at the following `GeoPoint` definition for latitude/longitude coordinates:
+```mindscript
+let GeoPoint = type {
+  lat!: Num,      ## required floating-point
+  lng!: Num,      ## required floating-point
+  label: Str?     ## optional descriptive label
 }
-
-# Backend: Anthropic (Messages API)
-let _anthropic = {
-	name: "anthropic",
-	state: {
-		baseUrl: "https://api.anthropic.com/v1",
-		model: null,
-		apiKey: osEnv("ANTHROPIC_API_KEY"),
-		version: "2023-06-01",
-		options: {max_tokens: 1024}
-	},
-	listModels: fun(self: {}) -> [Str]? do
-		if self.state.apiKey == null then
-			return _err("anthropic listModels: missing API key")
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {
-				"x-api-key": self.state.apiKey,
-				"anthropic-version": self.state.version,
-				"content-type": "application/json"
-			}
-		})
-		if r == null then
-			return _err("anthropic listModels: request failed")
-		end
-		if r.status != 200 then
-			return _err("anthropic listModels: HTTP " + str(r.status))
-		end
-		let body = jsonParse(r.body)
-		if body == null then
-			return _err("anthropic listModels: bad JSON")
-		end
-		let out = []
-		if mapHas(body, "data") then
-			for m in iter(body.data) do
-				out = out + [m.id]
-			end
-		end
-		out
-	end,
-	probe: fun(self: {}) -> {} do
-		let authed = self.state.apiKey != null
-		if not authed then
-			return {ok: false, authed: false, reason: "missing API key"}
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {
-				"x-api-key": self.state.apiKey,
-				"anthropic-version": self.state.version,
-				"content-type": "application/json"
-			}
-		})
-		if r == null then
-			return {ok: false, authed: authed, reason: "request failed"}
-		end
-		if r.status != 200 then
-			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
-		end
-		{ok: true, authed: authed}
-	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
-		if self.state.apiKey == null then
-			return _err("anthropic: missing API key (llm.auth)")
-		end
-		if self.state.model == null then
-			return _err("anthropic: model not set")
-		end
-
-		let eff = self.state.options
-		let body = {
-			model: self.state.model,
-			messages: [{role: "user", content: prompt}]
-		}
-		if mapHas(eff, "temperature") and num(eff.temperature) != null then
-			body.temperature = num(eff.temperature)
-		end
-		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
-			body.max_tokens = int(num(eff.max_tokens))
-		end
-		if mapHas(eff, "top_p") and num(eff.top_p) != null then
-			body.top_p = num(eff.top_p)
-		end
-		if mapHas(eff, "top_k") and num(eff.top_k) != null then
-			body.top_k = int(num(eff.top_k))
-		end
-
-		let r = http({
-			url: self.state.baseUrl + "/messages",
-			method: "POST",
-			headers: {
-				"x-api-key": self.state.apiKey,
-				"anthropic-version": self.state.version,
-				"content-type": "application/json"
-			},
-			body: jsonStringify(body)
-		})
-		if r == null then
-			return _err("anthropic: request failed")
-		end
-		if r.status != 200 then
-			let b = jsonParse(r.body)
-			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
-				return _err("anthropic: " + b.error.message)
-			end
-			return _err("anthropic: HTTP " + str(r.status))
-		end
-
-		let j = jsonParse(r.body)
-		if j == null then
-			return _err("anthropic: bad JSON from server")
-		end
-		if not mapHas(j, "content") or len(j.content) == 0 or not mapHas(j.content[0], "text") or j.content[0].text == null then
-			return _err("anthropic: missing content")
-		end
-		j.content[0].text
-	end
+```
+Now any object matching `{lat: Num, lng: Num, label: Str?}` can be annotated as a `GeoPoint`. They can also be nested. For instance, we can define a type schema for representing the boundaries of territories:
+```mindscript 
+let Territory = type {
+  name!: Str,
+  track!: [GeoPoint]
 }
+```
 
-# Backend: Cohere (Chat API)
-let _cohere = {
-	name: "cohere",
-	state: {
-		baseUrl: "https://api.cohere.ai/v1",
-		model: null,
-		apiKey: osEnv("COHERE_API_KEY"),
-		options: {}
-	},
-	listModels: fun(self: {}) -> [Str]? do
-		if self.state.apiKey == null then
-			return _err("cohere listModels: missing API key")
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {Authorization: "Bearer " + self.state.apiKey}
-		})
-		if r == null then
-			return _err("cohere listModels: request failed")
-		end
-		if r.status != 200 then
-			return _err("cohere listModels: HTTP " + str(r.status))
-		end
-		let body = jsonParse(r.body)
-		if body == null then
-			return _err("cohere listModels: bad JSON")
-		end
-		let out = []
-		if mapHas(body, "models") then
-			for m in iter(body.models) do
-				out = out + [m.name]
-			end
-		elif mapHas(body, "data") then
-			for m in iter(body.data) do
-				out = out + [m.id]
-			end
-		end
-		out
-	end,
-	probe: fun(self: {}) -> {} do
-		let authed = self.state.apiKey != null
-		if not authed then
-			return {ok: false, authed: false, reason: "missing API key"}
-		end
-		let r = http({
-			url: self.state.baseUrl + "/models",
-			method: "GET",
-			headers: {Authorization: "Bearer " + self.state.apiKey}
-		})
-		if r == null then
-			return {ok: false, authed: authed, reason: "request failed"}
-		end
-		if r.status != 200 then
-			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
-		end
-		{ok: true, authed: authed}
-	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
-		if self.state.apiKey == null then
-			return _err("cohere: missing API key (llm.auth)")
-		end
-		if self.state.model == null then
-			return _err("cohere: model not set")
-		end
 
-		let eff = self.state.options
-		let body = {model: self.state.model, message: prompt}
-		if mapHas(eff, "temperature") and num(eff.temperature) != null then
-			body.temperature = num(eff.temperature)
-		end
-		if mapHas(eff, "top_p") and num(eff.top_p) != null then
-			body.p = num(eff.top_p)
-		end
-		if mapHas(eff, "top_k") and num(eff.top_k) != null then
-			body.k = int(num(eff.top_k))
-		end
-		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
-			body.max_tokens = int(num(eff.max_tokens))
-		end
+## Declaring Functions
 
-		let r = http({
-			url: self.state.baseUrl + "/chat",
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: "Bearer " + self.state.apiKey
-			},
-			body: jsonStringify(body)
-		})
-		if r == null then
-			return _err("cohere: request failed")
-		end
-		if r.status != 200 then
-			let b = jsonParse(r.body)
-			if b != null and mapHas(b, "message") then
-				return _err("cohere: " + b.message)
-			end
-			return _err("cohere: HTTP " + str(r.status))
-		end
+Functions in MindScript are created with the `fun` keyword. This yields anonymous functions (called *lambdas*) that can be bound to variables. The general syntax is:
 
-		let j = jsonParse(r.body)
-		if j == null then
-			return _err("cohere: bad JSON from server")
-		end
-		if mapHas(j, "text") and j.text != null then
-			return j.text
-		end
-		if mapHas(j, "message") and mapHas(j.message, "content") and j.message.content != null then
-			return j.message.content
-		end
-		_err("cohere: missing content")
-	end
+```mindscript
+fun([arg1]: [Type1], [arg2]: [Type2], ...) -> [ReturnType] do
+  ...    ## body of the function
+end
+```
+
+There are a few rules. Type annotations on arguments and return type are optional; omitting them defaults to the universal type `Any`. If you omit all arguments, a hidden `null: Null` parameter is added automatically. Hence, all functions have arguments. To exit early you can use `return([value])`; otherwise the last expression's value is returned.
+
+As an example, consider the *factorial* function:
+
+```mindscript
+let factorial = fun(n: Int) -> Int do
+  if n == 0 then
+    1
+  else
+    n * factorial(n - 1)
+  end
+end
+```
+
+To evaluate a function, use parenthesis and the arguments right after the function expression, with no space in between:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> factorial(4)</span>
+<span class="value">24</span>
+
+<span class="prompt">> (fun(n, m) do n + m end)(1, 2)</span>
+<span class="value">3</span>
+
+<span class="prompt">> (fun(n, m) do n + m end)("Hello ", "Jack")</span>
+<span class="value">"Hello Jack"</span>
+</code></pre>
+</div>
+The last two examples also show how to evaluate (and immediately discard) a function.
+
+In the case of the factorial function, notice that the declaration uses a recursive call
+```{.mindscript hl_lines="5"}
+let factorial = fun(n: Int) -> Int do
+  if n == 0 then
+    1
+  else
+    n * factorial(n - 1)
+  end
+end
+```
+even though the name `factorial` is only bound after the function has been created. This works because the variable `factorial` is only evaluated at runtime, when we call it.
+
+
+## Currying
+
+All MindScript functions are *curried*, that is, every multi-argument function is translated into a sequence of single-argument functions. Consider the following:
+```mindscript
+let sum = fun(x: Int, y: Int) -> Int do
+  return(x + y)
+end
+```
+If we check its type we get
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> typeOf(sum)</span>
+<span class="value">type Int -> Int -> Int</span>
+</code></pre>
+</div>
+which says that `sum` is a function that takes `x:Int` and returns a function of type `Int -> Int`, which in turn takes an argument `y:Int` and returns a result of type `Int`.
+
+Because of this, multi-argument functions can be called in stages. For instance:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> sum(3, 4)</span>
+<span class="value">7</span>
+
+<span class="prompt">> sum(3)</span>
+<span class="value">y:Int -> Int</span>
+
+<span class="prompt">> let add3 = sum(3)</span>
+<span class="value">y:Int -> Int</span>
+
+<span class="prompt">> add3(4)</span>
+<span class="value">7</span>
+
+<span class="prompt">> sum(3)(4)</span>
+<span class="value">7</span>
+</code></pre>
+</div>
+The expression `sum(3, 4)` returns `7` as expected. But then, `sum(3)` binds the argument `x=3`, returning the new function of type `y:Int -> Int` which adds 3 to its argument `y`. This is the reason why `sum(3, 4)` gives the same result as evaluating it in stages like in `sum(3)(4)`.
+
+Currying promotes concise higher-order patterns: you can pass partially applied functions to `map`, `filter`, etc. For instance, consider the following function `eval` which takes an arbitrary function, its arguments, and then evaluates it:
+```mindscript
+let eval = fun(f: Any -> Any, args: [Any]) do
+  for x in iter(args) do
+    f = f(x)
+  end
+end
+```
+In the body we iterate over the arguments, and in each step, we evaluate `f = f(x)`, which evaluates the function with a single argument, obtains the partially evaluated function, and assigns it to `f` itself. If we apply this to `sum` and  arguments `[3, 4]`, we get
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> eval(sum, [3, 4])</span>
+<span class="value">7</span>
+</code></pre>
+</div>
+as expected.
+
+## Duck Typing
+
+MindScript embraces *structural typing*, sometimes colloquially called "duck typing", for object shapes. (The expression comes from the saying "if it walks like a duck and quacks like a duck, then it is a duck".) A function expecting a `{name: Str, age: Int}` will accept *any* object containing those properties (and possibly more), regardless of its declared type.
+
+```mindscript
+# Greets any object with a 'name' field
+let greet = fun(person: {name!: Str}) -> Str do
+  "Hello, " + person.name + "!"
+end
+
+let foo = { name: "Alice", hobby: "chess" }
+let bar = { name: "Bob", age: 30, city: "London" }
+
+greet(foo)  ## prints "Hello, Alice!"
+greet(bar)  ## prints "Hello, Bob!"
+```
+
+Even though `foo` and `bar` lack a shared named type, they both "quack" like `{name!: Str}`, so the function `greet` accepts them.
+
+
+## Closures
+
+MindScript functions form *closures*, that is, they capture variables from their defining scope. These closed-over variables remain alive even after the outer function returns. This is best explained using an example. Let's say you want to create an iterator (for a [loop](/manual/blocks#loop-expressions)) that counts from 1 onward:
+
+```mindscript
+let makeCounter = fun() -> (Null -> Int) do
+  let count = 0
+  fun() -> Int do
+    count = count + 1
+  end
+end
+
+let c1 = makeCounter()
+c1()   ## 1
+c1()   ## 2
+
+let c2 = makeCounter()
+c2()   ## 1 (independent count)
+```
+Here, each call to `makeCounter()` produces a fresh closure over its own `count` variable. The inner function can read and mutate `count`, and successive calls remember the updated value. Lexical scoping ensures these captured variables behave predictably, enabling patterns like generators, memoization, and private state.
+
+
+=== END FILE: ./docs/manual/docs/learn/functions.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/index.md ===
+# Introduction
+
+MindScript is an experimental programming language that seamlessly combines the features of a traditional programming language and the power of large language models (LLMs). It was inspired by the pioneering work done by the [LangChain team](https://langchain.com). The question was: "What if, rather than bolting LLM-powered functions onto a Python framework, we built a Turing-complete language from the ground up with LLM capabilities as first-class citizens?"
+
+The motivation behind MindScript is to provide programmers with a minimalistic language for processing JSON objects using both programmatic and inductive constructs which allow for semantic processing in way that wasn't possible before the advent of LLMs.
+
+!!! information
+    To setup your MindScript environment, please follow the instructions in the [Quick Intro](/installation).
+
+
+## Your first MindScript program
+
+Let's go over the basics of writing a MindScript program. First, we create a file with the following content
+```
+# Say hello in a funny way!
+let sayHello = oracle() -> Str
+
+println(sayHello())
+```
+and save it as `first.ms`. In order to execute it, run
+```
+$ mindscript [FLAGS] first.ms
+```
+where flags specifies the LLM backend to use, such as
+```
+$ mindscript -b openai -m gpt-4o first.ms
+```
+which specifies using the `gpt-4o` model from the OpenAI backend. This will of course depend on your specific setup.
+
+Running the above should print something like
+```
+$ mindscript -b openai -m gpt-4o first.ms
+
+Greetings, Earthling! Ready for some rib-tickling fun
+and intergalactic high fives? Let's make today out of
+this world! 🚀😄
+```
+The greeting will depend on what your LLM came up with whilst following the instruction `Say hello in a funny way!`.
+
+Let's go over the program, line by line. The very first line is a comment. Comments start with a hash `#` and are followed by a string.
+``` hl_lines="1"
+# Say hello in a funny way!
+let sayHello = oracle() -> Str
+
+println(sayHello())
+```
+*Unlike* other programming languages, a comment is an annotation which is attached to the value that follows it. It serves as a hint for both for programmers and for the LLM.
+
+In this case, it is attached to the result of evaluating the next line
+``` hl_lines="2"
+# Say hello in a funny way!
+let sayHello = oracle() -> Str
+
+println(sayHello())
+```
+which assigns a new oracle to the newly created variable `sayHello`.
+
+In MindScript there's only one construct to declare a new variable. This is done using the `let` keyword and providing a variable name. Variable names must always start with a alphabetic character or an underscore followed by zero or more alphanumeric characters or an underscore. The following are all valid variable names:
+```
+x
+_secret
+AlphaBeta
+coordinate1
+the_speed_of_light
+```
+
+The expression `oracle() -> Str` declares an **oracle**. Oracles are like functions, expect that their implementation is a black box and their behavior is guided by hints. Oracles are the main feature of MindScript.
+
+Unlike most programming languages, function objects and oracles are always anonymous (like Python lambdas) and are often immediately assigned to a variable. In addition, they are always typed, and input and output values are checked at runtime, yielding an error if they don't conform. 
+
+In MindScript everything is an expression. Hence, declarations and assignments themselves return a value. In this case, the entire line evaluates to an oracle object.
+
+Because it evaluates to an oracle object, the comment in the preceeding line gets attached to it. Attaching a hint to an oracle guides its evaluation.
+
+In the final line we evaluate the oracle and print the result followed by a newline
+``` hl_lines="4"
+# Say hello in a funny way!
+let sayHello = oracle() -> Str
+
+println(sayHello())
+```
+Because the oracle is a black box, it will return an arbitrary string guided by the hint. Multiple executions of this program should print different greetings.
+
+
+
+
+
+
+
+
+
+
+
+=== END FILE: ./docs/manual/docs/learn/index.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/oracles.md ===
+<style>
+  .my-code span.prompt { color: black; }
+  .my-code span.note { color: green; }
+  .my-code span.value { color: blue; }
+</style>
+
+# Oracles and Informal Types
+
+In this chapter, we explore two powerful features of MindScript that blur the line between code and documentation, and increase its expressiveness beyond traditional programming languages:
+
+1. *Informal Annotations*: a lightweight, comment-based type hinting system;
+2. *Oracles* LLM-backed computational “black boxes” that boost the language’s capabilities.
+
+In classical computation theory, an **oracle machine** is a Turing machine augmented with access to a “black-box” that instantly solves a particular problem, even if it is undecidable by the machine alone. Similarly, 
+
+* *Semantic Queries*: Oracles can answer questions about meaning or world knowledge that no static algorithm could compute (e.g., “Who invented the World Wide Web?”).
+* *On-the-fly Reasoning*: They enable operations like free-form text generation, pattern recognition, or domain-specific inference, all at runtime.
+* *Extensible Capability*: By changing the LLM prompt (informal type) or examples, you effectively “upgrade” the oracle’s power without altering the language core.
+
+This mechanism sets MindScript apart from a purely syntactic language to one with **semantic computation** capabilities, akin to dynamically consulting an expert whenever you need an intelligent answer.
+
+
+## Informal Annotations
+
+In MindScript, you can attach human-readable comments directly to values or definitions. These comments become **informal types**, guiding a Large Language Model (LLM) when it interprets or generates code. They are *not* checked at runtime, but they enrich the "intent" behind your code.
+
+Comments are denoted by the `#` operator following by an explanation. Place a comment on its own line immediately before an expression. The annotation attaches to the *value* of that expression.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> # The speed of light in meters per second.</span>
+<span class="prompt">| let c = 299792458</span>
+<span class="note">The speed of light in meters per second.</span>
+<span class="value">299792458</span>
+</code></pre>
+</div>
+
+Here, the value `299792458` gains the informal type "The speed of light in meters per second."
+
+If we type a variable name in the REPL, it returns the annotation and the value:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> c</span>
+<span class="note">The speed of light in meters per second.</span>
+<span class="value">299792458</span>
+</code></pre>
+</div>
+
+We have already seen annotations with double-hashes `##`. Double-hash annotations are ignored by the interpreter, i.e. they behave just like code comments in other programming languages.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> ## The speed of light in meters per second.</span>
+<span class="prompt">> let c = 299792458    ## This will be ignored too.</span>
+<span class="value">299792458</span>
+</code></pre>
+</div>
+
+Setting and retrieving notes can also be achieved programmatically using the `setNote([val], [note])` and `getNote([val])` functions respectively.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> let c = 299792458</span>
+<span class="value">299792458</span>
+
+<span class="prompt">> setNote(c, "The speed of light in meters per second.")</span>
+<span class="note">The speed of light in meters per second.</span>
+<span class="value">299792458</span>
+
+<span class="prompt">> getNote(c)</span>
+<span class="value">"The speed of light in meters per second."</span>
+</code></pre>
+</div>
+
+You can stack multiple `#`-comments directly above a definition to form a single, multi-line annotation. All of those lines will be treated as one coherent "hint". For example, imagine you want to annotate a function that processes quarterly sales data:
+
+```mindscript
+# Processes a batch of raw sales records.
+#   1. Filters out any returned items.
+#   2. Groups the remaining sales by region code.
+#   3. Sums the total revenue per region.
+# Returns list of revenues, one per region.
+let processQuarterlySales = fun(records: [SaleRecord]) -> [Revenue] do
+
+    ... the code here ...
+
+end
+```
+Here, the four consecutive `#` lines form one multi-line annotation describing *what* `processQuarterlySales` does and *how*. Under the hood, MindScript (and any connected LLM) will treat that block as a single "informal type" or hint attached to the function's value.
+
+
+Annotations are *meta-data*. Unlike values, which represent the actual information your code processes, annotations only convey intent, documentation, or hints for another human reader or an oracle. In other words, formal operations won't be impacted by an annotation.
+
+Annotations don't propagate in operations. If you use an annotated value in an expression, the result won't have any annotation unless you attach one explicitly.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> # The Golden ratio.</span>
+<span class="prompt">| let phi = (1 + sqrt(5)) / 2</span>
+<span class="note">The Golden ratio.</span>
+<span class="value">1.618033988749895</span>
+
+<span class="prompt">> 2 * phi</span>
+<span class="value">3.23606797749979</span>
+</code></pre>
+</div>
+
+
+### Documenting Functions
+
+As is the case in other programming languages, annotations are especially helpful for documenting the purpose of functions:
+
+```mindscript
+# Computes the sum of two integers.
+let sum = fun(n: Int, m: Int) -> Int do
+    n + m
+end
+```
+This declaration specifies that the function `sum` has a type with two parts:
+
+* *Formal part*: `fun(n: Int, m: Int) -> Int` declares the signature which restricts the formal type of the inputs and outputs and is runtime checked.
+* *Informal part*: The preceding comment helps a human reader and an oracle to understand that `sum` "computes the sum of two integers." 
+
+
+### Annotating Data Structures
+
+You can sprinkle annotations inside object literals to explain individual fields:
+
+```mindscript
+let Person = {
+    # The person’s full name.
+    name!: Str,
+
+    # Age in completed years.
+    age: Int
 }
+```
 
-# =============================
-# Registry & environment sync
-# =============================
+This approach turns your data model into self-documenting code. It enhances readability and it serves as an explanation of the *semantic meaning* of the data passed around.
 
-_state.backends["ollama"] = _ollama
-_state.backends["openai"] = _openai
-_state.backends["openai-responses"] = _openai_responses
-_state.backends["anthropic"] = _anthropic
-_state.backends["cohere"] = _cohere
+## Oracles
 
-# If OPENAI_API_KEY is present, mirror it into both OpenAI backends at load.
-if _openai.state.apiKey != null then
-	_state.backends["openai"].state.apiKey = _openai.state.apiKey
-	_state.backends["openai-responses"].state.apiKey = _openai.state.apiKey
+An **oracle** in MindScript is like a function powered by an LLM: it can perform inductive inference based on either:
+
+* A **natural-language description** (an informal type), or/and
+* A **set of examples**.
+
+Calling an oracle is like sending a message with a question to another person who replies with the best answer they can come up with. Under the hood, invoking an oracle sends a prompt—including formal and informal type hints or examples—to the LLM, which returns a result conforming to the declared type.
+
+### Basic Syntax
+
+To declare an oracle, use the `oracle` keyword similarly to using `fun` for defining a function but without specifying a body.
+```mindscript
+# Write the name of an important researcher in the given field.
+let researcher = oracle(field: Str) -> {name: Str}
+```
+In this declaration, the formal type of the oracle is `field:Str -> {name: Str}`: it expects a `Str` and returns an object containing a `name` property. The informal type of the oracle, "Write the name of an important researcher in the given field.", is interpreted as an instruction.
+
+You can then call it as you would any function:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> researcher("physics")</span>
+<span class="value">{ "name": "Albert Einstein" }</span>
+
+<span class="prompt">> researcher("biology")</span>
+<span class="value">{ "name": "Charles Darwin" }</span>
+</code></pre>
+</div>
+
+
+### Using Examples
+
+Sometimes it is better to demonstrate the desired behavior using examples rather than describing it. If you already have input/output pairs, you can add them using the `from` keyword followed by a list of examples:
+
+```mindscript
+let examples = [
+    [0, "zero"],
+    [1, "one"],
+    [2, "two"],
+    [3, "three"]
+]
+
+let number2lang = oracle(number: Int) -> Str from examples
+```
+Here, `number2lang(2)` will induce `"two"`, and even produce new mappings like `"forty-two"` for `42`. An array of examples must always contain `[input, output]` pairs. 
+
+Of course, you can always combine descriptions and examples to improve the hints for the oracle.
+
+
+## How is the LLM prompt constructed?
+
+<style>
+  .oracle span.purple { color: purple; }
+  .oracle span.blue   { color: blue; }
+  .oracle span.green  { color: green; }
+  .oracle span.red    { color: red; }
+  .oracle span.cyan   { color: darkcyan; }
+</style>
+
+As mentioned before, informal types are hints for guiding the behavior of the LLM. But how does this happen, precisely? Under the hood, MindScript uses the hints during the oracle invocation to draft a prompt for the LLM. The informal type of the function will be interpreted as the instruction, the input and output types are constraints on the JSON Schemas, etc.
+
+To illustrate, consider the following creation of an oracle.
+
+<div class="oracle" markdown="0">
+<pre><code><span class="purple"># Example input output pairs.
+let examples = [
+  [{input: 9}, {output: 16}],
+  [{input: 25}, {output: 36}], 
+  [{input: 1}, {output: 4}]
+]</span>
+
+<span class="blue"># The input number.
+let Input = type {input!: Int}</span>
+
+<span class="green"># The output number.
+let Output = type {output!: Int}</span>
+
+<span class="red"># Given a square number, provide the next square.</span>
+let main = oracle(<span class="blue">args: Input</span>) -> <span class="green">Output</span> from <span class="purple">examples</span>
+
+main(<span class="cyan">{input: 144}</span>)
+</code></pre>
+</div>
+
+Then a call to the oracle will generate the following prompt below, which has been colored to highlight the correspondences to the code above.
+<div class="oracle" markdown="0">
+<pre><code>
+PROMPT: 
+You are a helpful assistant, and your task is to provide answers
+respecting the format of the OUTPUT JSON SCHEMA. Do not put code
+fences around the output (like ```json), only generate valid JSON.
+
+<span class="blue">INPUT JSON SCHEMA:
+
+{
+    "type": "object",
+    "required": [
+        "input"
+    ],
+    "properties": {
+        "args": {
+            "type": "object",
+            "description": "The input number.",
+            "required": [
+                "input"
+            ],
+            "properties": {
+                "input": {
+                    "type": "integer"
+                }
+            }
+        }
+    }
+}</span>
+
+<span class="green">OUTPUT JSON SCHEMA:
+
+{
+    "type": "object", 
+    "properties": {
+        "result": {
+            "type": "object", 
+            "description": "The output number.", 
+            "required": ["output"], 
+            "properties": {"output": {"type": "integer"}}}
+    }, 
+    "required": ["result"]
+}</span>
+
+<span class="red">TASK:
+
+Given the input, determine the output.</span>
+
+<span class="purple">INPUT:
+
+{"input": {"input": 9}}
+
+OUTPUT:
+
+{"output": 16}</span>
+
+<span class="red">TASK:
+
+Given the input, determine the output.</span>
+
+<span class="purple">INPUT:
+
+{"input": {"input": 25}}
+
+OUTPUT:
+
+{"output": 36}</span>
+
+<span class="red">TASK:
+
+Given the input, determine the output.</span>
+
+<span class="purple">INPUT:
+
+{"input": {"input": 1}}
+
+OUTPUT:
+
+{"output": 4}</span>
+
+<span class="red">TASK:
+
+Given a square number, provide the next square.</span>
+
+<span class="cyan">INPUT:
+
+{"input": {"input": 144}}</span>
+
+OUTPUT:
+
+</code></pre>
+</div>
+
+
+
+
+
+
+
+=== END FILE: ./docs/manual/docs/learn/oracles.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/scopes.md ===
+# Scopes & Control
+
+In this chapter, we’ll explore how MindScript handles variable scope, block structure, and the three core control constructs: logical expressions, conditional expressions, and for-loops. 
+
+
+### Lexical Scoping and Blocks
+
+MindScript uses *lexical (static) scoping*, meaning each variable is bound to the nearest enclosing block at *write* time. A block is any section of code surrounded by `do ... end` (and other delimiters in conditional blocks which we'll see later). The only exception to this is the *global scope* which has no delimiters. 
+
+Variables declared inside an inner block *shadow* variables with the same name declared in an outer block.
+
+```mindscript
+let a = "global a"
+let b = "global b"
+let c = "global c"
+
+## A block creates a new scope
+do
+    let a = "inner a"     ## shadows the outer 'a'
+    b = "inner b"         ## overwrites the outer 'b'
+    println(a)            ## inner a
+    println(b)            ## inner b
+    println(c)            ## global c
 end
 
-# =============================
-# Public API
-# =============================
+println(a)  ## global a
+println(b)  ## inner b
+println(c)  ## global b
+```
+In this code, `a` declared inside the block shadows `a` declared in the global scope and thus `let a = "inner a"` does not affect `global a`. Also, variables declared with `let` inside a block vanish when the block ends.
 
-# Probe all backends, print diagnostics, and ensure a usable current backend.
-# Args: _: Null (ignored)
-# Return: { backends!: [Str], current!: Str }
-let init = fun(_: Null) -> {} do
-	let names = []
-	let firstOK = null
-	for [k, _] in _state.backends do
-		names = names + [k]
-	end
+The value of a block is the last evaluated expression. Therefore, in the case above, the value of the block is `"global c"`. In fact, one could even assign the result of a block to a variable.
+```
+let name = "Andreas"
 
-	let currentOK = false
-	for name in names do
-		let b = _state.backends[name]
-		let pr = b.probe(b)
-		let line = _diagLine(name, pr.ok, pr.authed, if mapHas(b.state, "model") then
-			b.state.model
-		else
-			null
-		end, if mapHas(b.state, "baseUrl") then
-			b.state.baseUrl
-		else
-			null
-		end, if mapHas(pr, "reason") then
-			pr.reason
-		else
-			null
-		end)
-		println(line)
-		if pr.ok and firstOK == null then
-			firstOK = name
-		end
-		if name == _state.current and pr.ok then
-			currentOK = true
-		end
-	end
+let result = 
+    do
+        let prefix = "Hello, "
+        let greeting = prefix + name
+    end
 
-	if not currentOK and firstOK != null then
-		_state.current = firstOK
-		println(sprintf("llm: switched current backend to \"%s\"", [
-			_state.current
-		]))
-	end
+println(result)   ## prints "Hello, Andreas"
+```
 
-	{backends: names, current: _state.current}
+Use block scoping to limit variable lifetimes, avoid name collisions, and make your code easier to reason about.
+
+
+### Control Structures
+
+MindScript has three control flow constructs: logical expressions, conditionals, and loops.
+
+#### Logical Expressions (Short-Circuit)
+
+The logical operators `and` and `or` *short-circuit*: the evaluation stops as soon as the result is determined. In a sequence of `and` operations, the evaluation continues until any subexpression is `false`. Similarly, a sequence of `or` operations stops its evaluation as soon as it encounters a subexpression that is `false`. For example:
+
+```mindscript
+let isValid = (userInput != "") and (length(userInput) < 100)
+
+let quickTest = (1 == 2) or expensiveCheck()
+```
+In the first line, if `userInput` is equal to the empty string `""`, then the evaluation stops immediately and the second term is not evaluated. Likewise, in the second line, `expensiveCheck()` will always be evaluated, because `(1 == 2)` is false.
+
+
+#### Conditional Expressions
+
+MindScript’s `if ... then ... else` is an **expression**&mdash;it returns a value. Use `elif` for multiple branches.
+
+```mindscript
+let age = 27
+
+let describeAge = 
+    if age < 13 then
+        "Child"
+    elif age < 20 then
+        "Teenager"
+    elif age < 65 then
+        "Adult"
+    else
+        "Senior"
+    end
+
+println(describeAge)  ## Adult
+```
+Here, the individual branches between the conditions are blocks, that is, they have their own scope and return the last evaluated expression.
+
+
+#### Loop Expressions
+
+MindScript’s `for` loops operate over *iterators*. This is similar to Python's `for ... in ...` construction. Technically, iterators are [closures](manual/functions.md), a topic we'll discuss later. For our purposes here, iterators are functions that generate sequences of values.
+
+One way of building iterators from arrays or objects is using the `iter` function.
+```mindscript
+let arr = [1, 2, 3, 4]
+let obj = {a: 1, b: 2, c: 3}
+
+let arrIt = iter(arr)
+let objIt = iter(obj)
+```
+Then, repeatedly invoking `arrIt()` and `objIt()` will return the sequences
+```
+1, 2, 3, 4, null, null, ...
+
+[a, 1], [b, 2], [c, 3], null, null, ...
+```
+respectively. After the last element in the container was produced these iterators return `null` values forever. For objects, two additional useful functions are `keys(obj)` and `values(obj)`, which produce a sequence of `obj`'s keys and values respectively.
+
+The loop constructor takes the form `for [v] in [it] do [block] end`, where `[v]` is a variable, `[it]` an iterator, and `[block]` a block of expressions. Let's have a look at this code to compute squared numbers:
+```mindscript
+let nums = [1, 2, 3, 4]
+let it = iter(nums)
+
+for n in it do
+    println(x * x)
 end
+```
+This will print the sequence `1, 4, 9, 16`. Note that loops stop as soon as the iterator returns a `null` value. Since loops are expressions, the value of the entire loop is the last computed value&mdash;in this case, `16`. 
 
-# List registered backend names.
-let backends = fun(_: Null) -> [Str] do
-	let out = []
-	for [k, _] in _state.backends do
-		out = out + [k]
-	end
-	out
+You can influence the execution of the loop using `break(expr)` and `continue(expr)`, where
+
+- `break(expr)` exits the loops and returns `expr`,
+- and `continue(expr)` skips to the next iteration after evaluating `expr`. 
+
+The returning values are mandatory because loops are expressions, unlike the loop constructs in other programming languages.
+
+We can use this to mimic the behavior of a while loop. The code below computes the sum of positive numbers until a negative number is encountered:
+```mindscript
+let mixed = iter([2, 3, -1, 7])
+
+var total = 0
+for v in it do
+    if v < 0 do
+        break(total)
+    end
+    total = total + v
 end
+```
+This loop adds `2` and `3` and then breaks with a value equal to `5`.
 
-# Report current backend status without network calls.
-let status = fun(_: Null) -> {} do
-	let b = _state.backends[_state.current]
-	let requiresKey = b.name == "openai" or b.name == "openai-responses" or b.name == "anthropic" or b.name == "cohere"
-	let authed = if requiresKey then
-		mapHas(b.state, "apiKey") and b.state.apiKey != null
-	else
-		true
-	end
-	{
-		backend: b.name,
-		model: if mapHas(b.state, "model") then
-			b.state.model
-		else
-			null
-		end,
-		authed: authed,
-		options: if mapHas(b.state, "options") then
-			b.state.options
-		else
-			{}
-		end
-	}
+
+### Best Practices
+
+1. **Keep scopes small**: declare variables as late as possible inside the smallest `do ... end` block.
+2. **Use descriptive names**: avoid shadowing outer variables unless intentional.
+3. **Leverage expression-based control**: capture `if` and `for` results directly in variables.
+4. **Handle iterators cleanly**: always design iterators to return `null` when done, enabling idiomatic loops.
+
+
+
+=== END FILE: ./docs/manual/docs/learn/scopes.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/stdlib.md ===
+# Standard Library
+
+MindScript fires up with a set of built-in functions (= *the Standard Library*) to operate on [arrays](#arrays), [iterators](#iterators), [objects](#objects), [strings](#string-functions), and more. Below you'll find a complete reference.
+
+
+## General functions
+
+### print
+`value:Any -> Any`
+
+Prints a value.
+
+### assert
+`condition:Bool -> Bool`
+
+Asserts the condition.
+
+
+### error
+`message:Str? -> Null`
+
+Throws a runtime error.
+
+
+### size
+`value:Any -> Int?`
+
+Returns the size of a collection or a string.
+
+
+### clone
+`value:Any -> Any`
+
+Makes a (deep) clone of a value.
+
+
+### exit
+`_:Null -> Null`
+
+Exits the program.
+
+
+
+## Arrays
+
+### list
+`iterator:(Any -> Any) -> [Any]`
+
+Collects the elements generated by an iterator into an array.
+
+
+### slice
+
+`array:[Any] -> s:Int -> e:Int -> [Any]`
+
+Slices an array between two indexes.
+
+
+### push
+
+`array:[Any] -> value:Any -> [Any]`
+
+Adds a value to the end of an array. See a use example [here](basics.md#pseudo-while-loops).
+
+
+### pop
+
+`array:[Any] -> Any`
+
+Pops the last value from the array.
+
+
+### shift
+
+`array:[Any] -> value:Any -> [Any]`
+
+Inserts a value at the front of an array.
+
+
+### unshift
+
+`array:[Any] -> Any`
+
+Pops the first value from the array.
+
+
+
+## Objects
+
+### delete
+`obj:{} -> prop:Str -> {}`
+
+Deletes a property from an object.
+
+### keys
+`obj:{} -> (Null -> Str?)`
+
+Returns an iterator over an object's keys.
+
+
+### values
+`obj:{} -> (Null -> Any?)`
+
+Returns an iterator over an object's values.
+
+
+### exists
+
+`obj:{} -> key:Str -> Bool`
+
+Checks whether a key exists.
+
+
+### get
+
+`obj:{} -> key:Str -> Any`
+
+Returns a property.
+
+
+### set
+
+`obj:{} -> key:Str -> value:Any -> Any`
+
+Set a property to a given value.
+
+
+### dir
+`obj:{} -> [Str]`
+
+Returns a list of keys for a given object.
+
+### dirFun
+`obj:{} -> [Str]`
+
+Return the methods of an object.
+
+
+## Iterators
+
+### iter
+`value:Any -> Any`
+
+Creates an iterator function from the value.
+
+
+### natural0
+`_:Null -> (Null -> Int?)`
+
+The positive integers.
+
+
+### natural
+`_:Null -> (Null -> Int?)`
+
+The natural numbers.
+
+
+### range
+`start:Int -> stop:Int? -> (Null -> Int?)`
+
+Returns an iterator for the integers from a given starting number until an ending number.
+
+
+### reduce
+`f:(Any -> Any -> Any) -> iterator:(Null -> Any) -> Any`
+
+Reduces an iterator using a binary function.
+
+Example: calculate the sum from 1 to 100.
+```
+let sum = fun(n, m) do n+m end
+reduce(sum, range(1, 101))
+```
+
+### filter
+`cond:(Any -> Bool) -> iterator:(Null -> Any) -> (Null -> Any)`
+
+Filters an iterator using a condition.
+
+Example: print the first 10 even numbers.
+```
+for k in filter(fun(n: Int) -> Bool do (n % 2 == 0) end, natural()) do
+    if k<10 do
+        println(k)
+    else
+        break(k)
+    end
 end
+```
 
-# Switch the current backend by name.
-let useBackend = fun(name: Str) -> {}? do
-	if not mapHas(_state.backends, name) then
-		return _err("unknown backend: " + name)
-	end
-	_state.current = name
-	status(null)
+### map
+`f:(Any -> Any) -> iterator:(Null -> Any) -> (Null -> Any)`
+
+Applies a function to an iterator.
+
+Example: print the first 10 even numbers.
+```
+for k in map(fun(n: Int) -> Int do 2*n end, natural()) do
+    if k<10 do
+        println(k)
+    else
+        break(k)
+    end
 end
+```
 
-# List models for the current backend (if supported).
-let models = fun(_: Null) -> [Str]? do
-	let b = _state.backends[_state.current]
-	if not mapHas(b, "listModels") then
-		return _err(b.name + " does not support model listing")
-	end
-	b.listModels(b)
-end
 
-# Set the active model for the current backend.
-let useModel = fun(name: Str) -> {}? do
-	let b = _state.backends[_state.current]
-	b.state.model = name
-	status(null)
-end
 
-# Get an editable config snapshot for the current backend.
-let getConfig = fun(_: Null) -> {} do
-	let b = _state.backends[_state.current]
-	let cfg = {
-		backend: b.name,
-		baseUrl: if mapHas(b.state, "baseUrl") then
-			b.state.baseUrl
-		else
-			null
-		end,
-		model: if mapHas(b.state, "model") then
-			b.state.model
-		else
-			null
-		end,
-		options: if mapHas(b.state, "options") then
-			b.state.options
-		else
-			{}
-		end
-	}
-	if mapHas(b.state, "timeoutMs") then
-		cfg.timeoutMs = b.state.timeoutMs
-	end
-	cfg
-end
+## Mathematical functions
 
-# Merge a config object into the current backend's state.
-let setConfig = fun(cfg: {}) -> {}? do
-	let b = _state.backends[_state.current]
-	if mapHas(cfg, "baseUrl") then
-		b.state.baseUrl = cfg.baseUrl
-	end
-	if mapHas(cfg, "model") then
-		b.state.model = cfg.model
-	end
-	if mapHas(cfg, "options") then
-		b.state.options = cfg.options
-	end
-	if mapHas(cfg, "timeoutMs") then
-		b.state.timeoutMs = cfg.timeoutMs
-	end
-	status(null)
-end
+### PI
+`3.14159265359`
 
-# Store credentials for the current backend (never printed).
-let auth = fun(creds: {}) -> {}? do
-	let b = _state.backends[_state.current]
-	# Ensure apiKey is set/cleared where status() looks.
-	if mapHas(creds, "apiKey") then
-		b.state.apiKey = creds.apiKey
-	end
-	b.state = b.state + creds # Shallow-merge any other credential keys.
-	status(null)
-end
+The number pi (π).
 
-# Execute the current backend with a prompt.
-# Returns the provider's RAW STRING (or soft-null on error).
-let exec = fun(prompt: Str) -> Str? do
-	let b = _state.backends[_state.current]
-	b.exec(b, prompt)
-end
-=== END FILE: ./lib/llm.ms ===
 
-=== BEGIN FILE: ./lib/std.ms ===
-# # std.ms
-# # Minimal standard library implemented in MindScript on top of builtins.
-# #
-# # === MINDSCRIPT CODE CONVENTION
-# #
-# # 1) Naming
-# #	Functions/vars: camelCase; Types: PascalCase; Consts: SCREAMING_SNAKE_CASE;
-# #	Modules: snake_case; Private: _prefix.
-# #
-# # 2) Errors
-# #	Soft errors: use nullable returns (T?); return `null  # <reason>`.
-# #	Any? = Any → do NOT use Any for maybes; pick a concrete T.
-# #	Hard errors: `panic(msg)` only for invariants/programmer bugs or unrecoverable state.
-# #	Catch hard errors with `try`; prefer soft errors for expected conditions.
-# #	Caller check idiom:
-# #	```
-# #		let v = parseX(s)
-# #		if v == null then return null  # <invalid input> end
-# #		use(v)
-# #	```
-# #	Add brief, grep-able slugs: `<not found>`, `<timeout: 200ms>`.
-# #
-# # 3) Function docs (PRE)
-# #	First line: short summary. Then blank line. Then Args/Returns/Soft-fail notes.
-# #	Example:
-# #	```
-# #		# Parse URL string.
-# #		#
-# #		# Args: s: Str
-# #		# Returns: {…}? (null on <invalid url>)
-# #		fun parseUrl(s: Str) -> { scheme!:Str, host!:Str, port:Int, path!:Str, query!:Str, fragment:Str }? do
-# #			let u = urlParse(s); if u == null then return null  # <invalid url> end; u
-# #		end
-# #	```
-# #
-# # 4) Formatting
-# #	Tabs for indentation. POST forces newline and follows after-separator rule.
-# #	Canonical output ends with exactly one trailing newline.
+### E
+`2.7182818284`
 
-# # -----------------------------
-# # Error/Assert
-# # -----------------------------
+Euler's number
 
-# Produce an annotated null (soft error).
-# 
-# Returns `null` annotated with `msg`. Use for recoverable failures.
-# Args: msg: Str
-# Returns: Null
-let error = fun(msg: Str) -> Null do
-	__annotate(msg, null)
-end
 
-# Assert that a condition holds.
-# 
-# Returns true if `cond` is true; otherwise throws a hard failure.
-# Args: cond: Bool
-# Returns: Bool
-let assert = fun(cond: Bool) -> Bool do
-	if cond then
-		true
-	else
-		panic("assertion failed")
-	end
-end
+### sin
+`value:Num -> Num`
 
-# # -----------------------------
-# # Console I/O
-# # -----------------------------
+Sine function
 
-# Print a formatted string to standard output.
-# 
-# Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
-# Caller controls newlines:
-# printf("%s = %v\n", ["x", 42])
-# 
-# Params:
-# fmt:  Str
-# args: [Any]
-# 
-# Returns:
-# Str? — the printed string, or null (annotated) on write error.
-let printf = fun(fmt: Str, args: [Any]) -> Str? do
-	let out = sprintf(fmt, args)
-	write(STDOUT, out)
-	flush(STDOUT)
-	out
-end
 
-# Print a value and return it.
-# 
-# Prints the string form of `x` without a trailing newline, and returns `x`.
-# Args: x: Any
-# Returns: Any
-let print = fun(x) do
-	write(STDOUT, sprintf("%s", [str(x)]))
-	flush(STDOUT)
-	x
-end
+### cos
+`value:Num -> Num`
 
-# Print a value with newline and return it.
-# 
-# Prints the string form of `x` followed by a newline, and returns `x`.
-# Args: x: Any
-# Returns: Any
-let println = fun(x) do
-	write(STDOUT, sprintf("%s\n", [str(x)]))
-	flush(STDOUT)
-	x
-end
+Cosine function
 
-# # -----------------------------
-# # Iterators
-# # -----------------------------
 
-# Infinite iterator: 0, 1, 2, ...
-# 
-# Produces a thunk `(Null -> Int)` that increments on each call.
-# Args: _: Null (ignored)
-# Returns: (Null -> Int)
-let naturals0 = fun(_: Null) -> Null -> Int do
-	let i = 0
-	fun(_: Null) -> Int do
-		let v = i
-		i = i + 1
-		v
-	end
-end
+### tan
+`value:Num -> Num`
 
-# Infinite iterator: 1, 2, 3, ...
-# 
-# Produces a thunk `(Null -> Int)` that starts at 1.
-# Args: _: Null (ignored)
-# Returns: (Null -> Int)
-let naturals = fun(_: Null) -> Null -> Int do
-	let i = 1
-	fun(_: Null) -> Int do
-		let v = i
-		i = i + 1
-		v
-	end
-end
+Tangent function
 
-# Integer range iterator (stop exclusive; infinite if stop is null).
-# 
-# Returns a thunk that yields start, start+1, ... until `stop-1`, or forever if `stop` is null.
-# Args: start: Int, stop: Int?
-# Returns: (Null -> Int?)
-let range = fun(start: Int, stop: Int?) -> Null -> Int? do
-	let i = start
-	fun(_: Null) -> Int? do
-		if stop == null then
-			let v = i
-			i = i + 1
-			v
-		elif i >= stop then
-			null
-		else
-			let v = i
-			i = i + 1
-			v
-		end
-	end
-end
 
-# Turn arrays or maps into (Null -> Any?) iterators; pass iterators through unchanged.
-# 
-# - [Any]      → yields elements
-# - {}         → yields [key, value] pairs
-# - (Null->?)  → returned as-is
-# Else: hard error.
-# Args: v: Any
-# Returns: (Null -> Any?)
-let iter = fun(v) -> Null -> Any? do
-	if isType(v, type [Any]) then
-		let xs = v
-		let i = 0
-		fun(_: Null) -> Any? do
-			if i < len(xs) then
-				let y = xs[i]
-				i = i + 1
-				y
-			else
-				null
-			end
-		end
-	elif isType(v, type {}) then
-		let kvs = []
-		for [k, val] in v do
-			kvs = kvs + [[k, val]]
-		end
-		let i = 0
-		fun(_: Null) -> Any? do
-			if i < len(kvs) then
-				let p = kvs[i]
-				i = i + 1
-				p
-			else
-				null
-			end
-		end
-	elif isType(v, type Null -> Any?) then
-		v
-	else
-		panic("iter: expected array, map, or iterator")
-	end
-end
+### sqrt
+`value:Num -> Num`
 
-# Collect an iterator into an array.
-# 
-# Consumes `it` until it returns null.
-# Args: it: (Null -> Any?)
-# Returns: [Any]
-let list = fun(it: Null -> Any?) -> [Any] do
-	let out = []
-	for _ in naturals0(null) do
-		let x = it(null)
-		if x == null then
-			break
-		end
-		out = out + [x]
-	end
-	out
-end
+Square-root function
 
-# Map over an iterator (lazy transform).
-# 
-# Returns a thunk that yields `f(x)` for each `x` in `it`.
-# Args: f: (Any -> Any), it: (Null -> Any?)
-# Returns: (Null -> Any?)
-let map = fun(f: Any -> Any, it: Null -> Any?) -> Null -> Any? do
-	fun(_: Null) -> Any? do
-		let x = it(null)
-		if x == null then
-			null
-		else
-			f(x)
-		end
-	end
-end
 
-# Filter an iterator (lazy predicate).
-# 
-# Returns a thunk that yields only values where `cond(x)` is true.
-# Args: cond: (Any -> Bool), it: (Null -> Any?)
-# Returns: (Null -> Any?)
-let filter = fun(cond: Any -> Bool, it: Null -> Any?) -> Null -> Any? do
-	fun(_: Null) -> Any? do
-		for _ in naturals0(null) do
-			let x = it(null)
-			if x == null then
-				break
-			end
-			if cond(x) then
-				return x
-			end
-		end
-		null
-	end
-end
+### log
+`value:Num -> Num?`
 
-# Fold an iterator with a binary function.
-# 
-# Reduces `it` by applying `f` left-to-right. Returns null for empty iterator.
-# Args: f: (Any -> Any -> Any), it: (Null -> Any?)
-# Returns: Any?
-let reduce = fun(f: Any -> Any -> Any, it: Null -> Any?) -> Any? do
-	let first = it(null)
-	if first == null then
-		null
-	else
-		let acc = first
-		for _ in naturals0(null) do
-			let x = it(null)
-			if x == null then
-				break
-			end
-			acc = f(acc, x)
-		end
-		acc
-	end
-end
+Logarithm function
 
-# # -----------------------------
-# # Arrays
-# # -----------------------------
 
-# Slice an array [s, e).
-# 
-# Returns a shallow copy of `xs` from index `s` (inclusive) to `e` (exclusive).
-# Args: xs: [Any], s: Int, e: Int
-# Returns: [Any]
-let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
-	let out = []
-	for i in range(s, e) do
-		out = out + [xs[i]]
-	end
-	out
-end
+### exp
+`value:Num -> Num?`
 
-# Sort an array in-place using a comparison function.
-# Args: arr:[Any] - array to sort (modified in-place)
-# cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
-# Return: [Any] - the sorted array (same reference)
-let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
-	let swap = fun(i: Int, j: Int) -> Null do
-		let t = arr[i]
-		arr[i] = arr[j]
-		arr[j] = t
-		null
-	end
+Exponential function
 
-	let partition = fun(lo: Int, hi: Int) -> [Int] do
-		let pivot = arr[lo]
-		let lt = lo
-		let gt = hi
-		let i = lo
-		while i <= gt do
-			let c = cmp(arr[i], pivot)
-			if c < 0 then
-				swap(lt, i)
-				lt = lt + 1
-				i = i + 1
-			elif c > 0 then
-				swap(i, gt)
-				gt = gt - 1
-			else
-				i = i + 1
-			end
-		end
-		[lt, gt]
-	end
 
-	let qsort = fun(lo: Int, hi: Int) -> Null do
-		if lo >= hi then
-			return
-		end
-		let [lt, gt] = partition(lo, hi)
-		qsort(lo, lt - 1)
-		qsort(gt + 1, hi)
-		null
-	end
+### pow
+`base:Num -> exp:Num -> Num`
 
-	qsort(0, len(arr) - 1)
-	arr
-end
+Power function
 
-# # -----------------------------
-# # Objects (maps)
-# # -----------------------------
+### random
+`_:Null -> Num`
 
-# Iterator over keys of an object.
-# 
-# Args: obj: {}
-# Returns: (Null -> Str?)
-let keys = fun(obj: {}) -> Null -> Str? do
-	let it = iter(obj) # yields [k, v]
+Returns a uniform random variate in [0, 1).
 
-	fun(_: Null) -> Str? do
-		let pair = it(null)
-		if pair == null then
-			null
-		else
-			pair[0]
-		end
-	end
-end
 
-# Iterator over values of an object.
-# 
-# Args: obj: {}
-# Returns: (Null -> Any?)
-let values = fun(obj: {}) -> Null -> Any? do
-	let it = iter(obj)
-	fun(_: Null) -> Any? do
-		let pair = it(null)
-		if pair == null then
-			null
-		else
-			pair[1]
-		end
-	end
-end
+## String functions
 
-# Directory listing of visible fields/functions.
-# 
-# For maps: returns keys not starting with "_".
-# For modules: returns exported names (not starting with "_"), or [] if unavailable.
-# If a value has a PRE note, the first line is attached as an annotation to the key.
-# Args: x: {}
-# Returns: [Str]
-let dir = fun(x: {}) -> [Str] do
-	let out = []
-	for [k, v] in x do
-		if not (substr(k, 0, 1) == "_") then
-			let ann = noteGet(v)
-			if ann != null then
-				ann = split(ann, "\n")[0]
-				k = noteSet(ann, k)
-			end
-			out = out + [k]
-		end
-	end
-	out
-end
+### substr
+`string:Str -> s:Int -> e:Int -> Str`
 
-# # -----------------------------
-# # Importing / modules
-# # -----------------------------
+Substring function
 
-# Create an importer from a code string.
-# 
-# Returns a function that imports the code under a given module name.
-# Args: code: Str
-# Returns: (Str -> {})
-let codeImport = fun(code: Str) -> Str -> {} do
-	fun(name: Str) -> {} do
-		importCode(name, code)
-	end
-end
 
-# Import a module from a URL.
-# 
-# Returns the module object, or annotated null on failure.
-# Args: url: Str
-# Returns: {}?
-let importUrl = fun(url: Str) -> {}? do
-	let r = try(fun() do
-		import(url)
-	end)
-	if r.ok then
-		r.value
-	else
-		error("import failed: " + str(r.error))
-	end
-end
+### toLower
+`string:Str -> Str`
 
-# # -----------------------------
-# # Misc
-# # -----------------------------
+Converts a string to lowercase.
 
-# Stable-ish integer id for a value’s content.
-# 
-# Hashes the UTF-8 bytes of `str(value)` via sha256, then folds over the hex string
-# with a DJB2-like accumulator for a compact Int.
-# Args: value: Any
-# Returns: Int
-let uid = fun(value) -> Int do
-	let hx = hexEncode(sha256(formatValue(value)))
-	let h = 5381
-	let n = len(hx)
-	let i = 0
 
-	let hexVal = fun(c: Str) -> Int do
-		if c == "0" then
-			0
-		elif c == "1" then
-			1
-		elif c == "2" then
-			2
-		elif c == "3" then
-			3
-		elif c == "4" then
-			4
-		elif c == "5" then
-			5
-		elif c == "6" then
-			6
-		elif c == "7" then
-			7
-		elif c == "8" then
-			8
-		elif c == "9" then
-			9
-		elif c == "a" or c == "A" then
-			10
-		elif c == "b" or c == "B" then
-			11
-		elif c == "c" or c == "C" then
-			12
-		elif c == "d" or c == "D" then
-			13
-		elif c == "e" or c == "E" then
-			14
-		elif c == "f" or c == "F" then
-			15
-		else
-			0
-		end
-	end
+### toUpper
+`string:Str -> Str`
 
-	while i < n do
-		let nib = substr(hx, i, i + 1)
-		h = h * 33 + hexVal(nib)
-		i = i + 1
-	end
-	h
-end
+Converts a string to uppercase.
 
-# Mute (sink) a value.
-# 
-# Accepts any value and returns null.
-# Args: _: Any
-# Returns: Null
-let mute = fun(_) -> Null do
-	null
-end
 
-# # -----------------------------
-# # Oracle hook (prelude-owned, minimal)
-# # -----------------------------
+### strip
+`string:Str -> Str`
 
-# Global oracle execution hook.
-# 
-# Backends install their executor here via `oracleInstall`.
-# Until installed, oracle calls should return an annotated null via this hook.
-# Once installed, this function is supposed to return a JSON string containing
-# a value `x` boxed as `{output: x}`.
-# Args: prompt: Str
-# Returns: Str?
-let __oracle_execute = fun(prompt: Str) -> Str? do
-	error("oracle backend not configured")
-end
+Removes leading and trailing whitespace.
 
-# Internal flag for diagnostics.
-# 
-# Tracks whether a backend was installed via `oracleInstall`.
-# Args: (none)
-# Returns: (stateful)
-let _oracleInstalled = false
 
-# Install a new global oracle executor.
-# 
-# Rebinds `__oracle_execute` to the provided function.
-# Args: exec: (Str -> Str?)
-# Returns: Null
-let oracleInstall = fun(exec: Str -> Str?) -> Bool do
-	__oracle_execute = exec
-	_oracleInstalled = true
-	true
-end
+### lstrip
+`string:Str -> Str`
 
-# Show oracle installation status.
-# 
-# Returns a short string indicating whether a backend is installed.
-# Args: _: Null (ignored)
-# Returns: Str
-let oracleStatus = fun(_: Null) -> Str do
-	if _oracleInstalled then
-		"oracle: installed"
-	else
-		"oracle: not installed"
-	end
-end
+Removes leading whitespace.
 
-# Quick oracle health check (real call, tiny).
-# Success: { ok:true, ms }; failure/not installed: annotated null.
-let oracleHealth = fun(_: Null) -> {}? do
-	if not _oracleInstalled then
-		return error("oracle not installed")
-	end
 
-	let ping = oracle(msg: Str) -> Str
-	let t0 = nowMillis()
-	let out = ping("ping")
-	let dt = nowMillis() - t0
-	if out == null then
-		return out
-	end
-	if out == "pong" then
-		return {ok: true, ms: dt}
-	end
+### rstrip
+`string:Str -> Str`
 
-	let j = jsonParse(out)
-	if j != null and mapHas(j, "output") and j.output == "pong" then
-		return {ok: true, ms: dt}
-	end
+Removes trailing whitespace.
 
-	error("pong mismatch")
-end
 
-# ---- Prompt tap (diagnostics) ----
+### split
+`string:Str -> separator:Str -> [Str]`
 
-# Most recent oracle prompt captured for diagnostics.
-# Type: Str?
-let _oracleLastPrompt = null
+Splits a string into a list of string using a separator.
 
-# Rolling log of oracle prompts and outputs captured for diagnostics.
-# Type: [[Str]]
-let _oracleLog = []
 
-# Install an oracle executor that records each prompt before forwarding.
-# Args: exec: (Str -> Str?)  # underlying executor
-# Return: Bool               # true on install
-let oracleInstallWithTap = fun(exec: Str -> Str?) -> Bool do
-	oracleInstall(fun(p: Str) -> Str? do
-		_oracleLastPrompt = p
-		let out = exec(p)
-		push(_oracleLog, [p, out])
-		out
-	end)
-	true
-end
+### join
+`strings:[Str] -> separator:Str -> Str`
 
-# Return the most recently recorded oracle prompt (if any).
-# Args: _: Null (ignored)
-# Return: Str?
-let oracleLastPrompt = fun(_: Null) -> Str? do
-	_oracleLastPrompt
-end
+Joins strings into a single string using a separator.
 
-# Return the full recorded oracle prompt/output log.
-# Args: _: Null (ignored)
-# Return: [[Str]]
-let oracleLog = fun(_: Null) -> [[Str]] do
-	_oracleLog
-end
 
-# # -----------------------------
-# # LLM backend bootstrap (installed in prelude)
-# # -----------------------------
+### match
+`pattern:Str -> string:Str -> [Str]`
 
-# Load the llm module, install its executor, and select a default backend/model.
+Searches for a regex pattern within a string and returns a list of matches.
 
-let llm = import("llm") # The LLM module.
-oracleInstall(llm.exec)
-llm.useBackend("openai-responses")
-llm.useModel("gpt-4.1-mini")
-=== END FILE: ./lib/std.ms ===
+
+### replace
+`pattern:Str -> replace:Str -> string:Str -> Str`
+
+Substitutes a regex pattern with a replacement within a string.
+
+
+## Module importing
+
+### codeImport
+`code:Str -> name:Str -> {}`
+
+Imports code as a module.
+
+
+### import
+`filename:Str -> {}`
+
+Imports a file at a given path as a module.
+
+### netImport
+
+`url:Str -> {}`
+
+Import a remote module.
+
+
+
+## Networking
+
+
+### www
+`url:Str -> Str?`
+
+Retrieve a web page.
+
+### http
+`params:HTTPParams? -> method:Str? -> url:Str -> {}`
+
+Makes an HTTP request. The parameter `HTTPParams` is an object defined
+as
+```
+type {
+    mode: Str?,
+    cache: Str?,
+    credentials: Str?,
+    headers: {}?,
+    redirect: Str?,
+    referrerPolicy: Str?,
+    body: {}
+}
+```
+where `mode` is an HTTP verb (`header`, `get`, `post`, `update`, or `delete`),
+`cache`...
+
+
+
+## Time
+
+### tsNow
+`_:Null -> Int`
+
+Returns the current timestamp in milliseconds.
+
+
+### dateNow
+`_:Null -> {}`
+
+Returns a the current date.
+
+
+## Casting & type checking
+
+
+### str
+`value:Any -> Str`
+
+Converts a value into a string.
+
+
+### bool
+`value:Any -> Bool?`
+
+Converts a value into a boolean.
+
+
+### int
+`value:Any -> Int?`
+
+Converts a value into an integer.
+
+
+### num
+`value:Any -> Num?`
+
+Converts a value into a string.
+
+
+### typeOf
+`value:Any -> Type`
+
+Returns the type of the value.
+
+
+### isType
+`value:Any -> ttype:Type -> Bool`
+
+Checks whether a value conforms to a given type.
+
+
+### isSubtype
+`subtype:Type -> supertype:Type -> Bool`
+
+Checks whether a type is a subtype of another type.
+
+
+
+## Schemas and grammars
+
+### schema
+`value:Type -> Str`
+
+Returns the JSON schema of a type.
+
+### bnf
+`value:Type -> Str`
+
+Returns the BNF grammar of a type.
+
+
+
+
+## Annotations
+
+### setNote
+`value:Any -> annotation:Str? -> Any`
+
+Annotates a value.
+
+
+### getNote
+`value:Any -> Str?`
+
+Get a value's annotation.
+
+
+
+## Miscelleanous
+
+### bindMethod
+`value:Any -> func:(Any -> Any) -> Any -> Any `
+
+Binds a function to a value as a method.
+
+
+### uid
+`value:Any -> Int`
+
+Returns the unique value identifier.
+
+### mute
+`_:Any -> Null`
+
+Return null given any input.
+
+
+### dump
+`_:Null -> Null`
+
+Prints the current environment and its parents.
+
+
+### getEnv
+`_:Null -> {}`
+
+Returns the current environment.
+
+=== END FILE: ./docs/manual/docs/learn/stdlib.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/values.md ===
+<style>
+  .my-code span.prompt { color: black; }
+  .my-code span.note { color: green; }
+  .my-code span.value { color: blue; }
+</style>
+
+# Values and Formal Types
+
+In this chapter we will explore MindScript's *formal type system*. Formal types are those that can be programmatically declared and manipulated, and they have strict semantics, just as you would expect from any programming language. This is contrast to *informal types*, which have a vague, context-dependent meaning. Informal types are explained [here](/manual/informal.md).
+
+MindScript's built-in types have been deliberately chosen to mirror JSON types. In fact, the type system implements a simple subset of the [JSON schema](https://json-schema.org/) standard, rendering MindScript a scripting language that is specially suited for processing JSON objects and Web applications.
+
+## Expressions and Everything-as-a-Value
+
+Before diving into types, remember one core principle: *every MindScript construct is an expression*. That means whether you write a standalone literal or invoke a function, you always get back a value. For example:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> 42</span>
+<span class="value">42</span>
+
+<span class="prompt">> (40 + 2)</span>
+<span class="value">42</span>
+
+<span class="prompt">> print(42)</span>
+<span class="value">42</span>
+
+<span class="prompt">> let x = 42</span>
+<span class="value">42</span>
+</code></pre>
+</div>
+Because all constructs, including assignments, loops, and conditionals yield values, you can chain and nest them. If you know programming languages like LISP or any of its dialects (e.g. Scheme) this should be familiar.
+
+## Dynamic Typing: Variables vs. Values
+
+MindScript is dynamically typed, just like JavaScript or Python:
+```mindscript
+let greeting = "Hello, world!"
+```
+Here, `greeting` is a *variable* bound to the *value* `"Hello, world!"`, which is of type `Str` (string). Variables themselves don't have a type; only values do. You can check the type of any value using the `typeOf(...)` function:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> typeOf(greeting)</span>
+<span class="value">type Str</span>
+
+<span class="prompt">> typeOf(42)</span>
+<span class="value">type Int</span>
+</code></pre>
+</div>
+Unlike Python and JavaScript however, in MindScript types are *runtime checked*. Calling a function with incompatible argument types will lead to a runtime error.
+
+
+## Primitive Types
+
+MindScript ships with the following primitive types:
+
+| Type     | Example Literals       | Description                                   |
+| -------- | ---------------------- | --------------------------------------------- |
+| `Null` | `null`                 | The type of the `null` value. It is idiomatic to use `null` values to mark the absence of a value or to indicate an error. |
+| `Bool` | `true`<br>`false`        | The type of the two logical truth values.     |
+| `Int`  | `42`<br>`-7`             | Integer numbers without fractional parts.     |
+| `Num`  | `3.14`<br>`-1e3`         | Floating-point numbers for real values.       |
+| `Str`  | `'Hi'`<br>`"🚀Launch!"` | Sequences of characters, delimited by double- or single-quotes. |
+| `Type` | `type Str`<br>`type [Int]` | The type of types. Note that type literals always feature the type constructor keyword `type`. |
+
+Remember, only the values/literals have a type, never the variables.
+
+Again, you can check the types at runtime using the `typeOf(...)` function.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> typeOf(null)</span>
+<span class="value">type Null</span>
+
+<span class="prompt">> typeOf(true)</span>
+<span class="value">type Bool</span>
+
+<span class="prompt">> typeOf(42)</span>
+<span class="value">type Int</span>
+
+<span class="prompt">> typeOf(42.0)</span>
+<span class="value">type Num</span>
+
+<span class="prompt">> typeOf("foo")</span>
+<span class="value">type Str</span>
+</code></pre>
+</div>
+
+### Operators
+
+MindScript provides familiar operators:
+
+| Level        | Operators              |
+| ------------ | ---------------------- |
+| Arithmetic 1 | `-` (unary, e.g. -7)   |
+| Arithmetic 2 | `*  /  %`              |
+| Arithmetic 3 | `+  -`                 |
+| Comparison   | `==  !=  <  >  <=  >=` |
+| Logical 1    | `not`                  |
+| Logical 2    | `and`                  |
+| Logical 3    | `or`                   |
+| Assignment   | `=`                    |
+
+The operators higher in this list have precendence over those below (e.g. `*` before `not`).
+
+
+### No automatic casting
+
+In addition, there is no automatic type casting. Invoking a function with wrong types or applying an operator on incompatible values yields a runtime error (e.g., `"text" + 5`). The mathematical operators are the exception: applying a mathematical operator on an `Int` and a `Num` promotes the `Int` operand to a `Num`.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> true and false</span>
+<span class="value">false</span>
+
+<span class="prompt">> "Hello, " + 'world!'</span>
+<span class="value">"Hello, world!"</span>
+
+<span class="prompt">> 42 * 3</span>
+<span class="value">126</span>
+
+<span class="prompt">> 42 * 3.</span>
+<span class="value">126.</span>
+</code></pre>
+</div>
+
+## Container Types
+
+MindScript has two container types: **arrays** and **objects**. Unlike other programming languages, there are no tuples (i.e. arrays of fixed size).
+
+### Arrays
+
+Arrays hold a sequence of values all of the same type. They are instantiated using square brackets:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> let path = ["start", "middle", "end"]  ## of type [Str]</span>
+<span class="value">["start", "middle", "end"]</span>
+
+<span class="prompt">> path[1]</span>
+<span class="value">"middle"</span>
+
+<span class="prompt">> path[-1]</span>
+<span class="value">"end"</span>
+
+<span class="prompt">> path[1] = "begin"</span>
+<span class="value">"begin"</span>
+</code></pre>
+</div>
+As shown above, individual elements are accessed using the index notation. Negative indices count from the end. Note the double-hash `##`: these are comments that are truly ignored by the interpreter.
+
+You can mutate arrays in place by using functions such as `push`, `pop`, `shift`, and `unshift`. The `slice` function allows extracting slices.
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> push(path, "bonus")</span>
+<span class="value">["begin", "middle", "end", "bonus"]</span>
+
+<span class="prompt">> pop(path) </span>
+<span class="value">"bonus"</span>
+
+<span class="prompt">> slice(path, 0, 2)</span>
+<span class="value">["start", "middle"]</span>
+</code></pre>
+</div>
+
+
+### Objects
+
+Objects are key–value maps. They are instantiated by enclosing a list of key-value pairs within curly brackets:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> let user1 = {"name": "Alice", "age": 30}</span>
+<span class="value">{"name": "Alice", "age": 30}</span>
+
+<span class="prompt">> let user2 = {name: Sarah, age: 28}</span>
+<span class="value">{"name": "Sarah", "age": 28}</span>
+
+<span class="prompt">> let point = {"x-coordinate": -1, "y-coordinate": 12}</span>
+<span class="value">{"x-coordinate": -1, "y-coordinate": 12}</span>
+</code></pre>
+</div>
+Note that you can omit the quotes delimiting key names (e.g. `name` instead of `"name"`) if they follow the same naming convention as variable names. If they don't, you must use quotes.
+
+You can access the properties using the dot `.` notation as shown below:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> user1.age</span>
+<span class="value">30</span>
+
+<span class="prompt">> user1.age = 31</span>
+<span class="value">31</span>
+
+<span class="prompt">> point."x-coordinate"</span>
+<span class="value">-1</span>
+
+<span class="prompt">> point."z-coordinate" = 3</span>
+<span class="value">3</span>
+</code></pre>
+</div>
+As shown before, it is valid to assign a value to a new property. However, attempting to access a non-existent property will yield a runtime error.
+
+Alternatively, you can also use the `get` and `set` functions to retrieve or set the value of a property:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> let property = "email"</span>
+<span class="value">"email"</span>
+
+<span class="prompt">> set(user, "email", "alice@example.com")</span>
+<span class="value">"alice@example.com"</span>
+
+<span class="prompt">> get(user, property)</span>
+<span class="value">"alice@example.com"</span>
+</code></pre>
+</div>
+This is especially useful when the property name is only known at runtime.
+
+To check whether a property exists, use the `exists` function:
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">> exists(user, "hobbies")</span>
+<span class="value">false</span>
+
+<span class="prompt">> exists(user, "age")</span>
+<span class="value">true</span>
+</code></pre>
+</div>
+
+
+## Function Types
+
+Functions have types too. These are indicated with an arrow (`->`). For instance, a function that takes and integer and produces a string from has type `Int -> Str`. Function types will be discussed later in the [chapter about functions](manual/functions.md).
+
+
+
+=== END FILE: ./docs/manual/docs/learn/values.md ===
 

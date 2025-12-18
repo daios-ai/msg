@@ -197,12 +197,11 @@ func cmdRun(args []string) int {
 	}
 	child.Define("runtime", mindscript.Value{Tag: mindscript.VTMap, Data: rt})
 
-	val, err := ip.EvalAST(ast, child)
+	_, err = ip.EvalAST(ast, child)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 1
 	}
-	fmt.Println(mindscript.FormatValue(val))
 	return 0
 }
 

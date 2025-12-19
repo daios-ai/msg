@@ -120,11 +120,9 @@ If you installed from a repo checkout, `./uninstall.sh` performs the same cleanu
 
 ## Oracle backends
 
-MindScript’s oracles are executed by an LLM backend. Installing MindScript does **not** install a backend. This is intentional:
+MindScript’s oracles are executed by an LLM backend. Installing MindScript does **not** install a backend. You have to either install a local backend or use an LLM provider.
 
-* It keeps the core runtime lightweight.
-* It lets you choose between local and hosted providers.
-* It avoids forcing a particular vendor or model.
+By default, MindScript attempts to use a local installation of `ollama` with the `llama3.2:latest` model, but you can change this via the `llm` module (see below). 
 
 ### Supported backends (from `lib/llm.ms`)
 
@@ -136,11 +134,11 @@ The backend manager currently registers these backend names:
 * `anthropic`
 * `cohere`
 
-Backend selection is configured **in your script** (not via `msg` flags).
+Backend selection is configured **in your script** via the `llm` module (not via `msg` flags).
 
 ### Choosing a backend: practical guidance
 
-Choosing a backend is mostly a trade-off between **control** (local) and **convenience/quality ceiling** (hosted). If you want the fastest “it works” path, use a hosted provider. If you care most about keeping data local or avoiding per-call billing, use a self-hosted backend like Ollama.
+Choosing a backend is mostly a trade-off between **control** (local or self-hosted) and **convenience/quality ceiling** (hosted). If you want the fastest “it works” path, use a hosted provider. If you care most about keeping data local or avoiding per-call billing, use a self-hosted backend like [Ollama](https://www.ollama.com).
 
 | What matters most      | Self-hosted (Ollama)                      | Online provider (OpenAI & others) |
 | ---------------------- | ----------------------------------------- | ------------------------------------------------ |
@@ -155,11 +153,12 @@ Choosing a backend is mostly a trade-off between **control** (local) and **conve
 [Ollama](https://ollama.com) is a local model server. MindScript calls it over HTTP.
 
 1. Install [Ollama](https://ollama.com/) (version 0.5 or higher).
-2. Pull a model you want to use (example: `ollama pull llama3.2:3b`).
+2. Pull a model you want to use (example: `ollama pull llama3.2:latest`).
 3. Ensure the server is running:
 ```bash
 ollama list
 ```
+This should list the available models.
 
 By default, the `ollama` backend uses `http://localhost:11434`, but you can change it.
 

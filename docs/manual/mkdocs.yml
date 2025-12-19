@@ -60,8 +60,11 @@ nav:
   - Quick Tour: quicktour.md
   - Learn: 
     - learn/index.md
+    - learn/runtime.md
     - learn/values.md
     - learn/scopes.md
+    - learn/annotations.md
+    - learn/errors.md
     - learn/functions.md
     - learn/oracles.md
     - learn/stdlib.md

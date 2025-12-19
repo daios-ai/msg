@@ -47,6 +47,7 @@ Oracles are **typed**: inputs and outputs are validated at runtime, so you can s
 * Normalize and deduplicate real-world data (names, addresses, products)
 * Enrich datasets with summaries, tags, and entities—then post-process deterministically
 * Build **semantic web** pipelines: map unstructured content into entities/relations, align to vocabularies, and emit JSON/linked-data shapes
+* Build agentic applications.
 
 ## Installation
 
@@ -72,9 +73,7 @@ Usage:
   msg version                              Print the compiled version
 ```
 
-Want to use oracles? Follow the installation guide to configure an LLM backend.
-
-For more installation options, check the **[Installation Guide](installation.md)**.
+For more installation options and configuring the LLM backend, check the **[Installation Guide](installation.md)**.
 
 ## Requirements
 

@@ -1,4 +1,10 @@
 === BEGIN FILE: ./docs/manual/docs/learn/annotations.md ===
+<style>
+  .my-code span.prompt { color: black; }
+  .my-code span.note { color: green; }
+  .my-code span.value { color: blue; }
+</style>
+
 # Annotations
 
 MindScript uses `#` to write **annotations**.
@@ -21,11 +27,13 @@ MindScript decides whether a `# ...` attaches based on what comes next.
 
 A `# ...` annotation attaches to the value produced by the **next expression**.
 
-```mindscript
-# The speed of light in meters per second.
-let c = 299792458
-c
-```
+<div class="my-code" markdown="0">
+<pre><code><span class="prompt">==> # The speed of light in meters per second.</span>
+<span class="prompt">... let c = 299792458</span>
+<span class="note">The speed of light in meters per second.</span>
+<span class="value">299792458</span>
+</code></pre>
+</div>
 
 This is the key mental model: annotations attach to **values**, not to variable names or to lines.
 
@@ -255,6 +263,298 @@ This matters because it changes what the parser considers “the next expression
 * Annotated `null` is the standard way to explain failure results.
 
 === END FILE: ./docs/manual/docs/learn/annotations.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/concurrency.md ===
+# Concurrency
+
+Concurrency in MindScript is designed for scripts that need to overlap work, limit latency, and keep mutable state disciplined. The runtime offers three building blocks that compose cleanly: processes (`procSpawn` / `procJoin`), channels (`chanOpen` / `chanSend` / `chanRecv`), and actors (`actorStart` / `actorCall`). Each tool exists to solve a specific problem.
+
+The most important design decision is that MindScript does not share ordinary data structures across concurrent execution. Arrays and objects are mutable in a single thread, but when you spawn concurrent work the runtime runs it in an isolated interpreter. The closure you provide is snapshotted into that isolate, and the work produces a result that is snapshotted back to the parent. This avoids data races by construction. If you need coordination, you do it explicitly with handles: process handles, channel handles, actor handles, file handles, and network handles.
+
+This chapter explains how the model works, why it is shaped this way, and how to write correct concurrent programs that still feel like scripts.
+
+---
+
+## The concurrency contract: isolates, snapshots, and handles
+
+A spawned computation runs in a fresh interpreter isolate. You can think of it as “the same program, but with its own heap.” The function you spawn is deep-snapshotted into that isolate along with the values it closes over. In practice this means that arrays and objects you captured become independent copies in the child. Mutating them in the child does not affect the parent, and mutating them in the parent does not affect the child.
+
+This has two consequences that matter when you write real programs. First, it eliminates the most common concurrency failure mode in scripting languages: accidental shared mutation. Second, it forces you to be intentional about communication. If you want to exchange values between concurrent computations, you send them explicitly through channels, or you return them as process results, or you store them inside an actor and interact with that actor through actor operations.
+
+Handles are the one exception: they are opaque references managed by the runtime. Some handle kinds are specifically meant to be shared across isolates, such as channels and process handles. When you pass a handle into a spawned function, you are not copying an in-memory data structure; you are passing a reference to an external resource. That is precisely the point: handles are how concurrent parts of the program coordinate.
+
+---
+
+## Processes: `procSpawn` and `procJoin`
+
+A process in MindScript is a concurrent evaluation of a function in an isolate. You create a process with `procSpawn(f)` and you wait for it with `procJoin(p)`.
+
+The function you spawn should be callable with no arguments. In MindScript that can be written either as `fun() do ... end` or as `fun(_: Null) do ... end`, since a single-parameter function whose parameter type is `Null` can also be called with no arguments.
+
+```mindscript
+let p = procSpawn(fun() do
+    40 + 2
+end)
+
+procJoin(p)  # 42
+```
+
+### What happens on failure
+
+A spawned process can fail in two ways. It can return a normal “soft failure” value such as `null  # <reason>`, which is just data. Or it can panic. Panics inside a spawned process are caught and converted into an annotated `null` result. This is intentional: it means a process always “joins” to a value, and you decide how to handle it.
+
+```mindscript
+let p = procSpawn(fun() do
+    panic("boom")
+end)
+
+let v = procJoin(p)
+if v == null then
+    println("process failed: " + (noteGet(v) or "<no details>"))
+end
+```
+
+This pattern keeps concurrent code composable. The parent thread can join, inspect the annotation, and decide whether to retry, skip, or stop.
+
+### Joining many: `procJoinAll` and `procJoinAny`
+
+When you have multiple independent tasks, joining them one at a time is verbose and often less efficient. The runtime provides two helpers.
+
+`procJoinAll(ps)` waits for all processes in the given array and returns an array of their results in the same order.
+
+`procJoinAny(ps)` waits until any process completes and returns `{ index: Int, value: Any }`. If the list is empty, it returns `null` with an annotation.
+
+A simple parallel map illustrates `procJoinAll`. The example below performs a CPU-bound transform of many inputs at once and then collects results.
+
+```mindscript
+let work = fun(x: Int) -> Int do
+    let n = x
+    let i = 0
+    while i < 500_000 do
+        n = (n * 1664525 + 1013904223) % 2147483647
+        i = i + 1
+    end
+    n
+end
+
+let xs = [1, 2, 3, 4, 5, 6, 7, 8]
+let ps = []
+
+for x in xs do
+    push(ps, procSpawn(fun() do work(x) end))
+end
+
+let ys = procJoinAll(ps)
+ys
+```
+
+Notice what you do not need to think about. There is no locking around `xs`, and there is no danger that one task mutates another task’s intermediate state, because each spawned function runs in its own isolate with its own copied values.
+
+---
+
+## Cancellation: cooperative stop signals
+
+Cancellation in MindScript is cooperative. The parent can request cancellation with `procCancel(p)`, and code running in the process can observe that request with `procCancelled(p)` if it has access to its own handle.
+
+In practice, cancellation is most useful when you combine processes with timeouts or with “first result wins” patterns. Cancellation is also idempotent in the sense that the first cancel attempt returns `true`, and subsequent attempts return `null` with an annotation indicating that it was already cancelled.
+
+A common pattern is a slow operation with a deadline. You start the operation and a timer, wait for whichever finishes first, and cancel the other.
+
+---
+
+## Timers and timeouts: `timerAfter` and `ticker`
+
+Concurrency becomes more useful when you can bound waiting. MindScript provides timers as channels.
+
+`timerAfter(ms)` returns a channel handle that will deliver a single tick after `ms` milliseconds. The tick is an integer timestamp (Unix milliseconds). After sending the tick, the channel closes.
+
+`ticker(ms)` returns a channel handle that delivers ticks repeatedly until you close the channel from the receiving side.
+
+Because timers are channels, you can integrate them with the same receive loop you would write for a network stream, and you can use them with process orchestration.
+
+### Implementing a timeout for a process
+
+The code below runs a task and returns `null  # <timeout>` if it does not finish within the deadline. It uses `procJoinAny` to wait for either the task or the timer.
+
+```mindscript
+let withTimeout = fun(ms: Int, f: Null -> Any) -> Any? do
+    let pTask = procSpawn(f)
+    let pTimer = procSpawn(fun() do
+        let c = timerAfter(ms)
+        chanRecv(c)
+    end)
+
+    let r = procJoinAny([pTask, pTimer])
+    if r == null then
+        null  # <internal error>
+    elif r.index == 0 then
+        procCancel(pTimer)
+        r.value
+    else
+        procCancel(pTask)
+        null  # <timeout>
+    end
+end
+
+withTimeout(200, fun() do
+    sleep(500)
+    "done"
+end)
+```
+
+The example uses `chanRecv` to wait for the timer tick; since `timerAfter` closes after one tick, this cannot leak an infinite stream.
+
+### Periodic work with `ticker`
+
+A ticker is appropriate when you want to do periodic polling or sampling without blocking the rest of the program.
+
+```mindscript
+let t = ticker(250)
+
+let i = 0
+while i < 5 do
+    let ts = chanRecv(t)
+    if ts == null then
+        break(null)
+    end
+    println("tick at " + str(ts))
+    i = i + 1
+end
+
+chanClose(t)
+```
+
+Closing a ticker’s channel stops the ticking. This is a deliberate resource-management step, like closing a file.
+
+---
+
+## Channels: explicit communication between concurrent parts
+
+Channels are the primitive for communicating values between concurrent computations. A channel is a handle of kind `Handle.chan`. You create one with `chanOpen(cap)`.
+
+A capacity of `0` creates an unbuffered channel, where sends and receives rendezvous. A positive capacity creates a buffered channel, where sends can proceed until the buffer is full.
+
+A channel’s operations follow a disciplined failure convention: “closed” is not a panic in the sending direction, but it is still not a normal value. In several operations, a closed channel is represented as `null` annotated with a message. This makes it visible and explicit.
+
+### Send and receive
+
+`chanSend(c, x)` blocks until the value is accepted, returning `true` on success and returning `null` with an annotation if the channel is closed.
+
+`chanRecv(c)` blocks until a value is available and returns that value. If the channel is closed and empty, it returns `null` annotated with a message indicating the channel is closed.
+
+This means you should treat `null` from `chanRecv` as “stop,” but if you care about whether it is a normal stop or an abnormal close, you look at `noteGet`.
+
+### Non-blocking operations
+
+Sometimes blocking is wrong: you want to attempt an operation and continue if it would block. `chanTrySend(c, x)` returns a boolean indicating whether the value was sent.
+
+`chanTryRecv(c)` returns a map `{ ok: Bool, value: Any }`. When `ok` is `false`, no value was available right now and the channel is still open; the `value` is `null`. When `ok` is `true`, `value` contains a received value, which may itself be an annotated `null` indicating that the channel is closed and empty.
+
+This shape makes it possible to write polling loops without turning control flow into exceptions.
+
+### A producer/consumer pipeline
+
+The example below runs a producer in one process and a consumer in another, using a channel to carry work items. The producer closes the channel to signal completion.
+
+```mindscript
+let c = chanOpen(8)
+
+let producer = procSpawn(fun() do
+    let i = 0
+    while i < 10 do
+        if chanSend(c, i) == null then
+            return (null  # <channel closed early>)
+        end
+        i = i + 1
+    end
+    chanClose(c)
+    null
+end)
+
+let consumer = procSpawn(fun() do
+    let sum = 0
+    while true do
+        let v = chanRecv(c)
+        if v == null then
+            break(sum)
+        end
+        sum = sum + v
+    end
+end)
+
+procJoin(producer)
+procJoin(consumer)  # 45
+```
+
+This style is explicit and predictable. Values move through one boundary, and completion is signaled through channel closure. If the channel closes unexpectedly, the annotation on the `null` makes the reason inspectable.
+
+---
+
+## Actors: serialized access to shared mutable state
+
+Processes and channels are good when tasks are independent or communicate through message passing. Actors solve a different problem: you have mutable state that must be accessed safely from multiple places, and you want a single owner of that state.
+
+An actor is a dedicated isolate with an internal state value `m`. Calls into the actor are serialized, so there are no data races on `m`. You start an actor with `actorStart(m, pinOSThread?)`. You interact with it using `actorRun`, `actorCall`, `actorGet`, and `actorSet`.
+
+The key is that actor operations deep-snapshot values into the actor isolate, run there, and then deep-snapshot results back. This preserves the same “no shared mutable data” guarantee, while still giving you a single logical state.
+
+### A safe counter service
+
+This example creates a counter actor and increments it from multiple processes. The increments are serialized inside the actor, so the final count is deterministic.
+
+```mindscript
+let counter = actorStart({ value: 0 })
+
+let inc = fun(m: {}) -> Int do
+    m.value = m.value + 1
+    m.value
+end
+
+let ps = []
+let i = 0
+while i < 20 do
+    push(ps, procSpawn(fun() do
+        actorRun(counter, inc)
+    end))
+    i = i + 1
+end
+
+procJoinAll(ps)
+
+actorGet(counter, "value")  # 20
+actorClose(counter)
+```
+
+The important point is not that the counter increments. The important point is that you never need locks, and you never need to reason about aliasing of mutable objects. The actor isolate is the owner, and every interaction is a serialized message into that owner.
+
+### Actor calls with explicit arguments
+
+When you want to call a function with arguments inside the actor, use `actorCall(a, f, args)`.
+
+```mindscript
+let store = actorStart({})
+
+let put = fun(m: {}, k: Str, v: Any) -> Bool do
+    m.(k) = v
+    true
+end
+
+actorCall(store, put, ["answer", 42])
+actorGet(store, "answer")  # 42
+actorClose(store)
+```
+
+Actor getters and setters (`actorGet` and `actorSet`) are specialized helpers for the common case where `m` is a map or a module. They are convenient, but `actorRun` and `actorCall` are the general mechanism.
+
+---
+
+## Choosing the right tool
+
+If you need parallelism for independent work, processes are the simplest option: spawn, join, and treat failures as values. If you need explicit communication, add channels and model your program as message passing. If you need a single authoritative mutable state, use an actor so you get serialized access without locks.
+
+The model is intentionally strict: ordinary arrays and objects are not shared across concurrent execution. That constraint is what makes MindScript concurrency reliable in scripts, where correctness and predictability matter more than squeezing every last microsecond out of shared-memory parallelism.
+
+=== END FILE: ./docs/manual/docs/learn/concurrency.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/errors.md ===
 STUB# Errors and Inspection
@@ -543,6 +843,319 @@ Use these as defaults:
 * Use `panic(...)` only for truly fatal situations.
 
 === END FILE: ./docs/manual/docs/learn/errors.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/ffi.md ===
+# Foreign Function Interface
+
+MindScript is happiest when most of your program lives in ordinary values—strings, numbers, arrays, and objects—because that keeps scripts portable and easy to reason about. Sometimes, though, the thing you want already exists as a mature C library: a codec, a database client, a numerical routine, a device API, or a legacy SDK. The foreign function interface (FFI) is the bridge for that situation.
+
+In MindScript, the entry point is `ffiOpen(spec)`. You give it a *specification*—a plain MindScript object that describes the C library surface you want to call—and you get back a MindScript module. Functions become callable values. Global variables become small objects with `get()`, `set(value)`, and `addr()` accessors. Native pointers and aggregate storage become opaque `Handle` values so you can’t accidentally treat a pointer like an integer and corrupt memory.
+
+The FFI is powerful, but it is also where the usual safety guarantees end. The runtime can type-check and range-check conversions, but it cannot prove your spec matches the real C header, nor can it prevent you from freeing memory too early if you design the wrapper incorrectly. This chapter focuses on writing small, correct bindings, and on building a wrapper layer so the rest of your code never needs to touch raw FFI details.
+
+---
+
+## Availability and platform assumptions
+
+The FFI is not a pure-language feature: it depends on the host platform and the availability of `libffi` and dynamic loading (`dlopen`/`dlsym`). In practice it is intended for systems where that stack is available (commonly macOS and Linux builds with cgo enabled). If your build does not include FFI support, `ffiOpen` will not be present or will fail early.
+
+Even when it is available, you should assume the FFI follows the platform ABI rules. That matters for “exotic” types (packed bitfields, large structs passed by value, variadic functions, and callbacks), because ABI mismatches produce the worst kind of bug: code that sometimes appears to work. The safest workflow is to begin with a trivial scalar function binding and only expand once you have a passing sanity test.
+
+---
+
+## The mental model: a spec becomes a module
+
+A spec is a MindScript object that declares three things:
+
+1. which shared library to load,
+2. which C types to name and reuse, and
+3. which exported symbols to bind (functions and variables).
+
+`ffiOpen(spec)` returns a module with a predictable shape. Besides your declared symbols, it exposes bookkeeping fields (such as the loaded library name and a handle to the dynamic library) and a memory toolbox under `__mem`. The toolbox is where allocation, casting, struct field access, and string decoding live. Keeping these operations behind `__mem` is not cosmetic—it enforces a boundary between “ordinary MindScript values” and “native memory objects,” which makes it harder to accidentally treat a pointer like data.
+
+The single most important design choice in this FFI is that native pointers and aggregate storage are *not* numbers. They are handles. You pass them back into FFI calls and into `__mem` helpers, but you do not inspect or compute with them.
+
+---
+
+## Your first binding: calling a scalar function
+
+A good first binding is one with only integers or floating-point values. You want the simplest possible end-to-end path: open the library, call one function, compare to a known result.
+
+Here is a complete binding for `hypot`, which on most Unix-like systems is provided by the math library:
+
+```mindscript
+let C = ffiOpen({
+    version: "1",
+    lib: "libm.so.6",
+
+    types: {
+        double: { kind: "float", bits: 64 }
+    },
+
+    functions: [
+        { name: "hypot", ret: "double", params: ["double", "double"] }
+    ]
+})
+
+let r = C.hypot(3.0, 4.0)
+println(r)   # about 5.0
+```
+
+The technical justification for starting here is that scalar calls have the least surface area for ABI mistakes. If you declare a 64-bit float and pass a MindScript `Num`, the runtime can marshal that into the exact representation the C function expects. If you get a surprising result, it is usually because the symbol name is wrong, the library is not the one you think it is, or the type declaration does not match the C signature.
+
+Once this works, you have proven that dynamic loading works, symbol lookup works, and call marshalling works on your machine. That baseline makes later debugging dramatically easier.
+
+---
+
+## The spec format and why it is explicit
+
+The top-level object must include `version: "1"` and a default `lib`. The version is not decoration: it exists to prevent silent reinterpretation of specs as the format evolves. If a future runtime changes how type descriptions are interpreted, requiring an explicit version forces you to opt in instead of inheriting a subtle mismatch.
+
+The `types` map is optional, but in practice you should use it. Naming types is not just for readability; it reduces the risk of copying a slightly different definition into multiple places. A single inconsistent `int` width is enough to turn a correct-looking spec into an incorrect call boundary.
+
+The `functions` list binds C function symbols. Each entry is a declarative restatement of the C prototype: return type and parameter types. The runtime uses that declaration to marshal MindScript values into C arguments and to marshal the C return value back into MindScript.
+
+The `variables` list binds global data symbols. Those bindings do not behave like plain values, because C globals live in native memory and can be mutated externally. Instead, each global becomes an object that you can query and set via explicit methods. That explicitness is important: it makes it clear you are crossing an FFI boundary every time you touch the value.
+
+---
+
+## Integers, floats, and range safety
+
+When you bind an integer type, you must specify its width and signedness. MindScript integers are conceptually unbounded at the language level, but the FFI boundary is not. C wants a fixed-width value in a particular register or stack slot. The runtime therefore must check whether your `Int` fits into the declared width before performing the conversion.
+
+This is not pedantry; it is memory safety. If you pass `1_000_000_000_000` as a 32-bit signed integer without range checks, the value will wrap, and the C function will see a different number than your program believes it passed. With range checks, the call fails loudly instead of producing a wrong computation or corrupting memory.
+
+Floating-point bindings work similarly, except the “range” question is mostly about representability. A 64-bit float is the usual safe choice for interoperability, because most C libraries expose `double` in their public APIs.
+
+---
+
+## Strings: `Str` as bytes and `char*` boundaries
+
+C “strings” are almost always pointers to bytes with a terminating NUL character (`'\0'`). MindScript strings (`Str`) are also used as byte containers throughout the runtime (for file data, HTTP bodies, gzip buffers, digests), which makes them a natural bridge type.
+
+When a C function expects a `char*` (or `unsigned char*`) parameter, the FFI can accept a MindScript `Str` and produce a temporary NUL-terminated buffer for the duration of the call. The key phrase is “for the duration of the call.” If the C library stores the pointer and uses it later, passing a temporary buffer is incorrect. In that case you must allocate stable storage yourself (typically with `__mem`) and pass a pointer handle whose lifetime you control.
+
+A minimal example with `puts` looks like this:
+
+```mindscript
+let C = ffiOpen({
+    version: "1",
+    lib: "libc.so.6",
+
+    types: {
+        int32: { kind: "int", bits: 32, signed: true },
+        charp: { kind: "pointer", to: { kind: "int", bits: 8, signed: true } }
+    },
+
+    functions: [
+        { name: "puts", ret: "int32", params: ["charp"] }
+    ]
+})
+
+C.puts("Hello from MindScript")
+```
+
+You should read this spec the way a C compiler would: the function takes a pointer to 8-bit integer data. The only “string” semantics are the convention that the memory is NUL-terminated, which is why the temporary buffer is needed.
+
+Return values are trickier. Some C functions return `char*` that you must free, some return `char*` that points into static storage and must not be freed, and some return `char*` that is only valid until the next call. The FFI can optionally convert certain `char*` returns into MindScript `Str` directly (when you mark the binding accordingly), but you still need to understand the ownership rule from the C library documentation. Converting to `Str` does not solve the ownership problem; it only chooses when the bytes are copied.
+
+---
+
+## Handles: pointers and aggregates are not maps and arrays
+
+A C struct is not a MindScript object. A pointer is not a number. If you try to model native memory with ordinary MindScript composites, you lose the ability to enforce correct layout and lifetime, and you invite ABI mismatches.
+
+The FFI therefore uses `Handle` values to represent native pointers and aggregate storage. A handle is opaque: you can pass it back into FFI calls, and you can hand it to `__mem` operations, but you cannot iterate it, index it, or inspect its address. This is a deliberate safety constraint.
+
+The most practical consequence is this rule:
+
+If a function’s parameter is declared as a struct, union, or fixed-size array (either by value or behind a pointer), you must pass a handle that refers to properly allocated storage. You cannot pass `{x: 1, y: 2}` where C expects `struct Point*`. The only safe place for a map literal is as an initializer *when allocating native storage*.
+
+---
+
+## `__mem`: allocating memory, reading fields, and casting
+
+Every module produced by `ffiOpen` contains a `__mem` submodule. Think of it as “the small, sharp tools” you use to operate on native memory.
+
+For everyday bindings, four operations matter first: allocation, struct field access, conversion of pointer-to-bytes into `Str`, and lifetime management.
+
+### Working with a struct through a handle
+
+Suppose a C library defines:
+
+```c
+struct Point { int32_t x; int32_t y; };
+void move_point(struct Point* p, int32_t dx, int32_t dy);
+```
+
+You bind the type and the function, then allocate a `Point` with `__mem.box`, pass the resulting handle, and read back the fields:
+
+```mindscript
+let C = ffiOpen({
+    version: "1",
+    lib: "libpoints.so",
+
+    types: {
+        int32: { kind: "int", bits: 32, signed: true },
+
+        Point: {
+            kind: "struct",
+            fields: [
+                { name: "x", type: "int32" },
+                { name: "y", type: "int32" }
+            ]
+        },
+
+        PointPtr: { kind: "pointer", to: "Point" }
+    },
+
+    functions: [
+        { name: "move_point", ret: { kind: "void" }, params: ["PointPtr", "int32", "int32"] }
+    ]
+})
+
+let p = C.__mem.box("Point", { x: 10, y: 20 })
+C.move_point(p, 5, -3)
+
+let x = C.__mem.getf("Point", p, "x")
+let y = C.__mem.getf("Point", p, "y")
+println(sprintf("(%d,%d)", [x, y]))
+```
+
+The justification for this pattern is layout correctness. `__mem.box("Point", ...)` allocates a correctly-sized, correctly-aligned chunk of native memory that matches the struct declaration in your spec. `getf` and `setf` then compute field offsets from that same declaration, so you don’t have to manually calculate or hard-code byte offsets.
+
+If you reach for raw `copy` and pointer arithmetic too early, you reintroduce the problems the FFI is trying to prevent.
+
+### The difference between “pointer to bytes” and “text”
+
+`__mem.string(ptr, len?)` exists because a pointer handle is not usable by itself. You often need to interpret the bytes it points to as a MindScript `Str`. When `len` is `null`, it typically reads until a NUL byte. When you know a length, passing it avoids scanning and avoids accidentally reading past the end.
+
+Because MindScript `Str` can represent raw bytes, you can then render it safely using `hexEncode` or `base64Encode` when the bytes are not guaranteed to be printable.
+
+---
+
+## Ownership and lifetimes: the part you must design
+
+C APIs rarely manage memory the way a garbage-collected language does. Some functions allocate; others return borrowed pointers; others require you to pass in buffers they fill. If you do not encode the ownership rule into your wrapper, you will eventually free too early or leak forever.
+
+The FFI provides two complementary mechanisms: explicit allocation/free through `__mem` (such as `malloc`, `free`, `new`, and `box`) and an attachment mechanism `gc(ptr, finalizer)` that arranges for cleanup when the handle becomes unreachable.
+
+Here is the simplest correct pattern for “malloc + free” ownership: allocate, attach a finalizer, and only then return the handle to the rest of your program.
+
+```mindscript
+let C = ffiOpen({
+    version: "1",
+    lib: "libc.so.6",
+    types: {
+        size: { kind: "int", bits: 64, signed: false }
+    },
+    functions: []
+})
+
+let allocBytes = fun(n: Int) -> Any do
+    let p = C.__mem.malloc(n)
+    if p == null then
+        panic("malloc failed")
+    end
+
+    # Arrange to free it later. The string "free" is a common shorthand finalizer.
+    C.__mem.gc(p, "free")
+    p
+end
+```
+
+This is not just convenience; it is correctness. The moment you return a raw pointer handle without a clear ownership rule, every caller must guess whether to free it, and different callers will guess differently. Centralizing the rule in one allocation function makes the rest of the code safe by default.
+
+Some libraries require a custom destructor, not `free`. In that case the finalizer must call the correct symbol, and your wrapper should export a `close()` or `destroy()` function for eager cleanup when that matters.
+
+The `ffiOpen` module itself also owns resources: dynamic library handles, libffi call interfaces, and callback closures. That is why the module exposes a `close()` function. Closing twice is treated as a misuse, because after close the module cannot safely service calls.
+
+---
+
+## Variadic functions and why they are special
+
+Variadic C functions (such as `printf`) are dangerous to bind directly because C applies default promotions to variadic arguments (for example, smaller integer types may be promoted to `int`, and floats are promoted to `double`). The FFI supports variadic calls, but it needs a disciplined way to separate “fixed parameters” from “variadic tail.”
+
+The rule enforced by this FFI is that the final argument for a variadic binding must be an array holding the variadic arguments. This makes the boundary explicit and keeps the call marshaling deterministic. You still need to ensure your types match the promoted forms that the C function expects, because C will not tell you you got it wrong—it will just read the wrong bytes.
+
+If you are new to FFI, avoid variadic functions until you have ordinary fixed-signature bindings working and tested.
+
+---
+
+## Callbacks and function pointers: powerful, but not day one
+
+Some C APIs accept function pointers as callbacks. The FFI can build a native closure that calls back into a MindScript function. That feature is real—and extremely useful—but it is also where lifetimes become subtle, because C might call your callback long after the original MindScript call has returned.
+
+The safe pattern is the same as for other ownership problems: encapsulate callback creation inside a wrapper that pins the callback handle for at least as long as C might call it, and provide an explicit `close` operation that unregisters the callback before releasing memory. The FFI’s closure machinery is capable, but it cannot guess the lifetime rules of the library you bind.
+
+Unless you have a pressing need, treat callbacks as an advanced topic and keep your first bindings to “call in, get result out” APIs.
+
+---
+
+## Global variables
+
+When you bind a global variable symbol, the module exports an object with methods rather than exporting the value directly. That design prevents a common mistake: reading a global once and then assuming it stays in sync.
+
+A global wrapper typically supports `get()` to read the current value, `set(value)` to write it, and `addr()` to obtain its address as a pointer handle when an API expects a pointer to that global.
+
+In wrapper code, you should usually hide these behind named functions so callers never directly manipulate global state unless they truly have to.
+
+---
+
+## Wrapping the raw bindings into a MindScript-friendly module
+
+The best FFI code is the code most of your project never sees. A wrapper module serves three purposes.
+
+First, it stabilizes naming. C APIs often use prefixes and underscores; MindScript projects typically use `camelCase`. Your wrapper can adapt names without changing the underlying binding.
+
+Second, it stabilizes types. The wrapper can accept and return ordinary MindScript values, allocating native storage and copying bytes only where required.
+
+Third, it stabilizes ownership. The wrapper is where you decide who frees what, and where you attach finalizers so callers don’t have to.
+
+Here is a small template that illustrates the idea:
+
+```mindscript
+# mylib.ms
+
+let _C = ffiOpen({
+    version: "1",
+    lib: "libmylib.so",
+    types: {
+        int32: { kind: "int", bits: 32, signed: true }
+    },
+    functions: [
+        { name: "mylib_add", ret: "int32", params: ["int32", "int32"] }
+    ]
+})
+
+let add = fun(a: Int, b: Int) -> Int do
+    _C.mylib_add(a, b)
+end
+
+let close = fun() -> Null do
+    _C.close()
+end
+```
+
+Your application code imports `mylib` and never touches `_C` or the spec. If you later discover that the real C type was `int64_t` on one platform, you change the spec in one place, rerun your sanity tests, and the application remains unchanged.
+
+---
+
+## Debugging and sanity testing
+
+With FFI, most failures are spec mismatches. A wrong integer width, a wrong signedness, or a wrong calling convention will not always fail immediately. The discipline that keeps you safe is to add a tiny test per binding that exercises one function with known inputs and checks a known output. When you move to structs, add a test that writes fields, calls a function, and then reads fields back. When you bind memory ownership, add a test that allocates and frees in a loop to shake out leaks early.
+
+When something fails, prefer small, local proofs over global debugging. Confirm the library loads. Confirm the symbol resolves. Confirm the simplest call works. Only then add the next layer of complexity.
+
+---
+
+## Summary
+
+`ffiOpen` is a spec-driven bridge from MindScript to C. Its central safety idea is that native pointers and aggregate storage are represented as opaque handles, and all native memory manipulation is routed through the `__mem` toolbox. That design does not remove the need to understand C ownership and ABI rules, but it gives you a place to encode those rules once, inside a wrapper module, so the rest of your program can remain ordinary MindScript.
+
+If you keep two habits—write a small sanity test for each new binding, and wrap raw FFI surfaces behind a MindScript-style module—you can call native libraries productively without letting FFI complexity leak into your whole codebase.
+
+=== END FILE: ./docs/manual/docs/learn/ffi.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/functions.md ===
 
@@ -944,6 +1557,822 @@ println(sayHello())
 Because the oracle is a black box, it will return an arbitrary string guided by the hint. Multiple executions of this program should print different greetings.
 
 === END FILE: ./docs/manual/docs/learn/index.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/io.md ===
+# Input and Output
+
+Input/output is how a MindScript program communicates with its environment: terminals, pipelines, files, and (through other libraries) networks and processes. The language itself works only with values—numbers, strings, arrays, and objects—but the runtime also provides **handles** that represent open streams such as standard input, standard output, open files, and sockets.
+
+This chapter aims to answer three practical questions. First, where does a program read from and write to? Second, what do the basic read and write operations return, especially at end-of-file? Third, how should a program report failures without breaking shell pipelines?
+
+MindScript follows a simple convention that makes I/O predictable. When an I/O operation cannot produce a meaningful result, it usually returns `null`. When that `null` carries an explanation, it is stored as an annotation, which you can retrieve with `noteGet(...)`. This style keeps error handling explicit without forcing you into a separate exception mechanism for everyday boundary failures.
+
+We begin with the standard streams, because every program has them, and then move to files and a few filesystem helpers.
+
+---
+
+## Handles and the standard streams
+
+A **handle** is an opaque value of type `Handle` managed by the runtime. You do not inspect the internals of a handle; instead you pass it to the I/O functions provided by the runtime.
+
+Every MindScript program starts with three predefined handles: `STDIN`, `STDOUT`, and `STDERR`. These correspond to the conventional Unix streams. It is useful to adopt the Unix discipline: use standard output for the program’s primary results—often machine-consumable text such as JSON—and use standard error for diagnostics such as warnings, progress messages, and explanations. This separation is what makes pipelines robust: a downstream program can read clean JSON from stdout even while your program reports status messages to stderr.
+
+---
+
+## Writing output
+
+The most fundamental output operation is `write(h, s: Str) -> Int?`. It writes the bytes of the string `s` to the handle `h`. On success it returns the number of bytes written; on failure it returns `null`, often annotated with a short reason. The word “bytes” matters: `write` does not interpret the string, and it does not insert separators or newlines. If you want a newline, you must include `"\n"` yourself.
+
+```mindscript
+write(STDOUT, "hello")
+write(STDOUT, "\n")
+```
+
+Output is buffered. Buffering improves performance and reduces system calls, but it also means you might not see output immediately. When you need output to appear right away—typically for progress messages—call `flush(h) -> Bool?`. A good mental model is that `write` appends to a buffer and `flush` pushes that buffer to the operating system.
+
+```mindscript
+write(STDERR, "loading...\n")
+flush(STDERR)
+```
+
+For convenience during development, the prelude provides `print(x)` and `println(x)`. They convert common “data values” to a readable representation and write them, with `println` adding a trailing newline. Both return the original value, which makes them easy to insert into an expression without restructuring code.
+
+When you need formatted output, use `sprintf(fmt: Str, args: [Any]) -> Str?` to build a string or `printf(fmt: Str, args: [Any]) -> Str?` to write formatted output to stdout. The `printf` function writes through the same buffered stdout writer as `write(STDOUT, ...)` and flushes, which helps keep output ordering stable when you mix the two.
+
+```mindscript
+printf("count=%d\n", [42])
+```
+
+If the format string and the arguments do not match, `sprintf` and `printf` return `null` with an annotation describing the formatting problem.
+
+---
+
+## Reading input
+
+Streams can be consumed in different ways, so MindScript provides three basic reading operations. The point is not to memorize names, but to understand the meaning of each operation and how it signals end-of-file.
+
+### Reading the whole stream: `readAll`
+
+The function `readAll(h) -> Str?` reads from a handle until end-of-file and returns the entire contents as one string. If reading fails, it returns `null`. This is the simplest choice when the input is small enough to fit comfortably in memory, and it is common in “filter” programs that read from stdin, transform, and write to stdout.
+
+```mindscript
+let input = readAll(STDIN)
+if input == null then
+    write(STDERR, "read failed: " + (noteGet(input) or "<no details>") + "\n")
+    flush(STDERR)
+    null
+else
+    let out = replace("\\s+", " ", strip(input))
+    write(STDOUT, out + "\n")
+    flush(STDOUT)
+    out
+end
+```
+
+Notice the structure: the I/O boundary is checked immediately, the transformation is ordinary computation, and output is written explicitly.
+
+### Reading line by line: `readLine`
+
+The function `readLine(h) -> Str?` returns the next line of text without its trailing newline (`"\n"` or `"\r\n"`). When the stream is at end-of-file, it returns `null`. This design makes line-processing loops direct: read a line, stop when the read returns `null`, otherwise process and continue.
+
+```mindscript
+while true do
+    let line = readLine(STDIN)
+    if line == null then
+        break(null)
+    end
+
+    write(STDOUT, strip(line) + "\n")
+end
+
+flush(STDOUT)
+```
+
+It is important to distinguish an empty line from end-of-file. An empty line is the string `""`, which is a valid value that `readLine` may return. End-of-file is `null`. If you care about distinguishing “normal EOF” from “a read failure,” check the annotation: in many parts of the standard library, failures return an annotated `null`, whereas EOF is usually plain `null`.
+
+### Reading fixed-size chunks: `readN`
+
+The function `readN(h, n: Int) -> Str?` reads up to `n` bytes and returns a string containing exactly what it read. It may return fewer than `n` bytes without this being an error. If reading fails, it returns `null`. End-of-file is detected when `readN` returns a string of length zero, so the typical loop checks `len(chunk) == 0`.
+
+```mindscript
+let bufSize = 64_000
+
+while true do
+    let chunk = readN(STDIN, bufSize)
+    if chunk == null then
+        write(STDERR, "read failed: " + (noteGet(chunk) or "<no details>") + "\n")
+        flush(STDERR)
+        break(null)
+    end
+    if len(chunk) == 0 then
+        break(null)  # EOF
+    end
+    write(STDOUT, chunk)
+end
+
+flush(STDOUT)
+```
+
+This pattern is the backbone of streaming tasks: copying, hashing, compression, and large transfers all reduce to “read chunks until EOF, process each chunk, write results.”
+
+---
+
+## Files
+
+MindScript supports whole-file helpers for simple scripts and explicit file handles for streaming.
+
+When a script wants the simplest interface, it uses `readFile(path: Str) -> Str?` to read a file as one string and `writeFile(path: Str, data: Str) -> Int?` to overwrite a file with the given data. As with other I/O, failures return `null`.
+
+```mindscript
+let s = readFile("input.txt")
+if s == null then
+    write(STDERR, "cannot read input.txt: " + (noteGet(s) or "<no details>") + "\n")
+    flush(STDERR)
+    null
+else
+    let out = toUpper(s)
+    let n = writeFile("output.txt", out)
+    if n == null then
+        write(STDERR, "cannot write output.txt: " + (noteGet(n) or "<no details>") + "\n")
+        flush(STDERR)
+        null
+    else
+        n
+    end
+end
+```
+
+When you need incremental processing, you open a file and work with a handle. The function `open(path: Str, mode: "r"|"w"|"a"|"rw") -> Handle.file?` returns a file handle (or `null` on failure). Once you have a handle, you use the same `readAll`, `readLine`, `readN`, `write`, `flush`, and `close` operations you already learned. Closing is important: it releases operating-system resources, and for writable handles it flushes buffered output.
+
+```mindscript
+let f = open("big.bin", "r")
+if f == null then
+    f
+else
+    let chunk = readN(f, 64_000)
+    close(f)
+    chunk
+end
+```
+
+A file copy example shows the full discipline of stream programming. You acquire resources, loop reading and writing until EOF, and ensure that both handles are closed on every exit path. In this example, end-of-file is detected by `len(chunk) == 0` and is not treated as an error.
+
+```mindscript
+let copyFile = fun(srcPath: Str, dstPath: Str) -> Null? do
+    let src = open(srcPath, "r")
+    if src == null then
+        return (null  # <cannot open source>)
+    end
+
+    let dst = open(dstPath, "w")
+    if dst == null then
+        close(src)
+        return (null  # <cannot open destination>)
+    end
+
+    while true do
+        let chunk = readN(src, 64_000)
+        if chunk == null then
+            close(src)
+            close(dst)
+            return (null  # <read error>)
+        end
+        if len(chunk) == 0 then
+            break(null)  # EOF
+        end
+
+        let n = write(dst, chunk)
+        if n == null then
+            close(src)
+            close(dst)
+            return (null  # <write error>)
+        end
+    end
+
+    close(src)
+    close(dst)
+    null
+end
+```
+
+---
+
+## Directories and paths
+
+Scripts often need to build paths portably and work with directory trees. The function `pathJoin(parts: [Str]) -> Str` joins path components using the platform’s conventions, which keeps scripts portable across operating systems.
+
+```mindscript
+let p = pathJoin(["out", "result.txt"])
+```
+
+To create a directory (and any missing parents), use `mkdir(path) -> Bool?`. To list a directory, use `dirList(path) -> [Str]?`, which returns the names within the directory (or `null` on failure).
+
+```mindscript
+if mkdir("out") == null then
+    write(STDERR, "cannot create out/\n")
+    flush(STDERR)
+    null
+else
+    let xs = dirList(".")
+    if xs == null then
+        write(STDERR, "cannot list directory\n")
+        flush(STDERR)
+        null
+    else
+        for name in xs do
+            write(STDOUT, name + "\n")
+        end
+        flush(STDOUT)
+        xs
+    end
+end
+```
+
+Other OS helpers exist—such as `stat`, `rename`, `remove`, `cwd`, `chdir`, and environment variable access—and they follow the same convention: return `null` when they cannot deliver the requested result.
+
+---
+
+## Bytes and text: one `Str`, two uses
+
+MindScript uses `Str` both for Unicode text and for raw byte sequences returned by I/O, such as file contents, stream chunks, HTTP bodies, compressed data, and cryptographic digests. Text-oriented functions like `strip`, `split`, and `substr` interpret strings as Unicode text, while I/O functions treat strings as byte containers.
+
+When a string contains arbitrary bytes, it may not be printable. In that case, encode it first with `hexEncode` or `base64Encode`. For example, to compute and print a SHA-256 digest as hex:
+
+```mindscript
+let b = readFile("payload.bin")
+if b == null then
+    b
+else
+    write(STDOUT, hexEncode(sha256(b)) + "\n")
+    flush(STDOUT)
+end
+```
+
+---
+
+## Summary
+
+MindScript performs I/O through handles such as `STDIN`, `STDOUT`, `STDERR`, and file handles returned by `open`. Writing is done with `write`, and because output is buffered you sometimes call `flush` when immediacy matters. Reading can be done all at once with `readAll`, line by line with `readLine`, or in fixed-size chunks with `readN`; end-of-file appears as `null` for `readLine` and as a zero-length chunk for `readN`. File I/O comes in both whole-file helpers (`readFile`, `writeFile`) and streaming style (`open` plus handle-based reads and writes). Throughout, ordinary I/O failures are represented as `null`, often annotated with a reason, so checking for `null` is the normal way to write reliable scripts.
+
+=== END FILE: ./docs/manual/docs/learn/io.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/metaprogramming.md ===
+# Metaprogramming and Introspection
+
+MindScript also exposes program structure itself as data. *Metaprogramming* means treating code as a value that you can parse, validate, transform, format, and evaluate. Introspection means observing or manipulating metadata attached to values (notably annotations) and inspecting runtime structure.
+
+This chapter focuses on the practical tooling layer that MindScript ships with. The goal is not to turn every script into a compiler, but to make common tasks—formatting, light linting, safe evaluation of small snippets, reproducible code generation, and data-to-code roundtrips—straightforward and reliable.
+
+## Code as data: the runtime-S representation
+
+MindScript exposes a canonical representation of programs as ordinary values. This representation is called runtime-S. A runtime-S node is an array whose first element is a string “tag” identifying the node kind, followed by child nodes and scalar fields. Because it is made from arrays, strings, numbers, booleans, and objects, you can store it in files, send it over the network, and manipulate it with the same tools you use for JSON.
+
+A key design choice is that runtime-S is sugar-free. Many surface syntactic forms (such as property access, indexing, or operator precedence) are lowered into a small set of canonical node tags. That makes transformation simpler: you don’t need to preserve trivia like parentheses or spacing in order to produce correct output. The formatter can recover readable source from the canonical form.
+
+Runtime-S also preserves annotations. In source code, `# ...` attaches to values. In runtime-S, annotations are represented explicitly as an `annot` wrapper node. This matters for tooling, because documentation and “failure reasons” are part of the data model and should survive roundtrips.
+
+## Parsing source into runtime-S
+
+The entry point for metaprogramming is `astParse`, which turns a source string into a runtime-S AST.
+
+```mindscript
+let src = "let x = 1 + 2\nx"
+let ast = astParse(src)
+
+if ast == null then
+    println("parse failed: " + (noteGet(ast) or "<no details>"))
+    null
+else
+    ast
+end
+```
+
+`astParse` returns `null` on parse failure, usually annotated with a readable error message. This is intentionally a “soft” boundary, because tooling often wants to report problems rather than stop the whole process.
+
+Even when parsing succeeds, you should not assume the AST has a valid canonical shape. A runtime-S value may have been constructed by hand, produced by a buggy tool, or received from an untrusted source. That is why MindScript separates parsing from validation.
+
+## Validating runtime-S before you trust it
+
+Canonical validation checks that a runtime-S tree is structurally well-formed: tags are known, arities are correct, and node layouts match what the evaluator and formatter expect. The validator reports problems as an array of error objects rather than panicking, which makes it suitable for editors, CI checks, and pipelines.
+
+```mindscript
+let errors = astValidate(ast)
+
+if len(errors) != 0 then
+    println("AST is invalid.")
+    println(errors)
+    null
+else
+    println("AST is valid.")
+    ast
+end
+```
+
+Each error contains at least a message and a path describing where the problem occurred. When the runtime-S value is not even shaped like an AST (for example, it is not an array whose first element is a tag string), the validator still returns a standardized error entry instead of crashing. This “always returns errors as data” behavior is a deliberate choice: tooling needs totality and predictable failure modes.
+
+Validation is a structural guarantee, not a semantic guarantee. A structurally valid program can still be “bad” at runtime (for example, it can index the wrong kind of value, call a missing command, or attempt I/O). Validation answers “is this a well-formed program?”, not “is this a safe program?” or “will it succeed?”.
+
+## Formatting runtime-S back to source
+
+Once you have runtime-S, `astFormat` can produce canonical, formatted MindScript source. This is useful when you are building programmatic refactors, code generators, or format-preserving pipelines.
+
+```mindscript
+let formatted = astFormat(ast)
+
+if formatted == null then
+    println("format failed: " + (noteGet(formatted) or "<no details>"))
+    null
+else
+    formatted
+end
+```
+
+Formatting is defined on the canonical form, which is why validation is the right step before formatting. If you skip validation and feed malformed runtime-S into the formatter, you should expect a `null` result with an explanation rather than a hard crash.
+
+A good way to think about this pipeline is: `astParse` gives you structure, `astValidate` gives you confidence, and `astFormat` gives you stable output.
+
+## Evaluating runtime-S: `astEval` versus `reify`
+
+MindScript provides two evaluation entry points for runtime-S. They exist because metaprogramming is used in two very different modes.
+
+The first mode is “evaluate something in the current scope”, which is what you want for REPL helpers, small expression evaluators, and code that should not leak definitions into the global environment. That is what `astEval` does.
+
+```mindscript
+let evalSnippet = fun(src: Str) -> Any do
+    let ast = astParse(src)
+    if ast == null then
+        return ast
+    end
+
+    let errs = astValidate(ast)
+    if len(errs) != 0 then
+        return (null  # <invalid AST>)
+    end
+
+    astEval(ast)
+end
+
+evalSnippet("1 + 2")
+```
+
+`astEval` decodes runtime-S, validates it, and then evaluates it in the caller’s scope. If decoding or validation fails, it returns `null` with an explanation. If evaluation fails due to a runtime error, it returns `null` with an explanation rather than terminating the process. This “tooling-friendly” behavior is intentional: metaprogramming often wants errors as values.
+
+The second mode is “turn code into persistent definitions”, which is what you want for generators that create helpers, synthesize modules, or build a small DSL on top of MindScript. That is what `reify` does.
+
+```mindscript
+let defineHelper = fun() -> Any do
+    let ast = astParse('let add1 = fun(x: Int) -> Int do x + 1 end')
+    if ast == null then
+        return ast
+    end
+
+    let errs = astValidate(ast)
+    if len(errs) != 0 then
+        return (null  # <invalid AST>)
+    end
+
+    reify(ast)
+end
+
+defineHelper()
+add1(41)   # now exists persistently in the current session
+```
+
+The semantic difference is persistence: `reify` evaluates in the persistent environment, so definitions survive beyond the call (and, in the REPL, beyond the current prompt). This makes `reify` a powerful mechanism, and it is also why you should treat it with care. Reifying untrusted code is equivalent to executing untrusted code.
+
+If you need “evaluate, but don’t permanently define”, use `astEval`. If you need “evaluate as if it were typed into the REPL and keep the result”, use `reify`.
+
+## Reflecting values into constructor code
+
+Metaprogramming is not only about transforming source code; it is also about turning data back into code. MindScript exposes a `reflect` function that produces runtime-S constructor code for a value. In other words, `reflect(v)` returns an AST that, when evaluated, reconstructs `v`.
+
+This is useful in two common situations. The first is serialization for reproducibility: instead of writing ad-hoc JSON for a complex value, you can emit MindScript code that re-creates the value precisely (including annotations where applicable). The second is snapshot-style debugging: you can capture a value as code and paste it into a test or a REPL session.
+
+```mindscript
+let v = {
+    # human-facing label
+    name: "Ada",
+    tags: ["math", "programming"]
+}
+
+let ast = reflect(v)
+if ast == null then
+    println("cannot reflect: " + (noteGet(ast) or "<no details>"))
+    null
+else
+    let src = astFormat(ast)
+    if src == null then
+        println("cannot format reflected AST: " + (noteGet(src) or "<no details>"))
+        null
+    else
+        src
+    end
+end
+```
+
+Not every value is reflectable. Pure data values (null/bools/numbers/strings/arrays/objects) are reflectable. Types are reflectable as type constructors. MindScript functions and oracles can be reflected as code when they are defined in MindScript. Opaque runtime objects such as handles generally cannot be reflected, because they represent external resources (open files, sockets, processes) that have no meaningful source-level constructor.
+
+When reflection cannot represent a value, it returns `null` with a reason. This is a correctness property: pretending a handle is reconstructible would produce misleading code.
+
+## A practical refactoring example: normalize “free-floating” annotations
+
+Because annotations are explicit nodes in runtime-S, you can write tools that enforce style. As a simple example, suppose you want to ensure that “section header” comment blocks do not accidentally attach to a following definition. In source, a blank line prevents attachment, but in AST form you can detect standalone annotations reliably.
+
+The following script parses a file, validates it, formats it, and writes it back. It does not implement a sophisticated transformation; instead it demonstrates the canonical tool pipeline you should follow whenever you manipulate code.
+
+```mindscript
+let rewriteFile = fun(path: Str) -> Bool? do
+    let src = readFile(path)
+    if src == null then
+        return (null  # <cannot read file>)
+    end
+
+    let ast = astParse(src)
+    if ast == null then
+        return (null  # <parse failed>)
+    end
+
+    let errs = astValidate(ast)
+    if len(errs) != 0 then
+        write(STDERR, "invalid AST in " + path + "\n")
+        write(STDERR, formatValue(errs) + "\n")
+        flush(STDERR)
+        return (null  # <invalid AST>)
+    end
+
+    let out = astFormat(ast)
+    if out == null then
+        return (null  # <format failed>)
+    end
+
+    let n = writeFile(path, out)
+    if n == null then
+        return (null  # <cannot write file>)
+    end
+    true
+end
+```
+
+This pattern matters more than it looks. The parse step gives you structure, the validate step gives you a contract that the rest of your tooling can rely on, and the format step produces canonical output that is stable across machines and editor settings. Once you build transformation passes that rewrite `ast` (for example, renaming identifiers or inserting timing calls), this outer scaffolding stays the same.
+
+## A safe “expression evaluator” for configuration
+
+A common temptation is to accept “little snippets of code” as configuration. If you do that, you need a predictable boundary: parsing and evaluation failures should be data, not a process crash; code should not accidentally define names permanently; and you should be able to control what context the code sees.
+
+A pragmatic approach is to evaluate in a fresh scope by calling a helper function, and to wrap evaluation in `try` so that hard failures become values.
+
+```mindscript
+let evalExpr = fun(expr: Str, env: {}) -> Any do
+    let ast = astParse(expr)
+    if ast == null then
+        return ast
+    end
+
+    let errs = astValidate(ast)
+    if len(errs) != 0 then
+        return (null  # <invalid AST>)
+    end
+
+    let r = try(fun() do
+        do
+            for kv in env do
+                let k = kv[0]
+                let v = kv[1]
+                # store values in locals for the expression to use
+                # (this is a simple approach; serious sandboxes should not run untrusted code)
+                (let tmp = 0)  # placeholder expression to keep structure obvious
+            end
+            astEval(ast)
+        end
+    end)
+
+    if r.ok then
+        r.value
+    else
+        null  # <eval failed>
+    end
+end
+```
+
+This example is intentionally conservative about promises: it is not a sandbox. MindScript does not try to make untrusted code safe to execute. Validation ensures structural correctness, not safety. If you execute arbitrary code, it can call `open`, `exec`, `http`, and other boundary functions. The right security boundary for untrusted input is “do not evaluate it”.
+
+What metaprogramming gives you is control over *tooling failure modes*: you can accept or reject code based on structural rules, present good diagnostics, and keep evaluation from polluting persistent scope.
+
+## Programmatic annotations as a documentation channel
+
+Annotations are first-class metadata. In tooling, that is valuable because it lets you attach explanations to intermediate values without changing their “shape”. For example, a linter can return `null` on failure and annotate it with the reason, or it can annotate a successful value with a short “how it was computed” note.
+
+At the value level, `noteGet` and `noteSet` let you build this channel explicitly. When you combine this with `reflect`, you get a reproducible audit trail: a value can carry its own documentation, and `reflect` can emit code that preserves that documentation.
+
+## Summary
+
+Metaprogramming in MindScript is built on a small, explicit contract. Code can be represented as runtime-S, which is just JSON-shaped data. You can parse source into runtime-S, validate it structurally, format it back into canonical source, and evaluate it either in the current scope (`astEval`) or persistently (`reify`). You can also reflect values into constructor code, which supports reproducibility and tooling workflows.
+
+The power here is not cleverness; it is predictability. Every step has a total interface, and every failure can be represented as a value with an explanation. That makes it practical to build formatters, linters, small code generators, and debugging tools directly in MindScript, using the same error-handling idioms you already use at other boundaries.
+
+=== END FILE: ./docs/manual/docs/learn/metaprogramming.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/networking.md ===
+# Networking
+
+MindScript’s networking primitives are designed for the kind of work scripts actually do: fetch data from an API, post results to a service, and occasionally speak a simple TCP protocol. The runtime exposes network connections as opaque `Handle` values, so the same I/O operations you already use for files—`readN`, `readAll`, `readLine`, `write`, `flush`, `close`—also work for sockets. This unification matters: once you understand stream I/O, you already understand most of networking in MindScript.
+
+MindScript also makes a sharp distinction between two classes of failure. Misusing an API contract is a hard error (a panic), because the program is wrong. Environmental failures—DNS errors, connection resets, timeouts, remote server errors—are normal boundary failures and are represented as `null`, often annotated with a reason. This keeps network code explicit without forcing every script into exception-style control flow.
+
+---
+
+## The model: handles and boundary failures
+
+A TCP connection is represented as a `Handle.net`. You do not inspect it; you pass it to I/O functions. When you are done, you close it with `close(h)`. If you fail to close connections, scripts that run for a long time (or loop over many URLs) can leak OS resources. Closing also matters for correctness with streaming protocols because it signals to the peer that no more bytes are coming.
+
+Networking operations typically return `null` on failure. When they do, `noteGet(nullValue)` often carries a message that is safe to log. A reliable pattern is to check immediately at the boundary, before you assume you have a connection or a response.
+
+```mindscript
+let conn = netConnect("example.com:80")
+if conn == null then
+    println("connect failed: " + (noteGet(conn) or "<no details>"))
+    null
+else
+    # use conn
+    close(conn)
+end
+```
+
+That early check is not just style; it prevents accidental panics later when you pass a `null` to `readAll` or `write`.
+
+---
+
+## HTTP: buffered requests, buffered responses
+
+Most scripts should start with the HTTP client because it covers the common “call an API” use case without manual socket handling.
+
+The function `http(req)` performs an HTTP request and returns a response object. The request is a map where `url` is required and everything else is optional. The response is also a map and includes fields such as status code, headers, and the full response body as a string. The function returns `null` when it cannot produce a meaningful response (for example, due to a network error or timeout).
+
+A minimal GET looks like this:
+
+```mindscript
+let r = http({url: "https://httpbin.org/json"})
+if r == null then
+    println("request failed: " + (noteGet(r) or "<no details>"))
+    null
+else
+    r.status
+end
+```
+
+A response is not automatically “success” just because it is non-null. HTTP represents many application-level failures as normal responses with status codes. Treat this as part of the boundary: check `r.status` explicitly.
+
+```mindscript
+let r = http({url: "https://api.example.com/items"})
+if r == null then
+    r
+elif r.status < 200 or r.status >= 300 then
+    null  # <http status not ok>
+else
+    jsonRepair(r.body)
+end
+```
+
+In this example, `jsonRepair` is used rather than `jsonParse` because APIs sometimes include minor JSON irregularities. If you require strict JSON, use `jsonParse` and propagate its annotated failure instead.
+
+### Methods, headers, and timeouts
+
+HTTP requests are usually parameterized by method, headers, body, and timeout. MindScript uses a plain object for this because scripts tend to assemble requests dynamically.
+
+```mindscript
+let payload = jsonStringify({name: "Ada", role: "engineer"})
+if payload == null then
+    payload
+else
+    let r = http({
+        url: "https://api.example.com/users",
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            "accept": "application/json",
+        },
+        body: payload,
+        timeoutMs: 15_000
+    })
+
+    if r == null then
+        r
+    elif r.status != 201 then
+        null  # <create failed>
+    else
+        jsonRepair(r.body)
+    end
+end
+```
+
+Headers are represented as a map of strings to strings. This is an intentional constraint: it avoids ambiguity and makes requests deterministic. On responses, header values are also strings; if a header has multiple values, they are joined into a single string, which is typically good enough for script-level work.
+
+The timeout is specified in milliseconds. Timeouts are not “exceptions”; they are ordinary failures and so they produce `null` with a note. This is important for robust automation: timeouts should be handled explicitly, often by retrying.
+
+### A retry loop with backoff
+
+A careful script should expect transient failures and retry a small number of times. Since failures are represented as values, a retry loop is ordinary computation.
+
+```mindscript
+let fetchJson = fun(url: Str) -> Any? do
+    let attempt = 0
+    let r = null
+
+    while attempt < 5 and r == null do
+        r = http({url: url, timeoutMs: 5_000})
+        if r == null then
+            attempt = attempt + 1
+            sleep(200 * (attempt * attempt))
+        end
+    end
+
+    if r == null then
+        null  # <http failed after retries>
+    elif r.status < 200 or r.status >= 300 then
+        null  # <http status not ok>
+    else
+        jsonRepair(r.body)
+    end
+end
+```
+
+The backoff is quadratic purely because it is simple and adequate for many scripts. More elaborate strategies belong in a dedicated library, but the key idea is the same: treat network unreliability as normal.
+
+---
+
+## HTTP streaming: large downloads and early resource release
+
+Buffered HTTP is convenient but sometimes too expensive. If a response body is large, buffering it into memory can be slow or even impossible. MindScript therefore offers `httpStream(req)`, which returns a response object where the body is exposed as a readable `Handle.net` named `bodyH`.
+
+The design mirrors Unix streaming: you pull bytes from the handle in chunks and process them as you go. This makes it possible to download large files, compute checksums, or decompress streams without building huge intermediate strings.
+
+A streaming download to a file looks like this:
+
+```mindscript
+let url = "https://example.com/big.bin"
+
+let r = httpStream({url: url, timeoutMs: 30_000})
+if r == null then
+    println("download start failed: " + (noteGet(r) or "<no details>"))
+    null
+else
+    if r.status < 200 or r.status >= 300 then
+        close(r.bodyH)
+        null  # <http status not ok>
+    else
+        let out = open("big.bin", "w")
+        if out == null then
+            close(r.bodyH)
+            out
+        else
+            while true do
+                let chunk = readN(r.bodyH, 64_000)
+                if chunk == null then
+                    close(r.bodyH)
+                    close(out)
+                    return (null  # <read failed>)
+                end
+                if len(chunk) == 0 then
+                    break(null)  # EOF
+                end
+
+                let n = write(out, chunk)
+                if n == null then
+                    close(r.bodyH)
+                    close(out)
+                    return (null  # <write failed>)
+                end
+            end
+
+            close(r.bodyH)
+            close(out)
+            null
+        end
+    end
+end
+```
+
+Two details here are worth keeping as habits.
+
+First, the response handle must be closed even on error. Closing early is not just cleanup; it allows the underlying HTTP transport to release the connection, which matters in scripts that run many requests.
+
+Second, the loop uses `readN` and checks `len(chunk) == 0` to detect EOF. This is the standard streaming idiom in MindScript.
+
+### Streaming uploads with `bodyH`
+
+Sometimes the large data is on the request side rather than the response side. The HTTP functions accept `bodyH` in the request. When provided, it must be a readable file or network handle. This lets you send a file without reading it into memory.
+
+```mindscript
+let f = open("payload.bin", "r")
+if f == null then
+    f
+else
+    let r = http({
+        url: "https://api.example.com/upload",
+        method: "POST",
+        headers: {"content-type": "application/octet-stream"},
+        bodyH: f,
+        timeoutMs: 60_000
+    })
+
+    close(f)
+
+    if r == null then
+        r
+    elif r.status < 200 or r.status >= 300 then
+        null  # <upload failed>
+    else
+        r.body
+    end
+end
+```
+
+The explicit `close(f)` is important. A readable handle is still an OS resource, and the upload will finish sooner than a long-running script might otherwise exit.
+
+---
+
+## TCP: raw connections for simple protocols
+
+HTTP covers most integration work, but raw TCP is still useful for quick tools and for talking to services that use a custom line protocol.
+
+MindScript provides `netConnect(addr)` to create an outbound connection, `netListen(addr)` to create a listener, and `netAccept(listener)` to accept inbound connections. All of these return `null` on environmental failure.
+
+Once you have a `Handle.net`, you use the same I/O primitives as files. This is not a convenience; it is a deliberate design that prevents a second, socket-specific API surface.
+
+### A tiny TCP client
+
+The following example sends a single line and reads a single line response. It uses `readLine`, which works on network handles.
+
+```mindscript
+let c = netConnect("127.0.0.1:9000")
+if c == null then
+    println("connect failed: " + (noteGet(c) or "<no details>"))
+    null
+else
+    write(c, "ping\n")
+    flush(c)
+
+    let line = readLine(c)
+    close(c)
+
+    if line == null then
+        null  # <no reply>
+    else
+        line
+    end
+end
+```
+
+The flush is usually unnecessary for sockets because writes go directly to the OS, but using `flush` keeps the example consistent with the buffered I/O model and avoids surprises if a handle is layered through a buffered writer.
+
+### A single-connection echo server
+
+A basic server accepts a connection and echoes each incoming line. This example handles one connection and then exits. Handling many connections is a concurrency topic, but the protocol logic is the same.
+
+```mindscript
+let l = netListen("127.0.0.1:9000")
+if l == null then
+    println("listen failed: " + (noteGet(l) or "<no details>"))
+    null
+else
+    let c = netAccept(l)
+    close(l)
+
+    if c == null then
+        println("accept failed: " + (noteGet(c) or "<no details>"))
+        null
+    else
+        while true do
+            let line = readLine(c)
+            if line == null then
+                break(null)
+            end
+            write(c, line + "\n")
+            flush(c)
+        end
+        close(c)
+        null
+    end
+end
+```
+
+This shows the essential server discipline: acquire resources, handle boundary failures, loop until EOF, then close.
+
+---
+
+## Diagnosing failures responsibly
+
+Networking failures are often outside your control. What you can control is how clearly your script reports them and how safely it continues.
+
+When a networking primitive returns `null`, printing `noteGet(value)` is usually enough for logs. When an operation panics, that is usually a contract mistake: for example, passing a non-string header value or giving a malformed request shape. In those cases you should fix the program rather than “handle the error.” If you truly need to treat a hard failure as data—say, you are writing a tool that validates request objects—wrap the operation in `try(fun() do ... end)` and propagate the resulting `{ok, value}`.
+
+---
+
+## Summary
+
+MindScript networking is deliberately built around one core idea: network connections are streams, and streams are handled through the same I/O primitives everywhere. Use `http` for ordinary API calls, and treat non-2xx statuses as normal boundary outcomes that you must check explicitly. Use `httpStream` when buffering a body is too expensive, and close streaming handles promptly to release resources. Use `netConnect` and `netListen` when you need raw TCP, and reuse the same `readLine`/`readN`/`write` patterns you already know.
+
+=== END FILE: ./docs/manual/docs/learn/networking.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/oracles.md ===
 
@@ -1473,7 +2902,7 @@ end
 println(a)  # global a
 println(b)  # inner b
 println(c)  # global c
-````
+```
 
 In this code, `a` declared inside the block shadows `a` declared in the global scope and thus `let a = "inner a"` does not affect `global a`. Also, variables declared with `let` inside a block vanish when the block ends.
 
@@ -1629,507 +3058,739 @@ This loop adds `2` and `3` and then breaks with a value equal to `5`.
 === BEGIN FILE: ./docs/manual/docs/learn/stdlib.md ===
 # Standard Library
 
-MindScript fires up with a set of built-in functions (= *the Standard Library*) to operate on [arrays](#arrays), [iterators](#iterators), [objects](#objects), [strings](#string-functions), and more. Below you'll find a complete reference.
+MindScript’s standard library is built for the kind of work scripts actually do: read some data, turn it into values, transform it, then write something useful back out—often in a way that composes in shell pipelines and CI.
 
+You will see the same design pattern across the library:
 
-## General functions
+* **At boundaries**, functions usually return `null` on failure, often with an annotation explaining why.
+* **Inside your program**, you keep values JSON-shaped (arrays, objects, strings, numbers) and use small, predictable primitives to transform them.
+* **When you truly cannot continue**, something panics (a hard stop). You can catch hard failures with `try(...)` when you want to keep going.
 
-### print
-`value:Any -> Any`
+This chapter is not a reference list. It shows how the standard tools fit together in real scripts.
 
-Prints a value.
+---
 
-### assert
-`condition:Bool -> Bool`
+## Seeing what you have
 
-Asserts the condition.
+When you’re building a transformation, the fastest way to debug is to print intermediate values without restructuring your code.
 
+`println(x)` prints a readable representation **and returns `x`**, so you can insert it into an expression pipeline.
 
-### error
-`message:Str? -> Null`
-
-Throws a runtime error.
-
-
-### size
-`value:Any -> Int?`
-
-Returns the size of a collection or a string.
-
-
-### clone
-`value:Any -> Any`
-
-Makes a (deep) clone of a value.
-
-
-### exit
-`_:Null -> Null`
-
-Exits the program.
-
-
-
-## Arrays
-
-### list
-`iterator:(Any -> Any) -> [Any]`
-
-Collects the elements generated by an iterator into an array.
-
-
-### slice
-
-`array:[Any] -> s:Int -> e:Int -> [Any]`
-
-Slices an array between two indexes.
-
-
-### push
-
-`array:[Any] -> value:Any -> [Any]`
-
-Adds a value to the end of an array. See a use example [here](basics.md#pseudo-while-loops).
-
-
-### pop
-
-`array:[Any] -> Any`
-
-Pops the last value from the array.
-
-
-### shift
-
-`array:[Any] -> value:Any -> [Any]`
-
-Inserts a value at the front of an array.
-
-
-### unshift
-
-`array:[Any] -> Any`
-
-Pops the first value from the array.
-
-
-
-## Objects
-
-### delete
-`obj:{} -> prop:Str -> {}`
-
-Deletes a property from an object.
-
-### keys
-`obj:{} -> (Null -> Str?)`
-
-Returns an iterator over an object's keys.
-
-
-### values
-`obj:{} -> (Null -> Any?)`
-
-Returns an iterator over an object's values.
-
-
-### exists
-
-`obj:{} -> key:Str -> Bool`
-
-Checks whether a key exists.
-
-
-### get
-
-`obj:{} -> key:Str -> Any`
-
-Returns a property.
-
-
-### set
-
-`obj:{} -> key:Str -> value:Any -> Any`
-
-Set a property to a given value.
-
-
-### dir
-`obj:{} -> [Str]`
-
-Returns a list of keys for a given object.
-
-### dirFun
-`obj:{} -> [Str]`
-
-Return the methods of an object.
-
-
-## Iterators
-
-### iter
-`value:Any -> Any`
-
-Creates an iterator function from the value.
-
-
-### natural0
-`_:Null -> (Null -> Int?)`
-
-The positive integers.
-
-
-### natural
-`_:Null -> (Null -> Int?)`
-
-The natural numbers.
-
-
-### range
-`start:Int -> stop:Int? -> (Null -> Int?)`
-
-Returns an iterator for the integers from a given starting number until an ending number.
-
-
-### reduce
-`f:(Any -> Any -> Any) -> iterator:(Null -> Any) -> Any`
-
-Reduces an iterator using a binary function.
-
-Example: calculate the sum from 1 to 100.
-```
-let sum = fun(n, m) do n+m end
-reduce(sum, range(1, 101))
-```
-
-### filter
-`cond:(Any -> Bool) -> iterator:(Null -> Any) -> (Null -> Any)`
-
-Filters an iterator using a condition.
-
-Example: print the first 10 even numbers.
-```
-for k in filter(fun(n: Int) -> Bool do (n % 2 == 0) end, natural()) do
-    if k<10 do
-        println(k)
+```mindscript
+let s = readAll(STDIN)
+if s == null then
+    s
+else
+    let x = jsonRepair(s)
+    if x == null then
+        x
     else
-        break(k)
+        println(x)    # inspect, then keep going
+        x
     end
 end
 ```
 
-### map
-`f:(Any -> Any) -> iterator:(Null -> Any) -> (Null -> Any)`
+When you need a guaranteed representation (for logs, snapshots, or error reports), use formatting explicitly:
 
-Applies a function to an iterator.
+* `formatValue(x)` produces a stable formatted string for any value.
+* `str(x)` converts only “data values” (`null/bool/numbers/strings/arrays/maps`) to a string, returning `null` for opaque runtime objects (handles, types, functions).
 
-Example: print the first 10 even numbers.
+A common pattern for human-facing error messages:
+
+```mindscript
+let x = jsonParse(input)
+if x == null then
+    println("bad input: " + (noteGet(x) or "<no details>"))
+    null
+else
+    x
+end
 ```
-for k in map(fun(n: Int) -> Int do 2*n end, natural()) do
-    if k<10 do
-        println(k)
+
+---
+
+## Working with arrays and objects
+
+Most scripts transform JSON-like structures:
+
+* arrays: `[ {...}, {...} ]`
+* objects: `{ user: {...}, items: [...] }`
+
+### Arrays: indexing, mutation, copying
+
+Arrays are mutable. Indexing supports negatives (`xs[-1]` is the last element). If you need to avoid shared mutation, deep-copy with `clone`.
+
+```mindscript
+let xs = [1, 2, 3]
+push(xs, 4)      # [1, 2, 3, 4]
+pop(xs)          # 4
+xs[-1]           # 3
+
+let ys = clone(xs)
+ys[0] = 999
+xs[0]            # still 1
+```
+
+`len(xs)` gives the element count.
+
+### Objects: property access, computed keys, safe edits
+
+Objects are ordered maps. Use dot access when the key is a normal identifier, and computed access when it isn’t (or when the key is a runtime value).
+
+```mindscript
+let user = {name: "Ada", "x-coordinate": 10}
+
+user.name                 # "Ada"
+user."x-coordinate"       # 10
+
+let k = "name"
+user.(k)                  # "Ada"
+```
+
+Accessing an unknown property is a hard failure. If missing keys are normal in your data, check first:
+
+```mindscript
+let stripDebug = fun(obj: {}) -> {} do
+    if mapHas(obj, "debug") then
+        mapDelete(obj, "debug")   # in-place
+    end
+    obj
+end
+```
+
+---
+
+## Iteration: arrays, objects, and iterator functions
+
+`for` loops can iterate over:
+
+* an array (yields elements),
+* an object (yields `[key, value]` pairs),
+* an iterator function of type `Null -> Any?` (returns next item or `null` to stop).
+
+The prelude builds on this with `iter`, `range`, `map`, `filter`, `reduce`, and `list`, which lets you write “pipeline-style” data processing without inventing custom loop patterns every time.
+
+### Turning values into iterators
+
+`iter(v)` returns an iterator function:
+
+```mindscript
+let it1 = iter([10, 20, 30])
+it1()   # 10
+it1()   # 20
+
+let it2 = iter({a: 1, b: 2})
+it2()   # ["a", 1]
+it2()   # ["b", 2]
+```
+
+### A small pipeline example
+
+```mindscript
+let clean = fun(s: Str) -> Str do strip(toLower(s)) end
+let nonEmpty = fun(s: Str) -> Bool do s != "" end
+
+let out = list(
+    filter(nonEmpty,
+        map(clean, iter(["  Ada  ", "", "  BOB "]))
+    )
+)
+
+out   # ["ada", "bob"]
+```
+
+### Counting with `range`
+
+`range(start, stop)` is stop-exclusive; use `null` for an open-ended range.
+
+```mindscript
+for i in range(0, 3) do
+    println(i)
+end
+```
+
+---
+
+## Strings and regular expressions
+
+Most boundary work is text cleanup: trimming, splitting, normalizing, and light pattern replacement.
+
+Strings are treated as Unicode text for operations like `len` and `substr` (they use rune indices, not bytes).
+
+```mindscript
+let s = "  Hello   World \n"
+strip(s)                    # "Hello   World"
+replace("\\s+", " ", strip(s))   # "Hello World"
+```
+
+For delimited text:
+
+```mindscript
+let parts = split("a,b,c", ",")     # ["a", "b", "c"]
+join(parts, "|")                   # "a|b|c"
+```
+
+Regex matching returns a list of matched substrings (non-overlapping matches). Replacement substitutes matches (no capture-group backrefs).
+
+---
+
+## JSON: strict parsing, permissive parsing, and printing
+
+JSON is the default interchange format, so the standard library gives you both:
+
+* strict parsing for clean inputs, and
+* a permissive “repair” path for real-world messy inputs.
+
+```mindscript
+let x = jsonParse(input)
+if x == null then
+    x = jsonRepair(input)
+end
+x
+```
+
+To print JSON, use `jsonStringify(x)`. It returns `null` if `x` contains non-JSON kinds (functions, handles, types, modules).
+
+A canonical stdin → stdout JSON transformer looks like this:
+
+```mindscript
+let s = readAll(STDIN)
+if s == null then
+    s
+else
+    let x = jsonRepair(s)
+    if x == null then
+        x
     else
-        break(k)
+        x.processedAt = nowMillis()
+        jsonStringify(x)
     end
 end
 ```
 
-
-
-## Mathematical functions
-
-### PI
-`3.14159265359`
-
-The number pi (π).
-
-
-### E
-`2.7182818284`
-
-Euler's number
-
-
-### sin
-`value:Num -> Num`
-
-Sine function
-
-
-### cos
-`value:Num -> Num`
-
-Cosine function
-
-
-### tan
-`value:Num -> Num`
-
-Tangent function
-
-
-### sqrt
-`value:Num -> Num`
-
-Square-root function
-
-
-### log
-`value:Num -> Num?`
-
-Logarithm function
-
-
-### exp
-`value:Num -> Num?`
-
-Exponential function
-
-
-### pow
-`base:Num -> exp:Num -> Num`
-
-Power function
-
-### random
-`_:Null -> Num`
-
-Returns a uniform random variate in [0, 1).
-
-
-## String functions
-
-### substr
-`string:Str -> s:Int -> e:Int -> Str`
-
-Substring function
-
-
-### toLower
-`string:Str -> Str`
-
-Converts a string to lowercase.
-
-
-### toUpper
-`string:Str -> Str`
-
-Converts a string to uppercase.
-
-
-### strip
-`string:Str -> Str`
-
-Removes leading and trailing whitespace.
-
-
-### lstrip
-`string:Str -> Str`
-
-Removes leading whitespace.
-
-
-### rstrip
-`string:Str -> Str`
-
-Removes trailing whitespace.
-
-
-### split
-`string:Str -> separator:Str -> [Str]`
-
-Splits a string into a list of string using a separator.
-
-
-### join
-`strings:[Str] -> separator:Str -> Str`
-
-Joins strings into a single string using a separator.
-
-
-### match
-`pattern:Str -> string:Str -> [Str]`
-
-Searches for a regex pattern within a string and returns a list of matches.
-
-
-### replace
-`pattern:Str -> replace:Str -> string:Str -> Str`
-
-Substitutes a regex pattern with a replacement within a string.
-
-
-## Module importing
-
-### codeImport
-`code:Str -> name:Str -> {}`
-
-Imports code as a module.
-
-
-### import
-`filename:Str -> {}`
-
-Imports a file at a given path as a module.
-
-### netImport
-
-`url:Str -> {}`
-
-Import a remote module.
-
-
-
-## Networking
-
-
-### www
-`url:Str -> Str?`
-
-Retrieve a web page.
-
-### http
-`params:HTTPParams? -> method:Str? -> url:Str -> {}`
-
-Makes an HTTP request. The parameter `HTTPParams` is an object defined
-as
+---
+
+## Schemas at boundaries
+
+In MindScript, types are runtime values (`Type`) used mainly as **schemas**: validate incoming data before you index it, and validate outgoing data before you ship it.
+
+```mindscript
+let User = type { id!: Str, name!: Str, email: Str? }
+
+let x = jsonRepair(input)
+if x == null then
+    x
+elif not isType(x, User) then
+    null  # <not a User>
+else
+    x.name
+end
 ```
-type {
-    mode: Str?,
-    cache: Str?,
-    credentials: Str?,
-    headers: {}?,
-    redirect: Str?,
-    referrerPolicy: Str?,
-    body: {}
-}
+
+When you need to understand an unfamiliar value, start with `typeOf(x)`.
+
+---
+
+## Files, streams, and OS basics
+
+Scripts often read stdin, write stdout, and touch the filesystem. MindScript uses handles (`STDIN`, `STDOUT`, `STDERR`, file handles, network handles) so the same I/O functions work across domains.
+
+### A line-based filter
+
+`readLine(h)` returns a line (without the newline) or `null` at EOF.
+
+```mindscript
+while true do
+    let line = readLine(STDIN)
+    if line == null then
+        break(null)
+    end
+
+    line = strip(line)
+    if line != "" then
+        write(STDOUT, line + "\n")
+    end
+end
+
+flush(STDOUT)
 ```
-where `mode` is an HTTP verb (`header`, `get`, `post`, `update`, or `delete`),
-`cache`...
 
+`write(...)` is buffered; call `flush(...)` when you need output to appear immediately.
 
+### Whole-file convenience
 
-## Time
+For small scripts, whole-file helpers keep code short:
 
-### tsNow
-`_:Null -> Int`
+```mindscript
+let cfg = readFile("config.json")
+if cfg == null then
+    cfg
+else
+    jsonRepair(cfg)
+end
+```
 
-Returns the current timestamp in milliseconds.
+There are also basic OS utilities (stat/mkdir/rename/remove/cwd/chdir, env get/set, tempDir) for glue work.
 
+---
 
-### dateNow
-`_:Null -> {}`
+## HTTP and TCP networking
 
-Returns a the current date.
+For typical API calls, use `http(...)`, which returns a response object (status, headers, body). For large downloads, use `httpStream(...)`, which gives you a readable handle `bodyH`.
 
+### GET JSON → transform
 
-## Casting & type checking
+```mindscript
+let r = http({url: "https://api.example.com/items"})
+if r == null then
+    r
+else
+    jsonRepair(r.body)
+end
+```
 
+### Streaming download skeleton
 
-### str
-`value:Any -> Str`
+```mindscript
+let r = httpStream({url: url})
+if r == null then
+    r
+else
+    let out = open("download.bin", "w")
+    if out == null then
+        out
+    else
+        while true do
+            let chunk = readN(r.bodyH, 64_000)
+            if chunk == null then break(null) end
+            if len(chunk) == 0 then break(null) end
+            write(out, chunk)
+        end
+        close(r.bodyH)
+        close(out)
+    end
+end
+```
 
-Converts a value into a string.
+TCP primitives (`netConnect/netListen/netAccept`) exist for cases where you need raw connections; they integrate with the same read/write functions.
 
+---
 
-### bool
-`value:Any -> Bool?`
+## Running external commands
 
-Converts a value into a boolean.
+Sometimes the right tool already exists. `exec([cmd...], opts?)` runs a process without relying on shell quoting and returns `{status, stdout, stderr}` (non-zero `status` is not an error by itself).
 
+```mindscript
+let r = exec(["git", "rev-parse", "HEAD"], {cwd: pathDir(runtime.path)})
+if r == null then
+    r
+elif r.status != 0 then
+    null  # <git failed>
+else
+    strip(r.stdout)
+end
+```
 
-### int
-`value:Any -> Int?`
+---
 
-Converts a value into an integer.
+## Time: timestamps, parsing, retry loops
 
+Time utilities are for timestamps, RFC3339 formatting/parsing, and retries.
 
-### num
-`value:Any -> Num?`
+```mindscript
+let attempt = 0
+let r = null
 
-Converts a value into a string.
+while attempt < 5 and r == null do
+    r = http({url: url, timeoutMs: 5000})
+    attempt = attempt + 1
+    if r == null then
+        sleep(200 * (attempt * attempt))
+    end
+end
 
+r
+```
 
-### typeOf
-`value:Any -> Type`
+`dateNow()` returns local time fields. `timeFormatRFC3339(millis)` formats UTC.
 
-Returns the type of the value.
+---
 
+## Bytes in `Str`: encoding, URLs, crypto, compression
 
-### isType
-`value:Any -> ttype:Type -> Bool`
+Several APIs treat `Str` as a byte container (HTTP bodies, gzip, crypto). Use encoding helpers to render bytes safely and move them through text channels.
 
-Checks whether a value conforms to a given type.
+```mindscript
+let b = randBytes(32)
+if b == null then
+    b
+else
+    base64Encode(b)
+end
+```
 
+URL helpers let you parse and modify queries structurally:
 
-### isSubtype
-`subtype:Type -> supertype:Type -> Bool`
+```mindscript
+let u = urlParse("https://example.com/search?q=ada")
+if u == null then
+    u
+else
+    u.query.q = ["ada", "lovelace"]
+    urlBuild(u)
+end
+```
 
-Checks whether a type is a subtype of another type.
+Crypto primitives (sha256, hmacSha256, ctEqual) and gzip helpers exist for common integration needs (integrity checks, signatures, payload compression).
 
+---
 
+## Modules: organizing real scripts
 
-## Schemas and grammars
+As soon as a script grows beyond a single file, use modules. Imports are extensionless:
 
-### schema
-`value:Type -> Str`
+```mindscript
+let testing = import("testing")
+let llm = import("llm")
+```
 
-Returns the JSON schema of a type.
+For tooling and tests, `importCode(name, src)` loads a module from a string.
 
-### bnf
-`value:Type -> Str`
+---
 
-Returns the BNF grammar of a type.
+## Advanced tools (not day one)
 
+MindScript also ships with powerful capabilities that are best learned after you’re comfortable with data + boundaries:
 
+* concurrency (procs, channels, actors),
+* AST tooling (`astParse`, `astValidate`, `reflect`, `reify`),
+* FFI (`ffiOpen`) where supported.
 
-
-## Annotations
-
-### setNote
-`value:Any -> annotation:Str? -> Any`
-
-Annotates a value.
-
-
-### getNote
-`value:Any -> Str?`
-
-Get a value's annotation.
-
-
-
-## Miscelleanous
-
-### bindMethod
-`value:Any -> func:(Any -> Any) -> Any -> Any `
-
-Binds a function to a value as a method.
-
-
-### uid
-`value:Any -> Int`
-
-Returns the unique value identifier.
-
-### mute
-`_:Any -> Null`
-
-Return null given any input.
-
-
-### dump
-`_:Null -> Null`
-
-Prints the current environment and its parents.
-
-
-### getEnv
-`_:Null -> {}`
-
-Returns the current environment.
+They exist for advanced workflows, but most scripts never need them.
 
 === END FILE: ./docs/manual/docs/learn/stdlib.md ===
+
+=== BEGIN FILE: ./docs/manual/docs/learn/testing.md ===
+# Testing
+
+MindScript scripts often start life as one-off utilities. The moment a script becomes part of a data pipeline, a CI job, or a production integration, you need a way to prevent “small refactors” from silently changing behavior. MindScript’s testing story is designed around that reality: tests are ordinary MindScript code, they run under the same runtime type checks as everything else, and failures produce readable diagnostics that point back to the source location.
+
+The `msg` runtime ships with a test runner (`msg test`) and a standard module named `testing`. The `testing` module provides a registry for tests and a small set of assertion helpers. The runner discovers test files, loads them, executes the registered tests, prints a compact report, and exits non-zero when any test fails. That last property is the whole point: it makes tests composable with CI and shell automation.
+
+This chapter shows how to write tests that are readable, deterministic, and useful when they fail, including strategies for code that calls oracles.
+
+---
+
+## The basic model: tests are registered functions
+
+A MindScript test is a function of type `Null -> Any`. You register tests by importing `testing` and calling `testing.test(name, fn)`. The runner will load your test files and execute these registered functions.
+
+Create a file named `math_test.ms`:
+
+```mindscript
+let testing = import("testing")
+
+let add = fun(a: Int, b: Int) -> Int do
+    a + b
+end
+
+testing.test("add adds integers", fun() do
+    testing.assertEq(5, add(2, 3))
+end)
+```
+
+Run tests from the current directory:
+
+```bash
+msg test
+```
+
+The runner discovers files whose names end in `_test.ms` under the path you pass to `msg test` (default is the current directory). Each discovered test file is loaded, it registers tests with `testing.test(...)`, and then the runner executes the registry.
+
+This “register then run” design is intentional. It keeps tests declarative and makes it easy for the runner to support different execution strategies later (sequential, parallel, with per-test timeouts). It also keeps the model close to what many engineers already know from Go, Jest/Mocha-style registration, and Python’s collection mechanisms.
+
+---
+
+## Assertions and how failures behave
+
+Assertions are the workhorse of tests. MindScript’s `testing` module follows a simple rule: an assertion either returns normally (the test continues), or it panics with a readable message (the test fails). The runner catches these panics, reports them as failures, and continues running other tests unless the process itself is fatally compromised.
+
+Here is the most common assertion pair:
+
+```mindscript
+testing.assert(ok: Bool, msg: Str?)
+testing.assertEq(want: Any, got: Any)
+```
+
+Use `assertEq` for structural equality across numbers, strings, arrays, and objects:
+
+```mindscript
+let testing = import("testing")
+
+testing.test("deep equality works for JSON-shaped data", fun() do
+    let got = {a: 1, b: [2, 3], c: {d: "x"}}
+    let want = {a: 1, b: [2, 3], c: {d: "x"}}
+    testing.assertEq(want, got)
+end)
+```
+
+When `assertEq` fails, it prints both values using a stable representation, which matters because you want diffs to be meaningful and reproducible. This is especially valuable for nested objects where “expected vs actual” needs to be obvious at a glance.
+
+MindScript also supports type-oriented assertions:
+
+```mindscript
+testing.assertType(v: Any, T: Type)
+```
+
+This is most useful at boundaries, such as JSON parsing and oracle outputs, where “shape” is the core contract:
+
+```mindscript
+let testing = import("testing")
+
+let User = type { id!: Str, name!: Str, email: Str? }
+
+testing.test("parsed user conforms to schema", fun() do
+    let x = jsonParse("{\"id\":\"u1\",\"name\":\"Ada\"}")
+    testing.assert(x != null, "jsonParse failed: " + (noteGet(x) or "<no details>"))
+    testing.assertType(x, User)
+end)
+```
+
+If you need to verify that code fails (panics) when misused, use `assertThrows`. It runs a function and expects a panic; optionally it checks that the first line of the error contains a substring.
+
+```mindscript
+let testing = import("testing")
+
+testing.test("indexing a non-object panics", fun() do
+    testing.assertThrows(fun() do
+        let x = 123
+        x["field"]
+    end, "index")
+end)
+```
+
+This style is preferable to “catching errors yourself” because it tests the observable behavior of the runtime contract. In MindScript, contract violations should be loud, and `assertThrows` lets you encode that expectation precisely.
+
+---
+
+## Table-driven tests with `cases`
+
+Many functions are best tested by running the same logic over a list of inputs. The `testing.cases(name, xs, fn)` helper is designed for this. It generates a family of tests named `name/0`, `name/1`, and so on, which makes failures easy to locate without manually naming each case.
+
+Here is a realistic example: a port parser that returns `Int?` and annotates failure reasons.
+
+```mindscript
+let testing = import("testing")
+
+let parsePort = fun(s: Str) -> Int? do
+    let n = int(s)
+    if n == null then
+        null  # <invalid port>
+    elif n < 1 or n > 65535 then
+        null  # <port out of range>
+    else
+        n
+    end
+end
+
+testing.cases("parsePort", [
+    ["80", 80, null],
+    ["0", null, "<port out of range>"],
+    ["70000", null, "<port out of range>"],
+    ["eighty", null, "<invalid port>"],
+], fun(case) do
+    let input = case[0]
+    let want = case[1]
+    let wantNote = case[2]
+
+    let got = parsePort(input)
+
+    testing.assertEq(want, got)
+
+    if want == null then
+        testing.assertEq(wantNote, noteGet(got))
+    end
+end)
+```
+
+This test does two things that are worth calling out. It verifies the returned value and it verifies the error message contract (the annotation on `null`). In MindScript, annotated `null` is an API surface. If you intend callers to branch on reasons, that reason should be stable enough to test.
+
+---
+
+## Snapshot tests for large structured output
+
+When the output is large—pretty-printed objects, normalized JSON, formatted code, generated schemas—asserting equality inline is unpleasant and fragile. Snapshot tests solve this by storing an “expected output” in a file and comparing the current result to that stored value.
+
+The `testing` module provides:
+
+```mindscript
+snapshot(path: Str, value: Any, update?: Bool)
+snapshotUpdate(path: Str, value: Any)
+```
+
+A snapshot test reads the snapshot file, compares it to a stable representation of `value`, and fails if they differ. The stable representation is designed to be deterministic and diff-friendly.
+
+Here is a snapshot test for a normalization function:
+
+```mindscript
+let testing = import("testing")
+
+let normalizeUser = fun(u: {}) -> {} do
+    if mapHas(u, "name") and u.name != null then if true then
+        u.name = strip(toLower(u.name))
+    end end
+    u
+end
+
+testing.test("normalizeUser snapshot", fun() do
+    let input = {name: "  ADA  ", extra: [1, 2, 3]}
+    let out = normalizeUser(clone(input))
+
+    testing.snapshot("testdata/normalizeUser.snap", out)
+end)
+```
+
+The snapshot file lives alongside the test data (`testdata/` is a common convention because it keeps fixtures organized and makes repository layout predictable).
+
+When you intentionally change behavior, update the snapshot. One disciplined workflow is to keep snapshot updates explicit so you never accidentally accept changes:
+
+```mindscript
+let testing = import("testing")
+
+testing.test("normalizeUser snapshot update (manual)", fun() do
+    let out = normalizeUser({name: "  ADA  ", extra: [1, 2, 3]})
+    testing.snapshotUpdate("testdata/normalizeUser.snap", out)
+end)
+```
+
+You would run this test locally only when you want to refresh the golden file, then revert the update test or keep it commented out, depending on your project style. The important idea is that snapshot updates should be deliberate, because snapshots encode behavior.
+
+---
+
+## Running tests with `msg test`
+
+The test runner is invoked through `msg test`. With no arguments it runs tests under the current directory. If you pass a path, it uses that path as a prefix for discovery.
+
+```bash
+msg test
+msg test .
+msg test src
+```
+
+The runner prints progress and a summary. When any test fails, `msg test` exits with a non-zero status code so CI can fail fast.
+
+Two flags change how execution happens.
+
+Verbose mode (`-v`) prints each test name and its result, which is useful when diagnosing hangs or ordering-sensitive issues:
+
+```bash
+msg test . -v
+```
+
+Parallel mode (`-p`) executes tests concurrently:
+
+```bash
+msg test . -p
+```
+
+Parallel mode is valuable when tests involve I/O, network calls (preferably mocked or stubbed), or oracle calls that spend time waiting. It also raises the standard concurrency question: are your tests isolated? If two tests mutate global state, write the same snapshot file, or share a resource without coordination, parallel execution can produce flaky outcomes. The simplest discipline is to make each test self-contained and avoid shared mutable state. When that is not possible, keep those tests sequential or isolate state per test.
+
+The timeout flag (`-t`) sets a per-test timeout in milliseconds:
+
+```bash
+msg test . -t 5000
+```
+
+A timeout is not a correctness mechanism; it is a guardrail. It protects you against tests that hang due to deadlocks, unbounded retries, or a stalled external dependency. When a test times out, the runner reports a timeout failure and continues with the rest.
+
+---
+
+## Determinism, randomness, and reproducibility
+
+Good tests are reproducible. MindScript makes deterministic code easy, but scripts often involve randomness or time. The testing module provides `testing.seed(n)` to seed randomness used by test helpers (and you can also use `seedRand` from the standard library). If you use randomness in tests, seed it at the beginning of the test so failures can be replayed.
+
+```mindscript
+let testing = import("testing")
+
+testing.test("randomized input is reproducible with a seed", fun() do
+    testing.seed(12345)
+
+    let xs = []
+    for _ in range(0, 5) do
+        push(xs, randInt(10))
+    end
+
+    testing.assertEq([6, 3, 3, 0, 5], xs)
+end)
+```
+
+The exact sequence depends on the RNG implementation, so snapshotting or hardcoding sequences is only appropriate if you intend to lock it down. A more robust pattern is to test invariants (“all values are between 0 and 9”, “no duplicates after dedupe”, “sorted output is nondecreasing”) while still seeding for repeatability when debugging.
+
+---
+
+## Testing code that uses oracles
+
+Oracles introduce nondeterminism. A testing strategy must either control that nondeterminism or avoid it.
+
+The first line of defense is schema discipline. If an oracle returns a narrow structured type, then a large portion of “randomness” becomes irrelevant because the output must conform to a shape. Tests can then assert type conformance and validate deterministic post-processing:
+
+```mindscript
+let testing = import("testing")
+
+let Label = type { label!: Str, confidence: Num? }
+
+# Classify a short message.
+let classify = oracle(text: Str) -> Label
+
+let normalizeLabel = fun(x: Label) -> Label do
+    x.label = strip(toLower(x.label))
+    x
+end
+
+testing.test("oracle output conforms and normalization is deterministic", fun() do
+    let r = classify("Shipping was delayed by weather.")
+    testing.assert(r != null, "oracle failed: " + (noteGet(r) or "<no details>"))
+    testing.assertType(r, Label)
+
+    let n = normalizeLabel(r)
+    testing.assert(n.label == toLower(n.label), "label was not normalized")
+end)
+```
+
+When you need full determinism, treat the oracle as an interface and stub it. Since oracles are values, you can assign a non-oracle function with the same call shape in tests and exercise the rest of your pipeline deterministically:
+
+```mindscript
+let testing = import("testing")
+
+let Label = type { label!: Str, confidence: Num? }
+
+let normalizeLabel = fun(x: Label) -> Label do
+    x.label = strip(toLower(x.label))
+    x
+end
+
+testing.test("pipeline can be tested with a stubbed oracle", fun() do
+    let classify = fun(text: Str) -> Label do
+        {label: "Delay", confidence: 0.9}
+    end
+
+    let out = normalizeLabel(classify("anything"))
+    testing.assertEq("delay", out.label)
+end)
+```
+
+This approach is technically justified because it tests the deterministic part of your program—your control flow, data transformations, and boundary checks—without relying on an external service. It also keeps your test suite fast and stable.
+
+If you do want end-to-end oracle tests, keep them clearly separated (for example in a different directory or with naming conventions) and expect them to be slower and potentially flaky. In CI, you can gate them on environment availability, but the core project health should not depend on a third-party API being reachable.
+
+---
+
+## Summary
+
+Testing in MindScript is built around the idea that tests are ordinary functions registered in `_test.ms` files and executed by `msg test`. Assertions fail by panicking; the runner catches those failures and reports them with readable diagnostics. `cases` makes table-driven testing ergonomic, snapshots make large structured outputs testable, and timeouts/parallel execution make large suites practical. For oracle-based code, schema constraints and deterministic post-processing reduce nondeterminism, and stubbing is the reliable way to keep tests reproducible.
+
+=== END FILE: ./docs/manual/docs/learn/testing.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/values.md ===
 <style>

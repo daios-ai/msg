@@ -1,6 +1,6 @@
 # The `msg` Runtime
 
-When you install MindScript you get a small command-line program called `msg`. It reads MindScript `.ms` files, parses them, evaluates them, and prints results. It also gives you a REPL for interactive work, a formatter so everyone’s code has the same shape, and a test runner for projects.
+When you install MindScript you get a small command-line program called `msg`. It reads MindScript `.ms` files, parses them, evaluates them, and prints results. It also gives you a REPL for interactive work, a standard code formatter, and a test runner for.
 
 This chapter is a tour of `msg` itself, so that you know what commands exist, what they do, and what a normal workflow looks like.
 
@@ -14,7 +14,7 @@ When you forget a command, ask `msg`:
 msg help
 ```
 
-The help output is the contract. It shows the version banner, then the subcommands and their usage:
+This command prints a message listing all the commands:
 
 * `run` runs a file
 * `repl` starts an interactive prompt
@@ -22,7 +22,7 @@ The help output is the contract. It shows the version banner, then the subcomman
 * `test` runs tests
 * `version` prints the version string
 
-You may see `get` listed too; it exists, but it is not implemented yet.
+You may see `get` listed too, but this is not implemented yet.
 
 ---
 

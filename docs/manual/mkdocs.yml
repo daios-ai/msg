@@ -67,6 +67,12 @@ nav:
     - learn/errors.md
     - learn/functions.md
     - learn/oracles.md
+    - learn/io.md
+    - learn/concurrency.md
+    - learn/networking.md
+    - learn/testing.md
+    - learn/metaprogramming.md
+    - learn/ffi.md
     - learn/stdlib.md
   - Examples: examples.md
 

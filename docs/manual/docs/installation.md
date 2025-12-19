@@ -1,20 +1,20 @@
 # Installation 
 
-This page covers installing the `msg` MindScript runtime, upgrading/rolling back, uninstalling, and setting up oracle backends (LLM providers).
+This page covers installing `msg`, the state of the art MindScript runtime. It also explains upgrading/rolling back, uninstalling, and setting up oracle backends (LLM providers).
 
-MindScript is split into:
+The `msg` installation ships with:
 
-* **The language** (your `.ms` scripts)
-* **The runtime** (**`msg`**, which runs scripts and provides built-ins + the bundled standard library)
-* **Oracle backends** (optional, but necessary for **oracles**)
+* **A command-line tool** `msg` which runs scripts and performs other actions,
+* **A standard library** providing built-ins and standard modules.
 
-Installing MindScript gives you the interpreter and standard library; installing a backend gives you an LLM to execute oracle calls.
+In addition, in order to execute oracles, you need to provide an **LLM backend**.
+
 
 ---
 
 ## Requirements
 
-* **Linux** or **macOS**
+* **Linux**, **macOS**, or **Raspberry Pi OS**
 * An LLM backend is **only required** if you run scripts that call **oracles**.
 * Windows builds are not provided in the current release pipeline.
 
@@ -35,7 +35,7 @@ And then either open a new terminal or run the shell startup file
 source ~/.bashrc    # or ~/.zshrc, etc.
 ```
 
-What you get:
+With this intallation you get:
 
 * A self-contained installation in `~/.mindscript`
 * `msg` (runtime) at `~/.mindscript/bin/msg`
@@ -50,7 +50,7 @@ The installer adds `~/.mindscript/bin` to your shell startup file. Check that `m
 msg
 ```
 This should print something like:
-```
+```text
 MindScript 0.1.4 (built 2025-12-16T13:12:08Z)
 
 Usage:
@@ -65,32 +65,32 @@ Usage:
 Run a bundled example:
 
 ```bash
-msg run examples/hello.ms
+msg run ~/.mindscript/examples/hello.ms
 ```
 
 If these work, the runtime and bundle discovery are correct. 
 
 ### Upgrade to the latest release
 
-Running the installer again is the normal way to upgrade.
+To upgrade, just run the installer again:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DAIOS-AI/msg/main/install.sh | bash
 ```
 
 ### Install a specific version
 
-Pin a version or roll back:
+Run the installer with the environment variable `VERSION` set to the desired version
 
 ```bash
 VERSION=vX.Y.Z bash -c "$(curl -fsSL https://raw.githubusercontent.com/DAIOS-AI/msg/main/install.sh)"
 ```
 
-Use tags like `v0.4.1`.
+replacing `vX.Y.Z` with version tags such like `v0.4.1`. 
 
 
 ### Offline / air-gapped install
 
-If you can’t download during install time, install from already-downloaded artifacts.
+You can also install from a local, already-downloaded `msg` distribution.
 
 Put these files in the same directory:
 
@@ -108,13 +108,13 @@ This allows making installs reproducible, and it's friendly to locked-down machi
 
 ### Uninstall
 
-Uninstall removes the installation directory and cleans up the `PATH` entries the installer added:
+To uninstall, run the `uninstall.sh` script provided with the `msg` distribution. 
 
 ```bash
 ~/.mindscript/uninstall.sh
 ```
 
-If you installed from a repo checkout, `./uninstall.sh` performs the same cleanup.
+This removes the installation directory and cleans up the `PATH` entries the installer added:
 
 ---
 
@@ -196,7 +196,7 @@ llm.useModel("llama3.2:3b")  # example model name
 ```
 
 or any other backend or model. You can check which backends and models are available using the `llm.backends` and `llm.models` functions.
-```mindscript
+```mindscript-repl
 ==> llm.backends()
 ["ollama", "openai", "openai-responses", "anthropic", "cohere"]
 
@@ -243,7 +243,7 @@ This is useful when you’re not sure what’s “wrong”:
 
 To inspect the currently selected backend and its configuration:
 
-```mindscript
+```mindscript-repl
 ==> llm.status()
 {backend: "ollama", model: "qwen2.5:1.5b", authed: true, options: {}}
 
@@ -260,7 +260,7 @@ To inspect the currently selected backend and its configuration:
 
 The standard library includes a minimal real oracle ping:
 
-```mindscript
+```mindscript-repl
 ==> oracleStatus()
 "oracle: installed"
 
@@ -268,10 +268,6 @@ The standard library includes a minimal real oracle ping:
 {ok: true, ms: 12993}
 
 ```
-
-Expected outcomes:
-* Working: `{ok: true, ms: ...}`
-* Not configured: `null` with an error message (missing key, model not set, request failed, etc.)
 
 !!! tip
 

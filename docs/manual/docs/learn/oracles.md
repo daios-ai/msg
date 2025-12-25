@@ -1,147 +1,56 @@
+# Oracles
 
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
-
-# Oracles and Annotations
-
-This chapter covers two features that make MindScript different from typical scripting languages:
-
-1. **Annotations**: `# ...` text attached to values, used for documentation and (especially) for guiding oracles.
-2. **Oracles**: LLM-backed “black box” functions whose inputs/outputs are constrained by runtime-checked type schemas.
+We have finally reached the chapter where we explain the central distinguishing feature of MindScript: **oracles**. Oracles are LLM-backed "black box" functions whose inputs/outputs are constrained by runtime-checked type schemas. Intuitively, calling an oracle is like "asking a friend for an answer", and are thus useful for semantic processing.
 
 An oracle call is still a normal function call in MindScript: it has parameters, a return type, and it produces a value. The difference is that its implementation lives outside the language runtime and is invoked through an oracle backend.
 
----
-
-## Annotations
-
-An annotation is introduced with `#` and attaches to the **value of the next expression**.
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> # The speed of light in meters per second.</span>
-<span class="prompt">... let c = 299792458</span>
-<span class="note">The speed of light in meters per second.</span>
-<span class="value">299792458</span>
-</code></pre>
-</div>
-
-Annotations are metadata:
-
-* They help humans (documentation).
-* They help oracles (prompt instructions).
-* They do **not** change equality, arithmetic, indexing, etc.
-
-Annotations don’t automatically “flow” through computations:
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> # The golden ratio.</span>
-<span class="prompt">... let phi = (1 + sqrt(5)) / 2</span>
-<span class="note">The golden ratio.</span>
-<span class="value">1.618033988749895</span>
-
-<span class="prompt">==> 2 * phi</span> <span class="value">3.23606797749979</span> </code></pre>
-
-</div>
-
-### Programmatic access to annotations
-
-You can read and write annotations using:
-
-* `noteGet(x) -> Str?`
-* `noteSet(text: Str, value) -> Any`
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> let c = 299792458</span>
-<span class="value">299792458</span>
-
-<span class="prompt">==> noteSet("The speed of light in meters per second.", c)</span> <span class="note">The speed of light in meters per second.</span> <span class="value">299792458</span>
-
-<span class="prompt">==> noteGet(c)</span> <span class="value">"The speed of light in meters per second."</span> </code></pre>
-
-</div>
-
-### Multi-line annotations
-
-Consecutive lines that start with `#` form a single multi-line annotation, attached to the following value:
-
-```mindscript
-# Processes a batch of raw sales records:
-#   1. Filters out returned items.
-#   2. Groups the remaining sales by region.
-#   3. Sums revenue per region.
-let processQuarterlySales = fun(records: [Any]) -> {} do
-    ...
-end
-```
 
 ---
 
-## Oracles
+## Oracle Declaration
 
-An **oracle** is declared like a function signature, but without a body:
-
+An oracle is declared like a function signature, but without a body:
+intal
 ```mindscript
 # Write the name of an important researcher in the given field.
 let researcher = oracle(field: Str) -> {name: Str}
 ```
 
-The oracle’s **formal contract** is the declared parameter and return types. The runtime checks:
+The oracle’s *formal contract* is the declared parameter and return types. The runtime checks:
 
 * argument values match the parameter types,
-* the returned value matches the declared return type (with oracle-specific nullability rules described below).
+* the returned value matches the declared return type.
 
-The oracle’s **instruction** comes from the oracle value’s annotation (the `# ...` text attached to it).
+The oracle’s *instruction* comes from the oracle value’s annotation (the `# ...` text attached to it). Because every oracle can fail to produce an output, the runtime automatically expands the return type to a nullable type.
 
-Calling an oracle is just a normal call:
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> researcher("physics")</span>
-<span class="value">{"name": "Albert Einstein"}</span>
-
-<span class="prompt">==> researcher("biology")</span> <span class="value">{"name": "Charles Darwin"}</span> </code></pre>
-
-</div>
-
-### Oracles can fail (nullable return in practice)
-
-Oracles are allowed to “not produce an answer.” Operationally, an oracle return is treated as **nullable** unless the declared return type is `Any`. This is how failures are represented:
-
-* a failure returns `null` with an annotation explaining what went wrong (invalid JSON, type mismatch, backend error, etc.).
-
-This makes it idiomatic to handle failures explicitly:
-
-```mindscript
-let r = researcher("physics")
-if r == null then
-    println("oracle failed: " + noteGet(r))
-    null
-else
-    r.name
-end
+```mindscript-reply
+==> researcher
+# Write the name of an important researcher in the given field.
+<oracle: field:Str -> {name: Str}?>
 ```
 
-(When `r` is `null`, `noteGet(r)` may carry the failure reason.)
+Once declared, calling an oracle is just a normal call:
 
----
+```mindscript-repl
+==> researcher("physics")
+{"name": "Albert Einstein"}
 
-## Using examples
+==> researcher("biology") 
+{"name": "Charles Darwin"}
+```
 
-You can provide example input/output pairs using `from`.
+### Using examples
 
-Examples are most clear when written as:
+Sometimes you want to help the oracle to produce outputs by supplying input/output examples. This is especially useful when the intended function is difficult to describe with an instruction alone. This is done with the keyword `from` followed by an array containing examples.
 
-* **input**: an object mapping parameter names to values
-* **output**: a value matching the oracle return type
+A valid collection of examples is an array containing input-output pairs that must conform to the type constraints. For instance, let's say we want to create an oracle that takes a number as input (`Int`) and outputs that number spelled in English (`Str`), such as `5` and `five`. Then, this is how we could declare an oracle based on a handful of examples:
 
 ```mindscript
 let examples = [
-    [{number: 0}, "zero"],
-    [{number: 1}, "one"],
-    [{number: 2}, "two"],
-    [{number: 3}, "three"]
+    [5, "five"],
+    [5, "ten"],
+    [5, "twenty-one"],
+    [5, "fourty-two"]
 ]
 
 let numberToEnglish = oracle(number: Int) -> Str from examples
@@ -149,12 +58,21 @@ let numberToEnglish = oracle(number: Int) -> Str from examples
 
 Now calls can generalize beyond the examples:
 
-```mindscript
-numberToEnglish(2)    ## "two"
-numberToEnglish(42)   ## e.g. "forty-two"
+```mindscript-repl
+==> numberToEnglish(-5)
+"minus five"
+
+==> numberToEnglish(125)
+"one hundred twenty-five"
+
+==> numberToEnglish(-8)
+"negative eight"
+
+==> numberToEnglish(1024)
+"one thousand twenty-four"
 ```
 
-You can combine an annotation (instruction) with examples:
+Notice that in this case we did not supply an instruction, although we could have. You can combine an annotation (instruction) with examples:
 
 ```mindscript
 # Convert integers to English words.
@@ -163,40 +81,53 @@ let numberToEnglish = oracle(number: Int) -> Str from examples
 
 ---
 
-## How the prompt is constructed
+## Oracle execution details
+
+Let's have a peek under the hood to see how oracles are implemented.
+
+When an oracle is called, MindScript does the following:
+
+* it builds a prompt using all the available hints,
+* it calls a oracle execution callback function,
+* the result gets parsed, type-checked, and returned.
+
+### Prompt construction 
 
 When you call an oracle, MindScript builds a prompt that includes:
 
-* the instruction (the oracle annotation),
-* an **input JSON Schema** derived from parameter names and parameter types,
-* an **output JSON Schema** derived from the return type, **boxed** as:
-
-  * `{"output": T}` where `T` is the oracle’s declared return type (success type),
-* optional examples (normalized as input maps and boxed outputs),
+* a *system prompt*, asking the model to follow the instruction and return a valid JSON object;
+* an **instruction*, which is the oracle's annotation;
+* an *input JSON Schema* derived from parameter names and parameter types;
+* an *output JSON Schema* derived from the return type, **boxed** as `{"output": T}` where `T` is the oracle’s declared return type in case of success;
+* *examples*, normalized (inputs transformed into a map, outputs boxed),
 * the current call’s concrete input values.
 
-The backend hook is:
+### The oracle callback function `__oracle_execute`
+
+The MindScript runtime assumes there is a global callback function
 
 ```mindscript
 __oracle_execute(prompt: Str) -> Str?
 ```
 
-It must return a JSON string. The runtime then parses it, extracts `output`, and type-checks it.
+Which receives the prompt and returns a string. Any function that conforms to this signature can be assigned to it, *but MindScript assumes it is the LLM backend.* The oracle will execute whichever function is bound to the variable `__oracle_execute` within the lexical scope *at declaration time*.
+
+This design allows installing new or multiple LLM backends at runtime.
 
 ### What the model must return
 
-The model output must be valid JSON, without code fences. It may return either:
+The prompt asks the model to output valid JSON, without code fences. This could be either:
 
 * a boxed object: `{"output": <value>}`, or
 * a bare value `<value>` (which MindScript will treat as if it were `{"output": <value>}`).
 
-If parsing fails or the value doesn’t match the declared type, the oracle call returns an **annotated null**.
-
-MindScript also attempts to repair common “JSON-ish” mistakes (fences, trailing commas, single quotes, etc.), but you should still aim for strict JSON.
+If parsing fails or the value doesn’t match the declared type, the oracle call returns an error. MindScript also attempts to repair common “JSON-ish” mistakes (fences, trailing commas, single quotes, etc.), but you should still aim for strict JSON.
 
 ---
 
-## Operating oracles (installing and checking the backend)
+## Backend management
+
+At startup, MindScript installs builtins and loads the standard library `std` from the standard library directory (`~/.mindscript/lib`). The latter in turn imports the module `llm` which implements the backends. 
 
 The standard library exposes a simple workflow:
 

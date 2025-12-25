@@ -1,73 +1,66 @@
 === BEGIN FILE: ./docs/manual/docs/learn/annotations.md ===
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
-
 # Annotations
 
-MindScript uses `#` to write **annotations**.
+In the previous chapters, we've been using annotations (`# ...`) as if they were comments.
 
-An annotation is text that the language preserves and attaches to what follows. Annotations are used for:
+Most programming languages let you add comments to explain your code. Comments help humans understand intent, but they typically do not affect how the program runs. For example, in many languages you'd write comments like this:
+
+```mindscript
+# Computes the first n numbers in the Fibonacci sequence.
+let fibonacci = fun(n: Int) -> [Int] do
+    ...
+    SOME IMPLEMENTATION
+    ...
+end
+```
+
+If the comment and signature are clear, a reader can understand what fibonacci is for without reading the body.
+
+MindScript takes this idea one step further. For some computations, we want to treat the implementation as a black box (an oracle) and rely on surrounding intent and type constraints:
+
+```mindscript
+# Summarize the text as 3 bullet points.
+let summarize = oracle(text: Str) -> [Str]
+```
+
+To support this, MindScript elevates commenting to a first-class language feature called **annotations**. Annotations are preserved by the language and attached to values, so they can be inspected at runtime.
+
+MindScript uses `#` as an annotation marker. It takes the following text and attaches it to a value. It is used for:
 
 * documentation that travels with data,
 * carrying a failure reason on a returned `null`,
-* and (later) providing instructions to oracles.
+* and providing instructions to [oracles](/learn/oracles).
 
-Most of the time, an annotation attaches to a **value**. But you can also write comment-only lines that act like **true comments**: they are kept as standalone notes in the source without attaching to any value.
+Annotations are metadata: they do not change evaluation (they don’t affect equality, arithmetic, indexing, or control flow). It’s fine to read annotations for diagnostics, but deterministic program logic should rely on ordinary values and types rather than annotation text.
 
 ---
 
 ## The attachment rule
 
-MindScript decides whether a `# ...` attaches based on what comes next.
+All annotations start with a `#` followed by a text up to the end of the line, and then attach to the "nearest" value. The rule for attachment is:
 
-### 1) Attached annotations
-
-A `# ...` annotation attaches to the value produced by the **next expression**.
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> # The speed of light in meters per second.</span>
-<span class="prompt">... let c = 299792458</span>
-<span class="note">The speed of light in meters per second.</span>
-<span class="value">299792458</span>
-</code></pre>
-</div>
-
-This is the key mental model: annotations attach to **values**, not to variable names or to lines.
-
-A more explicit example:
+**Trailing-annotations**: If a *single-line* annotation is on the right of an expression, it attaches to the value of that expression. For instance, in
 
 ```mindscript
-# This annotation attaches to the value 1.
+let x = 1  # This attaches to the value 1.
+let y = -1 # This attaches to the value -1.
+```
+
+**Pre-annotation**: Otherwise, it attaches to the value of the expression on the very next line. For instance,
+
+```mindscript
+# This attaches to the value 1.
 let x = 1
 
-# This annotation attaches to the value (x + 1).
+# This attaches to the value (x + 1).
 x + 1
 ```
 
-### 2) Free-floating comments
+While this simple attachment rule was designed trying to mimic what feels natural in a programming language, it has a few special cases worth discussing.
 
-If an annotation line is separated from the next expression by a **blank line**, it does **not** attach to anything. It acts as a free-floating comment.
+### Multi-line blocks
 
-```mindscript
-# This is a standalone comment.
-# It is not attached to any value.
-
-let x = 1
-```
-
-This lets you write ordinary comments for sectioning and narration without accidentally annotating the next value.
-
-### 3) Multi-line blocks
-
-Consecutive lines whose first non-space character is `#` form a single multi-line annotation block. Whether that block attaches depends on the same rule as above:
-
-* If the block is immediately followed by an expression, it attaches to that expression’s value.
-* If there is a blank line after the block, it is free-floating.
-
-Attached block:
+Consecutive lines whose first non-space character is `#` form a single multi-line annotation block. For instance,
 
 ```mindscript
 # Processes raw sales records:
@@ -79,184 +72,103 @@ let process = fun(records: [Any]) -> {} do
 end
 ```
 
-Free-floating block:
+attaches the four-line annotation block to the function assigned to the `process` variable. Because a multi-line block fails the single line condition for trailing annotations they always attach to the next expression.
+
+
+### Free-floating comments
+
+If an annotation block is followed by a *blank line*, it does *not* attach to the next expression. Instead, it attaches to a special *no-op* expression represented by the blank line, so it behaves like a free-floating comment.
 
 ```mindscript
-# --- Data cleaning helpers ---
-# This section is about normalization.
+# This is a standalone comment.
+# It is not attached to any value.
 
-let normalize = fun(s: Str) -> Str do
-    strip(toLower(s))
-end
+let x = 1
 ```
 
----
+This lets you write ordinary comments for sectioning and narration without accidentally annotating the next value.
 
-## Annotations are metadata
+!!! info
+    Technically, a blank line is parsed as a no-op expression whose result is ignored. The formatter prints multiple blank lines as a single blank line because they reduce to the same no-op.
 
-Annotations do not change computation. They do not affect equality, arithmetic, indexing, or control flow.
 
-```mindscript
-# The golden ratio.
-let phi = (1 + sqrt(5)) / 2
+### Annotations inside objects and arrays
 
-phi == phi          # true
-2 * phi             # a number
-noteGet(2 * phi)    # usually null (annotations do not propagate automatically)
-```
-
-Annotations are not automatically “carried through” derived values. You attach notes where you want them.
-
----
-
-## Reading and writing annotations
-
-You can access annotations at runtime:
-
-* `noteGet(x) -> Str?` returns the annotation text, or `null` if none.
-* `noteSet(text: Str, value: Any) -> Any` attaches an annotation and returns the value.
-
-```mindscript
-let c = 299792458
-noteGet(c)  # null
-
-noteSet("The speed of light in meters per second.", c)
-noteGet(c)  # "The speed of light in meters per second."
-```
-
-`noteSet` updates the annotation on the value you pass in.
-
----
-
-## Annotating `null` to explain failure
-
-Many functions in the standard library return `null` to signal failure, and attach a reason as an annotation. You can do the same.
-
-```mindscript
-let parsePort = fun(s: Str) -> Int? do
-    let n = int(s)
-    if n == null then
-        null  # <invalid port>
-    elif n < 1 or n > 65535 then
-        null  # <port out of range>
-    else
-        n
-    end
-end
-```
-
-Then the caller can inspect the reason:
-
-```mindscript
-let p = parsePort("eighty")
-if p == null then
-    println(noteGet(p) or "<no details>")
-end
-```
-
-A related helper from the prelude is:
-
-```mindscript
-error(msg: Str) -> Null
-```
-
-It returns `null` annotated with `msg`, which is convenient when you want a one-line failure result.
-
----
-
-## Annotations inside objects and arrays
-
-Annotations can attach to values inside composites, which is useful for documenting individual fields.
+Annotations can attach to values inside composites, which is useful for documenting individual fields. For instance, we can document the fields of a specific user record:
 
 ```mindscript
 let user = {
     # Unique identifier from the upstream system.
     id: "u_123",
-
     # Display name shown in the UI.
     name: "Ada"
 }
-
-noteGet(user.id)
-noteGet(user.name)
 ```
 
-And inside arrays:
+The same works with annotations inside arrays:
 
 ```mindscript
 let limits = [
-    # Minimum supported value.
-    1,
-
-    # Maximum supported value.
-    10
+    1, # Minimum supported value.
+    10 # Maximum supported value.
 ]
-
-noteGet(limits[0])
-noteGet(limits[1])
 ```
+
+Furthermore, we'll see later that annotations can also be used to annotate fields in type schemas.
+
+!!! warning
+    The formatter may move annotations when it rewrites code. It chooses a canonical placement on a case-to-case basis, so an annotation may end up in a different location than in the original source. In particular, single-line annotations are often formatted as trailing annotations when they fit on the same line.
 
 ---
 
-## Annotating returned values explicitly
+## Annotations are metadata
 
-Sometimes you want to return a `null` with a note from inside a function. Write the annotation on the value you are returning:
+As already mentioned, annotations are metadata attached to values and they do not affect computation, as illustrated in the next code:
+
+```mindscript-repl
+==> # The golden ratio.
+... let phi = (1 + sqrt(5.)) / 2
+1.618033988749895 # the golden ratio.
+
+==> let phiCopy = phi
+1.618033988749895 # the golden ratio.
+
+==> phi == phi
+true
+
+==> 2 * phi
+3.23606797749979
+```
+
+This also shows that annotations are not automatically "carried through" derived values; you have to attach them where you want them. Only assignment preserves annotations.
+
+### Reading and writing annotations
+
+You can read and write annotations at runtime:
+
+* `noteGet(x) -> Str?` returns the annotation text, or `null` if none.
+* `noteSet(text: Str, value: Any) -> Any` attaches an annotation and returns the value.
+
+In the next example we programmatically set and retrieve an annotation:
 
 ```mindscript
-let findUser = fun(id: Str) -> {}? do
-    let u = { }  # pretend lookup
-    if u == null then
-        return (null  # <user not found>)
-    end
-    u
-end
+==> let c = 299_792_458
+299792458
+
+==> noteSet("The speed of light in meters per second.", c)
+299_792_458 # The speed of light in meters per second.
+
+==> noteGet(c)
+"The speed of light in meters per second."
 ```
 
-This style makes it obvious that the note belongs to the returned value.
-
----
-
-## Common surprises
-
-### Blank lines control whether a comment attaches
-
-If you intend a comment to be free-floating, put a blank line after it.
-
-If you intend it to annotate the next value, do not put a blank line in between.
-
-This is the most important practical rule to internalize.
-
-### Dot-chains cannot be interrupted
-
-Property access must be contiguous (`obj.name`). You cannot insert an annotation between `obj` and `.name`. Annotate the full expression instead:
-
-```mindscript
-# User's display name.
-let n = obj.name
-```
-
-### Calls and indexing are whitespace-sensitive
-
-Calls and indexing require no space before `(` or `[`.
-
-* `f(x)` is a call; `f (x)` is not.
-* `arr[i]` is indexing; `arr [i]` is not.
-
-This matters because it changes what the parser considers “the next expression”, which in turn changes what an annotation attaches to. When in doubt, annotate a whole line (or use parentheses) to make intent clear.
-
----
-
-## Recommended style
-
-* Use line-leading `# ...` blocks for documentation.
-* Use short, stable tags when annotating `null` for failure (`<invalid input>`, `<missing key>`, …).
-* Use a blank line after a comment block when you mean it as narration rather than as an annotation.
+These functions should be used with care under limited circumstances such as printing human-readable messages. Avoid using annotation content to drive logic.
 
 ---
 
 ## Summary
 
-* `# ...` attaches to the value of the **next expression** if there is no blank line separating them.
+* Single-line `# ...` annotations on the r.h.s. of an expression attach to its value; otherwise they attach to the value of the next expression if there is no blank line separating them.
 * A `# ...` block followed by a blank line is a standalone comment.
 * Annotations are metadata: they do not change evaluation.
 * Use `noteGet` / `noteSet` to work with annotations programmatically.
@@ -557,175 +469,84 @@ The model is intentionally strict: ordinary arrays and objects are not shared ac
 === END FILE: ./docs/manual/docs/learn/concurrency.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/errors.md ===
-STUB# Errors and Inspection
+# Errors and Panics
 
-MindScript treats errors as **values**.
+MindScript treats errors as **values**. If a function doesn't succeed in performing its operation, for instance, because there was
 
-The idiom is simple:
+* an invalid input;
+* missing data;
+* a network failure;
+* failed authentication;
 
-* When something fails in a normal, expected way (bad input, missing data, invalid JSON, network failure, “can’t parse”), the operation usually produces **`null`**.
-* When something fails, it is common for that `null` to carry a short explanation as an **annotation** (a note attached to the value).
-* When something truly cannot continue (a fatal invariant violation, or a misuse of a built-in’s contract), the program **panics** and stops.
+and so forth, then the convention is to signal this by returning `null` carrying a short explanation as an [annotation](/learn/annotations). Because this forces a nullable return type (e.g. `Str?`, `[Int]?`, `{...}?`, `Any`, etc.), functions that can fail can be spotted at a glance.
 
-This chapter shows how to write MindScript that:
+This design was deliberately chosen to avoid hidden control flow that can come with exception-based mechanisms in languages such as Java or Python. The drawback is that it requires programmers to check for errors upfront everytime a nullable function is called.
 
-* returns useful `null` values on failure,
-* inspects failure reasons,
-* and uses panic only when you genuinely want to stop execution.
+!!! warning
+    A key rule: it’s okay to display the annotation text for humans in logs and UI, but avoid basing control flow on it, as annotations are metadata, and also, error messages might not be stable across different versions of the code. If you need to distinguish error kinds programmatically, return a formal value (for example an `Enum[...]` or a tagged object).
 
-> Important type note: `Any` is the supertype, so it includes `Null`. In practice, **`Any` is nullable**. If you want “not null”, use a narrower type than `Any` and check it.
+In addition, MindScript has **panics**. Panics happen when there's
+
+* a syntax error;
+* a missing module;
+* a call with wrong argument types;
+* a fatal invariant violation;
+* or other runtime errors.
+
+When MindScript encounters a panic, *it considers it fatal and halts execution*. As we'll see later, there is a recovery mechanism (the `try` function), but it should be used sparingly.
+
 
 ---
 
-## The basic shape: returning `null` (with a reason)
+## Returning errors and checking boundaries
 
-Here is the most common pattern in MindScript: validate input, and return `null` on failure.
+The basic pattern is: *validate, and return* `null` *(with a reason) on failure*.
 
-```mindscript
+```mindscript hl_lines="4 6"
 let parsePort = fun(s: Str) -> Int? do
     let n = int(s)
     if n == null then
-        null  # <invalid port>
-    elif n < 1 or n > 65535 then
-        null  # <port out of range>
-    else
-        n
+        return null  # invalid port
     end
-end
-```
-
-A few things are happening:
-
-* The return type is `Int?`, meaning “an integer or `null`”.
-* The function returns `null` in multiple places.
-* The `# <...>` text attaches to the `null` value. That note becomes your error message.
-
-### Reading the reason later
-
-You can retrieve the note from the returned value:
-
-```mindscript
-let p = parsePort("eighty")
-if p == null then
-    println("port error: " + (noteGet(p) or "<no details>"))
-    null
-else
-    p
-end
-```
-
-Why the `(noteGet(p) or "<no details>")`?
-
-* `noteGet(x)` returns `Str?`.
-* If there is no note, it returns `null`.
-* `+` only concatenates strings with strings, so you want a real `Str` in both cases.
-
----
-
-## `error(...)` is the standard “return null with a message”
-
-The standard library defines:
-
-```mindscript
-error(msg: Str) -> Null
-```
-
-It returns `null` annotated with `msg`. It’s a convenience for “return a failure value”.
-
-```mindscript
-let requireKey = fun(obj: {}, key: Str) -> Any? do
-    if not mapHas(obj, key) then
-        error("<missing key: " + key + ">")
-    else
-        obj[key]
+    if n < 1 or n > 65535 then
+        return null  # port out of range
     end
+    n
 end
 ```
 
-This is a good fit when:
+The `# ...` text attaches to the returned `null`. It’s meant for humans (logs/UI). If you need machine-readable error kinds, return a formal value (enum/tagged object), not a message string.
 
-* you want a one-line failure value,
-* and you expect callers to check `== null` and then inspect `noteGet(...)`.
+The standard library defines `error(msg: Str) -> Null`, a helper function which returns `null` annotated with `msg`. It can provide a cosmetic touch to signal intent in the code:
 
----
-
-## Checking results without making the code noisy
-
-A common beginner mistake is to forget that an operation can return `null`, and then immediately use the result as if it were a non-null value.
-
-Example: parsing JSON.
-
-```mindscript
-let x = jsonParse("{ not json }")
-# x is null on failure
-```
-
-If you immediately index it:
-
-```mindscript
-let y = x["field"]  # this will panic (x isn't a map)
-```
-
-…you’ve turned a normal “invalid JSON” situation into a fatal stop.
-
-Instead, branch right away:
-
-```mindscript
-let x = jsonParse("{ not json }")
-if x == null then
-    println("bad input: " + (noteGet(x) or "<no details>"))
-    null
-else
-    x
-end
-```
-
-If you are doing this often, wrap it in a helper:
-
-```mindscript
-let require = fun(v: Any, msg: Str) -> Any do
-    if v == null then
-        error(msg)
-    else
-        v
+```mindscript hl_lines="4 6"
+let parsePort = fun(s: Str) -> Int? do
+    let n = int(s)
+    if n == null then
+        return error("invalid port")
     end
+    if n < 1 or n > 65535 then
+        return error("port out of range")
+    end
+    n
 end
 ```
 
-Remember the type note: `Any` includes `null`, so `require` is not “making it non-null at the type level”; it’s making the check explicit and giving you a message at the failure site.
+Remember, as a rule of thumb, *check for `null` immediately after any `T?`-returning call* before indexing, property access, or passing it to code that expects a non-null shape. This is a common beginner mistake.
 
 ---
 
 ## Panics: fatal stops
 
-A **panic** stops evaluation and prints a diagnostic. It is used for:
+A **panic** stops evaluation and prints a diagnostic. Panics are for “the program is wrong” situations: contract violations, missing required properties/modules, or invariants that should never be violated.
 
-* contract violations (calling a built-in with the wrong kinds of values),
-* invariants (“this should never happen”),
-* uncaught fatal failures.
-
-You can trigger one explicitly:
+You can trigger a panic explicitly:
 
 ```mindscript
 panic("this should never happen")
 ```
 
-You’ll also see panics from common mistakes, such as:
-
-* indexing a non-array / non-map,
-* using an unknown property on an object/module,
-* passing the wrong type into a built-in that requires a specific type,
-* using a non-`Bool` in an `if`/`while` condition.
-
-### The key guideline
-
-Use `null` (with a note) for *expected* failure paths.
-
-Use `panic(...)` only when continuing would be wrong.
-
----
-
-## Catching panics with `try(...)`
+### Catching panics with `try(...)`
 
 Sometimes you want to treat a panic as “just another result” so you can keep going or report a nicer message. The standard tool is:
 
@@ -733,114 +554,37 @@ Sometimes you want to treat a panic as “just another result” so you can keep
 try(f: (Null -> Any)) -> { ok: Bool, value: Any }
 ```
 
-You pass a zero-argument function (a common MindScript idiom is “callable with a `Null` parameter”), and `try` returns:
+which is used to wrap a function that can panic. If the call succeeds, it returns `{ok: true, value: V}` where `V` is the return value; otherwise it return `{ok: false, value: null}`.
 
-* `{ ok: true, value: <result> }` when it ran successfully
-* `{ ok: false, value: <error value> }` when it panicked
-
-Example:
+The following example illustrates how to use it for sanitizing a potentially unsafe field access:
 
 ```mindscript
 let r = try(fun() do
-    # This might panic if the input isn't an object.
     let x = jsonParse("{ not json }")
-    x["user"]
+    x["user"]   # may panic
 end)
 
 if r.ok then
-    println("user: " + str(r.value))
     r.value
 else
-    println("failed: " + str(r.value))
+    println("no 'user' field")
     null
 end
 ```
 
-Notes:
+### Legitimate uses of `panic(...)` and `try(...)`
 
-* The `value` on failure is commonly `null` with a readable message attached.
-* `str(...)` is useful here because it produces a printable representation for common data values.
+While panics should be avoided in favor of errors, there are legitimate use cases:
 
----
+* *internal invariants*: e.g. "this branch should be unreachable";
+* *programmer errors*: your own config/code is invalid and you want to stop;
+* *hard contract enforcement* in libraries where callers must not proceed.
 
-## Inspecting values while debugging
+Similarly, use `try` sparingly, typically for:
 
-When you’re unsure what you have, print it.
-
-Recommended tools:
-
-* `println(x)` prints a readable representation and returns `x` (handy inside expressions).
-* `formatValue(x)` produces a stable, formatted string representation.
-* `noteGet(x)` shows the annotation message, if any.
-
-Example: instrumenting a pipeline:
-
-```mindscript
-let x = jsonParse(input)
-println(x)
-
-if x == null then
-    println("parse failed: " + (noteGet(x) or "<no details>"))
-    null
-else
-    # continue with x
-    x
-end
-```
-
----
-
-## Making your own “error contracts” explicit
-
-MindScript code becomes easier to use when functions clearly document:
-
-* what success looks like,
-* what failure looks like (`null`),
-* and what the note means.
-
-A common style is to use short, bracketed slugs:
-
-```mindscript
-let loadConfig = fun(path: Str) -> {}? do
-    let s = readFile(path)
-    if s == null then
-        null  # <cannot read config>
-    else
-        let cfg = jsonParse(s)
-        if cfg == null then
-            null  # <config is not valid JSON>
-        else
-            cfg
-        end
-    end
-end
-```
-
-Callers don’t need to know which sub-step failed; they just need a stable message to display or log.
-
----
-
-## Reading diagnostics when a panic happens
-
-When MindScript stops due to a panic (or a parse error), it prints a diagnostic that points at a source location. In practice you use it like this:
-
-1. Look at the **file name** and the **line/column**.
-2. Look at the **caret (`^`)**: that’s the expression that triggered the panic.
-3. Fix the immediate contract violation first (wrong type, missing key, bad property), then rerun.
-
-In the REPL, incomplete input is handled by continuing the prompt until the parser considers the expression complete. If you see the continuation prompt, you haven’t finished a block or expression yet.
-
----
-
-## Summary patterns
-
-Use these as defaults:
-
-* For expected failure: `null  # <reason>` (or `error("<reason>")`).
-* Immediately check results that can be `null` before indexing, calling, or assuming shape.
-* Use `noteGet(x)` to retrieve the reason from a `null` value.
-* Use `try(fun() do ... end)` when you need to handle a panic as data.
-* Use `panic(...)` only for truly fatal situations.
+* *tooling code* that must keep running (formatters, linters, AST tooling);
+* *wrapping a hard failure at a boundary* so you can return a clean `null`;
+* *best-effort batch processing* where one bad record should be skipped rather than killing the whole run.
 
 === END FILE: ./docs/manual/docs/learn/errors.md ===
 
@@ -1159,15 +903,9 @@ If you keep two habits—write a small sanity test for each new binding, and wra
 
 === BEGIN FILE: ./docs/manual/docs/learn/functions.md ===
 
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
-
 # Functions
 
-This chapter introduces **functions** in MindScript. Along the way, it introduces **type schemas**, because function calls and returns are **runtime-checked** against their declared types. If a value does not match a declared type, execution fails with a runtime error.
+This chapter introduces **functions** in MindScript. Along the way, it introduces **type schemas**, because function calls and returns are *runtime-checked* against their declared types. If a value does not match a declared type, execution fails with a panic.
 
 Type schemas are written using the `type` keyword. They are values of type `Type`, and you can pass them around like any other value.
 
@@ -1196,17 +934,18 @@ There are three core helpers:
 * `isType(val, T: Type) -> Bool` checks whether `val` conforms to schema `T`.
 * `isSubtype(A: Type, B: Type) -> Bool` checks whether `A` is a subtype of `B`.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> isType(42, type Int)</span>
-<span class="value">true</span>
+The REPL example below illustrates them.
 
-<span class="prompt">==> isType({name: "John"}, type {name: Str})</span>
-<span class="value">true</span>
+```mindscript-repl
+==> isType(42, type Int)
+true
 
-<span class="prompt">==> isSubtype(type Int, type Num)</span>
-<span class="value">true</span> </code></pre>
+==> isType({name: "John"}, type {name: Str})
+true
 
-</div>
+==> isSubtype(type Int, type Num)
+true
+```
 
 ### Enumerated types
 
@@ -1254,28 +993,33 @@ This allows values like:
 
 ### Required fields in object schemas
 
-In object schemas, **fields are optional by default**. This means:
+In object schemas, *fields are optional by default*. This means:
 
-```mindscript
-let Person = type {
-    name: Str
-    age: Int
-}
+```mindscript-repl
+==> let Person = type {
+...    name: Str
+...    age: Int
+... }
 
-isType({name: "John", age: 45}, Person)  ## true
-isType({}, Person)                        ## true
+==> isType({name: "John", age: 45}, Person)
+true
+
+==> isType({}, Person)
+true
 ```
 
 To require a field, add `!` after the field name:
 
 ```mindscript
 let MusicRecord = type {
-    title!: Str,            ## required
-    artist!: Str,           ## required
-    releaseYear: Int,       ## optional
-    genre!: Str?,           ## required, may be null
+    title!: Str,            # required
+    artist!: Str,           # required
+    releaseYear: Int,       # optional
+    genre!: Str?,           # required, may be null
 }
 ```
+
+Now we can test whether object instances conform to the schema:
 
 ```mindscript
 let song1 = {
@@ -1291,26 +1035,25 @@ let song2 = {
     releaseYear: 1965
 }
 
-isType(song1, MusicRecord)  ## true
-isType(song2, MusicRecord)  ## false (missing genre)
+isType(song1, MusicRecord)  # true
+isType(song2, MusicRecord)  # false (missing genre)
 ```
 
-Note: object schemas are **open-world**: extra fields are allowed. The schema describes what must be present (and typed), not the complete set of keys.
+Object schemas are **open-world**: extra fields are allowed. The schema describes what must be present (and typed), not the complete set of keys.
 
 ### The universal type `Any`
 
 `Any` is the universal schema: every value conforms to it.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> isType(123, type Any)</span>
-<span class="value">true</span>
+```mindscript-repl
+==> isType(123, type Any)
+true
 
-<span class="prompt">==> isType({x: 1}, type Any)</span>
-<span class="value">true</span> </code></pre>
+==> isType({x: 1}, type Any)
+true
+```
 
-</div>
-
-Use `Any` when you genuinely don’t know the shape yet (or when building generic helpers), but prefer concrete schemas when you can.
+In practice, `Any` tells the interpreter to skip the type check. Use `Any` when you genuinely don’t know the shape yet (or when building generic helpers), but prefer concrete schemas when you can.
 
 ### Type aliases
 
@@ -1481,11 +1224,13 @@ Each call to `makeCounter()` creates a fresh closure with its own `count`.
 === BEGIN FILE: ./docs/manual/docs/learn/index.md ===
 # Introduction
 
-MindScript is a programming language that seamlessly combines the features of a traditional programming language and the power of large language models (LLMs). The question was: "What if, rather than bolting LLM-powered functions onto a Python framework, we built a Turing-complete language from the ground up with LLM capabilities as first-class citizens?"
+MindScript is a programming language that seamlessly combines the features of a traditional programming language and the power of large language models (LLMs). The question was:
+
+> "What if, rather than bolting LLM-powered functions onto a Python framework, we built a Turing-complete language from the ground up with LLM capabilities as first-class citizens?"
 
 The motivation behind MindScript is to provide programmers with a minimalistic language using both programmatic and inductive constructs which allow for semantic processing in a way that wasn't possible before the advent of LLMs.
 
-This manual assumes you have `msg` installed and working. `msg` is the state of the art MindScript runtime. To set up your environment, follow the instructions in the [Installation](/installation).
+This manual assumes you have `msg` installed and working. `msg` is the state of the art MindScript runtime. To set up your environment, follow the instructions in the [Installation Guide](/installation).
 
 
 ## Your first MindScript program
@@ -1504,48 +1249,38 @@ msg run first.ms
 
 Running the above should print something like
 ```bash
-msg run first.ms
-
+$ msg run first.ms
 Greetings, Earthling! Ready for some rib-tickling fun
 and intergalactic high fives? Let's make today out of
 this world! 🚀😄
 ```
 The greeting will depend on what your LLM came up with by following the instruction `Say hello in a funny way!`.
 
-Let's go over the program, line by line. The very first line is a comment. Comments start with a hash `#` and are followed by a string.
+Let's go over the program, line by line. The very first line is a comment. 
 ``` hl_lines="1"
 # Say hello in a funny way!
 let sayHello = oracle() -> Str
 
 println(sayHello())
 ```
-*Unlike* other programming languages, a `#` line is an annotation which attaches descriptive text to the value that follows it. It serves as a hint for both for programmers and for the LLM.
+*Unlike* other programming languages, comments are not ignored, but they are annotations that attach descriptive text to the value that follows it (or before it, if there's an expression on the left). It serves as a hint for both for programmers and for the LLM.
 
-In this case, it is attached to the value produced by evaluating the next expression
+In this case, it is attached to the **value** produced by evaluating the next expression:
 ``` hl_lines="2"
 # Say hello in a funny way!
 let sayHello = oracle() -> Str
 
 println(sayHello())
 ```
-which assigns a new oracle to the newly created variable `sayHello`.
+This line creates an oracle that generates a string, and assigns it to the newly created variable `sayHello`. The annotation attaches itself to this oracle. Let's break this down further.
 
-In MindScript there's only one construct to declare a new variable. This is done using the `let` keyword and providing a variable name. Variable names must always start with a alphabetic character or an underscore followed by zero or more alphanumeric characters or an underscore. The following are all valid variable names:
-```
-x
-_secret
-AlphaBeta
-coordinate1
-the_speed_of_light
-```
-
-The expression `oracle() -> Str` declares an **oracle**. Oracles are like functions, expect that their implementation is a black box and their behavior is guided by hints. Oracles are the main feature of MindScript.
+The expression `oracle() -> Str` declares an **oracle**. Oracles are like functions, expect that their implementation is a black box and their behavior is guided by hints; in this case, the instruction "Say hello in a funny way" and the return type `Str`. Oracles are the main feature of MindScript.
 
 Unlike most programming languages, function and oracles are always anonymous values that are often immediately assigned to a variable. In addition, they are always typed, and input and output values are checked at runtime, yielding an error if they don't conform. 
 
-In MindScript everything is an expression. Hence, declarations and assignments themselves return a value. In this case, the entire line evaluates to an oracle object.
+The construct `let VARNAME` declares a new variable. Variable names must always start with a alphabetic character or an underscore followed by zero or more alphanumeric characters or an underscore, such as `x`, `_secret`, `AlphaBeta`, `coordinate1`, and `the_speed_of_light`.
 
-Because it evaluates to an oracle object, the annotation in the preceeding line gets attached to it. Attaching a hint to an oracle guides its evaluation.
+In MindScript everything is an expression. Even declarations and assignments themselves return a value. In this case, the entire line evaluates to an oracle object. Because of that, the annotation in the preceeding line attaches to it.
 
 In the final line we evaluate the oracle and print the result followed by a newline
 ``` hl_lines="4"
@@ -1556,6 +1291,7 @@ println(sayHello())
 ```
 Because the oracle is a black box, it will return an arbitrary string guided by the hint. Multiple executions of this program should print different greetings.
 
+This example gives you a first taste of MindScript.
 === END FILE: ./docs/manual/docs/learn/index.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/io.md ===
@@ -2375,90 +2111,18 @@ MindScript networking is deliberately built around one core idea: network connec
 === END FILE: ./docs/manual/docs/learn/networking.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/oracles.md ===
+# Oracles
 
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
-
-# Oracles and Annotations
-
-This chapter covers two features that make MindScript different from typical scripting languages:
-
-1. **Annotations**: `# ...` text attached to values, used for documentation and (especially) for guiding oracles.
-2. **Oracles**: LLM-backed “black box” functions whose inputs/outputs are constrained by runtime-checked type schemas.
+We have finally reached the chapter where we explain the central distinguishing feature of MindScript: **oracles**. Oracles are LLM-backed "black box" functions whose inputs/outputs are constrained by runtime-checked type schemas. Intuitively, they are like "asking a friend" for an answer, and are thus useful for semantic processing.
 
 An oracle call is still a normal function call in MindScript: it has parameters, a return type, and it produces a value. The difference is that its implementation lives outside the language runtime and is invoked through an oracle backend.
 
----
-
-## Annotations
-
-An annotation is introduced with `#` and attaches to the **value of the next expression**.
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> # The speed of light in meters per second.</span>
-<span class="prompt">... let c = 299792458</span>
-<span class="note">The speed of light in meters per second.</span>
-<span class="value">299792458</span>
-</code></pre>
-</div>
-
-Annotations are metadata:
-
-* They help humans (documentation).
-* They help oracles (prompt instructions).
-* They do **not** change equality, arithmetic, indexing, etc.
-
-Annotations don’t automatically “flow” through computations:
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> # The golden ratio.</span>
-<span class="prompt">... let phi = (1 + sqrt(5)) / 2</span>
-<span class="note">The golden ratio.</span>
-<span class="value">1.618033988749895</span>
-
-<span class="prompt">==> 2 * phi</span> <span class="value">3.23606797749979</span> </code></pre>
-
-</div>
-
-### Programmatic access to annotations
-
-You can read and write annotations using:
-
-* `noteGet(x) -> Str?`
-* `noteSet(text: Str, value) -> Any`
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> let c = 299792458</span>
-<span class="value">299792458</span>
-
-<span class="prompt">==> noteSet("The speed of light in meters per second.", c)</span> <span class="note">The speed of light in meters per second.</span> <span class="value">299792458</span>
-
-<span class="prompt">==> noteGet(c)</span> <span class="value">"The speed of light in meters per second."</span> </code></pre>
-
-</div>
-
-### Multi-line annotations
-
-Consecutive lines that start with `#` form a single multi-line annotation, attached to the following value:
-
-```mindscript
-# Processes a batch of raw sales records:
-#   1. Filters out returned items.
-#   2. Groups the remaining sales by region.
-#   3. Sums revenue per region.
-let processQuarterlySales = fun(records: [Any]) -> {} do
-    ...
-end
-```
 
 ---
 
-## Oracles
+## Oracle Declaration
 
-An **oracle** is declared like a function signature, but without a body:
+An oracle is declared like a function signature, but without a body:
 
 ```mindscript
 # Write the name of an important researcher in the given field.
@@ -2652,7 +2316,7 @@ Treat oracle prompts as data you may log. Avoid embedding secrets directly in pr
 === BEGIN FILE: ./docs/manual/docs/learn/runtime.md ===
 # The `msg` Runtime
 
-When you install MindScript you get a small command-line program called `msg`. It reads MindScript `.ms` files, parses them, evaluates them, and prints results. It also gives you a REPL for interactive work, a formatter so everyone’s code has the same shape, and a test runner for projects.
+When you install MindScript you get a small command-line program called `msg`. It reads MindScript `.ms` files, parses them, evaluates them, and prints results. It also gives you a REPL for interactive work, a standard code formatter, and a test runner for.
 
 This chapter is a tour of `msg` itself, so that you know what commands exist, what they do, and what a normal workflow looks like.
 
@@ -2666,7 +2330,7 @@ When you forget a command, ask `msg`:
 msg help
 ```
 
-The help output is the contract. It shows the version banner, then the subcommands and their usage:
+This command prints a message listing all the commands:
 
 * `run` runs a file
 * `repl` starts an interactive prompt
@@ -2674,7 +2338,7 @@ The help output is the contract. It shows the version banner, then the subcomman
 * `test` runs tests
 * `version` prints the version string
 
-You may see `get` listed too; it exists, but it is not implemented yet.
+You may see `get` listed too, but this is not implemented yet.
 
 ---
 
@@ -2686,24 +2350,22 @@ The workhorse command is `msg run`. To execute a file named `hello.ms`, enter
 msg run hello.ms
 ```
 
-During execution your program may also write to stdout/stderr (for example via `println`). That output appears as the program runs; the final formatted value is printed at the end.
+The process then ends with exit status 0 if successful or non-zero otherwise.
 
-### A small stdin/stdout template
+### A small stdin/stdout example
 
-A common pattern is “data in, data out”: read from stdin, transform, print to stdout.
-
-Many operations report failure by returning `null` (often with an attached message). In scripts, it’s normal to check for `null` and print a short diagnostic.
+A common pattern is to read data from the standard input, process it, and print to the standard output (or standard error if there's an error). To read/write from these, use the predefined handles named `STDIN`, `STDOUT`, and `STDERR` respectively. 
 
 Create `echo.ms`:
 
 ```mindscript
 let input = readAll(STDIN)
-
 if input == null then
-    println("failed to read stdin")
-    null
+    write(STDERR, "failed to read stdin")
+    flush(STDOUT)
 else
-    println(input)
+    write(STDOUT, input)
+    flush(STDOUT)
 end
 ```
 
@@ -2713,9 +2375,11 @@ Run it as a pipeline:
 echo "hello" | msg run echo.ms
 ```
 
+This will print `hello` to the standard output.
+
 ### Script arguments
 
-The additional inputs to `msg run` are interpreted as command-line arguments for the MindScript program. The runtime exposes information through a special object named `runtime` within the program. The most important field is `runtime.argv`, which is an array of strings containing the arguments.
+Additional inputs to `msg run` are interpreted as command-line arguments for the script. The runtime exposes execution context information through a special object named `runtime` within the program. It also contains the field `runtime.argv`, which is an array of strings containing the arguments.
 
 Create `args.ms`:
 
@@ -2723,34 +2387,28 @@ Create `args.ms`:
 println(runtime.argv)
 ```
 
-Run it:
+To test it, run it as follows:
 
 ```bash
 msg run args.ms one two three
 ```
 
-You will see:
+This will print
 
 ```mindscript
 ["one", "two", "three"]
 ```
 
-Alternatively you can add `--` to separate the arguments from `msg`’s own parsing:
+Two additional useful fields of the `runtime` object are:
 
-```bash
-msg run args.ms -- one two three
-```
-
-### Finding the entry file from inside the program
-
-Programs often need to locate files relative to the script itself (a `config.json`, a `data/` folder, fixtures). The field `runtime.path` is the path of the entry script, which is absolute when possible. The field `runtime.isEntry` is `true` for that entry script.
-
+* `runtime.path`, which contains the path of the entry script;
+* `runtime.isEntry`, which is `true` if it is the entry script.
 
 ---
 
-## Exploring interactively: `msg repl`
+## Interactive sessions: `msg repl`
 
-You can run `msg` interactively using the `msg repl` command. This starts an interactive session where you can type expressions and see their results immediately (a read-eval-print loop).
+You can run `msg` interactively using the `msg repl` command. This starts an interactive session where you can type expressions and see their results immediately (a Read-Eval-Print Loop).
 
 ```
 $ msg repl
@@ -2773,40 +2431,32 @@ The REPL also writes a history file at `~/.mindscript_history`.
 
 ## Keeping code tidy: `msg fmt`
 
-MindScript ships with a formatter which will rewrite your source code following the standard conventions. The `msg fmt` takes a path prefix as an input and it will format all the files that match it in place.
+MindScript ships with a formatter which will rewrite your source code following the standard conventions. The `msg fmt` takes a *path prefix* as an input and it will format all the matching files *in place*.
 
-To format everything under the current directory, enter:
+For instance, to format all the MindScripts `.ms` files in the current directory and all its subdirectories, enter:
 
 ```bash
 msg fmt .
 ```
 
-This formats all the files inside the current and the nested directories.
-
-In continuous integration you usually do not want to rewrite files. You want to check whether they *would* change. That is what `--check` is for:
+Sometimes you only want to check whether a given source code is formatted correctly. For this, you can run the formatting command with the `--check` flag.
 
 ```bash
 msg fmt --check .
 ```
 
-In check mode, `msg fmt` prints the files that are not formatted and exits with a failing status if any would change.
+In this mode the formatter will print a list of the files that are not well-formatted.
 
 ---
 
 ## Running tests: `msg test`
 
-The runtime ships with a built-in unit tester and a standard module `testing` to write tests. The command `msg test` then runs your project’s automated checks and reports pass/fail with a summary. It discovers test files, loads them, runs the registered tests, prints progress, and exits non-zero if anything failed.
+The runtime ships with a built-in unit tester and a standard module called `testing` to write tests. The command `msg test` then runs your project’s automated checks and reports pass/fail with a summary. It discovers test files, loads them, runs the registered tests, prints progress, and exits non-zero if anything failed.
 
-By convention, test files end in `_test.ms`. To run all tests under the current directory:
-
-```bash
-msg test
-```
-
-To run tests under a specific path prefix `xyz`, enter:
+By convention, test files end in `_test.ms`, and they are usually located alongside the code they test. Like in formatting, the testing command takes a *path prefix* as argument. So, to run all tests under the current directory, enter:
 
 ```bash
-msg test xyz
+msg test .
 ```
 
 This will print the all test failures if there were any.
@@ -2819,56 +2469,45 @@ You can run your tests in verbose mode with the `-v` flag:
 msg test . -v
 ```
 
+This will print all the tests that are being executed with their success/failure status.
+
 In addition, you can run your tests concurrently using the parallel mode flag `-p`. This is useful when tests are independent and you want speed:
 
 ```bash
 msg test . -p
 ```
 
-You can also set per-test time limit in milliseconds. This is mainly a safety net for tests that might hang:
+As a safety net for tests that might hang, you can also set a per-test time limit, in milliseconds. This is done using the `-t` flag:
 
 ```bash
 msg test . -t 5000
 ```
 
-Flags can be combined:
+Obviously, flags can be combined:
 
 ```bash
 msg test . -p -v -t 5000
 ```
 
-To learn how to write tests, please refer to the chapter on [testing](learn/testing.md).
+Writing tests is beyond the scope of this chapter. We will learn how to do this in chapter on [testing](learn/testing.md).
 
 ---
 
 ## Version information: `msg version`
 
-When you file a bug report or compare behaviors between machines, the first thing you want is the exact runtime version.
+When you file a bug report or compare behaviors between machines, the first thing you want is the exact runtime version. The `msg version` command prints the version string.
 
 ```bash
 msg version
 ```
 
-It prints the compiled version string and nothing else.
-
 ## Install packages using `msg get`
 
 This feature is not implemented yet.
 
----
+## Final words
 
-## A normal workflow
-
-A typical small MindScript project looks like this in practice:
-
-* start in the REPL when you are unsure
-* move into a file when the idea solidifies
-* run it with `msg run`, often as a pipeline component
-* format with `msg fmt` before committing
-* run `msg test` when the project grows beyond a single script
-* compare `msg version` when behaviors differ across machines
-
-That is the entire `msg` story: run, explore, format, test, and know what version you’re on.
+This concludes the chapter on the `msg` command line interface. As we have seen, this tool packs (and thereby standardizes) a number of utilities typically used during the lifecycle of a project.
 
 === END FILE: ./docs/manual/docs/learn/runtime.md ===
 
@@ -2876,7 +2515,7 @@ That is the entire `msg` story: run, explore, format, test, and know what versio
 
 # Scopes & Control
 
-In this chapter, we’ll explore how MindScript handles variable scope, block structure, and the three core control constructs: logical expressions, conditional expressions, and for-loops. 
+In this chapter, we’ll explore how MindScript handles variable scope, block structure, and the three core control constructs: logical expressions, conditional expressions, and loops. 
 
 
 ## Lexical Scoping and Blocks
@@ -2923,11 +2562,9 @@ println(result)   # prints "Hello, Andreas"
 
 Use block scoping to limit variable lifetimes, avoid name collisions, and make your code easier to reason about.
 
-## Control Structures
+## Logical Expressions (Short-Circuit)
 
 MindScript has three control flow constructs: logical expressions, conditionals, and loops.
-
-## Logical Expressions (Short-Circuit)
 
 The logical operators `and` and `or` *short-circuit*: the evaluation stops as soon as the result is determined.
 
@@ -2965,52 +2602,26 @@ let describeAge =
 println(describeAge)  # Adult
 ```
 
-Here, the individual branches are blocks: they have their own scope and return the last evaluated expression.
+Here, the individual branches are blocks: they have their own scope and return the last evaluated expression. If the `else` branch is omitted, it is implied to evaluate to `null`.
+
 
 ## Loop Expressions
 
-MindScript has `for` loops and `while` loops, and both are **expressions**: they evaluate to a value (typically the last value produced by the loop body).
-
-This section focuses on `for`, because it is the most common loop when processing arrays and objects.
-
-### Iterators
-
-`for` loops operate over *iterators*. An iterator is a function of type `Null -> Any?` that returns:
-
-* the next item, or
-* `null` to signal “no more items”.
-
-One way of building iterators from arrays or objects is using the `iter` function from the standard library:
-
-```mindscript
-let arr = [1, 2, 3, 4]
-let obj = {a: 1, b: 2, c: 3}
-
-let arrIt = iter(arr)
-let objIt = iter(obj)
-```
-
-Then, repeatedly invoking `arrIt()` and `objIt()` will return the sequences:
-
-```
-1, 2, 3, 4, null, ...
-
-["a", 1], ["b", 2], ["c", 3], null, ...
-```
-
-For objects, the iterator yields key–value pairs as two-element arrays. Objects also preserve insertion order when iterating.
+MindScript has `for` loops and `while` loops, and both are **expressions**: they typically evaluate to the last value produced by the loop body.
 
 ### The `for` loop form
 
-The loop constructor takes the form `for [v] in [it] do [block] end`, where `[v]` is an assignment target, `[it]` is:
+The loop constructor takes the form 
+``` mindscript
+for V in IT do BLOCK end
+```
+where `V` is an assignment target, `BLOCK` is an expression block, and `IT` is:
 
 * an array,
-* an object, or
-* an iterator function (`Null -> Any?`),
+* an object,
+* or an iterator function.
 
-and `[block]` is a block of expressions.
-
-Here is code to compute and print squares:
+For instance, the following loop computes and prints square numbers:
 
 ```mindscript
 let nums = [1, 2, 3, 4]
@@ -3020,30 +2631,49 @@ for n in nums do
 end
 ```
 
-This prints `1, 4, 9, 16`. Loops stop as soon as the iterator signals completion by returning `null`. Since loops are expressions, the value of the entire loop is the last computed value—in this case, `16`.
+This prints `1`, `4`, `9`, `16`, one per line. 
 
-You can influence the execution of a loop using `break` and `continue`. Both may carry a value, but they do not have to:
+Since loops are expressions, the value of the entire loop is the last computed value—in this case, `16`. You can influence the execution of a loop using `break` and `continue`. Both carry a value:
 
-* `break(x)` exits the loop and the loop expression evaluates to `x`.
-* `break` exits the loop and the loop expression evaluates to `null`.
-* `continue(x)` skips to the next iteration after evaluating `x`.
-* `continue` skips to the next iteration and yields `null` for that step.
+* `break x` exits the loop and the loop expression evaluates to `x`;
+* `continue x` skips to the next iteration after evaluating `x`.
 
-We can use this to mimic the behavior of a while loop. The code below computes the sum of positive numbers until a negative number is encountered:
+If the value is omitted, then it is assumed to be equal to `null`. 
+
+Similarly, iterating over a map works as expected:
 
 ```mindscript
-let it = iter([2, 3, -1, 7])
+let obj = {first: "Ada", last: "Lovelace", age: null, job: "programmer"}
 
-let total = 0
-for v in it do
-    if v < 0 then
-        break(total)
-    end
-    total = total + v
+for [key, value] in obj do
+    println(key + ": " + value)
 end
 ```
 
-This loop adds `2` and `3` and then breaks with a value equal to `5`.
+that is, the loop iterates over the key-value pairs (in an unspecified order).
+
+
+An **iterator function** is a function of type `Null -> Any` that either generates the next item or `null` to signal "no more items". A `for` loop terminates as soon as the iterator the completion by generating  a stop signal. 
+
+The standard library offers builtin iterators such as `range`, `natural` and `natural0`, and functions building iterators from others. You can also write your own iterators, using [closures](/learn/functions).
+
+### The `while` loop form
+
+A while loop has the form
+```
+while COND do BLOCK end
+```
+were `COND` is a boolean expression and `BLOCK` is an expression block. They execute the block as long as the condition is `true` and return the last evaluated expression.
+
+For example, the following while loop prints the square numbers from 1 to 4 and returns `5`:
+
+```mindscript
+let i = 1
+while i < 5 do
+    println(i)
+    i = i + 1
+end
+```
 
 ## Best Practices
 
@@ -3793,35 +3423,30 @@ Testing in MindScript is built around the idea that tests are ordinary functions
 === END FILE: ./docs/manual/docs/learn/testing.md ===
 
 === BEGIN FILE: ./docs/manual/docs/learn/values.md ===
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
 
-# Values and Formal Types
+# Values and Types
 
-In this chapter we will explore MindScript's values and their types. MindScript's built-in types have been deliberately chosen to mirror JSON types. In fact, the type system implements a subset of JSON Schema, rendering MindScript a scripting language that is specially suited for processing JSON objects and Web applications.
+In this chapter we will explore MindScript's values and their types. The built-in types have been deliberately chosen to mirror JSON types. In fact, the type system implements a subset of JSON Schema, making MindScript a scripting language that is specially suited for processing JSON objects and writing web applications.
 
 ## Expressions and Everything-as-a-Value
 
 Before diving into types, remember one core principle: *every MindScript construct is an expression*. That means whether you write a standalone literal or invoke a function, you always get back a value. For example:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> 42</span>
-<span class="value">42</span>
+```mindscript-repl
+==> 42
+42
 
-<span class="prompt">==> (40 + 2)</span>
-<span class="value">42</span>
+==> (40 + 2)
+42
 
-<span class="prompt">==> print(42)</span>
-<span class="value">42</span>
+==> print(42)
+42
 
-<span class="prompt">==> let x = 42</span>
-<span class="value">42</span> </code></pre>
+==> let x = 42
+42
+```
 
-</div>
-Because all constructs, including assignments, loops, and conditionals yield values, you can chain and nest them. If you know programming languages like LISP or any of its dialects (e.g. Scheme) this should be familiar.
+Because all constructs, including assignments, loops, and conditionals yield values, you can chain and nest them. This should be a familiar concept if you know programming languages like LISP or any of its dialects (e.g. Scheme).
 
 ## Dynamic Typing: Variables vs. Values
 
@@ -3833,98 +3458,74 @@ let greeting = "Hello, world!"
 
 Here, `greeting` is a *variable* bound to the *value* `"Hello, world!"`, which is of type `Str` (string). Variables themselves don't have a type; only values do. You can check the type of any value using the `typeOf(...)` function:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> typeOf(greeting)</span>
-<span class="value">type Str</span>
+```mindscript-repl
+==> typeOf(greeting)
+type Str
 
-<span class="prompt">==> typeOf(42)</span> <span class="value">type Int</span> </code></pre>
+==> typeOf(42)
+type Int
+```
 
-</div>
-Unlike Python and JavaScript however, in MindScript types are *runtime checked*. Calling a function with incompatible argument types will lead to a runtime error.
+Unlike Python and JavaScript however, in MindScript types are *runtime checked* at call boundaries: calling a function or oracle with incompatible argument types will lead to a runtime error.
 
 ## Primitive Types
 
-MindScript ships with the following primitive types:
+MindScript has JSON-like primitive types, listed in the following table:
 
-| Type     | Example Literals           | Description                                                                                                                                                                                            |
-| -------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Null`   | `null`                     | The type of the `null` value. It is idiomatic to use `null` values to mark the absence of a value or to indicate a failure. When `null` is annotated (via `# ...`), it often carries an error message. |
-| `Bool`   | `true`<br>`false`          | The type of the two logical truth values.                                                                                                                                                              |
-| `Int`    | `42`<br>`-7`<br>`1_000_000`               | Integer numbers without fractional parts.                                                                                                                                                              |
-| `Num`    | `3.14`<br>`-1e3`<br>`.5`   | Floating-point numbers for real values.                                                                                                                                                                |
-| `Str`    | `'Hi'`<br>`"🚀Launch!"`    | Strings. In practice `Str` is also used as a byte container for IO (HTTP bodies, gzip, crypto digests).                                                                                                |
-| `Type`   | `type Str`<br>`type [Int]` | The type of types. Note that type literals always use the type constructor keyword `type`.                                                                                                             |
-| `Any`    | *(no literal)*             | The universal type: any value conforms to `type Any`.                                                                                                                                                  |
-| `Handle` | *(no literal)*             | Opaque host values (files, network connections, processes, channels, actors, FFI pointers, etc.).                                                                                                      |
-
-Remember, only the values/literals have a type, never the variables.
-
-Again, you can check the types at runtime using the `typeOf(...)` function.
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> typeOf(null)</span>
-<span class="value">type Null</span>
-
-<span class="prompt">==> typeOf(true)</span> 
-<span class="value">type Bool</span>
-
-<span class="prompt">==> typeOf(42)</span> 
-<span class="value">type Int</span>
-
-<span class="prompt">==> typeOf(42.0)</span> 
-<span class="value">type Num</span>
-
-<span class="prompt">==> typeOf("foo")</span> 
-<span class="value">type Str</span> </code></pre>
-</div>
+| Type | Example Literals | Description |
+| ---- | ---------------- | ----------- |
+| `Null` | `null` | The type of the `null` value. It is idiomatic to use `null` values to mark the absence of a value or to indicate a failure. When `null` is annotated (via `# ...`), it often carries an error message. |
+| `Bool` | `true`<br>`false` | The type of the two logical truth values. |
+| `Int` | `42`<br>`-7`<br>`1_000_000` | Integer numbers without fractional parts. |
+| `Num` | `3.14`<br>`-1e3`<br>`.5` | Floating-point numbers for real values. |
+| `Str` | `'Hi'`<br>`"🚀Launch!"` | Strings. In practice `Str` is also used as a byte container for IO (HTTP bodies, gzip, crypto digests). |
+| `Type` | `type Str`<br>`type [Int]` | The type of types. Note that type literals always use the type constructor keyword `type`. |
+| `Any` | *(no literal)* | The universal type: any value conforms to `type Any`. In practice, type checking is omitted. |
+| `Handle` | *(no literal)* | Opaque host values (files, network connections, processes, channels, actors, FFI pointers, etc.). |
 
 ### Operators
 
-MindScript provides familiar operators. This list is not exhaustive, but covers what you will use day-to-day:
+Operators are used to perform operations on values. The following table lists them in order of precedence, from highest to lowest.
 
-| Level        | Operators              |
-| ------------ | ---------------------- |
-| Power        | `**`                   |
-| Arithmetic 1 | `-` (unary, e.g. `-7`) |
-| Arithmetic 2 | `*  /  %`              |
-| Arithmetic 3 | `+  -`                 |
-| Shifts       | `<<  >>`               |
-| Comparison   | `==  !=  <  >  <=  >=` |
-| Bitwise 1    | `~`                    |
-| Bitwise 2    | <code>& &vert;</code>  |
-| Logical 1    | `not`                  |
-| Logical 2    | `and`                  |
-| Logical 3    | `or`                   |
-| Assignment   | `=`                    |
+| Level        | Operators |
+| ------------ | --------- |
+| Power        | `**` |
+| Unary negation | `-` (e.g. `-7`) |
+| Product, division, and modulo | `*  /  %` |
+| Addition*, and subtraction | `+  -` |
+| Bitwise left and right shifts | `<<  >>` |
+| Comparisons | `==  !=  <  >  <=  >=` |
+| Bitwise NOT | `~` |
+| Bitwise AND and OR | <code>& &vert;</code> |
+| Logical negatiion | `not` |
+| Logical conjunction | `and` |
+| Logical disjunction | `or` |
+| Assignment | `=` |
 
-A few important notes:
+The logical operators `and` and `or` require `Bool` operands and they short-circuit: they evaluate their operands only up to the point when the truth value is established. 
 
-* `and` / `or` short-circuit, and both sides must be `Bool` values.
-* `==` compares numbers by value across `Int` and `Num` (for example, `1 == 1.0` is true).
-* `+` is overloaded:
+The equality `==` operators compares numbers by value across `Int` and `Num`. So, for instance, `1 == 1.0` is true.
 
-  * numbers add (preserving `Int` when both sides are `Int`),
-  * strings concatenate,
-  * arrays concatenate,
-  * maps merge (right-hand side overwrites on conflicts; new keys are appended in insertion order).
+Finally, `+` is overloaded: numbers add, preserving `Int` when both sides are `Int`; strings and arrays concatenate; and maps merge, where the right-hand operand overwrites on conflicts and new keys are appended in insertion order.
+
 
 ### No automatic casting
 
 There is no automatic type casting. Invoking a function with wrong types or applying an operator on incompatible values yields a runtime error (e.g., `"text" + 5`). The numeric operators are the only “widening” case: applying a numeric operator to an `Int` and a `Num` promotes the `Int` operand to a `Num`.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> true and false</span>
-<span class="value">false</span>
+```mindscript-repl
+==> true and false
+false
 
-<span class="prompt">==> "Hello, " + 'world!'</span> 
-<span class="value">"Hello, world!"</span>
+==> "Hello, " + 'world!'
+"Hello, world!"
 
-<span class="prompt">==> 42 * 3</span> 
-<span class="value">126</span>
+==> 42 * 3
+126
 
-<span class="prompt">==> 42 * 3.0</span> 
-<span class="value">126.0</span> </code></pre>
-</div>
+==> 42 * 3.0
+126.0
+```
 
 ## Container Types
 
@@ -3936,93 +3537,94 @@ Both arrays and objects are **mutable**. If you assign the same array/object to 
 
 Arrays hold a sequence of values. They are instantiated using square brackets:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> let path = ["start", "middle", "end"]</span>
-<span class="value">["start", "middle", "end"]</span>
+```mindscript-repl
+==> let path = ["start", "middle", "end"]
+["start", "middle", "end"]
 
-<span class="prompt">==> path[1]</span> 
-<span class="value">"middle"</span>
+==> path[1] 
+"middle"
 
-<span class="prompt">==> path[-1]</span> 
-<span class="value">"end"</span>
+==> path[-1] 
+"end"
 
-<span class="prompt">==> path[1] = "begin"</span> 
-<span class="value">"begin"</span> </code></pre>
-</div>
+==> path[1] = "begin" 
+"begin"
+```
 
 As shown above, individual elements are accessed using the index notation. Negative indices count from the end.
 
 You can mutate arrays in place by using functions such as `push`, `pop`, `shift`, and `unshift`. The `slice` function allows extracting slices.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> push(path, "bonus")</span>
-<span class="value">["start", "begin", "end", "bonus"]</span>
+```mindscript-repl
+==> push(path, "bonus")
+["start", "begin", "end", "bonus"]
 
-<span class="prompt">==> pop(path)</span> 
-<span class="value">"bonus"</span>
+==> pop(path) 
+"bonus"
 
-<span class="prompt">==> slice(path, 0, 2)</span> 
-<span class="value">["start", "begin"]</span> </code></pre>
-</div>
+==> slice(path, 0, 2) 
+["start", "begin"]
+```
 
 ### Objects
 
-Objects are key–value maps. They are instantiated by enclosing a list of key-value pairs within curly brackets:
+Objects are key-value maps. They are instantiated by enclosing a list of key-value pairs within curly brackets:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> let user1 = {"name": "Alice", "age": 30}</span>
-<span class="value">{"name": "Alice", "age": 30}</span>
+```mindscript-repl
+==> let user1 = {"name": "Alice", "age": 30}
+{"name": "Alice", "age": 30}
 
-<span class="prompt">==> let user2 = {name: "Sarah", age: 28}</span>
-<span class="value">{"name": "Sarah", "age": 28}</span>
+==> let user2 = {name: "Sarah", age: 28}
+{"name": "Sarah", "age": 28}
 
-<span class="prompt">==> let point = {"x-coordinate": -1, "y-coordinate": 12}</span> 
-<span class="value">{"x-coordinate": -1, "y-coordinate": 12}</span> </code></pre>
-</div>
-Note that you can omit the quotes delimiting key names (e.g. `name` instead of `"name"`) if they follow the same naming convention as variable names. If they don't, you must use quotes.
+==> let point = {"x-coordinate": -1, "y-coordinate": 12} 
+{"x-coordinate": -1, "y-coordinate": 12}
+```
+
+Notice above that you can omit the quotes delimiting key names (e.g. `name` instead of `"name"`) if they follow the same naming convention as variable names. If they don't, you must use quotes.
 
 Objects preserve insertion order of keys. This matters when you iterate or when you print values: keys appear in the order they were inserted.
 
 You can access properties using the dot `.` notation:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> user1.age</span>
-<span class="value">30</span>
+```mindscript-repl
+==> user1.age
+30
 
-<span class="prompt">==> user1.age = 31</span>
-<span class="value">31</span>
+==> user1.age = 31
+31
 
-<span class="prompt">==> point."x-coordinate"</span>
-<span class="value">-1</span>
+==> point."x-coordinate"
+-1
 
-<span class="prompt">==> point."z-coordinate" = 3</span>
-<span class="value">3</span> </code></pre>
+==> point."z-coordinate" = 3
+3
+```
 
-</div>
 As shown before, it is valid to assign a value to a new property. However, attempting to access a non-existent property yields a runtime error.
 
 When the property name is only known at runtime, use a computed property access. If `property` is a string:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> let property = "email"</span>
-<span class="value">"email"</span>
+```mindscript-repl
+==> let property = "email"
+"email"
 
-<span class="prompt">==> user1.(property) = "[alice@example.com](mailto:alice@example.com)"</span> 
-<span class="value">"[alice@example.com](mailto:alice@example.com)"</span>
+==> user1.(property) = "[alice@example.com](mailto:alice@example.com)" 
+"[alice@example.com](mailto:alice@example.com)"
 
-<span class="prompt">==> user1.(property)</span> 
-<span class="value">"[alice@example.com](mailto:alice@example.com)"</span> </code></pre>
-</div>
+==> user1.(property) 
+"[alice@example.com](mailto:alice@example.com)"
+```
 
 To check whether a key exists, use `mapHas(obj, key)`:
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> mapHas(user1, "hobbies")</span>
-<span class="value">false</span>
+```mindscript-repl
+==> mapHas(user1, "hobbies")
+false
 
-<span class="prompt">==> mapHas(user1, "age")</span>
-<span class="value">true</span> </code></pre>
-</div>
+==> mapHas(user1, "age")
+true
+```
 
 ## Function Types
 

@@ -1,13 +1,7 @@
 
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
-
 # Functions
 
-This chapter introduces **functions** in MindScript. Along the way, it introduces **type schemas**, because function calls and returns are **runtime-checked** against their declared types. If a value does not match a declared type, execution fails with a runtime error.
+This chapter introduces **functions** in MindScript. Along the way, it introduces **type schemas**, because function calls and returns are *runtime-checked* against their declared types. If a value does not match a declared type, execution fails with a panic.
 
 Type schemas are written using the `type` keyword. They are values of type `Type`, and you can pass them around like any other value.
 
@@ -36,17 +30,18 @@ There are three core helpers:
 * `isType(val, T: Type) -> Bool` checks whether `val` conforms to schema `T`.
 * `isSubtype(A: Type, B: Type) -> Bool` checks whether `A` is a subtype of `B`.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> isType(42, type Int)</span>
-<span class="value">true</span>
+The REPL example below illustrates them.
 
-<span class="prompt">==> isType({name: "John"}, type {name: Str})</span>
-<span class="value">true</span>
+```mindscript-repl
+==> isType(42, type Int)
+true
 
-<span class="prompt">==> isSubtype(type Int, type Num)</span>
-<span class="value">true</span> </code></pre>
+==> isType({name: "John"}, type {name: Str})
+true
 
-</div>
+==> isSubtype(type Int, type Num)
+true
+```
 
 ### Enumerated types
 
@@ -94,28 +89,33 @@ This allows values like:
 
 ### Required fields in object schemas
 
-In object schemas, **fields are optional by default**. This means:
+In object schemas, *fields are optional by default*. This means:
 
-```mindscript
-let Person = type {
-    name: Str
-    age: Int
-}
+```mindscript-repl
+==> let Person = type {
+...    name: Str
+...    age: Int
+... }
 
-isType({name: "John", age: 45}, Person)  ## true
-isType({}, Person)                        ## true
+==> isType({name: "John", age: 45}, Person)
+true
+
+==> isType({}, Person)
+true
 ```
 
 To require a field, add `!` after the field name:
 
 ```mindscript
 let MusicRecord = type {
-    title!: Str,            ## required
-    artist!: Str,           ## required
-    releaseYear: Int,       ## optional
-    genre!: Str?,           ## required, may be null
+    title!: Str,            # required
+    artist!: Str,           # required
+    releaseYear: Int,       # optional
+    genre!: Str?,           # required, may be null
 }
 ```
+
+Now we can test whether object instances conform to the schema:
 
 ```mindscript
 let song1 = {
@@ -131,26 +131,25 @@ let song2 = {
     releaseYear: 1965
 }
 
-isType(song1, MusicRecord)  ## true
-isType(song2, MusicRecord)  ## false (missing genre)
+isType(song1, MusicRecord)  # true
+isType(song2, MusicRecord)  # false (missing genre)
 ```
 
-Note: object schemas are **open-world**: extra fields are allowed. The schema describes what must be present (and typed), not the complete set of keys.
+Object schemas are **open-world**: extra fields are allowed. The schema describes what must be present (and typed), not the complete set of keys.
 
 ### The universal type `Any`
 
 `Any` is the universal schema: every value conforms to it.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> isType(123, type Any)</span>
-<span class="value">true</span>
+```mindscript-repl
+==> isType(123, type Any)
+true
 
-<span class="prompt">==> isType({x: 1}, type Any)</span>
-<span class="value">true</span> </code></pre>
+==> isType({x: 1}, type Any)
+true
+```
 
-</div>
-
-Use `Any` when you genuinely don’t know the shape yet (or when building generic helpers), but prefer concrete schemas when you can.
+In practice, `Any` tells the interpreter to skip the type check. Use `Any` when you genuinely don’t know the shape yet (or when building generic helpers), but prefer concrete schemas when you can.
 
 ### Type aliases
 

@@ -1,72 +1,65 @@
-<style>
-  .my-code span.prompt { color: black; }
-  .my-code span.note { color: green; }
-  .my-code span.value { color: blue; }
-</style>
-
 # Annotations
 
-MindScript uses `#` to write **annotations**.
+In the previous chapters, we've been using annotations (`# ...`) as if they were comments.
 
-An annotation is text that the language preserves and attaches to what follows. Annotations are used for:
+Most programming languages let you add comments to explain your code. Comments help humans understand intent, but they typically do not affect how the program runs. For example, in many languages you'd write comments like this:
+
+```mindscript
+# Computes the first n numbers in the Fibonacci sequence.
+let fibonacci = fun(n: Int) -> [Int] do
+    ...
+    SOME IMPLEMENTATION
+    ...
+end
+```
+
+If the comment and signature are clear, a reader can understand what fibonacci is for without reading the body.
+
+MindScript takes this idea one step further. For some computations, we want to treat the implementation as a black box (an oracle) and rely on surrounding intent and type constraints:
+
+```mindscript
+# Summarize the text as 3 bullet points.
+let summarize = oracle(text: Str) -> [Str]
+```
+
+To support this, MindScript elevates commenting to a first-class language feature called **annotations**. Annotations are preserved by the language and attached to values, so they can be inspected at runtime.
+
+MindScript uses `#` as an annotation marker. It takes the following text and attaches it to a value. It is used for:
 
 * documentation that travels with data,
 * carrying a failure reason on a returned `null`,
-* and (later) providing instructions to oracles.
+* and providing instructions to [oracles](/learn/oracles).
 
-Most of the time, an annotation attaches to a **value**. But you can also write comment-only lines that act like **true comments**: they are kept as standalone notes in the source without attaching to any value.
+Annotations are metadata: they do not change evaluation (they don’t affect equality, arithmetic, indexing, or control flow). It’s fine to read annotations for diagnostics, but deterministic program logic should rely on ordinary values and types rather than annotation text.
 
 ---
 
 ## The attachment rule
 
-MindScript decides whether a `# ...` attaches based on what comes next.
+All annotations start with a `#` followed by a text up to the end of the line, and then attach to the "nearest" value. The rule for attachment is:
 
-### 1) Attached annotations
-
-A `# ...` annotation attaches to the value produced by the **next expression**.
-
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> # The speed of light in meters per second.</span>
-<span class="prompt">... let c = 299792458</span>
-<span class="note">The speed of light in meters per second.</span>
-<span class="value">299792458</span>
-</code></pre>
-</div>
-
-This is the key mental model: annotations attach to **values**, not to variable names or to lines.
-
-A more explicit example:
+**Trailing-annotations**: If a *single-line* annotation is on the right of an expression, it attaches to the value of that expression. For instance, in
 
 ```mindscript
-# This annotation attaches to the value 1.
+let x = 1  # This attaches to the value 1.
+let y = -1 # This attaches to the value -1.
+```
+
+**Pre-annotation**: Otherwise, it attaches to the value of the expression on the very next line. For instance,
+
+```mindscript
+# This attaches to the value 1.
 let x = 1
 
-# This annotation attaches to the value (x + 1).
+# This attaches to the value (x + 1).
 x + 1
 ```
 
-### 2) Free-floating comments
+While this simple attachment rule was designed trying to mimic what feels natural in a programming language, it has a few special cases worth discussing.
 
-If an annotation line is separated from the next expression by a **blank line**, it does **not** attach to anything. It acts as a free-floating comment.
+### Multi-line blocks
 
-```mindscript
-# This is a standalone comment.
-# It is not attached to any value.
-
-let x = 1
-```
-
-This lets you write ordinary comments for sectioning and narration without accidentally annotating the next value.
-
-### 3) Multi-line blocks
-
-Consecutive lines whose first non-space character is `#` form a single multi-line annotation block. Whether that block attaches depends on the same rule as above:
-
-* If the block is immediately followed by an expression, it attaches to that expression’s value.
-* If there is a blank line after the block, it is free-floating.
-
-Attached block:
+Consecutive lines whose first non-space character is `#` form a single multi-line annotation block. For instance,
 
 ```mindscript
 # Processes raw sales records:
@@ -78,184 +71,103 @@ let process = fun(records: [Any]) -> {} do
 end
 ```
 
-Free-floating block:
+attaches the four-line annotation block to the function assigned to the `process` variable. Because a multi-line block fails the single line condition for trailing annotations they always attach to the next expression.
+
+
+### Free-floating comments
+
+If an annotation block is followed by a *blank line*, it does *not* attach to the next expression. Instead, it attaches to a special *no-op* expression represented by the blank line, so it behaves like a free-floating comment.
 
 ```mindscript
-# --- Data cleaning helpers ---
-# This section is about normalization.
+# This is a standalone comment.
+# It is not attached to any value.
 
-let normalize = fun(s: Str) -> Str do
-    strip(toLower(s))
-end
+let x = 1
 ```
 
----
+This lets you write ordinary comments for sectioning and narration without accidentally annotating the next value.
 
-## Annotations are metadata
+!!! info
+    Technically, a blank line is parsed as a no-op expression whose result is ignored. The formatter prints multiple blank lines as a single blank line because they reduce to the same no-op.
 
-Annotations do not change computation. They do not affect equality, arithmetic, indexing, or control flow.
 
-```mindscript
-# The golden ratio.
-let phi = (1 + sqrt(5)) / 2
+### Annotations inside objects and arrays
 
-phi == phi          # true
-2 * phi             # a number
-noteGet(2 * phi)    # usually null (annotations do not propagate automatically)
-```
-
-Annotations are not automatically “carried through” derived values. You attach notes where you want them.
-
----
-
-## Reading and writing annotations
-
-You can access annotations at runtime:
-
-* `noteGet(x) -> Str?` returns the annotation text, or `null` if none.
-* `noteSet(text: Str, value: Any) -> Any` attaches an annotation and returns the value.
-
-```mindscript
-let c = 299792458
-noteGet(c)  # null
-
-noteSet("The speed of light in meters per second.", c)
-noteGet(c)  # "The speed of light in meters per second."
-```
-
-`noteSet` updates the annotation on the value you pass in.
-
----
-
-## Annotating `null` to explain failure
-
-Many functions in the standard library return `null` to signal failure, and attach a reason as an annotation. You can do the same.
-
-```mindscript
-let parsePort = fun(s: Str) -> Int? do
-    let n = int(s)
-    if n == null then
-        null  # <invalid port>
-    elif n < 1 or n > 65535 then
-        null  # <port out of range>
-    else
-        n
-    end
-end
-```
-
-Then the caller can inspect the reason:
-
-```mindscript
-let p = parsePort("eighty")
-if p == null then
-    println(noteGet(p) or "<no details>")
-end
-```
-
-A related helper from the prelude is:
-
-```mindscript
-error(msg: Str) -> Null
-```
-
-It returns `null` annotated with `msg`, which is convenient when you want a one-line failure result.
-
----
-
-## Annotations inside objects and arrays
-
-Annotations can attach to values inside composites, which is useful for documenting individual fields.
+Annotations can attach to values inside composites, which is useful for documenting individual fields. For instance, we can document the fields of a specific user record:
 
 ```mindscript
 let user = {
     # Unique identifier from the upstream system.
     id: "u_123",
-
     # Display name shown in the UI.
     name: "Ada"
 }
-
-noteGet(user.id)
-noteGet(user.name)
 ```
 
-And inside arrays:
+The same works with annotations inside arrays:
 
 ```mindscript
 let limits = [
-    # Minimum supported value.
-    1,
-
-    # Maximum supported value.
-    10
+    1, # Minimum supported value.
+    10 # Maximum supported value.
 ]
-
-noteGet(limits[0])
-noteGet(limits[1])
 ```
+
+Furthermore, we'll see later that annotations can also be used to annotate fields in type schemas.
+
+!!! warning
+    The formatter may move annotations when it rewrites code. It chooses a canonical placement on a case-to-case basis, so an annotation may end up in a different location than in the original source. In particular, single-line annotations are often formatted as trailing annotations when they fit on the same line.
 
 ---
 
-## Annotating returned values explicitly
+## Annotations are metadata
 
-Sometimes you want to return a `null` with a note from inside a function. Write the annotation on the value you are returning:
+As already mentioned, annotations are metadata attached to values and they do not affect computation, as illustrated in the next code:
+
+```mindscript-repl
+==> # The golden ratio.
+... let phi = (1 + sqrt(5.)) / 2
+1.618033988749895 # the golden ratio.
+
+==> let phiCopy = phi
+1.618033988749895 # the golden ratio.
+
+==> phi == phi
+true
+
+==> 2 * phi
+3.23606797749979
+```
+
+This also shows that annotations are not automatically "carried through" derived values; you have to attach them where you want them. Only assignment preserves annotations.
+
+### Reading and writing annotations
+
+You can read and write annotations at runtime:
+
+* `noteGet(x) -> Str?` returns the annotation text, or `null` if none.
+* `noteSet(text: Str, value: Any) -> Any` attaches an annotation and returns the value.
+
+In the next example we programmatically set and retrieve an annotation:
 
 ```mindscript
-let findUser = fun(id: Str) -> {}? do
-    let u = { }  # pretend lookup
-    if u == null then
-        return (null  # <user not found>)
-    end
-    u
-end
+==> let c = 299_792_458
+299792458
+
+==> noteSet("The speed of light in meters per second.", c)
+299_792_458 # The speed of light in meters per second.
+
+==> noteGet(c)
+"The speed of light in meters per second."
 ```
 
-This style makes it obvious that the note belongs to the returned value.
-
----
-
-## Common surprises
-
-### Blank lines control whether a comment attaches
-
-If you intend a comment to be free-floating, put a blank line after it.
-
-If you intend it to annotate the next value, do not put a blank line in between.
-
-This is the most important practical rule to internalize.
-
-### Dot-chains cannot be interrupted
-
-Property access must be contiguous (`obj.name`). You cannot insert an annotation between `obj` and `.name`. Annotate the full expression instead:
-
-```mindscript
-# User's display name.
-let n = obj.name
-```
-
-### Calls and indexing are whitespace-sensitive
-
-Calls and indexing require no space before `(` or `[`.
-
-* `f(x)` is a call; `f (x)` is not.
-* `arr[i]` is indexing; `arr [i]` is not.
-
-This matters because it changes what the parser considers “the next expression”, which in turn changes what an annotation attaches to. When in doubt, annotate a whole line (or use parentheses) to make intent clear.
-
----
-
-## Recommended style
-
-* Use line-leading `# ...` blocks for documentation.
-* Use short, stable tags when annotating `null` for failure (`<invalid input>`, `<missing key>`, …).
-* Use a blank line after a comment block when you mean it as narration rather than as an annotation.
+These functions should be used with care under limited circumstances such as printing human-readable messages. Avoid using annotation content to drive logic.
 
 ---
 
 ## Summary
 
-* `# ...` attaches to the value of the **next expression** if there is no blank line separating them.
+* Single-line `# ...` annotations on the r.h.s. of an expression attach to its value; otherwise they attach to the value of the next expression if there is no blank line separating them.
 * A `# ...` block followed by a blank line is a standalone comment.
 * Annotations are metadata: they do not change evaluation.
 * Use `noteGet` / `noteSet` to work with annotations programmatically.

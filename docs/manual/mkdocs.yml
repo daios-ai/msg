@@ -63,9 +63,9 @@ nav:
     - learn/runtime.md
     - learn/values.md
     - learn/scopes.md
+    - learn/functions.md
     - learn/annotations.md
     - learn/errors.md
-    - learn/functions.md
     - learn/oracles.md
     - learn/io.md
     - learn/concurrency.md

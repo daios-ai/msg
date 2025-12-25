@@ -1,7 +1,7 @@
 
 # Scopes & Control
 
-In this chapter, we’ll explore how MindScript handles variable scope, block structure, and the three core control constructs: logical expressions, conditional expressions, and for-loops. 
+In this chapter, we’ll explore how MindScript handles variable scope, block structure, and the three core control constructs: logical expressions, conditional expressions, and loops. 
 
 
 ## Lexical Scoping and Blocks
@@ -48,11 +48,9 @@ println(result)   # prints "Hello, Andreas"
 
 Use block scoping to limit variable lifetimes, avoid name collisions, and make your code easier to reason about.
 
-## Control Structures
+## Logical Expressions (Short-Circuit)
 
 MindScript has three control flow constructs: logical expressions, conditionals, and loops.
-
-## Logical Expressions (Short-Circuit)
 
 The logical operators `and` and `or` *short-circuit*: the evaluation stops as soon as the result is determined.
 
@@ -90,52 +88,26 @@ let describeAge =
 println(describeAge)  # Adult
 ```
 
-Here, the individual branches are blocks: they have their own scope and return the last evaluated expression.
+Here, the individual branches are blocks: they have their own scope and return the last evaluated expression. If the `else` branch is omitted, it is implied to evaluate to `null`.
+
 
 ## Loop Expressions
 
-MindScript has `for` loops and `while` loops, and both are **expressions**: they evaluate to a value (typically the last value produced by the loop body).
-
-This section focuses on `for`, because it is the most common loop when processing arrays and objects.
-
-### Iterators
-
-`for` loops operate over *iterators*. An iterator is a function of type `Null -> Any?` that returns:
-
-* the next item, or
-* `null` to signal “no more items”.
-
-One way of building iterators from arrays or objects is using the `iter` function from the standard library:
-
-```mindscript
-let arr = [1, 2, 3, 4]
-let obj = {a: 1, b: 2, c: 3}
-
-let arrIt = iter(arr)
-let objIt = iter(obj)
-```
-
-Then, repeatedly invoking `arrIt()` and `objIt()` will return the sequences:
-
-```
-1, 2, 3, 4, null, ...
-
-["a", 1], ["b", 2], ["c", 3], null, ...
-```
-
-For objects, the iterator yields key–value pairs as two-element arrays. Objects also preserve insertion order when iterating.
+MindScript has `for` loops and `while` loops, and both are **expressions**: they typically evaluate to the last value produced by the loop body.
 
 ### The `for` loop form
 
-The loop constructor takes the form `for [v] in [it] do [block] end`, where `[v]` is an assignment target, `[it]` is:
+The loop constructor takes the form 
+``` mindscript
+for V in IT do BLOCK end
+```
+where `V` is an assignment target, `BLOCK` is an expression block, and `IT` is:
 
 * an array,
-* an object, or
-* an iterator function (`Null -> Any?`),
+* an object,
+* or an iterator function.
 
-and `[block]` is a block of expressions.
-
-Here is code to compute and print squares:
+For instance, the following loop computes and prints square numbers:
 
 ```mindscript
 let nums = [1, 2, 3, 4]
@@ -145,30 +117,49 @@ for n in nums do
 end
 ```
 
-This prints `1, 4, 9, 16`. Loops stop as soon as the iterator signals completion by returning `null`. Since loops are expressions, the value of the entire loop is the last computed value—in this case, `16`.
+This prints `1`, `4`, `9`, `16`, one per line. 
 
-You can influence the execution of a loop using `break` and `continue`. Both may carry a value, but they do not have to:
+Since loops are expressions, the value of the entire loop is the last computed value—in this case, `16`. You can influence the execution of a loop using `break` and `continue`. Both carry a value:
 
-* `break(x)` exits the loop and the loop expression evaluates to `x`.
-* `break` exits the loop and the loop expression evaluates to `null`.
-* `continue(x)` skips to the next iteration after evaluating `x`.
-* `continue` skips to the next iteration and yields `null` for that step.
+* `break x` exits the loop and the loop expression evaluates to `x`;
+* `continue x` skips to the next iteration after evaluating `x`.
 
-We can use this to mimic the behavior of a while loop. The code below computes the sum of positive numbers until a negative number is encountered:
+If the value is omitted, then it is assumed to be equal to `null`. 
+
+Similarly, iterating over a map works as expected:
 
 ```mindscript
-let it = iter([2, 3, -1, 7])
+let obj = {first: "Ada", last: "Lovelace", age: null, job: "programmer"}
 
-let total = 0
-for v in it do
-    if v < 0 then
-        break(total)
-    end
-    total = total + v
+for [key, value] in obj do
+    println(key + ": " + value)
 end
 ```
 
-This loop adds `2` and `3` and then breaks with a value equal to `5`.
+that is, the loop iterates over the key-value pairs (in an unspecified order).
+
+
+An **iterator function** is a function of type `Null -> Any` that either generates the next item or `null` to signal "no more items". A `for` loop terminates as soon as the iterator the completion by generating  a stop signal. 
+
+The standard library offers builtin iterators such as `range`, `natural` and `natural0`, and functions building iterators from others. You can also write your own iterators, using [closures](/learn/functions).
+
+### The `while` loop form
+
+A while loop has the form
+```
+while COND do BLOCK end
+```
+were `COND` is a boolean expression and `BLOCK` is an expression block. They execute the block as long as the condition is `true` and return the last evaluated expression.
+
+For example, the following while loop prints the square numbers from 1 to 4 and returns `5`:
+
+```mindscript
+let i = 1
+while i < 5 do
+    println(i)
+    i = i + 1
+end
+```
 
 ## Best Practices
 

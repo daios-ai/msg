@@ -431,6 +431,7 @@ type Callable interface {
 // (by parameter name) and the effect scope (where side effects should land).
 type CallCtx interface {
 	Arg(name string) Value
+	NumArg(name string) Value
 	Env() *Env
 }
 

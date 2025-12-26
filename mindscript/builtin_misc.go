@@ -1,4 +1,3 @@
-// === FILE: builtin_misc.go ===
 package mindscript
 
 import (
@@ -384,7 +383,7 @@ Returns:
 			[]ParamSpec{{Name: "x", Type: S{"id", "Num"}}},
 			S{"id", "Num"},
 			func(_ *Interpreter, ctx CallCtx) Value {
-				return Num(f(ctx.Arg("x").Data.(float64)))
+				return Num(f(ctx.NumArg("x").Data.(float64)))
 			},
 		)
 		setBuiltinDoc(target, name, doc)
@@ -441,7 +440,7 @@ Returns:
 		},
 		S{"id", "Num"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Num(math.Pow(ctx.Arg("base").Data.(float64), ctx.Arg("exp").Data.(float64)))
+			return Num(math.Pow(ctx.NumArg("base").Data.(float64), ctx.NumArg("exp").Data.(float64)))
 		},
 	)
 	setBuiltinDoc(target, "pow", `Power: base^exp.

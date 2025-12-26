@@ -511,6 +511,22 @@ func (c *callCtx) Arg(name string) Value {
 	fail("missing argument: " + name)
 	return Null
 }
+
+// NumArg returns the named argument as a Num Value:
+//   - Int is promoted to Num(float64(int64))
+//   - Num is returned as-is
+func (c *callCtx) NumArg(name string) Value {
+	v := c.Arg(name)
+	if v.Tag == VTInt {
+		return Num(float64(v.Data.(int64)))
+	}
+	if v.Tag == VTNum {
+		return v
+	}
+	fail("expected number: " + name)
+	return Null
+}
+
 func (c *callCtx) Env() *Env { return c.scope }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -8,12 +8,12 @@
 //  1. Builds a **prompt** that captures:
 //     • the oracle’s instruction (taken from the function Value’s .Annot),
 //     • the declared input type (parameter 0) and declared *success* return type,
-//     • optional example pairs [input, output] for few-shot guidance,
+//     • optional example for few-shot guidance (see "EXAMPLES" below),
 //     • the current call’s concrete input,
 //     and records that prompt internally (for debugging and testing).
 //
 //  2. Calls a pluggable backend hook in user space:
-//     __oracle_execute(prompt: Str, inType: Type, outType: Type, examples: [Any])
+//     __oracle_execute(prompt: Str) -> Str?
 //     which must return either:
 //     • Str — raw JSON (no fences) shaped like {"output": <value>}, or
 //     • Null — to signal failure.
@@ -23,6 +23,18 @@
 //  3. Validates the extracted value against the oracle’s **operational** return
 //     type, which is the declared success type widened to **nullable** (`T?`).
 //     On mismatch or parse failure, an *annotated null* Value is returned.
+//
+// EXAMPLES
+// --------
+// Oracles store examples in a canonical, signature-shaped form:
+//
+//	For an oracle with N parameters, each example is:
+//	  [arg1, arg2, ..., argN, returnValue]
+//
+//	where each arg_i conforms to the declared i-th parameter type and
+//	returnValue conforms to the oracle’s declared *success* return type
+//	(non-nullable). At runtime, examples are normalized into prompt-friendly
+//	pairs: [inputMap, {"output": returnValue}].
 //
 // Everything in this file is **private** implementation that the public
 // interpreter uses internally when executing oracle functions (see Interpreter
@@ -61,6 +73,7 @@ package mindscript
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -73,6 +86,77 @@ import (
 /* ===========================
    PRIVATE IMPLEMENTATION
    =========================== */
+
+// oracleSetExamples validates and sets examples on an oracle function.
+//
+// Canonical example format (arity N):
+//
+//	[arg1, arg2, ..., argN, returnValue]
+//
+// where each arg_i conforms to the declared i-th param type, and returnValue
+// conforms to the oracle's declared *success* return type (non-nullable).
+//
+// Passing Null clears examples.
+func (ip *Interpreter) oracleSetExamples(funVal Value, examples Value) error {
+	if funVal.Tag != VTFun {
+		return fmt.Errorf("not a function")
+	}
+	f := funVal.Data.(*Fun)
+	if f == nil || !f.IsOracle {
+		return fmt.Errorf("not an oracle")
+	}
+
+	// Recover original declaration signature (stable across currying).
+	paramNames := f.Params
+	declTypes := f.ParamTypes
+	if f.Sig != nil {
+		paramNames = f.Sig.Names
+		declTypes = f.Sig.Types
+	}
+
+	// Clear.
+	if examples.Tag == VTNull {
+		f.Examples = Null
+		return nil
+	}
+	if examples.Tag != VTArray {
+		return fmt.Errorf("examples must be an array or null")
+	}
+
+	n := len(declTypes)
+	if len(paramNames) != n {
+		return fmt.Errorf("oracle signature mismatch (names=%d types=%d)", len(paramNames), n)
+	}
+
+	// Success return type (examples represent successful outputs).
+	successRet := stripNullable(f.ReturnType)
+
+	exs := examples.Data.(*ArrayObject).Elems
+	for ei, ex := range exs {
+		if ex.Tag != VTArray {
+			return fmt.Errorf("example %d: must be an array", ei)
+		}
+		xs := ex.Data.(*ArrayObject).Elems
+		if len(xs) != n+1 {
+			return fmt.Errorf("example %d: expected %d items ([%d args..., return])", ei, n+1, n)
+		}
+
+		// Args.
+		for i := 0; i < n; i++ {
+			if !ip.isType(xs[i], declTypes[i], f.Env) {
+				return fmt.Errorf("example %d: arg %d does not match declared type", ei, i+1)
+			}
+		}
+
+		// Return value (success type).
+		if !ip.isType(xs[n], successRet, f.Env) {
+			return fmt.Errorf("example %d: return value does not match declared return type", ei)
+		}
+	}
+
+	f.Examples = examples
+	return nil
+}
 
 // execOracle is the primary oracle call engine used by the interpreter when an
 // oracle function is invoked. It builds the prompt, calls the backend hook,
@@ -296,44 +380,42 @@ func valueMapFromArgs(ctx CallCtx, names []string) Value {
 	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, Keys: keys}}
 }
 
-// Box examples: each example is [inVal, outVal]; normalize to maps for prompt rendering:
-// input → map[name]=..., output → {"output": outVal}.
-// Accepts a VTArray of pairs (or Null → returns empty).
+// Box examples (canonical):
+//
+//	each example is [arg1, ..., argN, returnValue]
+//
+// Normalize to prompt pairs:
+//
+//	input  → {"x": arg1, "y": arg2, ...}
+//	output → {"output": returnValue}
+//
+// Accepts a VTArray (or Null → returns empty).
 func boxExamplesAsMaps(exs Value, names []string) []Value {
 	out := []Value{}
 	if exs.Tag != VTArray {
 		return out
 	}
+	n := len(names)
 	for _, ex := range exs.Data.(*ArrayObject).Elems {
 		if ex.Tag != VTArray {
 			continue
 		}
-		pair := ex.Data.(*ArrayObject).Elems
-		if len(pair) != 2 {
+		xs := ex.Data.(*ArrayObject).Elems
+		if len(xs) != n+1 {
 			continue
 		}
-		inV, outV := pair[0], pair[1]
 
-		// Normalize input to a map using param order.
-		inMap := map[string]Value{}
-		keys := []string{}
-		if inV.Tag == VTArray {
-			xs := inV.Data.(*ArrayObject).Elems
-			for i := 0; i < len(xs) && i < len(names); i++ {
-				inMap[names[i]] = xs[i]
-				keys = append(keys, names[i])
-			}
-		} else {
-			// Single-arg case: use first name if available.
-			if len(names) > 0 {
-				inMap[names[0]] = inV
-				keys = append(keys, names[0])
-			}
+		// Input map from args.
+		inMap := make(map[string]Value, n)
+		keys := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			inMap[names[i]] = xs[i]
+			keys = append(keys, names[i])
 		}
 		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, Keys: keys}}
 
 		outVal := Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": outV},
+			Entries: map[string]Value{"output": xs[n]},
 			Keys:    []string{"output"},
 		}}
 

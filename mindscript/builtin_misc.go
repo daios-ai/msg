@@ -519,3 +519,66 @@ func stripAnnDeep(v Value) Value {
 		return v
 	}
 }
+
+func registerOracleBuiltins(ip *Interpreter, target *Env) {
+	// oracleExamples(fn: Any) -> Any
+	// Returns the oracle's stored examples (VTArray) or null.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"oracleGetExamples",
+		[]ParamSpec{{Name: "fn", Type: S{"id", "Any"}}},
+		S{"id", "Any"},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			v := ctx.Arg("fn")
+			if v.Tag != VTFun || v.Data == nil {
+				fail("oracleExamples: expected an oracle function")
+			}
+			f := v.Data.(*Fun)
+			if f == nil || !f.IsOracle {
+				fail("oracleExamples: expected an oracle function")
+			}
+			// Stored in canonical form: [ [arg1..argN, ret], ... ] or null.
+			return f.Examples
+		},
+	)
+	setBuiltinDoc(target, "oracleGetExamples", `Get examples attached to an oracle.
+
+Params:
+	fn: Any — must be an oracle function
+
+Returns:
+	Any — the examples array in canonical form, or null`)
+
+	// oracleSetExamples(fn: Any, examples: Any) -> Null
+	// Uses the engine validator; hard-fails (panic) on mismatch.
+	ip.RegisterRuntimeBuiltin(
+		target,
+		"oracleSetExamples",
+		[]ParamSpec{
+			{Name: "fn", Type: S{"id", "Any"}},
+			{Name: "examples", Type: S{"id", "Any"}},
+		},
+		S{"id", "Bool"},
+		func(ip *Interpreter, ctx CallCtx) Value {
+			fn := ctx.Arg("fn")
+			ex := ctx.Arg("examples")
+			if err := ip.OracleSetExamples(fn, ex); err != nil {
+				fail("oracleSetExamples: " + err.Error())
+			}
+			return Bool(true)
+		},
+	)
+	setBuiltinDoc(target, "oracleSetExamples", `Set examples on an oracle (hard-fails on type mismatch).
+
+Canonical example format for an oracle with N parameters:
+	[arg1, arg2, ..., argN, returnValue]
+
+Pass null to clear examples.
+
+Params:
+	fn: Any — must be an oracle function
+	examples: Any — array of examples or null
+
+Returns:
+	true if it succeeds.`)
+}

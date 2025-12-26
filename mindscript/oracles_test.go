@@ -761,3 +761,104 @@ func Test_Oracle_LexicalHook_SpawnedProcess(t *testing.T) {
 	}
 	wantStr(t, v, "Grace Hopper")
 }
+
+func Test_Oracle_SetExamples_MultiArg_EmitsExamplesInPrompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var prompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &prompt)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int, b: {name!: Str}) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	ex, err := ip.EvalSource(`[[1, {name:"Ada"}, "one"], [2, {name:"Bob"}, "two"]]`)
+	if err != nil {
+		t.Fatalf("EvalSource examples error: %v", err)
+	}
+
+	if err := ip.OracleSetExamples(fv, ex); err != nil {
+		t.Fatalf("OracleSetExamples error: %v", err)
+	}
+
+	_, err = ip.EvalSource(`f(9, {name:"Zoe"})`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if got := countExamplesInPrompt(prompt); got != 2 {
+		t.Fatalf("want 2 examples in prompt, got %d", got)
+	}
+}
+
+func Test_Oracle_SetExamples_ReplacesExamples(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var prompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &prompt)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	ex1, _ := ip.EvalSource(`[[0, "zero"]]`)
+	if err := ip.OracleSetExamples(fv, ex1); err != nil {
+		t.Fatalf("OracleSetExamples(1) error: %v", err)
+	}
+	_, _ = ip.EvalSource(`f(1)`)
+	if got := countExamplesInPrompt(prompt); got != 1 {
+		t.Fatalf("want 1 example after first set, got %d", got)
+	}
+
+	ex2, _ := ip.EvalSource(`[[1, "one"], [2, "two"]]`)
+	if err := ip.OracleSetExamples(fv, ex2); err != nil {
+		t.Fatalf("OracleSetExamples(2) error: %v", err)
+	}
+	_, _ = ip.EvalSource(`f(3)`)
+	if got := countExamplesInPrompt(prompt); got != 2 {
+		t.Fatalf("want 2 examples after replace, got %d", got)
+	}
+}
+
+func Test_Oracle_SetExamples_WrongArity_ReturnsError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"ignored"}`)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int, b: Int) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	// Needs 3 elements: [a, b, ret]. This has 2.
+	bad, _ := ip.EvalSource(`[[1, "nope"]]`)
+
+	if err := ip.OracleSetExamples(fv, bad); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+func Test_Oracle_SetExamples_TypeMismatch_ReturnsError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"ignored"}`)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	// a expects Int; given Str.
+	bad, _ := ip.EvalSource(`[[ "x", "ok" ]]`)
+
+	if err := ip.OracleSetExamples(fv, bad); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}

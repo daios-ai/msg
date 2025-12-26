@@ -759,6 +759,18 @@ func (ip *Interpreter) RegisterNative(
 	ip.Core.Define(name, funVal)
 }
 
+// OracleSetExamples validates and installs examples for an oracle function.
+//
+// Canonical example format for an oracle with N params:
+//
+//	[arg1, arg2, ..., argN, returnValue]
+//
+// Passing Null clears examples.
+func (ip *Interpreter) OracleSetExamples(fn Value, examples Value) error {
+	// Delegate to the private oracle implementation.
+	return ip.oracleSetExamples(fn, examples)
+}
+
 // AsMapValue returns a VTMap view for VTMap/VTModule (sharing the same MapObject),
 // else returns the input unchanged. This is useful when callers want uniform map
 // handling for modules and plain maps.

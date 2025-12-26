@@ -280,25 +280,19 @@ func initCore(ip *Interpreter) {
 				types[i] = typesV[i].Data.(*TypeValue).Ast
 			}
 
-			// ---- Validate and box examples as a VTArray of [input, output] pairs ----
-			var examples Value
-			if exAny.Tag == VTNull {
-				examples = Arr(nil)
-			} else if exAny.Tag == VTArray {
-				pairs := exAny.Data.(*ArrayObject).Elems
-				for i, ex := range pairs {
-					if ex.Tag != VTArray {
-						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
-					}
-					pp := ex.Data.(*ArrayObject).Elems
-					if len(pp) != 2 {
-						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
-					}
+			// ---- Examples (oracles only): canonical [arg1, ..., argN, returnVal] ----
+			// Validation is performed via oracleSetExamples (and failures are runtime errors).
+			var examples Value = Null
+			if isOr {
+				if exAny.Tag == VTNull {
+					examples = Null
+				} else if exAny.Tag == VTArray {
+					// Detach the slice so later mutations to the caller's array don't alias.
+					xs := exAny.Data.(*ArrayObject).Elems
+					examples = Arr(append([]Value(nil), xs...))
+				} else {
+					fail("examples must be an array of canonical examples ([arg1, ..., argN, returnVal]) or null")
 				}
-				// Detach the slice so later mutations to the caller's array don't alias.
-				examples = Arr(append([]Value(nil), pairs...))
-			} else {
-				return errNull("examples must be an array of [input, output] pairs (or null)")
 			}
 
 			hidden := false
@@ -338,7 +332,7 @@ func initCore(ip *Interpreter) {
 			bodyAst := expectAST(bodyAny, "__make_fun")
 
 			// Construct the function closing over the **parent env directly** (no extra frame).
-			return FunVal(&Fun{
+			fn := &Fun{
 				Params:     names,
 				ParamTypes: types,
 				ReturnType: retAst,
@@ -346,13 +340,21 @@ func initCore(ip *Interpreter) {
 				Env:        ctx.Env(), // <-- direct parent; makes globals late-bind correctly
 				HiddenNull: hidden,
 				IsOracle:   isOr,
-				Examples:   examples,
+				Examples:   Null,
 				Src:        sr,
 				Sig: &SigMeta{
 					Names: append([]string{}, names...),
 					Types: append([]S{}, types...),
 				},
-			})
+			}
+			fv := FunVal(fn)
+			// If oracle with examples, set them now.
+			if isOr {
+				if err := ip.oracleSetExamples(fv, examples); err != nil {
+					fail(err.Error())
+				}
+			}
+			return fv
 		})
 
 	// __is_fun(x: Any) -> Bool

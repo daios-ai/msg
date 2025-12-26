@@ -88,6 +88,7 @@ func (ip *Interpreter) SeedRuntimeInto(target *Env) error {
 	registerMathBuiltins(ip, target)
 	registerFFIBuiltins(ip, target)
 	registerActorBuiltins(ip, target)
+	registerOracleBuiltins(ip, target)
 
 	// --- Load prelude into the SAME target (overrideable within namespace) ---
 	// If you need to load from a different spec, make this configurable by caller.

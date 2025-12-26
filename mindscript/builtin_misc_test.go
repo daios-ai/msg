@@ -22,6 +22,9 @@ func approx(a, b, eps float64) bool {
 	return d <= eps
 }
 
+// strconvI formats an int as a decimal string (avoid importing strconv at top).
+func strconvI(n int) string { return fmt.Sprintf("%d", n) }
+
 func Test_Builtin_Misc_rand_seed_and_randInt_deterministic(t *testing.T) {
 	ip, _ := NewInterpreter()
 
@@ -225,7 +228,82 @@ func Test_Builtin_Misc_exit(t *testing.T) {
 	}
 }
 
-// --- helpers ---
+func Test_Builtin_Misc_math_unary_Num_funcs_accept_Int(t *testing.T) {
+	ip, _ := NewInterpreter()
 
-// strconvI formats an int as a decimal string (avoid importing strconv at top).
-func strconvI(n int) string { return fmt.Sprintf("%d", n) }
+	// Declared (Num) -> Num, but Int should be accepted without panicking.
+	if v := evalWithIP(t, ip, `sin(0)`); v.Tag != VTNum || !approx(v.Data.(float64), 0.0, 1e-12) {
+		t.Fatalf("sin(0) => 0.0, got %#v", v)
+	}
+	if v := evalWithIP(t, ip, `cos(0)`); v.Tag != VTNum || !approx(v.Data.(float64), 1.0, 1e-12) {
+		t.Fatalf("cos(0) => 1.0, got %#v", v)
+	}
+	if v := evalWithIP(t, ip, `sqrt(9)`); v.Tag != VTNum || !approx(v.Data.(float64), 3.0, 1e-12) {
+		t.Fatalf("sqrt(9) => 3.0, got %#v", v)
+	}
+}
+
+func Test_Builtin_Misc_math_pow_accepts_Ints(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	v := evalWithIP(t, ip, `pow(2, 10)`)
+	if v.Tag != VTNum || !approx(v.Data.(float64), 1024.0, 1e-12) {
+		t.Fatalf("pow(2,10) => 1024.0, got %#v", v)
+	}
+}
+
+func Test_Misc_oracleSetExamples_returns_true_on_success(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		do
+			let f = oracle(n: Int, m: Int) -> Int
+			oracleSetExamples(f, [[1, 2, 3]])
+		end
+	`)
+	if v.Tag != VTBool || v.Data.(bool) != true {
+		t.Fatalf("oracleSetExamples should return true on success, got %#v", v)
+	}
+}
+
+func Test_Misc_oracleGetExamples_roundtrip_canonical_shape(t *testing.T) {
+	ip, _ := NewInterpreter()
+	v := evalWithIP(t, ip, `
+		do
+			let f = oracle(n: Int, m: Int) -> Int
+			oracleSetExamples(f, [[1, 2, 3], [4, 5, 6]])
+			oracleGetExamples(f)
+		end
+	`)
+	if v.Tag != VTArray {
+		t.Fatalf("oracleGetExamples should return array when set, got %#v", v)
+	}
+	exs := v.Data.(*ArrayObject).Elems
+	if len(exs) != 2 {
+		t.Fatalf("expected 2 examples, got %d", len(exs))
+	}
+	for i, ex := range exs {
+		if ex.Tag != VTArray {
+			t.Fatalf("example %d should be array, got %#v", i, ex)
+		}
+		if got := len(ex.Data.(*ArrayObject).Elems); got != 3 {
+			t.Fatalf("example %d should have arity 3 ([arg1,arg2,ret]), got %d", i, got)
+		}
+	}
+}
+
+func Test_Misc_oracleSetExamples_hard_fails_on_bad_shape(t *testing.T) {
+	ip, _ := NewInterpreter()
+	_, err := ip.EvalSource(`
+		do
+			let f = oracle(n: Int, m: Int) -> Int
+			oracleSetExamples(f, [[1, 2]])
+		end
+	`)
+	if err == nil {
+		t.Fatalf("expected runtime error, got nil")
+	}
+	re := regexp.MustCompile(`oracleSetExamples:\s+example 0:\s+expected 3 items`)
+	if !re.MatchString(err.Error()) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

@@ -585,7 +585,7 @@ end
 let _oracleLastPrompt = null
 
 # Rolling log of oracle prompts and outputs captured for diagnostics.
-# Type: [[Str]]
+# Type: [[Str?]]
 let _oracleLog = []
 
 # Install an oracle executor that records each prompt before forwarding.
@@ -611,7 +611,7 @@ end
 # Return the full recorded oracle prompt/output log.
 # Args: _: Null (ignored)
 # Return: [[Str]]
-let oracleLog = fun(_: Null) -> [[Str]] do
+let oracleLog = fun(_: Null) -> [[Str?]] do
 	_oracleLog
 end
 

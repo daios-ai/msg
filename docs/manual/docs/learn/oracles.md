@@ -43,7 +43,11 @@ Once declared, calling an oracle is just a normal call:
 
 Sometimes you want to help the oracle to produce outputs by supplying input/output examples. This is especially useful when the intended function is difficult to describe with an instruction alone. This is done with the keyword `from` followed by an array containing examples.
 
-A valid collection of examples is an array containing input-output pairs that must conform to the type constraints. For instance, let's say we want to create an oracle that takes a number as input (`Int`) and outputs that number spelled in English (`Str`), such as `5` and `five`. Then, this is how we could declare an oracle based on a handful of examples:
+A valid collection of examples is an array containing input-output pairs that must conform to the type constraints. The general format of a single example is
+```mindscript
+[in1, in2, ..., inN, out]
+```
+where `in1` to `inN` are the input values and `out` is the output value, totalling *N*+1 values for an oracle with *N* inputs. For instance, let's say we want to create an oracle that takes a number as input (`Int`) and outputs that number spelled in English (`Str`), such as `5` and `five`. Then, this is how we could declare an oracle based on a handful of examples:
 
 ```mindscript
 let examples = [
@@ -72,51 +76,67 @@ Now calls can generalize beyond the examples:
 "one thousand twenty-four"
 ```
 
-Notice that in this case we did not supply an instruction, although we could have. You can combine an annotation (instruction) with examples:
+This examples demonstrates how to drive the behavior of an oracle *only* based on  few-shot examples, with no instructions. Of course, you can combine instruction and examples like so:
 
 ```mindscript
 # Convert integers to English words.
 let numberToEnglish = oracle(number: Int) -> Str from examples
 ```
 
+The performance of oracles can improve significantly with a handful of examples, especially when it is hard to describe the task in words.
+
+There are two helper functions to get and set an oracle `o`'s examples after it has been declared:
+
+* `oracleGetExamples(o)` returns the examples;
+* and `oracleSetExamples(o, examples)` sets them.
+
 ---
 
 ## Oracle execution details
 
-Let's have a peek under the hood to see how oracles are implemented.
+!!! note
+    This sections contains technical information for advanced usage.
 
-When an oracle is called, MindScript does the following:
+Let's have a peek under the hood to see how oracles are implemented. When an oracle is called, the runtime executes the following sequence:
 
-* it builds a prompt using all the available hints,
-* it calls a oracle execution callback function,
-* the result gets parsed, type-checked, and returned.
+- *Prompt construction*: it builds a prompt using all the available hints.
+- *Backend call*: it calls a oracle execution callback function.
+- *Result analysis*: it parses and type-checks the result.
+
+The details follow.
 
 ### Prompt construction 
 
-When you call an oracle, MindScript builds a prompt that includes:
+During this phase construction MindScript builds a prompt from:
 
-* a *system prompt*, asking the model to follow the instruction and return a valid JSON object;
+* a global *system prompt*, asking the model to follow the instruction and return a valid JSON object;
 * an **instruction*, which is the oracle's annotation;
-* an *input JSON Schema* derived from parameter names and parameter types;
-* an *output JSON Schema* derived from the return type, **boxed** as `{"output": T}` where `T` is the oracle’s declared return type in case of success;
+* an *input JSON Schema* derived from parameter names and types;
+* an *output JSON Schema* derived from the return type `T`, **boxed** as `{"output": T}`;
 * *examples*, normalized (inputs transformed into a map, outputs boxed),
-* the current call’s concrete input values.
+* the current call's *input values*.
 
-### The oracle callback function `__oracle_execute`
+This data is then inserted into a prompt template, ready to be delivered. 
 
-The MindScript runtime assumes there is a global callback function
+### Backend call and `__oracle_execute`
+
+The MindScript runtime assumes there is an *LLM callback function* with signature
 
 ```mindscript
 __oracle_execute(prompt: Str) -> Str?
 ```
 
-Which receives the prompt and returns a string. Any function that conforms to this signature can be assigned to it, *but MindScript assumes it is the LLM backend.* The oracle will execute whichever function is bound to the variable `__oracle_execute` within the lexical scope *at declaration time*.
+defined within the oracle's lexical environment. The oracle will call this function with the prompt, expecting a string in return. In other words, the oracle will execute whichever function is bound to the variable `__oracle_execute` within the lexical scope *at declaration time*.
 
-This design allows installing new or multiple LLM backends at runtime.
+This design allows installing/changing backends at runtime by assigning a new backend `exec` to `__oracle_execute`, or equivalently, by calling the standard helper function to install a new backend is
+```mindscript
+oracleInstall(exec: Str -> Str?) -> Bool
+```
 
-### What the model must return
 
-The prompt asks the model to output valid JSON, without code fences. This could be either:
+### Result Analysis 
+
+The prompt asks the model to output a valid JSON string, without code fences. This could be either:
 
 * a boxed object: `{"output": <value>}`, or
 * a bare value `<value>` (which MindScript will treat as if it were `{"output": <value>}`).
@@ -127,13 +147,32 @@ If parsing fails or the value doesn’t match the declared type, the oracle call
 
 ## Backend management
 
-At startup, MindScript installs builtins and loads the standard library `std` from the standard library directory (`~/.mindscript/lib`). The latter in turn imports the module `llm` which implements the backends. 
-
-The standard library exposes a simple workflow:
+At startup, MindScript automatically loads LLM helper functions and the LLM management module `llm`. This module exposes the following utility functions:
 
 * `oracleStatus()` reports whether an oracle backend is installed.
 * `oracleHealth()` performs a small end-to-end oracle call and reports success/failure.
 * `oracleInstall(exec)` installs a backend function `exec: Str -> Str?` as `__oracle_execute`.
+* `llm.status()`, to report the current backend status;
+* `llm.backends()`, to list the registered backend names;
+* `llm.useBackend(name: Str)`, to switch to another backend by name;
+* `llm.models()`, to list the available models for the chosen backend;
+* `llm.useModel(name: Str)`, to set the active model for the backend.
+
+The typical workflow is as follows: at the beginning of a program, we call `llm.useBackend` and `llm.useModel` with the chosen LLM backend and model, respectively. For instance,
+
+```mindscript
+llm.useBackend("openai-responses")
+llm.useModel("gpt-4.1-mini")
+
+# oracle definitions
+...
+```
+
+Internally, 
+
+In addition, there are the following helper functions:
+
+
 
 By default, the prelude imports `llm` and installs `llm.exec` as the oracle backend. You can inspect and change the backend/model through the `llm` module:
 

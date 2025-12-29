@@ -7,22 +7,30 @@
 //
 //  1. Builds a **prompt** that captures:
 //     • the oracle’s instruction (taken from the function Value’s .Annot),
-//     • the declared input type (parameter 0) and declared *success* return type,
-//     • optional example for few-shot guidance (see "EXAMPLES" below),
+//     • the declared input type (parameter map built from the declaration),
+//     • the declared *success* return type boxed as {"output": T},
+//     • optional examples for few-shot guidance (see "EXAMPLES" below),
 //     • the current call’s concrete input,
 //     and records that prompt internally (for debugging and testing).
 //
-//  2. Calls a pluggable backend hook in user space:
-//     __oracle_execute(prompt: Str) -> Str?
-//     which must return either:
-//     • Str — raw JSON (no fences) shaped like {"output": <value>}, or
-//     • Null — to signal failure.
-//     The interpreter parses the JSON via the host-provided global function
-//     jsonParse : Str -> Any (from the standard library).
+//     The prompt is currently constructed by this file’s internal builder
+//     (see buildOraclePrompt). There is no user-space prompt hook.
 //
-//  3. Validates the extracted value against the oracle’s **operational** return
-//     type, which is the declared success type widened to **nullable** (`T?`).
-//     On mismatch or parse failure, an *annotated null* Value is returned.
+//  2. Calls a pluggable backend hook resolved from the oracle’s lexical scope:
+//     __oracle_execute(prompt: Str) -> Str | Null
+//     which must return either:
+//     • Str  — raw JSON (no code fences) representing either:
+//     - {"output": <value>}  (preferred), or
+//     - a bare JSON value     (will be boxed to {"output": <value>})
+//     • Null — to signal failure.
+//
+//  3. Parses returned JSON using the host-side permissive repair/parser
+//     (jsonRepair), extracts/boxes the {"output": ...} field, and validates the
+//     extracted value against the oracle’s **operational** return type.
+//
+//     Oracles are **operationally nullable**: at runtime, outputs are validated
+//     against T? (declared success type widened to nullable unless Any).
+//     On parse failure or type mismatch, an *annotated null* Value is returned.
 //
 // EXAMPLES
 // --------
@@ -54,17 +62,18 @@
 // • schema.go
 //   - (*Interpreter) TypeValueToJSONSchema(...) to render JSON Schema for types.
 //
-// • std/lib.ms (MindScript standard library in user space)
-//   - jsonParse : Str -> Any  — required for parsing model JSON.
+// • json.go
+//   - jsonRepair(...) and Go↔︎Value JSON conversion helpers used for parsing and
+//     boxing oracle results.
 //
 // • Runtime hooks (user space, optional/required):
 //   - REQUIRED:  __oracle_execute(prompt: Str) -> Str | Null
-//   - OPTIONAL:  __oracle_build_prompt(instruction: Str, inType: Type, outType: Type, examples: [Any]) -> Str
 //
 // NOTE
 // ----
 // Oracles are **operationally nullable**: a declared return type T is validated
-// as T? at runtime. The backend must produce boxed JSON {"output": <value>}.
+// as T? at runtime. The backend should produce boxed JSON {"output": <value>},
+// but a bare JSON value is accepted and will be boxed automatically.
 //
 // ──────────────────────────────────────────────────────────────────────────────
 // PUBLIC API

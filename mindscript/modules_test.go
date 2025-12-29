@@ -151,7 +151,7 @@ func Test_Module_ImportFile_Cycle_TwoModules_IsHardError(t *testing.T) {
 	}
 }
 
-// Parse/runtime contract errors are HARD; resolver failures are SOFT.
+// Parse/runtime contract errors are HARD; resolver/fetch failures are HARD (clean resolver).
 func Test_Module_ImportFile_ErrorClassification_ParseRuntimeOperational(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()
@@ -201,19 +201,14 @@ func Test_Module_ImportFile_ErrorClassification_ParseRuntimeOperational(t *testi
 		t.Fatalf("want hard error indicating type mismatch for param x; got: %v", terr)
 	}
 
-	// 5) Missing file/resolve error → SOFT annotated null.
-	v, ferr := ip.EvalSource(`import("no_such_file")`)
-	if ferr != nil {
-		t.Fatalf("expected soft error (annotated null) for missing file, got hard error: %v", ferr)
+	// 5) Missing file/resolve error → HARD (clean resolver).
+	_, ferr := ip.EvalSource(`import("no_such_file")`)
+	if ferr == nil {
+		t.Fatalf("expected hard error for missing module, got nil")
 	}
-	if v.Tag != VTNull {
-		t.Fatalf("expected VTNull soft error value for missing file, got: %#v", v)
-	}
-	if v.Annot == "" || (!strings.Contains(strings.ToLower(v.Annot), "no_such_file") &&
-		!strings.Contains(strings.ToLower(v.Annot), "not found") &&
-		!strings.Contains(strings.ToLower(v.Annot), "module") &&
-		!strings.Contains(strings.ToLower(v.Annot), "import")) {
-		t.Fatalf("want annotation indicating missing file; got: %#v", v)
+	flo := strings.ToLower(ferr.Error())
+	if !strings.Contains(flo, "no_such_file") && !strings.Contains(flo, "not found") {
+		t.Fatalf("want error mentioning missing module; got: %v", ferr)
 	}
 }
 
@@ -239,25 +234,20 @@ func Test_Module_ContractualMistakes_AreHard(t *testing.T) {
 	}
 }
 
-// Operational loader issues (resolve/fetch) are SOFT.
-func Test_Module_SoftOperationalErrors_AreSoft(t *testing.T) {
+func Test_Module_OperationalErrors(t *testing.T) {
 	dir, done := withTempDir(t)
 	defer done()
 	defer chdir(t, dir)()
 
 	ip, _ := NewInterpreter()
 
-	v, err := ip.EvalSource(`import("does_not_exist")`)
-	if err != nil {
-		t.Fatalf("expected soft error (annotated null), got hard error: %v", err)
+	_, err := ip.EvalSource(`import("does_not_exist")`)
+	if err == nil {
+		t.Fatalf("expected hard error for missing module, got nil")
 	}
-	if v.Tag != VTNull {
-		t.Fatalf("expected VTNull soft error value, got: %#v", v)
-	}
-	if v.Annot == "" || (!strings.Contains(strings.ToLower(v.Annot), "does_not_exist") &&
-		!strings.Contains(strings.ToLower(v.Annot), "not found") &&
-		!strings.Contains(strings.ToLower(v.Annot), "import")) {
-		t.Fatalf("want annotation mentioning missing module; got: %#v", v)
+	lo := strings.ToLower(err.Error())
+	if !strings.Contains(lo, "does_not_exist") && !strings.Contains(lo, "not found") {
+		t.Fatalf("want error mentioning missing module; got: %v", err)
 	}
 }
 
@@ -418,21 +408,24 @@ m.x`)
 	wantInt(t, v, 5)
 }
 
-// HTTP 404/resolve errors are operational → SOFT annotated null.
-func Test_Module_ImportHTTP_404_IsSoft(t *testing.T) {
+// HTTP 404 is an operational loader error → HARD (clean resolver).
+func Test_Module_ImportHTTP_404(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
 
 	ip, _ := NewInterpreter()
-	v, err := ip.EvalSource(`import("` + srv.URL + `/nope")`)
-	if err != nil {
-		t.Fatalf("expected soft error (annotated null) for 404, got hard error: %v", err)
+
+	_, err := ip.EvalSource(`import("` + srv.URL + `/nope")`)
+	if err == nil {
+		t.Fatalf("expected hard error for HTTP 404, got nil")
 	}
-	if v.Tag != VTNull {
-		t.Fatalf("expected VTNull soft error for 404, got: %#v", v)
+
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "module not found") {
+		t.Fatalf("want error containing %q, got: %v", "module not found", err)
 	}
-	if v.Annot == "" || !strings.Contains(strings.ToLower(v.Annot), "http") {
-		t.Fatalf("want annotation mentioning http fetch failure; got: %#v", v)
+	if !strings.Contains(err.Error(), srv.URL) || !strings.Contains(err.Error(), "/nope") {
+		t.Fatalf("want error mentioning url/path, got: %v", err)
 	}
 }
 
@@ -488,8 +481,8 @@ m2.x`)
 	wantInt(t, v, 99)
 }
 
-// HTTP 500 is operational → SOFT annotated null.
-func Test_Module_ImportHTTP_500_IsSoft(t *testing.T) {
+// HTTP 500 is an operational loader error → HARD (clean resolver).
+func Test_Module_ImportHTTP_500(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		_, _ = w.Write([]byte("boom"))
@@ -497,14 +490,13 @@ func Test_Module_ImportHTTP_500_IsSoft(t *testing.T) {
 	defer srv.Close()
 
 	ip, _ := NewInterpreter()
-	v, err := ip.EvalSource(`import("` + srv.URL + `/oops")`)
-	if err != nil {
-		t.Fatalf("expected soft error (annotated null) for HTTP 500, got hard error: %v", err)
+
+	_, err := ip.EvalSource(`import("` + srv.URL + `/oops")`)
+	if err == nil {
+		t.Fatalf("expected hard error for HTTP 500, got nil")
 	}
-	if v.Tag != VTNull {
-		t.Fatalf("expected VTNull soft error for HTTP 500, got: %#v", v)
-	}
-	wantAnnotatedContains(t, v, "http 500")
+	wantErrContains(t, err, "http")
+	wantErrContains(t, err, "500")
 }
 
 // Mixed chain: file module importing an HTTP module (extensionless URL) works.

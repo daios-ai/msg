@@ -189,17 +189,27 @@ func Test_Builtin_Core_mapHas_and_mapDelete(t *testing.T) {
 func Test_Builtin_Core_import_and_importCode_paths(t *testing.T) {
 	ip, _ := NewInterpreter()
 
-	// import: with no loader configured, must return annotated null
-	v := evalWithIP(t, ip, `import("does-not-exist")`)
-	wantAnnotatedContains(t, v, "module not found")
+	// import: missing module is now a HARD runtime error.
+	_, err := ip.EvalSource(`import("does-not-exist")`)
+	if err == nil {
+		t.Fatalf("expected hard error for missing module, got nil")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "module not found") || !strings.Contains(msg, "does-not-exist") {
+		t.Fatalf("want error mentioning module not found and does-not-exist; got: %v", err)
+	}
 
 	// importCode: parse error should be a hard error
-	_, err := ip.EvalSource(`importCode("m", "let")`)
-	wantErrContains(t, err, "parse error")
+	_, err = ip.EvalSource(`importCode("m", "let")`)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "parse error") {
+		t.Fatalf("want parse error; got: %v", err)
+	}
 
-	// importCode: runtime failure during init becomes annotated null
-	_, err2 := ip.EvalSource(`importCode("m2", "fail(\"boom\")")`)
-	wantErrContains(t, err2, "boom")
+	// importCode: runtime failure during init is a hard error
+	_, err = ip.EvalSource(`importCode("m2", "fail(\"boom\")")`)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "boom") {
+		t.Fatalf("want error containing boom; got: %v", err)
+	}
 
 	// importCode: a simple valid module should succeed
 	mod := evalWithIP(t, ip, `importCode("m3", "let answer = 42")`)

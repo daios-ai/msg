@@ -92,59 +92,6 @@ There are two helper functions to get and set an oracle `o`'s examples after it 
 
 ---
 
-## Oracle execution details
-
-!!! note
-    This sections contains technical information for advanced usage.
-
-Let's have a peek under the hood to see how oracles are implemented. When an oracle is called, the runtime executes the following sequence:
-
-- *Prompt construction*: it builds a prompt using all the available hints.
-- *Backend call*: it calls a oracle execution callback function.
-- *Result analysis*: it parses and type-checks the result.
-
-The details follow.
-
-### Prompt construction 
-
-During this phase construction MindScript builds a prompt from:
-
-* a global *system prompt*, asking the model to follow the instruction and return a valid JSON object;
-* an **instruction*, which is the oracle's annotation;
-* an *input JSON Schema* derived from parameter names and types;
-* an *output JSON Schema* derived from the return type `T`, **boxed** as `{"output": T}`;
-* *examples*, normalized (inputs transformed into a map, outputs boxed),
-* the current call's *input values*.
-
-This data is then inserted into a prompt template, ready to be delivered. 
-
-### Backend call and `__oracle_execute`
-
-The MindScript runtime assumes there is an *LLM callback function* with signature
-
-```mindscript
-__oracle_execute(prompt: Str) -> Str?
-```
-
-defined within the oracle's lexical environment. The oracle will call this function with the prompt, expecting a string in return. In other words, the oracle will execute whichever function is bound to the variable `__oracle_execute` within the lexical scope *at declaration time*.
-
-This design allows installing/changing backends at runtime by assigning a new backend `exec` to `__oracle_execute`, or equivalently, by calling the standard helper function to install a new backend is
-```mindscript
-oracleInstall(exec: Str -> Str?) -> Bool
-```
-
-
-### Result Analysis 
-
-The prompt asks the model to output a valid JSON string, without code fences. This could be either:
-
-* a boxed object: `{"output": <value>}`, or
-* a bare value `<value>` (which MindScript will treat as if it were `{"output": <value>}`).
-
-If parsing fails or the value doesn’t match the declared type, the oracle call returns an error. MindScript also attempts to repair common “JSON-ish” mistakes (fences, trailing commas, single quotes, etc.), but you should still aim for strict JSON.
-
----
-
 ## Backend management
 
 At startup, MindScript automatically loads LLM helper functions and the LLM management module `llm`. This module exposes the following utility functions:
@@ -238,4 +185,57 @@ end
 ### Secrets and untrusted text
 
 Treat oracle prompts as data you may log. Avoid embedding secrets directly in prompts. When consuming untrusted text, keep the oracle output schema narrow and validate the result before using it.
+
+---
+
+## Oracle execution technical details
+
+!!! danger
+    This sections contains technical information intended for advanced usage.
+
+Let's have a peek under the hood to see how oracles are implemented. When an oracle is called, the runtime executes the following sequence:
+
+- *Prompt construction*: it builds a prompt using all the available hints.
+- *Backend call*: it calls a oracle execution callback function.
+- *Result analysis*: it parses and type-checks the result.
+
+The details follow.
+
+### Prompt construction 
+
+During this phase construction MindScript builds a prompt from:
+
+* a global *system prompt*, asking the model to follow the instruction and return a valid JSON object;
+* an *instruction*, which is the oracle's annotation;
+* an *input JSON Schema* derived from parameter names and types;
+* an *output JSON Schema* derived from the return type `T`, **boxed** as `{"output": T}`;
+* *examples*, normalized (inputs transformed into a map, outputs boxed),
+* the current call's *input values*.
+
+This data is then inserted into a prompt template, ready to be delivered. 
+
+### Backend call and `__oracle_execute`
+
+The MindScript runtime assumes there is an *LLM callback function* with signature
+
+```mindscript
+__oracle_execute(prompt: Str) -> Str?
+```
+
+defined within the oracle's lexical environment. The oracle will call this function with the prompt, expecting a string in return. In other words, the oracle will execute whichever function is bound to the variable `__oracle_execute` within the lexical scope *at declaration time*.
+
+This design allows installing/changing backends at runtime by assigning a new backend `exec` to `__oracle_execute`, or equivalently, by calling the standard helper function to install a new backend is
+```mindscript
+oracleInstall(exec: Str -> Str?) -> Bool
+```
+
+
+### Result Analysis 
+
+The prompt asks the model to output a valid JSON string, without code fences. This could be either:
+
+* a boxed object: `{"output": <value>}`, or
+* a bare value `<value>` (which MindScript will treat as if it were `{"output": <value>}`).
+
+If parsing fails or the value doesn’t match the declared type, the oracle call returns an error. MindScript also attempts to repair common “JSON-ish” mistakes (fences, trailing commas, single quotes, etc.), but you should still aim for strict JSON.
 

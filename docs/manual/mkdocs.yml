@@ -67,6 +67,7 @@ nav:
     - learn/annotations.md
     - learn/errors.md
     - learn/oracles.md
+    - learn/modules.md
     - learn/io.md
     - learn/concurrency.md
     - learn/networking.md

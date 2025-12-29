@@ -430,7 +430,7 @@ let importUrl = fun(url: Str) -> {}? do
 	if r.ok then
 		r.value
 	else
-		error("import failed: " + str(r.error))
+		error("import failed: " + str(r.value))
 	end
 end
 

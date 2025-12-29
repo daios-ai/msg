@@ -281,25 +281,19 @@ func initCore(ip *Interpreter) {
 				types[i] = typesV[i].Data.(*TypeValue).Ast
 			}
 
-			// ---- Validate and box examples as a VTArray of [input, output] pairs ----
-			var examples Value
-			if exAny.Tag == VTNull {
-				examples = Arr(nil)
-			} else if exAny.Tag == VTArray {
-				pairs := exAny.Data.(*ArrayObject).Elems
-				for i, ex := range pairs {
-					if ex.Tag != VTArray {
-						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
-					}
-					pp := ex.Data.(*ArrayObject).Elems
-					if len(pp) != 2 {
-						return errNull(fmt.Sprintf("examples[%d] must be [input, output] (array of length 2)", i))
-					}
+			// ---- Examples (oracles only): canonical [arg1, ..., argN, returnVal] ----
+			// Validation is performed via oracleSetExamples (and failures are runtime errors).
+			var examples Value = Null
+			if isOr {
+				if exAny.Tag == VTNull {
+					examples = Null
+				} else if exAny.Tag == VTArray {
+					// Detach the slice so later mutations to the caller's array don't alias.
+					xs := exAny.Data.(*ArrayObject).Elems
+					examples = Arr(append([]Value(nil), xs...))
+				} else {
+					fail("examples must be an array of canonical examples ([arg1, ..., argN, returnVal]) or null")
 				}
-				// Detach the slice so later mutations to the caller's array don't alias.
-				examples = Arr(append([]Value(nil), pairs...))
-			} else {
-				return errNull("examples must be an array of [input, output] pairs (or null)")
 			}
 
 			hidden := false
@@ -339,7 +333,7 @@ func initCore(ip *Interpreter) {
 			bodyAst := expectAST(bodyAny, "__make_fun")
 
 			// Construct the function closing over the **parent env directly** (no extra frame).
-			return FunVal(&Fun{
+			fn := &Fun{
 				Params:     names,
 				ParamTypes: types,
 				ReturnType: retAst,
@@ -347,13 +341,21 @@ func initCore(ip *Interpreter) {
 				Env:        ctx.Env(), // <-- direct parent; makes globals late-bind correctly
 				HiddenNull: hidden,
 				IsOracle:   isOr,
-				Examples:   examples,
+				Examples:   Null,
 				Src:        sr,
 				Sig: &SigMeta{
 					Names: append([]string{}, names...),
 					Types: append([]S{}, types...),
 				},
-			})
+			}
+			fv := FunVal(fn)
+			// If oracle with examples, set them now.
+			if isOr {
+				if err := ip.oracleSetExamples(fv, examples); err != nil {
+					fail(err.Error())
+				}
+			}
+			return fv
 		})
 
 	// __is_fun(x: Any) -> Bool
@@ -916,9 +918,9 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 			return equalLiteralS(ra, rb)
 
 		case VTHandle:
-			ah, okA := a.Data.(*Handle)
-			bh, okB := b.Data.(*Handle)
-			return okA && okB && ah == bh // identity equality
+			hx, okX := x.Data.(*Handle)
+			hy, okY := y.Data.(*Handle)
+			return okX && okY && hx == hy // identity equality
 
 		default:
 			// Handles VTHandle and any other tags we don't explicitly equal-compare.
@@ -1166,500 +1168,555 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 
 === END FILE: ./mindscript/interpreter_ops.go ===
 
-=== BEGIN FILE: ./mindscript/oracles.go ===
-// oracles.go — Oracle execution & prompt building (PUBLIC API + PRIVATE impl)
+=== BEGIN FILE: ./mindscript/modules.go ===
+// modules.go — MindScript module system (public API + private implementation)
 //
-// WHAT THIS FILE DOES
-// ===================
-// MindScript “oracles” are functions whose execution is delegated to an external
-// backend (e.g., an LLM). When an oracle is called at runtime, the interpreter:
-//
-//  1. Builds a **prompt** that captures:
-//     • the oracle’s instruction (taken from the function Value’s .Annot),
-//     • the declared input type (parameter 0) and declared *success* return type,
-//     • optional example for few-shot guidance (see "EXAMPLES" below),
-//     • the current call’s concrete input,
-//     and records that prompt internally (for debugging and testing).
-//
-//  2. Calls a pluggable backend hook in user space:
-//     __oracle_execute(prompt: Str) -> Str?
-//     which must return either:
-//     • Str — raw JSON (no fences) shaped like {"output": <value>}, or
-//     • Null — to signal failure.
-//     The interpreter parses the JSON via the host-provided global function
-//     jsonParse : Str -> Any (from the standard library).
-//
-//  3. Validates the extracted value against the oracle’s **operational** return
-//     type, which is the declared success type widened to **nullable** (`T?`).
-//     On mismatch or parse failure, an *annotated null* Value is returned.
-//
-// EXAMPLES
+// OVERVIEW
 // --------
-// Oracles store examples in a canonical, signature-shaped form:
+// MindScript modules are ordinary MindScript programs whose *exported bindings*
+// are snapshotted into a map-like value and paired with the lexical environment
+// where the program executed.
 //
-//	For an oracle with N parameters, each example is:
-//	  [arg1, arg2, ..., argN, returnValue]
+// At runtime, a module is represented as a `VTModule` value whose payload is:
 //
-//	where each arg_i conforms to the declared i-th parameter type and
-//	returnValue conforms to the oracle’s declared *success* return type
-//	(non-nullable). At runtime, examples are normalized into prompt-friendly
-//	pairs: [inputMap, {"output": returnValue}].
+//	type Module struct {
+//	  Name string     // canonical identity (path/URL/memory-name)
+//	  Map  *MapObject // ordered export surface
+//	  Env  *Env       // lexical environment where the module executed
+//	}
 //
-// Everything in this file is **private** implementation that the public
-// interpreter uses internally when executing oracle functions (see Interpreter
-// in interpreter.go). Public callers never need to invoke those directly.
+// Ergonomics: a module should behave like a map. Use `AsMapValue` (see
+// interpreter.go) to coerce VTModule→VTMap for length/overlay/iteration/property
+// reads without duplicating map logic.
 //
-// DEPENDENCIES (OTHER FILES)
-// --------------------------
-// • interpreter.go
-//   - type Interpreter (fields: Global, etc.)
-//   - Value model (Value, ValueTag, constructors like Str/Arr/Map, Fun, Env)
-//   - Thin call/eval surface (*Interpreter.Apply, resolveType, isType, etc.)
-//   - Annotated-null helpers (annotNull), SourceRef handling.
+// NEW BEHAVIOR (uniform across all entry points)
+// ---------------------------------------------
 //
-// • types.go
-//   - Type S-expressions and helpers (mapTypeFields, equalS, litToValue).
+//  1. Cycle detection is **uniform** for *every* entry point (AST/Code/File/inline).
+//     It happens inside the central constructor `nativeMakeModule`, so even inline
+//     `module "…" do … end` participates. Errors are reported as hard errors:
+//     "import cycle detected: A -> B -> … -> A".
 //
-// • schema.go
-//   - (*Interpreter) TypeValueToJSONSchema(...) to render JSON Schema for types.
+//  2. Caching is **uniform** for *every* entry point. Successful module builds are
+//     cached under their **canonical identity** (see below) by `nativeMakeModule`.
+//     Subsequent constructions of the same canonical name return the cached module.
 //
-// • std/lib.ms (MindScript standard library in user space)
-//   - jsonParse : Str -> Any  — required for parsing model JSON.
+//     Canonical identity rules used throughout:
+//     • ImportFile: absolute filesystem path (cleaned) or full https? URL.
+//     • ImportCode / ImportAST: the exact `name` you pass in (no "mem:" prefix).
+//     • Inline `module "Name"`: the string literal "Name".
 //
-// • Runtime hooks (user space, optional/required):
-//   - REQUIRED:  __oracle_execute(prompt: Str) -> Str | Null
-//   - OPTIONAL:  __oracle_build_prompt(instruction: Str, inType: Type, outType: Type, examples: [Any]) -> Str
+//  3. Source mapping is **precise** for *every* entry point.
 //
-// NOTE
-// ----
-// Oracles are **operationally nullable**: a declared return type T is validated
-// as T? at runtime. The backend must produce boxed JSON {"output": <value>}.
+//     - ImportFile/ImportCode: parse with spans via ParseSExprWithSpans.
+//     - ImportAST: first render to source via FormatSExpr, then parse with spans.
+//     - Inline `module …`: VM re-roots spans to the body using an absolute NodePath.
 //
-// ──────────────────────────────────────────────────────────────────────────────
-// PUBLIC API
-// ──────────────────────────────────────────────────────────────────────────────
+//  4. Module names are **not mutated** post-construction. The value passed as the
+//     "name" argument to `nativeMakeModule` **is** the Module.Name (the canonical
+//     identity). We do not overwrite it afterward.
 package mindscript
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
-/* ===========================
-   PUBLIC
-   =========================== */
+var errAmbiguousModule = errors.New("ambiguous module")
+
+////////////////////////////////////////////////////////////////////////////////
+//                                   PUBLIC API
+////////////////////////////////////////////////////////////////////////////////
+
+// Module is the payload carried by a VTModule value.
+type Module struct {
+	Name string
+	Map  *MapObject
+	Env  *Env
+}
+
+// Get returns the exported binding named key and whether it exists.
+func (m *Module) Get(key string) (Value, bool) { return m.get(key) }
+
+// ImportAST evaluates a ready AST as a module with **precise** source mapping,
+// **uniform** caching, and **uniform** cycle detection.
+//
+// Behavior:
+//   - Canonical identity: the provided `name` string (unchanged).
+//   - Formats the AST to a stable source string (FormatSExpr) and reparses it
+//     with spans for caret-precise diagnostics.
+//   - Executes in a fresh environment parented to ip.Core.
+//   - Caching & cycle detection happen in nativeMakeModule (uniform with others).
+//
+// Errors:
+//   - Parse errors are wrapped with source and returned as hard errors.
+//   - Runtime outcomes propagate as produced by the runtime.
+func (ip *Interpreter) ImportAST(name string, ast S) (Value, error) {
+	// Round-trip AST → source → AST-with-spans for precise caret mapping.
+	src := FormatSExpr(ast)
+	parsed, spans, perr := parseSourceWithSpans(name, src)
+	if perr != nil {
+		return Null, perr
+	}
+	// Canonical identity is the exact name.
+	canon := name
+	return ip.importWithBody(canon, name, parsed, src, spans)
+}
+
+// ImportCode parses source and evaluates it as a module with **precise** source
+// mapping, **uniform** caching, and **uniform** cycle detection.
+//
+// Behavior:
+//   - Canonical identity: the provided `name` string (unchanged).
+//   - Parses `src` into an AST with spans (precise diagnostics).
+//   - Executes in a fresh environment parented to ip.Core.
+//
+// Errors:
+//   - Syntax errors are wrapped with source and returned as hard errors.
+//   - Runtime outcomes propagate as produced by the runtime.
+func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
+	ast, spans, perr := parseSourceWithSpans(name, src)
+	if perr != nil {
+		return Null, perr
+	}
+	canon := name
+	return ip.importWithBody(canon, name, ast, src, spans)
+}
+
+// ImportFile resolves, fetches, parses, evaluates, *and* participates in the
+// same **uniform** caching/cycle-detection as other entry points.
+//
+// Behavior:
+//   - Canonical identity: absolute path (filesystem) or full URL (http/https).
+//   - Resolution & fetching follow the no-MSGPATH policy:
+//   - Relative specs resolve against the importing file's directory,
+//     or the REPL's current working directory if there is no importer.
+//   - If not found, fall back to the standard library at <install-root>/lib.
+//   - If resolution/fetch fails, returns **annotated null** with nil Go error.
+//   - Parses with spans for precise carets and evaluates in a fresh env.
+//
+// Caching:
+//   - Uniform caching is centralized in nativeMakeModule.
+func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
+	// Users import by module name; never write ".ms" explicitly (file or URL).
+	spec = strings.TrimSuffix(spec, "/")
+	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
+		if u, perr := url.Parse(spec); perr == nil {
+			p := strings.TrimSuffix(u.Path, "/")
+			if path.Ext(p) == defaultModuleExt {
+				u2 := *u
+				u2.Path = strings.TrimSuffix(p, defaultModuleExt)
+				return Null, fmt.Errorf("imports are extensionless; write import(%q), not import(%q)", u2.String(), spec)
+			}
+		}
+	} else if strings.HasSuffix(spec, defaultModuleExt) {
+		base := strings.TrimSuffix(spec, defaultModuleExt)
+		return Null, fmt.Errorf("imports are extensionless; write import(%q), not import(%q)", base, spec)
+	}
+
+	src, _, canon, rerr := resolveAndFetch(spec, importer)
+	if rerr != nil {
+		// Hard: ambiguity must stop execution.
+		if errors.Is(rerr, errAmbiguousModule) {
+			return Null, rerr
+		}
+		// Operational/soft: return annotated null; nil Go error.
+		return annotNull(fmt.Sprintf("import %q: %v", spec, rerr)), nil
+	}
+	// Diagnostics should show the module name the user imported (e.g. "nethttp").
+	ast, spans, perr := parseSourceWithSpans(spec, src)
+	if perr != nil {
+		return Null, perr
+	}
+	// Canonical identity stays the resolved path/URL; display is the import spec.
+	return ip.importWithBody(canon, spec, ast, src, spans)
+}
 
 //// END_OF_PUBLIC
 
-/* ===========================
-   PRIVATE IMPLEMENTATION
-   =========================== */
+////////////////////////////////////////////////////////////////////////////////
+//                             PRIVATE IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
 
-// oracleSetExamples validates and sets examples on an oracle function.
+// ---- Module runtime structs & VM hook --------------------------------------
+
+type moduleState int
+
+const (
+	modUnloaded moduleState = iota
+	modLoading
+	modLoaded
+)
+
+// moduleRec tracks cached module state by canonical identity.
+type moduleRec struct {
+	spec  string
+	env   *Env
+	mod   *Module
+	state moduleState
+	err   error
+}
+
+// get returns an exported binding by key. The VM uses this for property/index reads.
+func (m *Module) get(key string) (Value, bool) {
+	v, ok := m.Map.Entries[key]
+	return v, ok
+}
+
+// ---- Unified module import path --------------------------------------------
+
+// importWithBody evaluates a prepared module BODY AST by lowering to
+// ("module", ("str", canonName), body) and running it via runTopWithSource under
+// a SourceRef that points to the module’s own source text and spans.
 //
-// Canonical example format (arity N):
-//
-//	[arg1, arg2, ..., argN, returnValue]
-//
-// where each arg_i conforms to the declared i-th param type, and returnValue
-// conforms to the oracle's declared *success* return type (non-nullable).
-//
-// Passing Null clears examples.
-func (ip *Interpreter) oracleSetExamples(funVal Value, examples Value) error {
-	if funVal.Tag != VTFun {
-		return fmt.Errorf("not a function")
-	}
-	f := funVal.Data.(*Fun)
-	if f == nil || !f.IsOracle {
-		return fmt.Errorf("not an oracle")
+// Cycle detection and caching are **centralized** in nativeMakeModule so that
+// *all* entry points (AST/Code/File/inline) share identical semantics.
+// modules.go: importWithBody
+
+func (ip *Interpreter) importWithBody(canonName, display string, body S, src string, spans *SpanIndex) (Value, error) {
+	var sr *SourceRef
+	if src != "" && spans != nil {
+		// ⬇️ use the parser-faithful wrapper
+		wrapped := wrapUnderModuleLikeParser(body, spans, canonName)
+		sr = &SourceRef{Name: display, Src: src, Spans: wrapped}
 	}
 
-	// Recover original declaration signature (stable across currying).
-	paramNames := f.Params
-	declTypes := f.ParamTypes
-	if f.Sig != nil {
-		paramNames = f.Sig.Names
-		declTypes = f.Sig.Types
-	}
+	modAst := S{"module", S{"str", canonName}, body}
+	env := NewEnv(ip.Core)
+	env.SealParentWrites()
+	return ip.runTopWithSource(modAst, env, false, sr)
+}
 
-	// Clear.
-	if examples.Tag == VTNull {
-		f.Examples = Null
+// modules.go
+
+// New signature: we need the body AST to walk it in post-order.
+func wrapUnderModuleLikeParser(bodyAST S, bodyIdx *SpanIndex, canonName string) *SpanIndex {
+	if bodyIdx == nil {
 		return nil
 	}
-	if examples.Tag != VTArray {
-		return fmt.Errorf("examples must be an array or null")
-	}
 
-	n := len(declTypes)
-	if len(paramNames) != n {
-		return fmt.Errorf("oracle signature mismatch (names=%d types=%d)", len(paramNames), n)
-	}
+	// Build ("module", ("str", canonName), body) for a faithful traversal shape.
+	mod := S{"module", S{"str", canonName}, bodyAST}
 
-	// Success return type (examples represent successful outputs).
-	successRet := stripNullable(f.ReturnType)
+	// Body root span drives module extents.
+	bodyRoot, _ := bodyIdx.Get(nil)
 
-	exs := examples.Data.(*ArrayObject).Elems
-	for ei, ex := range exs {
-		if ex.Tag != VTArray {
-			return fmt.Errorf("example %d: must be an array", ei)
-		}
-		xs := ex.Data.(*ArrayObject).Elems
-		if len(xs) != n+1 {
-			return fmt.Errorf("example %d: expected %d items ([%d args..., return])", ei, n+1, n)
-		}
+	// Synthesize a zero-width name span at the body's start (best available anchor).
+	nameSpan := Span{StartByte: bodyRoot.StartByte, EndByte: bodyRoot.StartByte}
+	modSpan := Span{StartByte: bodyRoot.StartByte, EndByte: bodyRoot.EndByte}
 
-		// Args.
-		for i := 0; i < n; i++ {
-			if !ip.isType(xs[i], declTypes[i], f.Env) {
-				return fmt.Errorf("example %d: arg %d does not match declared type", ei, i+1)
+	// Gather body spans in post-order by walking the *body AST* and querying bodyIdx.
+	post := make([]Span, 0, 2+len(bodyIdx.byPath)) // rough capacity
+	var walk func(n S, path NodePath)
+	walk = func(n S, path NodePath) {
+		for i := 1; i < len(n); i++ {
+			if c, ok := n[i].(S); ok {
+				walk(c, append(path, i-1))
 			}
 		}
-
-		// Return value (success type).
-		if !ip.isType(xs[n], successRet, f.Env) {
-			return fmt.Errorf("example %d: return value does not match declared return type", ei)
-		}
-	}
-
-	f.Examples = examples
-	return nil
-}
-
-// execOracle is the primary oracle call engine used by the interpreter when an
-// oracle function is invoked. It builds the prompt, calls the backend hook,
-// parses & validates, and returns a nullable Value (success or annotated failure).
-func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
-	if funVal.Tag != VTFun {
-		return annotNull("oracle: not a function")
-	}
-	f := funVal.Data.(*Fun)
-
-	// Recover original declaration signature from Fun.Sig (stable across currying).
-	paramNames := f.Params
-	declTypes := f.ParamTypes
-	if f.Sig != nil {
-		paramNames = f.Sig.Names
-		declTypes = f.Sig.Types
-	}
-
-	// Build runtime boxes and the prompt.
-	inArgsVal := valueMapFromArgs(ctx, paramNames) // VTMap holding current call args
-
-	inTypesVal := Arr(func() []Value {
-		arr := make([]Value, len(declTypes))
-		for i := range declTypes {
-			arr[i] = TypeValIn(declTypes[i], f.Env)
-		}
-		return arr
-	}())
-
-	// Boxed output type: {"output": T}, where T is the declared success type (non-nullable here).
-	outBoxTypeS := S{"map", S{"pair!", S{"str", "output"}, stripNullable(f.ReturnType)}}
-
-	exPairs := boxExamplesAsMaps(f.Examples, paramNames)
-	examplesVal := Arr(exPairs)
-
-	instructionVal := Str(strings.TrimSpace(funVal.Annot))
-
-	// Build prompt text (prefers user hook when available) and record it.
-	prompt := ip.buildOraclePrompt(
-		instructionVal,
-		inArgsVal,
-		inTypesVal,
-		TypeValIn(outBoxTypeS, f.Env),
-		examplesVal,
-		f.Env,
-	)
-
-	// Locate executor hook strictly via the oracle's lexical environment.
-	hook, err := f.Env.Get("__oracle_execute")
-	if err != nil || hook.Tag != VTFun {
-		return annotNull("oracle backend not configured (define __oracle_execute)")
-	}
-	res := ip.Apply(hook, []Value{Str(prompt)})
-
-	// Backend can signal failure with null.
-	if res.Tag == VTNull {
-		return res
-	}
-	if res.Tag != VTStr {
-		return annotNull("oracle executor must return a string (raw model output) or null")
-	}
-
-	// Parse returned JSON and validate it matches {"output": T?}.
-	raw := strings.TrimSpace(res.Data.(string))
-	decoded, _, _ := jsonRepair(raw)
-	if decoded == nil {
-		return annotNull("oracle output was not valid JSON")
-	}
-	v := goJSONToValue(decoded)
-	if v.Tag != VTMap {
-		v = Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": v},
-			Keys:    []string{"output"},
-		}}
-	}
-	mo := v.Data.(*MapObject)
-	out, ok := mo.Entries["output"]
-	if !ok || !ip.isType(out, ensureNullableUnlessAny(f.ReturnType), f.Env) {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	return out
-}
-
-// buildOraclePrompt builds the prompt from Value-boxed parts.
-// instruction: Str
-// input:       Any (VTMap of call arguments)
-// inTypes:     [Type] (declared param types, in order)
-// outType:     Type   (boxed {"output": T})
-// examples:    [Any]  (each item is [inputMap, outputMap] or {"input":..,"output":..})
-func (ip *Interpreter) buildOraclePrompt(
-	instruction Value,
-	input Value,
-	inTypes Value,
-	outType Value,
-	examples Value,
-	env *Env,
-) string {
-	// Derive input map type S from (names, declared types).
-	names := []string{}
-	if input.Tag == VTMap {
-		mo := input.Data.(*MapObject)
-		names = append(names, mo.Keys...)
-		// for _, k := range mo.Keys {
-		// 	names = append(names, k)
-		// }
-	}
-	declTypes := []S{}
-	if inTypes.Tag == VTArray {
-		for _, v := range inTypes.Data.(*ArrayObject).Elems {
-			if v.Tag == VTType {
-				if tv, ok := v.Data.(*TypeValue); ok {
-					declTypes = append(declTypes, tv.Ast)
-				}
-			}
-		}
-	}
-	inMapTypeS := mapTypeFromParams(names, declTypes)
-
-	// Pretty-print schemas.
-	toSchemaString := func(tv Value) string {
-		s := ip.TypeValueToJSONSchema(tv, env)
-		b, err := json.MarshalIndent(s, "", "  ")
-		if err != nil {
-			return "{}"
-		}
-		return string(b)
-	}
-	inputSchema := toSchemaString(TypeValIn(inMapTypeS, env))
-	outputSchema := toSchemaString(outType)
-
-	// JSON stringifier (with spaces after ":" and ",").
-	toJSON := func(v Value) string {
-		j, err := valueToGoJSON(v)
-		if err != nil {
-			return "null"
-		}
-		b, err := json.Marshal(j)
-		if err != nil {
-			return "null"
-		}
-		s := string(b)
-		s = strings.ReplaceAll(s, ":", ": ")
-		s = strings.ReplaceAll(s, ",", ", ")
-		return s
-	}
-
-	var bld strings.Builder
-
-	// Header & guidance.
-	bld.WriteString("PROMPT:\n")
-	bld.WriteString("Please follow the instruction to the best of your ability:\n")
-	bld.WriteString("for every input, provide an output that solves the task and\n")
-	bld.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
-	bld.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
-
-	// Schemas.
-	bld.WriteString("INPUT JSON SCHEMA:\n\n")
-	bld.WriteString(indentBlock(inputSchema, 2))
-	bld.WriteString("\n\n")
-
-	bld.WriteString("OUTPUT JSON SCHEMA:\n\n")
-	bld.WriteString(indentBlock(outputSchema, 2))
-	bld.WriteString("\n\n")
-
-	// Instruction / task line.
-	taskLine := "Given the input, determine the output."
-	if instruction.Tag == VTStr && strings.TrimSpace(instruction.Data.(string)) != "" {
-		taskLine = strings.TrimSpace(instruction.Data.(string))
-	}
-
-	bld.WriteString("TASK:\n\n")
-	bld.WriteString(taskLine + "\n\n")
-
-	// Examples.
-	if examples.Tag == VTArray {
-		for _, ex := range examples.Data.(*ArrayObject).Elems {
-			if ex.Tag != VTArray {
-				continue
-			}
-			pair := ex.Data.(*ArrayObject).Elems
-			if len(pair) != 2 {
-				continue
-			}
-			inVal, outVal := pair[0], pair[1]
-
-			bld.WriteString("INPUT:\n\n")
-			bld.WriteString(toJSON(inVal) + "\n\n")
-			bld.WriteString("OUTPUT:\n\n")
-			bld.WriteString(toJSON(outVal) + "\n\n")
-		}
-	}
-
-	// Final TASK with current call's input.
-	bld.WriteString("INPUT:\n\n")
-	bld.WriteString(toJSON(input) + "\n\n")
-	bld.WriteString("OUTPUT:\n")
-
-	return bld.String()
-}
-
-// ------------- Helpers -----------------------------------
-
-// Build a map type S from parameter names and declared types.
-func mapTypeFromParams(names []string, types []S) S {
-	m := S{"map"}
-	for i := 0; i < len(names) && i < len(types); i++ {
-		m = append(m, S{"pair!", S{"str", names[i]}, types[i]})
-	}
-	return m
-}
-
-// Box current call arguments (from ctx) into a map Value conforming to the input map type.
-func valueMapFromArgs(ctx CallCtx, names []string) Value {
-	entries := make(map[string]Value, len(names))
-	keys := make([]string, 0, len(names))
-	for _, name := range names {
-		v := ctx.Arg(name) // if missing, omit/zero-value
-		entries[name] = v
-		keys = append(keys, name)
-	}
-	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, Keys: keys}}
-}
-
-// Box examples (canonical):
-//
-//	each example is [arg1, ..., argN, returnValue]
-//
-// Normalize to prompt pairs:
-//
-//	input  → {"x": arg1, "y": arg2, ...}
-//	output → {"output": returnValue}
-//
-// Accepts a VTArray (or Null → returns empty).
-func boxExamplesAsMaps(exs Value, names []string) []Value {
-	out := []Value{}
-	if exs.Tag != VTArray {
-		return out
-	}
-	n := len(names)
-	for _, ex := range exs.Data.(*ArrayObject).Elems {
-		if ex.Tag != VTArray {
-			continue
-		}
-		xs := ex.Data.(*ArrayObject).Elems
-		if len(xs) != n+1 {
-			continue
-		}
-
-		// Input map from args.
-		inMap := make(map[string]Value, n)
-		keys := make([]string, 0, n)
-		for i := 0; i < n; i++ {
-			inMap[names[i]] = xs[i]
-			keys = append(keys, names[i])
-		}
-		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, Keys: keys}}
-
-		outVal := Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": xs[n]},
-			Keys:    []string{"output"},
-		}}
-
-		out = append(out, Arr([]Value{inVal, outVal}))
-	}
-	return out
-}
-
-// indentBlock prefixes each line with n spaces (prompt formatting).
-func indentBlock(s string, n int) string {
-	pad := strings.Repeat(" ", n)
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = pad + lines[i]
-	}
-	return strings.Join(lines, "\n")
-}
-
-// Nullable helpers and small utilities.
-
-func ensureNullableUnlessAny(t S) S {
-	if isAnyType(t) || isNullable(t) {
-		return t
-	}
-	return S{"unop", "?", t}
-}
-func isAnyType(t S) bool  { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
-func isNullable(t S) bool { return len(t) >= 3 && t[0] == "unop" && t[1] == "?" }
-func stripNullable(t S) S {
-	for isNullable(t) {
-		t = t[2].(S)
-	}
-	return t
-}
-func unwrapFenced(s string) string {
-	if strings.HasPrefix(s, "```") {
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			s = s[i+1:]
+		if sp, ok := bodyIdx.Get(path); ok {
+			post = append(post, sp)
 		} else {
-			return s
+			// If a node lacks a span (shouldn’t happen from the parser), keep cardinality.
+			post = append(post, Span{})
 		}
-		if j := strings.LastIndex(s, "```"); j >= 0 {
-			s = s[:j]
-		}
-		s = strings.TrimSpace(s)
 	}
-	return s
+
+	// Post-order for the wrapper: [name] + [body subtree] + [module]
+	post = append(post, nameSpan)
+	walk(bodyAST, nil)
+	post = append(post, modSpan)
+
+	// Rebuild a fresh index, exactly like the parser would for `mod`.
+	return BuildSpanIndexPostOrder(mod, post)
 }
 
-// callGlobal1 invokes a global unary function by name and traps runtime errors,
-// returning the value and a non-empty error string when a failure is produced.
-func (ip *Interpreter) callGlobal1(name string, arg Value) (v Value, errStr string) {
-	fn, err := ip.Global.Get(name)
-	if err != nil || fn.Tag != VTFun {
-		v = annotNull(name + " is not available; load the standard library")
-		errStr = "missing"
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case rtErr:
-				v = annotNull(e.msg)
-			default:
-				v = annotNull("runtime error")
+// parseSourceWithSpans parses src into an S-expr AST + spans and wraps errors
+// with source context. Prefer this whenever you have the source text so we can
+// produce precise caret diagnostics during module execution.
+func parseSourceWithSpans(display string, src string) (S, *SpanIndex, error) {
+	ast, spans, err := ParseSExprWithSpans(src)
+	if err != nil {
+		if e, ok := err.(*Error); ok {
+			if e.Src == nil {
+				e.Src = &SourceRef{Name: display, Src: src}
 			}
-			errStr = v.Annot
+			return nil, nil, e // return structured error; pretty-print at API boundary
+
 		}
-	}()
-	v = ip.Apply(fn, []Value{arg})
-	if v.Tag == VTNull && v.Annot != "" {
-		errStr = v.Annot
+		return nil, nil, err
 	}
-	return
+	return ast, spans, nil
 }
 
-=== END FILE: ./mindscript/oracles.go ===
+// buildModuleMap snapshots modEnv.table into a MapObject:
+// • Keys are sorted for determinism (Env.table is a Go map).
+// • VTType exports without a pinned env are rewrapped with TypeValIn(..., modEnv).
+// • If a value carries Annot, mirror it into KeyAnn for that key.
+func buildModuleMap(modEnv *Env) *MapObject {
+	keys := make([]string, 0, len(modEnv.table))
+	for k := range modEnv.table {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic order
+
+	mo := &MapObject{
+		Entries: make(map[string]Value, len(keys)),
+		Keys:    make([]string, 0, len(keys)),
+	}
+	for _, k := range keys {
+		v := modEnv.table[k]
+
+		// Pin exported types to the module env if needed
+		if v.Tag == VTType {
+			tv := v.Data.(*TypeValue)
+			if tv.Env == nil {
+				nv := TypeValIn(tv.Ast, modEnv)
+				nv.Annot = v.Annot // preserve docs on the value
+				v = nv
+			}
+		}
+
+		mo.Entries[k] = v
+		mo.Keys = append(mo.Keys, k)
+	}
+	return mo
+}
+
+// ---- Autoloader (resolution & fetching) ------------------------------------
+
+const defaultModuleExt = ".ms" // preserved
+
+// resolveAndFetch returns (src, display, canonicalKey) for the given spec.
+//
+// Network:
+//   - Absolute http(s) URLs are fetched via GET with a timeout.
+//   - If the URL path has no extension, defaultModuleExt is appended.
+//
+// Filesystem:
+//   - Resolve relative specs against importer dir → (REPL) CWD → stdlib <install-root>/lib.
+//   - If spec has no extension, try spec+defaultModuleExt then spec.
+//   - Returns canonical ABSOLUTE path (cleaned) as both display and cache key.
+//
+// NOTE: This function returns Go errors; ImportFile is responsible for classifying
+func resolveAndFetch(spec string, importer string) (string, string, string, error) {
+	// Network?
+	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
+		u, perr := url.Parse(spec)
+		if perr != nil {
+			return "", "", "", fmt.Errorf("invalid import url: %w", perr)
+		}
+		// Extensionless URL: probe both <url>.ms and <url>/init.ms to detect ambiguity.
+		p := strings.TrimSuffix(u.Path, "/")
+		if path.Ext(p) == "" {
+			u1 := *u
+			u1.Path = p + defaultModuleExt
+			u2 := *u
+			u2.Path = p + "/init" + defaultModuleExt
+
+			ok1, e1 := httpProbe(u1.String())
+			ok2, e2 := httpProbe(u2.String())
+			if ok1 && ok2 {
+				return "", "", "", fmt.Errorf("%w: %q: both %q and %q exist", errAmbiguousModule, spec, u1.String(), u2.String())
+			}
+			if ok1 {
+				src, display, err := httpFetch(u1.String())
+				return src, display, u1.String(), err
+			}
+			if ok2 {
+				src, display, err := httpFetch(u2.String())
+				return src, display, u2.String(), err
+			}
+			if e1 != nil {
+				return "", "", "", e1
+			}
+			if e2 != nil {
+				return "", "", "", e2
+			}
+			return "", "", "", fmt.Errorf("module not found: %s", spec)
+		}
+
+		// URL with a non-empty extension (but not ".ms" — rejected earlier): fetch directly.
+		canon := u.String()
+		src, display, err := httpFetch(canon)
+		return src, display, canon, err
+	}
+
+	// Filesystem
+	canon, ferr := resolveFS(spec, importer)
+	if ferr != nil {
+		return "", "", "", ferr
+	}
+	b, rerr := os.ReadFile(canon)
+	if rerr != nil {
+		return "", "", "", fmt.Errorf("module not found: %s", spec)
+	}
+	return string(b), canon, canon, nil
+}
+
+func resolveFS(spec string, importer string) (string, error) {
+	var bases []string
+	// Prefer the importer’s directory, if present and not a URL.
+	if importer != "" && !strings.HasPrefix(importer, "http://") && !strings.HasPrefix(importer, "https://") {
+		bases = append(bases, filepath.Dir(importer))
+	}
+	// In REPL (no importer), or as a fallback, use the current working directory.
+	if cwd, err := os.Getwd(); err == nil {
+		bases = append(bases, cwd)
+	}
+
+	try := func(base, s string) (string, bool, error) {
+		// If caller provides an explicit extension (not ".ms"), treat it as exact.
+		if filepath.Ext(s) != "" {
+			p := filepath.Join(base, s)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				abs, _ := filepath.Abs(p)
+				return filepath.Clean(abs), true, nil
+			}
+			return "", false, nil
+		}
+
+		p1 := filepath.Join(base, s) + defaultModuleExt
+		p2 := filepath.Join(base, s, "init"+defaultModuleExt)
+
+		ex1 := false
+		ex2 := false
+		if fi, err := os.Stat(p1); err == nil && !fi.IsDir() {
+			ex1 = true
+		}
+		if fi, err := os.Stat(p2); err == nil && !fi.IsDir() {
+			ex2 = true
+		}
+
+		if ex1 && ex2 {
+			return "", false, fmt.Errorf("%w: %q: both %q and %q exist", errAmbiguousModule, s, p1, p2)
+		}
+		if ex1 {
+			abs, _ := filepath.Abs(p1)
+			return filepath.Clean(abs), true, nil
+		}
+		if ex2 {
+			abs, _ := filepath.Abs(p2)
+			return filepath.Clean(abs), true, nil
+		}
+		return "", false, nil
+	}
+
+	// Absolute path?
+	if filepath.IsAbs(spec) {
+		if p, ok, err := try("", spec); err != nil {
+			return "", err
+		} else if ok {
+			return p, nil
+		}
+		// fallthrough to stdlib for completeness.
+	} else {
+		for _, b := range bases {
+			if p, ok, err := try(b, spec); err != nil {
+				return "", err
+			} else if ok {
+				return p, nil
+			}
+		}
+	}
+
+	// Standard library fallback: <install-root>/lib
+	if installRoot != "" {
+		libRoot := filepath.Join(installRoot, "lib")
+		if p, ok, err := try(libRoot, spec); err != nil {
+			return "", err
+		} else if ok {
+			return p, nil
+		}
+	}
+
+	return "", fmt.Errorf("module not found: %s", spec)
+}
+
+func httpFetch(canonURL string) (src string, display string, err error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(canonURL)
+	if err != nil {
+		return "", canonURL, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", canonURL, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", canonURL, err
+	}
+	return string(b), canonURL, nil
+}
+
+// httpProbe checks existence without downloading the full body.
+// Returns (exists, err). Not-found is (false, nil). Other failures are err.
+func httpProbe(canonURL string) (bool, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", canonURL, nil)
+	if err != nil {
+		return false, err
+	}
+	// Small body, widely supported; avoids HEAD quirks.
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return true, nil
+	}
+	if resp.StatusCode == 404 || resp.StatusCode == 410 {
+		return false, nil
+	}
+	return false, fmt.Errorf("http %d", resp.StatusCode)
+}
+
+// prettySpec returns a short display name for a canonical spec:
+//   - file path   -> basename without extension
+//   - http(s) URL -> last segment without extension
+//   - fallback: original string if parsing fails
+func prettySpec(s string) string {
+	// Try URL first
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
+		base := path.Base(u.Path)
+		name := strings.TrimSuffix(base, path.Ext(base))
+		if name == "init" {
+			parent := path.Base(path.Dir(u.Path))
+			if parent != "" && parent != "." && parent != "/" {
+				return parent
+			}
+		}
+		if name != "" {
+			return name
+		}
+		return base
+	}
+	// Filesystem path (or arbitrary name)
+	base := filepath.Base(s)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	if name == "init" {
+		parent := filepath.Base(filepath.Dir(s))
+		if parent != "" && parent != "." {
+			return parent
+		}
+	}
+	if name != "" {
+		return name
+	}
+	return base
+}
+
+=== END FILE: ./mindscript/modules.go ===
 

@@ -132,7 +132,7 @@ As already mentioned, annotations are metadata attached to values and they do no
 ==> let phiCopy = phi
 1.618033988749895 # the golden ratio.
 
-==> phi == phi
+==> phi == phiCopy
 true
 
 ==> 2 * phi
@@ -154,7 +154,7 @@ In the next example we programmatically set and retrieve an annotation:
 ==> let c = 299_792_458
 299792458
 
-==> noteSet("The speed of light in meters per second.", c)
+==> c = noteSet("The speed of light in meters per second.", c)
 299_792_458 # The speed of light in meters per second.
 
 ==> noteGet(c)

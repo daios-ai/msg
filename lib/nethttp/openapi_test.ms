@@ -386,9 +386,6 @@ testing.test("openapi/spec from RouteSpec only", fun(_: Null) do
 	testing.assert(d.paths["/echo/{id}"].post.responses["200"] != null, "missing 200")
 end)
 
-let testing = import("testing")
-let openapi = import("openapi")
-
 # 1) PATH PARAMS — declared vs synthesized (no duplicates)
 testing.test("openapi/path params declared_vs_synth", fun(_: Null) do
 	let routes = [

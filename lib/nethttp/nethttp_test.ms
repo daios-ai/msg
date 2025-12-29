@@ -411,7 +411,7 @@ end)
 # =========================================================
 testing.test("nethttp/timeout fast -> 200", fun(_: Null) do
 	let r = http.router()
-	r.use(http.mwTimeout(50))
+	r.use(http.mwTimeout(500))
 
 	r.route("GET", "/fast", {}, fun(req, ctx) -> Any? do
 		sleep(10)

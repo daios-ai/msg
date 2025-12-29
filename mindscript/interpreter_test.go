@@ -2501,3 +2501,31 @@ x
 	}
 	wantInt(t, got, 1)
 }
+func Test_Interpreter_DeepEqual_Nested_Handle_In_Array(t *testing.T) {
+	ip, _ := NewInterpreter()
+
+	ip.RegisterNative("__deep_eq",
+		[]ParamSpec{{"x", S{"id", "Any"}}, {"y", S{"id", "Any"}}},
+		S{"id", "Bool"},
+		func(ip2 *Interpreter, ctx CallCtx) Value {
+			return Bool(ip2.deepEqual(ctx.Arg("x"), ctx.Arg("y")))
+		})
+
+	// Fresh opaque handles so we can test both equal and not-equal.
+	ip.RegisterNative("mkHandle", nil, S{"id", "Any"}, func(_ *Interpreter, _ CallCtx) Value {
+		return HandleVal("test-handle", &struct{}{})
+	})
+
+	// Same handle pointer nested inside arrays should deep-equal.
+	wantBool(t, mustEvalPersistent(t, ip, `
+let h = mkHandle()
+__deep_eq([h], [h])
+`), true)
+
+	// Different handle pointers should not deep-equal.
+	wantBool(t, mustEvalPersistent(t, ip, `
+let a = mkHandle()
+let b = mkHandle()
+__deep_eq([a], [b])
+`), false)
+}

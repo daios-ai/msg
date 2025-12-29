@@ -287,30 +287,27 @@ func (ip *Interpreter) buildOraclePrompt(
 	inputSchema := toSchemaString(TypeValIn(inMapTypeS, env))
 	outputSchema := toSchemaString(outType)
 
-	// JSON stringifier (with spaces after ":" and ",").
+	// JSON stringifier.
 	toJSON := func(v Value) string {
 		j, err := valueToGoJSON(v)
 		if err != nil {
 			return "null"
 		}
-		b, err := json.Marshal(j)
+		b, err := json.MarshalIndent(j, "", "  ")
 		if err != nil {
 			return "null"
 		}
-		s := string(b)
-		s = strings.ReplaceAll(s, ":", ": ")
-		s = strings.ReplaceAll(s, ",", ", ")
-		return s
+		return string(b)
 	}
 
 	var bld strings.Builder
 
-	// Header & guidance.
+	// System prompt.
 	bld.WriteString("PROMPT:\n")
 	bld.WriteString("Please follow the instruction to the best of your ability:\n")
 	bld.WriteString("for every input, provide an output that solves the task and\n")
-	bld.WriteString("respects the format of the OUTPUT JSON SCHEMA. Never put code\n")
-	bld.WriteString("fences around the output (like ```json); only generate valid JSON.\n\n")
+	bld.WriteString("respects the OUTPUT JSON SCHEMA. Never put code fences around\n")
+	bld.WriteString("the output. Only generate valid JSON.\n\n")
 
 	// Schemas.
 	bld.WriteString("INPUT JSON SCHEMA:\n\n")

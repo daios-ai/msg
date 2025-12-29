@@ -917,9 +917,9 @@ func (ip *Interpreter) deepEqual(a, b Value) bool {
 			return equalLiteralS(ra, rb)
 
 		case VTHandle:
-			ah, okA := a.Data.(*Handle)
-			bh, okB := b.Data.(*Handle)
-			return okA && okB && ah == bh // identity equality
+			hx, okX := x.Data.(*Handle)
+			hy, okY := y.Data.(*Handle)
+			return okX && okY && hx == hy // identity equality
 
 		default:
 			// Handles VTHandle and any other tags we don't explicitly equal-compare.

@@ -1,5 +1,5 @@
 # llm.ms — minimal LLM backend manager (uniform contract + startup probe)
-# 
+#
 # Public surface:
 # init()                 -> { backends!: [Str], current!: Str }          # probe all, pick a usable default, print diagnostics
 # backends()             -> [Str]                                        # available backend names
@@ -10,17 +10,19 @@
 # getConfig()            -> {}                                           # editable snapshot {backend, baseUrl, model, options, [timeoutMs]}
 # setConfig({})          -> {}?                                          # shallow-merge config; returns status
 # auth({})               -> {}?                                          # store credentials (e.g., {"apiKey":"…"}); returns status
-# exec(Str)              -> Str?                                         # run and return the provider's RAW STRING (or soft-null on error)
-# 
+# exec({})               -> Str?                                         # oracle hook: run and return provider RAW STRING (or soft-null on error)
+#
 # Notes:
 # - Backends expose { name, state, listModels?, probe, exec }.
 # - init() prints diagnostics and auto-selects the first OK backend if current is not OK.
 # - Only API keys are read from env; baseUrl/model are configured via setConfig/useModel.
 # - Options live in per-backend state.options. Common knobs:
-# temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
-# Backends ignore unknown/unsupported options gracefully.
+#   temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
+# - Backends ignore unknown/unsupported options gracefully.
 # - HTTP failures and provider error payloads are surfaced as soft errors (annotated null) with clear messages.
-# - Oracles are responsible for validating/boxing as {"output": x}. Backends DO NOT normalize/box.
+# - Oracles validate/box as {"output": x}. Backends DO NOT normalize/box.
+# - Structured outputs: if req.outputSchema is present, backends that support it will request
+#   schema-constrained JSON output (“best available” mode).
 
 # =============================
 # Internal state and minimal helpers
@@ -31,9 +33,24 @@ let _state = {
 	backends: {} # name -> backend record
 }
 
-# Soft error → annotated null.
-let _err = fun(msg: Str) -> Null do
-	error("llm: " + msg)
+# Extract prompt from oracle request bundle.
+let _reqPrompt = fun(req: {}) -> Str? do
+	if req == null then
+		return error("missing request")
+	end
+	if not mapHas(req, "prompt") or req.prompt == null then
+		return error("missing prompt")
+	end
+	str(req.prompt)
+end
+
+# Extract output schema (if provided) from oracle request bundle.
+let _reqOutputSchema = fun(req: {}) -> {}? do
+	if req != null and mapHas(req, "outputSchema") and req.outputSchema != null then
+		req.outputSchema
+	else
+		null
+	end
 end
 
 # Render a short backend status line.
@@ -65,6 +82,73 @@ let _diagLine = fun(name: Str, ok: Bool, authed: Bool, model: Str?, baseUrl: Str
 	sprintf("llm: %s %s%s%s%s", [name, mark, m, u, a])
 end
 
+# schemaCloseWorld(schema) walks a JSON Schema value
+# and forces every object-shaped subschema to include:
+#   additionalProperties: false
+# This is needed for OpenAI strict json_schema response_format.
+let _schemaCloseWorld = fun(schema: Any) -> Any do
+	let TMap = type {}
+	let TArr = type [Any]
+
+	let arrHas = fun(xs: [Any], needle: Any) -> Bool do
+		for v in iter(xs) do
+			if v == needle then
+				return true
+			end
+		end
+		false
+	end
+
+	let isObjectSchema = fun(m: {}) -> Bool do
+		# Treat as object schema if:
+		# - type is "object" OR includes "object" in a union array, OR
+		# - it has object-y keys like properties/required/additionalProperties.
+		if mapHas(m, "type") then
+			if m.type == "object" then
+				return true
+			end
+			if m.type != null and isSubtype(typeOf(m.type), TArr) and arrHas(m.type, "object") then
+				return true
+			end
+		end
+		mapHas(m, "properties") or mapHas(m, "required") or mapHas(m, "additionalProperties")
+	end
+
+	let close = fun(x: Any) -> Any do
+		if x == null then
+			return null
+		end
+
+		let tx = typeOf(x)
+
+		# Arrays: close each element.
+		if isSubtype(tx, TArr) then
+			let out = []
+			for v in iter(x) do
+				out = out + [close(v)]
+			end
+			return out
+		end
+
+		# Maps: close each value; then close-world the object schema itself.
+		if isSubtype(tx, TMap) then
+			let out = {}
+			for [k, v] in x do
+				out[k] = close(v)
+			end
+			if isObjectSchema(out) then
+				out.additionalProperties = false
+			end
+			return out
+		end
+
+		# Primitives (Str/Num/Bool/etc): unchanged.
+		x
+	end
+
+	close(schema)
+end
+
 # =============================
 # Backends (raw-string exec, no boxing)
 # =============================
@@ -77,14 +161,14 @@ let _ollama = {
 		let url = self.state.baseUrl + "/api/tags"
 		let r = http({url: url, method: "GET"})
 		if r == null then
-			return _err("ollama listModels: request failed")
+			return error("ollama listModels: request failed")
 		end
 		if r.status != 200 then
-			return _err("ollama listModels: HTTP " + str(r.status))
+			return error("ollama listModels: HTTP " + str(r.status))
 		end
 		let body = jsonParse(r.body)
 		if body == null then
-			return _err("ollama listModels: bad JSON")
+			return error("ollama listModels: bad JSON")
 		end
 		let out = []
 		if mapHas(body, "models") then
@@ -104,10 +188,15 @@ let _ollama = {
 		end
 		{ok: true, authed: true}
 	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
-		if self.state.model == null then
-			return _err("ollama: model not set (use llm.useModel)")
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
 		end
+		if self.state.model == null then
+			return error("ollama: model not set (use llm.useModel)")
+		end
+
 		let eff = self.state.options
 		let reqBody = {
 			model: self.state.model,
@@ -115,6 +204,13 @@ let _ollama = {
 			stream: false,
 			options: {}
 		}
+
+		# Best available structured output: pass JSON Schema via "format" when provided.
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			reqBody.format = schema
+		end
+
 		if mapHas(eff, "temperature") and num(eff.temperature) != null then
 			reqBody.options.temperature = num(eff.temperature)
 		end
@@ -132,22 +228,22 @@ let _ollama = {
 			body: jsonStringify(reqBody)
 		})
 		if r == null then
-			return r
+			return error("ollama: request failed")
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
 			if b != null and mapHas(b, "error") then
-				return _err("ollama: " + str(b.error))
+				return error("ollama: " + str(b.error))
 			end
-			return r
+			return error("ollama: HTTP " + str(r.status))
 		end
 
 		let j = jsonParse(r.body)
 		if j == null then
-			return r
+			return error("ollama: bad JSON from server")
 		end
 		if not mapHas(j, "response") or j.response == null then
-			return _err("ollama: missing response")
+			return error("ollama: missing response")
 		end
 		j.response
 	end
@@ -164,7 +260,7 @@ let _openai = {
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
-			return _err("openai listModels: missing API key")
+			return error("openai listModels: missing API key")
 		end
 		let r = http({
 			url: self.state.baseUrl + "/models",
@@ -172,14 +268,14 @@ let _openai = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return r
+			return error("openai listModels: request failed")
 		end
 		if r.status != 200 then
-			return _err("openai listModels: HTTP " + str(r.status))
+			return error("openai listModels: HTTP " + str(r.status))
 		end
 		let body = jsonParse(r.body)
 		if body == null then
-			return _err("openai listModels: bad JSON")
+			return error("openai listModels: bad JSON")
 		end
 		let out = []
 		for m in iter(body.data) do
@@ -198,19 +294,23 @@ let _openai = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return {ok: false, authed: authed, reason: noteGet(r)}
+			return {ok: false, authed: authed, reason: "request failed"}
 		end
 		if r.status != 200 then
 			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
 		end
 		{ok: true, authed: authed}
 	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
 		if self.state.apiKey == null then
-			return _err("openai: missing API key (llm.auth)")
+			return error("openai: missing API key (llm.auth)")
 		end
 		if self.state.model == null then
-			return _err("openai: model not set")
+			return error("openai: model not set")
 		end
 
 		let eff = self.state.options
@@ -224,6 +324,21 @@ let _openai = {
 				{role: "user", content: prompt}
 			]
 		}
+
+		# Best available structured output:
+		# - if schema provided: request strict JSON Schema constrained output
+		# - else: request JSON object (still not schema-constrained)
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			schema = _schemaCloseWorld(schema)
+			body.response_format = {
+				type: "json_schema",
+				json_schema: {name: "oracle_output", schema: schema, strict: true}
+			}
+		else
+			body.response_format = {type: "json_object"}
+		end
+
 		if mapHas(eff, "temperature") and num(eff.temperature) != null then
 			body.temperature = num(eff.temperature)
 		end
@@ -250,22 +365,22 @@ let _openai = {
 			body: jsonStringify(body)
 		})
 		if r == null then
-			return r
+			return error("openai: request failed")
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
 			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
-				return _err("openai: " + b.error.message)
+				return error("openai: " + b.error.message)
 			end
-			return _err("openai: HTTP " + str(r.status))
+			return error("openai: HTTP " + str(r.status))
 		end
 
 		let j = jsonParse(r.body)
 		if j == null then
-			return _err("openai: bad JSON from server")
+			return error("openai: bad JSON from server")
 		end
 		if not mapHas(j, "choices") or len(j.choices) == 0 or not mapHas(j.choices[0], "message") or not mapHas(j.choices[0].message, "content") or j.choices[0].message.content == null then
-			return _err("openai: missing content")
+			return error("openai: missing content")
 		end
 		j.choices[0].message.content
 	end
@@ -282,7 +397,7 @@ let _openai_responses = {
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
-			return _err("openai-responses listModels: missing API key")
+			return error("openai-responses listModels: missing API key")
 		end
 		let r = http({
 			url: self.state.baseUrl + "/models",
@@ -290,14 +405,14 @@ let _openai_responses = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return r
+			return error("openai-responses listModels: request failed")
 		end
 		if r.status != 200 then
-			return _err("openai-responses listModels: HTTP " + str(r.status))
+			return error("openai-responses listModels: HTTP " + str(r.status))
 		end
 		let body = jsonParse(r.body)
 		if body == null then
-			return _err("openai-responses listModels: bad JSON")
+			return error("openai-responses listModels: bad JSON")
 		end
 		let out = []
 		for m in iter(body.data) do
@@ -316,19 +431,23 @@ let _openai_responses = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return {ok: false, authed: authed, reason: noteGet(r)}
+			return {ok: false, authed: authed, reason: "request failed"}
 		end
 		if r.status != 200 then
 			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
 		end
 		{ok: true, authed: authed}
 	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
 		if self.state.apiKey == null then
-			return _err("openai-responses: missing API key (llm.auth)")
+			return error("openai-responses: missing API key (llm.auth)")
 		end
 		if self.state.model == null then
-			return _err("openai-responses: model not set")
+			return error("openai-responses: model not set")
 		end
 
 		let eff = self.state.options
@@ -337,6 +456,21 @@ let _openai_responses = {
 			input: prompt,
 			text: {format: {type: "json_object"}}
 		}
+
+		# Best available structured output: request strict JSON Schema constrained output.
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			schema = _schemaCloseWorld(schema)
+			body.text = {
+				format: {
+					type: "json_schema",
+					name: "oracle_output",
+					schema: schema,
+					strict: true
+				}
+			}
+		end
+
 		if mapHas(eff, "temperature") and num(eff.temperature) != null then
 			body.temperature = num(eff.temperature)
 		end
@@ -363,22 +497,22 @@ let _openai_responses = {
 			body: jsonStringify(body)
 		})
 		if r == null then
-			return _err("openai-responses: request failed")
+			return error("openai-responses: request failed")
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
 			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
-				return _err("openai-responses: " + b.error.message)
+				return error("openai-responses: " + b.error.message)
 			end
-			return _err("openai-responses: HTTP " + str(r.status))
+			return error("openai-responses: HTTP " + str(r.status))
 		end
 
 		let j = jsonParse(r.body)
 		if j == null then
-			return _err("openai-responses: bad JSON from server")
+			return error("openai-responses: bad JSON from server")
 		end
 		if not mapHas(j, "output") or len(j.output) == 0 then
-			return _err("openai-responses: missing content")
+			return error("openai-responses: missing content")
 		end
 
 		let text = null
@@ -394,7 +528,7 @@ let _openai_responses = {
 			end
 		end
 		if text == null then
-			return _err("openai-responses: missing content")
+			return error("openai-responses: missing content")
 		end
 		text
 	end
@@ -412,7 +546,7 @@ let _anthropic = {
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
-			return _err("anthropic listModels: missing API key")
+			return error("anthropic listModels: missing API key")
 		end
 		let r = http({
 			url: self.state.baseUrl + "/models",
@@ -424,14 +558,14 @@ let _anthropic = {
 			}
 		})
 		if r == null then
-			return _err("anthropic listModels: request failed")
+			return error("anthropic listModels: request failed")
 		end
 		if r.status != 200 then
-			return _err("anthropic listModels: HTTP " + str(r.status))
+			return error("anthropic listModels: HTTP " + str(r.status))
 		end
 		let body = jsonParse(r.body)
 		if body == null then
-			return _err("anthropic listModels: bad JSON")
+			return error("anthropic listModels: bad JSON")
 		end
 		let out = []
 		if mapHas(body, "data") then
@@ -463,12 +597,16 @@ let _anthropic = {
 		end
 		{ok: true, authed: authed}
 	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
 		if self.state.apiKey == null then
-			return _err("anthropic: missing API key (llm.auth)")
+			return error("anthropic: missing API key (llm.auth)")
 		end
 		if self.state.model == null then
-			return _err("anthropic: model not set")
+			return error("anthropic: model not set")
 		end
 
 		let eff = self.state.options
@@ -476,6 +614,20 @@ let _anthropic = {
 			model: self.state.model,
 			messages: [{role: "user", content: prompt}]
 		}
+
+		# Best available structured output: request JSON Schema constrained output if provided.
+		let schema = _reqOutputSchema(req)
+		let headers = {
+			"x-api-key": self.state.apiKey,
+			"anthropic-version": self.state.version,
+			"content-type": "application/json"
+		}
+		if schema != null then
+			body.output_format = {type: "json_schema", schema: schema}
+			# Beta header used by Anthropic for structured outputs (may vary by deployment/model).
+			headers["anthropic-beta"] = "structured-outputs-2025-11-13"
+		end
+
 		if mapHas(eff, "temperature") and num(eff.temperature) != null then
 			body.temperature = num(eff.temperature)
 		end
@@ -492,30 +644,26 @@ let _anthropic = {
 		let r = http({
 			url: self.state.baseUrl + "/messages",
 			method: "POST",
-			headers: {
-				"x-api-key": self.state.apiKey,
-				"anthropic-version": self.state.version,
-				"content-type": "application/json"
-			},
+			headers: headers,
 			body: jsonStringify(body)
 		})
 		if r == null then
-			return _err("anthropic: request failed")
+			return error("anthropic: request failed")
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
 			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
-				return _err("anthropic: " + b.error.message)
+				return error("anthropic: " + b.error.message)
 			end
-			return _err("anthropic: HTTP " + str(r.status))
+			return error("anthropic: HTTP " + str(r.status))
 		end
 
 		let j = jsonParse(r.body)
 		if j == null then
-			return _err("anthropic: bad JSON from server")
+			return error("anthropic: bad JSON from server")
 		end
 		if not mapHas(j, "content") or len(j.content) == 0 or not mapHas(j.content[0], "text") or j.content[0].text == null then
-			return _err("anthropic: missing content")
+			return error("anthropic: missing content")
 		end
 		j.content[0].text
 	end
@@ -532,7 +680,7 @@ let _cohere = {
 	},
 	listModels: fun(self: {}) -> [Str]? do
 		if self.state.apiKey == null then
-			return _err("cohere listModels: missing API key")
+			return error("cohere listModels: missing API key")
 		end
 		let r = http({
 			url: self.state.baseUrl + "/models",
@@ -540,14 +688,14 @@ let _cohere = {
 			headers: {Authorization: "Bearer " + self.state.apiKey}
 		})
 		if r == null then
-			return _err("cohere listModels: request failed")
+			return error("cohere listModels: request failed")
 		end
 		if r.status != 200 then
-			return _err("cohere listModels: HTTP " + str(r.status))
+			return error("cohere listModels: HTTP " + str(r.status))
 		end
 		let body = jsonParse(r.body)
 		if body == null then
-			return _err("cohere listModels: bad JSON")
+			return error("cohere listModels: bad JSON")
 		end
 		let out = []
 		if mapHas(body, "models") then
@@ -579,16 +727,29 @@ let _cohere = {
 		end
 		{ok: true, authed: authed}
 	end,
-	exec: fun(self: {}, prompt: Str) -> Str? do
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
 		if self.state.apiKey == null then
-			return _err("cohere: missing API key (llm.auth)")
+			return error("cohere: missing API key (llm.auth)")
 		end
 		if self.state.model == null then
-			return _err("cohere: model not set")
+			return error("cohere: model not set")
 		end
 
 		let eff = self.state.options
 		let body = {model: self.state.model, message: prompt}
+
+		# Best available structured output: request JSON object, attach schema when provided (if supported).
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			body.response_format = {type: "json_object", schema: schema}
+		else
+			body.response_format = {type: "json_object"}
+		end
+
 		if mapHas(eff, "temperature") and num(eff.temperature) != null then
 			body.temperature = num(eff.temperature)
 		end
@@ -612,19 +773,19 @@ let _cohere = {
 			body: jsonStringify(body)
 		})
 		if r == null then
-			return _err("cohere: request failed")
+			return error("cohere: request failed")
 		end
 		if r.status != 200 then
 			let b = jsonParse(r.body)
 			if b != null and mapHas(b, "message") then
-				return _err("cohere: " + b.message)
+				return error("cohere: " + b.message)
 			end
-			return _err("cohere: HTTP " + str(r.status))
+			return error("cohere: HTTP " + str(r.status))
 		end
 
 		let j = jsonParse(r.body)
 		if j == null then
-			return _err("cohere: bad JSON from server")
+			return error("cohere: bad JSON from server")
 		end
 		if mapHas(j, "text") and j.text != null then
 			return j.text
@@ -632,7 +793,7 @@ let _cohere = {
 		if mapHas(j, "message") and mapHas(j.message, "content") and j.message.content != null then
 			return j.message.content
 		end
-		_err("cohere: missing content")
+		error("cohere: missing content")
 	end
 }
 
@@ -739,7 +900,7 @@ end
 # Switch the current backend by name.
 let useBackend = fun(name: Str) -> {}? do
 	if not mapHas(_state.backends, name) then
-		return _err("unknown backend: " + name)
+		return error("unknown backend: " + name)
 	end
 	_state.current = name
 	status(null)
@@ -749,7 +910,7 @@ end
 let models = fun(_: Null) -> [Str]? do
 	let b = _state.backends[_state.current]
 	if not mapHas(b, "listModels") then
-		return _err(b.name + " does not support model listing")
+		return error(b.name + " does not support model listing")
 	end
 	b.listModels(b)
 end
@@ -807,7 +968,7 @@ let setConfig = fun(cfg: {}) -> {}? do
 end
 
 # Store credentials for the current backend (never printed).
-let auth = fun(creds: {}) -> {}? do
+let auth = fun(creds: {apiKey: Str?}) -> {}? do
 	let b = _state.backends[_state.current]
 	# Ensure apiKey is set/cleared where status() looks.
 	if mapHas(creds, "apiKey") then
@@ -817,9 +978,9 @@ let auth = fun(creds: {}) -> {}? do
 	status(null)
 end
 
-# Execute the current backend with a prompt.
+# Execute the current backend with an oracle request bundle.
 # Returns the provider's RAW STRING (or soft-null on error).
-let exec = fun(prompt: Str) -> Str? do
+let exec = fun(req: {}) -> Str? do
 	let b = _state.backends[_state.current]
-	b.exec(b, prompt)
+	b.exec(b, req)
 end

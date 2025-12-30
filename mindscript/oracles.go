@@ -17,12 +17,22 @@
 //     (see buildOraclePrompt). There is no user-space prompt hook.
 //
 //  2. Calls a pluggable backend hook resolved from the oracle’s lexical scope:
-//     __oracle_execute(prompt: Str) -> Str | Null
+//     __oracle_execute(req: {}) -> Str | Null
 //     which must return either:
 //     • Str  — raw JSON (no code fences) representing either:
 //     - {"output": <value>}  (preferred), or
 //     - a bare JSON value     (will be boxed to {"output": <value>})
 //     • Null — to signal failure.
+//
+//     The request map is intentionally minimal and contains ONLY:
+//     - prompt (Str)                     pre-rendered standard prompt
+//     - annotation (Str)                 oracle function annotation (raw, untrimmed)
+//     - examples ([Any])                 normalized pairs: [inputMap, outputMap]
+//     - input (Any)                      current call input map
+//     - inTypes ([Type])                 declared param types in order
+//     - outType (Type)                   boxed {"output": T} success type
+//     - inputSchema/outputSchema (Any)   JSON Schema objects (as maps)
+//     - inputSchemaString/outputSchemaString (Str)  pretty-printed schema JSON
 //
 //  3. Parses returned JSON using the host-side permissive repair/parser
 //     (jsonRepair), extracts/boxes the {"output": ...} field, and validates the
@@ -67,7 +77,7 @@
 //     boxing oracle results.
 //
 // • Runtime hooks (user space, optional/required):
-//   - REQUIRED:  __oracle_execute(prompt: Str) -> Str | Null
+//   - REQUIRED:  __oracle_execute(req: {}) -> Str | Null
 //
 // NOTE
 // ----
@@ -167,6 +177,32 @@ func (ip *Interpreter) oracleSetExamples(funVal Value, examples Value) error {
 	return nil
 }
 
+// oracleSchemas renders JSON Schema for the given input/output Type values.
+// Returns both the schema as a MindScript Value (maps/arrays) and the pretty JSON string.
+func (ip *Interpreter) oracleSchemas(inType Value, outType Value, env *Env) (inSchema Value, outSchema Value, inStr string, outStr string) {
+	toSchema := func(tv Value) any {
+		return ip.TypeValueToJSONSchema(tv, env)
+	}
+	toSchemaString := func(schema any) string {
+		b, err := json.MarshalIndent(schema, "", "  ")
+		if err != nil {
+			return "{}"
+		}
+		return string(b)
+	}
+
+	inAny := toSchema(inType)
+	outAny := toSchema(outType)
+
+	// Convert schema objects into MindScript values for the hook request.
+	inSchema = goJSONToValue(inAny)
+	outSchema = goJSONToValue(outAny)
+
+	inStr = toSchemaString(inAny)
+	outStr = toSchemaString(outAny)
+	return
+}
+
 // execOracle is the primary oracle call engine used by the interpreter when an
 // oracle function is invoked. It builds the prompt, calls the backend hook,
 // parses & validates, and returns a nullable Value (success or annotated failure).
@@ -201,14 +237,16 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	exPairs := boxExamplesAsMaps(f.Examples, paramNames)
 	examplesVal := Arr(exPairs)
 
-	instructionVal := Str(strings.TrimSpace(funVal.Annot))
+	// NOTE: do not trim; annotation is carried verbatim.
+	instructionVal := Str(funVal.Annot)
 
 	// Build prompt text (prefers user hook when available) and record it.
+	outTypeVal := TypeValIn(outBoxTypeS, f.Env)
 	prompt := ip.buildOraclePrompt(
 		instructionVal,
 		inArgsVal,
 		inTypesVal,
-		TypeValIn(outBoxTypeS, f.Env),
+		outTypeVal,
 		examplesVal,
 		f.Env,
 	)
@@ -216,9 +254,44 @@ func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
 	// Locate executor hook strictly via the oracle's lexical environment.
 	hook, err := f.Env.Get("__oracle_execute")
 	if err != nil || hook.Tag != VTFun {
-		return annotNull("oracle backend not configured (define __oracle_execute)")
+		return annotNull("oracle backend not configured (define __oracle_execute(req))")
 	}
-	res := ip.Apply(hook, []Value{Str(prompt)})
+
+	// Precompute schemas and pretty strings for the request bundle.
+	// Input schema is derived from the required-params input map type.
+	inMapTypeS := mapTypeFromParams(paramNames, declTypes)
+	inTypeVal := TypeValIn(inMapTypeS, f.Env)
+	inSchemaVal, outSchemaVal, inSchemaStr, outSchemaStr := ip.oracleSchemas(inTypeVal, outTypeVal, f.Env)
+
+	// New hook request bundle (and nothing else).
+	req := Value{Tag: VTMap, Data: &MapObject{
+		Entries: map[string]Value{
+			"prompt":             Str(prompt),
+			"annotation":         instructionVal,
+			"examples":           examplesVal,
+			"input":              inArgsVal,
+			"inTypes":            inTypesVal,
+			"outType":            outTypeVal,
+			"inputSchema":        inSchemaVal,
+			"outputSchema":       outSchemaVal,
+			"inputSchemaString":  Str(inSchemaStr),
+			"outputSchemaString": Str(outSchemaStr),
+		},
+		Keys: []string{
+			"prompt",
+			"annotation",
+			"examples",
+			"input",
+			"inTypes",
+			"outType",
+			"inputSchema",
+			"outputSchema",
+			"inputSchemaString",
+			"outputSchemaString",
+		},
+	}}
+
+	res := ip.Apply(hook, []Value{req})
 
 	// Backend can signal failure with null.
 	if res.Tag == VTNull {
@@ -329,8 +402,9 @@ func (ip *Interpreter) buildOraclePrompt(
 
 	// Instruction / task line.
 	taskLine := "Given the input, determine the output."
-	if instruction.Tag == VTStr && strings.TrimSpace(instruction.Data.(string)) != "" {
-		taskLine = strings.TrimSpace(instruction.Data.(string))
+	if instruction.Tag == VTStr && instruction.Data.(string) != "" {
+		// NOTE: do not trim; keep annotation verbatim.
+		taskLine = instruction.Data.(string)
 	}
 
 	bld.WriteString("TASK:\n\n")
@@ -455,20 +529,6 @@ func stripNullable(t S) S {
 		t = t[2].(S)
 	}
 	return t
-}
-func unwrapFenced(s string) string {
-	if strings.HasPrefix(s, "```") {
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			s = s[i+1:]
-		} else {
-			return s
-		}
-		if j := strings.LastIndex(s, "```"); j >= 0 {
-			s = s[:j]
-		}
-		s = strings.TrimSpace(s)
-	}
-	return s
 }
 
 // callGlobal1 invokes a global unary function by name and traps runtime errors,

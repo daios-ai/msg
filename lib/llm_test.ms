@@ -20,6 +20,26 @@ let _tight = {
 	options: {temperature: 0.0, top_p: 1.0, max_tokens: 16}
 }
 
+# Minimal oracle request bundle for llm.exec.
+#
+# llm.exec is the oracle hook and now expects a request object (not a raw Str).
+# Backends currently require at least `prompt`; we supply a full OracleRequest-ish
+# shape so this stays compatible if llm.exec is typed to OracleRequest later.
+let _mkReq = fun(prompt: Str) -> {} do
+	{
+		prompt: prompt,
+		annotation: "",
+		examples: [],
+		input: null,
+		inTypes: [],
+		outType: type Any,
+		inputSchema: null,
+		outputSchema: null,
+		inputSchemaString: "{}",
+		outputSchemaString: "{}"
+	}
+end
+
 # --------
 # Local helpers
 # --------
@@ -208,7 +228,7 @@ T.test("llm/ollama_exec_requires_model", fun(_: Null) do
 	let _ = L.useBackend("ollama")
 	let _ = L.setConfig({model: null}) # ensure no model
 
-	let out = L.exec("hello")
+	let out = L.exec(_mkReq("hello"))
 	T.assertEq(null, out) # expect soft-null
 end)
 
@@ -216,7 +236,7 @@ T.test("llm/openai_exec_requires_key", fun(_: Null) do
 	let _ = L.useBackend("openai")
 	let _ = L.auth({apiKey: null}) # ensure no key
 
-	let out = L.exec("hi")
+	let out = L.exec(_mkReq("hi"))
 	T.assertEq(out, null) # soft-null due to missing API key
 end)
 
@@ -226,14 +246,14 @@ T.test("llm/openai_exec_requires_model_even_when_authed", fun(_: Null) do
 
 	let _ = L.setConfig({model: null}) # ensure no model
 
-	let out = L.exec("hi")
+	let out = L.exec(_mkReq("hi"))
 	T.assertEq(null, out) # soft-null due to missing model
 end)
 
 T.test("llm/cohere_exec_requires_model", fun(_: Null) do
 	let _ = L.useBackend("cohere")
 	let _ = L.auth({apiKey: "XYZ"})
-	let out = L.exec("ping")
+	let out = L.exec(_mkReq("ping"))
 	T.assertEq(out, null) # soft-null due to missing model
 end)
 
@@ -242,7 +262,7 @@ T.test("llm/exec_ignores_unknown_options", fun(_: Null) do
 	let _ = L.auth({apiKey: "XYZ"})
 	let _2 = L.setConfig({options: {temperature: 0.1, weird_unused_flag: 1}})
 	# Still soft-null due to missing model, but must not hard-fail.
-	let out = L.exec("hi")
+	let out = L.exec(_mkReq("hi"))
 	T.assertEq(out, null)
 end)
 

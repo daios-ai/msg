@@ -8,15 +8,28 @@ import (
 
 // --- helpers specific to these oracle tests ----------------------------------
 
+func getReqPrompt(ctx CallCtx) (string, bool) {
+	req := ctx.Arg("req")
+	if req.Tag != VTMap {
+		return "", false
+	}
+	mo := req.Data.(*MapObject)
+	p, ok := mo.Entries["prompt"]
+	if !ok || p.Tag != VTStr {
+		return "", false
+	}
+	return p.Data.(string), true
+}
+
 // Installs a fake __oracle_execute that returns the provided raw string
 // (or an annotated null when raw == "").
-// Registered in Core and hoisted to Global (execOracle looks in Global).
-// NOTE: In the current engine, __oracle_execute takes only (prompt: Str) -> Str | Null.
+// Registered in Core and hoisted to Global.
+// NOTE: __oracle_execute takes (req: {}) -> Str | Null.
 func registerFakeOracle(ip *Interpreter, raw string) {
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "req", Type: S{"map"}},
 		},
 		S{"unop", "?", S{"id", "Str"}}, // Str? (executor may return null on transport failure)
 		func(_ *Interpreter, ctx CallCtx) Value {
@@ -31,19 +44,19 @@ func registerFakeOracle(ip *Interpreter, raw string) {
 	}
 }
 
-// Variant that also captures the prompt string into *outPrompt.
+// Variant that also captures req.prompt into *outPrompt.
 func registerFakeOracleWithCapture(ip *Interpreter, raw string, outPrompt *string) {
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "req", Type: S{"map"}},
 		},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value {
 			// capture the prompt for inspection in tests
 			if outPrompt != nil {
-				if p := ctx.Arg("prompt"); p.Tag == VTStr {
-					*outPrompt = p.Data.(string)
+				if p, ok := getReqPrompt(ctx); ok {
+					*outPrompt = p
 				}
 			}
 			if raw == "" {
@@ -224,7 +237,7 @@ func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
 	ip.RegisterNative(
 		"__oracle_execute",
 		[]ParamSpec{
-			{Name: "prompt", Type: S{"id", "Str"}},
+			{Name: "req", Type: S{"map"}},
 		},
 		S{"unop", "?", S{"id", "Str"}},
 		func(_ *Interpreter, ctx CallCtx) Value { return annotNull("network down") },
@@ -685,12 +698,12 @@ func Test_Oracle_Hook_StrToStr_Typecheck(t *testing.T) {
 	}
 
 	// Evaluate in Global(ns): should see __oracle_execute via Global -> Base(ns) -> Core.
-	v, err := ip.EvalSource(`isType(__oracle_execute, type Str -> Str?)`)
+	v, err := ip.EvalSource(`isType(__oracle_execute, type {} -> Str?)`)
 	if err != nil {
 		t.Fatalf("EvalSource error: %v", err)
 	}
 	if v.Tag != VTBool || v.Data.(bool) != true {
-		t.Fatalf("expected true for isType(__oracle_execute, type Str -> Str?), got: %#v", v)
+		t.Fatalf("expected true for isType(__oracle_execute, type {} -> Str?), got: %#v", v)
 	}
 }
 
@@ -701,7 +714,7 @@ func Test_Oracle_LexicalHook_UserSpaceBinding(t *testing.T) {
 	registerJSONParse(ip)
 
 	v, err := ip.EvalSource(`
-		let __oracle_execute = fun(prompt: Str) -> Str do
+		let __oracle_execute = fun(req: {}) -> Str do
 			"{\"output\":\"X-Ray Spex\"}"
 		end
 		let o = oracle() -> Str
@@ -727,7 +740,7 @@ func Test_Oracle_LexicalHook_IgnoresCallSiteShadow(t *testing.T) {
 		let scientist = oracle() -> Str
 		let g = fun() -> Str do
 			# This local binding is at the call site and must NOT affect the oracle.
-			let __oracle_execute = fun(prompt: Str) -> Str do
+			let __oracle_execute = fun(req: {}) -> Str do
 				"{\"output\":\"Hedy Lamarr\"}"
 			end
 			scientist()

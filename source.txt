@@ -1,2252 +1,2516 @@
-=== BEGIN FILE: ./mindscript/interpreter_ops.go ===
-// interpreter_ops.go — PRIVATE: language ops (built-ins, assignment, iteration)
-// and the AST → bytecode emitter used by the exec layer.
-//
-// This file:
-//  - Implements `newOps(ip)` with `initCore()` (registers all core natives).
-//  - Provides assignment semantics (`assignTo`) and helpers.
-//  - Normalizes collections to iterators (`__to_iter`) and drives iteration.
-//  - Implements deep value equality for const interning in the emitter.
-//  - Hosts the private emitter (`newEmitter`) used by exec for JIT.
-//
-// Public API is in interpreter.go. Exec/call engine is in interpreter_exec.go.
-//
-// Concurrency model (minimal, Lua-style isolates):
-//  - A single *Interpreter is **not re-entrant**; do not call it from multiple
-//    goroutines. For parallelism, clone via (*Interpreter).Clone() and use the
-//    clone in another goroutine. Each clone has its own Core/Global/env graph,
-//    module cache, and source-tracking, so no locks are required here.
-//  - All state touched in this file is per-interpreter (o.ip / ip.*). There are
-//    no package-level mutable singletons. As long as an Interpreter isn't shared
-//    concurrently, operations here are race-free without additional locking.
-//  - Host native functions you register may themselves use goroutines, but they
-//    must not touch the *same* Interpreter or its Env from multiple goroutines.
-//    Use isolates (clones) for truly concurrent execution.
-
-package mindscript
-
-import (
-	"fmt"
-	// "strings" already imported below
-	"strings"
-)
-
-////////////////////////////////////////////////////////////////////////////////
-//                         PRIVATE PANIC / ERROR HELPERS
-////////////////////////////////////////////////////////////////////////////////
-
-type rtErr struct {
-	msg  string
-	src  *SourceRef
-	line int
-	col  int
-}
-
-func fail(msg string)          { panic(rtErr{msg: msg}) }
-func errNull(msg string) Value { return withAnnot(Null, msg) }
-func annotNull(msg string) Value {
-	return Value{Tag: VTNull, Annot: msg}
-}
-func withAnnot(v Value, ann string) Value { v.Annot = ann; return v }
-
-// panicRt rethrows a structured runtime error as a **value** (never a pointer).
-// Always use this (or fail) to signal runtime errors within the interpreter.
-func panicRt(msg string, src *SourceRef, line, col int) {
-	panic(rtErr{msg: msg, src: src, line: line, col: col})
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                          PRIVATE OPS FACADE (to API)
-////////////////////////////////////////////////////////////////////////////////
-
-func initCore(ip *Interpreter) {
-	if ip.Core == nil {
-		ip.Core = NewEnv(nil)
-	}
-	// sugar for native registration with a ctx-only closure
-	reg := func(name string, params []ParamSpec, ret S, body func(ctx CallCtx) Value) {
-		ip.RegisterNative(name, params, ret, func(_ *Interpreter, ctx CallCtx) Value { return body(ctx) })
-	}
-
-	// __assign_set(targetAst: Any, value: Any) -> Any
-	reg("__assign_set",
-		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			// targetAst is a **pattern** AST (no leading "let").
-			pat := expectAST(ctx.Arg("targetAst"), "__assign_set")
-			v := ctx.Arg("value")
-			// Plain assignment: P = E
-			ip.assignPattern(pat, v, ctx.Env(), false)
-			return v
-		})
-
-	// __assign_def(targetAst: Any, value: Any) -> Any
-	reg("__assign_def",
-		[]ParamSpec{{"targetAst", S{"id", "Any"}}, {"value", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			// targetAst is a **pattern** AST (no leading "let").
-			pat := expectAST(ctx.Arg("targetAst"), "__assign_def")
-			v := ctx.Arg("value")
-			// Declarative assignment: let P = E  ≡  let P; P = E
-			ip.declarePattern(pat, ctx.Env())
-			ip.assignPattern(pat, v, ctx.Env(), false)
-			return v
-		})
-
-	// __declare_pattern(patternAst: Any) -> Any
-	// Pure declaration: walk the pattern and Define all identifier leaves to null.
-	reg("__declare_pattern",
-		[]ParamSpec{{"patternAst", S{"id", "Any"}}},
-		S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			ast := expectAST(ctx.Arg("patternAst"), "__declare_pattern")
-			ip.declarePattern(ast, ctx.Env())
-			return Null
-		})
-
-	// __plus (numbers/strings/arrays/maps)
-	reg("__plus",
-		[]ParamSpec{{"a", S{"id", "Any"}}, {"b", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			a := AsMapValue(ctx.Arg("a"))
-			b := AsMapValue(ctx.Arg("b"))
-			if isNumber(a) && isNumber(b) {
-				if a.Tag == VTInt && b.Tag == VTInt {
-					return Int(a.Data.(int64) + b.Data.(int64))
-				}
-				return Num(toFloat(a) + toFloat(b))
-			}
-			if a.Tag == VTStr && b.Tag == VTStr {
-				return Str(a.Data.(string) + b.Data.(string))
-			}
-			if a.Tag == VTArray && b.Tag == VTArray {
-				x := append(append([]Value{}, a.Data.(*ArrayObject).Elems...),
-					b.Data.(*ArrayObject).Elems...)
-				return Arr(x)
-			}
-			if a.Tag == VTMap && b.Tag == VTMap {
-				am, bm := a.Data.(*MapObject), b.Data.(*MapObject)
-				out := &MapObject{
-					Entries: make(map[string]Value, len(am.Entries)+len(bm.Entries)),
-					Keys:    make([]string, 0, len(am.Keys)+len(bm.Keys)),
-				}
-				seen := make(map[string]struct{}, len(am.Keys)+len(bm.Keys))
-				// LHS order/content
-				for _, k := range am.Keys {
-					out.Keys = append(out.Keys, k)
-					seen[k] = struct{}{}
-				}
-				for k, v := range am.Entries {
-					out.Entries[k] = v
-				}
-				// overlay RHS; append new keys in RHS order
-				for _, k := range bm.Keys {
-					if _, ok := seen[k]; !ok {
-						out.Keys = append(out.Keys, k)
-						seen[k] = struct{}{}
-					}
-				}
-				for k, v := range bm.Entries {
-					out.Entries[k] = v
-				}
-				return Value{Tag: VTMap, Data: out}
-			}
-			return errNull("unsupported operands for '+'")
-		})
-
-	// __resolve_type: Value(Type) -> Value(Type(resolved))
-	reg("__resolve_type",
-		[]ParamSpec{{"t", S{"id", "Type"}}}, S{"id", "Type"},
-		func(ctx CallCtx) Value {
-			t := ctx.Arg("t")
-			resolved := ip.resolveTypeValue(t, ctx.Env())
-			// Always return a pinned Type; never emit env-less types.
-			return TypeValIn(resolved, ctx.Env())
-		})
-
-	// __type_from_ast(ast: Any-handle) -> Type
-	// Build a Type at *instantiation* time from a serialized S-expression,
-	// pinning it to the current lexical environment (like closures do).
-	reg("__type_from_ast",
-		[]ParamSpec{{"ast", S{"id", "Any"}}}, S{"id", "Type"},
-		func(ctx CallCtx) Value {
-			h := ctx.Arg("ast")
-			if h.Tag != VTHandle {
-				return errNull("__type_from_ast: expected internal type-ast handle")
-			}
-			hd := h.Data.(*Handle)
-			if hd == nil || hd.Kind != "type-ast" {
-				return errNull("__type_from_ast: bad handle kind")
-			}
-			s, ok := hd.Data.(S)
-			if !ok {
-				return errNull("__type_from_ast: payload not a type AST")
-			}
-			if msg := validateTypeShape(s); msg != "" {
-				fail(msg)
-			}
-			return TypeValIn(s, ctx.Env())
-		})
-
-	// __annotate(text: Str, v: Any) -> Any
-	reg("__annotate",
-		[]ParamSpec{{"text", S{"id", "Str"}}, {"v", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value { return withAnnot(ctx.Arg("v"), ctx.Arg("text").Data.(string)) })
-
-	// __collect_for_elems(iter: Any) -> Any   (used by high-level mapping helpers)
-	reg("__collect_for_elems",
-		[]ParamSpec{{"iter", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ctx CallCtx) (out Value) {
-			defer func() {
-				if r := recover(); r != nil {
-					if e, ok := r.(rtErr); ok {
-						out = errNull(e.msg)
-						return
-					}
-					panic(r)
-				}
-			}()
-			out = Arr(ip.collectForElemsScoped(ctx.Arg("iter"), ctx.Env()))
-			return
-		})
-
-	// __map_from(keys:[Str], vals:[Any]) -> Map
-	reg("__map_from",
-		[]ParamSpec{{"keys", S{"array", S{"id", "Str"}}}, {"vals", S{"array", S{"id", "Any"}}}}, S{"id", "Any"},
-		func(ctx CallCtx) Value {
-			ka := ctx.Arg("keys").Data.(*ArrayObject).Elems
-			va := ctx.Arg("vals").Data.(*ArrayObject).Elems
-			if len(ka) != len(va) {
-				return errNull("map_from: mismatched arity")
-			}
-			mo := &MapObject{
-				Entries: make(map[string]Value, len(ka)),
-				Keys:    make([]string, 0, len(ka)),
-			}
-			for i := range ka {
-				if ka[i].Tag != VTStr {
-					return errNull("map key must be string")
-				}
-				k := ka[i].Data.(string)
-				mo.Entries[k] = va[i]
-				mo.Keys = append(mo.Keys, k)
-			}
-			return Value{Tag: VTMap, Data: mo}
-		})
-
-	// __len(array|map) -> Int
-	reg("__len",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Int"},
-		func(ctx CallCtx) Value {
-			x := AsMapValue(ctx.Arg("x"))
-			switch x.Tag {
-			case VTArray:
-				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
-			case VTMap:
-				return Int(int64(len(x.Data.(*MapObject).Entries)))
-			default:
-				return errNull("len expects array or map")
-			}
-		})
-
-	// __make_fun(params:[Str], types:[Type], ret:Type, bodyAst:Any, isOracle:Bool, examples:Any, basePath:[Int]) -> Fun
-	ip.RegisterNative("__make_fun",
-		[]ParamSpec{
-			{"params", S{"array", S{"id", "Str"}}},
-			{"types", S{"array", S{"id", "Type"}}},
-			{"ret", S{"id", "Type"}},
-			{"bodyAst", S{"id", "Any"}},
-			{"isOracle", S{"id", "Bool"}},
-			{"examples", S{"id", "Any"}},
-			{"basePath", S{"array", S{"id", "Int"}}},
-		},
-		S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			namesV := ctx.Arg("params").Data.(*ArrayObject).Elems
-			typesV := ctx.Arg("types").Data.(*ArrayObject).Elems
-			retTV := ctx.Arg("ret").Data.(*TypeValue)
-			bodyAny := ctx.Arg("bodyAst")
-			isOr := ctx.Arg("isOracle").Data.(bool)
-			exAny := ctx.Arg("examples")
-			baseAny := ctx.Arg("basePath")
-
-			names := make([]string, len(namesV))
-			types := make([]S, len(typesV))
-			for i := range namesV {
-				names[i] = namesV[i].Data.(string)
-			}
-			for i := range typesV {
-				types[i] = typesV[i].Data.(*TypeValue).Ast
-			}
-
-			// ---- Examples (oracles only): canonical [arg1, ..., argN, returnVal] ----
-			// Validation is performed via oracleSetExamples (and failures are runtime errors).
-			var examples Value = Null
-			if isOr {
-				if exAny.Tag == VTNull {
-					examples = Null
-				} else if exAny.Tag == VTArray {
-					// Detach the slice so later mutations to the caller's array don't alias.
-					xs := exAny.Data.(*ArrayObject).Elems
-					examples = Arr(append([]Value(nil), xs...))
-				} else {
-					fail("examples must be an array of canonical examples ([arg1, ..., argN, returnVal]) or null")
-				}
-			}
-
-			hidden := false
-			if len(names) == 0 {
-				names = []string{"_"}
-				types = []S{S{"id", "Null"}}
-				hidden = true
-			}
-
-			// Build absolute base path for the body
-			var base NodePath
-			if baseAny.Tag == VTArray {
-				xs := baseAny.Data.(*ArrayObject).Elems
-				base = make(NodePath, 0, len(xs))
-				for _, v := range xs {
-					if v.Tag == VTInt {
-						base = append(base, int(v.Data.(int64)))
-					}
-				}
-			}
-
-			retAst := retTV.Ast
-			if isOr {
-				retAst = ensureNullableUnlessAny(retAst)
-			}
-
-			// Clone current SourceRef and attach base path
-			var sr *SourceRef
-			if ip.currentSrc != nil {
-				cpy := *ip.currentSrc
-				// IMPORTANT: 'base' is ABSOLUTE - overwrite.
-				cpy.PathBase = append(NodePath(nil), base...)
-				sr = &cpy
-			}
-
-			// Unbox function BODY from AST handle ----
-			bodyAst := expectAST(bodyAny, "__make_fun")
-
-			// Construct the function closing over the **parent env directly** (no extra frame).
-			fn := &Fun{
-				Params:     names,
-				ParamTypes: types,
-				ReturnType: retAst,
-				Body:       bodyAst,
-				Env:        ctx.Env(), // <-- direct parent; makes globals late-bind correctly
-				HiddenNull: hidden,
-				IsOracle:   isOr,
-				Examples:   Null,
-				Src:        sr,
-				Sig: &SigMeta{
-					Names: append([]string{}, names...),
-					Types: append([]S{}, types...),
-				},
-			}
-			fv := FunVal(fn)
-			// If oracle with examples, set them now.
-			if isOr {
-				if err := ip.oracleSetExamples(fv, examples); err != nil {
-					fail(err.Error())
-				}
-			}
-			return fv
-		})
-
-	// __is_fun(x: Any) -> Bool
-	reg("__is_fun",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value { return Bool(ctx.Arg("x").Tag == VTFun) })
-
-	// __iter_should_stop(x: Any) -> Bool
-	reg("__iter_should_stop",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Bool"},
-		func(ctx CallCtx) Value {
-			v := ctx.Arg("x")
-			if v.Tag == VTNull {
-				if v.Annot != "" {
-					fail(v.Annot)
-				}
-				return Bool(true)
-			}
-			return Bool(false)
-		})
-
-	// __to_iter(x: Any) -> (Null -> Any?)  |  error
-	ip.RegisterNative("__to_iter",
-		[]ParamSpec{{"x", S{"id", "Any"}}}, S{"id", "Any"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.Arg("x"))
-
-			// Already an iterator?
-			if x.Tag == VTFun {
-				f := x.Data.(*Fun)
-				if len(f.Params) == 1 && ip.isType(Null, f.ParamTypes[0], f.Env) {
-					return x
-				}
-				fail("for expects array, map, or iterator function (Null -> Any?)")
-			}
-
-			// Helpers
-			newIter := func(parent *Env, lenTarget S, thenBlock S) Value {
-				env := NewEnv(parent)
-				env.Define("$i", Int(0))
-				body := S{"if",
-					S{"pair",
-						S{"binop", "<",
-							S{"id", "$i"},
-							S{"call", S{"id", "__len"}, lenTarget},
-						},
-						S{"block", thenBlock},
-					},
-					S{"block", S{"null"}},
-				}
-				var sr *SourceRef
-				if ip.currentSrc != nil {
-					cpy := *ip.currentSrc // shallow copy; Spans pointer intentionally shared
-					sr = &cpy
-				}
-				return FunVal(&Fun{
-					Params:     []string{"_"},
-					ParamTypes: []S{S{"id", "Null"}},
-					ReturnType: S{"unop", "?", S{"id", "Any"}},
-					Body:       body,
-					Env:        env,
-					Src:        sr,
-				})
-			}
-			inc := func() S {
-				return S{"assign", S{"id", "$i"},
-					S{"binop", "+", S{"id", "$i"}, S{"int", int64(1)}},
-				}
-			}
-
-			// Array → iterator
-			if x.Tag == VTArray {
-				envInit := NewEnv(ctx.Env())
-				envInit.Define("$arr", x)
-				then := S{"block",
-					inc(),
-					S{"idx",
-						S{"id", "$arr"},
-						S{"binop", "-", S{"id", "$i"}, S{"int", int64(1)}},
-					},
-				}
-				return newIter(envInit, S{"id", "$arr"}, then)
-			}
-
-			// Map → iterator (yields [key, value]) preserving insertion order
-			if x.Tag == VTMap {
-				mo := x.Data.(*MapObject)
-				envInit := NewEnv(ctx.Env())
-				envInit.Define("$map", x)
-				keyVals := make([]Value, 0, len(mo.Keys))
-				for _, k := range mo.Keys {
-					keyVals = append(keyVals, Str(k))
-				}
-				envInit.Define("$keys", Arr(keyVals))
-
-				then := S{"block",
-					S{"assign", S{"let", S{"id", "$k"}},
-						S{"idx", S{"id", "$keys"}, S{"id", "$i"}},
-					},
-					inc(),
-					S{"array",
-						S{"id", "$k"},
-						S{"idx", S{"id", "$map"}, S{"id", "$k"}},
-					},
-				}
-				return newIter(envInit, S{"id", "$keys"}, then)
-			}
-
-			fail("for expects array, map, or iterator function (Null -> Any?)")
-			return annotNull("__for_iter: unreachable")
-		})
-
-	ip.RegisterNative(
-		"__make_module",
-		[]ParamSpec{
-			{Name: "name", Type: S{"id", "Str"}}, // keep lax; runtime checks enforce string
-			{Name: "body", Type: S{"id", "Any"}}, // Type-carried AST
-			{Name: "base", Type: S{"id", "Any"}}, // [Int] path
-		},
-		S{"id", "Any"}, // could be a dedicated Module type later; Any is simplest now
-		nativeMakeModule,
-	)
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                                ASSIGNMENT
-////////////////////////////////////////////////////////////////////////////////
-
-// declarePattern implements the runtime semantics of `let P`:
-// walk the pattern and Define all identifier leaves to null, propagating any
-// pattern-local annotations to the initial null value.
-func (ip *Interpreter) declarePattern(p S, env *Env) {
-	ip.declarePatternWithDoc(p, env, "")
-}
-
-// declarePatternWithDoc threads a pending annotation doc string down to the
-// identifier leaves that are directly under an ("annot", ...) wrapper. Outer
-// annotations do not bleed across siblings; last annotation wins.
-func (ip *Interpreter) declarePatternWithDoc(p S, env *Env, doc string) {
-	if len(p) == 0 {
-		fail("invalid pattern")
-	}
-	switch p[0].(string) {
-	case "annot":
-		if len(p) < 3 {
-			fail("invalid pattern")
-		}
-		text, ok := p[1].(S)
-		if !ok || len(text) < 2 || text[0].(string) != "str" {
-			fail("invalid pattern")
-		}
-		sub, ok := p[2].(S)
-		if !ok {
-			fail("invalid pattern")
-		}
-		// Pattern annotation attaches to the binding(s) inside this subpattern.
-		// Last annotation wins, so override any outer doc.
-		ip.declarePatternWithDoc(sub, env, text[1].(string))
-
-	case "id":
-		name := p[1].(string)
-		// Forbid declarations of built-in type atoms (Int, Num, Handle, ...).
-		// This mirrors the Env.Set guard and keeps type namespace reserved.
-		if isBuiltinTypeAtom(name) {
-			fail(fmt.Sprintf("cannot declare reserved name: %s", name))
-		}
-		v := Null
-		if doc != "" {
-			v = withAnnot(v, doc)
-		}
-		env.Define(name, v)
-
-	case "array":
-		for i := 1; i < len(p); i++ {
-			child, ok := p[i].(S)
-			if !ok {
-				fail("invalid pattern")
-			}
-			// Annotations for a whole array pattern do not propagate to its
-			// elements unless explicitly wrapped in their own ("annot", ...).
-			ip.declarePatternWithDoc(child, env, "")
-		}
-
-	case "map":
-		for i := 1; i < len(p); i++ {
-			pair, ok := p[i].(S)
-			if !ok || len(pair) < 3 || pair[0].(string) != "pair" {
-				fail("invalid pattern")
-			}
-			sub, ok := pair[2].(S)
-			if !ok {
-				fail("invalid pattern")
-			}
-			// As with arrays, annotations on individual bindings are expressed
-			// via an inner ("annot", ...) around the binding subpattern.
-			ip.declarePatternWithDoc(sub, env, "")
-		}
-
-	default:
-		// get/idx or any other non-pattern expressions are invalid in `let P`.
-		fail("invalid pattern")
-	}
-}
-
-// assignPattern implements destructuring semantics for P = E where P is a
-// pattern (id / get / idx / array / map, optionally wrapped in annot).
-func (ip *Interpreter) assignPattern(p S, value Value, env *Env, allowDefine bool) {
-	ip.assignPatternWithDoc(p, value, env, allowDefine, "")
-}
-
-// assignPatternWithDoc threads a pending annotation doc string down to the
-// actual write target(s). When a pattern leaf is reached, the doc (if any) is
-// applied to the value being assigned, so pattern annotations end up on the
-// final bound value (last annotation wins).
-func (ip *Interpreter) assignPatternWithDoc(p S, value Value, env *Env, allowDefine bool, doc string) {
-	if len(p) == 0 {
-		fail("invalid assignment target")
-	}
-
-	switch p[0].(string) {
-	case "annot":
-		if len(p) < 3 {
-			fail("invalid assignment target")
-		}
-		text, ok := p[1].(S)
-		if !ok || len(text) < 2 || text[0].(string) != "str" {
-			fail("invalid assignment target")
-		}
-		sub, ok := p[2].(S)
-		if !ok {
-			fail("invalid assignment target")
-		}
-		// Pattern annotation applies to the binding(s) inside this subpattern.
-		// Last annotation wins over any outer doc.
-		ip.assignPatternWithDoc(sub, value, env, allowDefine, text[1].(string))
-
-	case "id":
-		if doc != "" {
-			value = withAnnot(value, doc)
-		}
-		name := p[1].(string)
-		if err := env.Set(name, value); err != nil {
-			if allowDefine {
-				env.Define(name, value)
-				return
-			}
-			fail(err.Error())
-		}
-
-	case "get":
-		if doc != "" {
-			value = withAnnot(value, doc)
-		}
-
-		obj := ip.evalFull(p[1].(S), env)
-		// resolve key string (literal or computed)
-		var keyStr string
-		if ks, ok := p[2].(S); ok && len(ks) >= 2 && (ks[0].(string) == "id" || ks[0].(string) == "str") {
-			keyStr = ks[1].(string)
-		} else {
-			k := ip.evalFull(p[2].(S), env)
-			if k.Tag != VTStr {
-				fail("object assignment requires map and string key")
-			}
-			keyStr = k.Data.(string)
-		}
-		mv := AsMapValue(obj)
-		if mv.Tag == VTMap {
-			mo := mv.Data.(*MapObject)
-			if _, exists := mo.Entries[keyStr]; !exists {
-				mo.Keys = append(mo.Keys, keyStr)
-			}
-			mo.Entries[keyStr] = value
-			syncModuleEnv(obj, keyStr, value) // no-op for plain maps
-			return
-		}
-		if obj.Tag == VTModule || obj.Tag == VTArray {
-			fail("object assignment requires map and string key")
-		}
-		fail("object assignment requires map and string key")
-
-	case "idx":
-		if doc != "" {
-			value = withAnnot(value, doc)
-		}
-
-		obj := ip.evalFull(p[1].(S), env)
-		idx := ip.evalFull(p[2].(S), env)
-		if obj.Tag == VTArray && idx.Tag == VTInt {
-			xs := obj.Data.(*ArrayObject).Elems
-			if len(xs) == 0 {
-				fail("index on empty array")
-			}
-			i := int(idx.Data.(int64))
-			if i < 0 {
-				i = len(xs) + i // -1 -> last, -len -> 0
-			}
-			if i < 0 || i >= len(xs) {
-				fail("array index out of range")
-			}
-			xs[i] = value
-			return
-		}
-		mv := AsMapValue(obj)
-		if mv.Tag == VTMap && idx.Tag == VTStr {
-			mo := mv.Data.(*MapObject)
-			k := idx.Data.(string)
-			if _, exists := mo.Entries[k]; !exists {
-				mo.Keys = append(mo.Keys, k)
-			}
-			mo.Entries[k] = value
-			syncModuleEnv(obj, k, value)
-			return
-		}
-		fail("index assignment requires array[int] or map[string]")
-
-	case "array":
-		if value.Tag != VTArray {
-			fail("array pattern: RHS is not an array")
-		}
-		xs := value.Data.(*ArrayObject).Elems
-		patLen := len(p) - 1
-		for i := 0; i < patLen; i++ {
-			elemPat, ok := p[i+1].(S)
-			if !ok {
-				fail("invalid array pattern")
-			}
-			var elemVal Value
-			if i < len(xs) {
-				elemVal = xs[i]
-			} else {
-				elemVal = Null
-			}
-			ip.assignPatternWithDoc(elemPat, elemVal, env, allowDefine, "")
-		}
-
-	case "map":
-		vmap := AsMapValue(value)
-		if vmap.Tag != VTMap {
-			fail("object pattern: RHS is not a map")
-		}
-		mo := vmap.Data.(*MapObject)
-		for i := 1; i < len(p); i++ {
-			pair, ok := p[i].(S)
-			if !ok || len(pair) < 3 || pair[0].(string) != "pair" {
-				fail("invalid object pattern")
-			}
-			key := unwrapKeyStr(pair[1].(S))
-			sub, ok := pair[2].(S)
-			if !ok {
-				fail("invalid object pattern")
-			}
-			fieldVal, ok := mo.Entries[key]
-			if !ok {
-				fieldVal = Null
-			}
-			ip.assignPatternWithDoc(sub, fieldVal, env, allowDefine, "")
-		}
-
-	default:
-		fail("invalid assignment target")
-	}
-}
-
-// syncModuleEnv keeps a module's Env consistent after a write to its map.
-// NOTE (isolates): modules live within a single Interpreter instance; this
-// function updates the module's *local* Env only. Do not cross-post between
-// interpreters.
-func syncModuleEnv(obj Value, key string, val Value) {
-	if obj.Tag == VTModule {
-		m := obj.Data.(*Module)
-		if _, ok := m.Env.table[key]; ok {
-			m.Env.table[key] = val
-		} else {
-			m.Env.Define(key, val)
-		}
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                     TINY EVALUATORS (used by assignment)
-////////////////////////////////////////////////////////////////////////////////
-
-// evalFull compiles and runs a single expression in env.
-// Annotated null is turned into a runtime failure (panic(rtErr)) to align with assignment.
-func (ip *Interpreter) evalFull(n S, env *Env) Value {
-	em := newEmitter(ip, ip.currentSrc)
-	em.emitExpr(n)
-	em.emit(opReturn, 0)
-	ch := em.chunk()
-	res := ip.runChunk(ch, env, 0)
-	switch res.status {
-	case vmOK, vmReturn:
-		if res.value.Tag == VTNull && res.value.Annot != "" {
-			fail(res.value.Annot)
-		}
-		return res.value
-	case vmRuntimeError:
-		if res.value.Tag == VTNull && res.value.Annot != "" {
-			fail(res.value.Annot)
-		}
-		fail("runtime error")
-	default:
-		fail("unknown VM status")
-	}
-	return Null
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                             ITERATOR EXPANSION
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) collectForElemsScoped(iter Value, scope *Env) []Value {
-	iter = AsMapValue(iter)
-
-	// Normalize to iterator function via Core's __to_iter when needed.
-	if iter.Tag != VTFun {
-		toIter, err := ip.Core.Get("__to_iter")
-		if err != nil {
-			fail("for expects array, map, or iterator function (Null -> Any?)")
-		}
-		iter = ip.applyArgsScoped(toIter, []Value{iter}, scope)
-
-		// Safety: __to_iter now fails itself for bad inputs; if it ever
-		// returns non-fun here, keep the user-facing invariant.
-		if iter.Tag != VTFun {
-			fail("for expects array, map, or iterator function (Null -> Any?)")
-		}
-	}
-
-	// At this point, iter must be a function of shape (Null) -> Any?
-	f, ok := iter.Data.(*Fun)
-	if !ok {
-		fail("for expects array, map, or iterator function (Null -> Any?)")
-	}
-	if len(f.Params) != 1 || !ip.isType(Null, f.ParamTypes[0], f.Env) {
-		name := "_"
-		if len(f.Params) > 0 {
-			name = f.Params[0]
-		}
-		fail(fmt.Sprintf("type mismatch in parameter '%s'", name))
-	}
-
-	stopFn, err := ip.Core.Get("__iter_should_stop")
-	if err != nil {
-		fail("missing __iter_should_stop")
-	}
-
-	out := []Value{}
-	for {
-		next := ip.applyArgsScoped(iter, []Value{Null}, scope)
-		if ip.applyArgsScoped(stopFn, []Value{next}, scope).Data.(bool) {
-			break
-		}
-		out = append(out, next)
-	}
-	return out
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                          VALUE EQUALITY (for emitter)
-////////////////////////////////////////////////////////////////////////////////
-
-func (ip *Interpreter) deepEqual(a, b Value) bool {
-	// Visited set of (leftPtr,rightPtr) pairs to break cycles in arrays/maps.
-	type pair struct{ x, y any }
-	visited := make(map[pair]bool)
-
-	var eq func(x, y Value) bool
-	eq = func(x, y Value) bool {
-		// Treat modules as maps (same as the original function).
-		if x.Tag == VTModule {
-			x = Value{Tag: VTMap, Data: x.Data.(*Module).Map}
-		}
-		if y.Tag == VTModule {
-			y = Value{Tag: VTMap, Data: y.Data.(*Module).Map}
-		}
-
-		// Numeric unification (Int/Num compare by value).
-		if isNumber(x) && isNumber(y) {
-			return toFloat(x) == toFloat(y)
-		}
-
-		// Tags must match (after numeric normalization above).
-		if x.Tag != y.Tag {
-			return false
-		}
-
-		switch x.Tag {
-		case VTNull:
-			return true
-		case VTBool:
-			return x.Data.(bool) == y.Data.(bool)
-		case VTInt:
-			return x.Data.(int64) == y.Data.(int64)
-		case VTNum:
-			return x.Data.(float64) == y.Data.(float64)
-		case VTStr:
-			return x.Data.(string) == y.Data.(string)
-
-		case VTArray:
-			ax := x.Data.(*ArrayObject)
-			ay := y.Data.(*ArrayObject)
-			// Cycle guard: if we've already compared this pair, consider it equal.
-			k := pair{ax, ay}
-			if visited[k] {
-				return true
-			}
-			visited[k] = true
-
-			if len(ax.Elems) != len(ay.Elems) {
-				return false
-			}
-			for i := range ax.Elems {
-				if !eq(ax.Elems[i], ay.Elems[i]) {
-					return false
-				}
-			}
-			return true
-
-		case VTMap:
-			mx := x.Data.(*MapObject)
-			my := y.Data.(*MapObject)
-			// Cycle guard for maps.
-			k := pair{mx, my}
-			if visited[k] {
-				return true
-			}
-			visited[k] = true
-
-			if len(mx.Entries) != len(my.Entries) {
-				return false
-			}
-			for k, xv := range mx.Entries {
-				yv, ok := my.Entries[k]
-				if !ok || !eq(xv, yv) {
-					return false
-				}
-			}
-			return true
-
-		case VTFun:
-			// Pointer equality on closures (matches original behavior).
-			return x.Data.(*Fun) == y.Data.(*Fun)
-
-		case VTType:
-			// Resolve and structurally compare type ASTs (matches original behavior).
-			ta := x.Data.(*TypeValue)
-			tb := y.Data.(*TypeValue)
-			ea := ta.Env
-			if ea == nil {
-				ea = ip.Core
-			}
-			eb := tb.Env
-			if eb == nil {
-				eb = ip.Core
-			}
-			ra := ip.resolveType(ta.Ast, ea)
-			rb := ip.resolveType(tb.Ast, eb)
-			return equalLiteralS(ra, rb)
-
-		case VTHandle:
-			hx, okX := x.Data.(*Handle)
-			hy, okY := y.Data.(*Handle)
-			return okX && okY && hx == hy // identity equality
-
-		default:
-			// Handles VTHandle and any other tags we don't explicitly equal-compare.
-			return false
-		}
-	}
-
-	return eq(a, b)
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                                SMALL HELPERS
-////////////////////////////////////////////////////////////////////////////////
-
-func isNumber(v Value) bool { return v.Tag == VTInt || v.Tag == VTNum }
-func toFloat(v Value) float64 {
-	if v.Tag == VTInt {
-		return float64(v.Data.(int64))
-	}
-	return v.Data.(float64)
-}
-
-func unwrapKeyStr(k S) string {
-	for len(k) > 0 && k[0].(string) == "annot" {
-		k = k[2].(S)
-	}
-	if len(k) >= 2 && k[0].(string) == "str" {
-		return k[1].(string)
-	}
-	fail("map key is not a string")
-	return ""
-}
-
-// Noop detection: ("noop") and ("annot", ..., ("noop"), ...) are “noopish” and
-// generate no code inside blocks.
-func isNoopish(n S) bool {
-	if len(n) == 0 {
-		return false
-	}
-	switch n[0].(string) {
-	case "noop":
-		// Defensive: treat a stray ("noop") in expression position as plain Null.
-		return true
-	case "annot":
-		// n[2] is the subject node; treat annot(noop) as noop
-		if len(n) >= 3 {
-			if sub, ok := n[2].(S); ok {
-				return isNoopish(sub)
-			}
-		}
-		return false
-	default:
-		return false
-	}
-}
-
-// Given a VTType, resolve its AST using its own env if present; otherwise use fallback.
-func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
-	if v.Tag != VTType {
-		return S{"id", "Any"}
-	}
-	tv := v.Data.(*TypeValue)
-	env := tv.Env
-	if env == nil {
-		env = fallback
-	}
-	return ip.resolveType(tv.Ast, env)
-}
-
-// "A -> B -> C -> A" using pretty names instead of full canonical specs.
-func joinCyclePath(stack []string, again string) string {
-	i := 0
-	for idx, s := range stack {
-		if s == again {
-			i = idx
-			break
-		}
-	}
-	chain := append(stack[i:], again)
-	out := make([]string, len(chain))
-	for k, s := range chain {
-		out[k] = prettySpec(s)
-	}
-	return strings.Join(out, " -> ")
-}
-
-// expectAST extracts an S-expression from a VTHandle("ast", ...).
-// Fails with a friendly runtime error instead of panicking on bad inputs.
-func expectAST(v Value, where string) S {
-	if v.Tag != VTHandle {
-		fail(where + ": body must be an AST handle")
-	}
-	hd, _ := v.Data.(*Handle)
-	if hd == nil || hd.Kind != "ast" {
-		fail(where + ": body must be an AST handle")
-	}
-	s, ok := hd.Data.(S)
-	if !ok {
-		fail(where + ": AST payload corrupt")
-	}
-	return s
-}
-
-// nativeMakeModule is the implementation of the __make_module primitive.
-//
-// UNIFORM CACHING & CYCLE DETECTION LIVE HERE.
-// This ensures AST/Code/File/inline constructions all behave the same.
-//
-// It receives:
-//   - name: Str   — the **canonical identity** for the module (NOT overwritten).
-//   - body: Type  — AST for the module body wrapped as a type value.
-//   - base: [Int] — absolute NodePath indicating where the body lives in the
-//     caller’s SourceRef; used to re-root spans to the body.
-//
-// Plumbing:
-//   - We build a child SourceRef with PathBase=base so VM marks and PC→(line,col)
-//     map into the module body text.
-//   - Runtime errors are rethrown with exact location using panicRt, so they
-//     bubble to runTopWithSource and render a single caret at the true site.
-//
-// Concurrency note: module load state (ip.modules, ip.loadStack) belongs to a
-// single Interpreter isolate. Do not share the same Interpreter across goroutines.
-func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
-	nameV := ctx.Arg("name")
-	bodyV := ctx.Arg("body")
-	baseV := ctx.Arg("base")
-
-	if nameV.Tag != VTStr {
-		fail("module name must be a string")
-	}
-	canon := nameV.Data.(string)
-
-	// ---- Uniform cycle detection (stack + in-progress record) ----
-	for _, s := range ip.loadStack {
-		if s == canon {
-			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(ip.loadStack, canon)))
-		}
-	}
-	if ip.modules != nil {
-		if rec, ok := ip.modules[canon]; ok && rec.state == modLoading {
-			fail(fmt.Sprintf("import cycle detected: %s", joinCyclePath(append(ip.loadStack, canon), canon)))
-		}
-	}
-
-	// ---- Uniform caching (success-only) ----
-	if ip.modules != nil {
-		if rec, ok := ip.modules[canon]; ok && rec.state == modLoaded && rec.mod != nil {
-			return Value{Tag: VTModule, Data: rec.mod}
-		}
-	} else {
-		ip.modules = map[string]*moduleRec{}
-	}
-
-	// Mark as loading and push on stack.
-	ip.modules[canon] = &moduleRec{spec: canon, state: modLoading}
-	ip.loadStack = append(ip.loadStack, canon)
-
-	// Ensure we never leave a stale modLoading record or a stuck stack entry.
-	// On panic/failure, delete the cache record; always pop loadStack.
-	defer func() {
-		// Pop load stack
-		if n := len(ip.loadStack); n > 0 {
-			ip.loadStack = ip.loadStack[:n-1]
-		}
-		// If not successfully flipped to modLoaded, remove the half-built record.
-		if rec, ok := ip.modules[canon]; ok && rec.state != modLoaded {
-			delete(ip.modules, canon)
-		}
-		// Preserve existing error semantics.
-		if r := recover(); r != nil {
-			panic(r)
-		}
-	}()
-
-	// ---- Decode body AST and base path ----
-	bodyAst := expectAST(bodyV, "__make_module")
-
-	// Decode absolute base path from [Int]
-	var base NodePath
-	if baseV.Tag == VTArray {
-		xs := baseV.Data.(*ArrayObject).Elems
-		base = make(NodePath, 0, len(xs))
-		for _, v := range xs {
-			if v.Tag != VTInt {
-				fail("internal error: module base path must be [Int]")
-			}
-			base = append(base, int(v.Data.(int64)))
-		}
-	}
-
-	// Fresh env for the module using a fast snapshot of the pre-seeded Base.
-	modBase := ip.newBaseFromTemplate()
-	// User frame for the module (exports come from here). Allow overwriting into Base.
-	modEnv := NewEnv(modBase)
-
-	// SourceRef rooted at the module BODY path (absolute)
-	var sr *SourceRef
-	if ip.currentSrc != nil {
-		// Compose any existing PathBase with the module's absolute body path.
-		sr = &SourceRef{
-			Name:     ip.currentSrc.Name,
-			Src:      ip.currentSrc.Src,
-			Spans:    ip.currentSrc.Spans, // keep full index; marks are absolute
-			PathBase: append(NodePath(nil), base...),
-		}
-	}
-
-	// JIT + run (like runTopWithSource, but we handle errors to avoid re-wrap)
-	ch := ip.jitTop(bodyAst, sr)
-
-	prev := ip.currentSrc
-	ip.currentSrc = ch.Src
-	res := ip.runChunk(ch, modEnv, 0)
-	ip.currentSrc = prev
-
-	switch res.status {
-	case vmOK, vmReturn:
-		// ok
-	case vmRuntimeError:
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		msg := res.value.Annot
-		if msg == "" {
-			msg = "runtime error"
-		}
-		// Rethrow as structured inner-source error (single caret at true site).
-		panicRt(msg, ch.Src, line, col)
-	default:
-		line, col := ip.sourcePosFromChunk(ch, ch.Src, res.pc)
-		panicRt("unknown VM status", ch.Src, line, col)
-	}
-
-	// Snapshot exports
-	mo := buildModuleMap(modEnv)
-	m := &Module{Name: canon, Map: mo, Env: modEnv}
-
-	// Commit cache (success-only)
-	rec := ip.modules[canon]
-	rec.mod = m
-	rec.env = modEnv
-	rec.state = modLoaded
-	rec.err = nil
-
-	return Value{Tag: VTModule, Data: m}
-}
-
-=== END FILE: ./mindscript/interpreter_ops.go ===
-
-=== BEGIN FILE: ./mindscript/oracles.go ===
-// oracles.go — Oracle execution & prompt building (PUBLIC API + PRIVATE impl)
-//
-// WHAT THIS FILE DOES
-// ===================
-// MindScript “oracles” are functions whose execution is delegated to an external
-// backend (e.g., an LLM). When an oracle is called at runtime, the interpreter:
-//
-//  1. Builds a **prompt** that captures:
-//     • the oracle’s instruction (taken from the function Value’s .Annot),
-//     • the declared input type (parameter 0) and declared *success* return type,
-//     • optional example for few-shot guidance (see "EXAMPLES" below),
-//     • the current call’s concrete input,
-//     and records that prompt internally (for debugging and testing).
-//
-//  2. Calls a pluggable backend hook in user space:
-//     __oracle_execute(prompt: Str) -> Str?
-//     which must return either:
-//     • Str — raw JSON (no fences) shaped like {"output": <value>}, or
-//     • Null — to signal failure.
-//     The interpreter parses the JSON via the host-provided global function
-//     jsonParse : Str -> Any (from the standard library).
-//
-//  3. Validates the extracted value against the oracle’s **operational** return
-//     type, which is the declared success type widened to **nullable** (`T?`).
-//     On mismatch or parse failure, an *annotated null* Value is returned.
-//
-// EXAMPLES
-// --------
-// Oracles store examples in a canonical, signature-shaped form:
-//
-//	For an oracle with N parameters, each example is:
-//	  [arg1, arg2, ..., argN, returnValue]
-//
-//	where each arg_i conforms to the declared i-th parameter type and
-//	returnValue conforms to the oracle’s declared *success* return type
-//	(non-nullable). At runtime, examples are normalized into prompt-friendly
-//	pairs: [inputMap, {"output": returnValue}].
-//
-// Everything in this file is **private** implementation that the public
-// interpreter uses internally when executing oracle functions (see Interpreter
-// in interpreter.go). Public callers never need to invoke those directly.
-//
-// DEPENDENCIES (OTHER FILES)
-// --------------------------
-// • interpreter.go
-//   - type Interpreter (fields: Global, etc.)
-//   - Value model (Value, ValueTag, constructors like Str/Arr/Map, Fun, Env)
-//   - Thin call/eval surface (*Interpreter.Apply, resolveType, isType, etc.)
-//   - Annotated-null helpers (annotNull), SourceRef handling.
-//
-// • types.go
-//   - Type S-expressions and helpers (mapTypeFields, equalS, litToValue).
-//
-// • schema.go
-//   - (*Interpreter) TypeValueToJSONSchema(...) to render JSON Schema for types.
-//
-// • std/lib.ms (MindScript standard library in user space)
-//   - jsonParse : Str -> Any  — required for parsing model JSON.
-//
-// • Runtime hooks (user space, optional/required):
-//   - REQUIRED:  __oracle_execute(prompt: Str) -> Str | Null
-//   - OPTIONAL:  __oracle_build_prompt(instruction: Str, inType: Type, outType: Type, examples: [Any]) -> Str
-//
-// NOTE
-// ----
-// Oracles are **operationally nullable**: a declared return type T is validated
-// as T? at runtime. The backend must produce boxed JSON {"output": <value>}.
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// PUBLIC API
-// ──────────────────────────────────────────────────────────────────────────────
+=== BEGIN FILE: ./mindscript/oracles_test.go ===
 package mindscript
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
+	"testing"
 )
 
-/* ===========================
-   PUBLIC
-   =========================== */
+// --- helpers specific to these oracle tests ----------------------------------
 
-//// END_OF_PUBLIC
-
-/* ===========================
-   PRIVATE IMPLEMENTATION
-   =========================== */
-
-// oracleSetExamples validates and sets examples on an oracle function.
-//
-// Canonical example format (arity N):
-//
-//	[arg1, arg2, ..., argN, returnValue]
-//
-// where each arg_i conforms to the declared i-th param type, and returnValue
-// conforms to the oracle's declared *success* return type (non-nullable).
-//
-// Passing Null clears examples.
-func (ip *Interpreter) oracleSetExamples(funVal Value, examples Value) error {
-	if funVal.Tag != VTFun {
-		return fmt.Errorf("not a function")
+func getReqPrompt(ctx CallCtx) (string, bool) {
+	req := ctx.Arg("req")
+	if req.Tag != VTMap {
+		return "", false
 	}
-	f := funVal.Data.(*Fun)
-	if f == nil || !f.IsOracle {
-		return fmt.Errorf("not an oracle")
+	mo := req.Data.(*MapObject)
+	p, ok := mo.Entries["prompt"]
+	if !ok || p.Tag != VTStr {
+		return "", false
 	}
-
-	// Recover original declaration signature (stable across currying).
-	paramNames := f.Params
-	declTypes := f.ParamTypes
-	if f.Sig != nil {
-		paramNames = f.Sig.Names
-		declTypes = f.Sig.Types
-	}
-
-	// Clear.
-	if examples.Tag == VTNull {
-		f.Examples = Null
-		return nil
-	}
-	if examples.Tag != VTArray {
-		return fmt.Errorf("examples must be an array or null")
-	}
-
-	n := len(declTypes)
-	if len(paramNames) != n {
-		return fmt.Errorf("oracle signature mismatch (names=%d types=%d)", len(paramNames), n)
-	}
-
-	// Success return type (examples represent successful outputs).
-	successRet := stripNullable(f.ReturnType)
-
-	exs := examples.Data.(*ArrayObject).Elems
-	for ei, ex := range exs {
-		if ex.Tag != VTArray {
-			return fmt.Errorf("example %d: must be an array", ei)
-		}
-		xs := ex.Data.(*ArrayObject).Elems
-		if len(xs) != n+1 {
-			return fmt.Errorf("example %d: expected %d items ([%d args..., return])", ei, n+1, n)
-		}
-
-		// Args.
-		for i := 0; i < n; i++ {
-			if !ip.isType(xs[i], declTypes[i], f.Env) {
-				return fmt.Errorf("example %d: arg %d does not match declared type", ei, i+1)
-			}
-		}
-
-		// Return value (success type).
-		if !ip.isType(xs[n], successRet, f.Env) {
-			return fmt.Errorf("example %d: return value does not match declared return type", ei)
-		}
-	}
-
-	f.Examples = examples
-	return nil
+	return p.Data.(string), true
 }
 
-// execOracle is the primary oracle call engine used by the interpreter when an
-// oracle function is invoked. It builds the prompt, calls the backend hook,
-// parses & validates, and returns a nullable Value (success or annotated failure).
-func (ip *Interpreter) execOracle(funVal Value, ctx CallCtx) Value {
-	if funVal.Tag != VTFun {
-		return annotNull("oracle: not a function")
-	}
-	f := funVal.Data.(*Fun)
-
-	// Recover original declaration signature from Fun.Sig (stable across currying).
-	paramNames := f.Params
-	declTypes := f.ParamTypes
-	if f.Sig != nil {
-		paramNames = f.Sig.Names
-		declTypes = f.Sig.Types
-	}
-
-	// Build runtime boxes and the prompt.
-	inArgsVal := valueMapFromArgs(ctx, paramNames) // VTMap holding current call args
-
-	inTypesVal := Arr(func() []Value {
-		arr := make([]Value, len(declTypes))
-		for i := range declTypes {
-			arr[i] = TypeValIn(declTypes[i], f.Env)
-		}
-		return arr
-	}())
-
-	// Boxed output type: {"output": T}, where T is the declared success type (non-nullable here).
-	outBoxTypeS := S{"map", S{"pair!", S{"str", "output"}, stripNullable(f.ReturnType)}}
-
-	exPairs := boxExamplesAsMaps(f.Examples, paramNames)
-	examplesVal := Arr(exPairs)
-
-	instructionVal := Str(strings.TrimSpace(funVal.Annot))
-
-	// Build prompt text (prefers user hook when available) and record it.
-	prompt := ip.buildOraclePrompt(
-		instructionVal,
-		inArgsVal,
-		inTypesVal,
-		TypeValIn(outBoxTypeS, f.Env),
-		examplesVal,
-		f.Env,
-	)
-
-	// Locate executor hook strictly via the oracle's lexical environment.
-	hook, err := f.Env.Get("__oracle_execute")
-	if err != nil || hook.Tag != VTFun {
-		return annotNull("oracle backend not configured (define __oracle_execute)")
-	}
-	res := ip.Apply(hook, []Value{Str(prompt)})
-
-	// Backend can signal failure with null.
-	if res.Tag == VTNull {
-		return res
-	}
-	if res.Tag != VTStr {
-		return annotNull("oracle executor must return a string (raw model output) or null")
-	}
-
-	// Parse returned JSON and validate it matches {"output": T?}.
-	raw := strings.TrimSpace(res.Data.(string))
-	decoded, _, _ := jsonRepair(raw)
-	if decoded == nil {
-		return annotNull("oracle output was not valid JSON")
-	}
-	v := goJSONToValue(decoded)
-	if v.Tag != VTMap {
-		v = Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": v},
-			Keys:    []string{"output"},
-		}}
-	}
-	mo := v.Data.(*MapObject)
-	out, ok := mo.Entries["output"]
-	if !ok || !ip.isType(out, ensureNullableUnlessAny(f.ReturnType), f.Env) {
-		return annotNull("oracle output did not match the declared return type")
-	}
-	return out
-}
-
-// buildOraclePrompt builds the prompt from Value-boxed parts.
-// instruction: Str
-// input:       Any (VTMap of call arguments)
-// inTypes:     [Type] (declared param types, in order)
-// outType:     Type   (boxed {"output": T})
-// examples:    [Any]  (each item is [inputMap, outputMap] or {"input":..,"output":..})
-func (ip *Interpreter) buildOraclePrompt(
-	instruction Value,
-	input Value,
-	inTypes Value,
-	outType Value,
-	examples Value,
-	env *Env,
-) string {
-	// Derive input map type S from (names, declared types).
-	names := []string{}
-	if input.Tag == VTMap {
-		mo := input.Data.(*MapObject)
-		names = append(names, mo.Keys...)
-		// for _, k := range mo.Keys {
-		// 	names = append(names, k)
-		// }
-	}
-	declTypes := []S{}
-	if inTypes.Tag == VTArray {
-		for _, v := range inTypes.Data.(*ArrayObject).Elems {
-			if v.Tag == VTType {
-				if tv, ok := v.Data.(*TypeValue); ok {
-					declTypes = append(declTypes, tv.Ast)
-				}
-			}
-		}
-	}
-	inMapTypeS := mapTypeFromParams(names, declTypes)
-
-	// Pretty-print schemas.
-	toSchemaString := func(tv Value) string {
-		s := ip.TypeValueToJSONSchema(tv, env)
-		b, err := json.MarshalIndent(s, "", "  ")
-		if err != nil {
-			return "{}"
-		}
-		return string(b)
-	}
-	inputSchema := toSchemaString(TypeValIn(inMapTypeS, env))
-	outputSchema := toSchemaString(outType)
-
-	// JSON stringifier.
-	toJSON := func(v Value) string {
-		j, err := valueToGoJSON(v)
-		if err != nil {
-			return "null"
-		}
-		b, err := json.MarshalIndent(j, "", "  ")
-		if err != nil {
-			return "null"
-		}
-		return string(b)
-	}
-
-	var bld strings.Builder
-
-	// System prompt.
-	bld.WriteString("PROMPT:\n")
-	bld.WriteString("Please follow the instruction to the best of your ability:\n")
-	bld.WriteString("for every input, provide an output that solves the task and\n")
-	bld.WriteString("respects the OUTPUT JSON SCHEMA. Never put code fences around\n")
-	bld.WriteString("the output. Only generate valid JSON.\n\n")
-
-	// Schemas.
-	bld.WriteString("INPUT JSON SCHEMA:\n\n")
-	bld.WriteString(indentBlock(inputSchema, 2))
-	bld.WriteString("\n\n")
-
-	bld.WriteString("OUTPUT JSON SCHEMA:\n\n")
-	bld.WriteString(indentBlock(outputSchema, 2))
-	bld.WriteString("\n\n")
-
-	// Instruction / task line.
-	taskLine := "Given the input, determine the output."
-	if instruction.Tag == VTStr && strings.TrimSpace(instruction.Data.(string)) != "" {
-		taskLine = strings.TrimSpace(instruction.Data.(string))
-	}
-
-	bld.WriteString("TASK:\n\n")
-	bld.WriteString(taskLine + "\n\n")
-
-	// Examples.
-	if examples.Tag == VTArray {
-		for _, ex := range examples.Data.(*ArrayObject).Elems {
-			if ex.Tag != VTArray {
-				continue
-			}
-			pair := ex.Data.(*ArrayObject).Elems
-			if len(pair) != 2 {
-				continue
-			}
-			inVal, outVal := pair[0], pair[1]
-
-			bld.WriteString("INPUT:\n\n")
-			bld.WriteString(toJSON(inVal) + "\n\n")
-			bld.WriteString("OUTPUT:\n\n")
-			bld.WriteString(toJSON(outVal) + "\n\n")
-		}
-	}
-
-	// Final TASK with current call's input.
-	bld.WriteString("INPUT:\n\n")
-	bld.WriteString(toJSON(input) + "\n\n")
-	bld.WriteString("OUTPUT:\n")
-
-	return bld.String()
-}
-
-// ------------- Helpers -----------------------------------
-
-// Build a map type S from parameter names and declared types.
-func mapTypeFromParams(names []string, types []S) S {
-	m := S{"map"}
-	for i := 0; i < len(names) && i < len(types); i++ {
-		m = append(m, S{"pair!", S{"str", names[i]}, types[i]})
-	}
-	return m
-}
-
-// Box current call arguments (from ctx) into a map Value conforming to the input map type.
-func valueMapFromArgs(ctx CallCtx, names []string) Value {
-	entries := make(map[string]Value, len(names))
-	keys := make([]string, 0, len(names))
-	for _, name := range names {
-		v := ctx.Arg(name) // if missing, omit/zero-value
-		entries[name] = v
-		keys = append(keys, name)
-	}
-	return Value{Tag: VTMap, Data: &MapObject{Entries: entries, Keys: keys}}
-}
-
-// Box examples (canonical):
-//
-//	each example is [arg1, ..., argN, returnValue]
-//
-// Normalize to prompt pairs:
-//
-//	input  → {"x": arg1, "y": arg2, ...}
-//	output → {"output": returnValue}
-//
-// Accepts a VTArray (or Null → returns empty).
-func boxExamplesAsMaps(exs Value, names []string) []Value {
-	out := []Value{}
-	if exs.Tag != VTArray {
-		return out
-	}
-	n := len(names)
-	for _, ex := range exs.Data.(*ArrayObject).Elems {
-		if ex.Tag != VTArray {
-			continue
-		}
-		xs := ex.Data.(*ArrayObject).Elems
-		if len(xs) != n+1 {
-			continue
-		}
-
-		// Input map from args.
-		inMap := make(map[string]Value, n)
-		keys := make([]string, 0, n)
-		for i := 0; i < n; i++ {
-			inMap[names[i]] = xs[i]
-			keys = append(keys, names[i])
-		}
-		inVal := Value{Tag: VTMap, Data: &MapObject{Entries: inMap, Keys: keys}}
-
-		outVal := Value{Tag: VTMap, Data: &MapObject{
-			Entries: map[string]Value{"output": xs[n]},
-			Keys:    []string{"output"},
-		}}
-
-		out = append(out, Arr([]Value{inVal, outVal}))
-	}
-	return out
-}
-
-// indentBlock prefixes each line with n spaces (prompt formatting).
-func indentBlock(s string, n int) string {
-	pad := strings.Repeat(" ", n)
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = pad + lines[i]
-	}
-	return strings.Join(lines, "\n")
-}
-
-// Nullable helpers and small utilities.
-
-func ensureNullableUnlessAny(t S) S {
-	if isAnyType(t) || isNullable(t) {
-		return t
-	}
-	return S{"unop", "?", t}
-}
-func isAnyType(t S) bool  { return len(t) == 2 && t[0] == "id" && t[1] == "Any" }
-func isNullable(t S) bool { return len(t) >= 3 && t[0] == "unop" && t[1] == "?" }
-func stripNullable(t S) S {
-	for isNullable(t) {
-		t = t[2].(S)
-	}
-	return t
-}
-func unwrapFenced(s string) string {
-	if strings.HasPrefix(s, "```") {
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			s = s[i+1:]
-		} else {
-			return s
-		}
-		if j := strings.LastIndex(s, "```"); j >= 0 {
-			s = s[:j]
-		}
-		s = strings.TrimSpace(s)
-	}
-	return s
-}
-
-// callGlobal1 invokes a global unary function by name and traps runtime errors,
-// returning the value and a non-empty error string when a failure is produced.
-func (ip *Interpreter) callGlobal1(name string, arg Value) (v Value, errStr string) {
-	fn, err := ip.Global.Get(name)
-	if err != nil || fn.Tag != VTFun {
-		v = annotNull(name + " is not available; load the standard library")
-		errStr = "missing"
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			switch e := r.(type) {
-			case rtErr:
-				v = annotNull(e.msg)
-			default:
-				v = annotNull("runtime error")
-			}
-			errStr = v.Annot
-		}
-	}()
-	v = ip.Apply(fn, []Value{arg})
-	if v.Tag == VTNull && v.Annot != "" {
-		errStr = v.Annot
-	}
-	return
-}
-
-=== END FILE: ./mindscript/oracles.go ===
-
-=== BEGIN FILE: ./mindscript/builtin_misc.go ===
-package mindscript
-
-import (
-	"fmt"
-	"math"
-	"math/rand"
-	"os"
-	"runtime/debug"
-	"strconv"
-	"sync"
-	"time"
-	"unicode/utf8"
-)
-
-// --- Random Utilities ----------------------------------------------------
-
-func registerRandomBuiltins(ip *Interpreter, target *Env) {
-	// Instance-local RNG and mutex; closures capture these.
-	var (
-		rng   = rand.New(rand.NewSource(time.Now().UnixNano()))
-		rngMu sync.Mutex
-	)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"seedRand",
-		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			n := ctx.Arg("n")
-			rngMu.Lock()
-			rng.Seed(n.Data.(int64))
-			rngMu.Unlock()
-			return Null
-		},
-	)
-	setBuiltinDoc(target, "seedRand", `Seed the pseudo-random number generator.
-
-Use a fixed seed for reproducible sequences.
-
-Params:
-	n: Int — seed value
-
-Returns:
-	Null`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"randInt",
-		[]ParamSpec{{Name: "n", Type: S{"id", "Int"}}},
-		S{"id", "Int"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			n := ctx.Arg("n").Data.(int64)
-			// Contractual: n must be > 0 (hard error)
-			if n <= 0 {
-				fail("randInt: n must be > 0")
-			}
-			// Guard against overflow when converting to platform int.
-			intMax := int64(int(^uint(0) >> 1))
-			if n > intMax {
-				fail("randInt: n too large on this platform")
-			}
-			rngMu.Lock()
-			res := rng.Intn(int(n))
-			rngMu.Unlock()
-			return Int(int64(res))
-		},
-	)
-	setBuiltinDoc(target, "randInt", `Uniform random integer in [0, n).
-
-Params:
-	n: Int — upper bound (must be > 0)
-
-Returns:
-	Int`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"randFloat",
-		[]ParamSpec{{Name: "_", Type: S{"id", "Null"}}},
-		S{"id", "Num"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			rngMu.Lock()
-			f := rng.Float64()
-			rngMu.Unlock()
-			return Num(f)
-		},
-	)
-	setBuiltinDoc(target, "randFloat", `Uniform random number in [0.0, 1.0).
-
-Params:
-	_: Null
-
-Returns:
-	Num`)
-}
-
-// --- Casting Utilities ----------------------------------------------------
-
-func registerCastBuiltins(ip *Interpreter, target *Env) {
-	// pretty(src: Str) -> Str?   (caret-formatted parse errors as soft null)
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"formatCode",
-		[]ParamSpec{{Name: "src", Type: S{"id", "Str"}}},
-		S{"unop", "?", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) (v Value) {
-			s := ctx.Arg("src").Data.(string)
-
-			// Catch panics from Pretty / printer and turn them into a soft error.
-			defer func() {
-				if r := recover(); r != nil {
-					// Print Go-side details to stderr for debugging.
-					fmt.Fprintf(
-						os.Stderr, // or os.Stderr, depending on your wiring
-						"formatCode panic: %v\n%s\n",
-						r,
-						debug.Stack(),
-					)
-					v = annotNull(fmt.Sprintf("formatCode panic: %v", r))
-				}
-			}()
-
-			out, err := Pretty(s)
-			if err != nil {
-				return annotNull(err.Error())
-			}
-			return Str(out)
-		},
-	)
-	setBuiltinDoc(target, "formatCode", `Format source code.
-
-Parses the input and pretty-prints it with normalized whitespace and minimal parentheses. Supports PRE/POST annotations (# ... lines above; trailing # ... forces newline). On parse failure, returns null with a caret-formatted error.
-
-Params:
-	src: Str
-
-Returns:
-	Str?`)
-
-	// formatValue(x: Any) -> Str   (renders with annotations)
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"formatValue",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"id", "Str"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			return Str(FormatValue(ctx.Arg("x")))
-		},
-	)
-	setBuiltinDoc(target, "formatValue", `Render a runtime value (with annotations).
-
-Produces a stable, readable string: scalars are literal; arrays/maps inline when short, otherwise multi-line (maps sort keys). PRE annotations print as header lines; POST as trailing comments. Functions show as <fun: ...>, types as <type: ...>, modules as <module: ...>.
-
-Params:
-	x: Any
-
-Returns:
-	Str`)
-
-	// str(x: Any) -> Str?   (ignores annotations; soft-error on unsupported)
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"str",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Str"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			// Normalize modules to maps so they print as their map view.
-			in := AsMapValue(ctx.Arg("x"))
-			// Functions, types, and handles are intentionally not printable.
-			switch in.Tag {
-			case VTFun, VTType, VTHandle:
-				return annotNull("unsupported type, cannot convert to Str")
-			}
-			// Strip annotations recursively before printing.
-			clean := stripAnnDeep(in)
-
-			// Identity for plain strings (no quotes).
-			if clean.Tag == VTStr {
-				return clean
-			}
-
-			// Everything else uses the pretty renderer.
-			return Str(FormatValue(clean))
-		},
-	)
-	setBuiltinDoc(target, "str", `Convert to string if possible; otherwise err.
-
-Converts values of type Null, Bool, Int, Num, Str, [...], and {...}.
-
-Params:
-	x: Any
-
-Returns:
-	Str?`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"int",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Int"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.Arg("x")
-			switch v.Tag {
-			case VTInt:
-				return v
-			case VTNum:
-				return Int(int64(v.Data.(float64)))
-			case VTBool:
-				if v.Data.(bool) {
-					return Int(1)
-				}
-				return Int(0)
-			case VTStr:
-				if n, err := strconv.ParseInt(v.Data.(string), 10, 64); err == nil {
-					return Int(n)
-				}
-				return annotNull("unsupported type, cannot convert to Int")
-			default:
-				return annotNull("unsupported type, cannot convert to Int")
-			}
-		},
-	)
-	setBuiltinDoc(target, "int", `Convert to Int when possible; otherwise errs.
-
-Rules:
-	• Int → Int
-	• Num → truncated toward zero
-	• Bool → 1 or 0
-	• Str → parsed base-10 integer, or null on failure
-	• Others → null
-
-Params:
-	x: Any
-
-Returns:
-	Int?`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"num",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Num"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.Arg("x")
-			switch v.Tag {
-			case VTNum:
-				return v
-			case VTInt:
-				return Num(float64(v.Data.(int64)))
-			case VTBool:
-				if v.Data.(bool) {
-					return Num(1)
-				}
-				return Num(0)
-			case VTStr:
-				if f, err := strconv.ParseFloat(v.Data.(string), 64); err == nil {
-					return Num(f)
-				}
-				return annotNull("unsupported type, cannot convert to Num")
-			default:
-				return annotNull("unsupported type, cannot convert to Num")
-			}
-		},
-	)
-	setBuiltinDoc(target, "num", `Convert to Num when possible; otherwise errs.
-
-Rules:
-	• Num → Num
-	• Int → floating-point value
-	• Bool → 1.0 or 0.0
-	• Str → parsed as float64, or null on failure
-	• Others → null
-
-Params:
-	x: Any
-
-Returns:
-	Num?`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"bool",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Bool"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.Arg("x")
-			switch v.Tag {
-			case VTBool:
-				return v
-			case VTNull:
-				return Bool(false)
-			case VTInt:
-				return Bool(v.Data.(int64) != 0)
-			case VTNum:
-				return Bool(v.Data.(float64) != 0)
-			case VTStr:
-				return Bool(v.Data.(string) != "")
-			case VTArray:
-				return Bool(len(v.Data.(*ArrayObject).Elems) > 0)
-			case VTMap:
-				return Bool(len(v.Data.(*MapObject).Entries) > 0)
-			default:
-				return annotNull("unsupported type, cannot convert to Bool")
-			}
-		},
-	)
-	setBuiltinDoc(target, "bool", `Convert to Bool using common "truthiness" rules; otherwise errs.
-
-Falsey:
-	• null
-	• 0, 0.0
-	• "" (empty string)
-	• [] (empty array)
-	• {} (empty map)
-
-Truthy:
-	• Any other value for Int, Num, [...], and {...}.
-
-Params:
-	x: Any
-
-Returns:
-	Bool?`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"len",
-		[]ParamSpec{{Name: "x", Type: S{"id", "Any"}}},
-		S{"unop", "?", S{"id", "Int"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			x := AsMapValue(ctx.Arg("x"))
-			switch x.Tag {
-			case VTArray:
-				return Int(int64(len(x.Data.(*ArrayObject).Elems)))
-			case VTMap:
-				mo := x.Data.(*MapObject)
-				// Use ordered keys length to reflect object “length”
-				return Int(int64(len(mo.Keys)))
-			case VTStr:
-				// Unicode-aware length to match substr’s rune semantics
-				return Int(int64(utf8.RuneCountInString(x.Data.(string))))
-			default:
-				return Null
-			}
-		},
-	)
-	setBuiltinDoc(target, "len", `Length of a value.
-
-Rules:
-	• [a, b, c] → 3
-	• {k: v, ...} → number of keys (in insertion order)
-	• "…unicode…" → rune count
-	• Others → null
-
-Params:
-	x: Any
-
-Returns:
-	Int?`)
-}
-
-// --- Math Utilities ----------------------------------------------------
-
-func registerMathBuiltins(ip *Interpreter, target *Env) {
-	// Constants
-	target.Define("PI", Num(math.Pi))
-	target.Define("E", Num(math.E))
-	setBuiltinDoc(target, "PI", `Mathematical constant π.
-
-Returns:
-	Num`)
-	setBuiltinDoc(target, "E", `Euler's number e.
-
-Returns:
-	Num`)
-
-	// Unary math helpers
-	un1 := func(name string, f func(float64) float64, doc string) {
-		ip.RegisterRuntimeBuiltin(
-			target,
-			name,
-			[]ParamSpec{{Name: "x", Type: S{"id", "Num"}}},
-			S{"id", "Num"},
-			func(_ *Interpreter, ctx CallCtx) Value {
-				return Num(f(ctx.NumArg("x").Data.(float64)))
-			},
-		)
-		setBuiltinDoc(target, name, doc)
-	}
-	un1("sin", math.Sin, `Sine of an angle in radians.
-
-Params:
-	x: Num — radians
-
-Returns:
-	Num`)
-	un1("cos", math.Cos, `Cosine of an angle in radians.
-
-Params:
-	x: Num — radians
-
-Returns:
-	Num`)
-	un1("tan", math.Tan, `Tangent of an angle in radians.
-
-Params:
-	x: Num — radians
-
-Returns:
-	Num`)
-	un1("sqrt", math.Sqrt, `Square root.
-
-Params:
-	x: Num — non-negative
-
-Returns:
-	Num`)
-	un1("log", math.Log, `Natural logarithm (base e).
-
-Params:
-	x: Num — positive
-
-Returns:
-	Num`)
-	un1("exp", math.Exp, `Exponential function e^x.
-
-Params:
-	x: Num
-
-Returns:
-	Num`)
-
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"pow",
+// Installs a fake __oracle_execute that returns the provided raw string
+// (or an annotated null when raw == "").
+// Registered in Core and hoisted to Global.
+// NOTE: __oracle_execute takes (req: {}) -> Str | Null.
+func registerFakeOracle(ip *Interpreter, raw string) {
+	ip.RegisterNative(
+		"__oracle_execute",
 		[]ParamSpec{
-			{Name: "base", Type: S{"id", "Num"}},
-			{Name: "exp", Type: S{"id", "Num"}},
+			{Name: "req", Type: S{"map"}},
 		},
-		S{"id", "Num"},
+		S{"unop", "?", S{"id", "Str"}}, // Str? (executor may return null on transport failure)
 		func(_ *Interpreter, ctx CallCtx) Value {
-			return Num(math.Pow(ctx.NumArg("base").Data.(float64), ctx.NumArg("exp").Data.(float64)))
-		},
-	)
-	setBuiltinDoc(target, "pow", `Power: base^exp.
-
-Params:
-	base: Num
-	exp:  Num
-
-Returns:
-	Num`)
-}
-
-// --- Process Utilities ----------------------------------------------------
-
-func registerProcessBuiltins(ip *Interpreter, target *Env) {
-	// exit(code:Int?) -> Null (terminates the host process)
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"exit",
-		[]ParamSpec{{Name: "code", Type: S{"unop", "?", S{"id", "Int"}}}},
-		S{"id", "Null"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			codeV := ctx.Arg("code")
-			code := 0
-			if codeV.Tag == VTInt {
-				code = int(codeV.Data.(int64))
+			if raw == "" {
+				return annotNull("fake backend: empty")
 			}
-			os.Exit(code)
-			return Null // unreachable
+			return Str(raw)
 		},
 	)
-	setBuiltinDoc(target, "exit", `Terminate the current process with an optional status code.
-
-By convention, 0 indicates success; non-zero indicates an error.
-
-Params:
-	code: Int? — exit status (default 0)
-
-Returns:
-	Null (never returns; process exits)`)
-}
-
-// stripAnnDeep removes annotations from a value recursively.
-//   - Clears Value.Annot on all nodes.
-//   - For arrays, deep-copies elements with annotations stripped.
-//   - For maps, deep-copies entries (annotations stripped), preserves key order (Keys),
-//     and clears KeyAnn entirely.
-func stripAnnDeep(v Value) Value {
-	// Always drop the annotation on this node.
-	v.Annot = ""
-	switch v.Tag {
-	case VTArray:
-		ao := v.Data.(*ArrayObject)
-		elems := make([]Value, len(ao.Elems))
-		for i := range ao.Elems {
-			elems[i] = stripAnnDeep(ao.Elems[i])
-		}
-		return Arr(elems) // Arr() builds a fresh ArrayObject
-	case VTMap:
-		mo := v.Data.(*MapObject)
-		cpE := make(map[string]Value, len(mo.Entries))
-		for k, vv := range mo.Entries {
-			cpE[k] = stripAnnDeep(vv)
-		}
-		cpK := make([]string, len(mo.Keys))
-		copy(cpK, mo.Keys)
-		return Value{
-			Tag: VTMap,
-			Data: &MapObject{
-				Entries: cpE,
-				Keys:    cpK,
-			},
-		}
-	default:
-		// Primitives, modules already normalized via AsMapValue, etc.
-		return v
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
 	}
 }
 
-func registerOracleBuiltins(ip *Interpreter, target *Env) {
-	// oracleExamples(fn: Any) -> Any
-	// Returns the oracle's stored examples (VTArray) or null.
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"oracleGetExamples",
-		[]ParamSpec{{Name: "fn", Type: S{"id", "Any"}}},
+// Variant that also captures req.prompt into *outPrompt.
+func registerFakeOracleWithCapture(ip *Interpreter, raw string, outPrompt *string) {
+	ip.RegisterNative(
+		"__oracle_execute",
+		[]ParamSpec{
+			{Name: "req", Type: S{"map"}},
+		},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value {
+			// capture the prompt for inspection in tests
+			if outPrompt != nil {
+				if p, ok := getReqPrompt(ctx); ok {
+					*outPrompt = p
+				}
+			}
+			if raw == "" {
+				return annotNull("fake backend: empty")
+			}
+			return Str(raw)
+		},
+	)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
+}
+
+// Minimal jsonParse native (Str -> Any | annotated Null).
+// Uses Go's encoding/json and converts into MindScript Values.
+func registerJSONParse(ip *Interpreter) {
+	ip.RegisterNative(
+		"jsonParse",
+		[]ParamSpec{{Name: "text", Type: S{"id", "Str"}}},
 		S{"id", "Any"},
 		func(_ *Interpreter, ctx CallCtx) Value {
-			v := ctx.Arg("fn")
-			if v.Tag != VTFun || v.Data == nil {
-				fail("oracleExamples: expected an oracle function")
+			raw := ctx.Arg("text").Data.(string)
+			var x any
+			if err := json.Unmarshal([]byte(raw), &x); err != nil {
+				return annotNull("json parse error")
 			}
-			f := v.Data.(*Fun)
-			if f == nil || !f.IsOracle {
-				fail("oracleExamples: expected an oracle function")
-			}
-			// Stored in canonical form: [ [arg1..argN, ret], ... ] or null.
-			return f.Examples
+			return goJSONToValue(x)
 		},
 	)
-	setBuiltinDoc(target, "oracleGetExamples", `Get examples attached to an oracle.
-
-Params:
-	fn: Any — must be an oracle function
-
-Returns:
-	Any — the examples array in canonical form, or null`)
-
-	// oracleSetExamples(fn: Any, examples: Any) -> Null
-	// Uses the engine validator; hard-fails (panic) on mismatch.
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"oracleSetExamples",
-		[]ParamSpec{
-			{Name: "fn", Type: S{"id", "Any"}},
-			{Name: "examples", Type: S{"id", "Any"}},
-		},
-		S{"id", "Bool"},
-		func(ip *Interpreter, ctx CallCtx) Value {
-			fn := ctx.Arg("fn")
-			ex := ctx.Arg("examples")
-			if err := ip.OracleSetExamples(fn, ex); err != nil {
-				fail("oracleSetExamples: " + err.Error())
-			}
-			return Bool(true)
-		},
-	)
-	setBuiltinDoc(target, "oracleSetExamples", `Set examples on an oracle (hard-fails on type mismatch).
-
-Canonical example format for an oracle with N parameters:
-	[arg1, arg2, ..., argN, returnValue]
-
-Pass null to clear examples.
-
-Params:
-	fn: Any — must be an oracle function
-	examples: Any — array of examples or null
-
-Returns:
-	true if it succeeds.`)
+	if v, err := ip.Core.Get("jsonParse"); err == nil {
+		ip.Global.Define("jsonParse", v)
+	}
 }
 
-=== END FILE: ./mindscript/builtin_misc.go ===
+// --- tiny assertions ---------------------------------------------------------
+
+// Count example INPUT blocks in a prompt (excludes the final call's INPUT).
+// Heuristic: the prompt renders one "INPUT:" per example plus one final "INPUT:"
+// for the current call. So (#INPUT occurrences - 1) == #examples.
+func countExamplesInPrompt(prompt string) int {
+	if prompt == "" {
+		return 0
+	}
+	n := strings.Count(prompt, "INPUT:\n\n")
+	if n > 0 {
+		return n - 1
+	}
+	return 0
+}
+
+// --- tests -------------------------------------------------------------------
+
+func Test_Oracle_StrSuccess(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
+
+	v, err := ip.EvalSource(`
+		# Say a scientist's name as plain text.
+		let scientist = oracle() -> Str
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Ada Lovelace")
+}
+
+func Test_Oracle_JSONSuccess_Object(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"name":"Marie Curie"}}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Marie Curie")
+}
+
+func Test_Oracle_JSONInvalid_YieldsError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `not-json`)
+
+	v, err := ip.EvalSource(`
+		let f = oracle() -> {name!: Str}
+		f()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "not valid JSON")
+}
+
+func Test_Oracle_JSONWrongShape_YieldsError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"ok":true}`)
+
+	v, err := ip.EvalSource(`
+		let f = oracle() -> {name!: Str}
+		f()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "did not match the declared return type")
+}
+
+func Test_Oracle_NullableBehavior_For_NonAny(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output": null}`)
+
+	v, err := ip.EvalSource(`
+		let b = oracle() -> Str
+		b()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v.Tag != VTNull || v.Annot != "" {
+		t.Fatalf("want plain null (accepted under Str?), got: %v (annot=%q)", v, v.Annot)
+	}
+}
+
+func Test_Oracle_JSONFailure_TypeMismatch_AnnotatedNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"wrong":42}}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "declared return type")
+}
+
+func Test_Oracle_AnyPassThrough_NoNullableWidening(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"foo":123}}`)
+
+	v, err := ip.EvalSource(`
+		let anything = oracle() -> Any
+		anything().foo
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantInt(t, v, 123)
+}
+
+func Test_Oracle_FencedJSON_Unwrapped(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```json\n{\"output\":{\"name\":\"Rosalind Franklin\"}}\n```")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Rosalind Franklin")
+}
+
+func Test_Oracle_ExecutorTransportError_PropagatesAnnotatedNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	ip.RegisterNative(
+		"__oracle_execute",
+		[]ParamSpec{
+			{Name: "req", Type: S{"map"}},
+		},
+		S{"unop", "?", S{"id", "Str"}},
+		func(_ *Interpreter, ctx CallCtx) Value { return annotNull("network down") },
+	)
+	if v, err := ip.Core.Get("__oracle_execute"); err == nil {
+		ip.Global.Define("__oracle_execute", v)
+	}
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "network down")
+}
+
+func Test_Oracle_ObjectResult_Parsed_OK(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"ok":true}}`)
+
+	v, err := ip.EvalSource(`
+		let s = oracle() -> {ok!: Bool}
+		s().ok
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantBool(t, v, true)
+}
+
+func Test_Oracle_OutType_Any_Not_Wrapped(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":{"ok":true}}`)
+
+	v, err := ip.EvalSource(`
+		let a = oracle() -> Any
+		## Backend returns {"output":{"ok": true}}; Any accepts the parsed map.
+		a().ok
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantBool(t, v, true)
+}
+
+// --- examples handling via captured prompt -----------------------------------
+
+func Test_Oracle_Examples_Present_In_Prompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		let ex = [
+			[0, "zero"],
+			[1, "one"],
+			[2, "two"]
+		]
+		let number2word = oracle(n: Int) -> Str from ex
+		number2word(5)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	if got := countExamplesInPrompt(lastPrompt); got != 3 {
+		t.Fatalf("want 3 examples in prompt, got %d\n\nPROMPT:\n%s", got, lastPrompt)
+	}
+}
+
+func Test_Oracle_Examples_From_Variable_Expr_In_Prompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+        let ex = [
+            [0, "zero"],
+            [1, "one"],
+            [2, "two"]
+        ]
+        let number2word = oracle(n: Int) -> Str from ex
+        number2word(5)
+    `)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	if got := countExamplesInPrompt(lastPrompt); got != 3 {
+		t.Fatalf("want 3 examples in prompt, got %d\n\nPROMPT:\n%s", got, lastPrompt)
+	}
+}
+
+func Test_Oracle_Examples_From_Expression_In_Prompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+        let a = [[0,"zero"]]
+        let b = [[1,"one"]]
+        let number2word = oracle(n: Int) -> Str from (a + b)
+        number2word(7)
+    `)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	if got := countExamplesInPrompt(lastPrompt); got != 2 {
+		t.Fatalf("want 2 examples in prompt, got %d\n\nPROMPT:\n%s", got, lastPrompt)
+	}
+}
+
+// --- fenced / null literal edge cases ---------------------------------------
+
+func Test_Oracle_Fenced_NoLabel_Unwrapped_JSON(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```\n{\"output\":{\"name\":\"Katherine Johnson\"}}\n```")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist().name
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Katherine Johnson")
+}
+
+func Test_Oracle_Str_Fenced_NoLabel_Unwrapped_Text(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "```\n{\"output\":\"Hello, world!\"}\n```")
+
+	v, err := ip.EvalSource(`
+		let greet = oracle() -> Str
+		greet()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Hello, world!")
+}
+
+func Test_Oracle_StrNullLiteral_YieldsAnnotatedNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerFakeOracle(ip, "null") // executor returns the literal string "null"
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "not valid JSON")
+}
+
+func Test_Oracle_NonStr_NonJSON_Yields_AnnotatedNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, "this is not json at all")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "valid JSON")
+}
+
+func Test_Oracle_Object_LiteralNull_Yields_AnnotatedNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerFakeOracle(ip, "null")
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> {name!: Str}
+		scientist()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "not valid JSON")
+}
+
+// Already had a transport error test; add one more variant: backend returns empty -> annotated null
+func Test_Oracle_Executor_Returns_Empty_AnnotatedNull(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerFakeOracle(ip, "") // will return annotNull("fake backend: empty")
+
+	v, err := ip.EvalSource(`
+		let s = oracle() -> Str
+		s()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantAnnotatedNullContains(t, v, "fake backend")
+}
+
+// -----------------------------------------------------------------------------
+// New tests focusing on arity/type errors at call sites (hard errors).
+// -----------------------------------------------------------------------------
+
+func Test_Oracle_MultiParam_Arity_And_TypeCheck(t *testing.T) {
+	ip, _ := NewInterpreter()
+	// Backend won't be reached if params fail type-checking (engine enforces)
+	registerFakeOracle(ip, `{"output":{"ignored":true}}`)
+
+	// Wrong type for first parameter (expects Int) → CONTRACT VIOLATION ⇒ HARD ERROR
+	_, err := ip.EvalSource(`
+		let f = oracle(a: Int, b: Str) -> Str
+		f("not-int", "ok")
+	`)
+	wantHardErrorContains(t, err, "type mismatch")
+}
+
+func wantHardErrorContains(t *testing.T, err error, substr string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected hard error containing %q, got nil error", substr)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, substr) {
+		t.Fatalf("hard error mismatch: want msg to contain %q, got: %s", substr, msg)
+	}
+	// Optional: assert caret header is present when runtimeErrorsAsGoError=true
+	if !strings.Contains(msg, "RUNTIME ERROR") {
+		t.Fatalf("expected caret-style RUNTIME ERROR, got: %s", msg)
+	}
+}
+
+// --- multi-input + type aliases (with schema descriptions) -------------------
+
+func Test_Oracle_MultiParam_With_Aliases_Success_And_Prompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ready"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		# A user record.
+		let User = type {name!: Str, age: Int}
+
+		# Hobbies.
+		let Hobbies = type [Str]
+
+		# Status of execution.
+		let Status = type Enum["ready", "running", "done"]
+
+		let decide = oracle(u: User, h: Hobbies) -> Status
+		decide({name: "Ada", age: 36}, ["math", "poetry"]) == "ready"
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Oracle returned "ready", which is valid Status → expression should be true.
+	wantBool(t, v, true)
+
+	// Prompt should include both inputs rendered and schema descriptions from annotations.
+	if !strings.Contains(lastPrompt, `"name": "Ada"`) || !strings.Contains(lastPrompt, `"age": 36`) {
+		t.Fatalf("prompt missing user input fields:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"math"`) || !strings.Contains(lastPrompt, `"poetry"`) {
+		t.Fatalf("prompt missing hobbies input:\n%s", lastPrompt)
+	}
+	// Descriptions must be present in the INPUT/OUTPUT JSON SCHEMA blocks.
+	if !strings.Contains(lastPrompt, `"description": "A user record."`) {
+		t.Fatalf("missing User description in schema:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"description": "Hobbies."`) {
+		t.Fatalf("missing Hobbies description in schema:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"description": "Status of execution."`) {
+		t.Fatalf("missing Status description in schema:\n%s", lastPrompt)
+	}
+}
+
+func Test_Oracle_TypeAlias_In_ReturnType_NullableOperationally(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var lastPrompt string
+	// Backend returns null → allowed at runtime as T? (operationally nullable).
+	registerFakeOracleWithCapture(ip, `{"output": null}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		# Status of execution.
+		let Status = type Enum["ready", "running", "done"]
+
+		let query = oracle() -> Status
+		query()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Should be plain (unannotated) null under Status?
+	if v.Tag != VTNull || v.Annot != "" {
+		t.Fatalf("want plain null (accepted under Status?), got %v (annot=%q)", v, v.Annot)
+	}
+	// Output schema should carry alias description.
+	if !strings.Contains(lastPrompt, `"description": "Status of execution."`) {
+		t.Fatalf("missing Status description in output schema:\n%s", lastPrompt)
+	}
+}
+
+func Test_Oracle_Alias_ArrayParam_Success_And_Prompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var lastPrompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &lastPrompt)
+
+	v, err := ip.EvalSource(`
+		# Hobbies.
+		let Hobbies = type [Str]
+
+		let summarize = oracle(h: Hobbies) -> Str
+		summarize(["skiing", "reading"])
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "ok")
+
+	// Prompt should show the array inputs and the alias description.
+	if !strings.Contains(lastPrompt, `"skiing"`) || !strings.Contains(lastPrompt, `"reading"`) {
+		t.Fatalf("prompt missing hobbies values:\n%s", lastPrompt)
+	}
+	if !strings.Contains(lastPrompt, `"description": "Hobbies."`) {
+		t.Fatalf("missing Hobbies description in schema:\n%s", lastPrompt)
+	}
+}
+
+func Test_Oracle_Alias_Param_WrongShape_HardError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"ignored"}`) // should not be reached
+
+	_, err := ip.EvalSource(`
+		# A user record.
+		let User = type {name!: Str, age: Int}
+
+		let f = oracle(u: User) -> Str
+		# Wrong shape: name is Int (should be Str).
+		f({name: 123, age: 5})
+	`)
+	// Structural type check at call-site should fail.
+	wantHardErrorContains(t, err, "type mismatch")
+}
+
+func Test_Oracles_TaskLine_UsesAnnotation_StraightCall(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var gotPrompt string
+	registerFakeOracleWithCapture(ip, `{"output": 6}`, &gotPrompt)
+
+	v, err := ip.EvalSource(`
+		# add two numbers
+		let add = oracle(n: Int, m: Int) -> Int
+		add(2, 4)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v.Tag != VTInt || v.Data.(int64) != 6 {
+		t.Fatalf("want Int(6), got: %v", v)
+	}
+
+	if gotPrompt == "" {
+		t.Fatalf("did not capture prompt")
+	}
+
+	// TASK must reflect the annotation (not the fallback).
+	if !strings.Contains(gotPrompt, "\nTASK:\n\nadd two numbers\n\n") {
+		t.Fatalf("TASK line did not use annotation; prompt was:\n%s", gotPrompt)
+	}
+	if strings.Contains(gotPrompt, "Given the input, determine the output.") {
+		t.Fatalf("fallback TASK line was used; prompt was:\n%s", gotPrompt)
+	}
+
+	// No examples provided → no example INPUT blocks.
+	if n := countExamplesInPrompt(gotPrompt); n != 0 {
+		t.Fatalf("expected 0 example INPUT blocks, got %d", n)
+	}
+}
+
+func Test_Oracles_TaskLine_UsesAnnotation_CurriedCall(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var gotPrompt string
+	registerFakeOracleWithCapture(ip, `{"output": 6}`, &gotPrompt)
+
+	v, err := ip.EvalSource(`
+		# add two numbers
+		let add = oracle(n: Int, m: Int) -> Int
+		add(2)(4)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v.Tag != VTInt || v.Data.(int64) != 6 {
+		t.Fatalf("want Int(6), got: %v", v)
+	}
+
+	if gotPrompt == "" {
+		t.Fatalf("did not capture prompt")
+	}
+
+	// Ensure annotation survives currying and appears in the TASK line.
+	if !strings.Contains(gotPrompt, "\nTASK:\n\nadd two numbers\n\n") {
+		t.Fatalf("TASK line did not use annotation after currying; prompt was:\n%s", gotPrompt)
+	}
+	if strings.Contains(gotPrompt, "Given the input, determine the output.") {
+		t.Fatalf("fallback TASK line was used after currying; prompt was:\n%s", gotPrompt)
+	}
+
+	// No examples provided → no example INPUT blocks.
+	if n := countExamplesInPrompt(gotPrompt); n != 0 {
+		t.Fatalf("expected 0 example INPUT blocks, got %d", n)
+	}
+}
+
+// --- extra tiny assertions for these tests ----------------------------------
+
+func wantAnnotNull(t *testing.T, v Value, substr string) {
+	t.Helper()
+	if v.Tag != VTNull {
+		t.Fatalf("want annotated null, got tag=%v val=%v", v.Tag, v)
+	}
+	if v.Annot == "" || !strings.Contains(v.Annot, substr) {
+		t.Fatalf("want annotated null containing %q, got %q", substr, v.Annot)
+	}
+}
+
+// --- lexical-resolution tests -----------------------------------------------
+
+func Test_Oracle_Hook_StrToStr_Typecheck(t *testing.T) {
+	ip, err := NewInterpreter()
+	if err != nil {
+		t.Fatalf("NewRuntime error: %v", err)
+	}
+
+	// Evaluate in Global(ns): should see __oracle_execute via Global -> Base(ns) -> Core.
+	v, err := ip.EvalSource(`isType(__oracle_execute, type {} -> Str?)`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if v.Tag != VTBool || v.Data.(bool) != true {
+		t.Fatalf("expected true for isType(__oracle_execute, type {} -> Str?), got: %#v", v)
+	}
+}
+
+//  2. A user-space binding defined BEFORE the oracle is created is captured
+//     lexically and used by the oracle.
+func Test_Oracle_LexicalHook_UserSpaceBinding(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	v, err := ip.EvalSource(`
+		let __oracle_execute = fun(req: {}) -> Str do
+			"{\"output\":\"X-Ray Spex\"}"
+		end
+		let o = oracle() -> Str
+		o()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "X-Ray Spex")
+}
+
+//  3. A call-site shadow (let __oracle_execute = ...) does NOT override the
+//     oracle's captured hook under pure lexical semantics.
+func Test_Oracle_LexicalHook_IgnoresCallSiteShadow(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	// Install a fake backend in Core/Global *before* oracle definition so it’s
+	// visible lexically when the oracle is created.
+	registerFakeOracle(ip, `{"output":"Ada Lovelace"}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		let g = fun() -> Str do
+			# This local binding is at the call site and must NOT affect the oracle.
+			let __oracle_execute = fun(req: {}) -> Str do
+				"{\"output\":\"Hedy Lamarr\"}"
+			end
+			scientist()
+		end
+		g()
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	// Should still use the pre-installed hook, not the call-site shadow.
+	wantStr(t, v, "Ada Lovelace")
+}
+
+//  4. The captured hook works inside a spawned process because the function's
+//     closure chain is snapshotted into the child isolate.
+func Test_Oracle_LexicalHook_SpawnedProcess(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"Grace Hopper"}`)
+
+	v, err := ip.EvalSource(`
+		let scientist = oracle() -> Str
+		let worker = fun() -> Str do
+			scientist()
+		end
+		let p = procSpawn(worker)
+		procJoin(p)
+	`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	wantStr(t, v, "Grace Hopper")
+}
+
+func Test_Oracle_SetExamples_MultiArg_EmitsExamplesInPrompt(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var prompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &prompt)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int, b: {name!: Str}) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	ex, err := ip.EvalSource(`[[1, {name:"Ada"}, "one"], [2, {name:"Bob"}, "two"]]`)
+	if err != nil {
+		t.Fatalf("EvalSource examples error: %v", err)
+	}
+
+	if err := ip.OracleSetExamples(fv, ex); err != nil {
+		t.Fatalf("OracleSetExamples error: %v", err)
+	}
+
+	_, err = ip.EvalSource(`f(9, {name:"Zoe"})`)
+	if err != nil {
+		t.Fatalf("EvalSource error: %v", err)
+	}
+	if got := countExamplesInPrompt(prompt); got != 2 {
+		t.Fatalf("want 2 examples in prompt, got %d", got)
+	}
+}
+
+func Test_Oracle_SetExamples_ReplacesExamples(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+
+	var prompt string
+	registerFakeOracleWithCapture(ip, `{"output":"ok"}`, &prompt)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	ex1, _ := ip.EvalSource(`[[0, "zero"]]`)
+	if err := ip.OracleSetExamples(fv, ex1); err != nil {
+		t.Fatalf("OracleSetExamples(1) error: %v", err)
+	}
+	_, _ = ip.EvalSource(`f(1)`)
+	if got := countExamplesInPrompt(prompt); got != 1 {
+		t.Fatalf("want 1 example after first set, got %d", got)
+	}
+
+	ex2, _ := ip.EvalSource(`[[1, "one"], [2, "two"]]`)
+	if err := ip.OracleSetExamples(fv, ex2); err != nil {
+		t.Fatalf("OracleSetExamples(2) error: %v", err)
+	}
+	_, _ = ip.EvalSource(`f(3)`)
+	if got := countExamplesInPrompt(prompt); got != 2 {
+		t.Fatalf("want 2 examples after replace, got %d", got)
+	}
+}
+
+func Test_Oracle_SetExamples_WrongArity_ReturnsError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"ignored"}`)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int, b: Int) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	// Needs 3 elements: [a, b, ret]. This has 2.
+	bad, _ := ip.EvalSource(`[[1, "nope"]]`)
+
+	if err := ip.OracleSetExamples(fv, bad); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+func Test_Oracle_SetExamples_TypeMismatch_ReturnsError(t *testing.T) {
+	ip, _ := NewInterpreter()
+	registerJSONParse(ip)
+	registerFakeOracle(ip, `{"output":"ignored"}`)
+
+	_, err := ip.EvalPersistentSource(`let f = oracle(a: Int) -> Str`)
+	if err != nil {
+		t.Fatalf("EvalPersistentSource error: %v", err)
+	}
+	fv, _ := ip.Global.Get("f")
+
+	// a expects Int; given Str.
+	bad, _ := ip.EvalSource(`[[ "x", "ok" ]]`)
+
+	if err := ip.OracleSetExamples(fv, bad); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+=== END FILE: ./mindscript/oracles_test.go ===
+
+=== BEGIN FILE: ./lib/llm.ms ===
+# llm.ms — minimal LLM backend manager (uniform contract + startup probe)
+#
+# Public surface:
+# init()                 -> { backends!: [Str], current!: Str }          # probe all, pick a usable default, print diagnostics
+# backends()             -> [Str]                                        # available backend names
+# status()               -> { backend!: Str, model: Str?, authed!: Bool, options!: {} }
+# useBackend(Str)        -> {}?                                          # switch current; returns status or soft-null
+# models()               -> [Str]?                                       # list models for current backend (if supported)
+# useModel(Str)          -> {}?                                          # set model for current backend; returns status
+# getConfig()            -> {}                                           # editable snapshot {backend, baseUrl, model, options, [timeoutMs]}
+# setConfig({})          -> {}?                                          # shallow-merge config; returns status
+# auth({})               -> {}?                                          # store credentials (e.g., {"apiKey":"…"}); returns status
+# exec({})               -> Str?                                         # oracle hook: run and return provider RAW STRING (or soft-null on error)
+#
+# Notes:
+# - Backends expose { name, state, listModels?, probe, exec }.
+# - init() prints diagnostics and auto-selects the first OK backend if current is not OK.
+# - Only API keys are read from env; baseUrl/model are configured via setConfig/useModel.
+# - Options live in per-backend state.options. Common knobs:
+#   temperature, top_p, top_k, max_tokens, presence_penalty, frequency_penalty
+# - Backends ignore unknown/unsupported options gracefully.
+# - HTTP failures and provider error payloads are surfaced as soft errors (annotated null) with clear messages.
+# - Oracles validate/box as {"output": x}. Backends DO NOT normalize/box.
+# - Structured outputs: if req.outputSchema is present, backends that support it will request
+#   schema-constrained JSON output (“best available” mode).
+
+# =============================
+# Internal state and minimal helpers
+# =============================
+
+let _state = {
+	current: "ollama",
+	backends: {} # name -> backend record
+}
+
+# Extract prompt from oracle request bundle.
+let _reqPrompt = fun(req: {}) -> Str? do
+	if req == null then
+		return error("missing request")
+	end
+	if not mapHas(req, "prompt") or req.prompt == null then
+		return error("missing prompt")
+	end
+	str(req.prompt)
+end
+
+# Extract output schema (if provided) from oracle request bundle.
+let _reqOutputSchema = fun(req: {}) -> {}? do
+	if req != null and mapHas(req, "outputSchema") and req.outputSchema != null then
+		req.outputSchema
+	else
+		null
+	end
+end
+
+# Render a short backend status line.
+let _diagLine = fun(name: Str, ok: Bool, authed: Bool, model: Str?, baseUrl: Str?, reason: Str?) -> Str do
+	let mark = if ok then
+		"✓"
+	else
+		"✗"
+	end
+	let m = if model == null then
+		""
+	else
+		" model=" + model
+	end
+	let u = if baseUrl == null then
+		""
+	else
+		" @ " + baseUrl
+	end
+	let a = if ok then
+		""
+	else
+		if reason == null then
+			""
+		else
+			" — " + reason
+		end
+	end
+	sprintf("llm: %s %s%s%s%s", [name, mark, m, u, a])
+end
+
+# schemaCloseWorld(schema) walks a JSON Schema value
+# and forces every object-shaped subschema to include:
+#   additionalProperties: false
+# This is needed for OpenAI strict json_schema response_format.
+let _schemaCloseWorld = fun(schema: Any) -> Any do
+	let TMap = type {}
+	let TArr = type [Any]
+
+	let arrHas = fun(xs: [Any], needle: Any) -> Bool do
+		for v in iter(xs) do
+			if v == needle then
+				return true
+			end
+		end
+		false
+	end
+
+	let isObjectSchema = fun(m: {}) -> Bool do
+		# Treat as object schema if:
+		# - type is "object" OR includes "object" in a union array, OR
+		# - it has object-y keys like properties/required/additionalProperties.
+		if mapHas(m, "type") then
+			if m.type == "object" then
+				return true
+			end
+			if m.type != null and isSubtype(typeOf(m.type), TArr) and arrHas(m.type, "object") then
+				return true
+			end
+		end
+		mapHas(m, "properties") or mapHas(m, "required") or mapHas(m, "additionalProperties")
+	end
+
+	let close = fun(x: Any) -> Any do
+		if x == null then
+			return null
+		end
+
+		let tx = typeOf(x)
+
+		# Arrays: close each element.
+		if isSubtype(tx, TArr) then
+			let out = []
+			for v in iter(x) do
+				out = out + [close(v)]
+			end
+			return out
+		end
+
+		# Maps: close each value; then close-world the object schema itself.
+		if isSubtype(tx, TMap) then
+			let out = {}
+			for [k, v] in x do
+				out[k] = close(v)
+			end
+			if isObjectSchema(out) then
+				out.additionalProperties = false
+			end
+			return out
+		end
+
+		# Primitives (Str/Num/Bool/etc): unchanged.
+		x
+	end
+
+	close(schema)
+end
+
+# =============================
+# Backends (raw-string exec, no boxing)
+# =============================
+
+# Backend: Ollama
+let _ollama = {
+	name: "ollama",
+	state: {baseUrl: "http://localhost:11434", model: null, options: {}},
+	listModels: fun(self: {}) -> [Str]? do
+		let url = self.state.baseUrl + "/api/tags"
+		let r = http({url: url, method: "GET"})
+		if r == null then
+			return error("ollama listModels: request failed")
+		end
+		if r.status != 200 then
+			return error("ollama listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return error("ollama listModels: bad JSON")
+		end
+		let out = []
+		if mapHas(body, "models") then
+			for m in iter(body.models) do
+				out = out + [m.name]
+			end
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let r = http({url: self.state.baseUrl + "/api/tags", method: "GET"})
+		if r == null then
+			return {ok: false, authed: true, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: true, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: true}
+	end,
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
+		if self.state.model == null then
+			return error("ollama: model not set (use llm.useModel)")
+		end
+
+		let eff = self.state.options
+		let reqBody = {
+			model: self.state.model,
+			prompt: prompt,
+			stream: false,
+			options: {}
+		}
+
+		# Best available structured output: pass JSON Schema via "format" when provided.
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			reqBody.format = schema
+		end
+
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			reqBody.options.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			reqBody.options.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "top_k") and num(eff.top_k) != null then
+			reqBody.options.top_k = int(num(eff.top_k))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/api/generate",
+			method: "POST",
+			headers: {"Content-Type": "application/json"},
+			body: jsonStringify(reqBody)
+		})
+		if r == null then
+			return error("ollama: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") then
+				return error("ollama: " + str(b.error))
+			end
+			return error("ollama: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return error("ollama: bad JSON from server")
+		end
+		if not mapHas(j, "response") or j.response == null then
+			return error("ollama: missing response")
+		end
+		j.response
+	end
+}
+
+# Backend: OpenAI (Chat Completions)
+let _openai = {
+	name: "openai",
+	state: {
+		baseUrl: "https://api.openai.com/v1",
+		model: null,
+		apiKey: osEnv("OPENAI_API_KEY"),
+		options: {}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return error("openai listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return error("openai listModels: request failed")
+		end
+		if r.status != 200 then
+			return error("openai listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return error("openai listModels: bad JSON")
+		end
+		let out = []
+		for m in iter(body.data) do
+			out = out + [m.id]
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return {ok: false, authed: authed, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
+		if self.state.apiKey == null then
+			return error("openai: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return error("openai: model not set")
+		end
+
+		let eff = self.state.options
+		let body = {
+			model: self.state.model,
+			messages: [
+				{
+					role: "system",
+					content: "You are a careful assistant that outputs only JSON."
+				},
+				{role: "user", content: prompt}
+			]
+		}
+
+		# Best available structured output:
+		# - if schema provided: request strict JSON Schema constrained output
+		# - else: request JSON object (still not schema-constrained)
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			schema = _schemaCloseWorld(schema)
+			body.response_format = {
+				type: "json_schema",
+				json_schema: {name: "oracle_output", schema: schema, strict: true}
+			}
+		else
+			body.response_format = {type: "json_object"}
+		end
+
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "presence_penalty") and num(eff.presence_penalty) != null then
+			body.presence_penalty = num(eff.presence_penalty)
+		end
+		if mapHas(eff, "frequency_penalty") and num(eff.frequency_penalty) != null then
+			body.frequency_penalty = num(eff.frequency_penalty)
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_tokens = int(num(eff.max_tokens))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/chat/completions",
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer " + self.state.apiKey
+			},
+			body: jsonStringify(body)
+		})
+		if r == null then
+			return error("openai: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
+				return error("openai: " + b.error.message)
+			end
+			return error("openai: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return error("openai: bad JSON from server")
+		end
+		if not mapHas(j, "choices") or len(j.choices) == 0 or not mapHas(j.choices[0], "message") or not mapHas(j.choices[0].message, "content") or j.choices[0].message.content == null then
+			return error("openai: missing content")
+		end
+		j.choices[0].message.content
+	end
+}
+
+# Backend: OpenAI (Responses API)
+let _openai_responses = {
+	name: "openai-responses",
+	state: {
+		baseUrl: "https://api.openai.com/v1",
+		model: null,
+		apiKey: osEnv("OPENAI_API_KEY"),
+		options: {}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return error("openai-responses listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return error("openai-responses listModels: request failed")
+		end
+		if r.status != 200 then
+			return error("openai-responses listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return error("openai-responses listModels: bad JSON")
+		end
+		let out = []
+		for m in iter(body.data) do
+			out = out + [m.id]
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return {ok: false, authed: authed, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
+		if self.state.apiKey == null then
+			return error("openai-responses: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return error("openai-responses: model not set")
+		end
+
+		let eff = self.state.options
+		let body = {
+			model: self.state.model,
+			input: prompt,
+			text: {format: {type: "json_object"}}
+		}
+
+		# Best available structured output: request strict JSON Schema constrained output.
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			schema = _schemaCloseWorld(schema)
+			body.text = {
+				format: {
+					type: "json_schema",
+					name: "oracle_output",
+					schema: schema,
+					strict: true
+				}
+			}
+		end
+
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "presence_penalty") and num(eff.presence_penalty) != null then
+			body.presence_penalty = num(eff.presence_penalty)
+		end
+		if mapHas(eff, "frequency_penalty") and num(eff.frequency_penalty) != null then
+			body.frequency_penalty = num(eff.frequency_penalty)
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_output_tokens = int(num(eff.max_tokens))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/responses",
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer " + self.state.apiKey
+			},
+			body: jsonStringify(body)
+		})
+		if r == null then
+			return error("openai-responses: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
+				return error("openai-responses: " + b.error.message)
+			end
+			return error("openai-responses: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return error("openai-responses: bad JSON from server")
+		end
+		if not mapHas(j, "output") or len(j.output) == 0 then
+			return error("openai-responses: missing content")
+		end
+
+		let text = null
+		for msg in j.output do
+			if mapHas(msg, "content") and len(msg.content) > 0 then
+				for part in msg.content do
+					if mapHas(part, "type") and part.type == "output_text" and mapHas(part, "text") and part.text != null then
+						text = part.text
+						break
+					end
+				end
+				break
+			end
+		end
+		if text == null then
+			return error("openai-responses: missing content")
+		end
+		text
+	end
+}
+
+# Backend: Anthropic (Messages API)
+let _anthropic = {
+	name: "anthropic",
+	state: {
+		baseUrl: "https://api.anthropic.com/v1",
+		model: null,
+		apiKey: osEnv("ANTHROPIC_API_KEY"),
+		version: "2023-06-01",
+		options: {max_tokens: 1024}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return error("anthropic listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
+			}
+		})
+		if r == null then
+			return error("anthropic listModels: request failed")
+		end
+		if r.status != 200 then
+			return error("anthropic listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return error("anthropic listModels: bad JSON")
+		end
+		let out = []
+		if mapHas(body, "data") then
+			for m in iter(body.data) do
+				out = out + [m.id]
+			end
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {
+				"x-api-key": self.state.apiKey,
+				"anthropic-version": self.state.version,
+				"content-type": "application/json"
+			}
+		})
+		if r == null then
+			return {ok: false, authed: authed, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
+		if self.state.apiKey == null then
+			return error("anthropic: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return error("anthropic: model not set")
+		end
+
+		let eff = self.state.options
+		let body = {
+			model: self.state.model,
+			messages: [{role: "user", content: prompt}]
+		}
+
+		# Best available structured output: request JSON Schema constrained output if provided.
+		let schema = _reqOutputSchema(req)
+		let headers = {
+			"x-api-key": self.state.apiKey,
+			"anthropic-version": self.state.version,
+			"content-type": "application/json"
+		}
+		if schema != null then
+			body.output_format = {type: "json_schema", schema: schema}
+			# Beta header used by Anthropic for structured outputs (may vary by deployment/model).
+			headers["anthropic-beta"] = "structured-outputs-2025-11-13"
+		end
+
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_tokens = int(num(eff.max_tokens))
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.top_p = num(eff.top_p)
+		end
+		if mapHas(eff, "top_k") and num(eff.top_k) != null then
+			body.top_k = int(num(eff.top_k))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/messages",
+			method: "POST",
+			headers: headers,
+			body: jsonStringify(body)
+		})
+		if r == null then
+			return error("anthropic: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "error") and mapHas(b.error, "message") then
+				return error("anthropic: " + b.error.message)
+			end
+			return error("anthropic: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return error("anthropic: bad JSON from server")
+		end
+		if not mapHas(j, "content") or len(j.content) == 0 or not mapHas(j.content[0], "text") or j.content[0].text == null then
+			return error("anthropic: missing content")
+		end
+		j.content[0].text
+	end
+}
+
+# Backend: Cohere (Chat API)
+let _cohere = {
+	name: "cohere",
+	state: {
+		baseUrl: "https://api.cohere.ai/v1",
+		model: null,
+		apiKey: osEnv("COHERE_API_KEY"),
+		options: {}
+	},
+	listModels: fun(self: {}) -> [Str]? do
+		if self.state.apiKey == null then
+			return error("cohere listModels: missing API key")
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return error("cohere listModels: request failed")
+		end
+		if r.status != 200 then
+			return error("cohere listModels: HTTP " + str(r.status))
+		end
+		let body = jsonParse(r.body)
+		if body == null then
+			return error("cohere listModels: bad JSON")
+		end
+		let out = []
+		if mapHas(body, "models") then
+			for m in iter(body.models) do
+				out = out + [m.name]
+			end
+		elif mapHas(body, "data") then
+			for m in iter(body.data) do
+				out = out + [m.id]
+			end
+		end
+		out
+	end,
+	probe: fun(self: {}) -> {} do
+		let authed = self.state.apiKey != null
+		if not authed then
+			return {ok: false, authed: false, reason: "missing API key"}
+		end
+		let r = http({
+			url: self.state.baseUrl + "/models",
+			method: "GET",
+			headers: {Authorization: "Bearer " + self.state.apiKey}
+		})
+		if r == null then
+			return {ok: false, authed: authed, reason: "request failed"}
+		end
+		if r.status != 200 then
+			return {ok: false, authed: authed, reason: "HTTP " + str(r.status)}
+		end
+		{ok: true, authed: authed}
+	end,
+	exec: fun(self: {}, req: {}) -> Str? do
+		let prompt = _reqPrompt(req)
+		if prompt == null then
+			return prompt
+		end
+		if self.state.apiKey == null then
+			return error("cohere: missing API key (llm.auth)")
+		end
+		if self.state.model == null then
+			return error("cohere: model not set")
+		end
+
+		let eff = self.state.options
+		let body = {model: self.state.model, message: prompt}
+
+		# Best available structured output: request JSON object, attach schema when provided (if supported).
+		let schema = _reqOutputSchema(req)
+		if schema != null then
+			body.response_format = {type: "json_object", schema: schema}
+		else
+			body.response_format = {type: "json_object"}
+		end
+
+		if mapHas(eff, "temperature") and num(eff.temperature) != null then
+			body.temperature = num(eff.temperature)
+		end
+		if mapHas(eff, "top_p") and num(eff.top_p) != null then
+			body.p = num(eff.top_p)
+		end
+		if mapHas(eff, "top_k") and num(eff.top_k) != null then
+			body.k = int(num(eff.top_k))
+		end
+		if mapHas(eff, "max_tokens") and num(eff.max_tokens) != null then
+			body.max_tokens = int(num(eff.max_tokens))
+		end
+
+		let r = http({
+			url: self.state.baseUrl + "/chat",
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer " + self.state.apiKey
+			},
+			body: jsonStringify(body)
+		})
+		if r == null then
+			return error("cohere: request failed")
+		end
+		if r.status != 200 then
+			let b = jsonParse(r.body)
+			if b != null and mapHas(b, "message") then
+				return error("cohere: " + b.message)
+			end
+			return error("cohere: HTTP " + str(r.status))
+		end
+
+		let j = jsonParse(r.body)
+		if j == null then
+			return error("cohere: bad JSON from server")
+		end
+		if mapHas(j, "text") and j.text != null then
+			return j.text
+		end
+		if mapHas(j, "message") and mapHas(j.message, "content") and j.message.content != null then
+			return j.message.content
+		end
+		error("cohere: missing content")
+	end
+}
+
+# =============================
+# Registry & environment sync
+# =============================
+
+_state.backends["ollama"] = _ollama
+_state.backends["openai"] = _openai
+_state.backends["openai-responses"] = _openai_responses
+_state.backends["anthropic"] = _anthropic
+_state.backends["cohere"] = _cohere
+
+# If OPENAI_API_KEY is present, mirror it into both OpenAI backends at load.
+if _openai.state.apiKey != null then
+	_state.backends["openai"].state.apiKey = _openai.state.apiKey
+	_state.backends["openai-responses"].state.apiKey = _openai.state.apiKey
+end
+
+# =============================
+# Public API
+# =============================
+
+# Probe all backends, print diagnostics, and ensure a usable current backend.
+# Args: _: Null (ignored)
+# Return: { backends!: [Str], current!: Str }
+let init = fun(_: Null) -> {} do
+	let names = []
+	let firstOK = null
+	for [k, _] in _state.backends do
+		names = names + [k]
+	end
+
+	let currentOK = false
+	for name in names do
+		let b = _state.backends[name]
+		let pr = b.probe(b)
+		let line = _diagLine(name, pr.ok, pr.authed, if mapHas(b.state, "model") then
+			b.state.model
+		else
+			null
+		end, if mapHas(b.state, "baseUrl") then
+			b.state.baseUrl
+		else
+			null
+		end, if mapHas(pr, "reason") then
+			pr.reason
+		else
+			null
+		end)
+		println(line)
+		if pr.ok and firstOK == null then
+			firstOK = name
+		end
+		if name == _state.current and pr.ok then
+			currentOK = true
+		end
+	end
+
+	if not currentOK and firstOK != null then
+		_state.current = firstOK
+		println(sprintf("llm: switched current backend to \"%s\"", [
+			_state.current
+		]))
+	end
+
+	{backends: names, current: _state.current}
+end
+
+# List registered backend names.
+let backends = fun(_: Null) -> [Str] do
+	let out = []
+	for [k, _] in _state.backends do
+		out = out + [k]
+	end
+	out
+end
+
+# Report current backend status without network calls.
+let status = fun(_: Null) -> {} do
+	let b = _state.backends[_state.current]
+	let requiresKey = b.name == "openai" or b.name == "openai-responses" or b.name == "anthropic" or b.name == "cohere"
+	let authed = if requiresKey then
+		mapHas(b.state, "apiKey") and b.state.apiKey != null
+	else
+		true
+	end
+	{
+		backend: b.name,
+		model: if mapHas(b.state, "model") then
+			b.state.model
+		else
+			null
+		end,
+		authed: authed,
+		options: if mapHas(b.state, "options") then
+			b.state.options
+		else
+			{}
+		end
+	}
+end
+
+# Switch the current backend by name.
+let useBackend = fun(name: Str) -> {}? do
+	if not mapHas(_state.backends, name) then
+		return error("unknown backend: " + name)
+	end
+	_state.current = name
+	status(null)
+end
+
+# List models for the current backend (if supported).
+let models = fun(_: Null) -> [Str]? do
+	let b = _state.backends[_state.current]
+	if not mapHas(b, "listModels") then
+		return error(b.name + " does not support model listing")
+	end
+	b.listModels(b)
+end
+
+# Set the active model for the current backend.
+let useModel = fun(name: Str) -> {}? do
+	let b = _state.backends[_state.current]
+	b.state.model = name
+	status(null)
+end
+
+# Get an editable config snapshot for the current backend.
+let getConfig = fun(_: Null) -> {} do
+	let b = _state.backends[_state.current]
+	let cfg = {
+		backend: b.name,
+		baseUrl: if mapHas(b.state, "baseUrl") then
+			b.state.baseUrl
+		else
+			null
+		end,
+		model: if mapHas(b.state, "model") then
+			b.state.model
+		else
+			null
+		end,
+		options: if mapHas(b.state, "options") then
+			b.state.options
+		else
+			{}
+		end
+	}
+	if mapHas(b.state, "timeoutMs") then
+		cfg.timeoutMs = b.state.timeoutMs
+	end
+	cfg
+end
+
+# Merge a config object into the current backend's state.
+let setConfig = fun(cfg: {}) -> {}? do
+	let b = _state.backends[_state.current]
+	if mapHas(cfg, "baseUrl") then
+		b.state.baseUrl = cfg.baseUrl
+	end
+	if mapHas(cfg, "model") then
+		b.state.model = cfg.model
+	end
+	if mapHas(cfg, "options") then
+		b.state.options = cfg.options
+	end
+	if mapHas(cfg, "timeoutMs") then
+		b.state.timeoutMs = cfg.timeoutMs
+	end
+	status(null)
+end
+
+# Store credentials for the current backend (never printed).
+let auth = fun(creds: {apiKey: Str?}) -> {}? do
+	let b = _state.backends[_state.current]
+	# Ensure apiKey is set/cleared where status() looks.
+	if mapHas(creds, "apiKey") then
+		b.state.apiKey = creds.apiKey
+	end
+	b.state = b.state + creds # Shallow-merge any other credential keys.
+	status(null)
+end
+
+# Execute the current backend with an oracle request bundle.
+# Returns the provider's RAW STRING (or soft-null on error).
+let exec = fun(req: {}) -> Str? do
+	let b = _state.backends[_state.current]
+	b.exec(b, req)
+end
+
+=== END FILE: ./lib/llm.ms ===
+
+=== BEGIN FILE: ./lib/std.ms ===
+# # std.ms
+# # Minimal standard library implemented in MindScript on top of builtins.
+# #
+# # === MINDSCRIPT CODE CONVENTION
+# #
+# # 1) Naming
+# #	Functions/vars: camelCase; Types: PascalCase; Consts: SCREAMING_SNAKE_CASE;
+# #	Modules: snake_case; Private: _prefix.
+# #
+# # 2) Errors
+# #	Soft errors: use nullable returns (T?); return `null  # <reason>`.
+# #	Any? = Any → do NOT use Any for maybes; pick a concrete T.
+# #	Hard errors: `panic(msg)` only for invariants/programmer bugs or unrecoverable state.
+# #	Catch hard errors with `try`; prefer soft errors for expected conditions.
+# #	Caller check idiom:
+# #	```
+# #		let v = parseX(s)
+# #		if v == null then return null  # <invalid input> end
+# #		use(v)
+# #	```
+# #	Add brief, grep-able slugs: `<not found>`, `<timeout: 200ms>`.
+# #
+# # 3) Function docs (PRE)
+# #	First line: short summary. Then blank line. Then Args/Returns/Soft-fail notes.
+# #	Example:
+# #	```
+# #		# Parse URL string.
+# #		#
+# #		# Args: s: Str
+# #		# Returns: {…}? (null on <invalid url>)
+# #		fun parseUrl(s: Str) -> { scheme!:Str, host!:Str, port:Int, path!:Str, query!:Str, fragment:Str }? do
+# #			let u = urlParse(s); if u == null then return null  # <invalid url> end; u
+# #		end
+# #	```
+# #
+# # 4) Formatting
+# #	Tabs for indentation. POST forces newline and follows after-separator rule.
+# #	Canonical output ends with exactly one trailing newline.
+
+# # -----------------------------
+# # Error/Assert
+# # -----------------------------
+
+# Produce an annotated null (soft error).
+# 
+# Returns `null` annotated with `msg`. Use for recoverable failures.
+# Args: msg: Str
+# Returns: Null
+let error = fun(msg: Str) -> Null do
+	__annotate(msg, null)
+end
+
+# Assert that a condition holds.
+# 
+# Returns true if `cond` is true; otherwise throws a hard failure.
+# Args: cond: Bool
+# Returns: Bool
+let assert = fun(cond: Bool) -> Bool do
+	if cond then
+		true
+	else
+		panic("assertion failed")
+	end
+end
+
+# # -----------------------------
+# # Console I/O
+# # -----------------------------
+
+# Print a formatted string to standard output.
+# 
+# Writes via STDOUT's buffered writer to preserve order with write(STDOUT,...).
+# Caller controls newlines:
+# printf("%s = %v\n", ["x", 42])
+# 
+# Params:
+# fmt:  Str
+# args: [Any]
+# 
+# Returns:
+# Str? — the printed string, or null (annotated) on write error.
+let printf = fun(fmt: Str, args: [Any]) -> Str? do
+	let out = sprintf(fmt, args)
+	write(STDOUT, out)
+	flush(STDOUT)
+	out
+end
+
+# Print a value and return it.
+# 
+# Prints the string form of `x` without a trailing newline, and returns `x`.
+# Args: x: Any
+# Returns: Any
+let print = fun(x) do
+	write(STDOUT, sprintf("%s", [str(x)]))
+	flush(STDOUT)
+	x
+end
+
+# Print a value with newline and return it.
+# 
+# Prints the string form of `x` followed by a newline, and returns `x`.
+# Args: x: Any
+# Returns: Any
+let println = fun(x) do
+	write(STDOUT, sprintf("%s\n", [str(x)]))
+	flush(STDOUT)
+	x
+end
+
+# # -----------------------------
+# # Iterators
+# # -----------------------------
+
+# Infinite iterator: 0, 1, 2, ...
+# 
+# Produces a thunk `(Null -> Int)` that increments on each call.
+# Args: _: Null (ignored)
+# Returns: (Null -> Int)
+let naturals0 = fun(_: Null) -> Null -> Int do
+	let i = 0
+	fun(_: Null) -> Int do
+		let v = i
+		i = i + 1
+		v
+	end
+end
+
+# Infinite iterator: 1, 2, 3, ...
+# 
+# Produces a thunk `(Null -> Int)` that starts at 1.
+# Args: _: Null (ignored)
+# Returns: (Null -> Int)
+let naturals = fun(_: Null) -> Null -> Int do
+	let i = 1
+	fun(_: Null) -> Int do
+		let v = i
+		i = i + 1
+		v
+	end
+end
+
+# Integer range iterator (stop exclusive; infinite if stop is null).
+# 
+# Returns a thunk that yields start, start+1, ... until `stop-1`, or forever if `stop` is null.
+# Args: start: Int, stop: Int?
+# Returns: (Null -> Int?)
+let range = fun(start: Int, stop: Int?) -> Null -> Int? do
+	let i = start
+	fun(_: Null) -> Int? do
+		if stop == null then
+			let v = i
+			i = i + 1
+			v
+		elif i >= stop then
+			null
+		else
+			let v = i
+			i = i + 1
+			v
+		end
+	end
+end
+
+# Turn arrays or maps into (Null -> Any?) iterators; pass iterators through unchanged.
+# 
+# - [Any]      → yields elements
+# - {}         → yields [key, value] pairs
+# - (Null->?)  → returned as-is
+# Else: hard error.
+# Args: v: Any
+# Returns: (Null -> Any?)
+let iter = fun(v) -> Null -> Any? do
+	if isType(v, type [Any]) then
+		let xs = v
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(xs) then
+				let y = xs[i]
+				i = i + 1
+				y
+			else
+				null
+			end
+		end
+	elif isType(v, type {}) then
+		let kvs = []
+		for [k, val] in v do
+			kvs = kvs + [[k, val]]
+		end
+		let i = 0
+		fun(_: Null) -> Any? do
+			if i < len(kvs) then
+				let p = kvs[i]
+				i = i + 1
+				p
+			else
+				null
+			end
+		end
+	elif isType(v, type Null -> Any?) then
+		v
+	else
+		panic("iter: expected array, map, or iterator")
+	end
+end
+
+# Collect an iterator into an array.
+# 
+# Consumes `it` until it returns null.
+# Args: it: (Null -> Any?)
+# Returns: [Any]
+let list = fun(it: Null -> Any?) -> [Any] do
+	let out = []
+	for _ in naturals0(null) do
+		let x = it(null)
+		if x == null then
+			break
+		end
+		out = out + [x]
+	end
+	out
+end
+
+# Map over an iterator (lazy transform).
+# 
+# Returns a thunk that yields `f(x)` for each `x` in `it`.
+# Args: f: (Any -> Any), it: (Null -> Any?)
+# Returns: (Null -> Any?)
+let map = fun(f: Any -> Any, it: Null -> Any?) -> Null -> Any? do
+	fun(_: Null) -> Any? do
+		let x = it(null)
+		if x == null then
+			null
+		else
+			f(x)
+		end
+	end
+end
+
+# Filter an iterator (lazy predicate).
+# 
+# Returns a thunk that yields only values where `cond(x)` is true.
+# Args: cond: (Any -> Bool), it: (Null -> Any?)
+# Returns: (Null -> Any?)
+let filter = fun(cond: Any -> Bool, it: Null -> Any?) -> Null -> Any? do
+	fun(_: Null) -> Any? do
+		for _ in naturals0(null) do
+			let x = it(null)
+			if x == null then
+				break
+			end
+			if cond(x) then
+				return x
+			end
+		end
+		null
+	end
+end
+
+# Fold an iterator with a binary function.
+# 
+# Reduces `it` by applying `f` left-to-right. Returns null for empty iterator.
+# Args: f: (Any -> Any -> Any), it: (Null -> Any?)
+# Returns: Any?
+let reduce = fun(f: Any -> Any -> Any, it: Null -> Any?) -> Any? do
+	let first = it(null)
+	if first == null then
+		null
+	else
+		let acc = first
+		for _ in naturals0(null) do
+			let x = it(null)
+			if x == null then
+				break
+			end
+			acc = f(acc, x)
+		end
+		acc
+	end
+end
+
+# # -----------------------------
+# # Arrays
+# # -----------------------------
+
+# Slice an array [s, e).
+# 
+# Returns a shallow copy of `xs` from index `s` (inclusive) to `e` (exclusive).
+# Args: xs: [Any], s: Int, e: Int
+# Returns: [Any]
+let slice = fun(xs: [Any], s: Int, e: Int) -> [Any] do
+	let out = []
+	for i in range(s, e) do
+		out = out + [xs[i]]
+	end
+	out
+end
+
+# Sort an array in-place using a comparison function.
+# Args: arr:[Any] - array to sort (modified in-place)
+# cmp:Any -> Any -> Int - comparator returning <0, 0, or >0
+# Return: [Any] - the sorted array (same reference)
+let sort = fun(arr: [Any], cmp: Any -> Any -> Int) -> [Any] do
+	let swap = fun(i: Int, j: Int) -> Null do
+		let t = arr[i]
+		arr[i] = arr[j]
+		arr[j] = t
+		null
+	end
+
+	let partition = fun(lo: Int, hi: Int) -> [Int] do
+		let pivot = arr[lo]
+		let lt = lo
+		let gt = hi
+		let i = lo
+		while i <= gt do
+			let c = cmp(arr[i], pivot)
+			if c < 0 then
+				swap(lt, i)
+				lt = lt + 1
+				i = i + 1
+			elif c > 0 then
+				swap(i, gt)
+				gt = gt - 1
+			else
+				i = i + 1
+			end
+		end
+		[lt, gt]
+	end
+
+	let qsort = fun(lo: Int, hi: Int) -> Null do
+		if lo >= hi then
+			return
+		end
+		let [lt, gt] = partition(lo, hi)
+		qsort(lo, lt - 1)
+		qsort(gt + 1, hi)
+		null
+	end
+
+	qsort(0, len(arr) - 1)
+	arr
+end
+
+# # -----------------------------
+# # Objects (maps)
+# # -----------------------------
+
+# Iterator over keys of an object.
+# 
+# Args: obj: {}
+# Returns: (Null -> Str?)
+let keys = fun(obj: {}) -> Null -> Str? do
+	let it = iter(obj) # yields [k, v]
+
+	fun(_: Null) -> Str? do
+		let pair = it(null)
+		if pair == null then
+			null
+		else
+			pair[0]
+		end
+	end
+end
+
+# Iterator over values of an object.
+# 
+# Args: obj: {}
+# Returns: (Null -> Any?)
+let values = fun(obj: {}) -> Null -> Any? do
+	let it = iter(obj)
+	fun(_: Null) -> Any? do
+		let pair = it(null)
+		if pair == null then
+			null
+		else
+			pair[1]
+		end
+	end
+end
+
+# Directory listing of visible fields/functions.
+# 
+# For maps: returns keys not starting with "_".
+# For modules: returns exported names (not starting with "_"), or [] if unavailable.
+# If a value has a PRE note, the first line is attached as an annotation to the key.
+# Args: x: {}
+# Returns: [Str]
+let dir = fun(x: {}) -> [Str] do
+	let out = []
+	for [k, v] in x do
+		if not (substr(k, 0, 1) == "_") then
+			let ann = noteGet(v)
+			if ann != null then
+				ann = split(ann, "\n")[0]
+				k = noteSet(ann, k)
+			end
+			out = out + [k]
+		end
+	end
+	out
+end
+
+# # -----------------------------
+# # Importing / modules
+# # -----------------------------
+
+# Create an importer from a code string.
+# 
+# Returns a function that imports the code under a given module name.
+# Args: code: Str
+# Returns: (Str -> {})
+let codeImport = fun(code: Str) -> Str -> {} do
+	fun(name: Str) -> {} do
+		importCode(name, code)
+	end
+end
+
+# Import a module from a URL.
+# 
+# Returns the module object, or annotated null on failure.
+# Args: url: Str
+# Returns: {}?
+let importUrl = fun(url: Str) -> {}? do
+	let r = try(fun() do
+		import(url)
+	end)
+	if r.ok then
+		r.value
+	else
+		error("import failed: " + str(r.value))
+	end
+end
+
+# # -----------------------------
+# # Misc
+# # -----------------------------
+
+# Stable-ish integer id for a value’s content.
+# 
+# Hashes the UTF-8 bytes of `str(value)` via sha256, then folds over the hex string
+# with a DJB2-like accumulator for a compact Int.
+# Args: value: Any
+# Returns: Int
+let uid = fun(value) -> Int do
+	let hx = hexEncode(sha256(formatValue(value)))
+	let h = 5381
+	let n = len(hx)
+	let i = 0
+
+	let hexVal = fun(c: Str) -> Int do
+		if c == "0" then
+			0
+		elif c == "1" then
+			1
+		elif c == "2" then
+			2
+		elif c == "3" then
+			3
+		elif c == "4" then
+			4
+		elif c == "5" then
+			5
+		elif c == "6" then
+			6
+		elif c == "7" then
+			7
+		elif c == "8" then
+			8
+		elif c == "9" then
+			9
+		elif c == "a" or c == "A" then
+			10
+		elif c == "b" or c == "B" then
+			11
+		elif c == "c" or c == "C" then
+			12
+		elif c == "d" or c == "D" then
+			13
+		elif c == "e" or c == "E" then
+			14
+		elif c == "f" or c == "F" then
+			15
+		else
+			0
+		end
+	end
+
+	while i < n do
+		let nib = substr(hx, i, i + 1)
+		h = h * 33 + hexVal(nib)
+		i = i + 1
+	end
+	h
+end
+
+# Mute (sink) a value.
+# 
+# Accepts any value and returns null.
+# Args: _: Any
+# Returns: Null
+let mute = fun(_) -> Null do
+	null
+end
+
+# # -----------------------------
+# # Oracle hook (prelude-owned, minimal)
+# # -----------------------------
+
+# Global oracle execution hook.
+# 
+# Backends install their executor here via `oracleInstall`.
+# Until installed, oracle calls should return an annotated null via this hook.
+# Once installed, this function is supposed to return a JSON string containing
+# a value `x` boxed as `{output: x}`.
+# Args: prompt: Str
+# Returns: Str?
+let __oracle_execute = fun(prompt: Str) -> Str? do
+	error("oracle backend not configured")
+end
+
+# Internal flag for diagnostics.
+# 
+# Tracks whether a backend was installed via `oracleInstall`.
+# Args: (none)
+# Returns: (stateful)
+let _oracleInstalled = false
+
+# Oracle request model.
+let OracleRequest = type {
+	prompt!: Str,
+	annotation!: Str,
+	examples!: [Any],
+	input!: Any,
+	inTypes!: [Type],
+	outType!: Type,
+	inputSchema!: Any,
+	outputSchema!: Any,
+	inputSchemaString!: Str,
+	outputSchemaString!: Str
+}
+
+
+# Install a new global oracle executor.
+# 
+# Rebinds `__oracle_execute` to the provided function.
+# Args: exec: (Str -> Str?)
+# Returns: Null
+let oracleInstall = fun(exec: OracleRequest -> Str?) -> Bool do
+	__oracle_execute = exec
+	_oracleInstalled = true
+	true
+end
+
+# Show oracle installation status.
+# 
+# Returns a short string indicating whether a backend is installed.
+# Args: _: Null (ignored)
+# Returns: Str
+let oracleStatus = fun(_: Null) -> Str do
+	if _oracleInstalled then
+		"oracle: installed"
+	else
+		"oracle: not installed"
+	end
+end
+
+# Quick oracle health check (real call, tiny).
+# Success: { ok:true, ms }; failure/not installed: annotated null.
+let oracleHealth = fun(_: Null) -> {}? do
+	if not _oracleInstalled then
+		return error("oracle not installed")
+	end
+
+	let ping = oracle(msg: Str) -> Str
+	let t0 = nowMillis()
+	let out = ping("ping")
+	let dt = nowMillis() - t0
+	if out == null then
+		return out
+	end
+	if out == "pong" then
+		return {ok: true, ms: dt}
+	end
+
+	let j = jsonParse(out)
+	if j != null and mapHas(j, "output") and j.output == "pong" then
+		return {ok: true, ms: dt}
+	end
+
+	error("pong mismatch")
+end
+
+# ---- Prompt tap (diagnostics) ----
+
+# Most recent oracle prompt captured for diagnostics.
+# Type: Str?
+let _oracleLastPrompt = null
+
+# Rolling log of oracle prompts and outputs captured for diagnostics.
+# Type: [[Str?]]
+let _oracleLog = []
+
+# Install an oracle executor that records each prompt before forwarding.
+# Args: exec: (Str -> Str?)  # underlying executor
+# Return: Bool               # true on install
+let oracleInstallWithTap = fun(exec: OracleRequest -> Str?) -> Bool do
+	oracleInstall(fun(p: OracleRequest) -> Str? do
+		_oracleLastPrompt = p
+		let out = exec(p)
+		push(_oracleLog, [p, out])
+		out
+	end)
+	true
+end
+
+# Return the most recently recorded oracle prompt (if any).
+# Args: _: Null (ignored)
+# Return: Str?
+let oracleLastPrompt = fun(_: Null) -> Str? do
+	_oracleLastPrompt
+end
+
+# Return the full recorded oracle prompt/output log.
+# Args: _: Null (ignored)
+# Return: [[Str]]
+let oracleLog = fun(_: Null) -> [[Str?]] do
+	_oracleLog
+end
+
+# # -----------------------------
+# # LLM backend bootstrap (installed in prelude)
+# # -----------------------------
+
+# Load the llm module, install its executor, and select a default backend/model.
+
+let llm = import("llm") # The LLM module.
+oracleInstall(llm.exec)
+llm.useBackend("ollama")
+llm.useModel("llama3.2")
+=== END FILE: ./lib/std.ms ===
 

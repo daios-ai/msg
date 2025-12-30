@@ -528,12 +528,27 @@ end
 # Returns: (stateful)
 let _oracleInstalled = false
 
+# Oracle request model.
+let OracleRequest = type {
+	prompt!: Str,
+	annotation!: Str,
+	examples!: [Any],
+	input!: Any,
+	inTypes!: [Type],
+	outType!: Type,
+	inputSchema!: Any,
+	outputSchema!: Any,
+	inputSchemaString!: Str,
+	outputSchemaString!: Str
+}
+
+
 # Install a new global oracle executor.
 # 
 # Rebinds `__oracle_execute` to the provided function.
 # Args: exec: (Str -> Str?)
 # Returns: Null
-let oracleInstall = fun(exec: Str -> Str?) -> Bool do
+let oracleInstall = fun(exec: OracleRequest -> Str?) -> Bool do
 	__oracle_execute = exec
 	_oracleInstalled = true
 	true
@@ -591,8 +606,8 @@ let _oracleLog = []
 # Install an oracle executor that records each prompt before forwarding.
 # Args: exec: (Str -> Str?)  # underlying executor
 # Return: Bool               # true on install
-let oracleInstallWithTap = fun(exec: Str -> Str?) -> Bool do
-	oracleInstall(fun(p: Str) -> Str? do
+let oracleInstallWithTap = fun(exec: OracleRequest -> Str?) -> Bool do
+	oracleInstall(fun(p: OracleRequest) -> Str? do
 		_oracleLastPrompt = p
 		let out = exec(p)
 		push(_oracleLog, [p, out])

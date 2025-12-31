@@ -34,7 +34,7 @@ out/
 generated/
 artifacts/
 release/
-docs/manual/.site/
+docs/.site/
 
 # --- Release artifacts ---
 mindscript-*.tar.gz

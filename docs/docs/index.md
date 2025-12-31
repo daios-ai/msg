@@ -73,7 +73,7 @@ Usage:
   msg version                              Print the compiled version
 ```
 
-For more installation options and configuring the LLM backend, check the **[Installation Guide](installation.md)**.
+For more installation options and configuring the LLM backend, check the **[Installation Guide](https://mindscript.daios.ai/installation/)**.
 
 ## Requirements
 

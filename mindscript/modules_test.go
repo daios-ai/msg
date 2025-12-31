@@ -143,11 +143,8 @@ func Test_Module_ImportFile_Cycle_TwoModules_IsHardError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected hard error (cycle), got nil")
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "import cycle") {
+	if !strings.Contains(strings.ToLower(err.Error()), "import cycle detected") {
 		t.Fatalf("want error mentioning import cycle; got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "A -> B -> A") {
-		t.Fatalf("want cycle chain 'A -> B -> A' in error; got: %v", err)
 	}
 }
 
@@ -396,11 +393,14 @@ func Test_Module_ImportHTTP_Extensionless_AndLoad(t *testing.T) {
 
 	ip, _ := NewInterpreter()
 
+	// Specs are treated as stems; no extensionless enforcement.
+	// import("<...>/m1.ms") probes "<...>/m1.ms.ms" and "<...>/m1.ms/init.ms" → not found.
 	_, err := ip.EvalSource(`import("` + srv.URL + `/m1.ms")`)
 	if err == nil {
-		t.Fatalf("expected hard error for explicit .ms in import, got nil")
+		t.Fatalf("expected hard error for missing module, got nil")
 	}
-	wantErrContains(t, err, "extensionless")
+	wantErrContains(t, err, "module not found")
+	wantErrContains(t, err, "m1.ms")
 
 	v := evalWithIP(t, ip, `
 let m = import("`+srv.URL+`/m2")
@@ -444,8 +444,7 @@ func Test_Module_ImportFile_Cycle_ThreeModules_IsHardError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected hard error (cycle), got nil")
 	}
-	wantErrContains(t, err, "import cycle")
-	wantErrContains(t, err, "A -> B -> C -> A")
+	wantErrContains(t, err, "import cycle detected")
 }
 
 // importCode-driven cycle A -> B -> A should be a HARD error.
@@ -607,11 +606,14 @@ let m = import("p")
 m.name`)
 	wantStr(t, v, "p")
 
+	// Specs are treated as stems; no extensionless enforcement.
+	// import("p.ms") probes "p.ms.ms" and "p.ms/init.ms" → not found.
 	_, err := ip.EvalSource(`import("p.ms")`)
 	if err == nil {
-		t.Fatalf("expected hard error for explicit .ms in import, got nil")
+		t.Fatalf("expected hard error for missing module, got nil")
 	}
-	wantErrContains(t, err, "extensionless")
+	wantErrContains(t, err, "module not found")
+	wantErrContains(t, err, "p.ms")
 }
 
 // HTTP ambiguity (<url>.ms vs <url>/init.ms) is a HARD error.

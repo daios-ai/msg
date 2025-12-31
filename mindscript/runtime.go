@@ -9,11 +9,9 @@
 package mindscript
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // --- Handle helpers (use central Handle from interpreter.go) ---
@@ -97,23 +95,26 @@ func (ip *Interpreter) SeedRuntimeInto(target *Env) error {
 	registerOracleBuiltins(ip, target)
 
 	// --- Load prelude into the SAME target (overrideable within namespace) ---
-	// Imports are extensionless now; prelude spec should be "std", not "std.ms".
-	if err := ip.LoadPreludeInto(target, "std", ""); err != nil {
+	// Prelude is not a module import. It is executed directly into 'target'
+	// from <installRoot>/lib/<filename>.
+	if err := ip.LoadPreludeInto(target, "std.ms"); err != nil {
 		return err
 	}
 	return nil
 }
 
-// LoadPreludeInto resolves `spec`, parses it with spans, and evaluates it
-// into the provided `target` environment (NOT Core). Errors are pretty-printed.
-func (ip *Interpreter) LoadPreludeInto(target *Env, spec string, importer string) error {
-	// 1) Resolve + fetch (using the same clean import rules as ImportFile)
-	src, display, err := resolveAndFetchClean(spec, importer)
+// LoadPreludeInto loads <installRoot>/lib/<filename>, parses it with spans,
+// and evaluates it into the provided `target` environment (NOT Core).
+// Prelude evaluation is NOT a module: no caching, no cycle detection, no two-form probing.
+func (ip *Interpreter) LoadPreludeInto(target *Env, filename string) error {
+	display := filepath.Join(installRoot, "lib", filename)
+	b, err := os.ReadFile(display)
 	if err != nil {
 		return err
 	}
+	src := string(b)
 
-	// 2) Parse with spans for caret diagnostics
+	// Parse with spans for caret diagnostics
 	ast, spans, perr := ParseSExprWithSpans(src)
 	if perr != nil {
 		if e, ok := perr.(*Error); ok {
@@ -125,8 +126,8 @@ func (ip *Interpreter) LoadPreludeInto(target *Env, spec string, importer string
 		return perr
 	}
 
-	// 3) Evaluate in the provided target environment. We want real errors for VM runtime failures,
-	//    and we also want to treat annotated-null as an error.
+	// Evaluate in the provided target environment. We want real errors for VM runtime failures,
+	// and we also want to treat annotated-null as an error.
 	v, rterr := ip.runTopWithSource(ast, target, false, &SourceRef{
 		Name:  display,
 		Src:   src,
@@ -151,108 +152,4 @@ func (ip *Interpreter) LoadPreludeInto(target *Env, spec string, importer string
 	}
 
 	return nil
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                 CLEAN RESOLUTION (shared with ImportFile)
-////////////////////////////////////////////////////////////////////////////////
-
-// resolveAndFetchClean implements the same "clean" resolution order as ImportFile,
-// but returns raw source (for prelude evaluation into an existing env).
-//
-// Returns:
-//   - src:     fetched source text
-//   - display: a useful name for diagnostics (canonical path/URL)
-func resolveAndFetchClean(spec string, importer string) (src string, display string, err error) {
-	spec = strings.TrimSuffix(spec, "/")
-
-	// Extensionless enforcement.
-	if _, sugg, ok := splitSpecExt(spec); ok {
-		return "", "", fmt.Errorf("imports are extensionless; write import(%q), not import(%q)", sugg, spec)
-	}
-
-	// Absolute URL?
-	if isHTTPURL(spec) {
-		target, err := pickURLTarget(spec)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return "", "", fmt.Errorf("module not found: %s", spec)
-			}
-			return "", "", err
-		}
-		src, _, err := httpFetch(target)
-		return src, target, err
-	}
-
-	// Absolute filesystem path?
-	if filepath.IsAbs(spec) {
-		target, err := pickFSTarget(spec)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return "", "", fmt.Errorf("module not found: %s", spec)
-			}
-			return "", "", err
-		}
-		b, err := os.ReadFile(target)
-		if err != nil {
-			return "", "", err
-		}
-		return string(b), target, nil
-	}
-
-	// Relative: base #1 importer dir (URL or FS), base #2 <installRoot>/lib (FS only).
-	type cand struct {
-		target string
-		isURL  bool
-	}
-	var candidates []cand
-
-	if isHTTPURL(importer) {
-		base, berr := importerURLDir(importer)
-		if berr != nil {
-			return "", "", berr
-		}
-		stem := resolveURL(base, spec)
-		if stem != "" {
-			if target, err := pickURLTarget(stem); err == nil {
-				candidates = append(candidates, cand{target: target, isURL: true})
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return "", "", err
-			}
-		}
-	} else {
-		base := importerFSDir(importer)
-		stem := filepath.Join(base, spec)
-		if target, err := pickFSTarget(stem); err == nil {
-			candidates = append(candidates, cand{target: target, isURL: false})
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return "", "", err
-		}
-	}
-
-	if installRoot != "" {
-		libRoot := filepath.Join(installRoot, "lib")
-		stem := filepath.Join(libRoot, spec)
-		if target, err := pickFSTarget(stem); err == nil {
-			candidates = append(candidates, cand{target: target, isURL: false})
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return "", "", err
-		}
-	}
-
-	if len(candidates) == 0 {
-		return "", "", fmt.Errorf("module not found: %s", spec)
-	}
-
-	chosen := candidates[0]
-	if chosen.isURL {
-		src, _, err := httpFetch(chosen.target)
-		return src, chosen.target, err
-	}
-
-	b, err := os.ReadFile(chosen.target)
-	if err != nil {
-		return "", "", err
-	}
-	return string(b), chosen.target, nil
 }

@@ -498,9 +498,6 @@ testing.test("openapi/params deterministic_order", fun(_: Null) do
 	testing.assertEq("b", qs[1])
 end)
 
-let testing = import("testing")
-let oapi2 = import("openapi")
-
 # helper: make a tiny route
 let _r = fun(method: Str, path: Str, style: Str, c: {}) -> {} do
 	{

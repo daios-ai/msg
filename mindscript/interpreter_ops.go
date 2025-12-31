@@ -26,6 +26,8 @@ package mindscript
 
 import (
 	"fmt"
+	"path/filepath"
+
 	// "strings" already imported below
 	"strings"
 )
@@ -989,7 +991,7 @@ func (ip *Interpreter) resolveTypeValue(v Value, fallback *Env) S {
 	return ip.resolveType(tv.Ast, env)
 }
 
-// "A -> B -> C -> A" using pretty names instead of full canonical specs.
+// "A -> B -> C -> A".
 func joinCyclePath(stack []string, again string) string {
 	i := 0
 	for idx, s := range stack {
@@ -999,11 +1001,7 @@ func joinCyclePath(stack []string, again string) string {
 		}
 	}
 	chain := append(stack[i:], again)
-	out := make([]string, len(chain))
-	for k, s := range chain {
-		out[k] = prettySpec(s)
-	}
-	return strings.Join(out, " -> ")
+	return strings.Join(chain, " -> ")
 }
 
 // expectAST extracts an S-expression from a VTHandle("ast", ...).
@@ -1051,6 +1049,11 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 		fail("module name must be a string")
 	}
 	canon := nameV.Data.(string)
+	// Inline modules are in-memory; canonicalize with a clear prefix.
+	// (Imported file/URL modules pass an absolute path or URL and are left as-is.)
+	if !strings.HasPrefix(canon, "mem://") && !isHTTPURL(canon) && !filepath.IsAbs(canon) {
+		canon = "mem://" + canon
+	}
 
 	// ---- Uniform cycle detection (stack + in-progress record) ----
 	for _, s := range ip.loadStack {
@@ -1118,9 +1121,9 @@ func nativeMakeModule(ip *Interpreter, ctx CallCtx) Value {
 	// SourceRef rooted at the module BODY path (absolute)
 	var sr *SourceRef
 	if ip.currentSrc != nil {
-		// Compose any existing PathBase with the module's absolute body path.
+		// Use the canonical identity as the diagnostic "filename".
 		sr = &SourceRef{
-			Name:     ip.currentSrc.Name,
+			Name:     canon,
 			Src:      ip.currentSrc.Src,
 			Spans:    ip.currentSrc.Spans, // keep full index; marks are absolute
 			PathBase: append(NodePath(nil), base...),

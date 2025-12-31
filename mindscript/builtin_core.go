@@ -225,7 +225,7 @@ Params:
 
 Returns: Bool`)
 
-	// import(path: Str) -> Module (nullable on soft failure)
+	// import(path: Str) -> Module
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"import",
@@ -252,23 +252,33 @@ Returns: Bool`)
 				}
 				fail(err.Error())
 			}
-			// SOFT: resolve/fetch issues come back as annotated null with err == nil.
 			return v
 		},
 	)
 	setBuiltinDoc(target, "import", `Load a module from filesystem or HTTP(S).
 
 Resolution rules:
-  - Files: resolve relative to the importer's directory, then CWD, then MSGPATH.
-  - HTTP(S): only absolute URLs; if no extension, ".ms" is appended automatically.
+  - Spec is treated as a stem; the loader probes:
+      <spec>.ms
+      <spec>/init.ms
+    (No special-casing for extensions: import("X.ms") probes "X.ms.ms" and "X.ms/init.ms".)
+  - Relative specs search: importer directory, then <installRoot>/lib (filesystem only).
+  - Absolute filesystem paths and absolute http(s) URLs resolve only at that location.
+
+Diagnostics:
+  - Caret errors and stack traces report the resolved canonical identity
+    (absolute path, resolved URL, or mem://<name>).
 
 Params:
-  path: Str — filesystem path or absolute URL to the module (".ms" assumed if missing).
+  path: Str — filesystem path/relative spec/absolute URL stem to load.
 
 Returns:
-  Module (nullable) — the loaded module value; or null with an error annotation on soft failures.`)
+  Module — the loaded module value.
 
-	// importCode(name: Str, src: Str) -> Module (nullable if user code returns annotated null)
+Errors:
+  Throws a runtime error if the module cannot be resolved/fetched/parsed/executed.`)
+
+	// importCode(name: Str, src: Str) -> Module
 	ip.RegisterRuntimeBuiltin(
 		target,
 		"importCode",
@@ -286,7 +296,7 @@ Returns:
 			name := nv.Data.(string)
 			src := sv.Data.(string)
 
-			// The loader assigns a synthetic identity "mem:<name>" internally.
+			// The loader assigns a synthetic identity "mem://<name>" internally.
 			v, err := ip.ImportCode(name, src)
 			if err != nil {
 				// HARD: preserve original diagnostic kind (Lex/Parse/Runtime/Incomplete).
@@ -295,23 +305,24 @@ Returns:
 				}
 				fail(err.Error())
 			}
-			// Module body may deliberately produce annotated null; propagate as-is (SOFT).
 			return v
 		},
 	)
 	setBuiltinDoc(target, "importCode", `Evaluate source text as a module in memory.
 
-Parses 'src' and evaluates it as a module named 'name' (no caching).
-The module's environment is fresh and parented to Core.
-The synthetic identity "mem:<name>" is used for cycle detection.
+Parses 'src' and evaluates it as a module named 'name'.
+The canonical identity "mem://<name>" is used for caching and cycle detection,
+and it is also used as the diagnostic filename.
 
 Params:
-  name: Str — display name for diagnostics and identity ("mem:<name>").
+  name: Str — module name (canonical identity is "mem://<name>")
   src:  Str — MindScript source code.
 
 Returns:
-  Module (nullable) — the created module value; or null with an error annotation if the
-  user code intentionally returns a soft failure.`)
+  Module — the created module value.
+
+Errors:
+  Throws a runtime error if parsing/execution fails.`)
 
 	// mapHas(obj: {}, key: Str) -> Bool
 	ip.RegisterRuntimeBuiltin(

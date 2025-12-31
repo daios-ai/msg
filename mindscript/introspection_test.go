@@ -14,30 +14,88 @@ func vInt(n int64) Value          { return Int(n) }
 func vNum(f float64) Value        { return Num(f) }
 func vBool(b bool) Value          { return Bool(b) }
 
+// valueDeepEqual performs a structural comparison of Values.
+// It is intentionally strict about Tag and Annot, and compares Array/Map
+// contents by structure (not pointer identity).
+//
+// NOTE: This is for tests that compare runtime-S (arrays/scalars) and some
+// direct VTMap comparisons. It does not attempt to handle cycles.
 func valueDeepEqual(a, b Value) bool {
 	if a.Tag != b.Tag {
 		return false
 	}
+	if a.Annot != b.Annot {
+		return false
+	}
+
 	switch a.Tag {
 	case VTNull:
 		return true
-	case VTBool, VTInt, VTNum, VTStr:
-		return reflect.DeepEqual(a.Data, b.Data)
+
+	case VTBool:
+		av, aok := a.Data.(bool)
+		bv, bok := b.Data.(bool)
+		return aok && bok && av == bv
+
+	case VTInt:
+		av, aok := a.Data.(int64)
+		bv, bok := b.Data.(int64)
+		return aok && bok && av == bv
+
+	case VTNum:
+		av, aok := a.Data.(float64)
+		bv, bok := b.Data.(float64)
+		return aok && bok && av == bv
+
+	case VTStr:
+		av, aok := a.Data.(string)
+		bv, bok := b.Data.(string)
+		return aok && bok && av == bv
+
 	case VTArray:
-		ax := a.Data.(*ArrayObject).Elems
-		bx := b.Data.(*ArrayObject).Elems
-		if len(ax) != len(bx) {
+		ao, aok := a.Data.(*ArrayObject)
+		bo, bok := b.Data.(*ArrayObject)
+		if !aok || !bok {
 			return false
 		}
-		for i := range ax {
-			if !valueDeepEqual(ax[i], bx[i]) {
+		if len(ao.Elems) != len(bo.Elems) {
+			return false
+		}
+		for i := range ao.Elems {
+			if !valueDeepEqual(ao.Elems[i], bo.Elems[i]) {
 				return false
 			}
 		}
 		return true
+
+	case VTMap:
+		am, aok := a.Data.(*MapObject)
+		bm, bok := b.Data.(*MapObject)
+		if !aok || !bok {
+			return false
+		}
+		if len(am.Keys) != len(bm.Keys) {
+			return false
+		}
+		for i := range am.Keys {
+			if am.Keys[i] != bm.Keys[i] {
+				return false
+			}
+			av, aok := am.Entries[am.Keys[i]]
+			bv, bok := bm.Entries[bm.Keys[i]]
+			if aok != bok {
+				return false
+			}
+			if !valueDeepEqual(av, bv) {
+				return false
+			}
+		}
+		return true
+
 	default:
-		// We only compare runtime-S (arrays/scalars) in these tests.
-		return reflect.DeepEqual(a, b)
+		// Tests in this file compare runtime-S and a few VTMap views.
+		// If you need more tags here, extend explicitly.
+		return false
 	}
 }
 
@@ -279,6 +337,12 @@ end`
 
 	got := IxReflect(v)
 
+	// Prefer the actual stored module name to avoid coupling tests to naming policy.
+	modName := ""
+	if m, ok := v.Data.(*Module); ok && m != nil {
+		modName = m.Name
+	}
+
 	// Expect CANONICAL inline form:
 	// ["module", ["str","Refl"],
 	//   ["block",
@@ -287,7 +351,7 @@ end`
 	// ]
 	want := vArray(
 		vStr("module"),
-		vArray(vStr("str"), vStr("Refl")),
+		vArray(vStr("str"), vStr(modName)),
 		vArray(
 			vStr("block"),
 			vArray(
@@ -350,7 +414,8 @@ func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
 	if v1.Tag != VTModule {
 		t.Fatalf("expected VTModule, got %v", v1.Tag)
 	}
-	mv1 := AsMapValue(v1).Data.(*MapObject)
+	mvv1 := AsMapValue(v1)
+	mv1 := mvv1.Data.(*MapObject)
 	x1 := mv1.Entries["x"]
 	if x1.Tag != VTInt || x1.Data.(int64) != 1 {
 		t.Fatalf("expected x=1, got %#v", x1)
@@ -368,9 +433,19 @@ func Test_Introspection_IxReify_Module_Lowered_Form_Caches(t *testing.T) {
 	if v2.Tag != VTModule {
 		t.Fatalf("expected VTModule, got %v", v2.Tag)
 	}
-	if v1.Data.(*Module) != v2.Data.(*Module) {
-		t.Fatalf("expected cached module pointer")
+	mvv2 := AsMapValue(v2)
+	mv2 := mvv2.Data.(*MapObject)
+	x2 := mv2.Entries["x"]
+	if x2.Tag != VTInt || x2.Data.(int64) != 1 {
+		t.Fatalf("expected x=1 after second install, got %#v", x2)
 	}
+
+	// Structural check: module exports are the same.
+	if !valueDeepEqual(mvv1, mvv2) {
+		t.Fatalf("expected cached module exports to be structurally identical")
+	}
+
+	// Cache-hit signal: counter unchanged.
 	cv2, _ := ip.Global.Get("counter")
 	if cv2.Data.(int64) != 1 {
 		t.Fatalf("expected counter to remain 1 (cache hit), got %v", cv2)

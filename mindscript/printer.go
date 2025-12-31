@@ -1592,7 +1592,7 @@ func valueOpaqueString(v Value) string {
 	case VTModule:
 		name := "<module>"
 		if m, ok := v.Data.(*Module); ok && m != nil && m.Name != "" {
-			disp := prettySpec(m.Name)
+			disp := m.Name
 			if disp == "" {
 				disp = m.Name
 			}

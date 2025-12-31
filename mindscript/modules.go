@@ -18,15 +18,28 @@
 // interpreter.go) to coerce VTModule→VTMap for length/overlay/iteration/property
 // reads without duplicating map logic.
 //
+// IDENTITY & DIAGNOSTICS (Node.js-style)
+// -------------------------------------
+// Imports involve two names:
+//   - author spec: the string written by the program, e.g. import("foo")
+//   - canonical identity: the resolved absolute path / resolved URL / mem://<name>
+//
+// The canonical identity is used for caching and cycle detection, and it is also
+// the "filename" surfaced in diagnostics (caret errors, stack traces).
+// Operational errors like "module not found: <spec>" still report the author spec.
+//
 // RESOLUTION RULES (clean + uniform)
 // ---------------------------------
 //
-//   - Imports are extensionless: any spec whose last path segment has an
-//     extension is rejected.
+//   - A spec is treated as a *stem*. The loader probes two forms:
+//     <spec>.ms
+//     <spec>/init.ms
+//     (No special-casing for extensions: import("X.ms") probes "X.ms.ms" and
+//     "X.ms/init.ms".)
 //
 //   - A spec names either a file stem or a directory stem:
-//     stem.ms        (file form)
-//     stem/init.ms   (directory form)
+//     <spec>.ms        (file form)
+//     <spec>/init.ms   (directory form)
 //     If both exist, the import is ambiguous (hard error).
 //     If neither exists in the chosen search base(s), it's not found (hard error).
 //
@@ -79,24 +92,26 @@ func (m *Module) Get(key string) (Value, bool) { return m.get(key) }
 func (ip *Interpreter) ImportAST(name string, ast S) (Value, error) {
 	// Round-trip AST → source → AST-with-spans for precise caret mapping.
 	src := FormatSExpr(ast)
-	parsed, spans, perr := parseSourceWithSpans(name, src)
+
+	// In-memory canonical identity and diagnostic name.
+	canon := "mem://" + name
+	parsed, spans, perr := parseSourceWithSpans(canon, src)
 	if perr != nil {
 		return Null, perr
 	}
-	// Canonical identity is the exact name.
-	canon := name
-	return ip.importWithBody(canon, name, parsed, src, spans)
+	return ip.importWithBody(canon, parsed, src, spans)
 }
 
 // ImportCode parses source and evaluates it as a module with **precise** source
 // mapping, **uniform** caching, and **uniform** cycle detection.
 func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
-	ast, spans, perr := parseSourceWithSpans(name, src)
+	// In-memory canonical identity and diagnostic name.
+	canon := "mem://" + name
+	ast, spans, perr := parseSourceWithSpans(canon, src)
 	if perr != nil {
 		return Null, perr
 	}
-	canon := name
-	return ip.importWithBody(canon, name, ast, src, spans)
+	return ip.importWithBody(canon, ast, src, spans)
 }
 
 // ImportFile resolves, fetches, parses, evaluates, *and* participates in the
@@ -105,11 +120,6 @@ func (ip *Interpreter) ImportCode(name string, src string) (Value, error) {
 // Resolution is described at the top of this file (clean + uniform).
 func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
 	spec = strings.TrimSuffix(spec, "/")
-
-	// Enforce extensionless imports (for both FS and URLs).
-	if _, sugg, ok := splitSpecExt(spec); ok {
-		return Null, fmt.Errorf("imports are extensionless; write import(%q), not import(%q)", sugg, spec)
-	}
 
 	// Absolute URL?
 	if isHTTPURL(spec) {
@@ -124,12 +134,12 @@ func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
 		if ferr != nil {
 			return Null, ferr
 		}
-		ast, spans, perr := parseSourceWithSpans(spec, src)
+		ast, spans, perr := parseSourceWithSpans(target, src)
 		if perr != nil {
 			return Null, perr
 		}
 		// Canonical identity is the fully resolved target URL.
-		return ip.importWithBody(target, spec, ast, src, spans)
+		return ip.importWithBody(target, ast, src, spans)
 	}
 
 	// Absolute filesystem path?
@@ -146,12 +156,12 @@ func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
 			return Null, rerr
 		}
 		src := string(b)
-		ast, spans, perr := parseSourceWithSpans(spec, src)
+		ast, spans, perr := parseSourceWithSpans(target, src)
 		if perr != nil {
 			return Null, perr
 		}
 		// Canonical identity is the absolute resolved path.
-		return ip.importWithBody(target, spec, ast, src, spans)
+		return ip.importWithBody(target, ast, src, spans)
 	}
 
 	// Relative: search (1) importer dir, then (2) <installRoot>/lib (FS only).
@@ -200,18 +210,18 @@ func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
 		return Null, fmt.Errorf("module not found: %s", spec)
 	}
 
-	// Fetch + parse using display=spec, cache key=canonical target.
+	// Fetch + parse using display=canonical target, cache key=canonical target.
 	chosen := candidates[0]
 	if chosen.isURL {
 		src, _, ferr := httpFetch(chosen.target)
 		if ferr != nil {
 			return Null, ferr
 		}
-		ast, spans, perr := parseSourceWithSpans(spec, src)
+		ast, spans, perr := parseSourceWithSpans(chosen.target, src)
 		if perr != nil {
 			return Null, perr
 		}
-		return ip.importWithBody(chosen.target, spec, ast, src, spans)
+		return ip.importWithBody(chosen.target, ast, src, spans)
 	}
 
 	b, rerr := os.ReadFile(chosen.target)
@@ -219,11 +229,11 @@ func (ip *Interpreter) ImportFile(spec string, importer string) (Value, error) {
 		return Null, rerr
 	}
 	src := string(b)
-	ast, spans, perr := parseSourceWithSpans(spec, src)
+	ast, spans, perr := parseSourceWithSpans(chosen.target, src)
 	if perr != nil {
 		return Null, perr
 	}
-	return ip.importWithBody(chosen.target, spec, ast, src, spans)
+	return ip.importWithBody(chosen.target, ast, src, spans)
 }
 
 //// END_OF_PUBLIC
@@ -265,12 +275,12 @@ func (m *Module) get(key string) (Value, bool) {
 //
 // Cycle detection and caching are centralized in nativeMakeModule so that
 // *all* entry points (AST/Code/File/inline) share identical semantics.
-func (ip *Interpreter) importWithBody(canonName, display string, body S, src string, spans *SpanIndex) (Value, error) {
+func (ip *Interpreter) importWithBody(canonName string, body S, src string, spans *SpanIndex) (Value, error) {
 	var sr *SourceRef
 	if src != "" && spans != nil {
 		// ⬇️ use the parser-faithful wrapper
 		wrapped := wrapUnderModuleLikeParser(body, spans, canonName)
-		sr = &SourceRef{Name: display, Src: src, Spans: wrapped}
+		sr = &SourceRef{Name: canonName, Src: src, Spans: wrapped}
 	}
 
 	modAst := S{"module", S{"str", canonName}, body}
@@ -382,32 +392,6 @@ func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-// splitSpecExt returns (ext, suggestion, ok) where ok indicates the spec's last
-// path segment has an extension. suggestion is the same spec with that extension removed.
-func splitSpecExt(spec string) (string, string, bool) {
-	if isHTTPURL(spec) {
-		u, err := url.Parse(spec)
-		if err != nil {
-			return "", "", false
-		}
-		p := strings.TrimSuffix(u.Path, "/")
-		ext := path.Ext(p)
-		if ext == "" {
-			return "", "", false
-		}
-		u2 := *u
-		u2.Path = strings.TrimSuffix(p, ext)
-		return ext, u2.String(), true
-	}
-
-	s := strings.TrimSuffix(spec, "/")
-	ext := filepath.Ext(s)
-	if ext == "" {
-		return "", "", false
-	}
-	return ext, strings.TrimSuffix(s, ext), true
-}
-
 // pickFSTarget chooses between stem.ms and stem/init.ms.
 // Returns os.ErrNotExist if neither exists.
 func pickFSTarget(stem string) (string, error) {
@@ -483,7 +467,8 @@ func pickURLTarget(stemURL string) (string, error) {
 // importerFSDir returns the filesystem directory to resolve relative imports from.
 // REPL (importer="") resolves from CWD.
 func importerFSDir(importer string) string {
-	if importer != "" && !isHTTPURL(importer) {
+	// In-memory modules ("mem://...") resolve like REPL: from CWD.
+	if importer != "" && !isHTTPURL(importer) && !strings.HasPrefix(importer, "mem://") {
 		return filepath.Dir(importer)
 	}
 	if cwd, err := os.Getwd(); err == nil {
@@ -556,43 +541,4 @@ func httpProbe(canonURL string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("http %d", resp.StatusCode)
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//                        DISPLAY HELPERS (CYCLES)
-////////////////////////////////////////////////////////////////////////////////
-
-// prettySpec returns a short display name for a canonical spec:
-//   - file path   -> basename without extension
-//   - http(s) URL -> last segment without extension
-//   - fallback: original string if parsing fails
-func prettySpec(s string) string {
-	// Try URL first
-	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
-		base := path.Base(u.Path)
-		name := strings.TrimSuffix(base, path.Ext(base))
-		if name == "init" {
-			parent := path.Base(path.Dir(u.Path))
-			if parent != "" && parent != "." && parent != "/" {
-				return parent
-			}
-		}
-		if name != "" {
-			return name
-		}
-		return base
-	}
-	// Filesystem path (or arbitrary name)
-	base := filepath.Base(s)
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	if name == "init" {
-		parent := filepath.Base(filepath.Dir(s))
-		if parent != "" && parent != "." {
-			return parent
-		}
-	}
-	if name != "" {
-		return name
-	}
-	return base
 }

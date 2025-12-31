@@ -1,4 +1,4 @@
-<img src="/assets/mindscript-logo-lambda-psi.svg" width="500px">
+<img src="https://raw.githubusercontent.com/daios-ai/msg/refs/heads/main/docs/docs/assets/mindscript-logo-lambda-psi.svg" width="500px">
 
 A programming language for **semantic computation** with **oracles** that let you call LLMs safely from real code.
 
@@ -8,7 +8,7 @@ A programming language for **semantic computation** with **oracles** that let yo
 **Try in Browser:** [https://www.daios.ai/playground](https://www.daios.ai/playground)  
 **Source code:** [https://github.com/daios-ai/msg](https://github.com/daios-ai/msg)
 
-![preview code example](/assets/mindscript-demo.png)
+![preview code example](https://raw.githubusercontent.com/daios-ai/msg/5171a849ac91f8eac5ffe2847eb9658b5af5b780/docs/docs/assets/mindscript-demo.png)
 
 ---
 

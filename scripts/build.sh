@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #set -euo pipefail
 
+# 
+# BUILD SCRIPT FOR DEVELOPMENT PURPOSES.
+#
+
 # For tests, we need to override the MindScript root directory
 # inferred from the path of the binary.
 export MSGPATH="$(pwd)"

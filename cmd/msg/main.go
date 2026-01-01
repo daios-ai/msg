@@ -133,8 +133,8 @@ func usage() {
 Usage:
   %s run <file.ms> [--] [args...]         Run a script.
   %s repl                                 Start the REPL.
-  %s fmt [--check] [path ...]             Format MindScript file(s) by path prefix
-  %s test [path] [-p] [-v] [-t <ms>]      Run tests (default root=".")
+  %s fmt [--check] [path ...]             Format file(s) by path prefix (default ".")
+  %s test [path] [-p] [-v] [-t <ms>]      Run test file(s) by path prefix (default ".")
   %s get <module>@<version?>              Install a third-party module (not implemented)
   %s version                              Print the compiled version
 

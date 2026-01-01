@@ -20,17 +20,23 @@ You write normal code for deterministic logic, and use oracles when the step is 
 
 ## A tiny example
 
-```mindscript
-==> # Examples of translating a number into English.
-... let examples = [[12, "twelve"], [21, "twenty-one"], [8, "eight"]]
-...
-... # Say the number in English.
-... let sayNumber = oracle(number: Int) -> Str from examples
-...
-... sayNumber(1024)
+Define an oracle:
 
+```mindscript
+# Examples of translating a number into English.
+let examples = [[12, "twelve"], [21, "twenty-one"], [8, "eight"]]
+
+# Say the number in English.
+let sayNumber = oracle(number: Int) -> Str from examples
+```
+
+Then, invoke it:
+
+```mindscript-repl
+==> sayNumber(1024)
 "one thousand twenty-four"
 ```
+
 Oracles are **typed**: inputs and outputs are validated at runtime, so you can safely compose semantic steps with deterministic code.
 
 ### Why you'd use it
@@ -38,16 +44,13 @@ Oracles are **typed**: inputs and outputs are validated at runtime, so you can s
 - **Semantic transforms as a first-class tool** (not a bolted-on API call)
 - **Guardrails by default**: runtime-checked types/schemas around LLM outputs
 - **Practical scripting workflow**: run scripts and pipelines with the `msg` runtime
-- **Works great with JSON** (for data interchange), but shines when the work is *meaning*, not formatting
+- **Works great with JSON** (for data interchange), but shines when the work is *meaning*
 
 ### Applications
 
-* Extract structured, **typed JSON** from messy text (emails, chats, notes)
-* Classify, label, and route items using semantics (“is this a bug report?”)
-* Normalize and deduplicate real-world data (names, addresses, products)
-* Enrich datasets with summaries, tags, and entities—then post-process deterministically
-* Build **semantic web** pipelines: map unstructured content into entities/relations, align to vocabularies, and emit JSON/linked-data shapes
-* Build agentic applications.
+* Extract structured, **typed JSON** from messy text (emails, chats, notes), and use this to classify, label, and route items using their **meaning**
+* Build **semantic** pipelines: map unstructured content into entities/relations, align to vocabularies, and emit JSON/linked-data shapes
+* Build **agentic applications** that can reason and have autonomy
 
 ## Installation
 
@@ -77,5 +80,5 @@ For more installation options and configuring the LLM backend, check the **[Inst
 
 ## Requirements
 
-- Linux or macOS
+- **Linux**, **macOS**, or **Raspberry OS**.
 - An LLM backend **only** if you run oracle calls.

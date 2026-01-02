@@ -27,7 +27,7 @@ In addition, in order to execute oracles, you need to provide an **LLM backend**
 This is the default install path. It downloads the latest release bundle and installs it locally (no admin/root required):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DAIOS-AI/msg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/daios-ai/msg/main/install.sh | bash
 ```
 
 And then either open a new terminal or run the shell startup file

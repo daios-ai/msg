@@ -56,9 +56,7 @@ Oracles are **typed**: inputs and outputs are validated at runtime, so you can s
 
 Download the installer and run it:
 ```bash
-wget https://raw.githubusercontent.com/daios-ai/msg/refs/heads/main/install.sh
-chmod +x install.sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/daios-ai/msg/main/install.sh | bash
 ```
 This will download the latest version and install it locally (in `~/.mindscript`). 
 
@@ -82,3 +80,22 @@ For more installation options and configuring the LLM backend, check the **[Inst
 
 - **Linux**, **macOS**, or **Raspberry OS**.
 - An LLM backend **only** if you run oracle calls.
+
+## Features
+
+You’re right. Here’s the same list with only the bracketed items filled in and minimal wording changes elsewhere.
+
+## Features
+
+* **LLM oracles as a language feature**: declare LLM-backed oracle functions with typed inputs and validated JSON outputs.
+* **Multi-provider LLM support**: supports Ollama, OpenAI (Chat Completions), OpenAI Responses, Anthropic, and Cohere backends.
+* **Comments as runtime data**: comments attach as documentation and hints to oracle execution.
+* **Errors as values**: No exceptions that hide execution flow.
+* **Dynamic, runtime-checked types**: Function parameter and return types are enforced at runtime.
+* **First-class modules**: imports modules from the local filesystem and from HTTP(S) URLs.
+* **Practical CLI tooling**: the CLI provides script execution, an interactive REPL, formatting, and test discovery and execution.
+* **Batteries-included standard library**: Includes iterators and functional helpers, JSON and schema bridges, filesystem and networking utilities, crypto, and process execution.
+* **Concurrency and communication primitives**: Processes run in isolated interpreter instances that are scheduled like Go goroutines rather than an async/await model, with channels, timers, tickers, and actors for coordination.
+* **Metaprogramming**: programs can be parsed into a canonical JSON-compatible S-expression form, transformed at runtime, and evaluated again via reification.
+* **Foreign function interface**: on supported builds, loads native libraries and exposes functions, variables, and callbacks to extend MindScript with C APIs.
+* **Built-in testing framework**: discovers test files, supports assertions and snapshot testing, runs tests in parallel, and reports failures with file and line locations.

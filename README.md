@@ -83,10 +83,6 @@ For more installation options and configuring the LLM backend, check the **[Inst
 
 ## Features
 
-You’re right. Here’s the same list with only the bracketed items filled in and minimal wording changes elsewhere.
-
-## Features
-
 * **LLM oracles as a language feature**: declare LLM-backed oracle functions with typed inputs and validated JSON outputs.
 * **Multi-provider LLM support**: supports Ollama, OpenAI (Chat Completions), OpenAI Responses, Anthropic, and Cohere backends.
 * **Comments as runtime data**: comments attach as documentation and hints to oracle execution.

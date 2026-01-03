@@ -1,18 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
-	"github.com/peterh/liner"
+	"github.com/ergochat/readline"
 
 	// Adjust this to your actual module path
 	mindscript "github.com/daios-ai/msg/mindscript"
@@ -36,6 +36,31 @@ REPL commands:
 func red(s string) string   { return "\x1b[31m" + s + "\x1b[0m" }
 func green(s string) string { return "\x1b[32m" + s + "\x1b[0m" }
 func blue(s string) string  { return "\x1b[94m" + s + "\x1b[0m" }
+
+// decorateForHistory prefixes continuation lines with "... " so multiline
+// entries look like true continuations when recalled from history.
+func decorateForHistory(src string) string {
+	lines := strings.Split(src, "\n")
+	for i := 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], promptCont) {
+			continue
+		}
+		lines[i] = promptCont + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// stripHistoryDecor removes the literal "... " prefix from continuation lines
+// (lines 2+) before parsing/evaluating.
+func stripHistoryDecor(src string) string {
+	lines := strings.Split(src, "\n")
+	for i := 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], promptCont) {
+			lines[i] = strings.TrimPrefix(lines[i], promptCont)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
 
 // splitInlineComment finds the first unquoted '#' (preceded by space/tab) that
 // looks like an inline comment. It ignores '#' inside double-quoted strings and
@@ -180,13 +205,6 @@ func cmdRun(args []string) int {
 		return 1
 	}
 
-	ast, perr := mindscript.ParseSExpr(string(src))
-	if perr != nil {
-		fmt.Fprintln(os.Stderr, perr.Error())
-		return 1
-	}
-
-	child := mindscript.NewEnv(ip.Global)
 	rt := &mindscript.MapObject{
 		Entries: map[string]mindscript.Value{
 			"isEntry": mindscript.Bool(true),
@@ -195,9 +213,10 @@ func cmdRun(args []string) int {
 		},
 		Keys: []string{"isEntry", "path", "argv"},
 	}
-	child.Define("runtime", mindscript.Value{Tag: mindscript.VTMap, Data: rt})
+	// Define in Global so EvalSource()'s ephemeral child can see it.
+	ip.Global.Define("runtime", mindscript.Value{Tag: mindscript.VTMap, Data: rt})
 
-	_, err = ip.EvalAST(ast, child)
+	_, err = ip.EvalSource(string(src))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 1
@@ -221,6 +240,51 @@ func strSliceToVals(xs []string) []mindscript.Value {
 }
 
 // -----------------------------------------------------------------------------
+// repl history (JSONL)
+// -----------------------------------------------------------------------------
+
+func loadHistoryJSONL(path string, rl *readline.Instance) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var items []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		b := sc.Bytes()
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			// Back-compat: treat as raw single-line entries.
+			s = string(b)
+		}
+		items = append(items, s)
+		_ = rl.SaveToHistory(decorateForHistory(s))
+	}
+	return items
+}
+
+func saveHistoryJSONL(path string, items []string) {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	for _, s := range items {
+		b, _ := json.Marshal(s)
+		_, _ = w.Write(b)
+		_ = w.WriteByte('\n')
+	}
+	_ = w.Flush()
+	_ = os.Rename(tmp, path)
+}
+
+// -----------------------------------------------------------------------------
 // repl
 // -----------------------------------------------------------------------------
 
@@ -230,30 +294,20 @@ func cmdRepl(_ []string) (ret int) {
 	home, _ := os.UserHomeDir()
 	histPath := filepath.Join(home, historyFile)
 
-	ln := liner.NewLiner()
-	defer ln.Close()
-	ln.SetCtrlCAborts(true)
-
-	defer func() {
-		if f, err := os.Create(histPath); err == nil {
-			_, _ = ln.WriteHistory(f)
-			_ = f.Close()
-		}
-	}()
-
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigc)
-	go func() {
-		<-sigc
-		ln.Close()
-		os.Exit(130)
-	}()
-
-	if f, err := os.Open(histPath); err == nil {
-		_, _ = ln.ReadHistory(f)
-		_ = f.Close()
+	rl, err := readline.NewFromConfig(&readline.Config{
+		Prompt:                 promptMain,
+		HistoryFile:            "",   // we persist history ourselves (JSONL)
+		DisableAutoSaveHistory: true, // we call SaveToHistory manually
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, red(err.Error()))
+		return 1
 	}
+	defer rl.Close()
+	rl.CaptureExitSignal()
+
+	history := loadHistoryJSONL(histPath, rl)
+	defer saveHistoryJSONL(histPath, history)
 
 	ip, rtErr := mindscript.NewInterpreter()
 	if rtErr != nil {
@@ -262,7 +316,7 @@ func cmdRepl(_ []string) (ret int) {
 	}
 
 	for {
-		code, ok := readByParseProbe(ln, promptMain, promptCont)
+		code, ok := readByParseProbe(rl, promptMain, promptCont)
 		if !ok {
 			fmt.Println()
 			break
@@ -282,34 +336,40 @@ func cmdRepl(_ []string) (ret int) {
 			continue
 		}
 
+		// Store even failing inputs (so quick edits via history work).
+		history = append(history, code)
+		_ = rl.SaveToHistory(decorateForHistory(code))
+
 		v, err := ip.EvalPersistentSource(code)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, red(err.Error()))
 			continue
 		}
 		fmt.Println(colorizeValue(mindscript.FormatValue(v)))
-		ln.AppendHistory(strings.ReplaceAll(code, "\n", " "))
 	}
 
 	return 0
 }
 
-func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
+func readByParseProbe(rl *readline.Instance, prompt, cont string) (string, bool) {
 	var b strings.Builder
 
 	for {
-		var line string
-		var err error
 		if b.Len() == 0 {
-			line, err = ln.Prompt(prompt)
+			rl.SetPrompt(prompt)
 		} else {
-			line, err = ln.Prompt(cont)
+			rl.SetPrompt(cont)
 		}
-		if errors.Is(err, io.EOF) {
+
+		line, err := rl.ReadLine()
+		if err == nil {
+			// ok
+		} else if errors.Is(err, io.EOF) {
 			return "", false
-		}
-		if err != nil {
-			return "", true
+		} else if errors.Is(err, readline.ErrInterrupt) {
+			return "", true // Ctrl+C cancels current input
+		} else {
+			return "", false
 		}
 
 		if b.Len() > 0 {
@@ -317,7 +377,7 @@ func readByParseProbe(ln *liner.State, prompt, cont string) (string, bool) {
 		}
 		b.WriteString(line)
 
-		src := b.String()
+		src := stripHistoryDecor(b.String())
 		_, _, perr := mindscript.ParseSExprInteractiveWithSpans(src)
 		if perr == nil {
 			return src, true

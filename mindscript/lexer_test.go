@@ -755,7 +755,7 @@ func Test_Lexer_Error_UnexpectedChar_NextLine(t *testing.T) {
 func Test_Lexer_Error_InvalidEscape_AnchorsAtOpeningQuote(t *testing.T) {
 	// MindScript source: "\"" + "\x" + "\""
 	src := "\"\\x\""
-	checkLexErr(t, src, 1, 1, "invalid escape sequence")
+	checkLexErr(t, src, 1, 1, "hex escape was not terminated")
 }
 
 func Test_Lexer_Error_InvalidUnicodeHex_AnchorsAtOpeningQuote(t *testing.T) {

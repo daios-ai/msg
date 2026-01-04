@@ -1058,7 +1058,7 @@ let s2 = "\u2029"`
 	t.Run("ControlAndC1Escapes", func(t *testing.T) {
 		src := `let a = "\u0001"
 let b = "\u0085"`
-		want := `let a = "\u0001"
+		want := `let a = "\x01"
 let b = "\u0085"`
 		got := pretty(t, src)
 		eq(t, got, want)

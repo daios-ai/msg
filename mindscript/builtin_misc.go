@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	"unicode/utf8"
 )
 
 // --- Random Utilities ----------------------------------------------------
@@ -338,8 +337,8 @@ Returns:
 				// Use ordered keys length to reflect object “length”
 				return Int(int64(len(mo.Keys)))
 			case VTStr:
-				// Unicode-aware length to match substr’s rune semantics
-				return Int(int64(utf8.RuneCountInString(x.Data.(string))))
+				// Str is bytes: length is byte count.
+				return Int(int64(len(x.Data.(string))))
 			default:
 				return Null
 			}
@@ -348,10 +347,10 @@ Returns:
 	setBuiltinDoc(target, "len", `Length of a value.
 
 Rules:
-	• [a, b, c] → 3
-	• {k: v, ...} → number of keys (in insertion order)
-	• "…unicode…" → rune count
-	• Others → null
+	• [a, b, c] yields 3
+	• {k: v, ...} yields number of keys
+	• "..." yields byte count
+	• Others yield null
 
 Params:
 	x: Any

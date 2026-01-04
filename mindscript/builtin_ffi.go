@@ -547,7 +547,7 @@ func registerFFIBuiltins(ip *Interpreter, target *Env) {
 						fail("string: len < 0")
 					}
 					return Str(cGoStringN(p, int(n)))
-				}, "Read UTF-8 from char* (NUL-terminated or fixed len).")
+				}, "Read bytes from char* (NUL-terminated or fixed len).")
 			registerMem("copy",
 				[]ParamSpec{{"dst", S{"id", "Any"}}, {"src", S{"id", "Any"}}, {"n", S{"id", "Int"}}}, S{"id", "Null"},
 				func(ctx CallCtx) Value {
@@ -1294,7 +1294,7 @@ Implements:
 
 Performance:
   • No per-call C allocations for argv/arg slots/return buffers in the common path.
-  • Small stack fast-paths for up to 8 fixed params and short char* strings.
+  • Small stack fast-paths for up to 8 fixed params and short char* values.
   • sync.Pool reuse for argv/slots/byte scratch; varargs slots are in Go memory.
 
 Limitations:

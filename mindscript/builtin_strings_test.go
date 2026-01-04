@@ -19,7 +19,7 @@ func Test_Builtin_Strings_Substr_Clamp_And_Unicode(t *testing.T) {
     `)
 	m := entriesOf(t, out)
 
-	if got := m["u"].Data.(string); got != "éll" {
+	if got := m["u"].Data.(string); got != "él" {
 		t.Fatalf(`substr unicode failed: got %q`, got)
 	}
 	if got := m["a"].Data.(string); got != "ab" {
@@ -180,7 +180,7 @@ func Test_Builtin_Strings_Smoke_Combined(t *testing.T) {
     `)
 	m := entriesOf(t, out)
 
-	if m["sub"].Data.(string) != "éll" {
+	if m["sub"].Data.(string) != "él" {
 		t.Fatalf("substr failed: %#v", m["sub"])
 	}
 	if m["st"].Data.(string) != "x" || m["ls"].Data.(string) != "x  " || m["rs"].Data.(string) != "x" {

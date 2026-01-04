@@ -108,6 +108,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ==============================
@@ -286,37 +287,60 @@ func isUnsafeLiteralRune(r rune) bool {
 func quoteString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '\\':
-			b.WriteString(`\\`)
-		case '"':
-			b.WriteString(`\"`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		default:
-			// For string *literals* in source, escape control / security-sensitive
-			// runes so they are visible and cannot be smuggled into the code.
-			if isUnsafeLiteralRune(r) {
-				if r <= 0xFFFF {
-					// Use \uXXXX for all problematic BMP runes.
-					b.WriteString(fmt.Sprintf(`\u%04X`, r))
+	// Unified printer: walk bytes, decoding UTF-8 when possible.
+	// Invalid UTF-8 bytes are emitted as \xHH so Str can round-trip as raw bytes.
+	for i := 0; i < len(s); {
+		c := s[i]
+
+		// Fast-path ASCII (also covers all short escapes).
+		if c < 0x80 {
+			switch c {
+			case '\\':
+				b.WriteString(`\\`)
+			case '"':
+				b.WriteString(`\"`)
+			case '\n':
+				b.WriteString(`\n`)
+			case '\r':
+				b.WriteString(`\r`)
+			case '\t':
+				b.WriteString(`\t`)
+			case '\b':
+				b.WriteString(`\b`)
+			case '\f':
+				b.WriteString(`\f`)
+			default:
+				// Printable ASCII.
+				if c >= 0x20 && c <= 0x7E {
+					b.WriteByte(c)
 				} else {
-					// All currently marked problematic characters are in the BMP,
-					// but fall back to a raw rune for non-BMP just in case.
-					b.WriteRune(r)
+					// Control bytes must be escaped for visibility/safety.
+					b.WriteString(fmt.Sprintf(`\x%02X`, c))
 				}
+			}
+			i++
+			continue
+		}
+
+		// Non-ASCII: decode a rune if valid UTF-8; otherwise treat as a raw byte.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			b.WriteString(fmt.Sprintf(`\x%02X`, c))
+			i++
+			continue
+		}
+		i += size
+
+		// For string *literals* in source, escape control / security-sensitive
+		// runes so they are visible and cannot be smuggled into the code.
+		if isUnsafeLiteralRune(r) {
+			if r <= 0xFFFF {
+				b.WriteString(fmt.Sprintf(`\u%04X`, r))
 			} else {
 				b.WriteRune(r)
 			}
+		} else {
+			b.WriteRune(r)
 		}
 	}
 	b.WriteByte('"')

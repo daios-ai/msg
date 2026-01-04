@@ -18,23 +18,22 @@ func registerStringBuiltins(ip *Interpreter, target *Env) {
 			s := ctx.Arg("s").Data.(string)
 			i := int(ctx.Arg("i").Data.(int64))
 			j := int(ctx.Arg("j").Data.(int64))
-			r := []rune(s)
 			if i < 0 {
 				i = 0
 			}
 			if j < i {
 				j = i
 			}
-			if i > len(r) {
-				i = len(r)
+			if i > len(s) {
+				i = len(s)
 			}
-			if j > len(r) {
-				j = len(r)
+			if j > len(s) {
+				j = len(s)
 			}
-			return Str(string(r[i:j]))
+			return Str(string(s[i:j]))
 		},
 	)
-	setBuiltinDoc(target, "substr", `Unicode-safe substring by rune index.
+	setBuiltinDoc(target, "substr", `Substring by byte index.
 
 Takes the half-open slice [i, j). Indices are clamped to bounds and negative
 values are treated as 0.

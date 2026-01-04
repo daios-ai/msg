@@ -52,8 +52,10 @@
 //
 // LITERALS
 //   - STRING — single or double quotes, JSON-style escapes, including \uXXXX with
-//     optional UTF-16 surrogate pair handling. Source must be valid UTF-8; non-ASCII
-//     bytes in the lexeme are validated and decoded.
+//     optional UTF-16 surrogate pair handling. The decoded STRING literal is a
+//     raw byte string (Go string as bytes): it may contain arbitrary bytes and
+//     need not be valid UTF-8. Source text is still required to be valid UTF-8.
+//     \uXXXX inserts the UTF-8 encoding of the code point; \xHH inserts a single raw byte.
 //   - INTEGER — 64-bit signed (ParseInt base 10), when no dot/exp part.
 //   - NUMBER  — 64-bit float (ParseFloat), for forms with '.' and/or exponent.
 //   - BOOLEAN — “true” or “false” (Literal: bool).
@@ -236,7 +238,7 @@ const (
 //	Lexeme  — the exact source slice comprising the token (verbatim, including
 //	          quotes for strings, escape sequences, etc.).
 //	Literal — a decoded value for literal tokens:
-//	          • STRING  → Go string with escapes and surrogate pairs resolved
+//	          • STRING  → Go string treated as raw bytes (escapes resolved; may be invalid UTF-8)
 //	          • INTEGER → int64
 //	          • NUMBER  → float64
 //	          • BOOLEAN → bool
@@ -577,6 +579,8 @@ func (l *Lexer) errIncomplete(msg string) error {
 // ---------------- scanners ----------------
 
 // scanString parses a JSON-style string literal (single or double quotes).
+// The decoded result is a raw byte string (Go string as bytes). It may contain
+// arbitrary bytes (including NUL) and need not be valid UTF-8.
 func (l *Lexer) scanString() (string, error) {
 	del := l.src[l.start]
 	if del != '"' && del != '\'' {
@@ -585,7 +589,26 @@ func (l *Lexer) scanString() (string, error) {
 	// consume the delimiter
 	l.advance()
 
-	var out []rune
+	out := make([]byte, 0, 32)
+
+	appendRune := func(r rune) {
+		var buf [utf8.UTFMax]byte
+		n := utf8.EncodeRune(buf[:], r)
+		out = append(out, buf[:n]...)
+	}
+	toHex := func(b byte) int {
+		switch {
+		case b >= '0' && b <= '9':
+			return int(b - '0')
+		case b >= 'a' && b <= 'f':
+			return 10 + int(b-'a')
+		case b >= 'A' && b <= 'F':
+			return 10 + int(b-'A')
+		default:
+			return -1
+		}
+	}
+
 	for !l.isAtEnd() {
 		ch, _ := l.advance()
 		if ch == byte(del) {
@@ -618,20 +641,27 @@ func (l *Lexer) scanString() (string, error) {
 				out = append(out, '\r')
 			case 't':
 				out = append(out, '\t')
+
+			case 'x':
+				// \xHH inserts exactly one raw byte.
+				b1, ok1 := l.peek()
+				b2, ok2 := l.peekN(1)
+				if !ok1 || !ok2 {
+					if l.interactive {
+						return "", l.errIncomplete("hex escape was not terminated (expect 2 hex digits)")
+					}
+					return "", l.err("hex escape was not terminated (expect 2 hex digits)")
+				}
+				d1, d2 := toHex(b1), toHex(b2)
+				if d1 < 0 || d2 < 0 {
+					return "", l.err("invalid hex escape")
+				}
+				out = append(out, byte((d1<<4)|d2))
+				l.advance()
+				l.advance()
+
 			case 'u':
 				// expect 4 hex digits
-				toHex := func(b byte) int {
-					switch {
-					case b >= '0' && b <= '9':
-						return int(b - '0')
-					case b >= 'a' && b <= 'f':
-						return 10 + int(b-'a')
-					case b >= 'A' && b <= 'F':
-						return 10 + int(b-'A')
-					default:
-						return -1
-					}
-				}
 				val := 0
 				for i := 0; i < 4; i++ {
 					b, ok := l.peek()
@@ -677,7 +707,7 @@ func (l *Lexer) scanString() (string, error) {
 							r2 := rune(val2)
 							if 0xDC00 <= r2 && r2 <= 0xDFFF {
 								cp := utf16.DecodeRune(r, r2)
-								out = append(out, cp)
+								appendRune(cp)
 								continue
 							}
 						}
@@ -686,27 +716,31 @@ func (l *Lexer) scanString() (string, error) {
 					l.cur = saveCur
 					l.line, l.col = saveLine, saveCol
 				}
-				out = append(out, r)
+				appendRune(r)
+
 			default:
 				return "", l.err(fmt.Sprintf("invalid escape sequence: \\%c", esc))
 			}
 			continue
 		}
-		// normal char; ensure it’s valid UTF-8 boundary (source may be UTF-8)
+
+		// normal char; keep source UTF-8 validity, but emit raw bytes
 		if ch < utf8.RuneSelf {
-			out = append(out, rune(ch))
+			out = append(out, ch)
 			continue
 		}
-		// If we see a non-ASCII byte here, the source itself is UTF-8; back up one byte and decode rune.
-		l.cur-- // step back 1 byte to let utf8.DecodeRuneInString read from correct start
+
+		// Non-ASCII: validate UTF-8 in *source* and copy the exact bytes.
+		l.cur-- // step back 1 byte to decode from the rune boundary
 		r, size := utf8.DecodeRuneInString(l.src[l.cur:])
 		if r == utf8.RuneError && size == 1 {
 			return "", l.err("invalid UTF-8 in source")
 		}
-		out = append(out, r)
+		out = append(out, l.src[l.cur:l.cur+size]...)
 		l.cur += size
 		l.col += size - 1
 	}
+
 	if l.interactive {
 		return "", l.errIncomplete("string was not terminated")
 	}

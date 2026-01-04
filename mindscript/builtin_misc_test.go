@@ -165,8 +165,8 @@ func Test_Builtin_Misc_int_num_bool_len(t *testing.T) {
 	if v := evalWithIP(t, ip, `len({a:1, b:2})`); v.Tag != VTInt || v.Data.(int64) != 2 {
 		t.Fatalf("len({a,b}) => 2, got %#v", v)
 	}
-	if v := evalWithIP(t, ip, `len("😀")`); v.Tag != VTInt || v.Data.(int64) != 1 {
-		t.Fatalf(`len("😀") => 1 (runes), got %#v`, v)
+	if v := evalWithIP(t, ip, `len("😀")`); v.Tag != VTInt || v.Data.(int64) != 4 {
+		t.Fatalf(`len("😀") => 1 (bytes), got %#v`, v)
 	}
 	if v := evalWithIP(t, ip, `len(42)`); v.Tag != VTNull {
 		t.Fatalf("len(42) => null, got %#v", v)

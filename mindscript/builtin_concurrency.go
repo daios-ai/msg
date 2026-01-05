@@ -235,65 +235,65 @@ Params:
 Returns:
 	Any`)
 
-	// procCancel(p) -> Bool | Null(err)
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"procCancel",
-		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
-		S{"unop", "?", S{"id", "Bool"}},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
-			// Close once; if already closed, signal soft error.
-			closed := false
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						closed = true
-					}
-				}()
-				close(pr.cancel)
-			}()
-			if closed {
-				return annotNull("already cancelled")
-			}
-			return Bool(true)
-		},
-	)
-	setBuiltinDoc(target, "procCancel", `Request cooperative cancellation of a process (best effort).
+	// 	// procCancel(p) -> Bool | Null(err)
+	// 	ip.RegisterRuntimeBuiltin(
+	// 		target,
+	// 		"procCancel",
+	// 		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
+	// 		S{"unop", "?", S{"id", "Bool"}},
+	// 		func(_ *Interpreter, ctx CallCtx) Value {
+	// 			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
+	// 			// Close once; if already closed, signal soft error.
+	// 			closed := false
+	// 			func() {
+	// 				defer func() {
+	// 					if r := recover(); r != nil {
+	// 						closed = true
+	// 					}
+	// 				}()
+	// 				close(pr.cancel)
+	// 			}()
+	// 			if closed {
+	// 				return annotNull("already cancelled")
+	// 			}
+	// 			return Bool(true)
+	// 		},
+	// 	)
+	// 	setBuiltinDoc(target, "procCancel", `Request cooperative cancellation of a process (best effort).
 
-See also: procCancelled.
+	// See also: procCancelled.
 
-Params:
-	p: Handle.proc   # proc handle
+	// Params:
+	// 	p: Handle.proc   # proc handle
 
-Returns:
-	Bool?   # true if cancellation was newly requested; Null(err) if already cancelled`)
+	// Returns:
+	// 	Bool?   # true if cancellation was newly requested; Null(err) if already cancelled`)
 
-	// procCancelled(p) -> Bool
-	ip.RegisterRuntimeBuiltin(
-		target,
-		"procCancelled",
-		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
-		S{"id", "Bool"},
-		func(_ *Interpreter, ctx CallCtx) Value {
-			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
-			select {
-			case <-pr.cancel:
-				return Bool(true)
-			default:
-				return Bool(false)
-			}
-		},
-	)
-	setBuiltinDoc(target, "procCancelled", `Check whether cancellation was requested for a process.
+	// 	// procCancelled(p) -> Bool
+	// 	ip.RegisterRuntimeBuiltin(
+	// 		target,
+	// 		"procCancelled",
+	// 		[]ParamSpec{{Name: "p", Type: S{"get", S{"id", "Handle"}, S{"str", "proc"}}}},
+	// 		S{"id", "Bool"},
+	// 		func(_ *Interpreter, ctx CallCtx) Value {
+	// 			pr := asHandle(ctx.Arg("p"), "proc").Data.(*procState)
+	// 			select {
+	// 			case <-pr.cancel:
+	// 				return Bool(true)
+	// 			default:
+	// 				return Bool(false)
+	// 			}
+	// 		},
+	// 	)
+	// 	setBuiltinDoc(target, "procCancelled", `Check whether cancellation was requested for a process.
 
-See also: procCancel.
+	// See also: procCancel.
 
-Params:
-	p: Handle.proc
+	// Params:
+	// 	p: Handle.proc
 
-Returns:
-	Bool`)
+	// Returns:
+	// 	Bool`)
 
 	// procJoinAll(ps:[proc]) -> [Any]
 	ip.RegisterRuntimeBuiltin(

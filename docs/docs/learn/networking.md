@@ -3,69 +3,138 @@
 !!! warning
     This page is under construction.
 
-MindScript’s networking primitives are designed for the kind of work scripts actually do: fetch data from an API, post results to a service, and occasionally speak a simple TCP protocol. The runtime exposes network connections as opaque `Handle` values, so the same I/O operations you already use for files—`readN`, `readAll`, `readLine`, `write`, `flush`, `close`—also work for sockets. This unification matters: once you understand stream I/O, you already understand most of networking in MindScript.
+MindScript's networking primitives allow performing the tasks that you'd expect: fetching data from an API, posting results to a service, and speaking a simple TCP protocol. 
 
-MindScript also makes a sharp distinction between two classes of failure. Misusing an API contract is a hard error (a panic), because the program is wrong. Environmental failures—DNS errors, connection resets, timeouts, remote server errors—are normal boundary failures and are represented as `null`, often annotated with a reason. This keeps network code explicit without forcing every script into exception-style control flow.
+The runtime exposes network connections (sockets) as `Handle.net` values. The same I/O operations you already use for [files](/learn/io) also work for sockets. That is, we can use the already familiar functions `readN`, `readAll`, `readLine`, `write`, `flush`, and `close`. 
 
 ---
 
-## The model: handles and boundary failures
+## TCP Connections
 
-A TCP connection is represented as a `Handle.net`. You do not inspect it; you pass it to I/O functions. When you are done, you close it with `close(h)`. If you fail to close connections, scripts that run for a long time (or loop over many URLs) can leak OS resources. Closing also matters for correctness with streaming protocols because it signals to the peer that no more bytes are coming.
+HTTP covers most integration work (see below), but raw TCP is still useful for quick tools and for talking to services that use a custom line protocol.
 
-Networking operations typically return `null` on failure. When they do, `noteGet(nullValue)` often carries a message that is safe to log. A reliable pattern is to check immediately at the boundary, before you assume you have a connection or a response.
+MindScript provides `netConnect(addr)` to create an outbound connection. To set up a listener, use `netListen(addr)`; once it is ready, you can accept an inbound connection with `netAccept(listener)`.
+
+Once you obtain a `Handle.net` connection handle from either `netConnect` or `netAccept`, you can use the same I/O primitives as files to write/read from it.
 
 ```mindscript
 let conn = netConnect("example.com:80")
 if conn == null then
-    println("connect failed: " + (noteGet(conn) or "<no details>"))
-    null
+    let reason = noteGet(conn)
+    reason = if reason == null then "no details" else reason end
+    println("connection failed: " + reason)
 else
-    # use conn
+    # use conn here with readN, write, etc.
+    ...
+
     close(conn)
 end
 ```
 
-That early check is not just style; it prevents accidental panics later when you pass a `null` to `readAll` or `write`.
+### A tiny TCP client and echo server
+
+In the following example we want to implement a simple TCP client that connects to an echo server on port `9000` of localhost. The client will write "ping", read the reply, and print the result.
+
+```mindscript
+# Tiny TCP client.
+
+let c = netConnect("127.0.0.1:9000")
+if c == null then
+    let reason = noteGet(c)
+    reason = if reason == null then "no details" else reason end
+    println("connect failed: " + reason)
+    null
+else
+    write(c, "ping\n")
+    flush(c)
+
+    let line = readLine(c)
+    close(c)
+
+    if line == null then
+        null  # no reply
+    else
+        println("Got reply: " + line)
+    end
+end
+```
+
+The flush is usually unnecessary for sockets because writes go directly to the OS, but using `flush` keeps the example consistent with the buffered I/O model and avoids surprises if a handle is layered through a buffered writer.
+
+Now on to the server. Our tiny server accepts a connection and echoes each incoming line. This example handles one connection and then exits. Handling many connections is a concurrency topic, but the protocol logic is the same.
+
+```mindscript
+# Tiny echo server.
+
+let l = netListen("127.0.0.1:9000")
+if l == null then
+    let reason = noteGet(l)
+    reason = if reason == null then "no details" else reason end
+    println("listen failed: " + reason)
+else
+    let c = netAccept(l)
+    close(l)
+
+    if c == null then
+        let reason = noteGet(c)
+        reason = if reason == null then "no details" else reason end
+        println("accept failed: " + (noteGet(c) or "<no details>"))
+    else
+        while true do
+            let line = readLine(c)
+            if line == null then
+                break
+            end
+            write(c, line + "\n")
+            flush(c)
+        end
+        close(c)
+    end
+end
+```
+
+This shows the essential server discipline: acquire resources, handle boundary failures, loop until EOF, then close.
 
 ---
 
-## HTTP: buffered requests, buffered responses
+## HTTP
 
-Most scripts should start with the HTTP client because it covers the common “call an API” use case without manual socket handling.
+TCP is fairly low level and requires manual socket handling. MindScript also provides a high-level HTTP client. In practice, most modern programs will use the HTTP client because it covers the common "call an API" use case.
 
-The function `http(req)` performs an HTTP request and returns a response object. The request is a map where `url` is required and everything else is optional. The response is also a map and includes fields such as status code, headers, and the full response body as a string. The function returns `null` when it cannot produce a meaningful response (for example, due to a network error or timeout).
+The function `http(req)` performs an HTTP request and returns a response object. The request `req` is a map where `url` is a required field and everything else is optional. The response is also a map and includes fields such as status code, headers, and the full response body as a string. The function returns an error when it cannot produce a meaningful response (for example, due to a network error or timeout).
 
 A minimal GET looks like this:
 
 ```mindscript
-let r = http({url: "https://httpbin.org/json"})
+let r = http({url: "https://www.daios.ai"})
 if r == null then
-    println("request failed: " + (noteGet(r) or "<no details>"))
-    null
+    let reason = str(noteGet(r))
+    println("request failed: " + reason)
 else
     r.status
 end
 ```
 
-A response is not automatically “success” just because it is non-null. HTTP represents many application-level failures as normal responses with status codes. Treat this as part of the boundary: check `r.status` explicitly.
+A non-null response is not automatically a "success" because HTTP represents many application-level failures as normal responses with status codes. It is good practice to check `r.status` explicitly. In the next example we'll use the "POST" method for the request.
 
 ```mindscript
-let r = http({url: "https://api.example.com/items"})
+let r = http({url: "https://api.example.com/items", method: "post"})
 if r == null then
     r
 elif r.status < 200 or r.status >= 300 then
-    null  # <http status not ok>
+    null  # http status not ok
 else
-    jsonRepair(r.body)
+    jsonParse(r.body)
 end
 ```
 
-In this example, `jsonRepair` is used rather than `jsonParse` because APIs sometimes include minor JSON irregularities. If you require strict JSON, use `jsonParse` and propagate its annotated failure instead.
+Notice how here we assume the endpoint returns a JSON string, and `jsonParse` is used to parse it.
 
-### Methods, headers, and timeouts
+### The request map
 
-HTTP requests are usually parameterized by method, headers, body, and timeout. MindScript uses a plain object for this because scripts tend to assemble requests dynamically.
+HTTP requests are usually parameterized by method, headers, body, and timeout. These can be provided in the request objects using the fields `method` (as we've already seen), `headers`, `body`, and `timeout` respectively.
+
+To illustrate this, we'll write a request to an endpoint for posting a new user record along with their role.
 
 ```mindscript
 let payload = jsonStringify({name: "Ada", role: "engineer"})
@@ -86,7 +155,7 @@ else
     if r == null then
         r
     elif r.status != 201 then
-        null  # <create failed>
+        null  # create failed
     else
         jsonRepair(r.body)
     end
@@ -217,74 +286,6 @@ end
 
 The explicit `close(f)` is important. A readable handle is still an OS resource, and the upload will finish sooner than a long-running script might otherwise exit.
 
----
-
-## TCP: raw connections for simple protocols
-
-HTTP covers most integration work, but raw TCP is still useful for quick tools and for talking to services that use a custom line protocol.
-
-MindScript provides `netConnect(addr)` to create an outbound connection, `netListen(addr)` to create a listener, and `netAccept(listener)` to accept inbound connections. All of these return `null` on environmental failure.
-
-Once you have a `Handle.net`, you use the same I/O primitives as files. This is not a convenience; it is a deliberate design that prevents a second, socket-specific API surface.
-
-### A tiny TCP client
-
-The following example sends a single line and reads a single line response. It uses `readLine`, which works on network handles.
-
-```mindscript
-let c = netConnect("127.0.0.1:9000")
-if c == null then
-    println("connect failed: " + (noteGet(c) or "<no details>"))
-    null
-else
-    write(c, "ping\n")
-    flush(c)
-
-    let line = readLine(c)
-    close(c)
-
-    if line == null then
-        null  # <no reply>
-    else
-        line
-    end
-end
-```
-
-The flush is usually unnecessary for sockets because writes go directly to the OS, but using `flush` keeps the example consistent with the buffered I/O model and avoids surprises if a handle is layered through a buffered writer.
-
-### A single-connection echo server
-
-A basic server accepts a connection and echoes each incoming line. This example handles one connection and then exits. Handling many connections is a concurrency topic, but the protocol logic is the same.
-
-```mindscript
-let l = netListen("127.0.0.1:9000")
-if l == null then
-    println("listen failed: " + (noteGet(l) or "<no details>"))
-    null
-else
-    let c = netAccept(l)
-    close(l)
-
-    if c == null then
-        println("accept failed: " + (noteGet(c) or "<no details>"))
-        null
-    else
-        while true do
-            let line = readLine(c)
-            if line == null then
-                break(null)
-            end
-            write(c, line + "\n")
-            flush(c)
-        end
-        close(c)
-        null
-    end
-end
-```
-
-This shows the essential server discipline: acquire resources, handle boundary failures, loop until EOF, then close.
 
 ---
 

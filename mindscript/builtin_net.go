@@ -99,7 +99,7 @@ Returns:
 		target,
 		"netListen",
 		[]ParamSpec{{Name: "addr", Type: S{"id", "Str"}}},
-		S{"id", "Any"},
+		S{"unop", "?", S{"get", S{"id", "Handle"}, S{"str", "listener"}}},
 		func(ip *Interpreter, ctx CallCtx) Value {
 			av := ctx.Arg("addr")
 			ln, err := net.Listen("tcp", av.Data.(string))

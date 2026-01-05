@@ -1,43 +1,51 @@
 # Input and Output
 
-!!! warning
-    This page is under construction.
-
-Input/output is how a MindScript program communicates with its environment: terminals, pipelines, files, and (through other libraries) networks and processes. The language itself works only with values—numbers, strings, arrays, and objects—but the runtime also provides **handles** that represent open streams such as standard input, standard output, open files, and sockets.
-
-This chapter aims to answer three practical questions. First, where does a program read from and write to? Second, what do the basic read and write operations return, especially at end-of-file? Third, how should a program report failures without breaking shell pipelines?
-
-MindScript follows a simple convention that makes I/O predictable. When an I/O operation cannot produce a meaningful result, it usually returns `null`. When that `null` carries an explanation, it is stored as an annotation, which you can retrieve with `noteGet(...)`. This style keeps error handling explicit without forcing you into a separate exception mechanism for everyday boundary failures.
-
-We begin with the standard streams, because every program has them, and then move to files and a few filesystem helpers.
+Input/output is how a MindScript program communicates with its environment: terminals, pipelines, files, and (through other libraries) networks and processes. The language provides **handles** that represent open streams such as standard input, standard output, open files, and sockets.
 
 ---
 
-## Handles and the standard streams
+## The standard I/O streams
 
-A **handle** is an opaque value of type `Handle` managed by the runtime. You do not inspect the internals of a handle; instead you pass it to the I/O functions provided by the runtime.
+Every MindScript program starts with three predefined handles, `STDIN`, `STDOUT`, and `STDERR`, of type `<handle: file>`. These correspond to the conventional Unix streams.
 
-Every MindScript program starts with three predefined handles: `STDIN`, `STDOUT`, and `STDERR`. These correspond to the conventional Unix streams. It is useful to adopt the Unix discipline: use standard output for the program’s primary results—often machine-consumable text such as JSON—and use standard error for diagnostics such as warnings, progress messages, and explanations. This separation is what makes pipelines robust: a downstream program can read clean JSON from stdout even while your program reports status messages to stderr.
+```mindscript-repl
+==> STDIN
+<handle: file> # Readable handle for the process standard input.
+
+==> STDOUT
+<handle: file> # Writable handle for the process standard output.
+
+==> STDERR
+<handle: file> # Writable handle for the process standard error.
+```
+
+The standard printing functions `print`, `println`, `printf` all write to `STDOUT`. For instance, the following three all print `Hello, world!` followed by a newline.
+
+```mindscript
+print("Hello, world!\n")
+
+println("Hello, world!")
+
+printf("%s, %s!\n", ["Hello", "world"])
+```
 
 ---
 
 ## Writing output
 
-The most fundamental output operation is `write(h, s: Str) -> Int?`. It writes the bytes of the string `s` to the handle `h`. On success it returns the number of bytes written; on failure it returns `null`, often annotated with a short reason. The word “bytes” matters: `write` does not interpret the string, and it does not insert separators or newlines. If you want a newline, you must include `"\n"` yourself.
+The most fundamental output operation is `write(h, s: Str) -> Int?`. It writes the bytes of the string `s` to the handle `h`. On success it returns the number of bytes written; on failure it returns an error (`null`). The word "bytes" matters: `write` does not interpret the string, and it does not insert separators or newlines. If you want a newline, you must include `"\n"` yourself.
 
 ```mindscript
 write(STDOUT, "hello")
 write(STDOUT, "\n")
 ```
 
-Output is buffered. Buffering improves performance and reduces system calls, but it also means you might not see output immediately. When you need output to appear right away—typically for progress messages—call `flush(h) -> Bool?`. A good mental model is that `write` appends to a buffer and `flush` pushes that buffer to the operating system.
+Output is buffered. Buffering improves performance and reduces system calls, but it also means you might not see output immediately. When you need output to appear right away (typically for progress messages) call `flush(h) -> Bool?`. A good mental model is that `write` appends to a buffer and `flush` pushes that buffer to the operating system.
 
 ```mindscript
 write(STDERR, "loading...\n")
 flush(STDERR)
 ```
-
-For convenience during development, the prelude provides `print(x)` and `println(x)`. They convert common “data values” to a readable representation and write them, with `println` adding a trailing newline. Both return the original value, which makes them easy to insert into an expression without restructuring code.
 
 When you need formatted output, use `sprintf(fmt: Str, args: [Any]) -> Str?` to build a string or `printf(fmt: Str, args: [Any]) -> Str?` to write formatted output to stdout. The `printf` function writes through the same buffered stdout writer as `write(STDOUT, ...)` and flushes, which helps keep output ordering stable when you mix the two.
 
@@ -45,13 +53,16 @@ When you need formatted output, use `sprintf(fmt: Str, args: [Any]) -> Str?` to 
 printf("count=%d\n", [42])
 ```
 
-If the format string and the arguments do not match, `sprintf` and `printf` return `null` with an annotation describing the formatting problem.
+If the format string and the arguments do not match, `sprintf` and `printf` will return an error.
+
+!!! note
+    The `sprintf` and `printf` functions are based on Go's `fmt.Printf`, which hsa a similar syntax as `printf` from the C standard library.
 
 ---
 
 ## Reading input
 
-Streams can be consumed in different ways, so MindScript provides three basic reading operations. The point is not to memorize names, but to understand the meaning of each operation and how it signals end-of-file.
+Streams can be consumed in different ways, so MindScript provides three basic reading operations.
 
 ### Reading the whole stream: `readAll`
 
@@ -60,7 +71,9 @@ The function `readAll(h) -> Str?` reads from a handle until end-of-file and retu
 ```mindscript
 let input = readAll(STDIN)
 if input == null then
-    write(STDERR, "read failed: " + (noteGet(input) or "<no details>") + "\n")
+    let reason = noteGet(input)
+    reason = if reason == null then "no details" else reason end
+    write(STDERR, "read failed: " + reason + "\n")
     flush(STDERR)
     null
 else
@@ -90,11 +103,11 @@ end
 flush(STDOUT)
 ```
 
-It is important to distinguish an empty line from end-of-file. An empty line is the string `""`, which is a valid value that `readLine` may return. End-of-file is `null`. If you care about distinguishing “normal EOF” from “a read failure,” check the annotation: in many parts of the standard library, failures return an annotated `null`, whereas EOF is usually plain `null`.
+It is important to distinguish an empty line from end-of-file. An empty line is the string `""`, which is a valid value that `readLine` may return. End-of-file is `null`. If you care about distinguishing “normal EOF” from “a read failure,” check the annotation.
 
 ### Reading fixed-size chunks: `readN`
 
-The function `readN(h, n: Int) -> Str?` reads up to `n` bytes and returns a string containing exactly what it read. It may return fewer than `n` bytes without this being an error. If reading fails, it returns `null`. End-of-file is detected when `readN` returns a string of length zero, so the typical loop checks `len(chunk) == 0`.
+The function `readN(h, n: Int) -> Str?` reads up to `n` bytes and returns a string containing exactly what it read. If reading fails, it returns `null`. End-of-file is detected when `readN` returns a string of length zero, so the typical loop checks `len(chunk) == 0`.
 
 ```mindscript
 let bufSize = 64_000
@@ -102,7 +115,9 @@ let bufSize = 64_000
 while true do
     let chunk = readN(STDIN, bufSize)
     if chunk == null then
-        write(STDERR, "read failed: " + (noteGet(chunk) or "<no details>") + "\n")
+        let reason = noteGet(chunk)
+        reason = if reason == null then "no reason" else reason end
+        write(STDERR, "read failed: " + reason + "\n")
         flush(STDERR)
         break(null)
     end
@@ -115,7 +130,7 @@ end
 flush(STDOUT)
 ```
 
-This pattern is the backbone of streaming tasks: copying, hashing, compression, and large transfers all reduce to “read chunks until EOF, process each chunk, write results.”
+This pattern is the backbone of streaming tasks: copying, hashing, compression, and large transfers all reduce to reading chunks until EOF, processing each chunk, and writing results.
 
 ---
 
@@ -123,34 +138,34 @@ This pattern is the backbone of streaming tasks: copying, hashing, compression, 
 
 MindScript supports whole-file helpers for simple scripts and explicit file handles for streaming.
 
-When a script wants the simplest interface, it uses `readFile(path: Str) -> Str?` to read a file as one string and `writeFile(path: Str, data: Str) -> Int?` to overwrite a file with the given data. As with other I/O, failures return `null`.
+The simplests interface is `readFile(path: Str) -> Str?`, which reads an entire file as one string, and `writeFile(path: Str, data: Str) -> Int?` to overwrite a file with the given data. As with other I/O, failures return errors.
 
 ```mindscript
 let s = readFile("input.txt")
 if s == null then
-    write(STDERR, "cannot read input.txt: " + (noteGet(s) or "<no details>") + "\n")
+    let reason = noteGet(s)
+    reason = if reason == null then "no details" else reason end
+    write(STDERR, "cannot read input.txt: " + reason + "\n")
     flush(STDERR)
-    null
 else
     let out = toUpper(s)
     let n = writeFile("output.txt", out)
     if n == null then
-        write(STDERR, "cannot write output.txt: " + (noteGet(n) or "<no details>") + "\n")
+        let reason = noteGet(n)
+        reason = if reason == null then "no details" else reason end
+        write(STDERR, "cannot write output.txt: " + reason + "\n")
         flush(STDERR)
-        null
     else
         n
     end
 end
 ```
 
-When you need incremental processing, you open a file and work with a handle. The function `open(path: Str, mode: "r"|"w"|"a"|"rw") -> Handle.file?` returns a file handle (or `null` on failure). Once you have a handle, you use the same `readAll`, `readLine`, `readN`, `write`, `flush`, and `close` operations you already learned. Closing is important: it releases operating-system resources, and for writable handles it flushes buffered output.
+When you need incremental processing, you open a file and work with a handle. The function `open(path: Str, mode: "r"|"w"|"a"|"rw") -> Handle.file?` returns a file handle. Once you have a handle, you use the same `readAll`, `readLine`, `readN`, `write`, `flush`, and `close` operations you already learned. Closing is important: it releases operating-system resources, and for writable handles it flushes buffered output.
 
 ```mindscript
 let f = open("big.bin", "r")
-if f == null then
-    f
-else
+if f != null then
     let chunk = readN(f, 64_000)
     close(f)
     chunk
@@ -160,16 +175,16 @@ end
 A file copy example shows the full discipline of stream programming. You acquire resources, loop reading and writing until EOF, and ensure that both handles are closed on every exit path. In this example, end-of-file is detected by `len(chunk) == 0` and is not treated as an error.
 
 ```mindscript
-let copyFile = fun(srcPath: Str, dstPath: Str) -> Null? do
+let copyFile = fun(srcPath: Str, dstPath: Str) -> Bool? do
     let src = open(srcPath, "r")
     if src == null then
-        return (null  # <cannot open source>)
+        return null  # cannot open source
     end
 
     let dst = open(dstPath, "w")
     if dst == null then
         close(src)
-        return (null  # <cannot open destination>)
+        return null  # cannot open destination
     end
 
     while true do
@@ -177,7 +192,7 @@ let copyFile = fun(srcPath: Str, dstPath: Str) -> Null? do
         if chunk == null then
             close(src)
             close(dst)
-            return (null  # <read error>)
+            return null  # read error
         end
         if len(chunk) == 0 then
             break(null)  # EOF
@@ -187,13 +202,13 @@ let copyFile = fun(srcPath: Str, dstPath: Str) -> Null? do
         if n == null then
             close(src)
             close(dst)
-            return (null  # <write error>)
+            return null  # write error
         end
     end
 
     close(src)
     close(dst)
-    null
+    true
 end
 ```
 
@@ -230,13 +245,13 @@ else
 end
 ```
 
-Other OS helpers exist—such as `stat`, `rename`, `remove`, `cwd`, `chdir`, and environment variable access—and they follow the same convention: return `null` when they cannot deliver the requested result.
+Other OS helpers exist, such as `stat` for reading a file status,  `rename` and `remove` to rename and remove a file, and `cwd` and `chdir` to get or change the current working directory.
 
 ---
 
-## Bytes and text: one `Str`, two uses
+## Bytes and text
 
-MindScript uses `Str` both for Unicode text and for raw byte sequences returned by I/O, such as file contents, stream chunks, HTTP bodies, compressed data, and cryptographic digests. Text-oriented functions like `strip`, `split`, and `substr` interpret strings as Unicode text, while I/O functions treat strings as byte containers.
+Values of type `Str` are byte containers and thus work well in I/O operations (file contents, stream chunks, HTTP bodies, compressed data, and cryptographic digests). However, text-oriented functions like `print` and others (e.g. `toUpper`, `strip`, `split`, `substr`, etc.) interpret strings as Unicode text.
 
 When a string contains arbitrary bytes, it may not be printable. In that case, encode it first with `hexEncode` or `base64Encode`. For example, to compute and print a SHA-256 digest as hex:
 
@@ -249,9 +264,3 @@ else
     flush(STDOUT)
 end
 ```
-
----
-
-## Summary
-
-MindScript performs I/O through handles such as `STDIN`, `STDOUT`, `STDERR`, and file handles returned by `open`. Writing is done with `write`, and because output is buffered you sometimes call `flush` when immediacy matters. Reading can be done all at once with `readAll`, line by line with `readLine`, or in fixed-size chunks with `readN`; end-of-file appears as `null` for `readLine` and as a zero-length chunk for `readN`. File I/O comes in both whole-file helpers (`readFile`, `writeFile`) and streaming style (`open` plus handle-based reads and writes). Throughout, ordinary I/O failures are represented as `null`, often annotated with a reason, so checking for `null` is the normal way to write reliable scripts.

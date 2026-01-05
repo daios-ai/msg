@@ -177,23 +177,23 @@ let after = chanRecv(c)
 	time.Sleep(10 * time.Millisecond)
 }
 
-func Test_Builtin_Concurrency_ProcCancel_Smoke(t *testing.T) {
-	ip, _ := NewInterpreter()
+// func Test_Builtin_Concurrency_ProcCancel_Smoke(t *testing.T) {
+// 	ip, _ := NewInterpreter()
 
-	// Spawn something that sleeps, then cancel; join should still eventually return.
-	out := evalWithIP(t, ip, `
-let sleeper = fun() do
-  sleep(10)
-  42
-end
-let p = procSpawn(sleeper)
-procCancel(p)    # best-effort; not observable directly here
-procJoin(p)
-	`)
-	if out.Tag != VTInt || out.Data.(int64) != 42 {
-		t.Fatalf("procCancel/procJoin unexpected result: %#v", out)
-	}
-}
+// 	// Spawn something that sleeps, then cancel; join should still eventually return.
+// 	out := evalWithIP(t, ip, `
+// let sleeper = fun() do
+//   sleep(10)
+//   42
+// end
+// let p = procSpawn(sleeper)
+// procCancel(p)    # best-effort; not observable directly here
+// procJoin(p)
+// 	`)
+// 	if out.Tag != VTInt || out.Data.(int64) != 42 {
+// 		t.Fatalf("procCancel/procJoin unexpected result: %#v", out)
+// 	}
+// }
 
 // ---------------- procJoinAll / procJoinAny ----------------
 
@@ -382,23 +382,23 @@ end
 
 // ---------------- procCancel remains best-effort ----------------
 
-func Test_Concurrency_ProcCancel_StillBestEffort(t *testing.T) {
-	ip, _ := NewInterpreter()
+// func Test_Concurrency_ProcCancel_StillBestEffort(t *testing.T) {
+// 	ip, _ := NewInterpreter()
 
-	// This test just exercises the API surface; cancellation is cooperative.
-	out := evalWithIP(t, ip, `
-let sleeper = fun() -> Int do
-  sleep(10)
-  99
-end
-let p = procSpawn(sleeper)
-procCancel(p)    # best-effort; not observable directly here
-procJoin(p)
-	`)
-	if out.Tag != VTInt || out.Data.(int64) != 99 {
-		t.Fatalf("procCancel/procJoin unexpected result: %#v", out)
-	}
-}
+// 	// This test just exercises the API surface; cancellation is cooperative.
+// 	out := evalWithIP(t, ip, `
+// let sleeper = fun() -> Int do
+//   sleep(10)
+//   99
+// end
+// let p = procSpawn(sleeper)
+// procCancel(p)    # best-effort; not observable directly here
+// procJoin(p)
+// 	`)
+// 	if out.Tag != VTInt || out.Data.(int64) != 99 {
+// 		t.Fatalf("procCancel/procJoin unexpected result: %#v", out)
+// 	}
+// }
 
 // 1) chanTryRecv on empty, unbuffered → {ok:false, value:null}
 func Test_Builtin_Concurrency_TryRecv_OnEmptyUnbuffered(t *testing.T) {

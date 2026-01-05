@@ -245,7 +245,7 @@ The speed of light
 
 Likewise, it is possible to annotate type expressions:
 
-```
+```mindscript
 let Person = {
     name!: Str,  # The name of the person.
     age: Int     # The age of the person.
@@ -265,7 +265,7 @@ Consider for example the annotations within the type `Person` above. If an oracl
 
 Most of the usual operators are available and they have the expected precedence rules:
 
-```
+```text
 * / % + - == != < <= > >= not and or =
 ```
 

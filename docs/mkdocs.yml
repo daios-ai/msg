@@ -12,10 +12,12 @@ theme:
     -navigation.footer
     -navigation.indexes
 markdown_extensions:
-  - pymdownx.highlight:
-      anchor_linenums: true
-      line_spans: __span
-      pygments_lang_class: true
+  - pymdownx.highlight: 
+      use_pygments: false
+#  - pymdownx.highlight:
+#      anchor_linenums: true
+#      line_spans: __span
+#      pygments_lang_class: true
   - pymdownx.inlinehilite
   - pymdownx.snippets
   - pymdownx.superfences
@@ -52,8 +54,15 @@ extra:
     - icon: fontawesome/solid/globe
       link: https://daios.ai
       name: Daios homepage
+extra_css:
+  - assets/prism.css
+  - assets/prism-mindscript-repl.css
+  - assets/prism-overrides.css
 extra_javascript:
   - javascripts/feedback.js
+  - assets/prism.js
+  - assets/prism-mindscript.js
+  - assets/prism-mindscript-repl.js
 nav:
   - MindScript: index.md
   - Installation: installation.md

@@ -1,5 +1,8 @@
 # Metaprogramming and Introspection
 
+!!! warning
+    This page is under construction.
+
 MindScript also exposes program structure itself as data. *Metaprogramming* means treating code as a value that you can parse, validate, transform, format, and evaluate. Introspection means observing or manipulating metadata attached to values (notably annotations) and inspecting runtime structure.
 
 This chapter focuses on the practical tooling layer that MindScript ships with. The goal is not to turn every script into a compiler, but to make common tasks—formatting, light linting, safe evaluation of small snippets, reproducible code generation, and data-to-code roundtrips—straightforward and reliable.

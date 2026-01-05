@@ -149,13 +149,13 @@ In practice you’ll often keep “helper helpers” private by convention (for 
 
 Start simple. A single script is fine when you’re experimenting:
 
-```
+```text
 tool.ms
 ```
 
 As the code grows, split it into a small `src/` tree and keep tests **colocated** with the code they cover (the test runner discovers `*_test.ms` files automatically):
 
-```
+```text
 src/
   main.ms
   main_test.ms

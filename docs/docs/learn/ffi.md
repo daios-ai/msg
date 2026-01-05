@@ -1,5 +1,8 @@
 # Foreign Function Interface
 
+!!! warning
+    This page is under construction.
+
 MindScript is happiest when most of your program lives in ordinary values—strings, numbers, arrays, and objects—because that keeps scripts portable and easy to reason about. Sometimes, though, the thing you want already exists as a mature C library: a codec, a database client, a numerical routine, a device API, or a legacy SDK. The foreign function interface (FFI) is the bridge for that situation.
 
 In MindScript, the entry point is `ffiOpen(spec)`. You give it a *specification*—a plain MindScript object that describes the C library surface you want to call—and you get back a MindScript module. Functions become callable values. Global variables become small objects with `get()`, `set(value)`, and `addr()` accessors. Native pointers and aggregate storage become opaque `Handle` values so you can’t accidentally treat a pointer like an integer and corrupt memory.

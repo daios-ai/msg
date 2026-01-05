@@ -1,5 +1,8 @@
 # Examples
 
+!!! warning
+    This page is under construction.
+
 This page contains a few code examples that should give you an idea of how to solve problems with MindScript.
 
 ## Hello, world!
@@ -9,16 +12,20 @@ We start with the classical "Hello, world!" example, but with a twist. We will i
 ### Formal computation
 
 We define a function that returns the string "Hello, world!"
-```
+
+```mindscript
 # Say "Hello, world!"
 let greet1 = fun() -> Str do
     return("Hello, world!")
 end
 ```
+
 Invoking `greet1()` yields:
-```
+
+```mindscript
 "Hello, world!"
 ```
+
 as expected.
 
 ### Unstructured computation
@@ -26,16 +33,17 @@ as expected.
 Now we define an oracle who will use the input-output signature
 and the comment annotation in order to derive the output:
 
-```
+```mindscript
 # Say "Hello, world!"
 let greet2 = oracle() -> Str
 ```
 
 If we evaluate `greet2()`, we should get
 
-```
+```mindscript
 "Hello, world!"
 ```
+
 but since this computation is informal and performed by the LLM, it might also return another string or fail (i.e. return `null`).
 
 ## Sentiment analysis
@@ -47,25 +55,26 @@ we write an oracle.
 
 First, let's define the type of the output as a string `Enum`
 with two possible values `"positive"` or `"negative"`:
-```
+
+```mindscript
 let Sentiment = type Enum ["positive", "negative"]
 ```
 
 Now we define an oracle that takes a text string as an input and
 then determines its sentiment.
-```
+
+```mindscript
 # Given a text, determine its sentiment.
 let evaluateSentiment = oracle(sentence: Str) -> Sentiment
 ```
 
 The oracle will now evaluate texts:
-```
-> evaluateSentiment("The cat isn't happy.")
 
+```mindscript-repl
+==> evaluateSentiment("The cat isn't happy.")
 "negative"
 
-> evaluateSentiment("The markets are pretty bullish!")
-
+==> evaluateSentiment("The markets are pretty bullish!")
 "positive"
 ```
 
@@ -75,24 +84,21 @@ We can leverage the knowledge of an oracle. Let's assume we
 want to figure out the name of a famous researcher given
 a subject field.
 
-```
+```mindscript
 # Given a subject, determine the name of a famous researcher.
 let researcher = oracle(subject: Str) -> {name: Str}
 ```
 
 This oracle can be queried:
 
-```
-> researcher("physics")
-
+```mindscript-repl
+==> researcher("physics")
 {"name": "Albert Einstein"}
 
-> researcher("chemistry")
-
+==> researcher("chemistry")
 {"name": "Marie Curie"}
 
-> researcher("economics")
-
+==> researcher("economics")
 {"name": "John Maynard Keynes"}
 ```
 
@@ -104,7 +110,7 @@ semantic manner. For instance, the next script extracts
 the price of the cryptocurrency ETH from the front page
 of CoinMarketCap:
 
-```
+```mindscript
 # Given the HTML of a web page, extract the price of a given cryptocurrency.
 let extractPrice = oracle(html: Str, currency: Str) -> Num
 
@@ -116,11 +122,10 @@ let ethPrice = extractPrice(page, "ETH")
 ```
 
 At the time of writing this, `ethPrice` was:
-```
-> ethPrice
 
-The price of ETH
-2625.87
+```mindscript-repl
+==> ethPrice
+2625.87 # The price of ETH
 ```
 
 ## Using the induction capabilities of oracles
@@ -135,7 +140,7 @@ For instance, let's compute the Fibonacci sequence
 0 and 1, the next one is obtained by adding the previous
 two.
 
-```
+```mindscript
 # Compute the n-th Fibonacci number.
 let fib = fun(n: Int) do
   if n == 0 then
@@ -154,7 +159,8 @@ end
 ```
 
 We can verify that these are indeed correct:
-```
+
+```mindscript-repl
 > numbers
 
 [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
@@ -163,7 +169,7 @@ We can verify that these are indeed correct:
 Now let's build an oracle `nextNumber` that, given a sequence of
 numbers, generates the next one.
 
-```
+```mindscript
 # Given a sequence of numbers, generate the next one.
 let nextNumber = oracle(numbers: [Int]) -> Int
 ```
@@ -171,19 +177,23 @@ let nextNumber = oracle(numbers: [Int]) -> Int
 Let's test it. Starting with the first five Fibonacci
 numbers, we let the oracle guess the next one in an iterative
 way until we have a total of ten numbers.
-```
+
+```mindscript
 let examples = slice(numbers, 0, 5)
 for n in range(5, 10) do
   let p = nextNumber(examples)
   push(examples, p)
 end
 ```
+
 This outputs
-```
-> examples
+
+```mindscript-repl
+==> examples
 
 [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
 ```
+
 which are the correct first ten Fibonacci numbers.
 
 !!! warning
@@ -200,15 +210,17 @@ examples.
 
 Consider the following text encoding rule, best shown in an example.
 Take the input, say `HELLO`, and rewrite this in a zigzag pattern of three rows
-```
+
+```text
 H   O
  E L
   L
 ```
+
 Then read the result of combining the letters line by line. The result is `HOELL`.
 Next we build an oracle with a bunch of such examples:
 
-```
+```mindscript
 let codeExamples =[
   ["HELLO", "HOELL"],
   ["ABCDEFGHIJK", "AEIBDFHJCGK"],
@@ -222,17 +234,15 @@ let encode = oracle(text: Str) -> {code: Str} from codeExamples
 ```
 
 We can now test it on some inputs:
-```
-> encode("HELLO")
 
+```mindscript-repl
+==> encode("HELLO")
 "HOELL"
 
-> encode("SANDWICH")
-
+==> encode("SANDWICH")
 "SHADICNW"
 
-> encode("TOBEORNOTTOBE")
-
+==> encode("TOBEORNOTTOBE")
 "TEOOBRTONBOTE"
 ```
 

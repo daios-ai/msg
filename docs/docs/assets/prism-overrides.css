@@ -1,0 +1,12 @@
+/* Make the code-block copy (md-clipboard) icon white */
+.md-typeset .md-clipboard,
+.md-typeset .md-clipboard::before,
+.md-typeset .md-clipboard::after {
+  color: #aaa !important;
+}
+
+/* If the icon is rendered as an SVG in your version */
+.md-typeset .md-clipboard svg {
+  fill: currentColor !important;
+}
+

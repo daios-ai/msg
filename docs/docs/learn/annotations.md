@@ -150,7 +150,7 @@ You can read and write annotations at runtime:
 
 In the next example we programmatically set and retrieve an annotation:
 
-```mindscript
+```mindscript-repl
 ==> let c = 299_792_458
 299792458
 

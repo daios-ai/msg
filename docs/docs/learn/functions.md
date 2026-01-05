@@ -210,17 +210,16 @@ end
 
 Calls must use parentheses with **no space** before `(`: `f(x)` is correct, but `f (x)` is the expression `f` followed by `(x)`.
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> factorial(4)</span>
-<span class="value">24</span>
+```mindscript-repl
+==> factorial(4)
+24
 
-<span class="prompt">==> (fun(n, m) do n + m end)(1, 2)</span> 
-<span class="value">3</span>
+==> (fun(n, m) do n + m end)(1, 2)
+3
 
-<span class="prompt">==> (fun(a, b) do a + b end)("Hello ", "Jack")</span>
-<span class="value">"Hello Jack"</span></code></pre>
-
-</div>
+==> (fun(a, b) do a + b end)("Hello ", "Jack")
+"Hello Jack"
+```
 
 The two latter examples also show how you can evaluate a function without binding it to a variable (i.e. an evaluation of a lambda expression).
 
@@ -236,21 +235,27 @@ let sum = fun(x: Int, y: Int) -> Int do
 end
 ```
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> typeOf(sum)</span>
-<span class="value">type Int -> Int -> Int</span>
+Then,
 
-<span class="prompt">==> sum(3, 4)</span> <span class="value">7</span>
+```mindscript-repl
+==> typeOf(sum)
+type Int -> Int -> Int
 
-<span class="prompt">==> sum(3)</span> <span class="value">y:Int -> Int</span>
+==> sum(3, 4)
+7
 
-<span class="prompt">==> let add3 = sum(3)</span> <span class="value">y:Int -> Int</span>
+==> sum(3)
+y:Int -> Int
 
-<span class="prompt">==> add3(4)</span> <span class="value">7</span>
+==> let add3 = sum(3)
+y:Int -> Int
 
-<span class="prompt">==> sum(3)(4)</span> <span class="value">7</span> </code></pre>
+==> add3(4)
+7
 
-</div>
+==> sum(3)(4)
+7
+```
 
 A practical pattern: apply a function to a list of arguments one by one.
 
@@ -262,11 +267,12 @@ let applyAll = fun(f, args: [Any]) do
 end
 ```
 
-<div class="my-code" markdown="0">
-<pre><code><span class="prompt">==> applyAll(sum, [3, 4])</span>
-<span class="value">7</span>
-</code></pre>
-</div>
+With this you can run
+
+```mindscript-repl
+==> applyAll(sum, [3, 4])
+7
+```
 
 ---
 

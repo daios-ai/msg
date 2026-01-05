@@ -1,0 +1,19 @@
+/* 3-color scheme for language-mindscript-repl */
+pre.language-mindscript-repl,
+code.language-mindscript-repl {
+  color: white; /* prompt lines stay normal */
+}
+
+.language-mindscript-repl .token.output {
+  color: deepskyblue; /* blue */
+}
+
+.language-mindscript-repl .token.comment {
+  color: lightgreen; /* green */
+}
+
+/* optional: ensure prompt token inherits even if your theme styles unknown tokens */
+.language-mindscript-repl .token.prompt {
+  color: white;
+}
+

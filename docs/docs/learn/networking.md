@@ -1,5 +1,8 @@
 # Networking
 
+!!! warning
+    This page is under construction.
+
 MindScript’s networking primitives are designed for the kind of work scripts actually do: fetch data from an API, post results to a service, and occasionally speak a simple TCP protocol. The runtime exposes network connections as opaque `Handle` values, so the same I/O operations you already use for files—`readN`, `readAll`, `readLine`, `write`, `flush`, `close`—also work for sockets. This unification matters: once you understand stream I/O, you already understand most of networking in MindScript.
 
 MindScript also makes a sharp distinction between two classes of failure. Misusing an API contract is a hard error (a panic), because the program is wrong. Environmental failures—DNS errors, connection resets, timeouts, remote server errors—are normal boundary failures and are represented as `null`, often annotated with a reason. This keeps network code explicit without forcing every script into exception-style control flow.

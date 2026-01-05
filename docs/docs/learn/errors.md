@@ -31,7 +31,7 @@ When MindScript encounters a panic, *it considers it fatal and halts execution*.
 
 The basic pattern is: *validate, and return* `null` *(with a reason) on failure*.
 
-```mindscript hl_lines="4 6"
+```mindscript
 let parsePort = fun(s: Str) -> Int? do
     let n = int(s)
     if n == null then
@@ -48,7 +48,7 @@ The `# ...` text attaches to the returned `null`. It’s meant for humans (logs/
 
 The standard library defines `error(msg: Str) -> Null`, a helper function which returns `null` annotated with `msg`. It can provide a cosmetic touch to signal intent in the code:
 
-```mindscript hl_lines="4 6"
+```mindscript
 let parsePort = fun(s: Str) -> Int? do
     let n = int(s)
     if n == null then

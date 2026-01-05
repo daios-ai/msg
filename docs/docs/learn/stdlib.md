@@ -1,5 +1,8 @@
 # Standard Library
 
+!!! warning
+    This page is under construction.
+
 MindScript’s standard library is built for the kind of work scripts actually do: read some data, turn it into values, transform it, then write something useful back out—often in a way that composes in shell pipelines and CI.
 
 You will see the same design pattern across the library:

@@ -1,5 +1,8 @@
 # Testing
 
+!!! warning
+    This page is under construction.
+
 MindScript scripts often start life as one-off utilities. The moment a script becomes part of a data pipeline, a CI job, or a production integration, you need a way to prevent “small refactors” from silently changing behavior. MindScript’s testing story is designed around that reality: tests are ordinary MindScript code, they run under the same runtime type checks as everything else, and failures produce readable diagnostics that point back to the source location.
 
 The `msg` runtime ships with a test runner (`msg test`) and a standard module named `testing`. The `testing` module provides a registry for tests and a small set of assertion helpers. The runner discovers test files, loads them, executes the registered tests, prints a compact report, and exits non-zero when any test fails. That last property is the whole point: it makes tests composable with CI and shell automation.

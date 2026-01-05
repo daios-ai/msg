@@ -1,5 +1,8 @@
 # Input and Output
 
+!!! warning
+    This page is under construction.
+
 Input/output is how a MindScript program communicates with its environment: terminals, pipelines, files, and (through other libraries) networks and processes. The language itself works only with values—numbers, strings, arrays, and objects—but the runtime also provides **handles** that represent open streams such as standard input, standard output, open files, and sockets.
 
 This chapter aims to answer three practical questions. First, where does a program read from and write to? Second, what do the basic read and write operations return, especially at end-of-file? Third, how should a program report failures without breaking shell pipelines?

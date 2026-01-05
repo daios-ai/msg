@@ -94,7 +94,7 @@ Two additional useful fields of the `runtime` object are:
 
 You can run `msg` interactively using the `msg repl` command. This starts an interactive session where you can type expressions and see their results immediately (a Read-Eval-Print Loop).
 
-```
+```mindscript-repl
 $ msg repl
 MindScript 0.1.4 REPL
 Ctrl+C cancels input, Ctrl+D exits. Type :quit to exit.

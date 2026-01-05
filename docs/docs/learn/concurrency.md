@@ -1,5 +1,8 @@
 # Concurrency
 
+!!! warning
+    This page is under construction.
+
 Concurrency in MindScript is designed for scripts that need to overlap work, limit latency, and keep mutable state disciplined. The runtime offers three building blocks that compose cleanly: processes (`procSpawn` / `procJoin`), channels (`chanOpen` / `chanSend` / `chanRecv`), and actors (`actorStart` / `actorCall`). Each tool exists to solve a specific problem.
 
 The most important design decision is that MindScript does not share ordinary data structures across concurrent execution. Arrays and objects are mutable in a single thread, but when you spawn concurrent work the runtime runs it in an isolated interpreter. The closure you provide is snapshotted into that isolate, and the work produces a result that is snapshotted back to the parent. This avoids data races by construction. If you need coordination, you do it explicitly with handles: process handles, channel handles, actor handles, file handles, and network handles.

@@ -33,7 +33,7 @@ this world! 🚀😄
 The greeting will depend on what your LLM came up with by following the instruction `Say hello in a funny way!`.
 
 Let's go over the program, line by line. The very first line is a comment. 
-``` hl_lines="1"
+```mindscript
 # Say hello in a funny way!
 let sayHello = oracle() -> Str
 
@@ -42,7 +42,7 @@ println(sayHello())
 *Unlike* other programming languages, comments are not ignored, but they are annotations that attach descriptive text to the value that follows it (or before it, if there's an expression on the left). It serves as a hint for both for programmers and for the LLM.
 
 In this case, it is attached to the **value** produced by evaluating the next expression:
-``` hl_lines="2"
+```mindscript
 # Say hello in a funny way!
 let sayHello = oracle() -> Str
 
@@ -59,7 +59,7 @@ The construct `let VARNAME` declares a new variable. Variable names must always 
 In MindScript everything is an expression. Even declarations and assignments themselves return a value. In this case, the entire line evaluates to an oracle object. Because of that, the annotation in the preceeding line attaches to it.
 
 In the final line we evaluate the oracle and print the result followed by a newline
-``` hl_lines="4"
+```mindscript
 # Say hello in a funny way!
 let sayHello = oracle() -> Str
 

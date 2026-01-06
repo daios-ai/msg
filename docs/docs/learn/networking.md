@@ -97,7 +97,7 @@ This shows the essential server discipline: acquire resources, handle boundary f
 
 ---
 
-## HTTP
+## Buffered HTTP
 
 TCP is fairly low level and requires manual socket handling. MindScript also provides a high-level HTTP client. In practice, most modern programs will use the HTTP client because it covers the common "call an API" use case.
 
@@ -106,13 +106,7 @@ The function `http(req)` performs an HTTP request and returns a response object.
 A minimal GET looks like this:
 
 ```mindscript
-let r = http({url: "https://www.daios.ai"})
-if r == null then
-    let reason = str(noteGet(r))
-    println("request failed: " + reason)
-else
-    r.status
-end
+let response = http({url: "https://www.daios.ai"})
 ```
 
 A non-null response is not automatically a "success" because HTTP represents many application-level failures as normal responses with status codes. It is good practice to check `r.status` explicitly. In the next example we'll use the "POST" method for the request.
@@ -195,11 +189,13 @@ end
 
 The backoff is quadratic purely because it is simple and adequate for many scripts. More elaborate strategies belong in a dedicated library, but the key idea is the same: treat network unreliability as normal.
 
----
+## HTTP streaming
 
-## HTTP streaming: large downloads and early resource release
+Buffered HTTP is convenient but sometimes too expensive. If a response body is large, buffering it into memory can be slow or even impossible. 
 
-Buffered HTTP is convenient but sometimes too expensive. If a response body is large, buffering it into memory can be slow or even impossible. MindScript therefore offers `httpStream(req)`, which returns a response object where the body is exposed as a readable `Handle.net` named `bodyH`.
+### Downloads
+
+MindScript therefore offers `httpStream(req)`, which returns a response object where the body is exposed as a readable `Handle.net` named `bodyH`.
 
 The design mirrors Unix streaming: you pull bytes from the handle in chunks and process them as you go. This makes it possible to download large files, compute checksums, or decompress streams without building huge intermediate strings.
 
@@ -255,7 +251,7 @@ First, the response handle must be closed even on error. Closing early is not ju
 
 Second, the loop uses `readN` and checks `len(chunk) == 0` to detect EOF. This is the standard streaming idiom in MindScript.
 
-### Streaming uploads with `bodyH`
+### Uploads
 
 Sometimes the large data is on the request side rather than the response side. The HTTP functions accept `bodyH` in the request. When provided, it must be a readable file or network handle. This lets you send a file without reading it into memory.
 
@@ -287,16 +283,4 @@ end
 The explicit `close(f)` is important. A readable handle is still an OS resource, and the upload will finish sooner than a long-running script might otherwise exit.
 
 
----
 
-## Diagnosing failures responsibly
-
-Networking failures are often outside your control. What you can control is how clearly your script reports them and how safely it continues.
-
-When a networking primitive returns `null`, printing `noteGet(value)` is usually enough for logs. When an operation panics, that is usually a contract mistake: for example, passing a non-string header value or giving a malformed request shape. In those cases you should fix the program rather than “handle the error.” If you truly need to treat a hard failure as data—say, you are writing a tool that validates request objects—wrap the operation in `try(fun() do ... end)` and propagate the resulting `{ok, value}`.
-
----
-
-## Summary
-
-MindScript networking is deliberately built around one core idea: network connections are streams, and streams are handled through the same I/O primitives everywhere. Use `http` for ordinary API calls, and treat non-2xx statuses as normal boundary outcomes that you must check explicitly. Use `httpStream` when buffering a body is too expensive, and close streaming handles promptly to release resources. Use `netConnect` and `netListen` when you need raw TCP, and reuse the same `readLine`/`readN`/`write` patterns you already know.

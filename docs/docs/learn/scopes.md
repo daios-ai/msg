@@ -146,9 +146,11 @@ The standard library offers builtin iterators such as `range`, `natural` and `na
 ### The `while` loop form
 
 A while loop has the form
-```
+
+```mindscript
 while COND do BLOCK end
 ```
+
 were `COND` is a boolean expression and `BLOCK` is an expression block. They execute the block as long as the condition is `true` and return the last evaluated expression.
 
 For example, the following while loop prints the square numbers from 1 to 4 and returns `5`:

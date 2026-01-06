@@ -160,13 +160,16 @@ Notice above that you can omit the quotes delimiting key names (e.g. `name` inst
 
 Objects preserve insertion order of keys. This matters when you iterate or when you print values: keys appear in the order they were inserted.
 
-You can access properties using the dot `.` notation:
+You can access properties using the dot `.` or index `[..]` notation:
 
 ```mindscript-repl
 ==> user1.age
 30
 
 ==> user1.age = 31
+31
+
+==> user1["age"]
 31
 
 ==> point."x-coordinate"

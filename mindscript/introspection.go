@@ -78,7 +78,7 @@ func IxFromS(rt Value) (S, error) { return ixFromS_Strict(rt) }
 func IxReflect(v Value) Value {
 	s, ok := ixConstructorS_ForValue(v)
 	if !ok {
-		return rtSoftError("cannot reflect value to constructor code")
+		return annotNull("cannot reflect value to constructor code")
 	}
 	return IxToS(s) // S → runtime-S
 }

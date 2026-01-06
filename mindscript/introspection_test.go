@@ -264,9 +264,7 @@ func Test_Introspection_Type_AsConstructor(t *testing.T) {
 func Test_Introspection_Handle_SoftError(t *testing.T) {
 	h := Value{Tag: VTHandle, Data: "opaque"}
 	got := IxReflect(h)
-	// We only assert it's an annotated-null soft error.
-	top := got.Data.(*ArrayObject).Elems
-	if len(top) != 3 || top[0].Data.(string) != "annot" {
+	if got.Tag != VTNull {
 		t.Fatalf("expected annotated-null for handle; got %#v", got)
 	}
 }
@@ -1016,24 +1014,6 @@ func Test_Introspection_Handle_Type_NestedGet_Validate_And_Reify(t *testing.T) {
 	if !reflect.DeepEqual(stripAnnot(tv.Ast), wantAst) {
 		t.Fatalf("type AST mismatch\n got : %#v\n want: %#v", tv.Ast, wantAst)
 	}
-}
-
-func Test_Introspection_Handle_Value_Reflect_SoftError(t *testing.T) {
-	// Reflecting an actual handle value must soft-fail as annotated-null.
-	h := &Handle{Kind: "file"}
-	got := IxReflect(Value{Tag: VTHandle, Data: h})
-
-	if got.Tag != VTArray {
-		t.Fatalf("expected VTArray, got %v", got.Tag)
-	}
-	top := got.Data.(*ArrayObject).Elems
-	if len(top) != 3 || top[0].Tag != VTStr || top[0].Data.(string) != "annot" {
-		t.Fatalf("expected annotated-null; got %#v", got)
-	}
-	// Final child must be ["null"]
-	nullNode := top[2]
-	wantNull := vArray(vStr("null"))
-	mustEqValue(t, nullNode, wantNull)
 }
 
 func Test_Introspection_Fun_Param_Allows_HandleKind_Type(t *testing.T) {
